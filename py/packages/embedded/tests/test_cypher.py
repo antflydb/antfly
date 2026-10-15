@@ -94,7 +94,7 @@ def test_graph_catalog_writes_and_receipts_survive_reopen(require_native, aflite
 
 def test_graph_table_joins_and_staged_sql_postimages(require_native, aflite_path):
     with af.create_hosted(aflite_path) as database:
-        database.sql("CREATE TABLE docs (id TEXT, title TEXT)")
+        database.sql("CREATE TABLE docs (id TEXT, title TEXT DEFAULT 'default')")
         database.sql("INSERT INTO docs (_id,id,title) VALUES ('a','a','Alpha'),('b','b','Beta')")
         database.graph_catalog_json(
             {"action": "put", "name": "knowledge", "definition": {"labels": [{"name": "Document", "table": "docs"}]}}
@@ -107,6 +107,10 @@ def test_graph_table_joins_and_staged_sql_postimages(require_native, aflite_path
             session.execute("INSERT INTO docs (_id,id,title) VALUES ('c','c','Gamma')")
             session.execute("DELETE FROM docs WHERE id='b'")
             assert session.execute(statement)["rows"] == [["a", "Changed"], ["c", "Gamma"]]
+            session.execute("INSERT INTO docs (_id,id,title) VALUES ('d','d',NULL)")
+            assert session.execute(
+                "SELECT g.title FROM GRAPH_TABLE(knowledge MATCH (n IS Document) COLUMNS (n.id AS id, n.title AS title)) g WHERE g.id='d'"
+            )["rows"] == [[None]]
             session.execute("ROLLBACK")
         assert database.sql(statement)["rows"] == [["a", "Alpha"], ["b", "Beta"]]
         parameterized = (
@@ -647,13 +651,13 @@ def test_union_inline_predicates_and_scalar_conversions_persist(require_native, 
         assert result["rows"] == [[{"type": "boolean", "value": True}]]
 
 
-def _put_link_graph(database):
+def _put_link_graph(database, name="g", predicate=None):
     database.graph_catalog_json(
         {
             "action": "put",
-            "name": "g",
+            "name": name,
             "definition": {
-                "labels": [{"name": "D", "table": "docs"}],
+                "labels": [{"name": "D", "table": "docs", **({"where": predicate} if predicate else {})}],
                 "relationships": [
                     {"name": "LINK", "index": "links", "source_label": "D", "target_label": "D", "stored_type": "link"}
                 ],
@@ -689,8 +693,9 @@ def test_shortest_paths_resolve_later_pattern_dependencies(require_native, aflit
 
 def test_nonincident_producer_deletion_updates_cypher_and_sql_views(require_native, aflite_path):
     with af.create_hosted(aflite_path) as database:
-        database.sql("CREATE TABLE docs (name TEXT)")
+        database.sql("CREATE TABLE docs (name TEXT, kind TEXT)")
         database.sql("INSERT INTO docs (_id,name) VALUES ('a','a'),('b','b'),('claim','claim'),('other','other')")
+        database.sql("UPDATE docs SET kind='vertex' WHERE _id IN ('a','b')")
         with database.open_table("docs") as table:
             table.add_index({"name": "links", "kind": "graph", "config_json": "{}"})
             table.batch_json(
@@ -712,6 +717,21 @@ def test_nonincident_producer_deletion_updates_cypher_and_sql_views(require_nati
         _put_link_graph(database)
         count = "SELECT count(*) FROM GRAPH_TABLE(g MATCH ()-[r IS LINK]->() COLUMNS(r AS edge)) g"
         assert database.sql(count)["rows"] == [["2"]]
+        _put_link_graph(database, name="vertices", predicate={"kind": "vertex"})
+        nonvertex_count = count.replace("GRAPH_TABLE(g ", "GRAPH_TABLE(vertices ")
+        assert database.sql(nonvertex_count)["rows"] == [["2"]]
+        assert database.cypher_json(
+            "g",
+            {
+                "query": "MATCH (n:D {name:'claim'}) SET n.kind='producer' WITH 1 AS ignored MATCH ()-[r:LINK]->() RETURN count(r)"
+            },
+        )["rows"] == [[{"type": "integer", "value": "2"}]]
+        with closing(database.sql_session()) as session:
+            session.execute("BEGIN")
+            session.execute("UPDATE docs SET name='changed' WHERE _id='claim'")
+            assert session.execute(count)["rows"] == [["2"]]
+            assert session.execute(nonvertex_count)["rows"] == [["2"]]
+            session.execute("ROLLBACK")
         with closing(database.sql_session()) as session:
             session.execute("BEGIN")
             session.execute("DELETE FROM docs WHERE _id='claim'")
@@ -731,6 +751,51 @@ def test_nonincident_producer_deletion_updates_cypher_and_sql_views(require_nati
         assert database.sql(count)["rows"] == [["1"]]
 
 
+def _seed_artifact_links(database, extraction, *, mixed=False):
+    if mixed:
+        database.sql("CREATE TABLE docs (name TEXT, ref TEXT, kg JSONB)")
+    else:
+        database.create_table("docs", {})
+    with database.open_table("docs") as table:
+        table.add_index(
+            {
+                "name": "links",
+                "type": "graph",
+                "source": {"artifact": "kg", "format": "extraction_graph", "mention_edge_type": "mentions"},
+                "artifact": {
+                    "name": "kg",
+                    "kind": "asset",
+                    "source": {"type": "field", "value": "kg"},
+                    "content_type": "application/json",
+                },
+                "edge_types": [{"name": "mentions"}, {"name": "link", **({"field": "ref"} if mixed else {})}],
+                "resolvers": [
+                    {
+                        "name": "entities",
+                        "table": "docs",
+                        "promote": False,
+                        "source_artifact": "kg",
+                        "resolution_artifact": "resolved",
+                        "key_template": "entity/{{ uslug _entity.text }}",
+                        "config_generation": 1,
+                    }
+                ],
+            }
+        )
+        table.batch_json(
+            {
+                "inserts": {
+                    "entity/a": {"name": "a", **({"ref": "entity/b", "kg": extraction} if mixed else {})},
+                    "entity/b": {"name": "b"},
+                    "claim": {"name": "claim", "kg": extraction},
+                    "other": {"name": "other", "kg": extraction},
+                }
+            }
+        )
+        table.run_until_idle()
+    _put_link_graph(database)
+
+
 def test_artifact_assertions_preserve_ownership_and_producer_identity(require_native, aflite_path):
     options = af.OpenOptions(profile=af.Profile.NATIVE, generated_enrichment_replay=True)
     extraction = {
@@ -738,49 +803,18 @@ def test_artifact_assertions_preserve_ownership_and_producer_identity(require_na
         "relations": [{"type": "link", "source": "a", "target": "b"}],
     }
     with af.create_with_options(aflite_path, options) as database:
-        database.create_table("docs", {})
-        with database.open_table("docs") as table:
-            table.add_index(
-                {
-                    "name": "links",
-                    "type": "graph",
-                    "source": {"artifact": "kg", "format": "extraction_graph", "mention_edge_type": "mentions"},
-                    "artifact": {
-                        "name": "kg",
-                        "kind": "asset",
-                        "source": {"type": "field", "value": "kg"},
-                        "content_type": "application/json",
-                    },
-                    "edge_types": [{"name": "mentions"}, {"name": "link"}],
-                    "resolvers": [
-                        {
-                            "name": "entities",
-                            "table": "docs",
-                            "promote": False,
-                            "source_artifact": "kg",
-                            "resolution_artifact": "resolved",
-                            "key_template": "entity/{{ uslug _entity.text }}",
-                            "config_generation": 1,
-                        }
-                    ],
-                }
-            )
-            table.batch_json(
-                {
-                    "inserts": {
-                        "entity/a": {"name": "a"},
-                        "entity/b": {"name": "b"},
-                        "claim": {"name": "claim", "kg": extraction},
-                        "other": {"name": "other", "kg": extraction},
-                    }
-                }
-            )
-            table.run_until_idle()
-        _put_link_graph(database)
+        _seed_artifact_links(database, extraction)
         relationships = database.cypher_json("g", {"query": "MATCH ()-[r:LINK]->() RETURN r"})["rows"]
         assert len(relationships) == 2
         assert {row[0]["value"]["ownership"] for row in relationships} == {"artifact"}
         assert len({row[0]["value"]["identity"]["key"] for row in relationships}) == 2
+        assert {row[0]["value"]["producer"]["key"] for row in relationships} == {"claim", "other"}
+        assert database.cypher_json(
+            "g",
+            {
+                "query": "MATCH (n:D {name:'claim'}) SET n.note='updated' WITH 1 AS ignored MATCH ()-[r:LINK]->() RETURN count(r)"
+            },
+        )["rows"] == [[{"type": "integer", "value": "2"}]]
         # A legacy direct contender shares tuple-level private contributor state;
         # it must not provide a mutation path that erases the managed assertions.
         with database.open_table("docs") as table:
@@ -827,3 +861,39 @@ def test_artifact_assertions_preserve_ownership_and_producer_identity(require_na
     with af.open_with_options(aflite_path, options) as database:
         relationships = database.cypher_json("g", {"query": "MATCH ()-[r:LINK]->() RETURN r"})["rows"]
         assert {row[0]["value"]["ownership"] for row in relationships} == {"artifact", "explicit"}
+        # A single physical relationship can have more producers than one
+        # private adjacency page. LIMIT must not require repeated full scans of
+        # all contributors or charge a quadratic amount of physical work.
+        with database.open_table("docs") as table:
+            table.batch_json({"inserts": {f"fan-in/{i}": {"kg": extraction} for i in range(2048)}})
+            table.run_until_idle()
+        result = database.cypher_json("g", {"query": "MATCH (a:D {name:'a'})-[r:LINK]->() RETURN r LIMIT 1"})
+        assert len(result["rows"]) == 1
+
+
+def test_fields_and_artifacts_from_one_producer_have_independent_postimages(require_native, aflite_path):
+    options = af.OpenOptions(profile=af.Profile.NATIVE, generated_enrichment_replay=True)
+    extraction = {
+        "entities": [{"id": "a", "label": "thing", "text": "A"}, {"id": "b", "label": "thing", "text": "B"}],
+        "relations": [{"type": "link", "source": "a", "target": "b"}],
+    }
+    with af.create_with_options(aflite_path, options) as database:
+        _seed_artifact_links(database, extraction, mixed=True)
+        rows = database.cypher_json("g", {"query": "MATCH ()-[r:LINK]->() RETURN r"})["rows"]
+        assert len(rows) == 4
+        assert len({row[0]["value"]["identity"]["key"] for row in rows}) == 4
+        assert sorted(row[0]["value"]["ownership"] for row in rows) == ["artifact"] * 3 + ["field"]
+        count = "SELECT count(*) FROM GRAPH_TABLE(g MATCH ()-[r IS LINK]->() COLUMNS(r AS edge)) g"
+        with closing(database.sql_session()) as session:
+            session.execute("BEGIN")
+            session.execute("UPDATE docs SET ref=NULL WHERE _id='entity/a'")
+            assert session.execute(count)["rows"] == [["3"]]
+            session.execute("ROLLBACK")
+        result = database.cypher_json(
+            "g", {"query": "MATCH (a:D {name:'a'}) SET a.ref=null WITH 1 AS ignored MATCH ()-[r:LINK]->() RETURN r"}
+        )
+        assert len(result["rows"]) == 3
+        assert {row[0]["value"]["ownership"] for row in result["rows"]} == {"artifact"}
+        with database.open_table("docs") as table:
+            table.run_until_idle()
+        assert database.sql(count)["rows"] == [["3"]]

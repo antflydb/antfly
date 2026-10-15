@@ -272,6 +272,13 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .filters = &.{ "initial self FK reserves one hidden child owner", "initial self FK resumes the second hidden range", "FK generation publication initial create reserves hidden identity", "generation lock freezes the table cut while initial support permits exact schema retirement", "native initial support finalization requires current bound root", "initial partial support begin survives restart", "initial MATCH PARTIAL publication pins parent witness support", "initial FK root generation", "canceled hidden reservation permits only exact tagged placement removal", "hosted initial FK retirement", "initial FK retirement ACK signature", "retirement ACK validates exact canceled work", "initial child root receipt", "initial child physical attestation", "store root enrollment proof" },
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
+    const graph_resolver_activation_tests = b.addTest(.{
+        .root_module = metadata_unit_baseline_mods[6],
+        .filters = &.{"target index reconciliation"},
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    const graph_resolver_activation_run = addFilteredTestRunArtifact(b, graph_resolver_activation_tests);
+    b.step("antfly-graph-resolver-activation-test", "Verify targeted graph index resolver activation and sibling isolation").dependOn(&graph_resolver_activation_run.step);
     const initial_fk_admission_step = b.step("antfly-metadata-initial-fk-admission-test", "Run initial-FK preflight and stale-begin metadata fault regressions");
     initial_fk_admission_step.dependOn(&addFilteredTestRunArtifact(b, initial_fk_admission_tests).step);
     const initial_fk_placement_tests = b.addTest(.{
@@ -2856,6 +2863,14 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const run_lib_metadata_service_tests = addFilteredTestRunArtifact(b, lib_metadata_service_tests);
     const lib_metadata_service_test_step = b.step("antfly-metadata-service-test", "Run metadata service/control-loop integration tests");
     lib_metadata_service_test_step.dependOn(&run_lib_metadata_service_tests.step);
+
+    const cypher_status_protocol_tests = b.addTest(.{
+        .root_module = antfly_test_mod,
+        .filters = &.{ "metadata runtime status producer completion", "metadata service transition commands negotiate runtime status payload versions", "runtime status native authority cannot downgrade", "catalog projection capability counts", "metadata runtime store producer completion", "metadata runtime index source producer completion" },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("cypher-status-protocol-test", "Verify graph publication and producer completion survive negotiated metadata transport")
+        .dependOn(&addFilteredTestRunArtifact(b, cypher_status_protocol_tests).step);
 
     const lib_metadata_logic_default_filters = [_][]const u8{
         "metadata reconciler",
@@ -6097,6 +6112,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     );
     const graph_runtime_test_step = b.step("graph-runtime-test", "Run graph artifact replay, repair, and traversal integration tests");
     graph_runtime_test_step.dependOn(&run_graph_runtime_tests.step);
+    graph_runtime_test_step.dependOn(&graph_resolver_activation_run.step);
     b.step("cypher-storage-write-test", "Run native graph transaction effect and recovery regressions").dependOn(&run_graph_runtime_tests.step);
     const cypher_open_failure_filters = [_][]const u8{ "db corrupt table catalog open releases native reclaimers", "db protected transaction BEGIN admits metadata while PREPARE still requires authority" };
     const cypher_open_failure_tests = b.addTest(.{
@@ -6113,13 +6129,24 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "db replicated merge imports graph source asset",
         "db replicated merge keeps expired graph source",
         "server ordered graph cleanup",
+        "server Cypher producer catalog activation",
+        "server Cypher ordered publication",
+        "server Cypher ordered transaction resolution",
+        "server Cypher readonly status",
+        "producer catalog proposal validates",
+        "ordered artifact inventory semantic",
+        "producer dispatch preserves foreign named failures",
+        "ordered artifact inventory resolver authored review",
+        "DistributedCandidateSource",
     };
     const graph_ordered_runtime_tests = b.addTest(.{
         .root_module = server_db_test_mod,
         .filters = &graph_ordered_runtime_filters,
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
-    graph_runtime_test_step.dependOn(&addCuratedTestRunArtifact(b, graph_ordered_runtime_tests, &graph_ordered_runtime_filters).step);
+    const graph_ordered_runtime_run = addCuratedTestRunArtifact(b, graph_ordered_runtime_tests, &graph_ordered_runtime_filters);
+    graph_runtime_test_step.dependOn(&graph_ordered_runtime_run.step);
+    b.step("cypher-producer-catalog-test", "Verify replicated producer catalog activation and ordered graph replay").dependOn(&graph_ordered_runtime_run.step);
 
     const resolver_backfill_tests = b.addTest(.{
         .root_module = db_test_mod,

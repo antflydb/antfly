@@ -112,25 +112,23 @@ pub fn open(adapter: anytype, a: A, binding: catalog.graph_relation.Binding, req
         try staged.vtable.begin.?(staged.ptr);
         const entries = try session.merged(stage_allocator);
         for (entries) |entry| {
-            const member = for (binding.graph.labels) |label| {
-                if (std.mem.eql(u8, label.table, entry.table.physical_name)) break true;
-            } else false;
-            if (!member or entry.mutation.predicate_only) continue;
+            const dependency: ?catalog.Table = for (binding.dependencies) |table| {
+                if (std.mem.eql(u8, table.physical_name, entry.table.physical_name)) break table;
+            } else null;
+            const table = dependency orelse continue;
+            if (entry.mutation.predicate_only) continue;
+            if (table.id != entry.table.id or table.schema_version != entry.table.schema_version or table.storage_mode != entry.table.storage_mode) return error.PreparedGenerationChanged;
             const identity: cypher.value.Identity = .{ .table = entry.table.physical_name, .key = entry.mutation.key };
-            const existing = try staged.vtable.get(staged.ptr, stage_allocator, identity);
-            if (entry.mutation.row) |row| {
-                const properties = try cypher.value.entityProperties(stage_allocator, (try cypher.value.Value.fromJson(stage_allocator, row)).map);
-                if (existing != null) {
-                    try staged.vtable.mutate.?(staged.ptr, stage_allocator, .{ .set_properties = .{ .target = .{ .node = identity }, .properties = properties, .replace = true } });
-                } else {
-                    const node = try stage_allocator.create(cypher.value.Node);
-                    node.* = .{ .identity = identity, .properties = properties };
-                    var labels: std.ArrayList([]const u8) = .empty;
-                    for (binding.graph.labels) |label| if (binding.graph.admits(node, label.name)) try labels.append(stage_allocator, label.name);
-                    node.labels = labels.items;
-                    try staged.vtable.mutate.?(staged.ptr, stage_allocator, .{ .create_node = node });
-                }
-            } else if (existing != null) try staged.vtable.mutate.?(staged.ptr, stage_allocator, .{ .delete_node = .{ .identity = identity, .detach = true } });
+            const row: ?std.json.Value = if (entry.encoded_row) |bytes|
+                try std.json.parseFromSliceLeaky(std.json.Value, stage_allocator, bytes, .{ .parse_numbers = false, .allocate = .alloc_always })
+            else
+                entry.mutation.row;
+            const node: ?*const cypher.value.Node = if (row) |document| blk: {
+                const value = try stage_allocator.create(cypher.value.Node);
+                value.* = .{ .identity = identity, .properties = try cypher.value.entityProperties(stage_allocator, (try cypher.value.Value.fromJson(stage_allocator, document)).map) };
+                break :blk value;
+            } else null;
+            try self.overlay.stageReadDocument(stage_allocator, identity, node);
         }
         provider = staged;
     };

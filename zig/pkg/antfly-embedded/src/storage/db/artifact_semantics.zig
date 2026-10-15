@@ -118,12 +118,16 @@ fn producerDefinitions(hash: *Hash, alloc: std.mem.Allocator, enrichments: []con
         if (raw.len == 0) continue;
         const parsed = try std.json.parseFromSlice(std.json.Value, alloc, raw, .{});
         defer parsed.deinit();
-        if (parsed.value != .array) return error.InvalidArtifactCatalogCommand;
-        if (parsed.value.array.items.len == 0) continue; // Preserve main/v14 empty-family identity.
+        const rows = if (std.mem.eql(u8, family, "resolvers"))
+            @import("catalog/resolver_catalog.zig").catalogRows(parsed.value) catch return error.InvalidArtifactCatalogCommand
+        else
+            parsed.value;
+        if (rows != .array) return error.InvalidArtifactCatalogCommand;
+        if (rows.array.items.len == 0) continue; // Preserve main/v14 empty-family identity.
         const Entry = struct { name: []const u8, value: std.json.Value };
-        const entries = try alloc.alloc(Entry, parsed.value.array.items.len);
+        const entries = try alloc.alloc(Entry, rows.array.items.len);
         defer alloc.free(entries);
-        for (parsed.value.array.items, entries) |value, *entry| {
+        for (rows.array.items, entries) |value, *entry| {
             if (value != .object) return error.InvalidArtifactCatalogCommand;
             const name = value.object.get("name") orelse return error.InvalidArtifactCatalogCommand;
             if (name != .string or name.string.len == 0) return error.InvalidArtifactCatalogCommand;
@@ -155,4 +159,14 @@ test "ordered artifact inventory semantic producer catalogs ignore order but bin
     const two = try digest(alloc, "", "", "[{\"name\":\"resolver\",\"config_generation\":2}]");
     try std.testing.expect(!std.mem.eql(u8, &one, &two));
     try std.testing.expectError(error.InvalidArtifactCatalogCommand, digest(alloc, "", "[{\"name\":\"a\"},{\"name\":\"a\"}]", ""));
+}
+
+test "ordered artifact inventory semantic resolver envelopes preserve definition identity" {
+    const a = std.testing.allocator;
+    const rows = "[{\"name\":\"entities\",\"config_generation\":7,\"promote\":false}]";
+    const wrapped = try std.fmt.allocPrint(a, "{{\"version\":2,\"resolvers\":{s}}}", .{rows});
+    defer a.free(wrapped);
+    try std.testing.expectEqualDeep(try digest(a, "", "", rows), try digest(a, "", "", wrapped));
+    try std.testing.expectEqualDeep(try digest(a, "", "", "[]"), try digest(a, "", "", "{\"version\":2,\"resolvers\":[]}"));
+    try std.testing.expectError(error.InvalidArtifactCatalogCommand, digest(a, "", "", "{\"version\":3,\"resolvers\":[]}"));
 }

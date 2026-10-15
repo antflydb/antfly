@@ -59,33 +59,41 @@ pub const View = struct {
             self.changed = true;
             self.inner.captured.scanned_anchors +|= 1;
             const projection: cypher.rpc.Projection = if (row.document_json) |json| try self.client.projectDocument(a, row.identity, try std.json.parseFromSliceLeaky(std.json.Value, a, json, .{ .parse_numbers = false }), row.json_null_fields, true) else .{ .node = null };
-            const visible = projection.node != null and projection.node.?.labels.len != 0;
+            const authorized = projection.node != null;
             var found = false;
             for (self.inner.nodes.items) |*node| {
                 if (!node.value.identity.eql(row.identity)) continue;
                 found = true;
-                node.deleted = !visible;
+                node.deleted = !authorized;
                 if (projection.node) |value| node.value = @constCast(value);
                 break;
             }
-            if (!found and visible) {
+            if (!found) {
                 try self.capacity();
-                try self.inner.nodes.append(a, .{ .value = @constCast(projection.node.?) });
+                const node = if (projection.node) |value| @constCast(value) else tombstone: {
+                    const value = try a.create(cypher.value.Node);
+                    value.* = .{ .identity = row.identity };
+                    break :tombstone value;
+                };
+                // Authorized producer rows need not be admitted graph vertices.
+                // Keep hidden/deleted rows as tombstones so a base-cut lookup
+                // cannot restore their old producer authority.
+                try self.inner.appendNode(a, .{ .value = node, .deleted = !authorized });
             }
             // A document owns its derived contributions even when an explicit
             // source override places their outgoing adjacency on another key.
             for (self.inner.relationships.items) |*relationship| {
-                if (try cypher.transaction.Overlay.ownedBy(a, relationship.value, row.identity)) relationship.deleted = true;
+                if ((!authorized or relationship.value.ownership == .field) and try cypher.transaction.Overlay.ownedBy(a, relationship.value, row.identity)) relationship.deleted = true;
             }
             for (projection.relationships) |relationship| {
                 try self.capacity();
-                try self.inner.relationships.append(a, .{ .value = @constCast(relationship) });
+                try self.inner.appendRelationship(a, .{ .value = @constCast(relationship) });
                 self.inner.captured.explored_edges +|= 1;
             }
         }
         for (self.effects) |effects| {
             for (effects.deletes) |edge| for (graph.relationships) |mapping| {
-                if (!matches(graph, effects.table, mapping, edge)) continue;
+                if (!matches(graph, effects.table, mapping, edge) or self.projectedFieldEffect(effects.table, mapping, edge)) continue;
                 self.changed = true;
                 for (self.inner.relationships.items) |*relationship| {
                     if (!std.mem.eql(u8, relationship.value.index, mapping.index) or !std.mem.eql(u8, relationship.value.type, mapping.name) or !std.mem.eql(u8, relationship.value.source.key, edge.source) or !std.mem.eql(u8, relationship.value.target.key, edge.target)) continue;
@@ -95,12 +103,13 @@ pub const View = struct {
                     }
                     if (!std.mem.startsWith(u8, relationship.value.identity.key, "[")) continue;
                     const tuple = try std.json.parseFromSliceLeaky([]const []const u8, a, relationship.value.identity.key, .{});
+                    if (tuple.len == 6 and std.mem.eql(u8, tuple[5], "field")) continue;
                     if (tuple.len != 5) return error.CypherInvalidRelationship;
                     if (std.mem.eql(u8, tuple[3], edge.edge_id) and std.mem.eql(u8, tuple[4], producer(edge))) relationship.deleted = true;
                 }
             };
             for (effects.writes) |edge| for (graph.relationships) |mapping| {
-                if (!matches(graph, effects.table, mapping, edge)) continue;
+                if (!matches(graph, effects.table, mapping, edge) or self.projectedFieldEffect(effects.table, mapping, edge)) continue;
                 self.changed = true;
                 try checkpoint(ptr);
                 const source = cypher.value.Identity{ .table = effects.table, .key = edge.source };
@@ -131,18 +140,21 @@ pub const View = struct {
                 }
                 const key = if (marker != null and producer(edge).len == 0 and std.mem.startsWith(u8, edge.edge_id, "cypher:")) edge.edge_id else try std.json.Stringify.valueAlloc(a, .{ edge.source, edge.target, edge.edge_type, edge.edge_id, producer(edge) }, .{});
                 var replaced = false;
-                for (self.inner.relationships.items) |*relationship| {
+                for (self.inner.relationships.items, 0..) |*relationship, position| {
                     if (!std.mem.eql(u8, relationship.value.index, mapping.index) or !relationship.value.identity.eql(.{ .table = effects.table, .key = key })) continue;
-                    relationship.value.* = .{ .identity = .{ .table = effects.table, .key = key }, .index = mapping.index, .type = mapping.name, .source = source, .target = target, .properties = try cypher.value.entityProperties(a, properties.items), .ownership = if (producer(edge).len == 0) .explicit else .document };
+                    const field_derived = relationship.value.ownership == .field;
+                    relationship.value.* = .{ .identity = .{ .table = effects.table, .key = key }, .index = mapping.index, .type = mapping.name, .source = source, .target = target, .properties = try cypher.value.entityProperties(a, properties.items), .ownership = if (producer(edge).len == 0) .explicit else .document, .producer = if (producer(edge).len == 0) null else .{ .table = effects.table, .key = producer(edge) } };
+                    if (field_derived) relationship.value.ownership = .field;
                     relationship.deleted = false;
+                    try self.inner.indexRelationship(a, position);
                     replaced = true;
                     break;
                 }
                 if (!replaced) {
                     try self.capacity();
                     const relationship = try a.create(cypher.value.Relationship);
-                    relationship.* = .{ .identity = .{ .table = effects.table, .key = key }, .index = mapping.index, .type = mapping.name, .source = source, .target = target, .properties = try cypher.value.entityProperties(a, properties.items), .ownership = if (producer(edge).len == 0) .explicit else .document };
-                    try self.inner.relationships.append(a, .{ .value = relationship });
+                    relationship.* = .{ .identity = .{ .table = effects.table, .key = key }, .index = mapping.index, .type = mapping.name, .source = source, .target = target, .properties = try cypher.value.entityProperties(a, properties.items), .ownership = if (producer(edge).len == 0) .explicit else .document, .producer = if (producer(edge).len == 0) null else .{ .table = effects.table, .key = producer(edge) } };
+                    try self.inner.appendRelationship(a, .{ .value = relationship });
                 }
                 self.inner.captured.explored_edges +|= 1;
             };
@@ -150,6 +162,21 @@ pub const View = struct {
     }
     fn matches(graph: cypher.catalog.Graph, table: []const u8, mapping: cypher.catalog.Relationship, edge: anytype) bool {
         return std.mem.eql(u8, graph.label(mapping.source_label).?.table, table) and std.mem.eql(u8, mapping.index, edge.index_name) and std.mem.eql(u8, mapping.stored_type, edge.edge_type);
+    }
+    // Deterministic fields have already been rebuilt from the complete staged
+    // document. Replaying their physical tuple deltas would also erase a
+    // published artifact assertion sharing that tuple and producer.
+    fn projectedFieldEffect(self: *View, table: []const u8, mapping: cypher.catalog.Relationship, edge: anytype) bool {
+        if (edge.edge_id.len != 0 or edge.owner_document.len != 0 or (edge.owner.len != 0 and !std.mem.eql(u8, edge.owner, edge.source))) return false;
+        const source = cypher.value.Identity{ .table = table, .key = edge.source };
+        const staged = for (self.rows) |row| {
+            if (row.identity.eql(source)) break true;
+        } else false;
+        if (!staged) return false;
+        for (self.inner.relationships.items) |relationship| {
+            if (relationship.value.ownership == .field and relationship.value.source.eql(source) and std.mem.eql(u8, relationship.value.index, mapping.index) and std.mem.eql(u8, relationship.value.type, mapping.name)) return true;
+        }
+        return false;
     }
     fn producer(edge: anytype) []const u8 {
         return if (edge.owner_document.len != 0) edge.owner_document else edge.owner;

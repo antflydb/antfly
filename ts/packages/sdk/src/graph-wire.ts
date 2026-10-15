@@ -25,7 +25,8 @@ export type GraphValue =
         type: string;
         source: GraphIdentity;
         target: GraphIdentity;
-        ownership: "explicit" | "document" | "artifact";
+        ownership: "explicit" | "document" | "field" | "artifact";
+        producer?: GraphIdentity | null;
         properties: GraphValue;
       };
     }

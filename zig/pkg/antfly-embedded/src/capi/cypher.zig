@@ -44,7 +44,14 @@ fn failureScope(out: *h.capi.Buffer, err: anyerror, diagnostic: cypher.compiler.
         else => .invalid_argument,
     };
 }
-pub export fn antfly_db_graph_catalog_json(raw: ?*anyopaque, request: h.capi.Slice, out: *h.capi.Buffer) h.capi.ErrorCode {
+comptime {
+    if (!@import("../storage/engine_selection.zig").enabled) {
+        @export(&antfly_db_graph_catalog_json, .{ .name = "antfly_db_graph_catalog_json", .linkage = .strong });
+        @export(&antfly_db_cypher_json, .{ .name = "antfly_db_cypher_json", .linkage = .strong });
+        @export(&antfly_db_graph_write_status_json, .{ .name = "antfly_db_graph_write_status_json", .linkage = .strong });
+    }
+}
+pub fn antfly_db_graph_catalog_json(raw: ?*anyopaque, request: h.capi.Slice, out: *h.capi.Buffer) callconv(.c) h.capi.ErrorCode {
     out.* = .{};
     const guard = api.enterHandle(raw, .exclusive) orelse return .invalid_argument;
     defer guard.leave();
@@ -55,7 +62,7 @@ pub export fn antfly_db_graph_catalog_json(raw: ?*anyopaque, request: h.capi.Sli
     catalog.execute(guard.handle, request.bytes(), out) catch |err| return failure(out, err, .{});
     return .ok;
 }
-pub export fn antfly_db_cypher_json(raw: ?*anyopaque, name: h.capi.Slice, request: h.capi.Slice, out: *h.capi.Buffer) h.capi.ErrorCode {
+pub fn antfly_db_cypher_json(raw: ?*anyopaque, name: h.capi.Slice, request: h.capi.Slice, out: *h.capi.Buffer) callconv(.c) h.capi.ErrorCode {
     out.* = .{};
     const guard = api.enterHandle(raw, .exclusive) orelse return .invalid_argument;
     defer guard.leave();
@@ -67,7 +74,7 @@ pub export fn antfly_db_cypher_json(raw: ?*anyopaque, name: h.capi.Slice, reques
     return .ok;
 }
 
-pub export fn antfly_db_graph_write_status_json(raw: ?*anyopaque, transaction_id: h.capi.Slice, out: *h.capi.Buffer) h.capi.ErrorCode {
+pub fn antfly_db_graph_write_status_json(raw: ?*anyopaque, transaction_id: h.capi.Slice, out: *h.capi.Buffer) callconv(.c) h.capi.ErrorCode {
     out.* = .{};
     const guard = api.enterHandle(raw, .read) orelse return .invalid_argument;
     defer guard.leave();

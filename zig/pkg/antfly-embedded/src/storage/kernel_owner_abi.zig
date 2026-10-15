@@ -19,7 +19,7 @@
 const failure_abi = @import("runtime_failure_abi");
 
 // Storage layouts evolve independently of the shared failure envelope.
-pub const abi_version: u32 = 76;
+pub const abi_version: u32 = 79;
 pub const Status = failure_abi.Status;
 pub const FailureBoundary = failure_abi.FailureBoundary;
 pub const FailureIdentity = failure_abi.FailureIdentity;
@@ -988,11 +988,21 @@ pub const ResolutionCandidateNearestFn = *const fn (
     ResolutionCandidateConsumeFn,
 ) callconv(.c) Status;
 
+pub const ResolutionCandidateGetManyFn = *const fn (?*anyopaque, BorrowedBytes, ?[*]const BorrowedBytes, u64, ?*anyopaque, ResolutionCandidateConsumeFn) callconv(.c) Status;
+pub const ResolutionCandidateBeginBatchFn = *const fn (?*anyopaque, ?[*]const BorrowedBytes, u64, *ResolutionCandidateConfig) callconv(.c) Status;
+pub const ResolutionCandidateBoundTableFn = *const fn (?*anyopaque, BorrowedBytes, *BorrowedBytes) callconv(.c) Status;
+pub const ResolutionCandidateReleaseFn = *const fn (?*anyopaque) callconv(.c) void;
+
 pub const ResolutionCandidateConfig = extern struct {
     callback_ctx: ?*anyopaque = null,
     get_fn: ?ResolutionCandidateGetFn = null,
     scan_prefix_fn: ?ResolutionCandidateScanPrefixFn = null,
     nearest_fn: ?ResolutionCandidateNearestFn = null,
+    get_many_fn: ?ResolutionCandidateGetManyFn = null,
+    begin_batch_fn: ?ResolutionCandidateBeginBatchFn = null,
+    /// Borrowed until the batch release callback; never retained past it.
+    bound_table_fn: ?ResolutionCandidateBoundTableFn = null,
+    release_fn: ?ResolutionCandidateReleaseFn = null,
 };
 
 pub const EntityUpsert = extern struct {
@@ -1088,9 +1098,17 @@ pub const TargetAdvanceFn = *const fn (
     identities_json: BorrowedBytes,
 ) callconv(.c) void;
 
+/// Schedules a status observation; it must not reenter the owner. No target
+/// debt is created for receiver-local completion or runtime-only changes.
+pub const StatusChangedFn = *const fn (
+    ctx: ?*anyopaque,
+    table_name: BorrowedBytes,
+) callconv(.c) void;
+
 pub const TargetObserver = extern struct {
     ctx: ?*anyopaque = null,
     notify: ?TargetAdvanceFn = null,
+    status_changed: ?StatusChangedFn = null,
 };
 
 pub const RestoreAdmission = extern struct {
@@ -1131,6 +1149,7 @@ pub const OpenRequest = extern struct {
     online_source_authority: u8 = 1,
     /// This owner is being opened to apply an entry whose catalog descriptor
     /// may predate the configuration already persisted by this replica.
+    /// 2 additionally prepares missing graph indexes for exact mutation replay.
     historical_raft_apply: u8 = 0,
     /// Optional result: the physical owner opened for exact topology control
     /// while current-catalog index reconciliation remains fence-deferred.

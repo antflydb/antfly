@@ -79,7 +79,9 @@ def test_authenticated_cypher_postimage_policy_on_replicated_owners(
     assert "4 authenticated Cypher postimage-policy checks passed" in result.stdout
 
 
+@pytest.mark.parametrize("preexisting_producers", [False, True])
 def test_authenticated_cypher_producer_postimages_on_replicated_owners(
+    preexisting_producers,
     three_by_three_backup_cluster,  # noqa: F811
 ):
     cluster = three_by_three_backup_cluster
@@ -89,7 +91,13 @@ def test_authenticated_cypher_producer_postimages_on_replicated_owners(
         Path(__file__).resolve().parents[2] / "scripts" / "verify_cypher_mutations.py"
     )
     result = subprocess.run(
-        [sys.executable, str(script), "--url", endpoint],
+        [
+            sys.executable,
+            str(script),
+            "--url",
+            endpoint,
+            *(["--preexisting-producers"] if preexisting_producers else []),
+        ],
         env={
             **os.environ,
             "ANTFLY_CYPHER_TEST_AUTH": f"admin:{AUTH_BOOTSTRAP_PASSWORD}",
@@ -99,8 +107,54 @@ def test_authenticated_cypher_producer_postimages_on_replicated_owners(
         timeout=220,
         check=False,
     )
+    witnesses = []
+    if result.returncode != 0:
+        for metadata_node in range(3):
+            try:
+                snapshot = cluster.metadata_snapshot(metadata_node, request_timeout_s=2)
+                for store in snapshot.get("stores", []):
+                    for report in store.get("runtime_statuses", []):
+                        for index in report.get("indexes", []):
+                            if index.get("name") != "mixed":
+                                continue
+                            witnesses.append(
+                                {
+                                    "metadata_node": metadata_node + 1,
+                                    "store": store.get("node_id"),
+                                    "store_generation": store.get("status_generation"),
+                                    "group": report.get("group_id"),
+                                    "source": report.get("source"),
+                                    "freshness": report.get("freshness"),
+                                    "generation": report.get("status_generation"),
+                                    "target_revision": report.get(
+                                        "target_observation_revision"
+                                    ),
+                                    "target_complete": report.get(
+                                        "target_observation_complete"
+                                    ),
+                                    "enrichment": report.get("enrichment"),
+                                    "index": {
+                                        key: index.get(key)
+                                        for key in (
+                                            "replay_applied_sequence",
+                                            "replay_target_sequence",
+                                            "edge_count",
+                                            "source_replay",
+                                        )
+                                    },
+                                }
+                            )
+            except Exception as error:
+                witnesses.append(
+                    {"metadata_node": metadata_node + 1, "error": str(error)}
+                )
     assert result.returncode == 0, (
-        result.stdout + result.stderr + "\n" + cluster.debug_logs()
+        result.stdout
+        + result.stderr
+        + "\n[runtime-witnesses]\n"
+        + json.dumps(witnesses, sort_keys=True)
+        + "\n"
+        + cluster.debug_logs()
     )
     assert "producer postimages and deferred shortest paths passed" in result.stdout
 

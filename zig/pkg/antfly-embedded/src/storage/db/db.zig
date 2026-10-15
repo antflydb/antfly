@@ -1037,6 +1037,7 @@ const EnrichmentAppendContext = struct {
 
     fn batchContext(self: *const EnrichmentAppendContext) BatchExecutionContext {
         return .{
+            .ordered_artifact_publication_required = self.artifact_publication_dispatcher != null,
             .alloc = self.alloc,
             .store = self.store,
             .applied_sequence_checkpoint_path = self.applied_sequence_checkpoint_path,
@@ -2153,17 +2154,26 @@ fn loadOrCreateDurableRootIdentity(
     backend_runtime: ?*background_runtime_mod.BackendRuntime,
     path: []const u8,
 ) !root_identity.State {
+    return loadDurableRootIdentity(alloc, backend_runtime, path, true);
+}
+
+fn loadDurableRootIdentity(
+    alloc: Allocator,
+    backend_runtime: ?*background_runtime_mod.BackendRuntime,
+    path: []const u8,
+    create: bool,
+) !root_identity.State {
     if (comptime builtin.os.tag == .freestanding) return error.UnsupportedPlatform;
     if (backend_runtime) |runtime| {
         const io = runtime.filesystemIo() orelse return error.BackendRuntimeIoUnavailable;
-        return try root_identity.loadOrCreate(alloc, io, path);
+        return if (create) try root_identity.loadOrCreate(alloc, io, path) else try root_identity.load(alloc, io, path);
     }
     // Legacy callers may omit a runtime entirely. Keep their fallback at this
     // operation boundary; a supplied runtime must carry its own filesystem
     // authority so storage work never creates a hidden executor.
     var io_impl = threadedIo();
     defer io_impl.deinit();
-    return try root_identity.loadOrCreate(alloc, io_impl.io(), path);
+    return if (create) try root_identity.loadOrCreate(alloc, io_impl.io(), path) else try root_identity.load(alloc, io_impl.io(), path);
 }
 
 const monotonicTimeNs = execution_resources.monotonicTimeNs;
@@ -4033,11 +4043,15 @@ pub const DB = struct {
             const table_storage_started_ns = monotonicTimeNs();
             try db.initializeTableStorage(opts.table_storage);
             profile.table_storage_ns = elapsedSince(table_storage_started_ns);
-            if (!openModeRequiresReadOnlyBackends(opts.open_mode) and
-                opts.physical_root_mode == .filesystem_managed)
-            {
-                const identity = try loadOrCreateDurableRootIdentity(alloc, db.backend_runtime, path);
-                db.root_incarnation = identity.incarnation;
+            if (opts.physical_root_mode == .filesystem_managed) {
+                // Read-only status needs the same receiver identity as the
+                // writer to validate completion. It may load an existing
+                // checkpoint, but must never create one on an older root.
+                const identity = loadDurableRootIdentity(alloc, db.backend_runtime, path, !openModeRequiresReadOnlyBackends(opts.open_mode)) catch |err| switch (err) {
+                    error.FileNotFound => if (openModeRequiresReadOnlyBackends(opts.open_mode)) null else return err,
+                    else => return err,
+                };
+                if (identity) |value| db.root_incarnation = value.incarnation;
             } else if (opts.physical_root_mode == .external_backend) {
                 db.root_incarnation = opts.external_root_incarnation;
             }
@@ -19751,6 +19765,7 @@ pub const DB = struct {
     /// statement cohort. Borrowing the supplied fences avoids reacquiring an
     /// exclusive admission lock or waiting for replay while replay is frozen.
     pub fn captureQueryCutAtStatementFence(self: *DB, request: @import("native_query_cut.zig").Request, fence: *const StatementReadFence, cancellation: types.CancellationToken) !void {
+        if (comptime storage_engine.enabled) return storage_engine.call("captureQueryCutAtStatementFence", .{ self, request, fence, cancellation });
         const cut = @import("native_query_cut.zig");
         try request.validate(cut.nowMs());
         if (!request.create or request.table_id != self.core.identity_namespace.table_id) return error.CatalogGenerationChanged;
@@ -19767,6 +19782,7 @@ pub const DB = struct {
     /// Statement cuts are local, unpublished generations with no continuation
     /// cursor. Reclaim them only after the statement's final reader closes.
     pub fn releaseStatementQueryCut(self: *DB, request: @import("native_query_cut.zig").Request) void {
+        if (comptime storage_engine.enabled) return storage_engine.call("releaseStatementQueryCut", .{ self, request }) catch @panic("incompatible storage owner");
         self.discardStatementQueryCut(request) catch |err| {
             std.log.warn("Cypher statement cut cleanup failed: {s}", .{@errorName(err)});
         };
@@ -25465,6 +25481,72 @@ pub const DB = struct {
         return observed;
     }
 
+    /// Reconcile producer authority through the server's bounded Raft queue.
+    /// Repeated observations retry crash windows without inventing readiness.
+    pub fn enqueueGeneratedArtifactCatalog(self: *DB) !void {
+        if (comptime storage_engine.enabled) return storage_engine.call("enqueueGeneratedArtifactCatalog", .{self});
+        const dispatcher = self.local_execution.artifact_publication_dispatcher orelse return;
+        if (self.local_execution.restore_staging_required.load(.acquire) or self.local_execution.initial_child_hidden.load(.acquire)) return;
+        // Cache observations under the same apply fence that invalidates them
+        // after ordered catalog/authority commits. Release it before dispatch:
+        // callbacks may schedule work that needs the exclusive owner writer.
+        self.core.lockApplyShared();
+        var apply_held = true;
+        defer if (apply_held) self.core.unlockApplyShared();
+        const generation = self.core.index_manager.writePlanGeneration();
+        if (self.local_execution.producer_catalog_generation.load(.acquire) == generation) return;
+        const has_producers = blk: {
+            // Resolver definitions are replaced under the catalog fence. Read
+            // their presence with the generation we may credit below.
+            const manager = self.core.index_manager;
+            manager.catalog_mutex.lockShared();
+            defer manager.catalog_mutex.unlockShared();
+            if (manager.writePlanGeneration() != generation) return;
+            break :blk self.core.hasGeneratedEnrichmentTargets() or manager.resolvers.items.len != 0;
+        };
+        if (!has_producers) {
+            var read = try self.core.store.beginReadTxn();
+            defer read.abort();
+            // Removing the final producer must advance the catalog too; its
+            // old authority cannot bind later writes to retired definitions.
+            if (try @import("artifact_publication.zig").authority(&read) == null) {
+                self.local_execution.producer_catalog_generation.store(generation, .release);
+                return;
+            }
+        }
+        var command = try self.artifactInventoryCommand(self.alloc);
+        defer command.catalogs.deinit(self.alloc);
+        command.binding.effect_protocol = 15;
+        if (command.previous) |previous| {
+            if (previous.effect_protocol == 15 and std.mem.eql(u8, &previous.digest, &command.binding.digest)) {
+                const publication = @import("artifact_publication.zig");
+                const current = blk: {
+                    var read = try self.core.store.beginReadTxn();
+                    defer read.abort();
+                    const active = (try publication.authority(&read)) orelse break :blk false;
+                    break :blk active.epoch == previous.epoch and std.mem.eql(u8, &active.catalog_digest, &previous.digest);
+                };
+                if (current) {
+                    self.local_execution.producer_catalog_generation.store(generation, .release);
+                    return;
+                }
+                var activation: publication.Command = .{ .mode = .activate, .namespace = command.namespace, .authority_epoch = previous.epoch, .catalog_digest = previous.digest, .producer_name = "", .producer_generation = 0, .sources = &.{}, .mutations = &.{}, .publication_digest = @splat(0) };
+                activation.publication_digest = activation.digest();
+                const encoded = try @import("artifact_publication_transport_codec.zig").encodeAlloc(self.alloc, activation);
+                defer self.alloc.free(encoded);
+                self.core.unlockApplyShared();
+                apply_held = false;
+                try dispatcher.enqueueCommand(command.namespace, encoded);
+                return;
+            }
+        }
+        const encoded = try @import("artifact_catalog_proposal.zig").encode(self.alloc, command);
+        defer self.alloc.free(encoded);
+        self.core.unlockApplyShared();
+        apply_held = false;
+        try dispatcher.enqueueCommand(command.namespace, encoded);
+    }
+
     /// The caller verifies this desired catalog against its metadata read-index
     /// before proposal. Ownership of catalogs belongs to the caller.
     pub fn artifactInventoryCommand(self: *DB, alloc: Allocator) !@import("artifact_inventory.zig").Command {
@@ -26050,6 +26132,7 @@ pub const DB = struct {
             try self.stageRestoreStagingReplicationOutbox(&txn, replication_payload);
             try txn.commit();
             txn_open = false;
+            if (command.mode == .activate) self.local_execution.producer_catalog_generation.store(0, .release);
             self.core.unlockApply();
             apply_held = false;
             if (replication_payload != null) try self.flushDurableReplicationOutboxes();
@@ -26194,6 +26277,12 @@ pub const DB = struct {
         self.executor.commitBacklogAdmission(sequence, &backlog);
         self.core.unlockApply();
         apply_held = false;
+        // Ordered publications append source-change replay just like local
+        // producer commits. Wake every downstream stage at the durable local
+        // boundary, including when outbox delivery must retry. These are work
+        // hints only; subsequent publication still validates ordered authority.
+        if (self.enrichment_runtime) |runtime| runtime.notifySequence(sequence);
+        self.notifyResolverReplayRuntimes(sequence);
         if (replication_payload != null) try self.flushDurableReplicationOutboxes();
         DB.notifyQueryVisibilityTargetAdvancedContext(&batch_ctx, sequence);
         if (self.executor.hasWorkers()) self.executor.forceSequence(sequence) else {
@@ -26248,6 +26337,7 @@ pub const DB = struct {
                 payload = try replication_effects_mod.encodeArtifactCatalogMutationRequestAlloc(self.alloc, req, entry);
             try self.stageRestoreStagingReplicationOutbox(&txn, payload);
             try txn.commit();
+            self.local_execution.producer_catalog_generation.store(0, .release);
         }
         if (payload != null) try self.flushDurableReplicationOutboxes();
     }
@@ -27044,10 +27134,11 @@ pub const DB = struct {
         key: []const u8,
         edge_types: []const []const u8,
         direction: graph_mod.EdgeDirection,
-        cursor: ?graph_mod.EdgeScanCursor,
+        cursor: ?graph_mod.CypherEdgeScanCursor,
         limits: graph_mod.EdgePageLimits,
         ttl_now_ns: u64,
-    ) !graph_mod.EdgePage {
+    ) !graph_mod.CypherEdgePage {
+        if (comptime storage_engine.enabled) return storage_engine.call("graphEdgesForCypherPageAt", .{ self, alloc, index_name, key, edge_types, direction, cursor, limits, ttl_now_ns });
         return self.graphEdgesForCypherPageAuthorizedAt(alloc, index_name, key, edge_types, direction, cursor, limits, ttl_now_ns, "", "");
     }
 
@@ -27061,19 +27152,21 @@ pub const DB = struct {
         key: []const u8,
         edge_types: []const []const u8,
         direction: graph_mod.EdgeDirection,
-        cursor: ?graph_mod.EdgeScanCursor,
+        cursor: ?graph_mod.CypherEdgeScanCursor,
         limits: graph_mod.EdgePageLimits,
         ttl_now_ns: u64,
         principal_proof: []const u8,
         database: []const u8,
-    ) !graph_mod.EdgePage {
+    ) !graph_mod.CypherEdgePage {
+        if (comptime storage_engine.enabled) return storage_engine.call("graphEdgesForCypherPageAuthorizedAt", .{ self, alloc, index_name, key, edge_types, direction, cursor, limits, ttl_now_ns, principal_proof, database });
         return self.graphEdgesForCypherPageInternal(alloc, index_name, key, edge_types, direction, cursor, limits, ttl_now_ns, principal_proof, database, null);
     }
-    pub fn graphEdgesForCypherCapturePageAuthorizedAt(self: *DB, fence: *const StatementReadFence, alloc: Allocator, index_name: []const u8, key: []const u8, edge_types: []const []const u8, direction: graph_mod.EdgeDirection, cursor: ?graph_mod.EdgeScanCursor, limits: graph_mod.EdgePageLimits, ttl_now_ns: u64, principal_proof: []const u8, database: []const u8) !graph_mod.EdgePage {
+    pub fn graphEdgesForCypherCapturePageAuthorizedAt(self: *DB, fence: *const StatementReadFence, alloc: Allocator, index_name: []const u8, key: []const u8, edge_types: []const []const u8, direction: graph_mod.EdgeDirection, cursor: ?graph_mod.CypherEdgeScanCursor, limits: graph_mod.EdgePageLimits, ttl_now_ns: u64, principal_proof: []const u8, database: []const u8) !graph_mod.CypherEdgePage {
+        if (comptime storage_engine.enabled) return storage_engine.call("graphEdgesForCypherCapturePageAuthorizedAt", .{ self, fence, alloc, index_name, key, edge_types, direction, cursor, limits, ttl_now_ns, principal_proof, database });
         if (fence.source != self) return error.CypherSnapshotRequired;
         return self.graphEdgesForCypherPageInternal(alloc, index_name, key, edge_types, direction, cursor, limits, ttl_now_ns, principal_proof, database, fence);
     }
-    fn graphEdgesForCypherPageInternal(self: *DB, alloc: Allocator, index_name: []const u8, key: []const u8, edge_types: []const []const u8, direction: graph_mod.EdgeDirection, cursor: ?graph_mod.EdgeScanCursor, limits: graph_mod.EdgePageLimits, ttl_now_ns: u64, principal_proof: []const u8, database: []const u8, capture_fence: ?*const StatementReadFence) !graph_mod.EdgePage {
+    fn graphEdgesForCypherPageInternal(self: *DB, alloc: Allocator, index_name: []const u8, key: []const u8, edge_types: []const []const u8, direction: graph_mod.EdgeDirection, cursor: ?graph_mod.CypherEdgeScanCursor, limits: graph_mod.EdgePageLimits, ttl_now_ns: u64, principal_proof: []const u8, database: []const u8, capture_fence: ?*const StatementReadFence) !graph_mod.CypherEdgePage {
         if (ttl_now_ns == 0 or (!self.hasRetainedQueryCut() and (capture_fence == null or capture_fence.?.source != self))) return error.CypherSnapshotRequired;
         var verified: ?std.json.Parsed(row_policy_authority_mod.Payload) = null;
         defer if (verified) |*value| value.deinit();
@@ -27094,13 +27187,14 @@ pub const DB = struct {
         return result;
     }
 
-    pub const CypherBackend = @import("cypher").native.Adapter(DB, graph_mod.GraphIndex, graph_mod.EdgeScanCursor);
+    pub const CypherBackend = @import("cypher").native.Adapter(DB, graph_mod.GraphIndex, graph_mod.CypherEdgeScanCursor);
     pub const CypherStatementSnapshot = @import("cypher_statement_snapshot.zig").Snapshot(DB);
     pub fn cypherDocumentKeyAllowed(key: []const u8) bool {
         return key.len != 0 and !internal_keys.isInternalUserKey(key) and !isMetadataKey(key);
     }
 
     pub fn cypherDocumentScanOptions(self: *DB, alloc: Allocator, input: types.ScanOptions) !types.ScanOptions {
+        if (comptime storage_engine.enabled) return storage_engine.call("cypherDocumentScanOptions", .{ self, alloc, input });
         var opts = input;
         var schema = self.core.acquireSchemaView() orelse return opts;
         defer schema.release();
@@ -27119,6 +27213,7 @@ pub const DB = struct {
     pub const normalizeCypherNode = @import("cypher_postimage.zig").normalize;
     pub const cypherDocumentRelationships = @import("cypher_postimage.zig").relationships;
     pub fn acquireCypherReadAuthority(self: *DB, alloc: Allocator, proof: []const u8, database: []const u8) !CypherReadLease {
+        if (comptime storage_engine.enabled) return storage_engine.call("acquireCypherReadAuthority", .{ self, alloc, proof, database });
         if (proof.len == 0) return self.local_execution.row_policy_gate.enterRawRead();
         const now_seconds: i64 = @intCast(platform_time.realtimeNs() / std.time.ns_per_s);
         var principal = try self.verifyRowPolicyPrincipal(alloc, proof, database, .read, now_seconds);
@@ -27129,6 +27224,7 @@ pub const DB = struct {
     /// Apply the retained owner policy to a staged SQL postimage. The caller
     /// cannot use a storage lookup: this row may not exist in the captured cut.
     pub fn permitsCypherDocument(self: *DB, alloc: Allocator, document: std.json.Value, json_null_fields: []const []const u8, proof: []const u8, database: []const u8) !bool {
+        if (comptime storage_engine.enabled) return storage_engine.call("permitsCypherDocument", .{ self, alloc, document, json_null_fields, proof, database });
         if (document != .object) return error.InvalidBatchRequest;
         var authority = try self.acquireCypherReadAuthority(alloc, proof, database);
         defer authority.release();
@@ -27169,6 +27265,7 @@ pub const DB = struct {
     }
 
     pub fn cypherFieldDerivedEdgeType(self: *const DB, index_name: []const u8, edge_type: []const u8) bool {
+        if (comptime storage_engine.enabled) return storage_engine.call("cypherFieldDerivedEdgeType", .{ self, index_name, edge_type }) catch @panic("incompatible storage owner");
         self.core.lockApplyShared();
         defer self.core.unlockApplyShared();
         for (self.core.graphIndexes()) |index| {
@@ -27181,6 +27278,7 @@ pub const DB = struct {
     }
 
     pub fn cypherGraphIndexIdentity(self: *const DB, alloc: Allocator, index_name: []const u8) !?@import("cypher").catalog.IndexIdentity {
+        if (comptime storage_engine.enabled) return storage_engine.call("cypherGraphIndexIdentity", .{ self, alloc, index_name });
         self.core.lockApplyShared();
         defer self.core.unlockApplyShared();
         const cfg = self.core.index_manager.get(index_name) orelse return null;
@@ -27205,6 +27303,7 @@ pub const DB = struct {
     }
 
     pub fn hasRetainedQueryCut(self: *const DB) bool {
+        if (comptime storage_engine.enabled) return storage_engine.call("hasRetainedQueryCut", .{self}) catch @panic("incompatible storage owner");
         return self.open_mode == .query_readonly and (self.retained_query_lease != null or self.retained_remote_query_lease != null);
     }
 
@@ -31503,7 +31602,12 @@ pub const DB = struct {
         const self: *DB = @ptrCast(@alignCast(ptr));
         switch (work) {
             .upload => return self.advanceArtifactUploadRecoveryWithTrigger(.maintenance),
-            .baseline => return self.advanceArtifactProducerBaselinePage(),
+            .baseline => {
+                // Retry queue pressure, leadership changes, and the durable
+                // catalog/activation gap independently of future DDL or writes.
+                try self.enqueueGeneratedArtifactCatalog();
+                return self.advanceArtifactProducerBaselinePage();
+            },
             .producer => return self.advanceArtifactProducerWorkPage(),
             .footprint => return self.advanceArtifactFootprintPage(),
             .repair => {
@@ -31581,7 +31685,7 @@ pub const DB = struct {
             const namespace = (try @import("../source_authority.zig").externalPublicationNamespace(&read)) orelse return false;
             break :blk try @import("artifact_publication_transport.zig").recoveryInventory(&read, namespace);
         };
-        return recovery.recover(dispatcher.ptr, .{
+        return dispatcher.recoverUploads(.{
             .io = self.core.index_manager.checkpointIo(),
             .now_ns = now_ns,
             .inventory = inventory,
@@ -31756,7 +31860,13 @@ pub const DB = struct {
         }
         var plan = try self.core.index_manager.acquireWritePlanSnapshot();
         defer plan.release();
+        const readiness_revision = self.core.store.query_generation_revision.load(.acquire);
         const readiness_progress = try @import("artifact_producer_readiness.zig").advance(scratch, self.core.store, self.root_incarnation, plan.plan());
+        // Receiver-local completion changes do not append replay records.
+        // Publish their status after commit, including an empty baseline that
+        // completes without leaving a work page or advancing a replay target.
+        if (readiness_progress or self.core.store.query_generation_revision.load(.acquire) != readiness_revision)
+            notifyQueryVisibilityHook(self.async_context, .status);
         const obligations = @import("artifact_producer_obligations.zig");
         var page = blk: {
             var read = try self.core.store.beginReadTxnWithBlockCacheAdmission(.transient);
@@ -32019,7 +32129,7 @@ pub const DB = struct {
                 };
                 const encoded = try @import("artifact_publication_transport_codec.zig").encodeAlloc(scratch, validation.command);
                 defer scratch.free(encoded);
-                try dispatcher.enqueue(dispatcher.ptr, validation.command.namespace, encoded);
+                try dispatcher.enqueueCommand(validation.command.namespace, encoded);
                 self.artifact_producer_baseline_pending.store(true, .release);
                 return false;
             };
@@ -32030,7 +32140,7 @@ pub const DB = struct {
             };
             const encoded = try @import("artifact_publication_transport_codec.zig").encodeAlloc(scratch, prepared.command);
             defer scratch.free(encoded);
-            try dispatcher.enqueue(dispatcher.ptr, prepared.command.namespace, encoded);
+            try dispatcher.enqueueCommand(prepared.command.namespace, encoded);
             // Queue admission is not a baseline certificate. The next pass
             // observes only progress installed by the replicated transaction.
             self.artifact_producer_baseline_pending.store(true, .release);
@@ -40092,6 +40202,7 @@ pub const DB = struct {
     /// Only retained, authenticated graph cuts may enter this search path.
     /// The caller supplies the authorized document whitelist before ranking.
     pub fn searchCypherCut(self: *DB, alloc: Allocator, req: types.SearchRequest, proof: []const u8, database: []const u8) !types.SearchResult {
+        if (comptime storage_engine.enabled) return storage_engine.call("searchCypherCut", .{ self, alloc, req, proof, database });
         if (!self.hasRetainedQueryCut() or !req.filter_doc_ids_positive) return error.CypherSnapshotRequired;
         var lease = try self.acquireCypherReadAuthority(alloc, proof, database);
         defer lease.release();
@@ -51678,7 +51789,21 @@ fn profileBenchTestsEnabled() bool {
 fn appendDerivedBatchFromEnrichment(ctx_ptr: *anyopaque, batch: derived_types.DerivedBatch) !u64 {
     const ctx: *EnrichmentAppendContext = @ptrCast(@alignCast(ctx_ptr));
     var batch_ctx = ctx.batchContext();
-    const sequence = try appendDerivedBatchRecordContextWithProducerFence(&batch_ctx, batch, true);
+    return appendDerivedBatchFromEnrichmentWithProducerFence(ctx, &batch_ctx, batch, true);
+}
+
+fn requireResolutionSchedulingHintsOnly(batch: derived_types.DerivedBatch) !void {
+    if (batch.changed_artifact_keys.len == 0) return error.InvalidBatchRequest;
+    const hints_only: derived_types.DerivedBatch = .{ .changed_artifact_keys = batch.changed_artifact_keys };
+    inline for (comptime std.meta.fieldNames(derived_types.DerivedBatch)) |field| {
+        if (comptime !std.mem.eql(u8, field, "changed_artifact_keys")) {
+            if (!std.meta.eql(@field(batch, field), @field(hints_only, field))) return error.InvalidBatchRequest;
+        }
+    }
+}
+
+fn appendDerivedBatchFromEnrichmentWithProducerFence(ctx: *EnrichmentAppendContext, batch_ctx: *const BatchExecutionContext, batch: derived_types.DerivedBatch, producer: bool) !u64 {
+    const sequence = try appendDerivedBatchRecordContextWithProducerFence(batch_ctx, batch, producer);
     notifyResolverReplayRuntimesForCatalog(ctx.index_manager, ctx.resolution_runtime, ctx.promotion_runtime, sequence);
     if (ctx.executor.hasWorkers()) {
         ctx.executor.forceSequence(sequence);
@@ -51687,9 +51812,9 @@ fn appendDerivedBatchFromEnrichment(ctx_ptr: *anyopaque, batch: derived_types.De
 
     var applied_batch = batch;
     applied_batch.sequence = sequence;
-    try lockApplyForPortableRuntimeContext(&batch_ctx);
+    try lockApplyForPortableRuntimeContext(batch_ctx);
     defer batch_ctx.apply_mutex.unlockExclusive();
-    try applyDerivedBatchContext(&batch_ctx, applied_batch);
+    try applyDerivedBatchContext(batch_ctx, applied_batch);
     return sequence;
 }
 
@@ -51868,6 +51993,14 @@ fn appendResolutionRecordWithHook(
 ) !u64 {
     const ctx: *EnrichmentAppendContext = @ptrCast(@alignCast(ctx_ptr));
     if (write.artifact_writes.len == 0 and write.artifact_deletes.len == 0 and write.target_hints == null) {
+        // Catalog backfill/review work appends scheduling hints, not producer
+        // effects. Ordered owners must be able to enqueue these after activation
+        // while every artifact mutation remains fenced through publication.
+        if (write.batch.changed_artifact_keys.len != 0) {
+            try requireResolutionSchedulingHintsOnly(write.batch);
+            var batch_ctx = ctx.batchContext();
+            return appendDerivedBatchFromEnrichmentWithProducerFence(ctx, &batch_ctx, write.batch, false);
+        }
         return appendDerivedBatchFromEnrichment(ctx_ptr, write.batch);
     }
 
@@ -52314,6 +52447,7 @@ fn requireArtifactProducerMutableContext(ctx: *const BatchExecutionContext) !voi
     var read = try ctx.store.beginReadTxn();
     defer read.abort();
     try @import("artifact_reconcile_intent.zig").requireAbsent(&read);
+    if (ctx.ordered_artifact_publication_required) return error.ArtifactCatalogDrift;
     // Activation is serialized with this same apply fence. Work prepared by
     // an old local lease may retry through ordered publication, never commit
     // an unreplicated result after the owner selected replicated producers.
@@ -137868,4 +138002,16 @@ test "capi resolver replacement wait rechecks generation in the publication gap"
     try std.testing.expectError(error.Cancelled, db.waitGraphReplacement("new", generation, 0));
     try std.testing.expect(db.indexGeneration("old") != null);
     try std.testing.expect(db.indexGeneration("new").? != generation);
+}
+
+test "db graph endpoint cleanup resolver scheduling hints never admit producer effects" {
+    const hints: derived_types.DerivedBatch = .{ .changed_artifact_keys = &.{"asset"} };
+    try requireResolutionSchedulingHintsOnly(hints);
+    var invalid = hints;
+    invalid.deleted_keys = &.{"document"};
+    try std.testing.expectError(error.InvalidBatchRequest, requireResolutionSchedulingHintsOnly(invalid));
+    invalid = hints;
+    invalid.sequence = 1;
+    try std.testing.expectError(error.InvalidBatchRequest, requireResolutionSchedulingHintsOnly(invalid));
+    try std.testing.expectError(error.InvalidBatchRequest, requireResolutionSchedulingHintsOnly(.{}));
 }

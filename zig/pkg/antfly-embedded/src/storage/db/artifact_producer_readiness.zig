@@ -146,7 +146,10 @@ fn register(alloc: std.mem.Allocator, store_handle: anytype, root: u128, plan: *
         txn.abort();
         return;
     };
-    if (!try matchesDurableCatalog(&txn, plan, authority)) return error.ArtifactCatalogDrift;
+    if (!try matchesDurableCatalog(&txn, plan, authority)) {
+        std.log.debug("producer readiness registration rejected stale catalog plan", .{});
+        return error.ArtifactCatalogDrift;
+    }
     if (try load(alloc, &txn)) |current| {
         defer current.deinit(alloc);
         if (std.meta.eql(current.authority, authority) and current.root == root) {
@@ -292,7 +295,10 @@ pub fn advance(alloc: std.mem.Allocator, store_handle: anytype, root: u128, plan
     for (items.items) |item| if (item.witness) |witness| {
         if (try optionalRevision(&txn, item.key) != item.revision) continue;
         witness.requireCurrent(&txn, root) catch |err| switch (err) {
-            error.ArtifactPublicationPending, error.EnrichmentSourceChanged, error.ArtifactCatalogDrift => continue,
+            error.ArtifactPublicationPending, error.EnrichmentSourceChanged, error.ArtifactCatalogDrift => {
+                std.log.debug("producer source readiness witness changed before commit: {s}", .{@errorName(err)});
+                continue;
+            },
             else => return err,
         };
         settled = (try settle(&txn, current.authority, current.root, item.key, item.revision)) or settled;
@@ -347,9 +353,27 @@ pub fn sourceComplete(alloc: std.mem.Allocator, txn: anytype, plan: *const Manag
     defer if (state) |value| value.deinit(alloc);
     for (requirements.nodes) |node| {
         if ((node.kind != .generated and node.kind != .unit_children) or (!relevant.contains(node.artifact) and !relevant.contains(node.embedding))) continue;
-        const current = state orelse return false;
-        if (!current.baseline or current.root != root or !try matchesDurableCatalog(txn, plan, current.authority) or !std.meta.eql((try publication.authority(txn)), @as(?publication.Authority, current.authority))) return false;
-        if (try count(txn, &counterKey(current.authority, current.root, node.id)) != 0) return false;
+        const current = state orelse {
+            std.log.debug("producer source readiness pending: registry not published", .{});
+            return false;
+        };
+        if (!current.baseline or current.root != root) {
+            std.log.debug("producer source readiness pending: baseline={} root_current={}", .{ current.baseline, current.root == root });
+            return false;
+        }
+        if (!try matchesDurableCatalog(txn, plan, current.authority)) {
+            std.log.debug("producer source readiness pending: catalog differs", .{});
+            return false;
+        }
+        if (!std.meta.eql((try publication.authority(txn)), @as(?publication.Authority, current.authority))) {
+            std.log.debug("producer source readiness pending: authority differs", .{});
+            return false;
+        }
+        const remaining = try count(txn, &counterKey(current.authority, current.root, node.id));
+        if (remaining != 0) {
+            std.log.debug("producer source readiness pending: {d} generated inputs", .{remaining});
+            return false;
+        }
     }
     return true; // Authored sources have no asynchronous producer dependency.
 }

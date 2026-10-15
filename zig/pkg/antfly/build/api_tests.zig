@@ -1677,7 +1677,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .dependOn(&addFilteredTestRunArtifact(b, row_semantics_codec_tests).step);
     const cypher_transaction_contract_tests = b.addTest(.{
         .root_module = api_transactions_docid_test_mod,
-        .filters = &.{"transaction graph effects"},
+        .filters = &.{ "transaction graph effects", "Cypher write releases retained owner reads", "api index status" },
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
     b.step("cypher-transaction-contract-test", "Verify graph transaction staging, receipts and principal identity").dependOn(&addFilteredTestRunArtifact(b, cypher_transaction_contract_tests).step);

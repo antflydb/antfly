@@ -2553,7 +2553,18 @@ pub const ResolutionRuntime = struct {
         if (!self.catch_up_mutex.tryLock()) return 25;
         defer self.catch_up_mutex.unlock();
         self.catchUpLocked(true) catch |err| {
-            std.log.warn("resolution catch-up failed: {s}", .{@errorName(err)});
+            // Accepted queue admission is not a completed publication. These
+            // states keep the replay cursor pending and retry without turning
+            // normal Raft/catalog convergence into a warning on every poll.
+            switch (err) {
+                error.ArtifactPublicationPending,
+                error.ArtifactCatalogDrift,
+                error.EnrichmentSourceChanged,
+                error.Timeout,
+                error.DeadlineExceeded,
+                => {},
+                else => std.log.warn("resolution catch-up failed: {s}", .{@errorName(err)}),
+            }
             return 50;
         };
         return 0;

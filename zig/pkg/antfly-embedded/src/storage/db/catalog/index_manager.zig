@@ -14577,6 +14577,43 @@ pub const IndexManager = struct {
             for (entry.artifact_sources) |source| try appendOwnedString(alloc, &names, source.artifact_name);
             return try names.toOwnedSlice(alloc);
         }
+        // Catalog-only status opens have no live index entries. Resolve the
+        // same direct inputs from canonical configuration so a cold owner does
+        // not lose its source-publication proof or producer dependencies.
+        for (self.status_only_index_configs) |cfg| {
+            if (!std.mem.eql(u8, cfg.name, name)) continue;
+            var refs = try self.artifactRefsFromConfig(cfg);
+            defer refs.deinit(self.alloc);
+            switch (cfg.kind) {
+                .full_text, .graph => {
+                    if (refs.source_artifact_names.len != 0) {
+                        for (refs.source_artifact_names) |value| try appendOwnedString(alloc, &names, value);
+                    } else if (refs.chunk_name) |value| try appendOwnedString(alloc, &names, value);
+                },
+                .dense_vector, .sparse_vector => {
+                    if (refs.embedding_names.len != 0) {
+                        for (refs.embedding_names) |value| try appendOwnedString(alloc, &names, value);
+                    } else if (refs.embedding_name) |value| {
+                        const required = if (cfg.kind == .dense_vector) blk: {
+                            const parsed = try parseDenseConfig(self.alloc, cfg.config_json);
+                            defer parsed.deinit(self.alloc);
+                            const generator = try parseDenseGeneratorConfig(self.alloc, cfg.config_json);
+                            defer if (generator) |g| g.deinit(self.alloc);
+                            break :blk !parsed.external and (generator != null or self.getEnrichment(.embedding, value) != null);
+                        } else blk: {
+                            const parsed = try parseSparseConfig(self.alloc, cfg.config_json);
+                            defer parsed.deinit(self.alloc);
+                            const generator = try parseSparseGeneratorConfig(self.alloc, cfg.config_json);
+                            defer if (generator) |g| g.deinit(self.alloc);
+                            break :blk !parsed.external and (generator != null or parsed.embedding_name != null or self.getEnrichment(.embedding, value) != null);
+                        };
+                        if (required) try appendOwnedString(alloc, &names, value);
+                    }
+                },
+                .algebraic => {},
+            }
+            break;
+        }
         return try names.toOwnedSlice(alloc);
     }
 
@@ -15908,7 +15945,7 @@ pub const IndexManager = struct {
         return containsOwnedString(refs.source_artifact_names, candidate);
     }
 
-    fn artifactRefsFromConfig(self: *IndexManager, cfg: types.IndexConfig) !ArtifactRefs {
+    fn artifactRefsFromConfig(self: *const IndexManager, cfg: types.IndexConfig) !ArtifactRefs {
         switch (cfg.kind) {
             .full_text => {
                 const text_cfg = try parseTextConfig(self.alloc, cfg.config_json);

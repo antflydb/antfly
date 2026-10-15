@@ -6957,7 +6957,7 @@ pub const ApiHttpServer = struct {
             // the requested index until each configured source has at least
             // one authoritative observation.
             for (index.source_replay) |source| {
-                if (source.observation_count == 0) return true;
+                if (source.observation_count == 0 or !source.producer_complete) return true;
             }
             // Refresh only for an incomplete proof attached to the requested
             // index. Table-level degradation may belong to another index, and
@@ -48185,7 +48185,7 @@ test "api index status refreshes synthetic configured index status from write so
     }};
     try std.testing.expect(ApiHttpServer.runtimeStatusesNeedOwnerSnapshot(structural_dense_statuses[0..]));
 
-    const incomplete_source_replay = [_]db_mod.types.IndexSourceReplayStatus{.{
+    var incomplete_source_replay = [_]db_mod.types.IndexSourceReplayStatus{.{
         .artifact_name = "chunk_embedding",
         .published_sequence = 3,
         .target_sequence = 3,
@@ -48212,6 +48212,14 @@ test "api index status refreshes synthetic configured index status from write so
         source_incomplete_status,
         .{ .name = "vec", .identity = null },
     ));
+    // Replay/source observation can be current before receiver-local producer
+    // completion. The detail path must refresh until that proof arrives, then
+    // return to its cache fast path without polling an already complete source.
+    incomplete_source_replay[0].observation_count = 1;
+    incomplete_source_replay[0].producer_complete = false;
+    try std.testing.expect(ApiHttpServer.runtimeStatusTargetNeedsOwnerSnapshot(source_incomplete_status, .{ .name = "vec", .identity = null }));
+    incomplete_source_replay[0].producer_complete = true;
+    try std.testing.expect(!ApiHttpServer.runtimeStatusTargetNeedsOwnerSnapshot(source_incomplete_status, .{ .name = "vec", .identity = null }));
 }
 
 test "api index status refreshes writer when read snapshot omits requested index" {

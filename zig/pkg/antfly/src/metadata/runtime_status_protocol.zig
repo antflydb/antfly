@@ -90,6 +90,16 @@ pub const framed_index_status_record_version: u16 = framed_index_record_version;
 pub const dense_native_capability_record_version: u16 = framed_index_record_version;
 pub const schema_epoch_record_version: u16 = current_record_version;
 
+/// Facts carried only by framed index extensions. Keep admission and every
+/// enclosing StoreRecord encoder on the same profile when these facts appear.
+pub fn requiresFramedIndexStatus(statuses: anytype) bool {
+    for (statuses) |status| for (status.indexes) |index| {
+        if (index.graph_counts_pending) return true;
+        for (index.source_replay) |source| if (source.producer_complete) return true;
+    };
+    return false;
+}
+
 pub fn isSupported(version: u16) bool {
     return isNegotiable(version);
 }

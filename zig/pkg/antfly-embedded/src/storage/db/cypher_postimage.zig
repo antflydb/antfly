@@ -59,12 +59,13 @@ pub fn relationships(self: anytype, a: A, graph: cypher.catalog.Graph, node: *co
         for (metadata.map) |entry| if (!std.mem.eql(u8, entry.name, "weight") and !std.mem.eql(u8, entry.name, "source_table") and !std.mem.eql(u8, entry.name, "target_table")) try properties.append(temporary, entry);
         try properties.append(temporary, .{ .name = "weight", .value = .{ .number = edge.weight } });
         const relationship: cypher.value.Relationship = .{
-            .identity = .{ .table = source_table, .key = try std.json.Stringify.valueAlloc(temporary, .{ edge.source, edge.target, edge.edge_type, edge.edge_id, node.identity.key }, .{}) },
+            .identity = .{ .table = source_table, .key = try std.json.Stringify.valueAlloc(temporary, .{ edge.source, edge.target, edge.edge_type, edge.edge_id, node.identity.key, "field" }, .{}) },
             .index = mapping.index,
             .type = mapping.name,
             .source = .{ .table = source_table, .key = edge.source },
             .target = .{ .table = target_table, .key = edge.target },
-            .ownership = .document,
+            .ownership = .field,
+            .producer = node.identity,
             .properties = try cypher.value.entityProperties(temporary, properties.items),
         };
         try result.append(a, (try (cypher.value.Value{ .relationship = &relationship }).clone(a)).relationship);

@@ -99,7 +99,7 @@ pub const Owner = struct {
         _ = port.run(port.ptr, .baseline) catch |err| blk: {
             port.failed(port.ptr, .baseline);
             switch (err) {
-                error.OnlineSourcePinPending, error.WriterLocked, error.Canceled, error.ResourceBudgetExceeded, error.ArtifactCatalogDrift => {},
+                error.NotLeader, error.OnlineSourcePinPending, error.WriterLocked, error.Canceled, error.ResourceLimitExceeded, error.ResourceBudgetExceeded, error.ResourceTemporarilyUnavailable, error.ArtifactCatalogDrift => {},
                 else => std.log.warn("artifact producer baseline failed: {s}", .{@errorName(err)}),
             }
             break :blk false;

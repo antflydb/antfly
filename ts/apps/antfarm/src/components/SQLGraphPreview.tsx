@@ -31,7 +31,7 @@ function graphValue(value: unknown, depth = 0): value is GraphValue {
         identity(body.target) &&
         typeof body.index === "string" &&
         typeof body.type === "string" &&
-        ["explicit", "document", "artifact"].includes(String(body.ownership)) &&
+        ["explicit", "document", "field", "artifact"].includes(String(body.ownership)) &&
         object(body.properties) &&
         body.properties.type === "map" &&
         object(body.properties.value)

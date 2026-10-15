@@ -6262,6 +6262,7 @@ pub const DataServer = struct {
         owner_source.row_policy_authority_secret = self.api_server_cfg.trusted_principal_secret;
         owner_source.row_policy_authority_issuer = self.api_server_cfg.trusted_principal_issuer;
         _ = owner_source.withRuntimeStatusCache(&self.provisioned_storage.runtime_status_cache);
+        owner_source.runtime_status_change_hook = self.localChangeHook();
         _ = owner_source.withNativeMigrationPolicy(self.provisioned_storage.denseNativeMigrationPolicySource());
         _ = owner_source.withGroupVisibleRootGeneration(self.provisioned_storage.groupVisibleRootGenerationSource());
         _ = owner_source.withTransactionRecoverySource(self.write_source.transactionRecoverySource());
@@ -6898,8 +6899,13 @@ pub const DataServer = struct {
         const io = runtime.io() orelse return error.ArtifactCatalogDrift;
         if (self.hotStandbyWriteGate()) |gate| try gate.check();
         if (self.group_leadership_source) |leadership| if (!leadership.isLocalLeader(group_id)) return error.NotLeader;
+        if (@import("antfly_local_sources").storage_db_artifact_catalog_proposal.isProposal(command)) {
+            var catalog = try @import("antfly_local_sources").storage_db_artifact_catalog_proposal.decode(self.alloc, command);
+            defer catalog.deinit();
+            if (!std.mem.eql(u8, &catalog.value.namespace, &namespace)) return error.IdentityNamespaceMismatch;
+        }
         const recovery = try @import("antfly_local_sources").storage_db_artifact_publication_transport.RecoveryHint.decode(command);
-        const class: artifact_publication_dispatch.Queue.Class = if (recovery != null or @import("antfly_local_sources").storage_db_artifact_publication_transport_codec.controlAdmissionHint(command)) .control else .producer;
+        const class: artifact_publication_dispatch.Queue.Class = if (@import("antfly_local_sources").storage_db_artifact_catalog_proposal.isProposal(command) or recovery != null or @import("antfly_local_sources").storage_db_artifact_publication_transport_codec.controlAdmissionHint(command)) .control else .producer;
         const proposal = (try self.artifact_publication_queue.reserveClass(io, self.alloc, group_id, namespace, command, class)) orelse return;
         errdefer self.artifact_publication_queue.release(io, proposal);
         const job = try self.alloc.create(ArtifactPublicationJob);
@@ -6920,6 +6926,14 @@ pub const DataServer = struct {
     };
 
     fn runArtifactPublicationJob(ptr: *anyopaque) !void {
+        return runArtifactPublicationJobInner(ptr) catch |err| {
+            const job: *ArtifactPublicationJob = @ptrCast(@alignCast(ptr));
+            std.log.debug("artifact publication proposal deferred group_id={d} chunk={d} error={s}", .{ job.proposal.group_id, job.next_chunk, @errorName(err) });
+            return err;
+        };
+    }
+
+    fn runArtifactPublicationJobInner(ptr: *anyopaque) !void {
         const job: *ArtifactPublicationJob = @ptrCast(@alignCast(ptr));
         const self = job.server;
         if (self.background_jobs_shutdown.load(.acquire)) return error.Canceled;
@@ -6954,6 +6968,16 @@ pub const DataServer = struct {
         if (try transport.RecoveryHint.decode(job.proposal.command)) |hint| {
             if (!std.mem.eql(u8, &hint.namespace, &job.proposal.namespace)) return error.IdentityNamespaceMismatch;
             try self.proposeRaftBatchGroup(self.alloc, job.proposal.group_id, table_name, .{ .artifact_publication_transport = hint.request(), .sync_level = .write }, .{ .discovery = .cached, .visibility_cancellation = .fromAtomic(&self.background_jobs_shutdown) });
+            return;
+        }
+        if (@import("antfly_local_sources").storage_db_artifact_catalog_proposal.isProposal(job.proposal.command)) {
+            var catalog = try @import("antfly_local_sources").storage_db_artifact_catalog_proposal.decode(self.alloc, job.proposal.command);
+            defer catalog.deinit();
+            if (!std.mem.eql(u8, &catalog.value.namespace, &job.proposal.namespace)) return error.IdentityNamespaceMismatch;
+            try self.proposeRaftBatchGroup(self.alloc, job.proposal.group_id, table_name, .{ .artifact_catalog = catalog.value, .sync_level = .write }, .{ .discovery = .cached, .visibility_cancellation = .fromAtomic(&self.background_jobs_shutdown) });
+            var activation: publication.Command = .{ .mode = .activate, .namespace = catalog.value.namespace, .authority_epoch = catalog.value.binding.epoch, .catalog_digest = catalog.value.binding.digest, .producer_name = "", .producer_generation = 0, .sources = &.{}, .mutations = &.{}, .publication_digest = @splat(0) };
+            activation.publication_digest = activation.digest();
+            try self.proposeRaftBatchGroup(self.alloc, job.proposal.group_id, table_name, .{ .artifact_publication = activation, .sync_level = .write }, .{ .discovery = .cached, .visibility_cancellation = .fromAtomic(&self.background_jobs_shutdown) });
             return;
         }
         const count = (job.proposal.command.len + codec.chunk_bytes - 1) / codec.chunk_bytes;
@@ -23199,6 +23223,7 @@ pub const DataServer = struct {
         if (status.stats.async_indexing.dense_catch_up.active) return true;
         if (status.stats.async_indexing.bulk_coalescing.active_session) return true;
         for (status.stats.indexes) |index| {
+            for (index.source_replay) |source| if (!source.producer_complete) return true;
             if (index.dense_vector_projection_pending) return true;
             if (index.dense_native_storage_phase == .native_building or
                 index.dense_native_storage_phase == .native_validating) return true;

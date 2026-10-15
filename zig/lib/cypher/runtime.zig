@@ -183,6 +183,7 @@ const Engine = struct {
     stats: Stats = .{},
     columns: []const []const u8 = &.{},
     match_aliases: []const []const u8 = &.{},
+    collect_match_paths: bool = false,
     stages: std.ArrayList(Stage) = .empty,
     recursion: usize = 0,
     deleted: std.ArrayList(v.EntityIdentity) = .empty,
@@ -337,29 +338,65 @@ const Engine = struct {
         }
         return true;
     }
-    // Inline predicates belong to MATCH, including references to later comma
-    // patterns. Select only after all of them resolve, but before MATCH WHERE.
-    // Keep the other complete pattern matches in the group, including anonymous
-    // entities, so selecting one path preserves the surrounding row multiplicity.
+    const SelectionContext = struct {
+        states: []const MatchState,
+        selected: usize,
+        fn textHash(hasher: *std.hash.Wyhash, text: []const u8) void {
+            const length: u64 = @intCast(text.len);
+            hasher.update(std.mem.asBytes(&length));
+            hasher.update(text);
+        }
+        fn identityHash(hasher: *std.hash.Wyhash, identity: v.Identity) void {
+            textHash(hasher, identity.table);
+            textHash(hasher, identity.key);
+        }
+        pub fn hash(self: @This(), index: usize) u64 {
+            var hasher = std.hash.Wyhash.init(0);
+            for (self.states[index].paths, 0..) |path, position| {
+                if (position == self.selected) {
+                    identityHash(&hasher, path.nodes[0].identity);
+                    identityHash(&hasher, path.nodes[path.nodes.len - 1].identity);
+                } else {
+                    const length: u64 = @intCast(path.relationships.len);
+                    hasher.update(std.mem.asBytes(&length));
+                    for (path.nodes) |node| identityHash(&hasher, node.identity);
+                    for (path.relationships) |relationship| {
+                        identityHash(&hasher, relationship.identity);
+                        textHash(&hasher, relationship.index);
+                    }
+                }
+            }
+            return hasher.final();
+        }
+        pub fn eql(self: @This(), left: usize, right: usize) bool {
+            return sameSelectionGroup(self.states[left], self.states[right], self.selected);
+        }
+    };
+    // Resolve the complete MATCH scope before selecting, then group by endpoints
+    // and the other complete patterns. Two linear passes preserve surrounding
+    // bags and all-shortest ties without comparing every pair of result rows.
     fn selectPaths(self: *Engine, states: []const MatchState, patterns: []const ast.Path) ![]const MatchState {
+        const Selection = struct { length: usize, path: v.Path };
         var selected = states;
         for (patterns, 0..) |pattern, index| {
             if (pattern.selector == .all) continue;
+            const context: SelectionContext = .{ .states = selected, .selected = index };
+            var groups: std.HashMapUnmanaged(usize, Selection, SelectionContext, std.hash_map.default_max_load_percentage) = .empty;
+            defer groups.deinit(self.a);
+            for (selected, 0..) |candidate, position| {
+                try self.checkpoint();
+                const path = candidate.paths[index];
+                const group = try groups.getOrPutContext(self.a, position, context);
+                if (!group.found_existing or path.relationships.len < group.value_ptr.length)
+                    group.value_ptr.* = .{ .length = path.relationships.len, .path = path };
+            }
             var output: std.ArrayList(MatchState) = .empty;
             for (selected, 0..) |candidate, position| {
                 try self.checkpoint();
-                const length = candidate.paths[index].relationships.len;
-                var retain = true;
-                for (selected, 0..) |other, other_position| {
-                    try self.checkpoint();
-                    if (!sameSelectionGroup(candidate, other, index)) continue;
-                    const other_length = other.paths[index].relationships.len;
-                    if (other_length < length or (pattern.selector == .shortest and other_length == length and other_position < position and !samePath(candidate.paths[index], other.paths[index]))) {
-                        retain = false;
-                        break;
-                    }
-                }
-                if (retain) try output.append(self.a, candidate);
+                const winner = groups.getContext(position, context).?;
+                const path = candidate.paths[index];
+                if (path.relationships.len == winner.length and (pattern.selector == .all_shortest or samePath(path, winner.path)))
+                    try output.append(self.a, candidate);
             }
             selected = try output.toOwnedSlice(self.a);
         }
@@ -464,7 +501,12 @@ const Engine = struct {
     }
     fn match(self: *Engine, rows: []const Row, operation: ast.Match) anyerror![]const Row {
         const prior_aliases = self.match_aliases;
+        const prior_collect = self.collect_match_paths;
         defer self.match_aliases = prior_aliases;
+        defer self.collect_match_paths = prior_collect;
+        self.collect_match_paths = for (operation.paths) |path| {
+            if (path.selector != .all) break true;
+        } else false;
         var aliases: std.ArrayList([]const u8) = .empty;
         for (operation.paths) |path| {
             for (path.nodes) |node| if (node.alias) |alias| try aliases.append(self.a, alias);
@@ -602,11 +644,19 @@ const Engine = struct {
     fn pathStep(self: *Engine, input: MatchState, path: ast.Path, mode: ast.PathMode, edge_index: usize, nodes: []const *const v.Node, relationships: []const *const v.Relationship, output: *std.ArrayList(MatchState)) anyerror!void {
         try self.state();
         if (edge_index == path.edges.len) {
-            const row = (try self.bind(input.row, path.alias, .{ .path = .{ .nodes = try self.a.dupe(*const v.Node, nodes), .relationships = try self.a.dupe(*const v.Relationship, relationships) } })) orelse return;
+            const matched_path: v.Path = if (path.alias != null or self.collect_match_paths)
+                .{ .nodes = try self.a.dupe(*const v.Node, nodes), .relationships = try self.a.dupe(*const v.Relationship, relationships) }
+            else
+                .{ .nodes = &.{}, .relationships = &.{} };
+            const row = (try self.bind(input.row, path.alias, .{ .path = matched_path })) orelse return;
             if (!try self.constraintsMatch(input.constraints, row, true)) return;
-            const paths = try self.a.alloc(v.Path, input.paths.len + 1);
-            @memcpy(paths[0..input.paths.len], input.paths);
-            paths[input.paths.len] = .{ .nodes = try self.a.dupe(*const v.Node, nodes), .relationships = try self.a.dupe(*const v.Relationship, relationships) };
+            var paths = input.paths;
+            if (self.collect_match_paths) {
+                const collected = try self.a.alloc(v.Path, input.paths.len + 1);
+                @memcpy(collected[0..input.paths.len], input.paths);
+                collected[input.paths.len] = matched_path;
+                paths = collected;
+            }
             try output.append(self.a, .{ .row = row, .used = input.used, .paths = paths, .constraints = input.constraints });
             return;
         }

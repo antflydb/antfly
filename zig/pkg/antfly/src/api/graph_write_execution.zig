@@ -30,6 +30,7 @@ pub const Provider = struct {
     graph: cypher.catalog.Graph,
     tables: []const port.GraphTable,
     channel: cypher.rpc.Channel,
+    release_read: ?*const fn (*anyopaque) void = null,
     overlay: ?*cypher.transaction.Overlay = null,
     transaction_id: ?types.TxnId = null,
     request_id: ?[]const u8 = null,
@@ -102,6 +103,11 @@ pub const Provider = struct {
             const proof = (try self.server.rowPolicyWriteProof(a, self.context, entry.table.table_id, entry.table.name, entry.table.database, if (entry.table.schema_version == 0) null else entry.table.schema_version)) orelse "";
             request.* = .{ .normalized_graph_rows = true, .table_name = entry.table.name, .schema_version = if (entry.table.schema_version == 0) null else entry.table.schema_version, .writes = entry.writes.items, .deletes = entry.deletes.items, .predicates = entry.predicates.items, .graph_writes = entry.edges.items, .graph_deletes = entry.removed_edges.items, .range_guards = entry.guards.items, .row_policy_principal_proof = proof, .row_policy_database = if (proof.len == 0) "" else entry.table.database, .row_policy_admitted_at_seconds = if (proof.len == 0) 0 else @intCast(@import("antfly_platform").time.realtimeNs() / std.time.ns_per_s) };
         }
+        // All result values, normalized postimages and conflict proofs are
+        // owned now. Retaining resident read leases across Raft prepare can
+        // deadlock a queued owner refresh against this transaction's apply.
+        // Native predicates/range proofs validate the cut after its release.
+        if (self.release_read) |release| release(self.channel.ptr);
         var id: types.TxnId = undefined;
         if (self.request_id) |encoded| id = try @import("distributed_txn.zig").parseTxnIdHex(encoded) else try self.server.embedding_provider_runtime.io.randomSecure(&id);
         self.transaction_id = id;

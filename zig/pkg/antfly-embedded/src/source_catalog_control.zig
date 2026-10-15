@@ -281,6 +281,7 @@ pub const storage_db_artifact_producer_retry = @import("storage/db/artifact_prod
 pub const storage_db_artifact_producer_validation = @import("storage/db/artifact_producer_validation.zig");
 pub const storage_db_artifact_projection_certificate = @import("storage/db/artifact_projection_certificate.zig");
 pub const storage_db_artifact_projection_epoch = @import("storage/db/artifact_projection_epoch.zig");
+pub const storage_db_artifact_catalog_proposal = @import("storage/db/artifact_catalog_proposal.zig");
 pub const storage_db_artifact_publication = @import("storage/db/artifact_publication.zig");
 pub const storage_db_artifact_publication_owner = @import("storage/db/artifact_publication_owner.zig");
 pub const storage_db_artifact_publication_resolution = @import("storage/db/artifact_publication_resolution.zig");

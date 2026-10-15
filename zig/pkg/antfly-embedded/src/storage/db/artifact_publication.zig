@@ -912,6 +912,20 @@ pub const UploadRecovery = struct {
 };
 
 pub const Dispatcher = struct {
+    const named = @import("../named_callback.zig");
+    const native = @import("antfly_runtime_abi").native_abi;
+    const RecoveryInvocation = struct {
+        io: native.IoBorrow,
+        now_ns: u64,
+        inventory: @FieldType(UploadRecoveryInvocation, "inventory"),
+        trigger: @FieldType(UploadRecoveryInvocation, "trigger"),
+    };
+    const RecoveryReceiver = *const fn (*anyopaque, @FieldType(UploadRecovery, "recover"), RecoveryInvocation) anyerror!bool;
+    const NativeCallbacks = struct { enqueue: @FieldType(Dispatcher, "enqueue"), recover: RecoveryReceiver };
+    const NativeBoundary = named.Boundary(NativeCallbacks);
+    callback_dispatch: named.Dispatch = NativeBoundary.local_dispatch,
+    recovery_receiver: RecoveryReceiver = receiveRecovery,
+
     ptr: *anyopaque,
     /// Borrowed synchronous owner capability. Storage releases its snapshot
     /// before recovery; absence leaves external publication recovery inert.
@@ -920,12 +934,23 @@ pub const Dispatcher = struct {
     /// admission only; output remains pending until the local durable receipt.
     enqueue: *const fn (*anyopaque, Namespace, []const u8) anyerror!void,
 
+    fn receiveRecovery(ptr: *anyopaque, callback: @FieldType(UploadRecovery, "recover"), invocation: RecoveryInvocation) !bool {
+        var receiver = try invocation.io.receive();
+        return callback(ptr, .{ .io = receiver.io(), .now_ns = invocation.now_ns, .inventory = invocation.inventory, .trigger = invocation.trigger });
+    }
+    pub fn enqueueCommand(self: Dispatcher, namespace: Namespace, command: []const u8) !void {
+        return NativeBoundary.call("enqueue", self.callback_dispatch, self.enqueue, .{ self.ptr, namespace, command });
+    }
+    pub fn recoverUploads(self: Dispatcher, invocation: UploadRecoveryInvocation) !bool {
+        const recovery = self.upload_recovery orelse return false;
+        return NativeBoundary.call("recover", self.callback_dispatch, self.recovery_receiver, .{ self.ptr, recovery.recover, RecoveryInvocation{ .io = native.IoBorrow.init(&invocation.io), .now_ns = invocation.now_ns, .inventory = invocation.inventory, .trigger = invocation.trigger } });
+    }
     /// Submit an already validated, bounded producer command. Queue/resource
     /// admission and leadership are transient control state, never evidence
     /// that inference failed or that this stream completed. Keep that boundary
     /// shared across asset, vector, graph and resolver callbacks.
     pub fn submit(self: Dispatcher, namespace: Namespace, command: []const u8) !void {
-        self.enqueue(self.ptr, namespace, command) catch |err| switch (err) {
+        self.enqueueCommand(namespace, command) catch |err| switch (err) {
             error.ResourceLimitExceeded, error.ResourceBudgetExceeded, error.ResourceTemporarilyUnavailable, error.NotLeader => return error.ArtifactPublicationPending,
             error.Canceled => return error.EnrichmentRetryAborted,
             else => return err,
@@ -1463,4 +1488,19 @@ test "ordered artifact inventory publication coverage is point bounded idempoten
     try stageRejection(&txn, changed, 9, .stale_source);
     try stageReceipts(&txn, command, 10);
     try std.testing.expect((try rejected(&txn, changed)) != null);
+}
+
+test "ordered artifact inventory producer dispatch preserves foreign named failures" {
+    const Harness = struct {
+        fn enqueue(_: *anyopaque, _: Namespace, _: []const u8) !void {
+            return error.NotLeader;
+        }
+        fn dispatch(contract: *const @import("antfly_runtime_abi").native_abi.CallContract, callback: *const anyopaque, args: *const anyopaque, output: *anyopaque) callconv(.c) @import("antfly_runtime_abi").error_abi.Status {
+            return Dispatcher.NativeBoundary.local_dispatch(contract, callback, args, output);
+        }
+    };
+    var context: u8 = 0;
+    const dispatcher: Dispatcher = .{ .ptr = &context, .enqueue = Harness.enqueue, .callback_dispatch = Harness.dispatch };
+    try std.testing.expectError(error.NotLeader, dispatcher.enqueueCommand(@splat(1), "control"));
+    try std.testing.expectError(error.ArtifactPublicationPending, dispatcher.submit(@splat(1), "output"));
 }

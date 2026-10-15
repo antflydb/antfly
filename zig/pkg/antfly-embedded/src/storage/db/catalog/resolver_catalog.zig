@@ -414,7 +414,7 @@ pub const ResolverConfig = struct {
 
 /// Extended catalogs carry an explicit envelope. Pre-epoch readers parse only
 /// arrays, so they reject this shape even when they ignore unknown row fields.
-fn catalogRows(value: std.json.Value) !std.json.Value {
+pub fn catalogRows(value: std.json.Value) !std.json.Value {
     if (value == .array) return value;
     if (value != .object) return error.InvalidResolverConfig;
     const version = value.object.get("version") orelse return error.InvalidResolverConfig;

@@ -1516,9 +1516,15 @@ test "opaque storage owner preserves source-vector policy and status across reop
 test "opaque storage owner fences exact source targets before acknowledging writes" {
     const Observer = struct {
         calls: std.atomic.Value(usize) = .init(0),
+        status_changes: std.atomic.Value(usize) = .init(0),
         additive: std.atomic.Value(bool) = .init(false),
         reducing: std.atomic.Value(bool) = .init(false),
         invalid: std.atomic.Value(bool) = .init(false),
+        fn statusChanged(ptr: ?*anyopaque, table: abi.BorrowedBytes) callconv(.c) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr.?));
+            if (!std.mem.eql(u8, table.slice(), "docs")) self.invalid.store(true, .release);
+            _ = self.status_changes.fetchAdd(1, .release);
+        }
         fn notify(ptr: ?*anyopaque, table: abi.BorrowedBytes, group: u64, sequence: u64, has_sequence: u8, json: abi.BorrowedBytes) callconv(.c) void {
             const self: *@This() = @ptrCast(@alignCast(ptr.?));
             if (!std.mem.eql(u8, table.slice(), "docs") or group != 7001 or has_sequence == 0 or sequence == 0) self.invalid.store(true, .release);
@@ -1545,7 +1551,7 @@ test "opaque storage owner fences exact source targets before acknowledging writ
         .table_name = .fromSlice("docs"),
         .group_id = 7001,
         .indexes_json = .fromSlice("{\"model\":{\"type\":\"embeddings\",\"external\":true,\"dimension\":3}}"),
-        .target_observer = .{ .ctx = &observer, .notify = Observer.notify },
+        .target_observer = .{ .ctx = &observer, .notify = Observer.notify, .status_changed = Observer.statusChanged },
     });
     defer owner.deinit();
     var inserted = try owner.batchJson("docs", "{\"inserts\":{\"a\":{\"_embeddings\":{\"model\":[1,0,0]}}},\"sync_level\":\"full_index\"}");
@@ -1555,6 +1561,11 @@ test "opaque storage owner fences exact source targets before acknowledging writ
     var deleted = try owner.batchJson("docs", "{\"deletes\":[\"a\"],\"sync_level\":\"full_index\"}");
     defer deleted.deinit();
     try std.testing.expect(observer.reducing.load(.acquire));
+    for (0..500) |_| {
+        if (observer.status_changes.load(.acquire) != 0) break;
+        try std.testing.io.sleep(.fromMilliseconds(2), .awake);
+    }
+    try std.testing.expect(observer.status_changes.load(.acquire) > 0);
     try std.testing.expect(!observer.invalid.load(.acquire));
 }
 

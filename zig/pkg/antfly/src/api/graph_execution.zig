@@ -74,7 +74,7 @@ pub fn execute(a: std.mem.Allocator, server: *server_mod.ApiHttpServer, identity
     var read: ?port.GraphRead = null;
     defer if (read) |value| value.deinit();
     var client: cypher.rpc.Client = undefined;
-    var channel: AuthorityChannel = .{ .server = server, .identity = identity, .context = context, .name = name, .record_id = record.id, .tables = tables.items, .writes = writes and !compiled.query.explain, .role_revision = role_revision };
+    var channel: AuthorityChannel = .{ .read_owner = &read, .server = server, .identity = identity, .context = context, .name = name, .record_id = record.id, .tables = tables.items, .writes = writes and !compiled.query.explain, .role_revision = role_revision };
     if (!compiled.query.explain) {
         const source = server.table_reads orelse return error.CypherSnapshotRequired;
         var nonce: [32]u8 = undefined;
@@ -90,7 +90,7 @@ pub fn execute(a: std.mem.Allocator, server: *server_mod.ApiHttpServer, identity
         client = .{ .channel = .{ .ptr = &channel, .call = AuthorityChannel.invoke, .checkpoint = AuthorityChannel.checkpoint }, .incarnation = graph.incarnation, .revision = graph.revision };
         provider = client.backend();
     }
-    var writer: @import("graph_write_execution.zig").Provider = .{ .server = server, .context = context, .identity = identity, .request_id = request.write_request_id, .graph = graph, .tables = tables.items, .channel = .{ .ptr = &channel, .call = AuthorityChannel.invoke, .checkpoint = AuthorityChannel.checkpoint } };
+    var writer: @import("graph_write_execution.zig").Provider = .{ .server = server, .context = context, .identity = identity, .request_id = request.write_request_id, .graph = graph, .tables = tables.items, .release_read = AuthorityChannel.releaseRead, .channel = .{ .ptr = &channel, .call = AuthorityChannel.invoke, .checkpoint = AuthorityChannel.checkpoint } };
     errdefer if (writer.receipt) |receipt| {
         write_outcome.* = switch (receipt.status) {
             .aborted => .aborted,
@@ -128,8 +128,18 @@ pub const AuthorityChannel = struct {
     tables: []const port.GraphTable,
     writes: bool,
     read: ?*port.GraphRead = null,
+    read_owner: ?*?port.GraphRead = null,
     last_authority_check: ?u64 = null,
     role_revision: ?u64 = null,
+    fn releaseRead(ptr: *anyopaque) void {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        self.read = null;
+        if (self.read_owner) |owner| {
+            const retained = owner.*;
+            owner.* = null;
+            if (retained) |read| read.deinit();
+        }
+    }
     pub fn checkpoint(ptr: *anyopaque) !void {
         const self: *@This() = @ptrCast(@alignCast(ptr));
         try self.validateAuthority(false);
@@ -226,7 +236,7 @@ pub fn httpStatus(err: anyerror) u16 {
     return switch (err) {
         error.Forbidden, error.RowPolicyDenied, error.RowPolicyAuthenticationRequired => 403,
         error.CatalogNotFound, error.TableNotFound, error.IndexNotFound => 404,
-        error.CatalogGenerationChanged, error.RowPolicyCatalogChanged, error.CypherTransactionConflict, error.CypherWriteRequestAlreadyUsed => 409,
+        error.CatalogGenerationChanged, error.SchemaVersionChanged, error.RowPolicyCatalogChanged, error.CypherTransactionConflict, error.CypherWriteRequestAlreadyUsed => 409,
         error.CypherSnapshotRequired, error.CypherSnapshotNotReady, error.ReadUnavailable, error.NotLeader, error.LeaderUnavailable, error.ReadIndexTimeout, error.TopologyChanged, error.StorageReadTemporarilyUnavailable, error.RetainedReadRestartRequired, error.GroupLeaderUnavailable, error.Backpressured, error.ConnectionResetByPeer, error.ConnectionRefused, error.ConnectionTimedOut, error.Timeout => 503,
         error.OutOfMemory, error.CypherResponseTooLarge, error.CypherMemoryBudgetExceeded, error.CypherAnchorBudgetExceeded, error.CypherEdgeBudgetExceeded, error.CypherStateBudgetExceeded, error.SqlWriteCapacityUnavailable => 429,
         error.DeadlineExceeded => 408,
@@ -247,7 +257,7 @@ pub fn errorMessage(err: anyerror, outcome: WriteOutcome) []const u8 {
         error.Forbidden, error.RowPolicyDenied, error.RowPolicyAuthenticationRequired => "The current principal cannot execute this query against the graph or its mapped tables.",
         error.CatalogNotFound => "This graph no longer exists. Refresh the graph catalog and select an available graph.",
         error.TableNotFound, error.IndexNotFound => "A mapped table or graph index is unavailable. Refresh the graph definition and check its mappings.",
-        error.CatalogGenerationChanged, error.RowPolicyCatalogChanged => "The graph catalog or row policy changed during execution. Refresh the graph and run a new query.",
+        error.CatalogGenerationChanged, error.SchemaVersionChanged, error.RowPolicyCatalogChanged => "The graph catalog, table schema, or row policy changed during execution. Refresh the graph and run a new query.",
         error.CypherTransactionConflict => "The write was aborted because its read set changed. Run a new statement with a new write request ID.",
         error.CypherSnapshotRequired, error.CypherSnapshotNotReady, error.ReadUnavailable, error.NotLeader, error.LeaderUnavailable, error.ReadIndexTimeout, error.TopologyChanged, error.StorageReadTemporarilyUnavailable, error.RetainedReadRestartRequired, error.GroupLeaderUnavailable, error.Backpressured, error.ConnectionResetByPeer, error.ConnectionRefused, error.ConnectionTimedOut, error.Timeout => "A coherent graph read is temporarily unavailable. Check graph readiness and try again after the owners become available.",
         error.CypherResponseTooLarge => "The result exceeds the response limit. Reduce RETURN data or add a smaller LIMIT.",
@@ -258,4 +268,27 @@ pub fn errorMessage(err: anyerror, outcome: WriteOutcome) []const u8 {
         error.MissingCypherParameter, error.InvalidCypherParameters => "Provide every query parameter using the supported parameter object or typed parameter format.",
         else => @errorName(err),
     };
+}
+
+test "Cypher write releases retained owner reads before commit and cleanup is idempotent" {
+    const Fixture = struct {
+        releases: usize = 0,
+        fn invoke(_: *anyopaque, _: std.mem.Allocator, _: []const u8) ![]u8 {
+            return error.TestUnexpectedResult;
+        }
+        fn release(ptr: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.releases += 1;
+        }
+    };
+    var fixture: Fixture = .{};
+    var read: ?port.GraphRead = .{ .ptr = &fixture, .vtable = &.{ .invoke = Fixture.invoke, .release = Fixture.release } };
+    var channel: AuthorityChannel = undefined;
+    channel.read = &read.?;
+    channel.read_owner = &read;
+    AuthorityChannel.releaseRead(&channel);
+    AuthorityChannel.releaseRead(&channel);
+    try std.testing.expect(read == null);
+    try std.testing.expect(channel.read == null);
+    try std.testing.expectEqual(@as(usize, 1), fixture.releases);
 }

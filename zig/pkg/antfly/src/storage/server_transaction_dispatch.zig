@@ -160,8 +160,11 @@ pub fn applyReplicatedTransactionMutationInternal(
                     resolve.txn_id,
                     resolve.status,
                     resolve.commit_version,
-                    req.sync_level,
-                    visibility_cancellation,
+                    // Ordered apply must never wait for output that is itself
+                    // published through this Raft progress driver. The proposer
+                    // enforces the requested visibility after apply confirmation.
+                    .write,
+                    .none,
                     entry,
                     if (defer_coordinator_ack) null else local_participant,
                 );

@@ -825,6 +825,11 @@ pub const Detail = enum(c_int) {
     retained_read_restart_required,
     row_policy_mutation_unsupported,
     cypher_invalid_regex,
+    schema_version_changed,
+    cypher_write_request_already_used,
+    invalid_cypher_parameters,
+    missing_cypher_parameter,
+    sql_write_capacity_unavailable,
 };
 
 pub const Status = extern struct {
@@ -842,6 +847,11 @@ pub const Status = extern struct {
 
 pub fn statusFromError(err: anyerror) Status {
     return switch (err) {
+        error.SchemaVersionChanged => status(.conflict, .schema_version_changed),
+        error.CypherWriteRequestAlreadyUsed => status(.conflict, .cypher_write_request_already_used),
+        error.InvalidCypherParameters => status(.invalid_argument, .invalid_cypher_parameters),
+        error.MissingCypherParameter => status(.invalid_argument, .missing_cypher_parameter),
+        error.SqlWriteCapacityUnavailable => status(.unavailable, .sql_write_capacity_unavailable),
         error.CypherAggregateScope => status(.invalid_argument, .cypher_aggregate_scope),
         error.CypherAggregateWildcard => status(.invalid_argument, .cypher_aggregate_wildcard),
         error.CypherAmbiguousSearchTable => status(.invalid_argument, .cypher_ambiguous_search_table),
@@ -1579,7 +1589,13 @@ pub fn statusFromError(err: anyerror) Status {
         error.RuntimeAlreadyReady => status(.conflict, .runtime_already_ready),
         error.DocumentExtractionWorkingSetTooLarge => status(.invalid_argument, .document_extraction_working_set_too_large),
         error.DocumentArtifactPublicationFailed => status(.conflict, .document_artifact_publication_failed),
-        else => status(.internal, .none),
+        else => blk: {
+            // Private error identities cannot cross this stable ABI. Retain
+            // the owning side's name in diagnostics instead of leaving an
+            // otherwise opaque RuntimeBoundaryFailure impossible to trace.
+            if (!@inComptime()) std.log.debug("runtime boundary unclassified error={s}", .{@errorName(err)});
+            break :blk status(.internal, .none);
+        },
     };
 }
 
@@ -1625,6 +1641,11 @@ fn detailErrorName(comptime detail: Detail) []const u8 {
     return switch (detail) {
         .document_extraction_working_set_too_large => "DocumentExtractionWorkingSetTooLarge",
         .document_artifact_publication_failed => "DocumentArtifactPublicationFailed",
+        .schema_version_changed => "SchemaVersionChanged",
+        .cypher_write_request_already_used => "CypherWriteRequestAlreadyUsed",
+        .invalid_cypher_parameters => "InvalidCypherParameters",
+        .missing_cypher_parameter => "MissingCypherParameter",
+        .sql_write_capacity_unavailable => "SqlWriteCapacityUnavailable",
         .cypher_aggregate_scope => "CypherAggregateScope",
         .cypher_aggregate_wildcard => "CypherAggregateWildcard",
         .cypher_ambiguous_search_table => "CypherAmbiguousSearchTable",
@@ -2641,7 +2662,7 @@ test "external lake and spill errors retain exact identity across runtime archiv
 }
 
 test "Cypher errors retain stable callback details" {
-    inline for (.{ error.CypherAnchorBudgetExceeded, error.CypherTransactionConflict, error.CypherMemoryBudgetExceeded, error.CypherObservationsUnavailable }) |err| {
+    inline for (.{ error.CypherAnchorBudgetExceeded, error.CypherTransactionConflict, error.CypherMemoryBudgetExceeded, error.CypherObservationsUnavailable, error.SchemaVersionChanged, error.CypherWriteRequestAlreadyUsed, error.InvalidCypherParameters, error.MissingCypherParameter, error.SqlWriteCapacityUnavailable }) |err| {
         try std.testing.expect(errorHasStableDetail(err));
         try std.testing.expectEqual(err, errorFromStatus(statusFromError(err)));
     }

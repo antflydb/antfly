@@ -158,7 +158,7 @@ test "native entity null properties are absent while nested user map nulls survi
     try std.testing.expect(row[3].map[0].value == .null);
 }
 
-test "native virtual labels exclude nonmembers from unlabeled anchors and lookup" {
+test "native virtual labels exclude nonmembers from anchors while retaining authorized producer lookup" {
     var docs: Database = .{ .name = "docs" };
     var authority: Authority = .{};
     var native: Native = .{ .tables = &.{.{ .name = "docs", .db = &docs }}, .authority = authority.callbacks(), .ttl_now_ns = 1 };
@@ -167,7 +167,8 @@ test "native virtual labels exclude nonmembers from unlabeled anchors and lookup
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     try backend.vtable.bind(backend.ptr, arena.allocator(), selected);
-    try std.testing.expect((try backend.vtable.get(backend.ptr, arena.allocator(), .{ .table = "docs", .key = "b" })) == null);
+    const producer = (try backend.vtable.get(backend.ptr, arena.allocator(), .{ .table = "docs", .key = "b" })).?;
+    try std.testing.expectEqual(@as(usize, 0), producer.labels.len);
     const queries = [_][]const u8{
         "MATCH (n) RETURN n.title",
         "MATCH (n) WHERE antfly.documentKey(n)='b' RETURN n.title",

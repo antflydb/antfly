@@ -15,6 +15,14 @@
 
 const std = @import("std");
 pub const Identity = struct {
+    pub const Context = struct {
+        pub fn hash(_: @This(), identity: Identity) u64 {
+            return std.hash.Wyhash.hash(std.hash.Wyhash.hash(0, identity.table), identity.key);
+        }
+        pub fn eql(_: @This(), left: Identity, right: Identity) bool {
+            return left.eql(right);
+        }
+    };
     table: []const u8,
     key: []const u8,
     pub fn eql(a: Identity, b: Identity) bool {
@@ -22,7 +30,18 @@ pub const Identity = struct {
     }
 };
 pub const Entry = struct { name: []const u8, value: Value };
-pub const RelationshipIdentity = struct { identity: Identity, index: []const u8 };
+pub const RelationshipIdentity = struct {
+    identity: Identity,
+    index: []const u8,
+    pub const Context = struct {
+        pub fn hash(_: @This(), identity: RelationshipIdentity) u64 {
+            return std.hash.Wyhash.hash((Identity.Context{}).hash(identity.identity), identity.index);
+        }
+        pub fn eql(_: @This(), left: RelationshipIdentity, right: RelationshipIdentity) bool {
+            return left.identity.eql(right.identity) and std.mem.eql(u8, left.index, right.index);
+        }
+    };
+};
 pub const EntityIdentity = union(enum) {
     node: Identity,
     relationship: RelationshipIdentity,
@@ -49,7 +68,17 @@ pub const Relationship = struct {
     source: Identity,
     target: Identity,
     properties: []const Entry = &.{},
-    ownership: enum { explicit, document, artifact } = .explicit,
+    ownership: enum { explicit, document, field, artifact } = .explicit,
+    /// Producer authority and lifecycle are independent of traversal endpoints.
+    producer: ?Identity = null,
+    pub fn producingDocument(self: Relationship, a: std.mem.Allocator) !?Identity {
+        if (self.producer) |identity| return identity;
+        if (self.ownership == .explicit) return null;
+        // Read pre-provenance wire values and retained fixture identities.
+        const tuple = try std.json.parseFromSliceLeaky([]const []const u8, a, self.identity.key, .{});
+        if (tuple.len != 5 or tuple[4].len == 0) return error.CypherInvalidRelationship;
+        return .{ .table = self.identity.table, .key = tuple[4] };
+    }
 };
 pub const Path = struct { nodes: []const *const Node, relationships: []const *const Relationship };
 pub const Value = union(enum) {
@@ -104,6 +133,7 @@ pub const Value = union(enum) {
                 copy.type = try a.dupe(u8, r.type);
                 copy.source = .{ .table = try a.dupe(u8, r.source.table), .key = try a.dupe(u8, r.source.key) };
                 copy.target = .{ .table = try a.dupe(u8, r.target.table), .key = try a.dupe(u8, r.target.key) };
+                if (r.producer) |producer| copy.producer = .{ .table = try a.dupe(u8, producer.table), .key = try a.dupe(u8, producer.key) };
                 copy.properties = (try (Value{ .map = r.properties }).clone(a)).map;
                 break :blk .{ .relationship = copy };
             },

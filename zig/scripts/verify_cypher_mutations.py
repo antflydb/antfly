@@ -15,6 +15,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--url", default="http://127.0.0.1:18591")
     parser.add_argument("--shards", type=int, choices=[1, 2], default=2)
+    parser.add_argument("--preexisting-producers", action="store_true")
     args = parser.parse_args()
     headers = {
         "Content-Type": "application/json",
@@ -252,7 +253,12 @@ def main():
         # dynamic document properties. Distributed transactions support READ
         # COMMITTED, while bare BEGIN requests serializable range guards.
         owned_table, owned_graph = table + "_owned", graph + "_owned"
-        call("/sql", {"statement": f"CREATE TABLE {owned_table} (id TEXT)"})
+        call(
+            "/sql",
+            {
+                "statement": f"CREATE TABLE {owned_table} (id TEXT, kind TEXT, ref TEXT, kg JSONB)"
+            },
+        )
         try:
             call(
                 f"/tables/{owned_table}/indexes/links",
@@ -290,7 +296,12 @@ def main():
                     f"/tables/{owned_table}/batch",
                     {
                         "inserts": {
-                            key: {"id": key}
+                            key: {
+                                "id": key,
+                                "kind": "vertex"
+                                if key in ("owned-a", "owned-b")
+                                else "producer",
+                            }
                             for key in (
                                 "owned-a",
                                 "owned-b",
@@ -314,6 +325,61 @@ def main():
                 )
                 count = f"SELECT count(*) FROM GRAPH_TABLE({owned_graph} MATCH ()-[r IS LINK]->() COLUMNS(r AS edge)) g"
                 assert call("/sql", {"statement": count})["rows"] == [["2"]]
+                preserved = call(
+                    f"/graphs/{owned_graph}/query",
+                    {
+                        "query": "MATCH (n:Document {id:'owned-claim'}) SET n.kind='producer' WITH 1 AS ignored MATCH ()-[r:LINK]->() RETURN count(r)"
+                    },
+                )
+                assert preserved["rows"] == [[{"type": "integer", "value": "2"}]], (
+                    preserved
+                )
+                nonvertex_graph = owned_graph + "_vertices"
+                call(
+                    f"/graphs/{nonvertex_graph}",
+                    {
+                        "labels": [
+                            {
+                                "name": "Document",
+                                "table": owned_table,
+                                "where": {"kind": "vertex"},
+                            }
+                        ],
+                        "relationships": [
+                            {
+                                "name": "LINK",
+                                "index": "links",
+                                "source_label": "Document",
+                                "target_label": "Document",
+                                "stored_type": "link",
+                            }
+                        ],
+                    },
+                )
+                try:
+                    nonvertex_count = count.replace(owned_graph, nonvertex_graph)
+                    assert call("/sql", {"statement": nonvertex_count})["rows"] == [
+                        ["2"]
+                    ]
+                    session = call(
+                        "/sql", {"statement": "BEGIN ISOLATION LEVEL READ COMMITTED"}
+                    )["session_id"]
+                    try:
+                        call(
+                            "/sql",
+                            {
+                                "statement": f"UPDATE {owned_table} SET kind='producer' WHERE _id='owned-claim'",
+                                "session_id": session,
+                            },
+                        )
+                        assert call(
+                            "/sql",
+                            {"statement": nonvertex_count, "session_id": session},
+                        )["rows"] == [["2"]]
+                    finally:
+                        call("/sql", {"statement": "ROLLBACK", "session_id": session})
+                finally:
+                    call(f"/graphs/{nonvertex_graph}", method="DELETE")
                 session = call(
                     "/sql", {"statement": "BEGIN ISOLATION LEVEL READ COMMITTED"}
                 )["session_id"]
@@ -338,6 +404,145 @@ def main():
                     },
                 )
                 assert result["rows"] == [[{"type": "integer", "value": "1"}]], result
+                # Field projections and published assertions can share both
+                # their producer and endpoints across replicated owners.
+                extraction = {
+                    "entities": [
+                        {"id": "a", "label": "thing", "text": "A"},
+                        {"id": "b", "label": "thing", "text": "B"},
+                    ],
+                    "relations": [{"type": "link", "source": "a", "target": "b"}],
+                }
+
+                def seed_mixed_documents():
+                    call(
+                        f"/tables/{owned_table}/batch",
+                        {
+                            "inserts": {
+                                "mixed/a": {
+                                    "id": "mixed-a",
+                                    "ref": "mixed/b",
+                                    "kg": extraction,
+                                },
+                                "mixed/b": {"id": "mixed-b"},
+                            },
+                            "sync_level": "write",
+                        },
+                    )
+
+                if args.preexisting_producers:
+                    seed_mixed_documents()
+                call(
+                    f"/tables/{owned_table}/indexes/mixed",
+                    {
+                        "type": "graph",
+                        "source": {
+                            "artifact": "kg",
+                            "format": "extraction_graph",
+                            "mention_edge_type": "mentions",
+                        },
+                        "artifact": {
+                            "name": "kg",
+                            "kind": "asset",
+                            "source": {"type": "field", "value": "kg"},
+                            "content_type": "application/json",
+                        },
+                        "edge_types": [
+                            {"name": "mentions"},
+                            {"name": "link", "field": "ref"},
+                        ],
+                        "resolvers": [
+                            {
+                                "name": "entities",
+                                "table": owned_table,
+                                "promote": False,
+                                "source_artifact": "kg",
+                                "resolution_artifact": "resolved",
+                                "key_template": "mixed/{{ uslug _entity.text }}",
+                                "config_generation": 1,
+                            }
+                        ],
+                    },
+                )
+                if not args.preexisting_producers:
+                    seed_mixed_documents()
+                ready_deadline = time.monotonic() + 60
+                while True:
+                    index = call(f"/tables/{owned_table}/indexes/mixed", method="GET")
+                    complete = (
+                        index.get("status", {})
+                        .get("milestones", {})
+                        .get("complete", {})
+                    )
+                    if (
+                        complete.get("reached") is True
+                        and complete.get("blockers") == []
+                    ):
+                        break
+                    assert time.monotonic() < ready_deadline, (
+                        index,
+                        call(f"/tables/{owned_table}", method="GET"),
+                        call(
+                            "/sql",
+                            {"statement": f"SELECT id, ref, kg FROM {owned_table}"},
+                        ),
+                    )
+                    time.sleep(0.2)
+                mixed_graph = owned_graph + "_mixed"
+                call(
+                    f"/graphs/{mixed_graph}",
+                    {
+                        "labels": [{"name": "Document", "table": owned_table}],
+                        "relationships": [
+                            {
+                                "name": "LINK",
+                                "index": "mixed",
+                                "source_label": "Document",
+                                "target_label": "Document",
+                                "stored_type": "link",
+                            }
+                        ],
+                    },
+                )
+                try:
+                    mixed_count = count.replace(owned_graph, mixed_graph)
+                    mixed_baseline = call("/sql", {"statement": mixed_count})
+                    assert mixed_baseline["rows"] == [["2"]], (
+                        mixed_baseline,
+                        call(
+                            f"/graphs/{mixed_graph}/query",
+                            {"query": "MATCH ()-[r:LINK]->() RETURN r"},
+                        ),
+                    )
+                    session = call(
+                        "/sql", {"statement": "BEGIN ISOLATION LEVEL READ COMMITTED"}
+                    )["session_id"]
+                    try:
+                        call(
+                            "/sql",
+                            {
+                                "statement": f"UPDATE {owned_table} SET ref=NULL WHERE _id='mixed/a'",
+                                "session_id": session,
+                            },
+                        )
+                        assert call(
+                            "/sql", {"statement": mixed_count, "session_id": session}
+                        )["rows"] == [["1"]]
+                    finally:
+                        call("/sql", {"statement": "ROLLBACK", "session_id": session})
+                    mixed = call(
+                        f"/graphs/{mixed_graph}/query",
+                        {
+                            "query": "MATCH (a:Document {id:'mixed-a'}) SET a.ref=null WITH 1 AS ignored MATCH ()-[r:LINK]->() RETURN r"
+                        },
+                    )
+                    assert (
+                        len(mixed["rows"]) == 1
+                        and mixed["rows"][0][0]["value"]["ownership"] == "artifact"
+                    ), mixed
+                    assert call("/sql", {"statement": mixed_count})["rows"] == [["1"]]
+                finally:
+                    call(f"/graphs/{mixed_graph}", method="DELETE")
             finally:
                 call(f"/graphs/{owned_graph}", method="DELETE")
         finally:

@@ -24854,7 +24854,8 @@ fn storeRuntimeStatusRecordVersion(record: metadata.StoreRecord) ?u16 {
     for (record.runtime_statuses) |status| {
         if (status.schema_epoch != 0) return runtime_status_protocol.schema_epoch_record_version;
     }
-    if (record.relational_topology_protocol_version != 0) return runtime_status_protocol.framed_index_record_version;
+    if (record.relational_topology_protocol_version != 0 or runtime_status_protocol.requiresFramedIndexStatus(record.runtime_statuses))
+        return runtime_status_protocol.framed_index_record_version;
     if (record.dense_native_storage_protocol_version != 0 or
         storeHasDenseNativeStorageStatus(record) or
         storeHasVectorProjectionStatus(record))
@@ -26827,7 +26828,7 @@ fn runtimeGroupStatusRecordVersion(record: metadata.RuntimeGroupStatusReport) u1
                 version = @max(version, runtime_status_protocol.artifact_source_failure_status_record_version);
             }
         }
-        if (index.source_replay.len != 0) {
+        if (index.source_replay.len != 0 or index.graph_counts_pending) {
             version = @max(version, runtime_status_protocol.framed_index_status_record_version);
         }
         if (index.repair_status != null) {
@@ -38565,4 +38566,29 @@ test "metadata.lake index object table engine framing preserves empty topology a
     invalid = table;
     invalid.indexes_json = "{\"new\":{\"type\":\"full_text\"}}";
     try std.testing.expectError(error.ObjectTableDefinitionConflict, metadata_table_manager.validateObjectTableMutation(a, table, invalid));
+}
+
+test "metadata runtime store producer completion selects framed envelope" {
+    const alloc = std.testing.allocator;
+    for ([_]bool{ false, true }) |completion_proof| {
+        var sources = [_]metadata.RuntimeIndexSourceReplayStatusReport{.{ .artifact_name = "kg", .producer_complete = completion_proof }};
+        var indexes = [_]metadata.RuntimeIndexStatusReport{.{ .name = "graph", .kind = "graph", .source_replay = if (completion_proof) &sources else &.{}, .graph_counts_pending = !completion_proof }};
+        var groups = [_]metadata.RuntimeGroupStatusReport{.{ .group_id = 10, .indexes = &indexes }};
+        const record: metadata.StoreRecord = .{ .store_id = 7, .node_id = 9, .runtime_statuses = &groups };
+        try std.testing.expectEqual(runtime_status_protocol.framed_index_record_version, runtimeGroupStatusRecordVersion(groups[0]));
+        try std.testing.expectEqual(@as(?u16, runtime_status_protocol.framed_index_record_version), storeRuntimeStatusRecordVersion(record));
+        var bytes: std.ArrayListUnmanaged(u8) = .empty;
+        defer bytes.deinit(alloc);
+        try appendStoreRecord(alloc, &bytes, record);
+        var position: usize = 0;
+        const decoded = try readStoreRecord(alloc, bytes.items, &position);
+        defer metadata_table_manager.freeStore(alloc, decoded);
+        try std.testing.expectEqual(bytes.items.len, position);
+        if (completion_proof) {
+            try std.testing.expect(decoded.runtime_statuses[0].indexes[0].source_replay[0].producer_complete);
+        } else {
+            try std.testing.expectEqual(@as(usize, 0), decoded.runtime_statuses[0].indexes[0].source_replay.len);
+        }
+        try std.testing.expectEqual(!completion_proof, decoded.runtime_statuses[0].indexes[0].graph_counts_pending);
+    }
 }

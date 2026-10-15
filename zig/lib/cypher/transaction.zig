@@ -32,8 +32,11 @@ pub const Overlay = struct {
     graph: ?c.Graph = null,
     alloc: ?A = null,
     active: bool = false,
+    staged_read_documents: bool = false,
     nodes: std.ArrayList(Node) = .empty,
+    node_positions: std.HashMapUnmanaged(v.Identity, usize, v.Identity.Context, std.hash_map.default_max_load_percentage) = .empty,
     relationships: std.ArrayList(Relationship) = .empty,
+    relationship_positions: std.HashMapUnmanaged(v.RelationshipIdentity, usize, v.RelationshipIdentity.Context, std.hash_map.default_max_load_percentage) = .empty,
     mutations: std.ArrayList(b.Mutation) = .empty,
     max_entities: usize = 65536,
     max_anchors: usize = 1_000_000,
@@ -91,7 +94,7 @@ pub const Overlay = struct {
                     try self.capacity();
                     const copy = try a.create(v.Node);
                     copy.* = node.*;
-                    try self.nodes.append(a, .{ .value = copy });
+                    try self.appendNode(a, .{ .value = copy });
                 }
                 after = page.next;
                 if (after == null) break;
@@ -113,24 +116,70 @@ pub const Overlay = struct {
                         try self.capacity();
                         const copy = try a.create(v.Relationship);
                         copy.* = relationship.*;
-                        try self.relationships.append(a, .{ .value = copy });
+                        try self.appendRelationship(a, .{ .value = copy });
                     }
                     after = page.next;
                     if (after == null) break;
                 }
             }
         }
+        // Producer authority is part of the same retained cut, even when its
+        // document fails every vertex predicate. Capture referenced producers
+        // before releasing cohort fences; active lookups never return to live
+        // storage. Deduplicate lookups independently of contribution fan-in.
+        var producers: std.HashMapUnmanaged(v.Identity, bool, v.Identity.Context, std.hash_map.default_max_load_percentage) = .empty;
+        defer producers.deinit(a);
+        for (self.nodes.items) |node| try producers.put(a, node.value.identity, true);
+        for (self.relationships.items) |*relationship| {
+            const identity = (try relationship.value.producingDocument(a)) orelse continue;
+            const seen = try producers.getOrPut(a, identity);
+            if (seen.found_existing) {
+                if (!seen.value_ptr.*) relationship.deleted = true;
+                continue;
+            }
+            seen.value_ptr.* = false;
+            try checkpoint(ptr);
+            if (self.captured.scanned_anchors >= self.max_anchors) return error.CypherAnchorBudgetExceeded;
+            self.captured.scanned_anchors += 1;
+            const producer = (try self.base.vtable.get(self.base.ptr, a, identity)) orelse {
+                relationship.deleted = true;
+                continue;
+            };
+            seen.value_ptr.* = true;
+            try self.capacity();
+            const copy = try a.create(v.Node);
+            copy.* = producer.*;
+            try self.appendNode(a, .{ .value = copy });
+        }
+    }
+    /// All node insertion paths maintain the same identity index. Producers are
+    /// retained entities too; resolving every edge's authority stays O(1).
+    pub fn appendNode(self: *Overlay, a: A, node: Node) !void {
+        try self.nodes.ensureUnusedCapacity(a, 1);
+        try self.node_positions.put(a, node.value.identity, self.nodes.items.len);
+        self.nodes.appendAssumeCapacity(node);
     }
     fn findNode(self: *Overlay, identity: v.Identity) ?*Node {
-        for (self.nodes.items) |*node| if (node.value.identity.eql(identity)) return node;
-        return null;
+        const position = self.node_positions.get(identity) orelse return null;
+        return &self.nodes.items[position];
     }
     fn startupWork(ptr: *anyopaque) b.StartupWork {
         return cast(ptr).captured;
     }
+    pub fn appendRelationship(self: *Overlay, a: A, relationship: Relationship) !void {
+        try self.relationships.ensureUnusedCapacity(a, 1);
+        const value = relationship.value;
+        try self.relationship_positions.put(a, .{ .identity = value.identity, .index = value.index }, self.relationships.items.len);
+        self.relationships.appendAssumeCapacity(relationship);
+    }
+    /// A host can replace an older physical copy when merging staged effects.
+    pub fn indexRelationship(self: *Overlay, a: A, position: usize) !void {
+        const value = self.relationships.items[position].value;
+        try self.relationship_positions.put(a, .{ .identity = value.identity, .index = value.index }, position);
+    }
     fn findRelationship(self: *Overlay, identity: v.RelationshipIdentity) ?*Relationship {
-        for (self.relationships.items) |*relationship| if (relationship.value.identity.eql(identity.identity) and std.mem.eql(u8, relationship.value.index, identity.index)) return relationship;
-        return null;
+        const position = self.relationship_positions.get(identity) orelse return null;
+        return &self.relationships.items[position];
     }
     fn scan(ptr: *anyopaque, a: A, table: []const u8, after: ?[]const u8, limit: usize) !b.Page(*const v.Node) {
         const self = cast(ptr);
@@ -139,6 +188,10 @@ pub const Overlay = struct {
         var found: std.ArrayList(*const v.Node) = .empty;
         for (self.nodes.items) |node| {
             if (node.deleted or !std.mem.eql(u8, node.value.identity.table, table)) continue;
+            const vertex = for (self.graph.?.labels) |label| {
+                if (self.graph.?.admits(node.value, label.name)) break true;
+            } else false;
+            if (!vertex) continue;
             if (after) |key| if (std.mem.order(u8, node.value.identity.key, key) != .gt) continue;
             try found.append(a, node.value);
         }
@@ -157,15 +210,13 @@ pub const Overlay = struct {
         const node = self.findNode(identity) orelse return null;
         return if (node.deleted) null else node.value;
     }
-    fn getRelationship(ptr: *anyopaque, _: A, identity: v.RelationshipIdentity) !?*const v.Relationship {
+    fn getRelationship(ptr: *anyopaque, a: A, identity: v.RelationshipIdentity) !?*const v.Relationship {
         const self = cast(ptr);
         try checkpoint(ptr);
-        // Document postimages replace contributions with the same identity.
-        // Skip retired copies so a retained alias sees the active replacement.
-        for (self.relationships.items) |relationship| {
-            if (!relationship.deleted and relationship.value.identity.eql(identity.identity) and std.mem.eql(u8, relationship.value.index, identity.index)) return relationship.value;
-        }
-        return null;
+        // Replacement projections update the identity index, so retained aliases
+        // resolve the current copy without scanning retired versions.
+        const relationship = self.findRelationship(identity) orelse return null;
+        return if (!relationship.deleted and try self.producerVisible(a, relationship.value)) relationship.value else null;
     }
     fn projectNode(ptr: *anyopaque, a: A, value: *const v.Node) !?*const v.Node {
         const self = cast(ptr);
@@ -189,6 +240,7 @@ pub const Overlay = struct {
         for (self.relationships.items[offset..], offset..) |item, index| {
             if (item.deleted or !std.mem.eql(u8, item.value.type, mapping.name) or !std.mem.eql(u8, item.value.index, mapping.index)) continue;
             if (!((direction != .in and item.value.source.eql(identity)) or (direction != .out and item.value.target.eql(identity)))) continue;
+            if (!try self.producerVisible(a, item.value)) continue;
             if (found.items.len == limit) {
                 next = try std.fmt.allocPrint(a, "{d}", .{index});
                 break;
@@ -201,7 +253,7 @@ pub const Overlay = struct {
         const self = cast(ptr);
         // Native rankers cannot see an uncommitted overlay. Failing here avoids
         // silently returning a mixture of pre-write scores and post-write rows.
-        if (self.mutations.items.len != 0) return error.CypherSearchAfterWrite;
+        if (self.mutations.items.len != 0 or self.staged_read_documents) return error.CypherSearchAfterWrite;
         return (self.base.vtable.search orelse return error.CypherSearchUnavailable)(self.base.ptr, a, table, input);
     }
     fn properties(a: A, old: []const v.Entry, updates: []const v.Entry, replace: bool) ![]const v.Entry {
@@ -217,6 +269,40 @@ pub const Overlay = struct {
         for (updates) |entry| if (entry.value != .null) try output.append(a, entry);
         return output.toOwnedSlice(a);
     }
+    /// Install an already-normalized SQL postimage in a read-only view.
+    /// SQL has applied defaults/generated columns; re-running a Cypher CREATE
+    /// normalizer here would turn an explicit SQL NULL back into a default.
+    pub fn stageReadDocument(self: *Overlay, a: A, identity: v.Identity, postimage: ?*const v.Node) !void {
+        if (!self.active) return error.CypherTransactionRequired;
+        const copy = if (postimage) |node| blk: {
+            if (!node.identity.eql(identity)) return error.CypherInvalidIdentity;
+            break :blk (try (v.Value{ .node = node }).clone(a)).node;
+        } else blk: {
+            const tombstone = try a.create(v.Node);
+            tombstone.* = .{ .identity = identity };
+            break :blk tombstone;
+        };
+        var labels: std.ArrayList([]const u8) = .empty;
+        if (postimage != null) for (self.graph.?.labels) |label| {
+            if (self.graph.?.admits(copy, label.name)) try labels.append(a, label.name);
+        };
+        @constCast(copy).labels = labels.items;
+        if (self.findNode(identity)) |node| {
+            node.* = .{ .value = @constCast(copy), .deleted = postimage == null, .dirty = true };
+        } else {
+            try self.capacity();
+            try self.appendNode(a, .{ .value = @constCast(copy), .deleted = postimage == null, .dirty = true });
+        }
+        self.staged_read_documents = true;
+        if (postimage != null) {
+            try self.refreshDocumentRelationships(a, copy);
+        } else {
+            for (self.relationships.items) |*relationship| {
+                if (try ownedBy(a, relationship.value, identity)) relationship.deleted = true;
+            }
+        }
+    }
+
     fn set(self: *Overlay, a: A, target: v.EntityIdentity, updates: []const v.Entry, replace: bool) !void {
         switch (target) {
             .node => |identity| {
@@ -237,16 +323,23 @@ pub const Overlay = struct {
         }
     }
     pub fn ownedBy(a: A, relationship: *const v.Relationship, identity: v.Identity) !bool {
-        if (relationship.ownership == .explicit or !std.mem.eql(u8, relationship.identity.table, identity.table)) return false;
-        const tuple = try std.json.parseFromSliceLeaky([]const []const u8, a, relationship.identity.key, .{});
-        if (tuple.len != 5) return error.CypherInvalidRelationship;
-        return std.mem.eql(u8, tuple[4], identity.key);
+        const producer = (try relationship.producingDocument(a)) orelse return false;
+        return producer.eql(identity);
+    }
+    fn producerVisible(self: *Overlay, a: A, relationship: *const v.Relationship) !bool {
+        const identity = (try relationship.producingDocument(a)) orelse return true;
+        // Initial producer admission belongs to the retained backend. Recheck
+        // changed rows against postimage USING authority, independently of the
+        // graph label predicates and the relationship's traversal endpoints.
+        const node = self.findNode(identity) orelse return false;
+        if (node.deleted) return false;
+        return (try projectNode(self, a, node.value)) != null;
     }
     fn refreshDocumentRelationships(self: *Overlay, a: A, node: *const v.Node) !void {
         const project = self.base.vtable.document_relationships orelse return;
         const relationships = try project(self.base.ptr, a, node);
         for (self.relationships.items) |*relationship| {
-            if (try ownedBy(a, relationship.value, node.identity)) relationship.deleted = true;
+            if (relationship.value.ownership == .field and try ownedBy(a, relationship.value, node.identity)) relationship.deleted = true;
         }
         for (relationships) |relationship| {
             try self.capacity();
@@ -254,7 +347,7 @@ pub const Overlay = struct {
             self.captured.explored_edges += 1;
             const copy = try a.create(v.Relationship);
             copy.* = relationship.*;
-            try self.relationships.append(a, .{ .value = copy });
+            try self.appendRelationship(a, .{ .value = copy });
         }
     }
     fn mutate(ptr: *anyopaque, a: A, mutation: b.Mutation) !void {
@@ -272,7 +365,7 @@ pub const Overlay = struct {
                 // Normalization may refresh labels. Validate the requested labels
                 // against defaults and generated values before staging the node.
                 for (node.labels) |name| if (!self.graph.?.admits(copy, name)) return error.CypherLabelPredicateViolation;
-                try self.nodes.append(a, .{ .value = copy, .dirty = true });
+                try self.appendNode(a, .{ .value = copy, .dirty = true });
                 try self.refreshDocumentRelationships(a, copy);
             },
             .create_relationship => |relationship| {
@@ -285,7 +378,7 @@ pub const Overlay = struct {
                 const copy = try a.create(v.Relationship);
                 copy.* = relationship.*;
                 copy.properties = try v.entityProperties(a, relationship.properties);
-                try self.relationships.append(a, .{ .value = copy });
+                try self.appendRelationship(a, .{ .value = copy });
             },
             .set_properties => |update| try self.set(a, update.target, update.properties, update.replace),
             .remove_properties => |update| {
@@ -323,14 +416,18 @@ pub const Overlay = struct {
         const self = cast(ptr);
         try checkpoint(ptr);
         if (!self.active) return error.CypherTransactionRequired;
+        if (self.staged_read_documents) return error.CypherMutationsUnavailable;
         try self.host.commit(self.host.ptr, self.alloc.?, self.mutations.items);
         self.active = false;
     }
     fn rollback(ptr: *anyopaque) void {
         const self = cast(ptr);
         self.active = false;
+        self.staged_read_documents = false;
         self.nodes = .empty;
+        self.node_positions = .empty;
         self.relationships = .empty;
+        self.relationship_positions = .empty;
         self.mutations = .empty;
     }
 };

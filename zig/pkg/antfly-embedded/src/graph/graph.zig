@@ -55,6 +55,7 @@ pub const EdgeDirection = enum { out, in, both };
 pub const Edge = struct {
     /// Private Cypher provenance; ordinary graph reads retain their logical projection.
     artifact_derived: bool = false,
+    field_derived: bool = false,
     edge_id: []const u8 = "",
     owner_document: []const u8 = "",
     source: []const u8,
@@ -165,6 +166,54 @@ pub const EdgePage = struct {
     pub fn deinit(self: *EdgePage, alloc: Allocator) void {
         if (self.edges.len > 0) GraphIndex.freeEdges(alloc, self.edges);
         if (self.next_cursor) |*cursor| cursor.deinit(alloc);
+        self.* = undefined;
+    }
+};
+
+/// Private Cypher continuation: physical adjacency and producer contributions
+/// resume independently, including a partially selected owner. Payloads stay in
+/// the pinned store; cursors retain only bounded keys, never whole edge values.
+pub const CypherEdgeScanCursor = struct {
+    physical: ?EdgeScanCursor = null,
+    edge: ?EdgeProbe = null,
+    phase: enum { classify, field, emit, projected } = .classify,
+    has_artifacts: bool = false,
+    resume_hex: []const u8 = "",
+    owner: ?[]const u8 = null,
+    winner_hex: []const u8 = "",
+    winner_rank: u64 = std.math.maxInt(u64),
+    pub fn clone(self: @This(), a: Allocator) !@This() {
+        var copy: @This() = .{ .phase = self.phase, .has_artifacts = self.has_artifacts, .winner_rank = self.winner_rank };
+        errdefer copy.deinit(a);
+        if (self.physical) |cursor| copy.physical = try cursor.clone(a);
+        if (self.edge) |edge| {
+            var owned: EdgeProbe = .{ .source = "", .target = "", .edge_type = "" };
+            errdefer inline for (.{ "source", "target", "edge_type", "edge_id", "owner_document" }) |field| if (@field(owned, field).len != 0) a.free(@field(owned, field));
+            inline for (.{ "source", "target", "edge_type", "edge_id", "owner_document" }) |field| @field(owned, field) = try a.dupe(u8, @field(edge, field));
+            copy.edge = owned;
+        }
+        copy.resume_hex = try a.dupe(u8, self.resume_hex);
+        if (self.owner) |owner| copy.owner = try a.dupe(u8, owner);
+        copy.winner_hex = try a.dupe(u8, self.winner_hex);
+        return copy;
+    }
+    pub fn deinit(self: *@This(), a: Allocator) void {
+        if (self.physical) |*cursor| cursor.deinit(a);
+        if (self.edge) |edge| inline for (.{ "source", "target", "edge_type", "edge_id", "owner_document" }) |field| if (@field(edge, field).len != 0) a.free(@field(edge, field));
+        if (self.resume_hex.len != 0) a.free(self.resume_hex);
+        if (self.owner) |owner| a.free(owner);
+        if (self.winner_hex.len != 0) a.free(self.winner_hex);
+        self.* = .{};
+    }
+};
+pub const CypherEdgePage = struct {
+    edges: []Edge,
+    next_cursor: ?CypherEdgeScanCursor = null,
+    owned_bytes: usize = 0,
+    scanned_rows: usize = 0,
+    pub fn deinit(self: *@This(), a: Allocator) void {
+        GraphIndex.freeEdges(a, self.edges);
+        if (self.next_cursor) |*cursor| cursor.deinit(a);
         self.* = undefined;
     }
 };
@@ -1373,7 +1422,7 @@ pub const GraphIndex = struct {
             self.* = undefined;
         }
         pub fn getPage(self: *@This(), alloc: Allocator, key: []const u8, edge_types: []const []const u8, cursor: ?EdgeScanCursor, limits: EdgePageLimits, now_ns: u64, scanned_out: ?*usize) !EdgePage {
-            return self.index.getEdgesByTypesPageInRead(alloc, key, edge_types, self.direction, cursor, limits, now_ns, scanned_out, &self.reads);
+            return self.index.getEdgesByTypesPageInRead(alloc, key, edge_types, self.direction, cursor, limits, now_ns, scanned_out, &self.reads, true);
         }
         pub fn getBounded(self: *@This(), alloc: Allocator, key: []const u8, edge_types: []const []const u8, max_edges: usize, max_owned_bytes: usize, max_physical_rows: usize, now_ns: u64, scanned_out: ?*usize) !BoundedEdgeResult {
             return self.index.getEdgesByTypesBoundedInRead(alloc, key, edge_types, self.direction, max_edges, max_owned_bytes, max_physical_rows, now_ns, scanned_out, &self.reads);
@@ -8482,100 +8531,204 @@ pub const GraphIndex = struct {
         return self.getEdgesByTypesPageAtCounted(alloc, key, edge_types, direction, scan_cursor, limits, now_ns, null);
     }
 
-    /// Cypher gives document assertions producer-qualified identities instead
-    /// of treating a legacy, aggregated adjacency as an explicit writable edge.
-    /// One physical adjacency per page keeps its existing cursor authoritative;
-    /// contribution work and payloads share the caller's physical/byte limits.
-    pub fn getCypherEdgesByTypesPageAt(self: *GraphIndex, alloc: Allocator, key: []const u8, edge_types: []const []const u8, direction: EdgeDirection, scan_cursor: ?EdgeScanCursor, limits: EdgePageLimits, now_ns: u64) !EdgePage {
-        var physical_limits = limits;
-        physical_limits.max_edges = @min(limits.max_edges, 1);
-        var page = try self.getEdgesByTypesPageAt(alloc, key, edge_types, direction, scan_cursor, physical_limits, now_ns);
-        errdefer page.deinit(alloc);
-        var output: std.ArrayListUnmanaged(Edge) = .empty;
-        errdefer {
-            for (output.items) |edge| freeEdge(alloc, edge);
-            output.deinit(alloc);
+    fn cypherKeyHex(a: Allocator, key: []const u8) ![]const u8 {
+        const result = try a.alloc(u8, try std.math.mul(usize, key.len, 2));
+        const digits = "0123456789abcdef";
+        for (key, 0..) |byte, i| {
+            result[2 * i] = digits[byte >> 4];
+            result[2 * i + 1] = digits[byte & 15];
         }
-        var scratch = std.heap.ArenaAllocator.init(alloc);
+        return result;
+    }
+    fn cypherKeyBytes(a: Allocator, hex: []const u8) ![]const u8 {
+        if (hex.len % 2 != 0) return error.InvalidArgument;
+        const result = try a.alloc(u8, hex.len / 2);
+        errdefer a.free(result);
+        return std.fmt.hexToBytes(result, hex) catch return error.InvalidArgument;
+    }
+    fn cypherPageCursor(a: Allocator, state: CypherEdgeScanCursor, resume_key: []const u8, owner: ?[]const u8, winner: []const u8) !CypherEdgeScanCursor {
+        var copy = state;
+        copy.resume_hex = try cypherKeyHex(a, resume_key);
+        defer a.free(copy.resume_hex);
+        copy.owner = owner;
+        copy.winner_hex = try cypherKeyHex(a, winner);
+        defer a.free(copy.winner_hex);
+        return copy.clone(a);
+    }
+    fn appendCypherWinner(a: Allocator, field_mapping: bool, read: *backend_erased.ReadTxn, output: *std.ArrayListUnmanaged(Edge), state: CypherEdgeScanCursor, owner: []const u8, winner: []const u8, owned_bytes: *usize, max_bytes: usize) !bool {
+        if (winner.len == 0) return true;
+        const value = try read.get(winner);
+        if (value.len < 8) return error.InvalidGraphEdgeValue;
+        const decoded = try decodeEdgeValue(value[8..]);
+        const edge = state.edge.?;
+        const producer = if (edge.edge_id.len != 0) edge.owner_document else if (state.has_artifacts or !std.mem.eql(u8, owner, edge.source)) owner else "";
+        const field_derived = field_mapping and std.mem.eql(u8, owner, edge.source) and (state.phase == .field or !state.has_artifacts);
+        const selected: Edge = .{ .field_derived = field_derived, .source = edge.source, .target = edge.target, .edge_type = edge.edge_type, .edge_id = edge.edge_id, .owner_document = producer, .artifact_derived = !field_derived and (if (edge.edge_id.len != 0) state.winner_rank != 0 and state.winner_rank != std.math.maxInt(u64) else state.has_artifacts), .metadata = decoded.metadata, .weight = decoded.weight, .created_at = decoded.created_at, .updated_at = decoded.updated_at, .winner_rank = state.winner_rank };
+        appendCypherEdge(a, output, selected, owned_bytes, max_bytes) catch |err| {
+            if (err == error.GraphExploredEdgeBytesBudgetExceeded and output.items.len != 0) return false;
+            return err;
+        };
+        return true;
+    }
+
+    /// Bound physical work, output, and owner selection independently. An owner
+    /// with many contenders can span pages without retaining payloads or rescanning
+    /// its prefix; many producers never have to fit in one adjacency page.
+    pub fn getCypherEdgesByTypesPageAt(self: *GraphIndex, a: Allocator, key: []const u8, edge_types: []const []const u8, direction: EdgeDirection, scan_cursor: ?CypherEdgeScanCursor, limits: EdgePageLimits, now_ns: u64) !CypherEdgePage {
+        if (limits.max_edges == 0 or limits.max_scanned_rows == 0) return error.GraphExploredEdgesBudgetExceeded;
+        if (limits.max_owned_bytes == 0) return error.GraphExploredEdgeBytesBudgetExceeded;
+        var context = try self.beginEdgeReadContextWithProof(direction);
+        defer context.deinit();
+        if (scan_cursor) |input| if (input.physical) |cursor| if (cursor.read_generation != null) try context.validateContinuation(cursor);
+        var scratch = std.heap.ArenaAllocator.init(a);
         defer scratch.deinit();
         const temporary = scratch.allocator();
-        var read = try self.beginReadReverseTxn();
-        defer read.abort();
+        var state: CypherEdgeScanCursor = if (scan_cursor) |cursor| try cursor.clone(temporary) else .{};
+        var resume_key: std.ArrayList(u8) = .empty;
+        try resume_key.appendSlice(temporary, try cypherKeyBytes(temporary, state.resume_hex));
+        var owner: std.ArrayList(u8) = .empty;
+        var has_owner = state.owner != null;
+        if (state.owner) |value| try owner.appendSlice(temporary, value);
+        var winner: std.ArrayList(u8) = .empty;
+        try winner.appendSlice(temporary, try cypherKeyBytes(temporary, state.winner_hex));
+        var output: std.ArrayListUnmanaged(Edge) = .empty;
+        errdefer {
+            for (output.items) |edge| freeEdge(a, edge);
+            output.deinit(a);
+        }
+        var scanned: usize = 0;
         var owned_bytes: usize = 0;
-        for (page.edges) |edge| {
-            if (edge.edge_id.len != 0) {
-                var copy = edge;
-                copy.artifact_derived = edge.winner_rank != 0 and edge.winner_rank != std.math.maxInt(u64);
-                try appendCypherEdge(alloc, &output, copy, &owned_bytes, limits.max_owned_bytes);
+        var finished = false;
+        const read = &context.reads.incoming.?;
+        page: while (scanned < limits.max_scanned_rows and output.items.len < limits.max_edges) {
+            if (state.edge == null) {
+                var physical = try self.getEdgesByTypesPageInRead(temporary, key, edge_types, direction, state.physical, .{ .max_edges = 1, .max_owned_bytes = limits.max_owned_bytes, .max_scanned_rows = limits.max_scanned_rows - scanned }, now_ns, null, &context.reads, false);
+                defer physical.deinit(temporary);
+                scanned += physical.scanned_rows;
+                state.physical = if (physical.next_cursor) |cursor| try cursor.clone(temporary) else null;
+                if (state.physical) |*cursor| context.bindContinuation(cursor);
+                if (physical.edges.len == 0) {
+                    if (state.physical == null) {
+                        finished = true;
+                        break;
+                    }
+                    continue;
+                }
+                const raw = physical.edges[0];
+                const prefix = try relationshipContributionPrefixAlloc(temporary, raw.source, raw.edge_type, raw.target, raw.edge_id, raw.owner_document);
+                const marker = try std.mem.concat(temporary, u8, &.{ prefix, &.{0} });
+                const has_contributions = if (read.get(marker)) |_| true else |err| switch (err) {
+                    error.NotFound => false,
+                    else => return err,
+                };
+                state.edge = .{ .source = try temporary.dupe(u8, raw.source), .target = try temporary.dupe(u8, raw.target), .edge_type = try temporary.dupe(u8, raw.edge_type), .edge_id = try temporary.dupe(u8, raw.edge_id), .owner_document = try temporary.dupe(u8, raw.owner_document) };
+                state.phase = if (!has_contributions) .projected else if (raw.edge_id.len != 0) .emit else .classify;
+                state.has_artifacts = false;
+                resume_key.clearRetainingCapacity();
+                has_owner = false;
+                winner.clearRetainingCapacity();
+                state.winner_rank = std.math.maxInt(u64);
+            }
+            const edge = state.edge.?;
+            const field_mapping = edge.edge_id.len == 0 and for (self.edge_type_configs) |config| {
+                if (config.field_name != null and std.mem.eql(u8, config.name, edge.edge_type)) break true;
+            } else false;
+            if (state.phase == .projected) {
+                const physical_key = try relationshipKeyAlloc(temporary, edge.target, self.index_name, edge.edge_type, edge.source, edge.edge_id, edge.owner_document);
+                const decoded = try decodeEdgeValue(try read.get(physical_key));
+                if (!self.edgeExpiredAt(decoded, now_ns)) {
+                    const selected: Edge = .{ .field_derived = field_mapping, .source = edge.source, .target = edge.target, .edge_type = edge.edge_type, .edge_id = edge.edge_id, .owner_document = edge.owner_document, .weight = decoded.weight, .created_at = decoded.created_at, .updated_at = decoded.updated_at, .metadata = decoded.metadata };
+                    appendCypherEdge(a, &output, selected, &owned_bytes, limits.max_owned_bytes) catch |err| {
+                        if (err == error.GraphExploredEdgeBytesBudgetExceeded and output.items.len != 0) break :page;
+                        return err;
+                    };
+                }
+                state.edge = null;
+                if (state.physical == null) {
+                    finished = true;
+                    break;
+                }
                 continue;
             }
-            const base = try relationshipContributionPrefixAlloc(temporary, edge.source, edge.edge_type, edge.target, "", "");
-            const marker = try std.mem.concat(temporary, u8, &.{ base, &.{0} });
-            _ = read.get(marker) catch |err| switch (err) {
-                error.NotFound => {
-                    try appendCypherEdge(alloc, &output, edge, &owned_bytes, limits.max_owned_bytes);
-                    continue;
-                },
-                else => return err,
-            };
+            const base = try relationshipContributionPrefixAlloc(temporary, edge.source, edge.edge_type, edge.target, edge.edge_id, edge.owner_document);
             const prefix = try std.mem.concat(temporary, u8, &.{ base, &.{1} });
-            const Candidate = struct { owner: []const u8, artifact: bool, rank: u64, value: []const u8 };
-            var candidates: std.ArrayList(Candidate) = .empty;
-            var scratch_bytes: usize = 0;
-            var has_artifacts = false;
             var cursor = try read.openCursor();
             defer cursor.close();
-            var row = try cursor.seekAtOrAfter(prefix);
+            var row = try cursor.seekAtOrAfter(if (resume_key.items.len != 0) resume_key.items else prefix);
+            if (row) |entry| if (std.mem.eql(u8, entry.key, resume_key.items)) {
+                row = try cursor.next();
+            };
             while (row) |entry| : (row = try cursor.next()) {
                 if (!std.mem.startsWith(u8, entry.key, prefix)) break;
-                if (page.scanned_rows >= limits.max_scanned_rows) return error.GraphExploredEdgesBudgetExceeded;
-                page.scanned_rows += 1;
+                if (scanned >= limits.max_scanned_rows) break :page;
                 if (entry.value.len < 8) return error.InvalidGraphEdgeValue;
                 const decoded = try decodeEdgeValue(entry.value[8..]);
-                if (self.edgeExpiredAt(decoded, now_ns)) continue;
                 const priority = std.mem.readInt(u64, entry.value[0..8], .big);
-                const artifact = priority != direct_source_priority;
-                has_artifacts = has_artifacts or artifact;
-                const owner_end = internal_keys.findComponentTerminator(entry.key, prefix.len) orelse return error.InvalidGraphEdgeValue;
-                const copy_bytes = std.math.add(usize, owner_end - prefix.len, entry.value.len) catch return error.GraphExploredEdgeBytesBudgetExceeded;
-                if (copy_bytes > limits.max_owned_bytes -| scratch_bytes) return error.GraphExploredEdgeBytesBudgetExceeded;
-                scratch_bytes += copy_bytes;
-                const owner = try internal_keys.decodeBodyAlloc(temporary, entry.key[prefix.len..owner_end]);
-                const rank = sourcePriorityRank(priority);
-                var existing: ?*Candidate = null;
-                for (candidates.items) |*candidate| if (std.mem.eql(u8, candidate.owner, owner)) {
-                    existing = candidate;
-                    break;
-                };
-                if (existing) |candidate| {
-                    if (candidate.rank <= rank) continue;
-                    candidate.rank = rank;
-                    candidate.artifact = artifact;
-                    candidate.value = try temporary.dupe(u8, entry.value[8..]);
-                } else try candidates.append(temporary, .{ .owner = owner, .artifact = artifact, .rank = rank, .value = try temporary.dupe(u8, entry.value[8..]) });
+                if (state.phase == .classify) {
+                    scanned += 1;
+                    // Legacy projections without source contenders use the unknown
+                    // priority sentinel; they are not published artifact assertions.
+                    if (priority != direct_source_priority and priority != std.math.maxInt(u64) and !self.edgeExpiredAt(decoded, now_ns)) {
+                        state.has_artifacts = true;
+                        state.phase = if (field_mapping) .field else .emit;
+                        resume_key.clearRetainingCapacity();
+                        continue :page;
+                    }
+                } else {
+                    const owner_end = internal_keys.findComponentTerminator(entry.key, prefix.len) orelse return error.InvalidGraphEdgeValue;
+                    var component = try decodeGraphKeyComponent(temporary, entry.key[prefix.len..owner_end]);
+                    defer component.deinit(temporary);
+                    if (has_owner and !std.mem.eql(u8, owner.items, component.bytes)) {
+                        if (!try appendCypherWinner(a, field_mapping, read, &output, state, owner.items, winner.items, &owned_bytes, limits.max_owned_bytes)) break :page;
+                        has_owner = false;
+                        winner.clearRetainingCapacity();
+                        state.winner_rank = std.math.maxInt(u64);
+                        if (output.items.len == limits.max_edges) break :page;
+                    }
+                    if (!has_owner) {
+                        owner.clearRetainingCapacity();
+                        try owner.appendSlice(temporary, component.bytes);
+                        has_owner = true;
+                    }
+                    scanned += 1;
+                    const rank = sourcePriorityRank(priority);
+                    const direct = priority == direct_source_priority or priority == std.math.maxInt(u64);
+                    const source_owner = std.mem.eql(u8, component.bytes, edge.source);
+                    const eligible = if (state.phase == .field) source_owner and direct else !(field_mapping and state.has_artifacts and source_owner and direct);
+                    if (eligible and !self.edgeExpiredAt(decoded, now_ns) and (winner.items.len == 0 or rank < state.winner_rank)) {
+                        winner.clearRetainingCapacity();
+                        try winner.appendSlice(temporary, entry.key);
+                        state.winner_rank = rank;
+                    }
+                }
+                resume_key.clearRetainingCapacity();
+                try resume_key.appendSlice(temporary, entry.key);
             }
-            for (candidates.items) |candidate| {
-                const decoded = try decodeEdgeValue(candidate.value);
-                var copy = edge;
-                // Legacy tuple mutations cannot address an individual direct
-                // contender. Keep a mixed artifact projection managed so a
-                // DELETE cannot erase another producer's private contenders.
-                copy.owner_document = if (has_artifacts or !std.mem.eql(u8, candidate.owner, edge.source)) candidate.owner else "";
-                copy.artifact_derived = has_artifacts;
-                copy.weight = decoded.weight;
-                copy.created_at = decoded.created_at;
-                copy.updated_at = decoded.updated_at;
-                copy.metadata = decoded.metadata;
-                copy.winner_rank = candidate.rank;
-                try appendCypherEdge(alloc, &output, copy, &owned_bytes, limits.max_owned_bytes);
+            if (state.phase == .classify) {
+                state.phase = .emit;
+                resume_key.clearRetainingCapacity();
+                continue;
+            }
+            if (has_owner and !try appendCypherWinner(a, field_mapping, read, &output, state, owner.items, winner.items, &owned_bytes, limits.max_owned_bytes)) break;
+            has_owner = false;
+            resume_key.clearRetainingCapacity();
+            winner.clearRetainingCapacity();
+            state.winner_rank = std.math.maxInt(u64);
+            if (state.phase == .field) {
+                // Fields and published assertions have separate lifecycles,
+                // even when one producer asserts the same physical tuple twice.
+                state.phase = .emit;
+                continue;
+            }
+            state.edge = null;
+            if (state.physical == null) {
+                finished = true;
+                break;
             }
         }
-        const expanded = try output.toOwnedSlice(alloc);
-        for (page.edges) |edge| freeEdge(alloc, edge);
-        alloc.free(page.edges);
-        page.edges = expanded;
-        page.owned_bytes = owned_bytes;
-        return page;
+        var next: ?CypherEdgeScanCursor = if (finished) null else try cypherPageCursor(a, state, resume_key.items, if (has_owner) owner.items else null, winner.items);
+        errdefer if (next) |*cursor| cursor.deinit(a);
+        return .{ .edges = try output.toOwnedSlice(a), .next_cursor = next, .owned_bytes = owned_bytes, .scanned_rows = scanned };
     }
 
     fn appendCypherEdge(alloc: Allocator, output: *std.ArrayListUnmanaged(Edge), edge: Edge, owned_bytes: *usize, max_bytes: usize) !void {
@@ -8619,7 +8772,7 @@ pub const GraphIndex = struct {
         if (limits.max_scanned_rows == 0) return error.GraphExploredEdgesBudgetExceeded;
         var context = try self.beginEdgeReadContext(direction);
         defer context.deinit();
-        return self.getEdgesByTypesPageInRead(alloc, key, edge_types, direction, scan_cursor, limits, now_ns, scanned_out, &context.reads);
+        return self.getEdgesByTypesPageInRead(alloc, key, edge_types, direction, scan_cursor, limits, now_ns, scanned_out, &context.reads, true);
     }
 
     fn getEdgesByTypesPageInRead(
@@ -8633,6 +8786,7 @@ pub const GraphIndex = struct {
         now_ns: u64,
         scanned_out: ?*usize,
         reads: *OwnershipReads,
+        select_contributors: bool,
     ) !EdgePage {
         if (scanned_out) |out| out.* = 0;
         if (limits.max_edges == 0) return error.GraphExploredEdgesBudgetExceeded;
@@ -8719,6 +8873,7 @@ pub const GraphIndex = struct {
                     direction == .both and phase == .in,
                     limits,
                     now_ns,
+                    select_contributors,
                 );
                 if (capped) |cursor| {
                     var owned_cursor = cursor;
@@ -8856,6 +9011,7 @@ pub const GraphIndex = struct {
                 now_ns,
                 &page_scanned,
                 reads,
+                true,
             ) catch |err| {
                 if (scanned_out) |out| out.* = total_scanned + page_scanned;
                 return err;
@@ -9002,7 +9158,7 @@ pub const GraphIndex = struct {
                             self.entry_charged = true;
                         }
                         var selection_budget = SelectionBudget{ .rows = &self.physical_rows_scanned, .limit = @import("work_budget.zig").default_max_explored_edges, .work = self.work_budget };
-                        if (try self.index.appendAdmittedEdge(a, if (self.incoming) |*reverse| reverse else null, &results, &owned_bytes, entry, self.phase, self.direction == .both and self.phase == .in, bytes, self.now_ns, &selection_budget) == .full) break;
+                        if (try self.index.appendAdmittedEdge(a, if (self.incoming) |*reverse| reverse else null, &results, &owned_bytes, entry, self.phase, self.direction == .both and self.phase == .in, bytes, self.now_ns, &selection_budget, true) == .full) break;
                         // Do not advance into (or decode) the unrequested tail.
                         self.advance = true;
                         continue;
@@ -9050,6 +9206,7 @@ pub const GraphIndex = struct {
         skip_mirrored_self_loops: bool,
         limits: EdgePageLimits,
         now_ns: u64,
+        select_contributors: bool,
     ) !?EdgeScanCursor {
         std.debug.assert(phase != .both);
         const phase_start_len = results.items.len;
@@ -9090,7 +9247,7 @@ pub const GraphIndex = struct {
 
             scanned_rows.* += 1;
             var selection_budget = SelectionBudget{ .rows = scanned_rows, .limit = limits.max_scanned_rows };
-            switch (try self.appendAdmittedEdge(alloc, selection_txn, results, owned_bytes, entry, phase, skip_mirrored_self_loops, limits.max_owned_bytes, now_ns, &selection_budget)) {
+            switch (try self.appendAdmittedEdge(alloc, selection_txn, results, owned_bytes, entry, phase, skip_mirrored_self_loops, limits.max_owned_bytes, now_ns, &selection_budget, select_contributors)) {
                 .full => {
                     // The next page will fetch this row again. Both backend
                     // visits count against the physical scan budget.
@@ -9117,12 +9274,12 @@ pub const GraphIndex = struct {
 
     /// Shared by RPC pages and retained native scans. No owned edge allocation
     /// takes place until the complete decoded edge fits the remaining budget.
-    fn appendAdmittedEdge(self: *GraphIndex, alloc: Allocator, selection_txn: ?*backend_erased.ReadTxn, results: *std.ArrayListUnmanaged(Edge), owned_bytes: *usize, entry: backend_erased.Entry, phase: EdgeDirection, skip_self_loops: bool, max_bytes: usize, now_ns: u64, budget: *SelectionBudget) !EdgeAdmission {
+    fn appendAdmittedEdge(self: *GraphIndex, alloc: Allocator, selection_txn: ?*backend_erased.ReadTxn, results: *std.ArrayListUnmanaged(Edge), owned_bytes: *usize, entry: backend_erased.Entry, phase: EdgeDirection, skip_self_loops: bool, max_bytes: usize, now_ns: u64, budget: *SelectionBudget, select_contributors: bool) !EdgeAdmission {
         const key = BorrowedEdgeKey.parse(entry.key, phase) orelse return .skipped;
         if (skip_self_loops and std.mem.eql(u8, key.source, key.target)) return .skipped;
         var selection: ?LiveEdgeSelection = null;
         defer if (selection) |owned| owned.deinit(alloc);
-        const selected = if (selection_txn != null and self.needsContributorSelection()) blk: {
+        const selected = if (select_contributors and selection_txn != null and self.needsContributorSelection()) blk: {
             const source_key = try BorrowedEdgeKey.decode(alloc, key.source);
             defer alloc.free(source_key);
             const target_key = try BorrowedEdgeKey.decode(alloc, key.target);
@@ -9142,7 +9299,7 @@ pub const GraphIndex = struct {
         } else entry.value;
         const decoded = try decodeEdgeValue(selected);
         var bytes: usize = @sizeOf(Edge);
-        for ([_]usize{ BorrowedEdgeKey.decodedLen(key.source), BorrowedEdgeKey.decodedLen(key.target), BorrowedEdgeKey.decodedLen(key.edge_type), BorrowedEdgeKey.decodedLen(key.edge_id), BorrowedEdgeKey.decodedLen(key.owner_document), decoded.metadata.len, if (selection) |owned| owned.key_hex.len else 0 }) |len|
+        for ([_]usize{ BorrowedEdgeKey.decodedLen(key.source), BorrowedEdgeKey.decodedLen(key.target), BorrowedEdgeKey.decodedLen(key.edge_type), BorrowedEdgeKey.decodedLen(key.edge_id), BorrowedEdgeKey.decodedLen(key.owner_document), if (select_contributors) decoded.metadata.len else 0, if (selection) |owned| owned.key_hex.len else 0 }) |len|
             bytes = std.math.add(usize, bytes, len) catch return error.GraphExploredEdgeBytesBudgetExceeded;
         if (bytes > max_bytes - owned_bytes.*) {
             if (results.items.len == 0) return error.GraphExploredEdgeBytesBudgetExceeded;
@@ -9158,7 +9315,9 @@ pub const GraphIndex = struct {
         errdefer alloc.free(edge_id);
         const owner_document = try BorrowedEdgeKey.decode(alloc, key.owner_document);
         errdefer alloc.free(owner_document);
-        const metadata = try alloc.dupe(u8, decoded.metadata);
+        // The private identity scan resolves payloads from contribution winners.
+        // A stale projected payload must neither allocate nor consume its output budget.
+        const metadata = try alloc.dupe(u8, if (select_contributors) decoded.metadata else "");
         errdefer alloc.free(metadata);
         const winner_key_hex = if (selection) |*owned| blk: {
             const key_hex = owned.key_hex;
@@ -37678,6 +37837,34 @@ test "graph untimed contributor order survives reopen and owner withdrawal" {
         try std.testing.expectEqualStrings("doc:z", assertions.edges[1].owner_document);
         try std.testing.expectEqual(@as(f64, 3), assertions.edges[1].weight);
         for (assertions.edges) |assertion| try std.testing.expect(assertion.artifact_derived);
+        // Even one physical row of work must make resumable progress through
+        // classification, owner winner selection, and the next adjacency.
+        for ([_]usize{ 1, 2, 3 }) |work_limit| {
+            var continuation: ?CypherEdgeScanCursor = null;
+            defer if (continuation) |*value| value.deinit(alloc);
+            var count: usize = 0;
+            var work: usize = 0;
+            var pages: usize = 0;
+            while (true) {
+                var tiny = try graph.getCypherEdgesByTypesPageAt(alloc, if (direction == .out) "a" else "b", &.{"links"}, direction, continuation, .{ .max_edges = 1, .max_scanned_rows = work_limit, .max_owned_bytes = 4096 }, std.math.maxInt(u64));
+                defer tiny.deinit(alloc);
+                if (continuation) |*value| value.deinit(alloc);
+                continuation = null;
+                try std.testing.expect(tiny.scanned_rows <= work_limit);
+                try std.testing.expect(tiny.edges.len <= 1);
+                for (tiny.edges) |assertion| {
+                    try std.testing.expectEqualStrings(if (count == 0) "doc:a" else "doc:z", assertion.owner_document);
+                    try std.testing.expectEqual(@as(f64, if (count == 0) 2 else 3), assertion.weight);
+                    count += 1;
+                }
+                pages += 1;
+                work += tiny.scanned_rows;
+                try std.testing.expect(pages < 12);
+                if (tiny.next_cursor) |value| continuation = try value.clone(alloc) else break;
+            }
+            try std.testing.expectEqual(@as(usize, 2), count);
+            try std.testing.expect(work <= 6);
+        }
     }
     try graph.replaceContributionSnapshots(&.{.{ .source = "a", .target = "b", .edge_type = "links", .owner = "doc:a", .contributions = &.{} }});
     const remaining = try graph.getEdges(alloc, "a", "links", .out);
@@ -39909,5 +40096,89 @@ test "graph metric native response adoption batch ownership context" {
         defer GraphIndex.freeEdges(a, fresh);
         try std.testing.expectEqual(@as(usize, 1), fresh.len);
         std.debug.print("EDGE_READ_CONTEXT backend={s} keys=64 ownership_pairs=1 pinned_edges=2 fresh_edges=1\n", .{@tagName(kind)});
+    }
+}
+
+test "graph bounded adjacency pages resume Cypher owners and payload limits with pinned TTL" {
+    const a = std.testing.allocator;
+    var graph = try GraphIndex.openWithPrivateStores(a, "unused-out", "unused-in", "links", .{ .reverse_backend = .mem });
+    defer graph.close();
+    graph.ttl_duration_ns = 5;
+    const stale = try std.fmt.allocPrint(a, "{{\"stale\":\"{s}\"}}", .{z17RepeatString("x", 2048)});
+    defer a.free(stale);
+    try graph.batchApply(&.{
+        .{ .source = "a", .target = "b", .edge_type = "R", .edge_id = "fact", .owner_document = "claim", .ttl_created_ns = 10, .metadata_json = stale },
+        .{ .source = "a", .target = "c", .edge_type = "R", .ttl_created_ns = 10 },
+        .{ .source = "a", .target = "expired", .edge_type = "R", .ttl_created_ns = 1 },
+    }, &.{});
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const history = try arena.allocator().alloc(EdgeContribution, 32);
+    for (history, 0..) |*item, i| item.* = .{ .state_key = try std.fmt.allocPrint(arena.allocator(), "state:{d:0>3}", .{i}), .source_priority = if (i == 31) 0 else 1, .weight = @floatFromInt(i), .created_at = 0, .updated_at = 0, .ttl_created_ns = 10, .metadata_json = "" };
+    try graph.replaceContributionSnapshots(&.{.{ .source = "a", .target = "b", .edge_type = "R", .edge_id = "fact", .owner_document = "claim", .owner = "", .contributions = history }});
+    try graph.replaceContributionSnapshots(&.{.{ .source = "a", .target = "c", .edge_type = "R", .owner = "a", .contributions = &.{.{ .state_key = "", .source_priority = std.math.maxInt(u64), .weight = 1, .created_at = 0, .updated_at = 0, .ttl_created_ns = 10, .metadata_json = "" }} }});
+    var continuation: ?CypherEdgeScanCursor = null;
+    defer if (continuation) |*value| value.deinit(a);
+    var count: usize = 0;
+    var pages: usize = 0;
+    while (true) {
+        var page = try graph.getCypherEdgesByTypesPageAt(a, "a", &.{"R"}, .out, continuation, .{ .max_edges = 2, .max_scanned_rows = 3, .max_owned_bytes = @sizeOf(Edge) + 40 }, 10);
+        defer page.deinit(a);
+        if (continuation) |*value| value.deinit(a);
+        continuation = null;
+        try std.testing.expect(page.scanned_rows <= 3);
+        try std.testing.expect(page.edges.len <= 1);
+        for (page.edges) |edge| {
+            if (count == 0) {
+                try std.testing.expectEqualStrings("b", edge.target);
+                try std.testing.expectEqualStrings("claim", edge.owner_document);
+                try std.testing.expectEqual(@as(f64, 31), edge.weight);
+                try std.testing.expect(edge.artifact_derived);
+            } else {
+                try std.testing.expectEqualStrings("c", edge.target);
+                try std.testing.expect(!edge.artifact_derived);
+            }
+            count += 1;
+        }
+        pages += 1;
+        try std.testing.expect(pages < 20);
+        if (page.next_cursor) |value| continuation = try value.clone(a) else break;
+    }
+    try std.testing.expectEqual(@as(usize, 2), count);
+}
+
+test "graph bounded adjacency pages separate fields and published assertions from one producer" {
+    const a = std.testing.allocator;
+    var graph = try GraphIndex.openWithPrivateStores(a, "unused-out", "unused-in", "links", .{ .reverse_backend = .mem, .edge_type_configs = &.{.{ .name = "R", .field_name = "ref" }} });
+    defer graph.close();
+    try graph.batchApply(&.{.{ .source = "a", .target = "b", .edge_type = "R", .weight = 1 }}, &.{});
+    try graph.replaceContributionSnapshots(&.{
+        .{ .source = "a", .target = "b", .edge_type = "R", .owner = "a", .contributions = &.{
+            .{ .state_key = "field", .source_priority = std.math.maxInt(u64), .weight = 1, .created_at = 0, .updated_at = 0, .ttl_created_ns = 0, .metadata_json = "" },
+            .{ .state_key = "artifact", .source_priority = 0, .weight = 2, .created_at = 0, .updated_at = 0, .ttl_created_ns = 0, .metadata_json = "" },
+        } },
+        .{ .source = "a", .target = "b", .edge_type = "R", .owner = "claim", .contributions = &.{.{ .state_key = "artifact", .source_priority = 0, .weight = 3, .created_at = 0, .updated_at = 0, .ttl_created_ns = 0, .metadata_json = "" }} },
+    });
+    for ([_]EdgeDirection{ .out, .in }) |direction| {
+        var continuation: ?CypherEdgeScanCursor = null;
+        defer if (continuation) |*value| value.deinit(a);
+        var count: usize = 0;
+        var pages: usize = 0;
+        while (true) {
+            var page = try graph.getCypherEdgesByTypesPageAt(a, if (direction == .out) "a" else "b", &.{"R"}, direction, continuation, .{ .max_edges = 1, .max_scanned_rows = 1, .max_owned_bytes = 4096 }, 1);
+            defer page.deinit(a);
+            if (continuation) |*value| value.deinit(a);
+            continuation = null;
+            for (page.edges) |edge| {
+                try std.testing.expectEqual(@as(f64, @floatFromInt(count + 1)), edge.weight);
+                try std.testing.expectEqual(count == 0, edge.field_derived);
+                try std.testing.expectEqual(count != 0, edge.artifact_derived);
+                count += 1;
+            }
+            pages += 1;
+            try std.testing.expect(pages < 20);
+            if (page.next_cursor) |value| continuation = try value.clone(a) else break;
+        }
+        try std.testing.expectEqual(@as(usize, 3), count);
     }
 }

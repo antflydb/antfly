@@ -189,6 +189,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
         pub fn batchContext(self: anytype) BatchExecutionContext {
             const resources = S.ownerField(self, "core").*.batchExecutionResources();
             return .{
+                .ordered_artifact_publication_required = S.ownerField(self, "local_execution").*.artifact_publication_dispatcher != null,
                 .alloc = S.ownerField(self, "alloc").*,
                 .store = resources.store,
                 .applied_sequence_checkpoint_path = resources.applied_sequence_checkpoint_path,
@@ -1190,9 +1191,9 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             if (opts.transaction_resolution == null) {
                 try S.ownerField(self, "core").*.checkOrdinaryWriteConflicts(effective_ops.writes, effective_ops.deletes);
                 var graph_sources: std.ArrayList(types.BatchWrite) = .empty;
-                defer graph_sources.deinit(self.alloc);
-                for (effective_req.graph_writes) |edge| try graph_sources.append(self.alloc, .{ .key = edge.source, .value = "" });
-                for (effective_req.graph_deletes) |edge| try graph_sources.append(self.alloc, .{ .key = edge.source, .value = "" });
+                defer graph_sources.deinit(S.ownerField(self, "alloc").*);
+                for (effective_req.graph_writes) |edge| try graph_sources.append(S.ownerField(self, "alloc").*, .{ .key = edge.source, .value = "" });
+                for (effective_req.graph_deletes) |edge| try graph_sources.append(S.ownerField(self, "alloc").*, .{ .key = edge.source, .value = "" });
                 try S.ownerField(self, "core").*.checkOrdinaryWriteConflicts(graph_sources.items, &.{});
             }
             try self.validateTransformReadSnapshot(transform_snapshot);
@@ -1288,10 +1289,10 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             // Touch its primary storage key so existing SQL range observations
             // detect graph phantoms and prepared graph writers fence outsiders.
             var touched_graph_sources = std.StringHashMapUnmanaged(void).empty;
-            defer touched_graph_sources.deinit(self.alloc);
+            defer touched_graph_sources.deinit(S.ownerField(self, "alloc").*);
             inline for (.{ effective_req.graph_writes, effective_req.graph_deletes }) |edges| for (edges) |edge| {
                 if (touched_graph_sources.contains(edge.source)) continue;
-                try touched_graph_sources.put(self.alloc, edge.source, {});
+                try touched_graph_sources.put(S.ownerField(self, "alloc").*, edge.source, {});
                 var primary_written = false;
                 for (effective_ops.writes) |write| if (std.mem.eql(u8, write.key, edge.source)) {
                     primary_written = true;
@@ -1302,22 +1303,22 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     break;
                 };
                 if (primary_written) continue;
-                const key = try encodeStoreLookupKeyAlloc(self, self.alloc, edge.source);
-                defer self.alloc.free(key);
-                const existing = self.core.store.get(self.alloc, key) catch |err| switch (err) {
+                const key = try encodeStoreLookupKeyAlloc(self, S.ownerField(self, "alloc").*, edge.source);
+                defer S.ownerField(self, "alloc").*.free(key);
+                const existing = S.ownerField(self, "core").*.store.get(S.ownerField(self, "alloc").*, key) catch |err| switch (err) {
                     error.NotFound => continue,
                     else => return err,
                 };
-                owned_store_values.append(self.alloc, existing) catch |err| {
-                    self.alloc.free(existing);
+                owned_store_values.append(S.ownerField(self, "alloc").*, existing) catch |err| {
+                    S.ownerField(self, "alloc").*.free(existing);
                     return err;
                 };
-                const copied_key = try self.alloc.dupe(u8, key);
-                owned_store_keys.append(self.alloc, copied_key) catch |err| {
-                    self.alloc.free(copied_key);
+                const copied_key = try S.ownerField(self, "alloc").*.dupe(u8, key);
+                owned_store_keys.append(S.ownerField(self, "alloc").*, copied_key) catch |err| {
+                    S.ownerField(self, "alloc").*.free(copied_key);
                     return err;
                 };
-                try store_writes.append(self.alloc, .{ .key = copied_key, .value = existing });
+                try store_writes.append(S.ownerField(self, "alloc").*, .{ .key = copied_key, .value = existing });
             };
             const vector_field_names_start_ns = monotonicTimeNs();
             const vector_store_field_names = if (relationalColumns(self) == null)

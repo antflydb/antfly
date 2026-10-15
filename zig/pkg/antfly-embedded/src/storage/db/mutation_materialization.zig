@@ -10236,7 +10236,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 const mention_artifact_key = try resolutionMentionArtifactKeyAlloc(alloc, doc_key, cfg.source_artifact, cfg.resolution_artifact, entity.local_id);
                 var mention_key_owned = true;
                 errdefer if (mention_key_owned) alloc.free(mention_artifact_key);
-                const aggregate = try findOrAppendMentionEdgeAggregate(alloc, &aggregates, entity.doc_ref.key, entity.doc_ref.table);
+                const aggregate = try findOrAppendMentionEdgeAggregate(alloc, &aggregates, entity.doc_ref.key, entity.doc_ref.storage_table orelse entity.doc_ref.table);
                 try aggregate.appendMentionArtifactKey(alloc, mention_artifact_key);
                 mention_key_owned = false;
                 aggregate.mention_confidence = @max(aggregate.mention_confidence, mention_confidence);

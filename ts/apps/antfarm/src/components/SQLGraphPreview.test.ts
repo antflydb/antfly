@@ -21,6 +21,24 @@ describe("SQL returned graph values", () => {
       )
     ).toEqual([]);
   });
+  it("accepts every managed relationship kind and preserves its producer", () => {
+    for (const ownership of ["document", "field", "artifact"]) {
+      const edge = {
+        type: "relationship",
+        value: {
+          identity: { table: "docs", key: "opaque-fact" },
+          index: "links",
+          type: "LINK",
+          source: { table: "docs", key: "a" },
+          target: { table: "docs", key: "b" },
+          ownership,
+          producer: { table: "docs", key: "claim" },
+          properties: { type: "map", value: {} },
+        },
+      };
+      expect(sqlGraphValues(result([[JSON.stringify(edge)]]))).toEqual([edge]);
+    }
+  });
   it("preserves qualified identities inside encoded JSON paths", () => {
     const node = {
       type: "node",

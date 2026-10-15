@@ -1710,6 +1710,78 @@ fn implementationTests() type {
             try std.testing.expect(findIndexConfig(configs, "full_text_index_v0").?.kind == .full_text);
         }
 
+        test "target index reconciliation installs inline resolvers without changing siblings" {
+            const alloc = std.testing.allocator;
+            var directory = try @import("antfly_local_sources").common_test_directory.TestDirectory.initFast("target-resolver");
+            defer directory.cleanup();
+            var db = try db_mod.DB.open(alloc, directory.path(), .{ .start_index_workers = false, .ttl_cleanup = .{ .enabled = false } });
+            defer db.close();
+            const initial =
+                \\{"keep_idx":{"type":"graph","source":{"artifact":"kg","format":"extraction_graph"},"artifact":{"name":"kg","kind":"asset","source":{"type":"field","value":"kg"},"content_type":"application/json"}},"resolvers":[{"name":"sibling","table":"docs","promote":false,"source_artifact":"kg","resolution_artifact":"sibling_resolved","key_template":"doc/{{ uslug _entity.text }}","config_generation":1,"_antfly_destination_authorization_v1":{"principal":"service:auth-disabled","signature":"auth-disabled","destinations":["docs"]}}]}
+            ;
+            _ = try reconcileDbIndexesWithOptions(alloc, &db, initial, .{ .drain_resolver_backfill = false, .source_table = "docs" });
+            const target_config =
+                \\{"source":{"artifact":"kg","format":"extraction_graph"},"artifact":{"name":"kg","kind":"asset","source":{"type":"field","value":"kg"},"content_type":"application/json"},"resolvers":[{"name":"inline_target","table":"docs","promote":false,"source_artifact":"kg","resolution_artifact":"target_resolved","key_template":"doc/{{ uslug _entity.text }}","config_generation":1,"_antfly_destination_authorization_v1":{"principal":"service:auth-disabled","signature":"auth-disabled","destinations":["docs"]}}]}
+            ;
+            const sibling_config =
+                \\{"resolvers":[{"name":"sibling","table":"docs","promote":false,"source_artifact":"kg","resolution_artifact":"sibling_resolved","key_template":"changed/{{ uslug _entity.text }}","config_generation":2}]}
+            ;
+            var target = try std.json.parseFromSlice(std.json.Value, alloc, target_config, .{});
+            defer target.deinit();
+            var sibling = try std.json.parseFromSlice(std.json.Value, alloc, sibling_config, .{});
+            defer sibling.deinit();
+            // A resolver inside the target remains subject to the same stored
+            // destination grant checks as a table-level resolver.
+            var rejected = try std.json.parseFromSlice(std.json.Value, alloc, target_config, .{});
+            defer rejected.deinit();
+            _ = rejected.value.object.getPtr("resolvers").?.array.items[0].object.swapRemove("_antfly_destination_authorization_v1");
+            const rejected_json = try std.json.Stringify.valueAlloc(alloc, .{ .bad_idx = rejected.value }, .{});
+            defer alloc.free(rejected_json);
+            try std.testing.expectError(error.StoredDestinationAuthorizationMissing, reconcileDbIndexTargetWithOptions(alloc, &db, rejected_json, "bad_idx", .{ .drain_resolver_backfill = false, .source_table = "docs" }));
+            const desired = try std.json.Stringify.valueAlloc(alloc, .{ .indexes = .{
+                .{ .name = "target_idx", .type = "graph", .config = target.value },
+                .{ .name = "unrelated_new", .type = "graph", .config = sibling.value },
+            } }, .{});
+            defer alloc.free(desired);
+            const added = try reconcileDbIndexTargetWithOptions(alloc, &db, desired, "target_idx", .{ .drain_resolver_backfill = false, .source_table = "docs" });
+            try std.testing.expectEqual(@as(usize, 1), added.resolvers_added);
+            try std.testing.expectEqual(@as(usize, 0), added.resolvers_updated);
+            const repeated = try reconcileDbIndexTargetWithOptions(alloc, &db, desired, "target_idx", .{ .drain_resolver_backfill = false, .source_table = "docs" });
+            try std.testing.expectEqual(@as(usize, 0), repeated.resolvers_added);
+            try std.testing.expectEqual(@as(usize, 0), repeated.resolvers_updated);
+            const resolvers = try db.listResolvers(alloc);
+            defer {
+                for (resolvers) |*resolver| resolver.deinit(alloc);
+                alloc.free(resolvers);
+            }
+            try std.testing.expectEqual(@as(usize, 2), resolvers.len);
+            for (resolvers) |resolver| {
+                try std.testing.expectEqual(@as(u64, 1), resolver.config_generation);
+                if (std.mem.eql(u8, resolver.name, "inline_target")) try std.testing.expectEqual(@as(?bool, true), resolver.inline_managed);
+            }
+            const configs = try db.listIndexes(alloc);
+            defer db_mod.types.freeIndexConfigs(alloc, configs);
+            try std.testing.expect(findIndexConfig(configs, "keep_idx") != null);
+            try std.testing.expect(findIndexConfig(configs, "unrelated_new") == null);
+            try std.testing.expect(findIndexConfig(configs, "bad_idx") == null);
+            const without_target = try std.json.Stringify.valueAlloc(alloc, .{ .indexes = .{
+                .{ .name = "unrelated_new", .type = "graph", .config = sibling.value },
+            } }, .{});
+            defer alloc.free(without_target);
+            const deleted = try reconcileDbIndexTargetWithOptions(alloc, &db, without_target, "target_idx", .{ .drain_resolver_backfill = false, .source_table = "docs" });
+            try std.testing.expectEqual(@as(usize, 1), deleted.indexes_removed);
+            const retried = try reconcileDbIndexTargetWithOptions(alloc, &db, without_target, "target_idx", .{ .drain_resolver_backfill = false, .source_table = "docs" });
+            try std.testing.expectEqual(@as(usize, 0), retried.resolvers_removed);
+            const remaining_resolvers = try db.listResolvers(alloc);
+            defer {
+                for (remaining_resolvers) |*resolver| resolver.deinit(alloc);
+                alloc.free(remaining_resolvers);
+            }
+            try std.testing.expectEqual(@as(usize, 1), remaining_resolvers.len);
+            try std.testing.expectEqualStrings("sibling", remaining_resolvers[0].name);
+            try std.testing.expectEqual(@as(u64, 1), remaining_resolvers[0].config_generation);
+        }
+
         test "target index reconciliation never mutates sibling indexes" {
             const path = "/tmp/antfly-metadata-table-provisioner-target-index";
             var io_impl = std.Io.Threaded.init(std.testing.allocator, .{});

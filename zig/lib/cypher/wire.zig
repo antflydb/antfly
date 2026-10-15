@@ -48,7 +48,7 @@ pub const Value = struct {
                 try writer.endObject();
             },
             .node => |node| try writer.write(.{ .identity = node.identity, .labels = node.labels, .properties = Value{ .value = .{ .map = node.properties } } }),
-            .relationship => |r| try writer.write(.{ .identity = r.identity, .index = r.index, .type = r.type, .source = r.source, .target = r.target, .ownership = r.ownership, .properties = Value{ .value = .{ .map = r.properties } } }),
+            .relationship => |r| try writer.write(.{ .identity = r.identity, .index = r.index, .type = r.type, .source = r.source, .target = r.target, .ownership = r.ownership, .producer = r.producer, .properties = Value{ .value = .{ .map = r.properties } } }),
             .path => |p| {
                 try writer.beginObject();
                 try writer.objectField("nodes");
@@ -111,12 +111,12 @@ fn decode(a: std.mem.Allocator, input: std.json.Value, depth: usize, entities: b
         return .{ .node = result };
     }
     if (entities and std.mem.eql(u8, kind.string, "relationship")) {
-        const Input = struct { identity: v.Identity, index: []const u8, type: []const u8, source: v.Identity, target: v.Identity, ownership: @FieldType(v.Relationship, "ownership"), properties: std.json.Value };
+        const Input = struct { identity: v.Identity, index: []const u8, type: []const u8, source: v.Identity, target: v.Identity, ownership: @FieldType(v.Relationship, "ownership"), producer: ?v.Identity = null, properties: std.json.Value };
         const relation = try std.json.parseFromValueLeaky(Input, a, value, .{ .allocate = .alloc_always });
         const properties = try decode(a, relation.properties, depth + 1, true);
         if (properties != .map or relation.identity.table.len == 0 or relation.identity.key.len == 0 or relation.index.len == 0 or relation.type.len == 0) return error.InvalidCypherWireValue;
         const result = try a.create(v.Relationship);
-        result.* = .{ .identity = relation.identity, .index = relation.index, .type = relation.type, .source = relation.source, .target = relation.target, .ownership = relation.ownership, .properties = properties.map };
+        result.* = .{ .identity = relation.identity, .index = relation.index, .type = relation.type, .source = relation.source, .target = relation.target, .ownership = relation.ownership, .producer = relation.producer, .properties = properties.map };
         return .{ .relationship = result };
     }
     if (entities and std.mem.eql(u8, kind.string, "path")) {
@@ -152,4 +152,20 @@ test "graph wire preserves signed integers and map discriminator keys" {
     try std.testing.expect(v.Value.eql(original, try parameter(a, parsed)));
     const forged = try std.json.parseFromSliceLeaky(std.json.Value, a, "{\"type\":\"node\",\"value\":{}}", .{});
     try std.testing.expectError(error.InvalidCypherWireValue, parameter(a, forged));
+}
+
+test "relationship transport and cloning retain explicit producer identity" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    for ([_]@FieldType(v.Relationship, "ownership"){ .document, .field, .artifact }) |ownership| {
+        const relationship: v.Relationship = .{ .identity = .{ .table = "docs", .key = "opaque-fact" }, .index = "links", .type = "LINK", .source = .{ .table = "docs", .key = "a" }, .target = .{ .table = "docs", .key = "b" }, .ownership = ownership, .producer = .{ .table = "docs", .key = "claim" } };
+        const cloned = try (v.Value{ .relationship = &relationship }).clone(a);
+        const json = try std.json.Stringify.valueAlloc(a, Value{ .value = cloned }, .{});
+        const parsed = try std.json.parseFromSliceLeaky(std.json.Value, a, json, .{});
+        const decoded = try transport(a, parsed);
+        try std.testing.expect(decoded.relationship.producer.?.eql(relationship.producer.?));
+        try std.testing.expectEqual(ownership, decoded.relationship.ownership);
+        try std.testing.expect((try decoded.relationship.producingDocument(a)).?.eql(relationship.producer.?));
+    }
 }

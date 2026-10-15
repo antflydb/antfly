@@ -22355,8 +22355,9 @@ fn prepareGraphAssetForRuntime(
             for (existing) |entry| {
                 if (write_positions.contains(entry.key)) continue;
                 if (protected_set.contains(entry.key)) continue;
-                try deletes.append(runtime.alloc, try runtime.alloc.dupe(u8, entry.key));
-                try appendUniqueIndexedRuntimeKey(runtime.alloc, &window.changed_artifact_keys, &window.changed_artifact_key_index, entry.key);
+                // Discovery is not deletion: a field or another producer may
+                // still own this physical edge. Reconciliation below selects
+                // its surviving winner before choosing a write or a delete.
                 // This edge has no tracked per-document state (previous_keys
                 // is null), so it is only found by the raw scan above. Feed
                 // it into the contender reconciliation below as a departing
@@ -22509,8 +22510,9 @@ fn prepareGraphAssetDeleteForRuntime(
             defer backend_scan.freeResults(runtime.alloc, existing);
             for (existing) |entry| {
                 if (protected_set.contains(entry.key)) continue;
-                try deletes.append(runtime.alloc, try runtime.alloc.dupe(u8, entry.key));
-                try appendUniqueIndexedRuntimeKey(runtime.alloc, &window.changed_artifact_keys, &window.changed_artifact_key_index, entry.key);
+                // Discovery is not deletion: a field or another producer may
+                // still own this physical edge. Reconciliation below selects
+                // its surviving winner before choosing a write or a delete.
                 // See the matching comment in materializeGraphAssetForRuntime:
                 // this edge is only visible via the raw scan above, so it
                 // must be reconciled as a departing contender or the

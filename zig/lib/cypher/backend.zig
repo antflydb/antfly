@@ -53,6 +53,8 @@ pub const Backend = struct {
         bind: *const fn (*anyopaque, std.mem.Allocator, catalog.Graph) anyerror!void,
         checkpoint: *const fn (*anyopaque) anyerror!void,
         scan: *const fn (*anyopaque, std.mem.Allocator, []const u8, ?[]const u8, usize) anyerror!Page(*const v.Node),
+        /// Authorized document lookup also serves nonvertex producers. The runtime
+        /// applies graph membership before admitting traversal endpoints.
         get: *const fn (*anyopaque, std.mem.Allocator, v.Identity) anyerror!?*const v.Node,
         /// Resolve the current statement postimage of a retained relationship
         /// alias. Mutable adapters provide this even without read projection.

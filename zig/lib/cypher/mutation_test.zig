@@ -599,3 +599,83 @@ test "producer deletion withdraws only its nonincident managed assertions" {
         try std.testing.expect(!overlay.relationships.items[1].deleted);
     }
 }
+
+test "producer postimages preserve facts and artifacts while refreshing fields and authority" {
+    const Host = struct {
+        fn commit(_: *anyopaque, _: A, _: []const b.Mutation) !void {}
+        fn relationships(_: *anyopaque, _: A, _: *const v.Node) ![]const *const v.Relationship {
+            return &.{};
+        }
+        fn project(_: *anyopaque, _: A, node: *const v.Node) !?*const v.Node {
+            return if ((v.Value{ .node = node }).property("hidden").eql(.{ .boolean = true })) null else node;
+        }
+    };
+    for ([_]@FieldType(v.Relationship, "ownership"){ .document, .artifact, .field }) |ownership| {
+        for ([_]bool{ false, true }) |hidden| {
+            var fixture = Fixture.init();
+            defer fixture.arena.deinit();
+            var seeded = try fixture.run("CREATE (a:Person {name:'a'}),(b:Person {name:'b'}),(c:Person {name:'claim'})");
+            seeded.deinit();
+            var relationship: v.Relationship = .{ .identity = .{ .table = "people", .key = "opaque-fact" }, .index = "links", .type = "KNOWS", .source = fixture.nodes[0].identity, .target = fixture.nodes[1].identity, .ownership = ownership, .producer = fixture.nodes[2].identity };
+            fixture.relationships = &.{&relationship};
+            var callbacks = fixture.backend().vtable.*;
+            callbacks.document_relationships = Host.relationships;
+            callbacks.project_postimage = Host.project;
+            var overlay: root.transaction.Overlay = .{ .base = .{ .ptr = &fixture, .vtable = &callbacks }, .host = .{ .ptr = &fixture, .new_identity = Fixture.identity, .commit = Host.commit } };
+            var diagnostic: root.compiler.Diagnostic = .{};
+            var query = try root.compiler.compile(std.testing.allocator, if (hidden) "MATCH (n:Person {name:'claim'}) SET n.hidden=true WITH 1 AS ignored MATCH ()-[r:KNOWS]->() RETURN count(r)" else "MATCH (n:Person {name:'claim'}) SET n.note='updated' WITH 1 AS ignored MATCH ()-[r:KNOWS]->() RETURN count(r)", .{}, &diagnostic);
+            defer query.deinit();
+            var result = try root.runtime.execute(std.testing.allocator, overlay.backend(), graph, &query, &.{}, .{});
+            defer result.deinit();
+            try std.testing.expectEqual(@as(i64, if (hidden or ownership == .field) 0 else 1), result.rows[0][0].integer);
+        }
+    }
+}
+
+test "materialized producer lookup retains nonvertices under the capture fence" {
+    const Captured = struct {
+        fn scan(ptr: *anyopaque, a: A, _: []const u8, after: ?[]const u8, _: usize) !b.Page(*const v.Node) {
+            if (after != null) return error.UnexpectedCursor;
+            return .{ .items = try a.dupe(*const v.Node, Fixture.self(ptr).nodes[0..2]) };
+        }
+    };
+    var fixture = Fixture.init();
+    defer fixture.arena.deinit();
+    var seeded = try fixture.run("CREATE (a:Person {name:'a',kind:'vertex'}),(b:Person {name:'b',kind:'vertex'}),(c:Person {name:'claim',kind:'producer'})");
+    seeded.deinit();
+    const filtered: root.catalog.Graph = .{ .name = "vertices", .incarnation = 1, .revision = 1, .labels = &.{.{ .name = "Person", .table = "people", .predicate = &.{.{ .name = "kind", .value = .{ .string = "vertex" } }} }}, .relationships = graph.relationships };
+    var relationship: v.Relationship = .{ .identity = .{ .table = "people", .key = "opaque-fact" }, .index = "links", .type = "KNOWS", .source = fixture.nodes[0].identity, .target = fixture.nodes[1].identity, .ownership = .document, .producer = fixture.nodes[2].identity };
+    fixture.relationships = &.{&relationship};
+    var callbacks = fixture.backend().vtable.*;
+    callbacks.scan = Captured.scan;
+    const snapshot = try root.snapshot.Materialized.create(std.testing.allocator, .{ .ptr = &fixture, .vtable = &callbacks }, filtered, .{});
+    defer snapshot.deinit();
+    const producer = fixture.nodes[2].identity;
+    try fixture.patch(.{ .node = producer }, &.{.{ .name = "name", .value = .{ .string = "newer" } }}, false, &.{});
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const backend = snapshot.backend();
+    const retained = (try backend.vtable.get(backend.ptr, arena.allocator(), producer)).?;
+    try std.testing.expectEqualStrings("claim", (v.Value{ .node = retained }).property("name").string);
+    try std.testing.expectEqual(@as(usize, 3), snapshot.overlay.nodes.items.len);
+    try std.testing.expectEqual(@as(usize, 1), snapshot.overlay.relationships.items.len);
+}
+
+test "missing producers suppress every assertion with one bounded lookup" {
+    var fixture = Fixture.init();
+    defer fixture.arena.deinit();
+    var seeded = try fixture.run("CREATE (a:Person {name:'a'}),(b:Person {name:'b'})");
+    seeded.deinit();
+    const a = fixture.arena.allocator();
+    const edges = try a.alloc(*const v.Relationship, 2);
+    for (edges, 0..) |*edge, index| {
+        const relationship = try a.create(v.Relationship);
+        relationship.* = .{ .identity = .{ .table = "people", .key = if (index == 0) "first" else "second" }, .index = "links", .type = "KNOWS", .source = fixture.nodes[0].identity, .target = fixture.nodes[1].identity, .ownership = .document, .producer = .{ .table = "people", .key = "missing" } };
+        edge.* = relationship;
+    }
+    fixture.relationships = edges;
+    const snapshot = try root.snapshot.Materialized.create(std.testing.allocator, fixture.backend(), graph, .{});
+    defer snapshot.deinit();
+    try std.testing.expectEqual(@as(usize, 3), snapshot.overlay.captured.scanned_anchors);
+    for (snapshot.overlay.relationships.items) |relationship| try std.testing.expect(relationship.deleted);
+}

@@ -583,3 +583,17 @@ test "shortest selectors resolve later MATCH predicates and preserve surrounding
     try check("UNWIND [1,1] AS x MATCH p=shortestPath((a:Document {id:'a'})-[:CITES*1..3]->(b:Document {id:'b'})),(:Document) RETURN count(*)", "[[6]]");
     try check("MATCH p=shortestPath((a:Document {id:'a'})-[:CITES*1..3]->(b:Document {id:'b'})) WHERE length(p)=3 RETURN length(p)", "[]");
 }
+
+test "shortest selection groups independent patterns within a linear checkpoint budget" {
+    for ([_][]const u8{ "shortestPath", "allShortestPaths" }) |selector| {
+        const query = try std.fmt.allocPrint(std.testing.allocator, "MATCH p={s}((a:Document)-[:CITES*0..0]->(b)),(c:Document),(d:Document),(e:Document),(f:Document),(g:Document),(h:Document) RETURN count(*)", .{selector});
+        defer std.testing.allocator.free(query);
+        var diagnostic: c.Diagnostic = .{};
+        var compiled = try c.compile(std.testing.allocator, query, .{}, &diagnostic);
+        defer compiled.deinit();
+        var fixture: Fixture = .{ .cancel_after = 100_000 };
+        var result = try runtime.execute(std.testing.allocator, fixture.backend(), graph, &compiled, &.{}, .{});
+        defer result.deinit();
+        try std.testing.expectEqual(@as(i64, 2187), result.rows[0][0].integer);
+    }
+}

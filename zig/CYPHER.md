@@ -710,10 +710,62 @@ producer's winning live value. Ordinary graph APIs keep their aggregate adjacenc
 projection. A legacy direct contender sharing an artifact projection also remains
 managed, because tuple-level writes cannot isolate its private contributor state.
 Explicit stable-ID relationships can coexist in the same index and remain writable.
-Artifact and field-derived relationships reject direct `SET`, `REMOVE`,
-and `DELETE`. Deleting a producer withdraws its nonincident assertions immediately
+Producer-owned facts, artifacts, and field-derived relationships reject direct `SET`, `REMOVE`,
+and `DELETE`. Relationship wire values carry their producer identity independently
+of the opaque relationship ID. Ownership distinguishes explicit edges, manually
+owned document facts, deterministic field projections (`field`), and published
+artifact assertions. Updating a producer rebuilds its field projections; unrelated
+updates preserve manually owned facts and the last published artifact assertions.
+Field projections have a distinct identity from artifact assertions, including
+when both share a producer and traversal endpoints.
+Postimage read authority applies to producers independently of graph label
+membership. Referenced producers are captured under the same snapshot fences,
+including nonvertices, with budgeted, deduplicated lookups and indexed identity
+resolution. Losing read authority hides their assertions in the statement view.
+Online graph index activation installs its own resolver dependencies under stored
+destination authorization, preserves sibling definitions, and schedules corpus
+backfill outside the DDL barrier.
+Contribution selection resumes within an owner under physical work and output
+budgets, so fan-in does not require materializing every producer in one page.
+Artifact reconciliation chooses the surviving contributor before emitting either
+a physical edge write or deletion, keeping ordered effects and their guards unique.
+Ordered resolver replay records authored review overrides (including absence)
+with exact value/revision guards; these inputs do not require generated receipts.
+Deleting a producer withdraws its nonincident assertions immediately
 in Cypher and staged SQL `GRAPH_TABLE` views; other producers' assertions survive.
 Endpoint deletion still follows the normal `DELETE`/`DETACH DELETE` rules.
+Replicated owners order the installed producer catalog and its activation through
+reserved control capacity before accepting asynchronous output. Reopens and
+reconciliation retry the catalog/activation receipt gap; hidden restore and child
+roots stay quiescent. Receiver-local completion and publication events wake the
+coalesced status publisher without adding replay debt. Startup reconciliation
+retains owners until producer completion and resolver replay settle. Resolver
+backfill hints remain schedulable after activation, while the hint-only boundary
+rejects bundled producer effects. Accepted publications wake enrichment, resolver,
+and promotion consumers at the durable replay boundary; background candidate
+reads carry bounded deadlines so owner transitions can make progress. Committed
+graph writes prepare missing physical graph indexes on the independent owner
+control worker, preserving newer durable schemas and sibling indexes during
+historical replay. Read-only status loads the existing physical root identity
+and derives direct source names from catalog configuration, retaining completion
+proofs after a live owner retires. Status observes resident historical owners
+under physical-root, table identity, range, and storage fences; query admission
+still requires current catalog metadata. Cached index detail and lifecycle status
+refresh incomplete producer observations until native completion is visible,
+then resume the cache fast path. Metadata registration, heartbeats, and cached
+capability summaries require framed runtime-status transport for producer
+completion or pending graph counts, including enclosing store and per-group
+codecs; older profiles cannot silently drop these facts. Resolver candidate batches
+retain their pinned physical table bindings and bulk reads across the private
+compiled callback boundary. Resolution artifacts keep public table names for
+curation alongside immutable `storage_table` identities; graph endpoint routing
+and mention edges prefer those identities, including after public-name rebinding.
+Bulk callback scratch space is bounded while complete candidate sets remain
+supported. Ordered transaction resolution publishes durable effects without
+waiting for producer output through the same Raft progress driver; the proposing
+request enforces its visibility barrier after apply confirmation. Resolver catalog hashing accepts the same versioned envelope
+as the resolver reader. SQL `GRAPH_TABLE` consumes normalized staged postimages,
+including encoded rows, without applying defaults or generated expressions again.
 
 Specify stable relationship IDs, parallel edges, uniqueness, concurrent `MERGE`,
 endpoint deletion, detach semantics, policy enforcement, and atomicity. Reuse
@@ -777,8 +829,9 @@ misrepresent the original query result.
   branch followed by a write. Failures roll back every branch. Write admission
   checks the entire query before resolving permissions or opening owner cuts.
   Retained overlays use the configured intermediate-state ceiling without a
-  separate 65,536-entity write limit. Owner range proofs validate the complete
-  cut at prepare; production writes do not materialize a predicate per row.
+  separate 65,536-entity write limit. Retained owner reads are released once
+  postimages and conflict proofs are owned, before distributed prepare/commit.
+  Owner range proofs validate the complete cut at prepare; production writes do not materialize a predicate per row.
   CREATE preserves explicit nulls through SQL default evaluation and validates
   requested labels after defaults and generated columns have been normalized.
   CREATE/MERGE reject labels or properties on an already-bound node before

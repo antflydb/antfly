@@ -44,6 +44,14 @@ pub const DistributedCandidateSource = struct {
     /// `read_index` keeps candidates consistent with committed writes; callers
     /// can relax this to `stale` to trade freshness for latency.
     consistency: raft_mod.ReadConsistency = .read_index,
+    /// A resolver holds its work turn while calling this adapter. Bound reads
+    /// so owner transitions can finish instead of waiting on a callback that
+    /// is itself waiting for that owner. Expiry retries the entire turn.
+    read_timeout_ns: u64 = 5 * std.time.ns_per_s,
+
+    fn readDeadline(self: *const DistributedCandidateSource) u64 {
+        return @import("antfly_platform").time.monotonicNs() +| self.read_timeout_ns;
+    }
 
     pub fn candidateSource(self: *DistributedCandidateSource) CandidateSource {
         return .{ .ptr = self, .vtable = &vtable };
@@ -121,7 +129,7 @@ pub const DistributedCandidateSource = struct {
         errdefer arena.deinit();
         const owned = try arena.allocator().alloc([]const u8, names.len);
         for (names, owned) |name, *copy| copy.* = try arena.allocator().dupe(u8, name);
-        batch.* = .{ .arena = arena, .raw = .{ .reads = self.reads, .consistency = self.consistency }, .binding = binding, .names = owned };
+        batch.* = .{ .arena = arena, .raw = .{ .reads = self.reads, .consistency = self.consistency, .read_timeout_ns = self.read_timeout_ns }, .binding = binding, .names = owned };
         return .{ .source = .{ .ptr = batch, .vtable = &BoundBatch.vtable }, .release = BoundBatch.release };
     }
 
@@ -134,7 +142,10 @@ pub const DistributedCandidateSource = struct {
         const self: *DistributedCandidateSource = @ptrCast(@alignCast(ptr));
         const physical = if (self.catalog_binding) |binding| try binding.bindOne(allocator, table) else table;
         defer if (self.catalog_binding != null) allocator.free(physical);
-        var resp = (try self.reads.lookup(allocator, physical, key, .{}, self.consistency)) orelse return null;
+        var resp = (self.reads.lookup(allocator, physical, key, .{ .execution_deadline_ns = self.readDeadline() }, self.consistency) catch |err| {
+            std.log.debug("resolver candidate lookup deferred table={s} error={s}", .{ physical, @errorName(err) });
+            return err;
+        }) orelse return null;
         defer resp.deinit(allocator);
         return try allocator.dupe(u8, resp.json);
     }
@@ -152,6 +163,7 @@ pub const DistributedCandidateSource = struct {
         while (start < keys.len) {
             const end = @min(start + max_keys, keys.len);
             var response = (try self.reads.query(alloc, physical, .{
+                .execution_deadline_ns = self.readDeadline(),
                 .filter_doc_ids = keys[start..end],
                 .filter_doc_ids_positive = true,
                 .limit = @intCast(end - start),
@@ -181,6 +193,7 @@ pub const DistributedCandidateSource = struct {
         defer allocator.free(upper);
 
         var resp = (try self.reads.scan(allocator, physical, prefix, upper, .{
+            .execution_deadline_ns = self.readDeadline(),
             .inclusive_from = true,
             .exclusive_to = true,
             .include_documents = true,
@@ -214,6 +227,7 @@ pub const DistributedCandidateSource = struct {
             .query = dense_query,
         }};
         const req = db_mod.types.SearchRequest{
+            .execution_deadline_ns = self.readDeadline(),
             .dense = if (query.index_name.len == 0) dense_query else null,
             .dense_queries = if (query.index_name.len == 0) &.{} else named_queries[0..],
             .limit = limit,
@@ -336,7 +350,7 @@ const FakeTableReadSource = struct {
         opts: db_mod.types.LookupOptions,
         consistency: raft_mod.ReadConsistency,
     ) !?table_reads.LookupResponse {
-        _ = opts;
+        try testing.expect(opts.execution_deadline_ns != null);
         _ = consistency;
         const self: *FakeTableReadSource = @ptrCast(@alignCast(ptr));
         if (!std.mem.eql(u8, table_name, self.table)) return null;
@@ -353,7 +367,7 @@ const FakeTableReadSource = struct {
         opts: db_mod.types.ScanOptions,
         consistency: raft_mod.ReadConsistency,
     ) !?table_reads.ScanResponse {
-        _ = opts;
+        try testing.expect(opts.execution_deadline_ns != null);
         _ = consistency;
         const self: *FakeTableReadSource = @ptrCast(@alignCast(ptr));
         if (!std.mem.eql(u8, table_name, self.table)) return null;
@@ -388,6 +402,7 @@ const FakeTableReadSource = struct {
         consistency: raft_mod.ReadConsistency,
     ) !?@import("antfly_local_sources").api_query.QueryResponse {
         _ = consistency;
+        try testing.expect(req.execution_deadline_ns != null);
         const self: *FakeTableReadSource = @ptrCast(@alignCast(ptr));
         if (!std.mem.eql(u8, table_name, self.table)) return null;
         if (req.filter_doc_ids_positive) {

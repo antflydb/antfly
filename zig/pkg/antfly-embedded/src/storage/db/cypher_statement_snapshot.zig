@@ -202,16 +202,16 @@ pub fn Snapshot(comptime DB: type) type {
         fn projectRelationship(ptr: *anyopaque, a: std.mem.Allocator, relationship: *const cypher.value.Relationship) !?*const cypher.value.Relationship {
             const self = cast(ptr);
             if (relationship.ownership != .explicit) {
-                const tuple = try std.json.parseFromSliceLeaky([]const []const u8, a, relationship.identity.key, .{});
-                if (tuple.len != 5 or tuple[4].len == 0 or !std.mem.eql(u8, relationship.identity.table, self.input.table)) return error.CypherInvalidRelationship;
+                const producer_identity = (try relationship.producingDocument(a)) orelse return error.CypherInvalidRelationship;
+                if (!std.mem.eql(u8, producer_identity.table, self.input.table)) return error.CypherInvalidRelationship;
                 // An artifact may override its source key. The producing row
                 // still owns its visibility, independently of both endpoints.
-                var producer = (try self.db.getDocument(a, tuple[4], .{ .row_policy_principal_proof = self.input.principal_proof, .row_policy_database = self.input.database })) orelse return null;
+                var producer = (try self.db.getDocument(a, producer_identity.key, .{ .row_policy_principal_proof = self.input.principal_proof, .row_policy_database = self.input.database })) orelse return null;
                 defer producer.deinit(a);
                 if (self.input.filter_query_json.len != 0) {
                     var filter = try @import("../../search/pattern_filter.zig").PreparedPatternFilter.init(a, self.input.filter_query_json);
                     defer filter.deinit();
-                    if (!try filter.matchesJson(a, tuple[4], try std.json.parseFromSliceLeaky(std.json.Value, a, producer.json, .{ .parse_numbers = false }))) return null;
+                    if (!try filter.matchesJson(a, producer_identity.key, try std.json.parseFromSliceLeaky(std.json.Value, a, producer.json, .{ .parse_numbers = false }))) return null;
                 }
             }
             return relationship;

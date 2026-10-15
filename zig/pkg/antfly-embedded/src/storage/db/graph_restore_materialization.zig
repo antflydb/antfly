@@ -561,8 +561,8 @@ fn canonicalEntityDocumentId(entity: std.json.Value) ?[]const u8 {
 
 fn canonicalEntityTable(entity: std.json.Value) ?[]const u8 {
     if (entity != .object) return null;
-    if (jsonStringField(entity, "table")) |table| return table;
-    if (entity.object.get("doc_ref")) |doc_ref| return jsonStringField(doc_ref, "table");
+    if (jsonStringField(entity, "storage_table") orelse jsonStringField(entity, "table")) |table| return table;
+    if (entity.object.get("doc_ref")) |doc_ref| return jsonStringField(doc_ref, "storage_table") orelse jsonStringField(doc_ref, "table");
     return null;
 }
 
@@ -771,4 +771,13 @@ test "graph restore text endpoints resolve unique canonical mentions and drop am
     try std.testing.expectEqualStrings("concept/antfly", jsonEndpointDocumentId(endpoint).?);
     try std.testing.expect(resolveGraphEndpointEntity(artifact.object.get("ambiguous").?, artifact) == null);
     try std.testing.expect(resolveGraphEndpointEntity(artifact.object.get("unknown").?, artifact) == null);
+}
+
+test "graph endpoint routing prefers immutable resolution binding" {
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator,
+        \\{ "doc_ref": { "table": "entities", "storage_table": "table:original", "key": "a" } }
+    , .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("table:original", canonicalEntityTable(parsed.value).?);
+    try std.testing.expectEqualStrings("a", canonicalEntityDocumentId(parsed.value).?);
 }

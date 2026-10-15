@@ -305,7 +305,13 @@ pub fn prepareEnrichmentClosure(alloc: std.mem.Allocator, txn: anytype, root: u1
             else => return err,
         };
         const selector: publication.Command = .{ .namespace = authorized.authority.namespace, .authority_epoch = authorized.authority.epoch, .catalog_digest = authorized.authority.catalog_digest, .producer_kind = .enrichment, .producer_name = name, .producer_generation = authorized.authority.epoch, .producer_artifact_name = name, .sources = (&source)[0..1], .mutations = &.{}, .publication_digest = @splat(0) };
-        const result = (try provenance.readCurrentForSource(alloc, txn, selector, source)) orelse return error.ArtifactPublicationPending;
+        const result = (provenance.readCurrentForSource(alloc, txn, selector, source) catch |err| {
+            std.log.debug("generated root closure pending producer={s} document={s} reason={s}", .{ name, request.doc_key, @errorName(err) });
+            return err;
+        }) orelse {
+            std.log.debug("generated root closure pending producer={s} document={s}: no accepted source receipt", .{ name, request.doc_key });
+            return error.ArtifactPublicationPending;
+        };
         break :blk result.owned;
     };
     defer accepted.deinit();

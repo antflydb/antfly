@@ -584,10 +584,75 @@ pub const StorageOwnerRuntimeHooks = struct {
     }
 
     const candidate_vtable = db_mod.CandidateSource.VTable{
+        .begin_batch = candidateBeginBatch,
+        .bound_table = candidateBoundTable,
+        .get_many = candidateGetMany,
         .get = candidateGet,
         .scan_prefix = candidateScanPrefix,
         .nearest = candidateNearest,
     };
+
+    const CandidateBatch = struct {
+        alloc: Allocator,
+        hooks: StorageOwnerRuntimeHooks,
+    };
+
+    fn candidateBeginBatch(ptr: *anyopaque, alloc: Allocator, tables: []const []const u8) anyerror!db_mod.CandidateSource.Batch {
+        const self: *StorageOwnerRuntimeHooks = @ptrCast(@alignCast(ptr));
+        const callback = self.config.resolution_candidates.begin_batch_fn orelse return .{ .source = self.candidateSource().? };
+        const encoded = try alloc.alloc(kernel_owner_abi.BorrowedBytes, tables.len);
+        defer alloc.free(encoded);
+        for (tables, encoded) |table, *out| out.* = .fromSlice(table);
+        var config: kernel_owner_abi.ResolutionCandidateConfig = .{};
+        try kernel_error_identity.statusToError(callback(self.config.resolution_candidates.callback_ctx, if (encoded.len == 0) null else encoded.ptr, encoded.len, &config));
+        errdefer if (config.release_fn) |release| release(config.callback_ctx);
+        if (config.callback_ctx == null or config.get_fn == null or config.release_fn == null) return error.InvalidArgument;
+        const batch = try alloc.create(CandidateBatch);
+        batch.* = .{ .alloc = alloc, .hooks = .{ .config = .{ .resolution_candidates = config }, .group_id = self.group_id } };
+        return .{ .source = batch.hooks.candidateSource().?, .release = candidateReleaseBatch };
+    }
+
+    fn candidateReleaseBatch(ptr: *anyopaque, _: Allocator) void {
+        const hooks: *StorageOwnerRuntimeHooks = @ptrCast(@alignCast(ptr));
+        const batch: *CandidateBatch = @fieldParentPtr("hooks", hooks);
+        const alloc = batch.alloc;
+        hooks.config.resolution_candidates.release_fn.?(hooks.config.resolution_candidates.callback_ctx);
+        alloc.destroy(batch);
+    }
+
+    fn candidateBoundTable(ptr: *anyopaque, table: []const u8) anyerror!?[]const u8 {
+        const self: *StorageOwnerRuntimeHooks = @ptrCast(@alignCast(ptr));
+        const callback = self.config.resolution_candidates.bound_table_fn orelse return null;
+        var physical: kernel_owner_abi.BorrowedBytes = .{};
+        const status = callback(self.config.resolution_candidates.callback_ctx, .fromSlice(table), &physical);
+        if (status == .not_found) return null;
+        try kernel_error_identity.statusToError(status);
+        return physical.slice();
+    }
+
+    fn candidateGetMany(ptr: *anyopaque, alloc: Allocator, table: []const u8, keys: []const []const u8, ctx: *anyopaque, consume: db_mod.CandidateSource.Consume) anyerror!void {
+        const self: *StorageOwnerRuntimeHooks = @ptrCast(@alignCast(ptr));
+        if (keys.len == 0) return;
+        const callback = self.config.resolution_candidates.get_many_fn orelse {
+            for (keys) |key| if (try candidateGet(ptr, alloc, table, key)) |raw| {
+                defer alloc.free(raw);
+                try consume(ctx, key, raw);
+            };
+            return;
+        };
+        // Bound the cross-boundary scratch space without imposing a limit on
+        // the resolver's complete candidate set.
+        const encoded = try alloc.alloc(kernel_owner_abi.BorrowedBytes, @min(keys.len, 4096));
+        defer alloc.free(encoded);
+        var bridge = CandidateConsumerBridge{ .ctx = ctx, .consume = consume };
+        var offset: usize = 0;
+        while (offset < keys.len) {
+            const count = @min(encoded.len, keys.len - offset);
+            for (keys[offset..][0..count], encoded[0..count]) |key, *out| out.* = .fromSlice(key);
+            try kernel_error_identity.statusToError(callback(self.config.resolution_candidates.callback_ctx, .fromSlice(table), encoded.ptr, count, &bridge, CandidateConsumerBridge.forward));
+            offset += count;
+        }
+    }
 
     pub fn candidateGet(
         ptr: *anyopaque,
@@ -3245,11 +3310,18 @@ pub fn storageOwnerTargetAdvanced(
     ptr: *anyopaque,
     event: db_mod.QueryVisibilityEvent,
 ) void {
-    if (event.change != .target_advanced) return;
     const handle: *Handle = @ptrCast(@alignCast(ptr));
     const table_name = handle.storage_owner_table_name orelse "";
     const group_id = handle.storage_owner_group_id;
     const observer = handle.storage_owner_target_observer;
+    if (event.change != .target_advanced) {
+        // Activity is telemetry-only. Every durable visibility/publication
+        // edge can change readiness and must wake a fresh owner observation.
+        if (event.change != .activity) {
+            if (observer.status_changed) |notify| notify(observer.ctx, .fromSlice(table_name));
+        }
+        return;
+    }
     const notify = observer.notify orelse return;
     const identities_json = if (event.target_scope_known)
         std.json.Stringify.valueAlloc(handle.alloc, event.target_indexes, .{}) catch null
@@ -3305,7 +3377,7 @@ pub fn storageOwnerOpen(
             .native_manifest_sha256 = request.restore.native_manifest_sha256.slice(),
         }) catch |err| return storageOwnerStatusFromError(err);
     }
-    if ((request.target_observer.ctx == null) != (request.target_observer.notify == null))
+    if ((request.target_observer.ctx == null) != (request.target_observer.notify == null and request.target_observer.status_changed == null))
         return .invalid_argument;
     const recovery_config = request.transaction_recovery;
     if (recovery_config.enabled != 0) {
@@ -3323,7 +3395,10 @@ pub fn storageOwnerOpen(
         return .invalid_argument;
     const candidate_configured = runtime_hooks_config.resolution_candidates.get_fn != null or
         runtime_hooks_config.resolution_candidates.scan_prefix_fn != null or
-        runtime_hooks_config.resolution_candidates.nearest_fn != null;
+        runtime_hooks_config.resolution_candidates.nearest_fn != null or
+        runtime_hooks_config.resolution_candidates.get_many_fn != null or
+        runtime_hooks_config.resolution_candidates.begin_batch_fn != null or
+        runtime_hooks_config.resolution_candidates.bound_table_fn != null;
     if (candidate_configured and
         (runtime_hooks_config.resolution_candidates.callback_ctx == null or
             runtime_hooks_config.resolution_candidates.get_fn == null))
@@ -3364,7 +3439,7 @@ pub fn storageOwnerOpen(
     const prepared_schema = local_write.prepareOwnerSchemaBeforeIndexLoad(alloc, request.schema_json.slice()) catch |err| return storageOwnerStatusFromError(err);
     defer local_write.freeOwnerSchemaBeforeIndexLoad(alloc, prepared_schema);
     if (request.restore_cancel_recovery > 1 or request.restore_ha_replay > 1 or
-        request.historical_raft_apply > 1 or
+        request.historical_raft_apply > 2 or
         (request.restore_cancel_recovery != 0 and request.restore_ha_replay != 0) or
         ((request.restore_cancel_recovery != 0 or request.restore_ha_replay != 0) and request.restore_bootstrap_json.len == 0) or request.restore_bootstrap_json.len > 16 * 1024 * 1024 or
         request.initial_child_bootstrap_json.len > 4096 or
@@ -3490,7 +3565,7 @@ pub fn storageOwnerOpen(
     handle.db.local_execution.row_policy_authority_issuer = owned_policy_issuer;
     handle.db.local_execution.row_policy_table_name = owned_table_name;
     if (runtime_hooks) |hooks| handle.db.setCoordinatedTtl(hooks.coordinatedTtlPort());
-    if (request.target_observer.notify != null) handle.db.setQueryVisibilityHook(.{
+    if (request.target_observer.notify != null or request.target_observer.status_changed != null) handle.db.setQueryVisibilityHook(.{
         .ptr = handle,
         .on_change = storageOwnerTargetAdvanced,
     });
@@ -3510,10 +3585,14 @@ pub fn storageOwnerOpen(
             if (owner_context) |context| context.secret_store else null,
             if (owner_context) |context| context.remoteContent() else null,
             &handle.storage_owner_managed_config,
-            request.historical_raft_apply != 0,
+            request.historical_raft_apply,
         ) catch |err| return storageOwnerStatusFromError(err);
         if (request.owner_catalog_deferred_out) |out| out.* = @intFromBool(deferred);
     }
+    handle.db.enqueueGeneratedArtifactCatalog() catch |err| switch (err) {
+        error.NotLeader, error.ResourceLimitExceeded, error.ResourceBudgetExceeded, error.ResourceTemporarilyUnavailable => {},
+        else => return storageOwnerStatusFromError(err),
+    };
     // DB.open returns by value. Only now is the compiled owner's DB at its
     // permanent address with configuration installed; use the same startup as
     // resident caches so relational builds, retirement and durable outboxes
@@ -3621,6 +3700,10 @@ pub fn storageOwnerReconcile(
             if (asStorageOwnerContext(handle.storage_owner_context)) |context| context.antflyProvider() else null,
             &handle.storage_owner_managed_config,
         ) catch |err| return storageOwnerStatusFromError(err);
+    handle.db.enqueueGeneratedArtifactCatalog() catch |err| switch (err) {
+        error.NotLeader, error.ResourceLimitExceeded, error.ResourceBudgetExceeded, error.ResourceTemporarilyUnavailable => {},
+        else => return storageOwnerStatusFromError(err),
+    };
     out_result.* = .{
         .state = switch (reconciled.state) {
             .complete => .complete,

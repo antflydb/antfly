@@ -36,9 +36,16 @@ fn capture(alloc: std.mem.Allocator, txn: anytype, config: catalog.ResolverConfi
     const binding = ordered.value.command.binding;
     if (binding.effect_protocol != 15 or binding.epoch != authority.epoch or
         !std.mem.eql(u8, &binding.digest, &authority.catalog_digest) or
-        !std.mem.eql(u8, &ordered.value.command.namespace, &authority.namespace)) return error.ArtifactCatalogDrift;
+        !std.mem.eql(u8, &ordered.value.command.namespace, &authority.namespace))
+    {
+        std.log.debug("resolver publication ordered authority differs", .{});
+        return error.ArtifactCatalogDrift;
+    }
     const local = try inventory.catalogs(txn);
-    if (!std.mem.eql(u8, &local.digest(), &binding.digest)) return error.ArtifactCatalogDrift;
+    if (!std.mem.eql(u8, &local.digest(), &binding.digest)) {
+        std.log.debug("resolver publication local catalog differs", .{});
+        return error.ArtifactCatalogDrift;
+    }
     const resolvers = try catalog.deserializeCatalog(owned, local.resolvers);
     const expected = try std.json.Stringify.valueAlloc(owned, config, .{});
     const matched = for (resolvers) |resolver| {
@@ -46,7 +53,10 @@ fn capture(alloc: std.mem.Allocator, txn: anytype, config: catalog.ResolverConfi
         const actual = try std.json.Stringify.valueAlloc(owned, resolver, .{});
         break std.mem.eql(u8, expected, actual);
     } else false;
-    if (!matched) return error.ArtifactCatalogDrift;
+    if (!matched) {
+        std.log.debug("resolver publication config differs name={s} generation={d}", .{ config.name, config.config_generation });
+        return error.ArtifactCatalogDrift;
+    }
     const producer_name = try owned.dupe(u8, config.name);
     const artifact_name = try owned.dupe(u8, config.resolution_artifact);
     const source = publication.capturePrimarySource(owned, txn, authority.namespace, doc_key) catch |err| switch (err) {
@@ -97,6 +107,7 @@ pub fn process(
     defer arena.deinit();
     const scratch = arena.allocator();
     var sources: std.ArrayList([]const u8) = .empty;
+
     for (changed_keys) |key| {
         const source_key = if (try runtime.parseSourceArtifactKeyAlloc(scratch, key) != null) key else blk: {
             const source = (try runtime.sourceExtractionKeyForResolutionKeyAlloc(scratch, resolvers, key)) orelse continue;
@@ -116,12 +127,14 @@ pub fn process(
             var work_arena = std.heap.ArenaAllocator.init(alloc);
             defer work_arena.deinit();
             const work = work_arena.allocator();
+
             var token = blk: {
                 var read = try store.beginReadTxnWithBlockCacheAdmission(.transient);
                 defer read.abort();
                 break :blk (try capture(alloc, &read, config.*, parsed.doc_key)) orelse return error.ArtifactCatalogDrift;
             };
             defer token.deinit();
+
             try setSourceScope(&token, key);
             {
                 // Discover the accepted input set by stable stream identity
@@ -131,6 +144,7 @@ pub fn process(
                 // every lost reply/restarted replay window.
                 var read = try store.beginReadTxnWithBlockCacheAdmission(.transient);
                 defer read.abort();
+
                 const selector = try token.command(&.{});
                 var accepted = @import("artifact_producer_provenance.zig").readCurrentForSource(alloc, &read, selector, token.source) catch |err| switch (err) {
                     error.EnrichmentSourceChanged => null,
@@ -141,8 +155,11 @@ pub fn process(
                     continue;
                 }
             }
+
             const output_key = try keys.resolutionArtifactKeyAlloc(work, parsed.resolution_scope_key, config.resolution_artifact);
-            var recorder: RecordingStore(@TypeOf(store.*)) = .{ .store = store, .fallback = fallback, .token = &token, .output_key = output_key, .upstream_key = key };
+            const review_key = try runtime.reviewOverrideArtifactKeyAlloc(work, parsed.resolution_scope_key, config.source_artifact, config.resolution_artifact);
+            var recorder: RecordingStore(@TypeOf(store.*)) = .{ .store = store, .fallback = fallback, .token = &token, .output_key = output_key, .upstream_key = key, .review_key = review_key };
+
             const value: ?[]const u8 = if (!token.source.exists) blk: {
                 // A genuine primary tombstone authorizes cleanup only. Never
                 // run inference on an orphaned extraction or resurrect output.
@@ -157,19 +174,23 @@ pub fn process(
                     .cleared, .source_missing => null,
                 };
             };
+
             const command = try token.command(&.{.{ .family = .resolution, .key = output_key, .value = value, .source_index = 0 }});
             try command.validate(work);
             {
                 var read = try store.beginReadTxnWithBlockCacheAdmission(.transient);
                 defer read.abort();
+
                 try token.validateInputs(work, &read);
                 // The accepted receipt precedes CAS validation: accepting this
                 // very output necessarily changes its old-value precondition.
                 if (try publication.readReceipt(&read, command, token.source) != null) continue;
                 try publication.validateArtifactSources(work, &read, token.namespace, token.sources(), token.preconditions.items);
             }
+
             const port = dispatcher orelse return error.ArtifactCatalogDrift;
             const bytes = try @import("artifact_publication_transport_codec.zig").encodeAlloc(work, command);
+
             try port.submit(token.namespace, bytes);
             return error.ArtifactPublicationPending;
         }
@@ -188,6 +209,7 @@ pub fn RecordingStore(comptime Store: type) type {
         token: *Token,
         output_key: []const u8,
         upstream_key: []const u8,
+        review_key: []const u8,
         const Self = @This();
 
         pub fn artifactStore(self: *Self) resolver_lib.ArtifactStore {
@@ -200,6 +222,15 @@ pub fn RecordingStore(comptime Store: type) type {
                 return self.fallback.get(alloc, key);
             var txn = try self.store.beginReadTxnWithBlockCacheAdmission(.transient);
             defer txn.abort();
+            if (std.mem.eql(u8, self.review_key, key)) {
+                // Review overrides are authored inputs, including their absence.
+                // No generated stream can supply an extraction receipt for them.
+                // Keep their exact bytes and revision in the causal read set so
+                // curation changes (including same-value ABA) invalidate work.
+                const raw = txn.get(key) catch |err| if (err == error.NotFound) null else return err;
+                try self.token.observe(key, raw, try publication.artifactRevision(&txn, self.token.namespace, key));
+                return if (raw) |value| try alloc.dupe(u8, value) else null;
+            }
             var input = try @import("artifact_extraction_generation.zig").captureInput(alloc, &txn, key);
             defer input.deinit();
             const raw = input.value;
@@ -460,4 +491,53 @@ test "ordered resolver preparation binds output to exact source and configured g
     command.producer_generation = 8;
     command.publication_digest = command.digest();
     try std.testing.expectError(error.EnrichmentSourceChanged, prepareResolution(alloc, command, .{ .resolvers = encoded }));
+}
+
+test "ordered artifact inventory resolver authored review absence and same-value revisions are causal inputs" {
+    const alloc = std.testing.allocator;
+    const review = try runtime.reviewOverrideArtifactKeyAlloc(alloc, "doc", "kg", "resolved");
+    defer alloc.free(review);
+    const namespace: publication.Namespace = @splat(1);
+    const Fixture = struct {
+        review: []const u8,
+        revision_key: []const u8,
+        value: ?[]const u8,
+        revision: [publication.Position.encoded_len]u8,
+        const Self = @This();
+        const Read = struct {
+            fixture: *Self,
+            pub fn get(self: *@This(), key: []const u8) anyerror![]const u8 {
+                if (std.mem.eql(u8, key, self.fixture.review)) return self.fixture.value orelse error.NotFound;
+                if (std.mem.eql(u8, key, self.fixture.revision_key)) return &self.fixture.revision;
+                return error.NotFound;
+            }
+            pub fn abort(_: *@This()) void {}
+        };
+        pub fn beginReadTxnWithBlockCacheAdmission(self: *@This(), _: anytype) !Read {
+            return .{ .fixture = self };
+        }
+    };
+    const output = try keys.resolutionArtifactKeyAlloc(alloc, "doc", "resolved");
+    defer alloc.free(output);
+    for ([_]bool{ false, true }) |own_output| {
+        const selected = if (own_output) output else review;
+        const revision_key = publication.artifactRevisionKey(namespace, selected);
+        for ([_]bool{ false, true }) |present| {
+            var fixture: Fixture = .{ .review = selected, .revision_key = &revision_key, .value = if (present) "{\"a\":{\"decision\":\"new\"}}" else null, .revision = try (publication.Position{ .raft = .{ .term = 1, .index = 1 } }).encode() };
+            var token: Token = .{ .arena = std.heap.ArenaAllocator.init(alloc), .namespace = namespace, .epoch = 1, .catalog_digest = @splat(2), .producer_kind = .resolver, .producer_name = "entities", .producer_generation = 1, .artifact_name = "resolved", .source = .{ .document_key = "doc", .content_digest = @splat(3), .timestamp = 1, .input_position = null } };
+            defer token.deinit();
+            var recording: RecordingStore(Fixture) = .{ .store = &fixture, .fallback = undefined, .token = &token, .output_key = output, .upstream_key = "unused-upstream", .review_key = review };
+            const store = recording.artifactStore();
+            const value = try store.get(alloc, selected);
+            defer if (value) |raw| alloc.free(raw);
+            try std.testing.expectEqual(present, value != null);
+            try std.testing.expectEqual(@as(usize, 1), if (own_output) token.preconditions.items.len else token.reads.items.len);
+            const original = fixture.value;
+            fixture.value = "changed override";
+            try std.testing.expectError(error.EnrichmentSourceChanged, store.get(alloc, selected));
+            fixture.value = original;
+            fixture.revision = try (publication.Position{ .raft = .{ .term = 1, .index = 2 } }).encode();
+            try std.testing.expectError(error.EnrichmentSourceChanged, store.get(alloc, selected));
+        }
+    }
 }
