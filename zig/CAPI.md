@@ -415,6 +415,38 @@ reclamation do not consume its deadline. Lite background maintenance advances
 one table per turn, including one relational index page, and releases the writer lease between
 turns, retaining pending work for subsequent turns.
 
+Detached maintenance primary transactions and index publications join the fair
+writer queue. They adopt the latest primary checkpoint when the namespace,
+catalog, and physical index inputs remain unchanged, so unrelated foreground
+commits do not force a retry. Inference and segment construction run outside
+the writer gate; changed index inputs or file replacement still cancel stale
+publication. Reclamation continues to yield on contention.
+
+Replay-producing maintenance delivers its prepared effects to the current
+coordinator under that writer lease. It validates captured documents and
+artifact keys, reserves the replay sequence on the live runtime, and advances
+the detached replay watermark after a successful commit. Resolver primary
+effects and their replay record commit together; derived projection work runs
+outside the owner gate. Resolver publication also validates the inputs read
+during computation, including absent keys and scanned candidate ranges, and
+rejects changes to resolver configurations. Mixed full and graph-only resolver
+phases share one publication admission and input validation, preserving their
+separate replay hints without invalidating themselves between commits.
+Unrelated keys remain publishable.
+
+`antfly_db_pending_work_stats_json` includes `index_replay_debt` per namespace:
+each index reports its `applied_sequence`, `target_sequence`, and
+`catch_up_required`. Their sequence difference measures replay lag, rather
+than elapsed time or a count of documents. Lite connections also expose
+`background_publications` with owner-lifetime `attempts`, `refused` admission
+counts (including publication errors and source/fence rejection), and successful
+checkpoint `rebased` counts. `generated_attempts` / `generated_refused` cover
+generated-result commits and store acquisition, including source validation
+(one refusal per acquired store lease). `replay_attempts` / `replay_refused`
+cover detached replay-producing publication. All these paths contribute to
+the total `attempts` / `refused` counts. These totals survive foreground runtime refreshes and reset on closing
+the last compatible connection. Root results include per-table debt in `tables`.
+
 Failed UNIQUE coverage admits constraint-checked UPDATE/DELETE repairs under
 the exact native activation checkpoint, including SQL transactions with cascades and multiple repair targets.
 Repair admission follows the complete mutation closure, including failed tables

@@ -2189,8 +2189,8 @@ export interface paths {
         get?: never;
         put?: never;
         /**
-         * Reprocess a derived asset across a table range
-         * @description Runs a bounded operational repair pass for any asset producer type
+         * Reprocess a derived artifact across a table range
+         * @description Runs a bounded operational repair pass for any asset or embedding producer
          *     across source rows in key order. Use `next_key` from the response as
          *     the next request's `from_key` for simple single-cursor continuation.
          *     Distributed repair controllers should persist `shard_cursors` from the
@@ -2255,7 +2255,7 @@ export interface paths {
         /**
          * Create a derived document artifact reprocess job
          * @description Creates a durable user-facing repair job for a derived document
-         *     artifact. The job advances through the same bounded per-shard repair
+         *     asset or embedding artifact. The job advances through the same bounded per-shard repair
          *     primitive used by `/reprocess`, and stores returned continuation
          *     cursors so hosted controllers can resume large sharded table repairs
          *     without collapsing progress into a single global key cursor.
@@ -2395,11 +2395,15 @@ export interface paths {
         get?: never;
         put?: never;
         /**
-         * Reprocess a derived asset
+         * Reprocess a derived artifact
          * @description Invalidates the current artifact state and requests the producer to
          *     rebuild the derived asset for the source document. Copy, generator,
          *     reader, transcriber, extractor, and document-extraction producers are
-         *     all supported.
+         *     all supported, as are dense and sparse embedding producers. Embedding
+         *     reprocessing regenerates vectors even when the source chunks are unchanged.
+         *     Embedding requests are committed durably and queued for supervised
+         *     inference. Acceptance does not wait for inference; inspect index coverage
+         *     and repair issues for the eventual outcome.
          */
         post: operations["reprocessDocumentArtifact"];
         delete?: never;
@@ -3713,23 +3717,15 @@ export interface paths {
         put?: never;
         /**
          * Chunk text into smaller segments
-         * @description Splits text into smaller chunks using semantic or fixed-size chunking models.
+         * @description Splits text into smaller chunks with the built-in fixed chunker.
          *
          *     ## Models
          *
-         *     ### Fixed Chunking (always available)
-         *     - Simple token-based splitting with overlap
-         *     - Use model="fixed"
+         *     ### Fixed Chunking
+         *     - Token-count splitting with overlap for text; fixed time windows for audio
+         *     - Use model="fixed" (aliases `fixed_bert`, `fixed_bpe`, and `fixed-bert-tokenizer` are accepted)
          *     - Fast and deterministic
-         *
-         *     ### ONNX Models
-         *     - Semantic chunking based on content similarity
-         *     - Models auto-discovered from `models_dir/chunkers/`
-         *     - Falls back to fixed chunking if model fails
-         *
-         *     ## Caching
-         *
-         *     Results are cached in memory for 2 minutes. Cache key includes both config and text content.
+         *     - Other model names are rejected as unsupported
          */
         post: operations["chunkText"];
         delete?: never;
@@ -4305,13 +4301,12 @@ export interface paths {
          *
          *     ## Embedders
          *
-         *     - ONNX models from `models_dir/embedders/`
+         *     - Embedding models from `models_dir`
          *     - Quantized variants have `-i8` suffix
          *
          *     ## Chunkers
          *
-         *     - Always includes "fixed" (built-in)
-         *     - Plus any ONNX models from `models_dir/chunkers/`
+         *     - Always "fixed" (built-in); chunking does not load models from `models_dir`
          *
          *     ## Rerankers
          *
@@ -5324,7 +5319,20 @@ export interface components {
              */
             retryable: true;
         };
-        QueryConflictError: components["schemas"]["HierarchyCursorStaleError"] | components["schemas"]["TopologyChangedError"];
+        /** @description The requested source artifact failed publication and requires inspection and reprocessing. */
+        DocumentArtifactPublicationFailedError: {
+            /** @enum {string} */
+            code: "document_artifact_publication_failed";
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            error: "document_artifact_publication_failed";
+            message: string;
+            /** @enum {boolean} */
+            retryable: false;
+        };
+        QueryConflictError: components["schemas"]["HierarchyCursorStaleError"] | components["schemas"]["TopologyChangedError"] | components["schemas"]["DocumentArtifactPublicationFailedError"];
         /** @description A requested hierarchy grouping level cannot represent every member because at least one selected source lacks durable document-unit identity. */
         UnsupportedHierarchyGroupingError: {
             /**
@@ -13102,11 +13110,12 @@ export interface components {
          * @description Configuration for the Antfly inference chunking provider.
          *
          *     Antfly inference is Antfly's built-in ML service for local chunking.
-         *     The model name maps to ONNX model directory names (similar to how Ollama works).
          *
          *     **Chunking Models:**
-         *     - fixed: Simple fixed-size chunking by token count (built-in, no ONNX required)
-         *     - Any other name will attempt to load from models/chunkers/{name}/ directory
+         *     - fixed: Fixed-size chunking by token count, with fixed time windows for audio
+         *       (aliases `fixed_bert`, `fixed_bpe`, and `fixed-bert-tokenizer`). This is the
+         *       only chunking model Antfly inference implements; other model names are
+         *       rejected as unsupported.
          *
          *     **Deduplication:**
          *     - Within a single document write, chunk results are deduplicated when multiple
@@ -19969,13 +19978,15 @@ export interface components {
             api_key?: string;
             /**
              * @description Base directory containing model subdirectories. Antfly inference auto-discovers models from:
-             *     - `{models_dir}/embedders/` - Embedding models (ONNX)
-             *     - `{models_dir}/chunkers/` - Chunking models (ONNX)
-             *     - `{models_dir}/rerankers/` - Reranking models (ONNX)
+             *     - `{models_dir}/{owner}/{name}/` - Models fetched with `antfly inference pull owner/name`
+             *     - `{models_dir}/embedders/` - Embedding models
+             *     - `{models_dir}/rerankers/` - Reranking models
              *     - `{models_dir}/extractors/` - Entity, relation, and structured extraction models
-             *     - `{models_dir}/rewriters/` - Seq2Seq rewriter models (ONNX)
+             *     - `{models_dir}/rewriters/` - Seq2Seq rewriter models
              *
-             *     Defaults to ~/.antfly/inference/models (set via viper). If not set, only built-in fixed chunking is available.
+             *     Defaults to `$ANTFLY_INFERENCE_MODELS_DIR` when set, otherwise `~/.antfly/inference/models`
+             *     (`./models` when `$HOME` is unset). The `--models-dir` flag overrides both. The built-in `fixed`
+             *     chunker needs no models.
              * @example ~/.antfly/inference/models
              */
             models_dir?: string;
@@ -21120,7 +21131,7 @@ export interface components {
          */
         InferenceChunkConfig: {
             /**
-             * @description The chunking model to use. Either 'fixed' for simple token-based chunking, or a model name from models/chunkers/{name}/.
+             * @description The chunking model to use. Antfly inference implements only 'fixed' (token-count text chunking and fixed audio windows); other model names are rejected.
              * @default fixed
              * @example fixed
              */
@@ -21129,7 +21140,7 @@ export interface components {
             max_chunks?: number;
             /**
              * Format: float
-             * @description Confidence threshold for model-based chunking (0.0-1.0). Used by ONNX text models and VAD audio models.
+             * @description Confidence threshold for model-based chunking (0.0-1.0). Validated but not used by the built-in fixed chunker.
              */
             threshold?: number;
             text?: components["schemas"]["TextChunkOptions"];
@@ -21554,7 +21565,7 @@ export interface components {
                 "application/json": components["schemas"]["HierarchyCursorStaleError"];
             };
         };
-        /** @description The query's pinned hierarchy or table topology changed while it was running */
+        /** @description The query's pinned hierarchy or table topology changed, or a requested source artifact failed publication */
         QueryConflict: {
             headers: {
                 [name: string]: unknown;
@@ -26887,6 +26898,7 @@ export interface operations {
             };
             400: components["responses"]["BadRequest"];
             404: components["responses"]["NotFound"];
+            409: components["responses"]["QueryConflict"];
             500: components["responses"]["InternalServerError"];
             /** @description Catalog target cannot be delegated to legacy table storage unambiguously. */
             501: {

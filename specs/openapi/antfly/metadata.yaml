@@ -3,51 +3,48 @@ info:
   version: v1alpha1
   title: Antfly Public API
   description: |
-    Antfly is a distributed key-value store and vector search engine built on a **multi-Raft consensus architecture**.
-    It combines the best of traditional databases with modern AI capabilities to deliver hybrid search at scale.
+    Antfly is a database with the retrieval pipeline built in. Tables carry full-text, vector, graph,
+    algebraic, and relational indexes side by side, and the models that chunk, embed, rerank, and extract
+    run inside the engine. It runs embedded, as a single standalone node, or as a distributed cluster built
+    on a **multi-Raft consensus architecture**.
 
-    ## What Makes Antfly Unique
+    ## Search
+    - **Index Types**: `full_text` (BM25), `embeddings` (dense vectors compressed with RaBitQ, or sparse SPLADE vectors), `graph` (edges, traversal, and pathfinding), `algebraic` (aggregates and materializations), and `relational` (ordered composite keys)
+    - **Hybrid Fusion**: Results from several indexes fused with Reciprocal Rank Fusion (default) or Relative Score Fusion, with optional per-index weights
+    - **Query Processors**: `reranker` (cross-encoder or late-interaction re-scoring), `pruner` (score-based result filtering after fusion and reranking), `document_renderer`, and `graph_metric_rerank`
+    - **Aggregations**: Terms, range, histogram, date histogram, and geo aggregations for faceting and analytics
+    - **Multimodal**: Index and search text, images, audio, and video; remote media referenced by URL (http/https/s3/file) is fetched with SSRF protection and content validation
 
-    ### Hybrid Search
-    - **BM25 + Vector Similarity**: Full-text search with vector embeddings using Reciprocal Rank Fusion (RRF)
-    - **Multimodal**: Index and search text, images, audio, and video
-    - **Embedding Providers**: Antfly, Ollama, OpenAI, OpenRouter, AWS Bedrock, Google Gemini/Vertex, and Cohere
-    - **Hardware Acceleration**: SIMD optimizations (AVX2/AVX-512 on x86, NEON on ARM) and SME (Scalable Matrix Extension) for ARM
+    ## Enrichments
+    - **Managed Enrichments**: Per-index producers that materialize generated artifacts before indexing; kinds are `chunk`, `embedding`, and `asset`
+    - **Asset Producers**: Summaries, extraction, transcription, document extraction, and decisions are produced as `asset` artifacts that chunk and embedding enrichments can consume
+    - **Chunking**: Configured on the index or enrichment; the default `fixed` chunker splits by token count, and each document is chunked at most once per write
+    - **Embedding Providers**: Antfly Inference, Ollama, OpenAI, OpenRouter, AWS Bedrock, Google Gemini/Vertex AI, and Cohere
 
-    ### Distributed Consensus
+    ## Agents
+    - **Retrieval Agent**: Streaming retrieval-augmented generation over Server-Sent Events (`POST /agents/retrieval`)
+    - **Query Builder Agent**: Turns a natural-language question into a structured Antfly query (`POST /agents/query-builder`)
+    - **Research Agent**: Multi-step research runs and jobs (`/agents/research`)
+
+    ## Consistency and Distribution
     - **Multi-Raft Design**: Separate consensus groups for metadata (single cluster) and storage (one per shard)
-    - **Horizontal Sharding**: Data automatically partitioned across shards with configurable replication
-    - **Distributed Transactions**: Atomic cross-shard writes using coordinator-based 2PC with intent-based locking
-    - **Fine-Grained Durability**: Control write consistency with sync levels (propose, write, full_text, enrichments, full_index)
+    - **Key-Range Sharding**: Tables are partitioned by key range with configurable replication; online shard splits, with automatic size-based split and merge as an opt-in
+    - **Transactions**: Atomic cross-shard writes using coordinator-driven two-phase commit over write intents with optimistic concurrency control
+    - **Sync Levels**: Control write durability per request (`propose`, `write`, `full_text`, `enrichments`, `full_index`)
+    - **Storage Engines**: `lite` (single `.aflite` file), `local` (directory LSM), and `object` (object storage)
 
-    ### AI-Native Features
-    - **RAG**: Streaming retrieval-augmented generation with Server-Sent Events
-    - **Retrieval Agent**: Intelligent query routing with automatic query generation
-    - **Document Chunking**: Antfly inference chunking service with multi-tier caching
-    - **Async Enrichment**: Background embedding and summarization with leader-only processing
-    - **Multimodal Remote Processing**: Automatic download, processing, and security controls for images, PDFs, and HTML from URLs (http/https/s3/file) with SSRF prevention and content validation
-
-    ### Developer Experience
-    - **Client Libraries**: Auto-generated SDKs for Go, TypeScript, and Python from OpenAPI spec
-    - **JSON Schema Extensions**: Custom `x-antfly-*` annotations for indexing
-    - **MongoDB-Style Transforms**: In-place updates ($inc, $set, $addToSet) without read-modify-write
+    ## Developer Experience
+    - **Client Libraries**: SDKs for Go, TypeScript, Python, and Rust built from this OpenAPI spec
+    - **JSON Schema Extensions**: `x-antfly-*` annotations that map schema fields to Antfly field types
+    - **MongoDB-Style Transforms**: In-place updates ($set, $inc, $addToSet, $pull, and more) without read-modify-write
     - **Linear Merge**: Stateless import of sorted records from external sources
-    - **Template Rendering**: Handlebars templates for custom document rendering
-    - **Graph Operations**: Declarative queries with traversals and pathfinding
+    - **Template Rendering**: Handlebars templates for document rendering
     - **TTL Support**: Automatic expiration for documents (table-level) and edges (graph index-level)
 
-    ### Operations & Scalability
-    - **Online Shard Splitting**: Automatic reallocation and splitting of shards without downtime
-    - **Kubernetes Operator**: Official `antfly-operator` with autoscaling and lifecycle management
+    ## Operations
+    - **Kubernetes Operator**: Official `antfly-operator` with opt-in autoscaling and lifecycle management
     - **Prometheus Metrics**: Built-in monitoring endpoints for observability
-    - **Zero-Downtime Upgrades**: Rolling upgrades across Raft consensus groups
-
-    ### Flexible Indexing
-    - **Index Types**: `full_text` (BM25), `embeddings` (vector with RaBitQ), `graph` (relationship traversal)
-    - **Enrichers**: `embeddingenricher`, `summarizeenricher`, `pipelineenricher` (async background processing)
-    - **Query Processors**: `chunker` (semantic document splitting), `pruner` (result filtering), `reranker` (relevance re-scoring)
-    - **Multimodal**: Durable document extraction plus application-managed descriptions or vectors
-    - **Pluggable Architecture**: Easy to add custom index types via registry pattern
+    - **Backup and Restore**: Portable backups to local disk or object storage
   contact:
     name: Antfly
     url: https://github.com/antflydb/antfly
@@ -2326,15 +2323,34 @@ components:
           type: boolean
           enum: [true]
           description: Retrying the complete query against fresh topology may succeed.
+    DocumentArtifactPublicationFailedError:
+      type: object
+      additionalProperties: false
+      description: The requested source artifact failed publication and requires inspection and reprocessing.
+      required: [code, error, message, retryable]
+      properties:
+        code:
+          type: string
+          enum: [document_artifact_publication_failed]
+        error:
+          type: string
+          enum: [document_artifact_publication_failed]
+        message:
+          type: string
+        retryable:
+          type: boolean
+          enum: [false]
     QueryConflictError:
       oneOf:
         - $ref: '#/components/schemas/HierarchyCursorStaleError'
         - $ref: '#/components/schemas/TopologyChangedError'
+        - $ref: '#/components/schemas/DocumentArtifactPublicationFailedError'
       discriminator:
         propertyName: error
         mapping:
           hierarchy_cursor_stale: '#/components/schemas/HierarchyCursorStaleError'
           topology_changed: '#/components/schemas/TopologyChangedError'
+          document_artifact_publication_failed: '#/components/schemas/DocumentArtifactPublicationFailedError'
     UnsupportedHierarchyGroupingError:
       type: object
       additionalProperties: false
@@ -3577,6 +3593,7 @@ components:
             $ref: "#/components/schemas/TableRepairIssue"
     RepairIssueListRequest:
       type: object
+      additionalProperties: false
       description: Bounded request to list table repair issues.
       properties:
         target:
@@ -3600,6 +3617,7 @@ components:
           description: Maximum repair records to return.
     RepairRunRequest:
       type: object
+      additionalProperties: false
       description: Bounded request to run a table repair pass.
       properties:
         target:
@@ -11950,7 +11968,7 @@ components:
           schema:
             $ref: "#/components/schemas/HierarchyCursorStaleError"
     QueryConflict:
-      description: The query's pinned hierarchy or table topology changed while it was running
+      description: The query's pinned hierarchy or table topology changed, or a requested source artifact failed publication
       content:
         application/json:
           schema:
@@ -15983,9 +16001,9 @@ paths:
         schema:
           type: string
     post:
-      summary: Reprocess a derived asset across a table range
+      summary: Reprocess a derived artifact across a table range
       description: |
-        Runs a bounded operational repair pass for any asset producer type
+        Runs a bounded operational repair pass for any asset or embedding producer
         across source rows in key order. Use `next_key` from the response as
         the next request's `from_key` for simple single-cursor continuation.
         Distributed repair controllers should persist `shard_cursors` from the
@@ -16108,7 +16126,7 @@ paths:
       summary: Create a derived document artifact reprocess job
       description: |
         Creates a durable user-facing repair job for a derived document
-        artifact. The job advances through the same bounded per-shard repair
+        asset or embedding artifact. The job advances through the same bounded per-shard repair
         primitive used by `/reprocess`, and stores returned continuation
         cursors so hosted controllers can resume large sharded table repairs
         without collapsing progress into a single global key cursor.
@@ -16351,12 +16369,16 @@ paths:
         schema:
           type: string
     post:
-      summary: Reprocess a derived asset
+      summary: Reprocess a derived artifact
       description: |
         Invalidates the current artifact state and requests the producer to
         rebuild the derived asset for the source document. Copy, generator,
         reader, transcriber, extractor, and document-extraction producers are
-        all supported.
+        all supported, as are dense and sparse embedding producers. Embedding
+        reprocessing regenerates vectors even when the source chunks are unchanged.
+        Embedding requests are committed durably and queued for supervised
+        inference. Acceptance does not wait for inference; inspect index coverage
+        and repair issues for the eventual outcome.
       tags:
         - data_operations
       operationId: reprocessDocumentArtifact
@@ -17294,6 +17316,8 @@ paths:
                 $ref: "#/components/schemas/QueryResponses"
         "400":
           $ref: "#/components/responses/BadRequest"
+        "409":
+          $ref: "#/components/responses/QueryConflict"
         "404":
           $ref: "#/components/responses/NotFound"
         "500":

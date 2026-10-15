@@ -1692,7 +1692,7 @@ pub const AnswerAgentSteps = struct {
     }
 };
 
-/// Configuration for the Antfly inference chunking provider. Antfly inference is Antfly's built-in ML service for local chunking. The model name maps to ONNX model directory names (similar to how Ollama works). **Chunking Models:** - fixed: Simple fixed-size chunking by token count (built-in, no ONNX required) - Any other name will attempt to load from models/chunkers/{name}/ directory **Deduplication:** - Within a single document write, chunk results are deduplicated when multiple indexes share the same source text and chunker configuration, so the source is chunked at most once per write.
+/// Configuration for the Antfly inference chunking provider. Antfly inference is Antfly's built-in ML service for local chunking. **Chunking Models:** - fixed: Fixed-size chunking by token count, with fixed time windows for audio (aliases `fixed_bert`, `fixed_bpe`, and `fixed-bert-tokenizer`). This is the only chunking model Antfly inference implements; other model names are rejected as unsupported. **Deduplication:** - Within a single document write, chunk results are deduplicated when multiple indexes share the same source text and chunker configuration, so the source is chunked at most once per write.
 pub const AntflyChunkerConfig = struct {
     /// Maximum number of chunks to generate per document. Zero (the default when omitted) means unlimited: the document is chunked in full. Set an explicit value up to 4096 to cap output; any chunks beyond the cap are silently omitted, so treat a result whose chunk count equals `max_chunks` as potentially truncated.
     max_chunks: ?i64 = null,
@@ -8682,6 +8682,14 @@ pub const DocumentArtifactManifestList = struct {
     /// Stable identity of the source document.
     document_id: []const u8,
     artifacts: []const DocumentArtifactManifest,
+};
+
+/// The requested source artifact failed publication and requires inspection and reprocessing.
+pub const DocumentArtifactPublicationFailedError = struct {
+    code: []const u8,
+    @"error": []const u8,
+    message: []const u8,
+    retryable: bool,
 };
 
 pub const DocumentArtifactReprocessFailure = struct {
@@ -22739,11 +22747,11 @@ pub const InferenceChunk = struct {
 
 /// Configuration for chunking requests to Antfly inference. Combines shared text options with inference-specific audio/VAD options.
 pub const InferenceChunkConfig = struct {
-    /// The chunking model to use. Either 'fixed' for simple token-based chunking, or a model name from models/chunkers/{name}/.
+    /// The chunking model to use. Antfly inference implements only 'fixed' (token-count text chunking and fixed audio windows); other model names are rejected.
     model: ?[]const u8 = null,
     /// Maximum number of chunks to generate per document. Zero (the default when omitted) means unlimited: the document is chunked in full. Set an explicit value up to 4096 to cap output; any chunks beyond the cap are silently omitted, so treat a result whose chunk count equals `max_chunks` as potentially truncated.
     max_chunks: ?i64 = null,
-    /// Confidence threshold for model-based chunking (0.0-1.0). Used by ONNX text models and VAD audio models.
+    /// Confidence threshold for model-based chunking (0.0-1.0). Validated but not used by the built-in fixed chunker.
     threshold: ?f32 = null,
     text: ?TextChunkOptions = null,
     audio: ?InferenceAudioChunkConfig = null,
@@ -23027,7 +23035,7 @@ pub const InferenceConfig = struct {
     api_url: ?[]const u8 = null,
     /// API key used when calling an authenticated shared Antfly inference API.
     api_key: ?[]const u8 = null,
-    /// Base directory containing model subdirectories. Antfly inference auto-discovers models from: - `{models_dir}/embedders/` - Embedding models (ONNX) - `{models_dir}/chunkers/` - Chunking models (ONNX) - `{models_dir}/rerankers/` - Reranking models (ONNX) - `{models_dir}/extractors/` - Entity, relation, and structured extraction models - `{models_dir}/rewriters/` - Seq2Seq rewriter models (ONNX) Defaults to ~/.antfly/inference/models (set via viper). If not set, only built-in fixed chunking is available.
+    /// Base directory containing model subdirectories. Antfly inference auto-discovers models from: - `{models_dir}/{owner}/{name}/` - Models fetched with `antfly inference pull owner/name` - `{models_dir}/embedders/` - Embedding models - `{models_dir}/rerankers/` - Reranking models - `{models_dir}/extractors/` - Entity, relation, and structured extraction models - `{models_dir}/rewriters/` - Seq2Seq rewriter models Defaults to `$ANTFLY_INFERENCE_MODELS_DIR` when set, otherwise `~/.antfly/inference/models` (`./models` when `$HOME` is unset). The `--models-dir` flag overrides both. The built-in `fixed` chunker needs no models.
     models_dir: ?[]const u8 = null,
     /// Base directory containing Traditional ML predictor subdirectories. The `/ml/v1/*` API auto-discovers predictors from `{ml_dir}/{name}/tabular_model.json`. Defaults to ~/.antfly/inference/ml.
     ml_dir: ?[]const u8 = null,
@@ -26261,7 +26269,7 @@ pub const InferenceRuntimeConfig = struct {
     api_url: ?[]const u8 = null,
     /// API key used when calling an authenticated shared Antfly inference API.
     api_key: ?[]const u8 = null,
-    /// Base directory containing model subdirectories. Antfly inference auto-discovers models from: - `{models_dir}/embedders/` - Embedding models (ONNX) - `{models_dir}/chunkers/` - Chunking models (ONNX) - `{models_dir}/rerankers/` - Reranking models (ONNX) - `{models_dir}/extractors/` - Entity, relation, and structured extraction models - `{models_dir}/rewriters/` - Seq2Seq rewriter models (ONNX) Defaults to ~/.antfly/inference/models (set via viper). If not set, only built-in fixed chunking is available.
+    /// Base directory containing model subdirectories. Antfly inference auto-discovers models from: - `{models_dir}/{owner}/{name}/` - Models fetched with `antfly inference pull owner/name` - `{models_dir}/embedders/` - Embedding models - `{models_dir}/rerankers/` - Reranking models - `{models_dir}/extractors/` - Entity, relation, and structured extraction models - `{models_dir}/rewriters/` - Seq2Seq rewriter models Defaults to `$ANTFLY_INFERENCE_MODELS_DIR` when set, otherwise `~/.antfly/inference/models` (`./models` when `$HOME` is unset). The `--models-dir` flag overrides both. The built-in `fixed` chunker needs no models.
     models_dir: ?[]const u8 = null,
     /// Base directory containing Traditional ML predictor subdirectories. The `/ml/v1/*` API auto-discovers predictors from `{ml_dir}/{name}/tabular_model.json`. Defaults to ~/.antfly/inference/ml.
     ml_dir: ?[]const u8 = null,
@@ -31651,6 +31659,7 @@ pub const QueryCandidateBudgetExceededError = struct {
 pub const QueryConflictError = union(enum) {
     hierarchy_cursor_stale_error: HierarchyCursorStaleError,
     topology_changed_error: TopologyChangedError,
+    document_artifact_publication_failed_error: DocumentArtifactPublicationFailedError,
 
     pub fn jsonParseFromSliceLeaky(allocator: std.mem.Allocator, input: []const u8, options: std.json.ParseOptions) !@This() {
         const DiscriminatorProbe = union(enum) {
@@ -31676,6 +31685,9 @@ pub const QueryConflictError = union(enum) {
         if (std.mem.eql(u8, disc_str, "topology_changed")) {
             return .{ .topology_changed_error = try std.json.parseFromSliceLeaky(TopologyChangedError, allocator, input, options) };
         }
+        if (std.mem.eql(u8, disc_str, "document_artifact_publication_failed")) {
+            return .{ .document_artifact_publication_failed_error = try std.json.parseFromSliceLeaky(DocumentArtifactPublicationFailedError, allocator, input, options) };
+        }
         return error.UnexpectedToken;
     }
 
@@ -31699,6 +31711,9 @@ pub const QueryConflictError = union(enum) {
         if (std.mem.eql(u8, disc_str, "topology_changed")) {
             return .{ .topology_changed_error = try std.json.parseFromValueLeaky(TopologyChangedError, allocator, source, options) };
         }
+        if (std.mem.eql(u8, disc_str, "document_artifact_publication_failed")) {
+            return .{ .document_artifact_publication_failed_error = try std.json.parseFromValueLeaky(DocumentArtifactPublicationFailedError, allocator, source, options) };
+        }
         return error.UnexpectedToken;
     }
 
@@ -31706,6 +31721,7 @@ pub const QueryConflictError = union(enum) {
         switch (self) {
             .hierarchy_cursor_stale_error => |v| try jw.write(v),
             .topology_changed_error => |v| try jw.write(v),
+            .document_artifact_publication_failed_error => |v| try jw.write(v),
         }
     }
 };

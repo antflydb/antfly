@@ -56,6 +56,7 @@ pub const Error = operation.ApiError || @import("relational_integrity_errors.zig
     IndexGenerationMismatch,
     GenerationTransitionActive,
     HierarchyCursorStale,
+    DocumentArtifactPublicationFailed,
     DocIdentityNamespaceMismatch,
     StorageReadTemporarilyUnavailable,
     ReadIndexTimeout,
@@ -304,6 +305,7 @@ pub const Operations = struct {
             error.IndexGenerationMismatch => error.IndexGenerationMismatch,
             error.GenerationTransitionActive => error.GenerationTransitionActive,
             error.DocIdentityNamespaceMismatch => error.DocIdentityNamespaceMismatch,
+            error.DocumentArtifactPublicationFailed => error.DocumentArtifactPublicationFailed,
             // Reads share the same leadership admission as point lookup. Do
             // not turn a leader election/routing race into an opaque 500 at
             // the internal scan boundary.
@@ -2153,7 +2155,10 @@ fn consumerTests() type {
                     try std.testing.expectEqualStrings("documents", table_name);
                     try std.testing.expectEqual(raft_mod.ReadConsistency.read_index, consistency);
                     try std.testing.expectEqual(@as(?u64, 12345), req.identity_read_generation);
-                    if (req.hierarchy_children != null) return error.HierarchyCursorStale;
+                    if (req.hierarchy_children) |navigation| {
+                        if (std.mem.eql(u8, navigation.parent_id, "doc:failed")) return error.DocumentArtifactPublicationFailed;
+                        return error.HierarchyCursorStale;
+                    }
                     return error.UnsupportedQueryRequest;
                 }
 
@@ -2186,6 +2191,16 @@ fn consumerTests() type {
                 .{
                     .identity_read_generation = 12345,
                     .hierarchy_children = .{ .parent_id = "doc:a" },
+                },
+            ));
+            try std.testing.expectError(error.DocumentArtifactPublicationFailed, operations.query(
+                std.testing.allocator,
+                .{},
+                17,
+                "documents",
+                .{
+                    .identity_read_generation = 12345,
+                    .hierarchy_children = .{ .parent_id = "doc:failed" },
                 },
             ));
 
