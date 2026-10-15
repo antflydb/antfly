@@ -126,7 +126,9 @@ pub const GraphReplacementBuild = struct {
     total_retry_count: u32 = 0,
     retry_after_ns: u64 = 0,
     activation_attempts: u32 = 0,
-    producer_replay_complete: bool = true,
+    // Older reservations have no producer checkpoint. Replay their sources
+    // before activation too; terminal coverage makes this restart-safe.
+    producer_replay_complete: bool = false,
     producer_replay_resume_b64: ?[]const u8 = null,
     producer_replay_target: u64 = 0,
 };
@@ -11977,7 +11979,7 @@ pub const IndexManager = struct {
         try self.provisionConfiguredIndexDirDurable(stored);
         const key = try std.fmt.allocPrint(self.alloc, "{s}{s}", .{ graph_replacement_build_prefix, stored.name });
         defer self.alloc.free(key);
-        const value = try std.json.Stringify.valueAlloc(self.alloc, GraphReplacementBuild{ .name = stored.name, .generation = stored.coverage_generation, .old = old, .config = stored, .request_hash = types.indexConfigHash(cfg), .applied_sequence = floor, .producer_replay_complete = self.resolvers.items.len == resolver_checkpoint or validated.artifact_sources.len == 0 }, .{});
+        const value = try std.json.Stringify.valueAlloc(self.alloc, GraphReplacementBuild{ .name = stored.name, .generation = stored.coverage_generation, .old = old, .config = stored, .request_hash = types.indexConfigHash(cfg), .applied_sequence = floor, .producer_replay_complete = validated.artifact_sources.len == 0 }, .{});
         defer self.alloc.free(value);
         var runtime_store = try initRuntimeStore(self.alloc, store);
         defer runtime_store.deinit();

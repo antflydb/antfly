@@ -1315,7 +1315,12 @@ separate execution contract alongside the serving resolver, records it with the
 durable shadow reservation, and resets the existing bounded resolution replay
 cursors. Inline extraction producers are admitted in that transaction too;
 existing documents are replayed in resumable pages before graph construction,
-without a corpus scan at admission or activation. The old graph and public resolver remain authoritative during the build.
+without a corpus scan at admission or activation. This replay covers every
+artifact source required by the new graph and its upstream producers, including
+graphs with absent or unchanged resolvers. A missing enrichment runtime is
+created on demand, including after reopen; manual owners retain synchronous
+execution without starting background workers. The old graph and public resolver
+remain authoritative during the build.
 The successor takes the public name in the same transaction that activates the
 shadow graph; cancellation or terminal build failure retires only the staged
 execution contract. Pending replacement and resolution work resume after reopen.
