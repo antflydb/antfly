@@ -4395,3 +4395,13 @@ filters with independent full admission before and after restart. Native error
 transport generation, Zig formatting, Python lint/formatting, whitespace,
 licenses and the Apache product boundary also passed. Fresh origin/main remained
 at f56cf1f4c7 and was already included in the branch.
+
+
+After that qualification, origin/main advanced to 5fdb3ea392 (#1135). The branch
+merged it, retaining the shared-owner inference diagnostic entry point and
+regenerating the compiler-local error transport for TestRuntimeMutexHeld. On the
+merged code, the Debug CLI rebuilt successfully, all 468 lake integration tests
+and 62 focused tests passed, and all 46 real Parquet/Iceberg E2Es passed in 303.59
+seconds. Generated error transport and the Apache source boundary checks passed;
+there are no unresolved merge conflicts. Provider retention qualification and
+archive-scale performance measurements remain deferred.
