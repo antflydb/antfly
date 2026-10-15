@@ -606,7 +606,7 @@ pub const Backend = struct {
         /// Native opaque identity, generated once before mutation admission.
         /// Providers without this capability require an explicit _id.
         generate_row_id: ?*const fn (*anyopaque, std.mem.Allocator) anyerror![]const u8 = null,
-        resolve_conflict_owners: ?*const fn (*anyopaque, std.mem.Allocator, Table, ConflictTarget, []const Mutation) anyerror![]const ConflictOwner = null,
+        resolve_conflict_owners: ?*const fn (*anyopaque, std.mem.Allocator, std.mem.Allocator, Table, ConflictTarget, []const Mutation) anyerror![]const ConflictOwner = null,
         // All returned data belongs to the supplied allocator. Scans receive
         // a short-lived page arena, not the retained statement result arena.
         resolve: *const fn (*anyopaque, std.mem.Allocator, ast.Name, Action) anyerror!Table,

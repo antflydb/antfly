@@ -11567,6 +11567,10 @@ pub const IndexManager = struct {
         self.storeGeneratedEnrichmentTargetCache(false);
     }
 
+    pub fn loadDeferredBackfill(self: *IndexManager, store: anytype) !void {
+        try self.loadWithBackfill(store, false, false);
+    }
+
     pub fn loadNoBackfill(self: *IndexManager, store: anytype) !void {
         try self.loadWithBackfill(store, false, true);
     }
@@ -23277,6 +23281,7 @@ pub const IndexManager = struct {
                 error.Unsupported => source_map.reset(),
                 else => {
                     if (task.deletion_state.budget.denied()) return error.ResourceBudgetExceeded;
+                    if (err == error.EnrichmentWaitCanceled or err == error.Canceled) return err;
                     std.log.err("scheduled text merge file-backed build failed index={s}: {s}", .{ task.index_name, @errorName(err) });
                     return err;
                 },
