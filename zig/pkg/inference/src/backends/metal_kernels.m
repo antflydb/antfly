@@ -6722,6 +6722,7 @@ static NSString *termite_metal_shader_source(void) {
            "    float y = 0.5f * x * (1.0f + tanh(inner));\n"
            "    return isfinite(y) ? y : 0.0f;\n"
            "}\n"
+           "inline ulong termite_dropout_mix(ulong value) { ulong x = value + 0x9e3779b97f4a7c15ul; x = (x ^ (x >> 30)) * 0xbf58476d1ce4e5b9ul; x = (x ^ (x >> 27)) * 0x94d049bb133111ebul; return x ^ (x >> 31); }\n"
            "inline float termite_gelu_exact(float x) {\n"
            "    if (!isfinite(x)) return 0.0f;\n"
            "    if (x > 10.0f) return x;\n"
@@ -11198,6 +11199,7 @@ static NSString *termite_metal_shader_source(void) {
            "        out[base+N+5u]=ok&&valid>=2u&&isfinite(sum)&&sum>0.0f&&isfinite(asum)&&asum>0.0f?0.0f:1.0f;break;\n"
            "    }\n"
            "    case 48u: {float x=a0[gid];out[gid]=termite_gelu_exact(x);break;}\n"
+           "    case 55u: {ulong seed=ulong(p.dims[1])|(ulong(p.dims[2])<<32);uint bits=uint(termite_dropout_mix(seed^termite_dropout_mix(ulong(gid)))>>32);out[gid]=bits<p.dims[3]?0.0f:p.scalars[0];break;}\n"
            "    case 54u: {uint part,row,col;if(D!=0u){row=gid/(3u*N);uint c=gid%(3u*N);part=c/N;col=c%N;}else{part=gid/(B*N);uint r=gid%(B*N);row=r/N;col=r%N;}uint src=D!=0u?(part*B+row)*N:row*3u*N+part*N;if(part==2u){out[gid]=a0[src+col];break;}uint half_dim=C/2u,d=col%C,pair=d%half_dim,head=col-d;uint t=(row*(N/C)+head/C)*half_dim+pair;float lo=a0[src+head+pair],hi=a0[src+head+half_dim+pair],c=a1[t],s=a2[t];if(D!=0u)out[gid]=d<half_dim?lo*c+hi*s:hi*c-lo*s;else out[gid]=d<half_dim?lo*c-hi*s:lo*s+hi*c;break;}\n"
            "    case 53u: {uint row=gid/(2u*N),c=gid%(2u*N),i=c<N?c:c-N;float x=a0[row*2u*N+i],g=a1[row*N+i];if(c<N){float dg=!isfinite(x)?0.0f:(x>10.0f?1.0f:(x<-10.0f?0.0f:0.5f*(1.0f+termite_erf_approx(x*0.7071067811865476f))+x*0.3989422804014327f*exp(-0.5f*x*x)));out[gid]=g*a0[row*2u*N+N+i]*dg;}else out[gid]=g*termite_gelu_exact(x);break;}\n"
            "    case 52u: {uint row=gid/N,col=gid%N,half_dim=C/2u,d=col%C,pair=d%half_dim,head=col-d;uint t=(row*(N/C)+head/C)*half_dim+pair;float lo=a0[row*N+head+pair],hi=a0[row*N+head+half_dim+pair],c=a1[t],s=a2[t];if(D!=0u)out[gid]=d<half_dim?lo*c+hi*s:hi*c-lo*s;else out[gid]=d<half_dim?lo*c-hi*s:lo*s+hi*c;break;}\n"
@@ -47547,7 +47549,7 @@ int termite_metal_decode_runtime_gliner_boundary_device(
     if (!termite_metal_decode_runtime_gliner_boundary_ready(runtime)) return -17;
     if(runtime==NULL||input_handles==NULL||input_offsets==NULL||input_bytes==NULL||params==NULL||output_handle==NULL)return -1;
     if(runtime->gliner_boundary_f32_pipeline==nil)return -2;
-    if(params->kind>54u||output_elements==0||output_elements>INT32_MAX||work_items==0||work_items>INT32_MAX||simd_groups>1u)return -3;
+    if(params->kind>55u||output_elements==0||output_elements>INT32_MAX||work_items==0||work_items>INT32_MAX||simd_groups>1u)return -3;
     if(simd_groups&&(work_items%32u!=0u||runtime->gliner_boundary_f32_pipeline.threadExecutionWidth!=32u||runtime->gliner_boundary_f32_pipeline.maxTotalThreadsPerThreadgroup<32u))return -4;
     @autoreleasepool {
         id<MTLBuffer> output=(__bridge id<MTLBuffer>)output_handle;

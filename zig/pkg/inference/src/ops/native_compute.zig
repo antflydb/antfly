@@ -4933,6 +4933,7 @@ pub const vtable_impl = ComputeBackend.VTable{
     .layerNormBackward = &layerNormBackwardOp,
     .ropeTable = &ropeTableOp,
     .qkvRopeTable = &qkvRopeTableOp,
+    .dropoutMask = &dropoutMaskOp,
     .geglu = &gegluOp,
     .gegluBackward = &gegluBackwardOp,
     .rmsNorm = &rmsNormOp,
@@ -6858,6 +6859,16 @@ fn ropeTableOp(ctx: *anyopaque, input: CT, cos: CT, sin: CT, width: usize, head_
     const result = try self.makeOwnedBuf(output);
     errdefer freeTensor(self, result);
     return propagateLogicalShapeLike(self, result, input);
+}
+
+fn dropoutMaskOp(ctx: *anyopaque, shape: []const i32, probability: f32, seed: u64) anyerror!CT {
+    const self: *NativeCompute = @ptrCast(@alignCast(ctx));
+    var count: usize = 1;
+    for (shape) |dim| count *= @intCast(dim);
+    const values = try self.allocator.alloc(f32, count);
+    defer self.allocator.free(values);
+    try ops.dropout_mask.fill(values, probability, seed);
+    return fromFloat32ShapeOp(ctx, values, shape);
 }
 
 fn qkvRopeTableOp(ctx: *anyopaque, input: CT, cos: CT, sin: CT, width: usize, head_dim: usize, inverse: bool) anyerror!CT {

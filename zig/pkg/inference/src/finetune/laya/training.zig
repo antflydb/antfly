@@ -381,13 +381,15 @@ pub fn inputs(a: std.mem.Allocator, cb: *const ops.ComputeBackend, graph: *const
             try result.append(a, .{ .node_id = id, .value = value });
         }
     }
-    for (built.dropouts.items) |entry| {
+    // Training masks are filled on the backend from one seed per step, each
+    // dropout site getting its own stream (ops/dropout_mask.zig), rather than
+    // drawn on the host and uploaded.
+    const dropout_seed = if (training and built.dropouts.items.len != 0) random.int(u64) else 0;
+    for (built.dropouts.items, 0..) |entry, site| {
         const shape = graph.node(entry.node).output_shape;
-        const mask = try a.alloc(f32, @intCast(shape.numElements().?));
-        for (mask) |*v| v.* = if (!training) 1 else if (random.float(f32) < entry.probability) 0 else 1 / (1 - entry.probability);
         var dims: [8]i32 = undefined;
         for (shape.dims[0..shape.rank()], 0..) |dim, i| dims[i] = @intCast(dim);
-        const value = try floatInput(cb, mask, dims[0..shape.rank()]);
+        const value = try cb.dropoutMask(dims[0..shape.rank()], if (training) entry.probability else 0, ops.dropout_mask.mix(dropout_seed ^ ops.dropout_mask.mix(site)));
         errdefer cb.free(value);
         try result.append(a, .{ .node_id = entry.node, .value = value });
     }
