@@ -31,7 +31,14 @@ pub const Overlay = struct {
     host: Host,
     graph: ?c.Graph = null,
     alloc: ?A = null,
+    /// Reclaim provider page/decode buffers after retaining independent values.
+    /// This must support individual frees (the retained arena cannot).
+    capture_allocator: ?A = null,
     active: bool = false,
+    work: ?b.Work = null,
+    capture_accounting: bool = true,
+    node_order: ?[]const usize = null,
+    references: std.HashMapUnmanaged(v.Identity, std.ArrayList(Reference), v.Identity.Context, std.hash_map.default_max_load_percentage) = .empty,
     staged_read_documents: bool = false,
     nodes: std.ArrayList(Node) = .empty,
     node_positions: std.HashMapUnmanaged(v.Identity, usize, v.Identity.Context, std.hash_map.default_max_load_percentage) = .empty,
@@ -42,9 +49,10 @@ pub const Overlay = struct {
     max_anchors: usize = 1_000_000,
     max_edges: usize = 1_000_000,
     captured: b.StartupWork = .{},
-    const Node = struct { value: *v.Node, deleted: bool = false, dirty: bool = false, projection_cached: bool = false, projected: ?*const v.Node = null };
-    const Relationship = struct { value: *v.Relationship, deleted: bool = false };
-    const plain_vtable: b.Backend.VTable = .{ .bind = bind, .checkpoint = checkpoint, .scan = scan, .get = get, .get_relationship = getRelationship, .expand = expand, .search = search, .begin = begin, .startup_work = startupWork, .mutate = mutate, .commit = commit, .rollback = rollback, .new_identity = newIdentity };
+    const Reference = struct { position: usize, version: usize };
+    const Node = struct { value: *v.Node, deleted: bool = false, created: bool = false, dirty: bool = false, projection_cached: bool = false, projected: ?*const v.Node = null };
+    const Relationship = struct { value: *v.Relationship, deleted: bool = false, created: bool = false, dirty: bool = false, version: usize = 0 };
+    const plain_vtable: b.Backend.VTable = .{ .bind = bind, .checkpoint = checkpoint, .scan = scan, .get = get, .get_relationship = getRelationship, .expand = expand, .search = search, .set_work = setWork, .begin = begin, .startup_work = startupWork, .mutate = mutate, .commit = commit, .rollback = rollback, .new_identity = newIdentity };
     const projecting_vtable: b.Backend.VTable = projected: {
         var value = plain_vtable;
         value.project_node = projectNode;
@@ -66,6 +74,26 @@ pub const Overlay = struct {
         const self = cast(ptr);
         try self.base.vtable.checkpoint(self.base.ptr);
     }
+    fn setWork(ptr: *anyopaque, work: ?b.Work) void {
+        cast(ptr).setExecutionWork(work);
+    }
+    pub fn setExecutionWork(self: *Overlay, work: ?b.Work) void {
+        self.work = work;
+        if (work != null) self.capture_accounting = false;
+    }
+    pub fn charge(self: *Overlay, amount: usize) !void {
+        if (self.work) |work| return work.charge(work.ptr, amount);
+        try self.base.vtable.checkpoint(self.base.ptr);
+        if (!self.capture_accounting) return;
+        // Snapshot construction precedes runtime.execute, but still consumes
+        // the same statement ceiling and reports its work to that runtime.
+        if (amount > self.max_entities -| self.captured.intermediate_states) return error.CypherStateBudgetExceeded;
+        self.captured.intermediate_states += amount;
+    }
+    pub fn chargeValue(self: *Overlay, value: v.Value) !void {
+        if (self.work) |work| return work.value(work.ptr, value);
+        try self.charge(1);
+    }
     fn capacity(self: *Overlay) !void {
         if (self.nodes.items.len + self.relationships.items.len >= self.max_entities) return error.CypherStateBudgetExceeded;
     }
@@ -86,17 +114,19 @@ pub const Overlay = struct {
             var after: ?[]const u8 = null;
             while (true) {
                 try checkpoint(ptr);
-                const page = try self.base.vtable.scan(self.base.ptr, a, label.table, after, 256);
+                var scratch = std.heap.ArenaAllocator.init(self.capture_allocator orelse a);
+                defer scratch.deinit();
+                const page_a = if (self.capture_allocator != null) scratch.allocator() else a;
+                const page = try self.base.vtable.scan(self.base.ptr, page_a, label.table, after, 256);
                 const examined = page.examined orelse page.items.len;
                 if (examined > self.max_anchors -| self.captured.scanned_anchors) return error.CypherAnchorBudgetExceeded;
                 self.captured.scanned_anchors += examined;
                 for (page.items) |node| {
                     try self.capacity();
-                    const copy = try a.create(v.Node);
-                    copy.* = node.*;
+                    const copy = try self.retainNode(a, node);
                     try self.appendNode(a, .{ .value = copy });
                 }
-                after = page.next;
+                after = if (page.next) |next| if (self.capture_allocator != null) try a.dupe(u8, next) else next else null;
                 if (after == null) break;
             }
         }
@@ -107,18 +137,24 @@ pub const Overlay = struct {
                 var after: ?[]const u8 = null;
                 while (true) {
                     try checkpoint(ptr);
-                    const page = try self.base.vtable.expand(self.base.ptr, a, mapping, node.value.identity, .out, after, 256);
+                    var scratch = std.heap.ArenaAllocator.init(self.capture_allocator orelse a);
+                    defer scratch.deinit();
+                    const page_a = if (self.capture_allocator != null) scratch.allocator() else a;
+                    const page = try self.base.vtable.expand(self.base.ptr, page_a, mapping, node.value.identity, .out, after, 256);
                     const examined = page.examined orelse page.items.len;
                     if (examined > self.max_edges -| self.captured.explored_edges) return error.CypherEdgeBudgetExceeded;
                     self.captured.explored_edges += examined;
                     for (page.items) |relationship| {
                         if (self.findRelationship(.{ .identity = relationship.identity, .index = relationship.index }) != null) continue;
                         try self.capacity();
-                        const copy = try a.create(v.Relationship);
-                        copy.* = relationship.*;
+                        const copy = if (self.capture_allocator != null) @constCast((try (v.Value{ .relationship = relationship }).clone(a)).relationship) else blk: {
+                            const copy = try a.create(v.Relationship);
+                            copy.* = relationship.*;
+                            break :blk copy;
+                        };
                         try self.appendRelationship(a, .{ .value = copy });
                     }
-                    after = page.next;
+                    after = if (page.next) |next| if (self.capture_allocator != null) try a.dupe(u8, next) else next else null;
                     if (after == null) break;
                 }
             }
@@ -141,16 +177,24 @@ pub const Overlay = struct {
             try checkpoint(ptr);
             if (self.captured.scanned_anchors >= self.max_anchors) return error.CypherAnchorBudgetExceeded;
             self.captured.scanned_anchors += 1;
-            const producer = (try self.base.vtable.get(self.base.ptr, a, identity)) orelse {
+            var scratch = std.heap.ArenaAllocator.init(self.capture_allocator orelse a);
+            defer scratch.deinit();
+            const page_a = if (self.capture_allocator != null) scratch.allocator() else a;
+            const producer = (try self.base.vtable.get(self.base.ptr, page_a, identity)) orelse {
                 relationship.deleted = true;
                 continue;
             };
             seen.value_ptr.* = true;
             try self.capacity();
-            const copy = try a.create(v.Node);
-            copy.* = producer.*;
+            const copy = try self.retainNode(a, producer);
             try self.appendNode(a, .{ .value = copy });
         }
+    }
+    fn retainNode(self: *Overlay, a: A, node: *const v.Node) !*v.Node {
+        if (self.capture_allocator != null) return @constCast((try (v.Value{ .node = node }).clone(a)).node);
+        const copy = try a.create(v.Node);
+        copy.* = node.*;
+        return copy;
     }
     /// All node insertion paths maintain the same identity index. Producers are
     /// retained entities too; resolving every edge's authority stays O(1).
@@ -158,6 +202,7 @@ pub const Overlay = struct {
         try self.nodes.ensureUnusedCapacity(a, 1);
         try self.node_positions.put(a, node.value.identity, self.nodes.items.len);
         self.nodes.appendAssumeCapacity(node);
+        self.node_order = null;
     }
     fn findNode(self: *Overlay, identity: v.Identity) ?*Node {
         const position = self.node_positions.get(identity) orelse return null;
@@ -171,37 +216,96 @@ pub const Overlay = struct {
         const value = relationship.value;
         try self.relationship_positions.put(a, .{ .identity = value.identity, .index = value.index }, self.relationships.items.len);
         self.relationships.appendAssumeCapacity(relationship);
+        try self.indexReferences(a, self.relationships.items.len - 1);
+    }
+    fn indexReferences(self: *Overlay, a: A, position: usize) !void {
+        const relationship = &self.relationships.items[position];
+        relationship.version = try std.math.add(usize, relationship.version, 1);
+        const value = relationship.value;
+        const producer = try value.producingDocument(a);
+        const identities = [_]?v.Identity{ value.source, value.target, producer };
+        for (identities, 0..) |optional, index| {
+            const identity = optional orelse continue;
+            var duplicate = false;
+            for (identities[0..index]) |previous| if (previous) |other| {
+                if (identity.eql(other)) duplicate = true;
+            };
+            if (duplicate) continue;
+            try self.charge(1);
+            const slot = try self.references.getOrPut(a, identity);
+            if (!slot.found_existing) slot.value_ptr.* = .empty;
+            try slot.value_ptr.append(a, .{ .position = position, .version = relationship.version });
+        }
+    }
+    fn currentReference(self: *Overlay, reference: Reference) ?*Relationship {
+        const relationship = &self.relationships.items[reference.position];
+        return if (relationship.version == reference.version) relationship else null;
     }
     /// A host can replace an older physical copy when merging staged effects.
     pub fn indexRelationship(self: *Overlay, a: A, position: usize) !void {
         const value = self.relationships.items[position].value;
         try self.relationship_positions.put(a, .{ .identity = value.identity, .index = value.index }, position);
+        try self.indexReferences(a, position);
     }
     fn findRelationship(self: *Overlay, identity: v.RelationshipIdentity) ?*Relationship {
         const position = self.relationship_positions.get(identity) orelse return null;
         return &self.relationships.items[position];
     }
+    /// Cached pages use the overlay's allocator, never a caller's transient
+    /// page allocator. Materialized snapshots prepare this before publication.
+    pub fn prepareNodeOrder(self: *Overlay) !void {
+        if (self.node_order == null) {
+            const order = try self.alloc.?.alloc(usize, self.nodes.items.len);
+            // Sort once per structural change, not once per scan page. Sorting
+            // is bounded before entering the standard library's comparator.
+            const levels = if (order.len == 0) 0 else std.math.log2_int(usize, order.len) + 1;
+            try self.charge(order.len *| levels);
+            for (order, 0..) |*position, index| position.* = index;
+            std.mem.sort(usize, order, self, struct {
+                fn less(overlay: *Overlay, left: usize, right: usize) bool {
+                    const x = overlay.nodes.items[left].value.identity;
+                    const y = overlay.nodes.items[right].value.identity;
+                    const tables = std.mem.order(u8, x.table, y.table);
+                    return tables == .lt or (tables == .eq and std.mem.order(u8, x.key, y.key) == .lt);
+                }
+            }.less);
+            self.node_order = order;
+        }
+    }
     fn scan(ptr: *anyopaque, a: A, table: []const u8, after: ?[]const u8, limit: usize) !b.Page(*const v.Node) {
         const self = cast(ptr);
         try checkpoint(ptr);
         if (!self.active) return self.base.vtable.scan(self.base.ptr, a, table, after, limit);
+        if (limit == 0) return error.CypherInvalidBackendPage;
+        try self.prepareNodeOrder();
+        const order = self.node_order.?;
+        var lo: usize = 0;
+        var hi = order.len;
+        while (lo < hi) {
+            const middle = lo + (hi - lo) / 2;
+            const identity = self.nodes.items[order[middle]].value.identity;
+            const tables = std.mem.order(u8, identity.table, table);
+            if (tables == .lt or (tables == .eq and if (after) |key| std.mem.order(u8, identity.key, key) != .gt else false)) lo = middle + 1 else hi = middle;
+        }
         var found: std.ArrayList(*const v.Node) = .empty;
-        for (self.nodes.items) |node| {
-            if (node.deleted or !std.mem.eql(u8, node.value.identity.table, table)) continue;
+        var examined: usize = 0;
+        var last: ?[]const u8 = null;
+        var position = lo;
+        while (position < order.len) : (position += 1) {
+            const node = self.nodes.items[order[position]];
+            if (!std.mem.eql(u8, node.value.identity.table, table)) break;
+            if (examined == limit) break;
+            try self.charge(1);
+            examined += 1;
+            last = node.value.identity.key;
+            if (node.deleted) continue;
             const vertex = for (self.graph.?.labels) |label| {
                 if (self.graph.?.admits(node.value, label.name)) break true;
             } else false;
-            if (!vertex) continue;
-            if (after) |key| if (std.mem.order(u8, node.value.identity.key, key) != .gt) continue;
-            try found.append(a, node.value);
+            if (vertex) try found.append(a, node.value);
         }
-        std.mem.sort(*const v.Node, found.items, {}, struct {
-            fn less(_: void, left: *const v.Node, right: *const v.Node) bool {
-                return std.mem.order(u8, left.identity.key, right.identity.key) == .lt;
-            }
-        }.less);
-        const length = @min(limit, found.items.len);
-        return .{ .items = found.items[0..length], .next = if (length < found.items.len and length != 0) found.items[length - 1].identity.key else null, .examined = length };
+        const more = position < order.len and std.mem.eql(u8, self.nodes.items[order[position]].value.identity.table, table);
+        return .{ .items = try found.toOwnedSlice(a), .next = if (more) last else null, .examined = examined };
     }
     fn get(ptr: *anyopaque, a: A, identity: v.Identity) !?*const v.Node {
         const self = cast(ptr);
@@ -234,20 +338,21 @@ pub const Overlay = struct {
         const self = cast(ptr);
         try checkpoint(ptr);
         if (!self.active) return self.base.vtable.expand(self.base.ptr, a, mapping, identity, direction, after, limit);
-        const offset = if (after) |cursor| try std.fmt.parseInt(usize, cursor, 10) else 0;
+        if (limit == 0) return error.CypherInvalidBackendPage;
+        const references = if (self.references.get(identity)) |list| list.items else &.{};
+        const offset = if (after) |cursor| try std.fmt.parseUnsigned(usize, cursor, 10) else 0;
+        if (offset > references.len) return error.CypherInvalidBackendCursor;
         var found: std.ArrayList(*const v.Relationship) = .empty;
-        var next: ?[]const u8 = null;
-        for (self.relationships.items[offset..], offset..) |item, index| {
+        const end = offset + @min(limit, references.len - offset);
+        for (references[offset..end]) |reference| {
+            try self.charge(1);
+            const item = self.currentReference(reference) orelse continue;
             if (item.deleted or !std.mem.eql(u8, item.value.type, mapping.name) or !std.mem.eql(u8, item.value.index, mapping.index)) continue;
             if (!((direction != .in and item.value.source.eql(identity)) or (direction != .out and item.value.target.eql(identity)))) continue;
             if (!try self.producerVisible(a, item.value)) continue;
-            if (found.items.len == limit) {
-                next = try std.fmt.allocPrint(a, "{d}", .{index});
-                break;
-            }
             try found.append(a, item.value);
         }
-        return .{ .items = try found.toOwnedSlice(a), .next = next };
+        return .{ .items = try found.toOwnedSlice(a), .next = if (end < references.len) try std.fmt.allocPrint(a, "{d}", .{end}) else null, .examined = end - offset };
     }
     fn search(ptr: *anyopaque, a: A, table: []const u8, input: b.SearchInput) !b.SearchPage {
         const self = cast(ptr);
@@ -256,13 +361,22 @@ pub const Overlay = struct {
         if (self.mutations.items.len != 0 or self.staged_read_documents) return error.CypherSearchAfterWrite;
         return (self.base.vtable.search orelse return error.CypherSearchUnavailable)(self.base.ptr, a, table, input);
     }
-    fn properties(a: A, old: []const v.Entry, updates: []const v.Entry, replace: bool) ![]const v.Entry {
+    fn properties(self: *Overlay, a: A, old: []const v.Entry, updates: []const v.Entry, replace: bool) ![]const v.Entry {
         var output: std.ArrayList(v.Entry) = .empty;
+        var names: std.StringHashMapUnmanaged(void) = .empty;
+        defer names.deinit(a);
+        if (updates.len > 8) for (updates) |entry| {
+            try self.charge(1 + entry.name.len / 64);
+            try names.put(a, entry.name, {});
+        };
         if (!replace) for (old) |entry| {
-            var changed = false;
-            for (updates) |update| if (std.mem.eql(u8, entry.name, update.name)) {
-                changed = true;
-                break;
+            try self.charge(1 + entry.name.len / 64);
+            const changed = if (updates.len > 8) names.contains(entry.name) else scan: {
+                for (updates) |update| {
+                    try self.charge(1 + update.name.len / 64);
+                    if (std.mem.eql(u8, update.name, entry.name)) break :scan true;
+                }
+                break :scan false;
             };
             if (!changed) try output.append(a, entry);
         };
@@ -297,9 +411,7 @@ pub const Overlay = struct {
         if (postimage != null) {
             try self.refreshDocumentRelationships(a, copy);
         } else {
-            for (self.relationships.items) |*relationship| {
-                if (try ownedBy(a, relationship.value, identity)) relationship.deleted = true;
-            }
+            try self.retireOwnedRelationships(a, identity, false);
         }
     }
 
@@ -308,7 +420,7 @@ pub const Overlay = struct {
             .node => |identity| {
                 const node = self.findNode(identity) orelse return error.CypherDeletedEntity;
                 if (node.deleted) return error.CypherDeletedEntity;
-                node.value.properties = try properties(a, node.value.properties, updates, replace);
+                node.value.properties = try self.properties(a, node.value.properties, updates, replace);
                 node.dirty = true;
                 node.projection_cached = false;
                 if (self.base.vtable.normalize_node) |normalize| node.value.* = (try normalize(self.base.ptr, a, node.value, false)).*;
@@ -318,7 +430,8 @@ pub const Overlay = struct {
                 const relationship = self.findRelationship(identity) orelse return error.CypherDeletedEntity;
                 if (relationship.deleted) return error.CypherDeletedEntity;
                 if (relationship.value.ownership != .explicit) return error.CypherDerivedRelationshipMutation;
-                relationship.value.properties = try properties(a, relationship.value.properties, updates, replace);
+                relationship.value.properties = try self.properties(a, relationship.value.properties, updates, replace);
+                relationship.dirty = true;
             },
         }
     }
@@ -335,12 +448,17 @@ pub const Overlay = struct {
         if (node.deleted) return false;
         return (try projectNode(self, a, node.value)) != null;
     }
+    pub fn retireOwnedRelationships(self: *Overlay, a: A, identity: v.Identity, fields_only: bool) !void {
+        if (self.references.get(identity)) |references| for (references.items) |reference| {
+            try self.charge(1);
+            const relationship = self.currentReference(reference) orelse continue;
+            if ((!fields_only or relationship.value.ownership == .field) and try ownedBy(a, relationship.value, identity)) relationship.deleted = true;
+        };
+    }
     fn refreshDocumentRelationships(self: *Overlay, a: A, node: *const v.Node) !void {
         const project = self.base.vtable.document_relationships orelse return;
         const relationships = try project(self.base.ptr, a, node);
-        for (self.relationships.items) |*relationship| {
-            if (relationship.value.ownership == .field and try ownedBy(a, relationship.value, node.identity)) relationship.deleted = true;
-        }
+        try self.retireOwnedRelationships(a, node.identity, true);
         for (relationships) |relationship| {
             try self.capacity();
             if (self.captured.explored_edges >= self.max_edges) return error.CypherEdgeBudgetExceeded;
@@ -365,7 +483,7 @@ pub const Overlay = struct {
                 // Normalization may refresh labels. Validate the requested labels
                 // against defaults and generated values before staging the node.
                 for (node.labels) |name| if (!self.graph.?.admits(copy, name)) return error.CypherLabelPredicateViolation;
-                try self.appendNode(a, .{ .value = copy, .dirty = true });
+                try self.appendNode(a, .{ .value = copy, .dirty = true, .created = true });
                 try self.refreshDocumentRelationships(a, copy);
             },
             .create_relationship => |relationship| {
@@ -378,7 +496,7 @@ pub const Overlay = struct {
                 const copy = try a.create(v.Relationship);
                 copy.* = relationship.*;
                 copy.properties = try v.entityProperties(a, relationship.properties);
-                try self.appendRelationship(a, .{ .value = copy });
+                try self.appendRelationship(a, .{ .value = copy, .dirty = true, .created = true });
             },
             .set_properties => |update| try self.set(a, update.target, update.properties, update.replace),
             .remove_properties => |update| {
@@ -390,20 +508,26 @@ pub const Overlay = struct {
                 const relationship = self.findRelationship(identity) orelse return error.CypherDeletedEntity;
                 if (relationship.value.ownership != .explicit) return error.CypherDerivedRelationshipMutation;
                 relationship.deleted = true;
+                relationship.dirty = true;
             },
             .delete_node => |deletion| {
                 const node = self.findNode(deletion.identity) orelse return error.CypherDeletedEntity;
-                for (self.relationships.items) |*relationship| {
+                if (self.references.get(deletion.identity)) |references| for (references.items) |reference| {
+                    try self.charge(1);
+                    const relationship = self.currentReference(reference) orelse continue;
                     if (relationship.deleted) continue;
                     if (try ownedBy(a, relationship.value, deletion.identity) and !(relationship.value.source.eql(deletion.identity) or relationship.value.target.eql(deletion.identity))) {
                         relationship.deleted = true;
+                        relationship.dirty = true;
                         continue;
                     }
                     if (!(relationship.value.source.eql(deletion.identity) or relationship.value.target.eql(deletion.identity))) continue;
                     if (!deletion.detach) return error.CypherNodeHasRelationships;
                     relationship.deleted = true;
-                }
+                    relationship.dirty = true;
+                };
                 node.deleted = true;
+                node.dirty = true;
             },
         }
         try self.mutations.append(a, mutation);
@@ -426,6 +550,8 @@ pub const Overlay = struct {
         self.staged_read_documents = false;
         self.nodes = .empty;
         self.node_positions = .empty;
+        self.node_order = null;
+        self.references = .empty;
         self.relationships = .empty;
         self.relationship_positions = .empty;
         self.mutations = .empty;

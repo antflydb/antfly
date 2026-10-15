@@ -30,6 +30,8 @@ const Fixture = struct {
     rollbacks: usize = 0,
     fail_commit: bool = false,
     active: bool = false,
+    checkpoints: usize = 0,
+    cancel_after: ?usize = null,
     fn init() Fixture {
         return .{ .arena = std.heap.ArenaAllocator.init(std.testing.allocator) };
     }
@@ -37,7 +39,11 @@ const Fixture = struct {
         return @ptrCast(@alignCast(ptr));
     }
     fn bind(_: *anyopaque, _: A, _: root.catalog.Graph) !void {}
-    fn checkpoint(_: *anyopaque) !void {}
+    fn checkpoint(ptr: *anyopaque) !void {
+        const fixture = self(ptr);
+        fixture.checkpoints += 1;
+        if (fixture.cancel_after) |stop| if (fixture.checkpoints >= stop) return error.Canceled;
+    }
     fn scan(ptr: *anyopaque, a: A, _: []const u8, cursor: ?[]const u8, _: usize) !b.Page(*const v.Node) {
         if (cursor != null) return error.UnexpectedCursor;
         return .{ .items = try a.dupe(*const v.Node, self(ptr).nodes) };
@@ -441,9 +447,9 @@ test "overlay admission and durable plans independently reject deleted endpoints
         try std.testing.expectError(error.CypherDeletedEntity, backend.vtable.mutate.?(backend.ptr, a, .{ .create_relationship = relationship }));
         // Simulate a malformed adapter that bypasses overlay admission. The
         // durable postimage planner must still reject the orphan edge.
-        try overlay.relationships.append(a, .{ .value = relationship });
+        try overlay.relationships.append(a, .{ .value = relationship, .dirty = true, .created = true });
         try overlay.mutations.append(a, .{ .create_relationship = relationship });
-        try std.testing.expectError(error.CypherDeletedEntity, root.mutations.build(a, graph, &overlay, overlay.mutations.items, .{ .ptr = &fixture, .existed = Host.existed }));
+        try std.testing.expectError(error.CypherDeletedEntity, root.mutations.build(a, graph, &overlay));
     }
 }
 
@@ -717,4 +723,288 @@ test "property writes include entity envelopes in the wire depth before committi
     const json = try std.json.Stringify.valueAlloc(a, root.wire.Value{ .value = result.rows[0][0] }, .{});
     const decoded = try root.wire.transport(a, try std.json.parseFromSliceLeaky(std.json.Value, a, json, .{}));
     try std.testing.expect(v.Value.eql(.{ .map = result.rows[0][0].node.properties }, .{ .map = decoded.node.properties }));
+}
+
+test "bulk write planning is linear, charged before commit, and owns commit-time arena growth" {
+    const Host = struct {
+        fixture: *Fixture,
+        overlay: *root.transaction.Overlay = undefined,
+        entered: bool = false,
+        committed: bool = false,
+        cancel: bool = false,
+        fn identity(ptr: *anyopaque, a: A, table: []const u8, relationship: bool) !v.Identity {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return Fixture.identity(self.fixture, a, table, relationship);
+        }
+        fn commit(ptr: *anyopaque, a: A, _: []const b.Mutation) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.entered = true;
+            if (self.cancel) self.fixture.cancel_after = self.fixture.checkpoints + 4;
+            const plans = try root.mutations.build(a, graph, self.overlay);
+            try std.testing.expectEqual(@as(usize, 1), plans.len);
+            try std.testing.expectEqual(self.overlay.nodes.items.len, plans[0].writes.items.len);
+            self.committed = true;
+        }
+    };
+    var previous_work: usize = 0;
+    for ([_]usize{ 1000, 2000, 4000 }) |count| {
+        var fixture = Fixture.init();
+        defer fixture.arena.deinit();
+        var host: Host = .{ .fixture = &fixture };
+        var overlay: root.transaction.Overlay = .{ .base = fixture.backend(), .host = .{ .ptr = &host, .new_identity = Host.identity, .commit = Host.commit } };
+        host.overlay = &overlay;
+        const query = try std.fmt.allocPrint(fixture.arena.allocator(), "UNWIND range(1,{d}) AS x CREATE (n:Person {{id:x}}) RETURN count(*)", .{count});
+        var diagnostic: root.compiler.Diagnostic = .{};
+        var compiled = try root.compiler.compile(std.testing.allocator, query, .{}, &diagnostic);
+        defer compiled.deinit();
+        var result = try root.runtime.execute(std.testing.allocator, overlay.backend(), graph, &compiled, &.{}, .{});
+        defer result.deinit();
+        try std.testing.expect(host.committed);
+        try std.testing.expect(overlay.work == null);
+        try std.testing.expectEqual(@as(i64, @intCast(count)), result.rows[0][0].integer);
+        try std.testing.expect(result.stats.intermediate_states < 50 * count);
+        if (previous_work != 0) try std.testing.expect(result.stats.intermediate_states <= 2 * previous_work);
+        previous_work = result.stats.intermediate_states;
+    }
+    for ([_]bool{ false, true }) |cancel| {
+        var fixture = Fixture.init();
+        defer fixture.arena.deinit();
+        var host: Host = .{ .fixture = &fixture, .cancel = cancel };
+        var overlay: root.transaction.Overlay = .{ .base = fixture.backend(), .host = .{ .ptr = &host, .new_identity = Host.identity, .commit = Host.commit } };
+        host.overlay = &overlay;
+        var diagnostic: root.compiler.Diagnostic = .{};
+        var compiled = try root.compiler.compile(std.testing.allocator, "UNWIND range(1,1000) AS x CREATE (n:Person {id:x}) RETURN count(*)", .{}, &diagnostic);
+        defer compiled.deinit();
+        try std.testing.expectError(if (cancel) error.Canceled else error.CypherStateBudgetExceeded, root.runtime.execute(std.testing.allocator, overlay.backend(), graph, &compiled, &.{}, .{ .intermediate_states = if (cancel) 1_000_000 else 20_000 }));
+        try std.testing.expect(host.entered);
+        try std.testing.expect(!host.committed);
+        try std.testing.expect(!overlay.active);
+        try std.testing.expect(overlay.work == null);
+        try std.testing.expectEqual(@as(usize, 0), fixture.nodes.len);
+    }
+}
+
+test "bulk deletion visits incident references once and plans deletions without preimage rescans" {
+    const Counter = struct {
+        units: usize = 0,
+        fn charge(ptr: *anyopaque, amount: usize) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.units += amount;
+        }
+        fn value(ptr: *anyopaque, _: v.Value) !void {
+            try charge(ptr, 1);
+        }
+        fn commit(_: *anyopaque, _: A, _: []const b.Mutation) !void {}
+    };
+    for ([_]usize{ 1000, 2000, 4000 }) |count| {
+        var fixture = Fixture.init();
+        defer fixture.arena.deinit();
+        const a = fixture.arena.allocator();
+        var counter: Counter = .{};
+        var overlay: root.transaction.Overlay = .{ .base = fixture.backend(), .host = .{ .ptr = &fixture, .new_identity = Fixture.identity, .commit = Counter.commit } };
+        const backend = overlay.backend();
+        try backend.vtable.bind(backend.ptr, a, graph);
+        overlay.active = true;
+        overlay.work = .{ .ptr = &counter, .charge = Counter.charge, .value = Counter.value };
+        for (0..count) |index| {
+            const node = try a.create(v.Node);
+            node.* = .{ .identity = .{ .table = "people", .key = try std.fmt.allocPrint(a, "doc:{d}", .{index}) } };
+            try overlay.appendNode(a, .{ .value = node });
+        }
+        for (0..count) |index| {
+            const relationship = try a.create(v.Relationship);
+            relationship.* = .{ .identity = .{ .table = "people", .key = try std.fmt.allocPrint(a, "cypher:{d}", .{index}) }, .index = "links", .type = "KNOWS", .source = overlay.nodes.items[index].value.identity, .target = overlay.nodes.items[(index + 1) % count].value.identity };
+            try overlay.appendRelationship(a, .{ .value = relationship });
+        }
+        for (overlay.nodes.items) |node| try backend.vtable.mutate.?(backend.ptr, a, .{ .delete_node = .{ .identity = node.value.identity, .detach = true } });
+        const plans = try root.mutations.build(a, graph, &overlay);
+        try std.testing.expectEqual(count, plans[0].deletes.items.len);
+        try std.testing.expectEqual(count, plans[0].removed_edges.items.len);
+        try std.testing.expectEqual(@as(usize, 0), plans[0].writes.items.len);
+        try std.testing.expect(counter.units <= 8 * count);
+    }
+}
+
+test "reindexed relationship references suppress old endpoints and deduplicate self loops" {
+    const Host = struct {
+        fn commit(_: *anyopaque, _: A, _: []const b.Mutation) !void {}
+    };
+    var fixture = Fixture.init();
+    defer fixture.arena.deinit();
+    const a = fixture.arena.allocator();
+    var overlay: root.transaction.Overlay = .{ .base = fixture.backend(), .host = .{ .ptr = &fixture, .new_identity = Fixture.identity, .commit = Host.commit } };
+    const backend = overlay.backend();
+    try backend.vtable.bind(backend.ptr, a, graph);
+    overlay.active = true;
+    const first: v.Identity = .{ .table = "people", .key = "first" };
+    const second: v.Identity = .{ .table = "people", .key = "second" };
+    const relationship = try a.create(v.Relationship);
+    relationship.* = .{ .identity = .{ .table = "people", .key = "cypher:one" }, .index = "links", .type = "KNOWS", .source = first, .target = first };
+    try overlay.appendRelationship(a, .{ .value = relationship });
+    var page = try backend.vtable.expand(backend.ptr, a, graph.relationships[0], first, .both, null, 256);
+    try std.testing.expectEqual(@as(usize, 1), page.items.len);
+    relationship.source = second;
+    relationship.target = second;
+    try overlay.indexRelationship(a, 0);
+    try overlay.indexRelationship(a, 0);
+    page = try backend.vtable.expand(backend.ptr, a, graph.relationships[0], first, .both, null, 256);
+    try std.testing.expectEqual(@as(usize, 0), page.items.len);
+    page = try backend.vtable.expand(backend.ptr, a, graph.relationships[0], second, .both, null, 256);
+    try std.testing.expectEqual(@as(usize, 1), page.items.len);
+    try std.testing.expectError(error.CypherInvalidBackendCursor, backend.vtable.expand(backend.ptr, a, graph.relationships[0], second, .both, "1000", 256));
+}
+
+test "retained snapshot paging survives transient page allocators and reports its capture work" {
+    var fixture = Fixture.init();
+    defer fixture.arena.deinit();
+    var seeded = try fixture.run("CREATE (a:Person {name:'a'}),(b:Person {name:'b'}) RETURN count(*)");
+    seeded.deinit();
+    const snapshot = try root.snapshot.Materialized.create(std.testing.allocator, fixture.backend(), graph, .{});
+    defer snapshot.deinit();
+    const backend = snapshot.backend();
+    const capture_work = backend.vtable.startup_work.?(backend.ptr);
+    var after: ?[]const u8 = null;
+    {
+        var page_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer page_arena.deinit();
+        const page = try backend.vtable.scan(backend.ptr, page_arena.allocator(), "people", null, 1);
+        try std.testing.expectEqual(@as(usize, 1), page.items.len);
+        after = try fixture.arena.allocator().dupe(u8, page.next.?);
+    }
+    const page = try backend.vtable.scan(backend.ptr, fixture.arena.allocator(), "people", after, 1);
+    try std.testing.expectEqual(@as(usize, 1), page.items.len);
+    try std.testing.expect(page.next == null);
+    const work = backend.vtable.startup_work.?(backend.ptr);
+    try std.testing.expect(work.intermediate_states > 0);
+    try std.testing.expectEqual(capture_work, work);
+}
+
+test "large retained delete keeps linear memory within the statement ceiling" {
+    const Host = struct {
+        overlay: *root.transaction.Overlay = undefined,
+        fn commit(ptr: *anyopaque, a: A, _: []const b.Mutation) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            const plans = try root.mutations.build(a, graph, self.overlay);
+            try std.testing.expectEqual(@as(usize, 8000), plans[0].deletes.items.len);
+        }
+    };
+    var fixture = Fixture.init();
+    defer fixture.arena.deinit();
+    const a = fixture.arena.allocator();
+    const nodes = try a.alloc(*const v.Node, 8000);
+    for (nodes, 0..) |*out, index| {
+        const node = try a.create(v.Node);
+        const properties = try a.alloc(v.Entry, 1);
+        properties[0] = .{ .name = "id", .value = .{ .string = try std.fmt.allocPrint(a, "{d}", .{index}) } };
+        node.* = .{ .identity = .{ .table = "people", .key = try std.fmt.allocPrint(a, "cypher:0123456789abcdef0123456789abcdef:{d}", .{index}) }, .properties = properties };
+        out.* = node;
+    }
+    fixture.nodes = nodes;
+    const snapshot = try root.snapshot.Materialized.create(std.testing.allocator, fixture.backend(), graph, .{});
+    defer snapshot.deinit();
+    var host: Host = .{};
+    var overlay: root.transaction.Overlay = .{ .base = snapshot.backend(), .host = .{ .ptr = &host, .new_identity = Fixture.identity, .commit = Host.commit } };
+    host.overlay = &overlay;
+    var diagnostic: root.compiler.Diagnostic = .{};
+    var compiled = try root.compiler.compile(std.testing.allocator, "MATCH (n:Person) DELETE n RETURN count(n)", .{}, &diagnostic);
+    defer compiled.deinit();
+    var result = try root.runtime.execute(std.testing.allocator, overlay.backend(), graph, &compiled, &.{}, snapshot.remainingLimits(.{}));
+    defer result.deinit();
+    try std.testing.expectEqual(@as(i64, 8000), result.rows[0][0].integer);
+    try std.testing.expect(result.stats.memory_bytes + snapshot.budget.live <= 64 << 20);
+}
+
+test "retained capture reclaims decode pages and owns values and cursors" {
+    const Pages = struct {
+        fn scan(_: *anyopaque, a: A, _: []const u8, after: ?[]const u8, _: usize) !b.Page(*const v.Node) {
+            const position = if (after) |cursor| try std.fmt.parseInt(usize, cursor, 10) else 0;
+            // A provider may decode much more than the authorized projection.
+            @memset(try a.alloc(u8, 2 << 20), 0xa5);
+            const node = try a.create(v.Node);
+            node.* = .{ .identity = .{ .table = try a.dupe(u8, "people"), .key = try std.fmt.allocPrint(a, "{d}", .{position}) }, .labels = try a.dupe([]const u8, &.{"Person"}), .properties = try a.dupe(v.Entry, &.{.{ .name = try a.dupe(u8, "name"), .value = .{ .string = try a.dupe(u8, "retained") } }}) };
+            return .{ .items = try a.dupe(*const v.Node, &.{node}), .next = if (position < 9) try std.fmt.allocPrint(a, "{d}", .{position + 1}) else null };
+        }
+    };
+    var fixture = Fixture.init();
+    defer fixture.arena.deinit();
+    var vtable = fixture.backend().vtable.*;
+    vtable.scan = Pages.scan;
+    var vertices = graph;
+    vertices.relationships = &.{};
+    const snapshot = try root.snapshot.Materialized.create(std.testing.allocator, .{ .ptr = &fixture, .vtable = &vtable }, vertices, .{ .memory_bytes = 4 << 20 });
+    defer snapshot.deinit();
+    try std.testing.expectEqual(@as(usize, 10), snapshot.overlay.nodes.items.len);
+    for (snapshot.overlay.nodes.items, 0..) |node, index| {
+        try std.testing.expectEqual(index, try std.fmt.parseInt(usize, node.value.identity.key, 10));
+        try std.testing.expectEqualStrings("retained", (v.Value{ .node = node.value }).property("name").string);
+    }
+    try std.testing.expect(snapshot.budget.live < 1 << 20);
+}
+
+test "anchor deduplication shares identities across labels in exhaustive and goal scans" {
+    for ([_]usize{ 1000, 2000 }) |count| {
+        var fixture = Fixture.init();
+        defer fixture.arena.deinit();
+        const a = fixture.arena.allocator();
+        const nodes = try a.alloc(*const v.Node, count);
+        for (nodes, 0..) |*out, index| {
+            const node = try a.create(v.Node);
+            node.* = .{ .identity = .{ .table = "people", .key = try std.fmt.allocPrint(a, "{d}", .{index}) }, .properties = try a.dupe(v.Entry, &.{.{ .name = "id", .value = .{ .integer = @intCast(index) } }}) };
+            out.* = node;
+        }
+        fixture.nodes = nodes;
+        var aliases = graph;
+        aliases.labels = &.{ .{ .name = "Person", .table = "people" }, .{ .name = "Other", .table = "people" } };
+        for ([_][]const u8{ "MATCH (n) RETURN count(n)", "MATCH (n) RETURN n.id LIMIT 4000" }, 0..) |query, mode| {
+            var diagnostic: root.compiler.Diagnostic = .{};
+            var compiled = try root.compiler.compile(std.testing.allocator, query, .{}, &diagnostic);
+            defer compiled.deinit();
+            var result = try root.runtime.execute(std.testing.allocator, fixture.backend(), aliases, &compiled, &.{}, .{ .intermediate_states = count * 50 });
+            defer result.deinit();
+            if (mode == 0) {
+                try std.testing.expectEqual(@as(i64, @intCast(count)), result.rows[0][0].integer);
+            } else {
+                try std.testing.expectEqual(count, result.rows.len);
+                for (result.rows, 0..) |row, index| try std.testing.expectEqual(@as(i64, @intCast(index)), row[0].integer);
+            }
+        }
+    }
+}
+
+test "bulk SET and REMOVE refresh only rows containing the changed entity" {
+    const Host = struct {
+        overlay: *root.transaction.Overlay = undefined,
+        count: usize,
+        fn commit(ptr: *anyopaque, a: A, _: []const b.Mutation) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            const plans = try root.mutations.build(a, graph, self.overlay);
+            try std.testing.expectEqual(self.count, plans[0].writes.items.len);
+        }
+    };
+    for ([_]usize{ 1000, 2000 }) |count| {
+        var fixture = Fixture.init();
+        defer fixture.arena.deinit();
+        const a = fixture.arena.allocator();
+        const nodes = try a.alloc(*const v.Node, count);
+        for (nodes, 0..) |*out, index| {
+            const node = try a.create(v.Node);
+            node.* = .{ .identity = .{ .table = "people", .key = try std.fmt.allocPrint(a, "{d}", .{index}) }, .properties = try a.dupe(v.Entry, &.{.{ .name = "age", .value = .{ .integer = 0 } }}) };
+            out.* = node;
+        }
+        fixture.nodes = nodes;
+        for ([_][]const u8{
+            "MATCH (n:Person) WITH n,[n,n] AS aliases SET n.age=1 RETURN sum(aliases[0].age)",
+            "MATCH (n:Person) WITH n,[n,n] AS aliases REMOVE n.age RETURN count(aliases[0].age)",
+        }, 0..) |query, mode| {
+            var host: Host = .{ .count = count };
+            var overlay: root.transaction.Overlay = .{ .base = fixture.backend(), .host = .{ .ptr = &host, .new_identity = Fixture.identity, .commit = Host.commit } };
+            host.overlay = &overlay;
+            var diagnostic: root.compiler.Diagnostic = .{};
+            var compiled = try root.compiler.compile(std.testing.allocator, query, .{}, &diagnostic);
+            defer compiled.deinit();
+            var result = try root.runtime.execute(std.testing.allocator, overlay.backend(), graph, &compiled, &.{}, .{ .intermediate_states = count * 200 });
+            defer result.deinit();
+            try std.testing.expectEqual(@as(i64, @intCast(if (mode == 0) count else 0)), result.rows[0][0].integer);
+        }
+    }
 }

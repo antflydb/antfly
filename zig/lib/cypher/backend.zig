@@ -23,7 +23,15 @@ pub fn Page(comptime T: type) type {
 pub const Seed = struct { node: *const v.Node, score: f64 };
 pub const SearchInput = struct { parameters: v.Value, prepared_json: []const u8 = "", max_examined: usize = 1_000_000 };
 pub const SearchPage = struct { seeds: []const Seed, examined: usize = 0, approximate: bool = false };
-pub const StartupWork = struct { scanned_anchors: usize = 0, explored_edges: usize = 0 };
+pub const StartupWork = struct { scanned_anchors: usize = 0, explored_edges: usize = 0, intermediate_states: usize = 0 };
+/// Statement-owned execution accounting. Adapters may retain this capability
+/// only until runtime.execute returns; durable commit must not invoke it after
+/// releasing the read authority or publishing a decision.
+pub const Work = struct {
+    ptr: *anyopaque,
+    charge: *const fn (*anyopaque, usize) anyerror!void,
+    value: *const fn (*anyopaque, v.Value) anyerror!void,
+};
 pub const Mutation = union(enum) {
     create_node: *const v.Node,
     create_relationship: *const v.Relationship,
@@ -70,6 +78,7 @@ pub const Backend = struct {
         document_relationships: ?*const fn (*anyopaque, std.mem.Allocator, *const v.Node) anyerror![]const *const v.Relationship = null,
         /// Mutation adapters must support read-your-writes, transactional MERGE
         /// uniqueness, and atomic rollback of every staged mutation on failure.
+        set_work: ?*const fn (*anyopaque, ?Work) void = null,
         begin: ?*const fn (*anyopaque) anyerror!void = null,
         startup_work: ?*const fn (*anyopaque) StartupWork = null,
         mutate: ?*const fn (*anyopaque, std.mem.Allocator, Mutation) anyerror!void = null,

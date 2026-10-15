@@ -61,19 +61,7 @@ pub const Provider = struct {
         for (plans) |*entry| if (std.mem.eql(u8, entry.table.name, table)) return entry;
         return error.CypherSearchTableOutsideGraph;
     }
-    const Preimage = struct { mutations: []const cypher.backend.Mutation };
-    fn existed(ptr: *anyopaque, table: []const u8, key: []const u8) bool {
-        const preimage: *Preimage = @ptrCast(@alignCast(ptr));
-        // The overlay captures every visible preimage before applying mutations.
-        // Only nodes created in this statement lack a durable preimage. Range
-        // proofs validate the complete retained cut, including deleted rows.
-        const identity: cypher.value.Identity = .{ .table = table, .key = key };
-        for (preimage.mutations) |mutation| {
-            if (mutation == .create_node and mutation.create_node.identity.eql(identity)) return false;
-        }
-        return true;
-    }
-    fn commit(ptr: *anyopaque, a: A, mutations: []const cypher.backend.Mutation) !void {
+    fn commit(ptr: *anyopaque, a: A, _: []const cypher.backend.Mutation) !void {
         const self = cast(ptr);
         try self.context.ensureActive();
         const overlay = self.overlay orelse return error.CypherTransactionRequired;
@@ -88,8 +76,7 @@ pub const Provider = struct {
             try entry.predicates.appendSlice(a, owner.predicates);
             try entry.guards.append(a, .{ .fence = owner.fence, .proofs = owner.proofs });
         }
-        var preimage: Preimage = .{ .mutations = mutations };
-        const postimages = try cypher.mutations.build(a, self.graph, overlay, mutations, .{ .ptr = &preimage, .existed = existed });
+        const postimages = try cypher.mutations.build(a, self.graph, overlay);
         for (postimages) |postimage| {
             const entry = try plan(plans, postimage.table);
             for (postimage.writes.items) |write| try entry.writes.append(a, .{ .key = write.key, .value = write.value });

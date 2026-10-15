@@ -46,17 +46,10 @@ pub const Writer = struct {
         try (self.read.handle.db.backend_runtime.io() orelse return error.BackendRuntimeIoUnavailable).randomSecure(&nonce);
         return .{ .table = table, .key = try std.fmt.allocPrint(a, "cypher:{s}", .{std.fmt.bytesToHex(nonce, .lower)}) };
     }
-    fn existed(ptr: *anyopaque, table: []const u8, key: []const u8) bool {
-        const self = cast(ptr);
-        for (self.read.snapshot.?.overlay.nodes.items) |node| {
-            if (std.mem.eql(u8, node.value.identity.table, table) and std.mem.eql(u8, node.value.identity.key, key)) return true;
-        }
-        return false;
-    }
-    fn commit(ptr: *anyopaque, a: A, mutations: []const cypher.backend.Mutation) !void {
+    fn commit(ptr: *anyopaque, a: A, _: []const cypher.backend.Mutation) !void {
         const self = cast(ptr);
         try self.read.validate();
-        const plans = try cypher.mutations.build(a, self.read.graph, self.overlay.?, mutations, .{ .ptr = self, .existed = existed });
+        const plans = try cypher.mutations.build(a, self.read.graph, self.overlay.?);
         const requests = try a.alloc(contract.TableCommitRequest, plans.len);
         for (plans, requests) |plan, *request| {
             const guard = for (self.guards) |entry| {

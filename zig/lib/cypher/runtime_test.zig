@@ -661,3 +661,26 @@ test "unique grouping DISTINCT aggregates projections and UNION use linear work"
         try std.testing.expect(result.stats.intermediate_states < 100_000);
     }
 }
+
+test "repeated string predicates pay each scan while immutable Unicode functions reuse analysis" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const text = try arena.allocator().alloc(u8, 400_000);
+    @memset(text, 'x');
+    var fixture: Fixture = .{};
+    var diagnostic: c.Diagnostic = .{};
+    var cached = try c.compile(std.testing.allocator, "RETURN reduce(a=0,i IN range(1,1000)|a+size(ltrim($s)))", .{}, &diagnostic);
+    defer cached.deinit();
+    var result = try runtime.execute(std.testing.allocator, fixture.backend(), graph, &cached, &.{.{ .name = "s", .value = .{ .string = text } }}, .{ .intermediate_states = 30_000 });
+    defer result.deinit();
+    try std.testing.expectEqual(@as(i64, 400_000_000), result.rows[0][0].integer);
+    for ([_][]const u8{
+        "RETURN reduce(a=0,i IN range(1,1000)|a+CASE WHEN $s CONTAINS 'z' THEN 1 ELSE 0 END)",
+        "RETURN reduce(a=0,i IN range(1,1000)|a+CASE WHEN $s STARTS WITH $s THEN 1 ELSE 0 END)",
+        "RETURN reduce(a=0,i IN range(1,1000)|a+size(substring($s,1)))",
+    }) |query| {
+        var scanned = try c.compile(std.testing.allocator, query, .{}, &diagnostic);
+        defer scanned.deinit();
+        try std.testing.expectError(error.CypherStateBudgetExceeded, runtime.execute(std.testing.allocator, fixture.backend(), graph, &scanned, &.{.{ .name = "s", .value = .{ .string = text } }}, .{ .intermediate_states = 30_000 }));
+    }
+}

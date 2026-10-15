@@ -135,5 +135,19 @@ for (const [query, count] of [
     const result = api.cypher("knowledge", { query });
     if (result.rows.length !== count || result.stats.intermediate_states >= 30000) throw new Error("WASM deduplication exceeded linear work");
 }
+const repeatedText = "x".repeat(400000);
+const cachedText = api.cypher("knowledge", {query:"RETURN reduce(a=0,i IN range(1,1000)|a+size(ltrim($s)))", parameters:{s:repeatedText}, limits:{intermediate_states:30000}});
+if (cachedText.rows[0][0].value !== "400000000") throw new Error("WASM cached Unicode analysis changed its result");
+try {
+    api.cypher("knowledge", {query:"RETURN reduce(a=0,i IN range(1,1000)|a+CASE WHEN $s CONTAINS 'z' THEN 1 ELSE 0 END)",parameters:{s:repeatedText},limits:{intermediate_states:30000}});
+    throw new Error("WASM string search bypassed work limits");
+} catch (error) { if (error.diagnostic?.code !== "CypherStateBudgetExceeded") throw error; }
+// Oversized indexes remain correct on wasm32, where usize is narrower than INTEGER.
+const wideSubstring = api.cypher("knowledge", {query:"RETURN substring('ÉΣ',9223372036854775807),substring('ÉΣ',0,9223372036854775807)"});
+if (wideSubstring.rows[0][0].value !== "" || wideSubstring.rows[0][1].value !== "ÉΣ") throw new Error("WASM substring narrowed a graph INTEGER");
+const bulkWrite = api.cypher("knowledge", {query:"UNWIND range(1,256) AS x CREATE (n:Document {id:'bulk'+toString(x)}) RETURN count(*)"});
+if (bulkWrite.rows[0][0].value !== "256" || bulkWrite.stats.intermediate_states > 15000) throw new Error("WASM bulk create planning exceeded linear work");
+const bulkDelete = api.cypher("knowledge", {query:"MATCH (n:Document) WHERE n.id STARTS WITH 'bulk' DELETE n RETURN count(n)"});
+if (bulkDelete.rows[0][0].value !== "256") throw new Error("WASM bulk delete lost rows");
 api.close();
 console.log("antfly embedded shared smoke passed: ok");

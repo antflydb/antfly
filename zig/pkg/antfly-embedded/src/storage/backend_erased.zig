@@ -533,8 +533,6 @@ pub const ReadTxn = struct {
     };
     const BoundaryAbi = runtime_callback_abi.Boundary(VTable);
 
-    const BoundaryAbi = runtime_callback_abi.Boundary(VTable);
-
     /// True only for immutable pinned views that permit cached delivery now.
     /// Mutable overlays, validation bypass and unsupported backends return false.
     pub fn canReuseDecodedResults(self: *const ReadTxn) bool {
@@ -610,8 +608,6 @@ pub const ProbeTxn = struct {
         get_many_sorted: ?*const fn (*anyopaque, []const []const u8, []?[]const u8) anyerror!void = null,
         get_many_sorted_with_block_cache_admission: ?*const fn (*anyopaque, []const []const u8, []?[]const u8, backend_types.Namespace.BlockCacheAdmission) anyerror!void = null,
     };
-    const BoundaryAbi = runtime_callback_abi.Boundary(VTable);
-
     const BoundaryAbi = runtime_callback_abi.Boundary(VTable);
 
     pub fn abort(self: *ProbeTxn) void {

@@ -99,6 +99,25 @@ def main():
         assert result["rows"] == [[{"type": "boolean", "value": True}]], result
         assert result["stats"]["intermediate_states"] < 1000, result["stats"]
         checks += 1
+        text = "x" * 400000
+        cached_text = query(
+            "RETURN reduce(a=0,i IN range(1,1000)|a+size(ltrim($s)))",
+            parameters={"s": text},
+            limits={"intermediate_states": 30000},
+        )
+        assert strings(cached_text) == [["400000000"]], cached_text
+        checks += 1
+        scanned_text = call(
+            f"/graphs/{graph}/query",
+            {
+                "query": "RETURN reduce(a=0,i IN range(1,1000)|a+CASE WHEN $s CONTAINS 'z' THEN 1 ELSE 0 END)",
+                "parameters": {"s": text},
+                "limits": {"intermediate_states": 30000},
+            },
+            status=429,
+        )
+        assert scanned_text["code"] == "CypherStateBudgetExceeded", scanned_text
+        checks += 1
         for statement, status, code in (
             (
                 "RETURN reduce(a=[],x IN range(1,10000)|[a])",

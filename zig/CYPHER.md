@@ -5,7 +5,7 @@ queries, native SQL GRAPH_TABLE, coordinated writes/search, and the query
 workbench are implemented. The compatibility matrix records supported behavior,
 qualification, and explicit limits against the pinned Cypher baseline.
 Repository observations were checked against `origin/main` at
-`89df7aff46cf6ae9fc948459a00cbeff08d81869`.
+`dc4e34c497`.
 
 ## Implementation status
 
@@ -28,7 +28,7 @@ each MATCH scope and accepts explicit zero-hop bounds.
 | JSON graph matching | Relationship-simple trails; parallel identities; node revisits; zero hops; conjunctive uniqueness; independent OPTIONAL scope | All deployment/cross-table paths and compatibility fixtures |
 | HTTP text queries | POST /graphs/{name}/query, scoped graph/table authorization, immutable owner cuts, EXPLAIN/PROFILE, strict request decoder, exact integer parameters and typed results | Authenticated three-metadata/three-data-node paging and mutations qualified; broader policy revocation and failure qualification remains |
 | SQL composition | Generated native GRAPH_TABLE MATCH/COLUMNS syntax; SQL token lowering into shared graph AST; positional parameters; graph-aware resolver contract | Native resolver and typed graph rows share one cut with ordinary SQL scans and multiple graph catalogs; prepared parameters, joins and rename behavior qualified through HTTP. Pgwire entities, prepared parameters, NULLs, and joins qualified through psql. Read-only and serializable transaction composition is qualified through psql. Staged SQL updates, inserts, deletes, joins, field-derived adjacency replacement and NULL removal, rollback, and policy-hidden postimages are qualified through psql. Staged explicit graph effects with their authenticated source-row intents and commits, and Cypher derived-adjacency read-your-writes are also qualified. Broader transaction fault qualification remains. |
-| Workbench | Graph selector/editor, exact typed parameters, Run/EXPLAIN/PROFILE/Cancel, SQL composition templates, table/graph/JSON/plan views, node/edge/path inspector, parallel edges/self loops, zoom/pan, bounded neighbor expansion, principal-scoped persisted write receipts, scoped catalog setup, schema property suggestions, text/semantic/hybrid templates, graph permission editing | Twenty-nine workbench/catalog/SQL UI tests, application type checking, and production build qualified. Visual browser qualification remains. |
+| Workbench | Graph selector/editor, exact typed parameters, Run/EXPLAIN/PROFILE/Cancel, SQL composition templates, table/graph/JSON/plan views, node/edge/path inspector, parallel edges/self loops, zoom/pan, bounded neighbor expansion, principal-scoped persisted write receipts, scoped catalog setup, schema property suggestions, text/semantic/hybrid templates, graph permission editing | Thirty-one workbench/catalog/SQL UI tests, application type checking, and production build qualified. Visual browser qualification remains. |
 
 Go, Python, Rust, TypeScript, and Zig generated clients carry the named graph
 catalog and query routes. Go exposes `ExecuteGraphQuery` and `GraphWriteStatus`;
@@ -124,6 +124,30 @@ UNION. At 8,000 rows, the same local Debug library probe dropped from roughly
 0.52s to 0.07s for grouping and 1.21s to 0.047s for UNION. Timings are diagnostic;
 regressions assert bounded linear work rather than machine-dependent latency.
 
+MATCH anchor scans use charged identity sets across graph labels, including
+terminal LIMIT scans, preserving first encounter order without prefix rescans.
+Mutation execution keeps index-qualified identity maps for pending/applied
+deletions and dirty/created overlay entities. Source/target/producer reference
+indexes bound detach and producer cleanup to relevant relationships; versioned
+references reject retired projections and deduplicate self loops. Node paging
+sorts once per structural change and keeps its cache in the retained owner's
+allocator. Postimage planning uses these indexes rather than rescanning mutation
+or entity arrays, and shares the runtime's work ceiling and cancellation checks
+before the durable decision. SET and REMOVE index entity-to-row aliases once
+per clause and refresh only affected rows, including aliases nested in paths
+and containers. Result ownership includes commit-time arena growth.
+Retained capture decodes each provider page in a temporary budgeted arena,
+clones authorized entities and cursors, then reclaims the scan and JSON buffers
+before the next page. This keeps temporary allocations out of the retained cut.
+
+Query-owned string caches reuse codepoint/trim analysis, casing, reversal, and
+numeric conversions for immutable input allocations. Uncached scans reserve
+byte work, long Unicode scans checkpoint, and CONTAINS uses a linear KMP scan
+with cached needle preprocessing. Large immutable maps similarly index property
+names once; small maps use charged bounded scans. Map projections and property
+merges avoid quadratic name searches. Regression tests cover bounded work,
+cancellation, rollback before commit, and retained page-allocator lifetimes.
+
 All public SDK graph catalog mutation helpers preserve committed-but-pending
 visibility outcomes. Go create/update return `GraphCatalogMutationResult` with
 exactly one of `Entry` or `Outcome`; Go drop returns an optional outcome. Python
@@ -143,9 +167,9 @@ migration scan, including resume before the first source-page checkpoint. Older
 jobs without that version retain the idempotent contributor migration. Lite and
 Directory process-exit recovery keep the same bounded-checkpoint deadlines.
 
-The 2026-10-15 follow-up qualifies 103 core Cypher tests, 942 SQL tests
-(with three skips), and 312 embedded database tests (with one skip). The
-authenticated two-owner campaign passes 47 expression checks and 66 graph
+The 2026-10-15 follow-up qualifies 115 core Cypher tests, 942 SQL tests
+(with three skips), and 314 embedded database tests (with one skip). The
+authenticated two-owner campaign passes 49 expression checks and 66 graph
 read/write checks. SDK suites pass in Go, Python (308 tests), and TypeScript
 (495 tests, one skip); the focused workbench/SQL/catalog UI suite passes 31 tests.
 
@@ -433,6 +457,9 @@ transport and `ANTFLY_TRUSTED_PRINCIPAL_SECRET`/
 publication also requires `ANTFLY_SETTING_AUTHORITY_SECRET`/
 `ANTFLY_SETTING_AUTHORITY_ISSUER` for setting/catalog authority. Test
 credentials in qualification scripts are isolated fixture credentials.
+Mixed artifact-source producer campaigns require Raft owners. Standalone
+ordered artifact publication remains unavailable on the merged main baseline;
+its guard rejects publication proposals instead of fabricating Raft receipts.
 
 Graph admission captures immutable graph/table/index identities and a coherent
 owner cut. Execution checks current graph/table permissions and policy grants at

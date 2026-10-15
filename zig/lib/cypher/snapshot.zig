@@ -43,7 +43,7 @@ pub const Materialized = struct {
             .budget = budget,
             .arena = std.heap.ArenaAllocator.init(budget.allocator()),
             .graph = graph,
-            .overlay = .{ .base = base, .host = .{ .ptr = self, .new_identity = unavailableIdentity, .commit = unavailableCommit }, .max_entities = limits.intermediate_states, .max_anchors = limits.scanned_anchors, .max_edges = limits.explored_edges },
+            .overlay = .{ .capture_allocator = budget.allocator(), .base = base, .host = .{ .ptr = self, .new_identity = unavailableIdentity, .commit = unavailableCommit }, .max_entities = limits.intermediate_states, .max_anchors = limits.scanned_anchors, .max_edges = limits.explored_edges },
         };
         errdefer self.arena.deinit();
         self.capture() catch |err| return if (budget.exhausted) error.CypherMemoryBudgetExceeded else err;
@@ -53,10 +53,11 @@ pub const Materialized = struct {
         const provider = self.overlay.backend();
         try provider.vtable.bind(provider.ptr, self.arena.allocator(), self.graph);
         try provider.vtable.begin.?(provider.ptr);
-        // Providers can return borrowed properties. The retained materialization
-        // owns every byte independently of subsequent live publications.
-        for (self.overlay.nodes.items) |*node| node.value = @constCast((try (root.value.Value{ .node = node.value }).clone(self.arena.allocator())).node);
-        for (self.overlay.relationships.items) |*edge| edge.value = @constCast((try (root.value.Value{ .relationship = edge.value }).clone(self.arena.allocator())).relationship);
+        // Capture clones each provider page before reclaiming its decode arena.
+        try self.overlay.prepareNodeOrder();
+        // Published snapshots may serve many transient page allocators. Their
+        // capture counters are immutable; the consuming runtime budgets reads.
+        self.overlay.capture_accounting = false;
     }
     pub fn deinit(self: *Materialized) void {
         const a = self.backing;

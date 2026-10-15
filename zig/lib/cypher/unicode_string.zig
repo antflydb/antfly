@@ -39,9 +39,20 @@ fn mapping(table: []const data.Mapping, cp: u21) ?[]const u8 {
     return null;
 }
 
-fn followedByCased(input: std.unicode.Utf8Iterator) bool {
+pub const Checkpoint = struct {
+    ptr: *anyopaque,
+    call: *const fn (*anyopaque) anyerror!void,
+    pub fn check(self: ?@This(), offset: usize, last: *usize) !void {
+        if (offset - last.* < 16 * 1024) return;
+        if (self) |checkpoint| try checkpoint.call(checkpoint.ptr);
+        last.* = offset;
+    }
+};
+fn followedByCased(input: std.unicode.Utf8Iterator, checkpoint: ?Checkpoint) !bool {
     var iterator = input;
+    var last = iterator.i;
     while (iterator.nextCodepoint()) |cp| {
+        try Checkpoint.check(checkpoint, iterator.i, &last);
         if (contains(&data.ignorable, cp)) continue;
         return contains(&data.cased, cp);
     }
@@ -49,17 +60,22 @@ fn followedByCased(input: std.unicode.Utf8Iterator) bool {
 }
 
 pub fn caseConvert(a: std.mem.Allocator, text: []const u8, upper: bool) ![]u8 {
+    return caseConvertWithCheckpoint(a, text, upper, null);
+}
+pub fn caseConvertWithCheckpoint(a: std.mem.Allocator, text: []const u8, upper: bool, checkpoint: ?Checkpoint) ![]u8 {
     const view = std.unicode.Utf8View.init(text) catch return error.CypherTypeMismatch;
     var iterator = view.iterator();
     var output: std.ArrayList(u8) = .empty;
     errdefer output.deinit(a);
     try output.ensureTotalCapacity(a, text.len);
     var preceded_by_cased = false;
+    var last: usize = 0;
     while (iterator.nextCodepointSlice()) |original| {
+        try Checkpoint.check(checkpoint, iterator.i, &last);
         const cp = std.unicode.utf8Decode(original) catch unreachable;
         // Unicode Final_Sigma examines the original input, skipping case-ignorable
         // characters on both sides. Lookahead visits each intervening run once.
-        const replacement = if (!upper and cp == 0x03a3 and preceded_by_cased and !followedByCased(iterator))
+        const replacement = if (!upper and cp == 0x03a3 and preceded_by_cased and !try followedByCased(iterator, checkpoint))
             "ς"
         else
             mapping(if (upper) &data.upper else &data.lower, cp) orelse original;
@@ -78,22 +94,35 @@ fn whitespace(cp: u21) bool {
     };
 }
 
-pub fn trim(text: []const u8, left: bool, right: bool) ![]const u8 {
+pub const Analysis = struct {
+    codepoints: usize = 0,
+    first: usize,
+    last: usize = 0,
+};
+/// One analysis supplies both trim boundaries and codepoint count. The runtime
+/// caches it by immutable allocation and charges this scan before entering it.
+pub fn analyze(text: []const u8, checkpoint: ?Checkpoint) !Analysis {
     const view = std.unicode.Utf8View.init(text) catch return error.CypherTypeMismatch;
     var iterator = view.iterator();
-    var first: usize = text.len;
-    var last: usize = 0;
+    var result: Analysis = .{ .first = text.len };
     var offset: usize = 0;
+    var checked: usize = 0;
     while (iterator.nextCodepointSlice()) |original| {
+        try Checkpoint.check(checkpoint, iterator.i, &checked);
         const cp = std.unicode.utf8Decode(original) catch unreachable;
+        result.codepoints += 1;
         if (!whitespace(cp)) {
-            first = @min(first, offset);
-            last = offset + original.len;
+            result.first = @min(result.first, offset);
+            result.last = offset + original.len;
         }
         offset += original.len;
     }
-    const start = if (left) first else 0;
-    const end = if (right) @max(start, last) else text.len;
+    return result;
+}
+pub fn trim(text: []const u8, left: bool, right: bool) ![]const u8 {
+    const analysis = try analyze(text, null);
+    const start = if (left) analysis.first else 0;
+    const end = if (right) @max(start, analysis.last) else text.len;
     return text[start..end];
 }
 

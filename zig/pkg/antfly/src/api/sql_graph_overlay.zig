@@ -29,8 +29,23 @@ pub const View = struct {
     limits: cypher.runtime.Limits,
     inner: cypher.transaction.Overlay = undefined,
     changed: bool = false,
+    staged_rows: cypher.value.IdentitySet = .empty,
+    projected_fields: std.HashMapUnmanaged(FieldKey, void, FieldKey.Context, std.hash_map.default_max_load_percentage) = .empty,
+    const FieldKey = struct {
+        source: cypher.value.Identity,
+        index: []const u8,
+        kind: []const u8,
+        const Context = struct {
+            pub fn hash(_: @This(), key: FieldKey) u64 {
+                return std.hash.Wyhash.hash(std.hash.Wyhash.hash((cypher.value.Identity.Context{}).hash(key.source), key.index), key.kind);
+            }
+            pub fn eql(_: @This(), left: FieldKey, right: FieldKey) bool {
+                return left.source.eql(right.source) and std.mem.eql(u8, left.index, right.index) and std.mem.eql(u8, left.kind, right.kind);
+            }
+        };
+    };
     pub fn backend(self: *View) cypher.backend.Backend {
-        return .{ .ptr = self, .vtable = &.{ .bind = bind, .checkpoint = checkpoint, .scan = scan, .get = get, .expand = expand, .search = search, .startup_work = startupWork } };
+        return .{ .ptr = self, .vtable = &.{ .bind = bind, .checkpoint = checkpoint, .scan = scan, .get = get, .expand = expand, .search = search, .startup_work = startupWork, .set_work = setWork } };
     }
     fn cast(ptr: *anyopaque) *View {
         return @ptrCast(@alignCast(ptr));
@@ -50,25 +65,26 @@ pub const View = struct {
         const backend_inner = self.inner.backend();
         try backend_inner.vtable.bind(backend_inner.ptr, a, graph);
         try backend_inner.vtable.begin.?(backend_inner.ptr);
+        self.staged_rows = .empty;
+        self.projected_fields = .empty;
+        for (self.inner.relationships.items) |relationship| try self.indexField(a, relationship.value);
         for (self.rows) |row| {
             const member = for (graph.labels) |label| {
                 if (std.mem.eql(u8, label.table, row.identity.table)) break true;
             } else false;
             if (!member) continue;
             try checkpoint(ptr);
+            try self.inner.charge(1);
+            try self.staged_rows.put(a, row.identity, {});
             self.changed = true;
             self.inner.captured.scanned_anchors +|= 1;
             const projection: cypher.rpc.Projection = if (row.document_json) |json| try self.client.projectDocument(a, row.identity, try std.json.parseFromSliceLeaky(std.json.Value, a, json, .{ .parse_numbers = false }), row.json_null_fields, true) else .{ .node = null };
             const authorized = projection.node != null;
-            var found = false;
-            for (self.inner.nodes.items) |*node| {
-                if (!node.value.identity.eql(row.identity)) continue;
-                found = true;
+            if (self.inner.node_positions.get(row.identity)) |position| {
+                const node = &self.inner.nodes.items[position];
                 node.deleted = !authorized;
                 if (projection.node) |value| node.value = @constCast(value);
-                break;
-            }
-            if (!found) {
+            } else {
                 try self.capacity();
                 const node = if (projection.node) |value| @constCast(value) else tombstone: {
                     const value = try a.create(cypher.value.Node);
@@ -82,10 +98,9 @@ pub const View = struct {
             }
             // A document owns its derived contributions even when an explicit
             // source override places their outgoing adjacency on another key.
-            for (self.inner.relationships.items) |*relationship| {
-                if ((!authorized or relationship.value.ownership == .field) and try cypher.transaction.Overlay.ownedBy(a, relationship.value, row.identity)) relationship.deleted = true;
-            }
+            try self.inner.retireOwnedRelationships(a, row.identity, authorized);
             for (projection.relationships) |relationship| {
+                try self.indexField(a, relationship);
                 try self.capacity();
                 try self.inner.appendRelationship(a, .{ .value = @constCast(relationship) });
                 self.inner.captured.explored_edges +|= 1;
@@ -95,17 +110,13 @@ pub const View = struct {
             for (effects.deletes) |edge| for (graph.relationships) |mapping| {
                 if (!matches(graph, effects.table, mapping, edge) or self.projectedFieldEffect(effects.table, mapping, edge)) continue;
                 self.changed = true;
-                for (self.inner.relationships.items) |*relationship| {
-                    if (!std.mem.eql(u8, relationship.value.index, mapping.index) or !std.mem.eql(u8, relationship.value.type, mapping.name) or !std.mem.eql(u8, relationship.value.source.key, edge.source) or !std.mem.eql(u8, relationship.value.target.key, edge.target)) continue;
-                    if (std.mem.eql(u8, relationship.value.identity.key, edge.edge_id) and edge.edge_id.len != 0) {
-                        relationship.deleted = true;
-                        continue;
-                    }
-                    if (!std.mem.startsWith(u8, relationship.value.identity.key, "[")) continue;
-                    const tuple = try std.json.parseFromSliceLeaky([]const []const u8, a, relationship.value.identity.key, .{});
-                    if (tuple.len == 6 and std.mem.eql(u8, tuple[5], "field")) continue;
-                    if (tuple.len != 5) return error.CypherInvalidRelationship;
-                    if (std.mem.eql(u8, tuple[3], edge.edge_id) and std.mem.eql(u8, tuple[4], producer(edge))) relationship.deleted = true;
+                const tuple = try std.json.Stringify.valueAlloc(a, .{ edge.source, edge.target, edge.edge_type, edge.edge_id, producer(edge) }, .{});
+                for ([_][]const u8{ edge.edge_id, tuple }) |key| {
+                    if (key.len == 0) continue;
+                    try self.inner.charge(1);
+                    const position = self.inner.relationship_positions.get(.{ .identity = .{ .table = effects.table, .key = key }, .index = mapping.index }) orelse continue;
+                    const relationship = &self.inner.relationships.items[position];
+                    if (std.mem.eql(u8, relationship.value.type, mapping.name) and std.mem.eql(u8, relationship.value.source.key, edge.source) and std.mem.eql(u8, relationship.value.target.key, edge.target)) relationship.deleted = true;
                 }
             };
             for (effects.writes) |edge| for (graph.relationships) |mapping| {
@@ -139,18 +150,14 @@ pub const View = struct {
                     try properties.append(a, .{ .name = "weight", .value = .{ .number = edge.weight } });
                 }
                 const key = if (marker != null and producer(edge).len == 0 and std.mem.startsWith(u8, edge.edge_id, "cypher:")) edge.edge_id else try std.json.Stringify.valueAlloc(a, .{ edge.source, edge.target, edge.edge_type, edge.edge_id, producer(edge) }, .{});
-                var replaced = false;
-                for (self.inner.relationships.items, 0..) |*relationship, position| {
-                    if (!std.mem.eql(u8, relationship.value.index, mapping.index) or !relationship.value.identity.eql(.{ .table = effects.table, .key = key })) continue;
+                if (self.inner.relationship_positions.get(.{ .identity = .{ .table = effects.table, .key = key }, .index = mapping.index })) |position| {
+                    const relationship = &self.inner.relationships.items[position];
                     const field_derived = relationship.value.ownership == .field;
                     relationship.value.* = .{ .identity = .{ .table = effects.table, .key = key }, .index = mapping.index, .type = mapping.name, .source = source, .target = target, .properties = try cypher.value.entityProperties(a, properties.items), .ownership = if (producer(edge).len == 0) .explicit else .document, .producer = if (producer(edge).len == 0) null else .{ .table = effects.table, .key = producer(edge) } };
                     if (field_derived) relationship.value.ownership = .field;
                     relationship.deleted = false;
                     try self.inner.indexRelationship(a, position);
-                    replaced = true;
-                    break;
-                }
-                if (!replaced) {
+                } else {
                     try self.capacity();
                     const relationship = try a.create(cypher.value.Relationship);
                     relationship.* = .{ .identity = .{ .table = effects.table, .key = key }, .index = mapping.index, .type = mapping.name, .source = source, .target = target, .properties = try cypher.value.entityProperties(a, properties.items), .ownership = if (producer(edge).len == 0) .explicit else .document, .producer = if (producer(edge).len == 0) null else .{ .table = effects.table, .key = producer(edge) } };
@@ -169,14 +176,14 @@ pub const View = struct {
     fn projectedFieldEffect(self: *View, table: []const u8, mapping: cypher.catalog.Relationship, edge: anytype) bool {
         if (edge.edge_id.len != 0 or edge.owner_document.len != 0 or (edge.owner.len != 0 and !std.mem.eql(u8, edge.owner, edge.source))) return false;
         const source = cypher.value.Identity{ .table = table, .key = edge.source };
-        const staged = for (self.rows) |row| {
-            if (row.identity.eql(source)) break true;
-        } else false;
-        if (!staged) return false;
-        for (self.inner.relationships.items) |relationship| {
-            if (relationship.value.ownership == .field and relationship.value.source.eql(source) and std.mem.eql(u8, relationship.value.index, mapping.index) and std.mem.eql(u8, relationship.value.type, mapping.name)) return true;
-        }
-        return false;
+        return self.staged_rows.contains(source) and self.projected_fields.contains(.{ .source = source, .index = mapping.index, .kind = mapping.name });
+    }
+    fn indexField(self: *View, a: A, relationship: *const cypher.value.Relationship) !void {
+        try self.inner.charge(1);
+        if (relationship.ownership == .field) try self.projected_fields.put(a, .{ .source = relationship.source, .index = relationship.index, .kind = relationship.type }, {});
+    }
+    fn setWork(ptr: *anyopaque, work: ?cypher.backend.Work) void {
+        cast(ptr).inner.setExecutionWork(work);
     }
     fn producer(edge: anytype) []const u8 {
         return if (edge.owner_document.len != 0) edge.owner_document else edge.owner;

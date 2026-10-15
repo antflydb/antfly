@@ -92,17 +92,10 @@ pub fn Host(comptime DB: type) type {
                 self.next_entity = try std.math.add(u64, self.next_entity, 1);
                 return .{ .table = table, .key = try std.fmt.allocPrint(a, "cypher:{s}:{d}", .{ std.fmt.bytesToHex(self.scope.transaction_id.?, .lower), self.next_entity }) };
             }
-            fn existed(ptr: *anyopaque, table: []const u8, key: []const u8) bool {
-                const self = cast(ptr);
-                for (self.snapshot.?.overlay.nodes.items) |node| {
-                    if (std.mem.eql(u8, node.value.identity.table, table) and std.mem.eql(u8, node.value.identity.key, key)) return true;
-                }
-                return false;
-            }
-            fn commit(ptr: *anyopaque, a: A, mutations: []const cypher.backend.Mutation) !void {
+            fn commit(ptr: *anyopaque, a: A, _: []const cypher.backend.Mutation) !void {
                 const self = cast(ptr);
                 try bind(ptr, self.graph);
-                const plans = try cypher.mutations.build(a, self.graph, self.overlay.?, mutations, .{ .ptr = self, .existed = existed });
+                const plans = try cypher.mutations.build(a, self.graph, self.overlay.?);
                 if (plans.len != 1 or !std.mem.eql(u8, plans[0].table, self.host.table)) return error.UndefinedGraphTable;
                 const plan = plans[0];
                 const writes = try a.alloc(types.TransactionWrite, plan.writes.items.len);

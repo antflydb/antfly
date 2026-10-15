@@ -28,6 +28,7 @@ pub const Work = struct {
     ptr: *anyopaque,
     charge: *const fn (*anyopaque, usize) anyerror!void,
     cache: std.AutoHashMapUnmanaged(Key, Info) = .empty,
+    fields: std.AutoHashMapUnmanaged(Key, std.StringHashMapUnmanaged(usize)) = .empty,
 
     fn key(value: v.Value) ?Key {
         return switch (value) {
@@ -36,6 +37,43 @@ pub const Work = struct {
             .string => |item| .{ .address = @intFromPtr(item.ptr), .length = item.len, .kind = .string },
             else => null,
         };
+    }
+    pub fn lookup(self: *Work, entries: []const v.Entry, name: []const u8) !?v.Value {
+        try self.charge(self.ptr, 1 + name.len / 64);
+        // Tiny maps need no separate allocation; their bounded scans still pay
+        // work. Larger immutable maps build a name index once per allocation.
+        if (entries.len <= 32) {
+            for (entries) |entry| {
+                try self.charge(self.ptr, 1 + entry.name.len / 64);
+                if (std.mem.eql(u8, entry.name, name)) return entry.value;
+            }
+            return null;
+        }
+        const cache_key = key(.{ .map = entries }).?;
+        var index = self.fields.get(cache_key);
+        if (index == null) {
+            var built: std.StringHashMapUnmanaged(usize) = .empty;
+            errdefer built.deinit(self.a);
+            for (entries, 0..) |entry, position| {
+                try self.charge(self.ptr, 1 + entry.name.len / 64);
+                const field = try built.getOrPut(self.a, entry.name);
+                if (!field.found_existing) field.value_ptr.* = position;
+            }
+            try self.fields.put(self.a, cache_key, built);
+            index = built;
+        }
+        const position = index.?.get(name) orelse return null;
+        return entries[position].value;
+    }
+    pub fn property(self: *Work, value: v.Value, name: []const u8) !v.Value {
+        const entries = switch (value) {
+            .null => return .null,
+            .map => value.map,
+            .node => value.node.properties,
+            .relationship => value.relationship.properties,
+            else => return error.CypherTypeMismatch,
+        };
+        return (try self.lookup(entries, name)) orelse .null;
     }
     fn mix(left: u64, right: u64) u64 {
         return std.hash.Wyhash.hash(left, std.mem.asBytes(&right));
@@ -242,4 +280,33 @@ test "cached comparisons and hash collision checks still honor cancellation" {
     try std.testing.expectError(error.Canceled, work.order(data, data));
     try std.testing.expectError(error.Canceled, work.compare(data, data));
     try std.testing.expectError(error.Canceled, work.traversal(data));
+}
+
+test "large immutable property maps are indexed once and preserve first-key and null semantics" {
+    const Counter = struct {
+        units: usize = 0,
+        canceled: bool = false,
+        fn charge(ptr: *anyopaque, amount: usize) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (self.canceled) return error.Canceled;
+            self.units += amount;
+        }
+    };
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const entries = try a.alloc(v.Entry, 4000);
+    for (entries, 0..) |*entry, index| entry.* = .{ .name = try std.fmt.allocPrint(a, "field:{d}", .{index}), .value = .{ .integer = @intCast(index) } };
+    entries[entries.len - 1] = .{ .name = "field:0", .value = .null };
+    var counter: Counter = .{};
+    var work: Work = .{ .a = a, .ptr = &counter, .charge = Counter.charge };
+    for (0..1000) |_| {
+        try std.testing.expectEqual(@as(i64, 3998), (try work.property(.{ .map = entries }, "field:3998")).integer);
+        try std.testing.expectEqual(@as(i64, 0), (try work.property(.{ .map = entries }, "field:0")).integer);
+        try std.testing.expectEqual(@as(?v.Value, null), try work.lookup(entries, "missing"));
+    }
+    try std.testing.expect(counter.units < 10_000);
+    try std.testing.expectEqual(@as(usize, 1), work.fields.count());
+    counter.canceled = true;
+    try std.testing.expectError(error.Canceled, work.property(.{ .map = entries }, "field:0"));
 }

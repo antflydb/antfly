@@ -934,3 +934,67 @@ def test_computed_graph_values_are_bounded_before_delivery_and_commit(require_na
             "rows"
         ][0][0]
         assert isinstance(nested, list) and nested[0]["type"] == "node"
+
+
+def test_bulk_mutations_and_string_scans_share_the_statement_budget(require_native, aflite_path):
+    with af.create_hosted(aflite_path) as database:
+        database.sql("CREATE TABLE docs (id TEXT)")
+        database.graph_catalog_json(
+            {"action": "put", "name": "g", "definition": {"labels": [{"name": "D", "table": "docs"}]}}
+        )
+        create = "UNWIND range(1,1000) AS x CREATE (n:D {id:toString(x)}) RETURN count(*)"
+        result = database.cypher_json("g", {"query": create, "limits": {"intermediate_states": 50000}})
+        assert result["rows"][0][0]["value"] == "1000"
+        result = database.cypher_json("g", {"query": "MATCH (n:D) DELETE n RETURN count(n)"})
+        assert result["rows"][0][0]["value"] == "1000"
+        assert result["stats"]["intermediate_states"] < 50000
+        with pytest.raises(af.GraphError) as limited:
+            database.cypher_json("g", {"query": create, "limits": {"intermediate_states": 20000}})
+        assert limited.value.graph_code == "CypherStateBudgetExceeded"
+        assert database.cypher_json("g", {"query": "MATCH (n:D) RETURN count(n)"})["rows"][0][0]["value"] == "0"
+        text = "x" * 400000
+        cached = database.cypher_json(
+            "g",
+            {
+                "query": "RETURN reduce(a=0,i IN range(1,1000)|a+size(ltrim($s)))",
+                "parameters": {"s": text},
+                "limits": {"intermediate_states": 30000},
+            },
+        )
+        assert cached["rows"][0][0]["value"] == "400000000"
+        with pytest.raises(af.GraphError) as limited:
+            database.cypher_json(
+                "g",
+                {
+                    "query": "RETURN reduce(a=0,i IN range(1,1000)|a+CASE WHEN $s CONTAINS 'z' THEN 1 ELSE 0 END)",
+                    "parameters": {"s": text},
+                    "limits": {"intermediate_states": 30000},
+                },
+            )
+        assert limited.value.graph_code == "CypherStateBudgetExceeded"
+        database.sql("INSERT INTO docs (id) VALUES ('one')")
+        assert database.sql(
+            "SELECT g.characters FROM GRAPH_TABLE(g MATCH (n IS D) COLUMNS(size(ltrim($1)) AS characters)) g",
+            [text],
+        )["rows"] == [["400000"]]
+
+
+def test_native_capture_and_bulk_delete_fit_the_default_memory_ceiling(require_native, aflite_path):
+    with af.create_hosted(aflite_path) as database:
+        database.sql("CREATE TABLE docs (id TEXT)")
+        database.graph_catalog_json(
+            {"action": "put", "name": "g", "definition": {"labels": [{"name": "D", "table": "docs"}]}}
+        )
+        database.cypher_json("g", {"query": "UNWIND range(1,8000) AS x CREATE (n:D {id:toString(x)}) RETURN count(*)"})
+        changed = database.cypher_json(
+            "g", {"query": "MATCH (n:D) WITH n,[n,n] AS aliases SET n.age=1 RETURN sum(aliases[0].age)"}
+        )
+        assert changed["rows"][0][0]["value"] == "8000"
+        removed = database.cypher_json(
+            "g", {"query": "MATCH (n:D) WITH n,[n,n] AS aliases REMOVE n.age RETURN count(aliases[0].age)"}
+        )
+        assert removed["rows"][0][0]["value"] == "0"
+        deleted = database.cypher_json("g", {"query": "MATCH (n:D) DELETE n RETURN count(n)"})
+        assert deleted["rows"][0][0]["value"] == "8000"
+        assert deleted["stats"]["intermediate_states"] < 400000
+        assert database.sql("SELECT count(*) FROM docs")["rows"] == [["0"]]

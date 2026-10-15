@@ -43,6 +43,17 @@ pub const RelationshipIdentity = struct {
     };
 };
 pub const EntityIdentity = union(enum) {
+    pub const Context = struct {
+        pub fn hash(_: @This(), identity: EntityIdentity) u64 {
+            return switch (identity) {
+                .node => |id| (Identity.Context{}).hash(id),
+                .relationship => |id| (RelationshipIdentity.Context{}).hash(id) ^ 0x9e3779b97f4a7c15,
+            };
+        }
+        pub fn eql(_: @This(), left: EntityIdentity, right: EntityIdentity) bool {
+            return left.eql(right);
+        }
+    };
     node: Identity,
     relationship: RelationshipIdentity,
     pub fn eql(a: @This(), b: @This()) bool {
@@ -486,3 +497,9 @@ test "value cloning bounds stack depth independently of query execution" {
     }
     try std.testing.expectError(error.CypherValueDepthExceeded, nested.clone(a));
 }
+
+pub const IdentitySet = std.HashMapUnmanaged(Identity, void, Identity.Context, std.hash_map.default_max_load_percentage);
+pub fn EntityMap(comptime T: type) type {
+    return std.HashMapUnmanaged(EntityIdentity, T, EntityIdentity.Context, std.hash_map.default_max_load_percentage);
+}
+pub const EntitySet = EntityMap(void);
