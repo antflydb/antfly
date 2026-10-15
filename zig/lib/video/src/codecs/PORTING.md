@@ -81,3 +81,10 @@ owned VP9 frame-view helpers now follow this rule. A deterministic boundary
 regression is explicitly discovered from `mod.zig`, fails with the prior getter
 and passes with the pure view. Producer-abandonment qualification also covers
 the runtime path that exposed this defect.
+
+Table rows in `av1/qm.zig`, `av1/cdf.zig` and `vp9/vp9_scan.zig` use bounded
+`zig fmt: off/on` regions to keep literal data readable without one scalar per
+line. The layout cleanup preserves every executable token and all copyright
+notices; it does not fold expressions, regenerate constants or change algorithms.
+Treat table contents as maintained source, and retain differential decoder checks
+when editing them.

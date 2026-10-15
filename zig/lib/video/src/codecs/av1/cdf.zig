@@ -1149,561 +1149,429 @@ pub const default_cdf: CdfDefaultContext = CdfDefaultContext{
         .uv_mode = [2][13][16]u16{
             [13][16]u16{
                 [12]u16{
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 22631)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 24152)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 25378)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 25661)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 25986)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 26520)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 27055)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 27923)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 28244)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 30059)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 30941)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 31961)))),
+                    // zig fmt: off
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 22631)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 24152)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 25378)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 25661)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 25986)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 26520)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 27055)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 27923)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 28244)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 30059)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 30941)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 31961)))),
+                    // zig fmt: on
                 } ++ @as([4]u16, @splat(0)),
                 [12]u16{
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 9513)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 26881)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 26973)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 27046)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 27118)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 27664)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 27739)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 27824)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 28359)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 29505)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 29800)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 31796)))),
+                    // zig fmt: off
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 9513)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 26881)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 26973)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 27046)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 27118)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 27664)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 27739)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 27824)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 28359)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 29505)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 29800)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 31796)))),
+                    // zig fmt: on
                 } ++ @as([4]u16, @splat(0)),
                 [12]u16{
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 9845)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 9915)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 28663)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 28704)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 28757)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 28780)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 29198)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 29822)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 29854)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 30764)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 31777)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 32029)))),
+                    // zig fmt: off
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 9845)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 9915)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 28663)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 28704)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 28757)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 28780)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 29198)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 29822)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 29854)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 30764)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 31777)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 32029)))),
+                    // zig fmt: on
                 } ++ @as([4]u16, @splat(0)),
                 [12]u16{
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 13639)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 13897)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 14171)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 25331)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 25606)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 25727)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 25953)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 27148)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 28577)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 30612)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 31355)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 32493)))),
+                    // zig fmt: off
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 13639)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 13897)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 14171)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 25331)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 25606)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 25727)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 25953)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 27148)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 28577)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 30612)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 31355)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 32493)))),
+                    // zig fmt: on
                 } ++ @as([4]u16, @splat(0)),
                 [12]u16{
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 9764)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 9835)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 9930)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 9954)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 25386)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 27053)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 27958)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 28148)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 28243)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 31101)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 31744)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 32363)))),
+                    // zig fmt: off
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 9764)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 9835)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 9930)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 9954)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 25386)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 27053)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 27958)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 28148)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 28243)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 31101)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 31744)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 32363)))),
+                    // zig fmt: on
                 } ++ @as([4]u16, @splat(0)),
                 [12]u16{
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 11825)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 13589)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 13677)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 13720)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 15048)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 29213)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 29301)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 29458)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 29711)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 31161)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 31441)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 32550)))),
+                    // zig fmt: off
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 11825)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 13589)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 13677)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 13720)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 15048)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 29213)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 29301)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 29458)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 29711)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 31161)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 31441)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 32550)))),
+                    // zig fmt: on
                 } ++ @as([4]u16, @splat(0)),
                 [12]u16{
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 14175)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 14399)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 16608)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 16821)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 17718)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 17775)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 28551)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 30200)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 30245)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 31837)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 32342)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 32667)))),
+                    // zig fmt: off
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 14175)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 14399)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 16608)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 16821)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 17718)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 17775)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 28551)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 30200)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 30245)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 31837)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 32342)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 32667)))),
+                    // zig fmt: on
                 } ++ @as([4]u16, @splat(0)),
                 [12]u16{
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 12885)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 13038)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 14978)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 15590)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 15673)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 15748)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 16176)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 29128)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 29267)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 30643)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 31961)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 32461)))),
+                    // zig fmt: off
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 12885)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 13038)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 14978)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 15590)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 15673)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 15748)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 16176)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 29128)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 29267)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 30643)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 31961)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 32461)))),
+                    // zig fmt: on
                 } ++ @as([4]u16, @splat(0)),
                 [12]u16{
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 12026)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 13661)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 13874)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 15305)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 15490)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 15726)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 15995)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 16273)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 28443)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 30388)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 30767)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 32416)))),
+                    // zig fmt: off
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 12026)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 13661)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 13874)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 15305)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 15490)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 15726)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 15995)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 16273)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 28443)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 30388)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 30767)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 32416)))),
+                    // zig fmt: on
                 } ++ @as([4]u16, @splat(0)),
                 [12]u16{
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 19052)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 19840)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 20579)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 20916)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 21150)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 21467)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 21885)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 22719)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 23174)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 28861)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 30379)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 32175)))),
+                    // zig fmt: off
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 19052)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 19840)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 20579)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 20916)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 21150)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 21467)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 21885)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 22719)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 23174)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 28861)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 30379)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 32175)))),
+                    // zig fmt: on
                 } ++ @as([4]u16, @splat(0)),
                 [12]u16{
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 18627)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 19649)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 20974)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 21219)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 21492)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 21816)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 22199)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 23119)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 23527)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 27053)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 31397)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 32148)))),
+                    // zig fmt: off
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 18627)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 19649)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 20974)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 21219)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 21492)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 21816)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 22199)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 23119)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 23527)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 27053)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 31397)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 32148)))),
+                    // zig fmt: on
                 } ++ @as([4]u16, @splat(0)),
                 [12]u16{
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 17026)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 19004)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 19997)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 20339)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 20586)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 21103)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 21349)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 21907)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 22482)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 25896)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 26541)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 31819)))),
+                    // zig fmt: off
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 17026)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 19004)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 19997)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 20339)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 20586)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 21103)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 21349)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 21907)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 22482)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 25896)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 26541)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 31819)))),
+                    // zig fmt: on
                 } ++ @as([4]u16, @splat(0)),
                 [12]u16{
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 12124)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 13759)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 14959)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 14992)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 15007)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 15051)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 15078)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 15166)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 15255)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 15753)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 16039)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 16606)))),
+                    // zig fmt: off
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 12124)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 13759)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 14959)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 14992)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 15007)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 15051)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 15078)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 15166)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 15255)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 15753)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 16039)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 16606)))),
+                    // zig fmt: on
                 } ++ @as([4]u16, @splat(0)),
             },
             [13][16]u16{
                 [13]u16{
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 10407)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 11208)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 12900)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 13181)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 13823)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 14175)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 14899)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 15656)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 15986)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 20086)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 20995)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 22455)))),
+                    // zig fmt: off
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 10407)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 11208)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 12900)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 13181)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 13823)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 14175)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 14899)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 15656)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 15986)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 20086)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 20995)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 22455)))),
                     @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 24212)))),
+                    // zig fmt: on
                 } ++ @as([3]u16, @splat(0)),
                 [13]u16{
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 4532)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 19780)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 20057)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 20215)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 20428)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 21071)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 21199)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 21451)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 22099)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 24228)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 24693)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 27032)))),
+                    // zig fmt: off
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 4532)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 19780)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 20057)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 20215)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 20428)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 21071)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 21199)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 21451)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 22099)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 24228)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 24693)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 27032)))),
                     @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 29472)))),
+                    // zig fmt: on
                 } ++ @as([3]u16, @splat(0)),
                 [13]u16{
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 5273)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 5379)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 20177)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 20270)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 20385)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 20439)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 20949)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 21695)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 21774)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 23138)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 24256)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 24703)))),
+                    // zig fmt: off
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 5273)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 5379)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 20177)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 20270)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 20385)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 20439)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 20949)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 21695)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 21774)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 23138)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 24256)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 24703)))),
                     @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 26679)))),
+                    // zig fmt: on
                 } ++ @as([3]u16, @splat(0)),
                 [13]u16{
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 6740)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 7167)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 7662)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 14152)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 14536)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 14785)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 15034)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 16741)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 18371)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 21520)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 22206)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 23389)))),
+                    // zig fmt: off
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 6740)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 7167)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 7662)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 14152)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 14536)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 14785)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 15034)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 16741)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 18371)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 21520)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 22206)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 23389)))),
                     @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 24182)))),
+                    // zig fmt: on
                 } ++ @as([3]u16, @splat(0)),
                 [13]u16{
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 4987)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 5368)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 5928)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 6068)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 19114)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 20315)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 21857)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 22253)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 22411)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 24911)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 25380)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 26027)))),
+                    // zig fmt: off
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 4987)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 5368)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 5928)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 6068)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 19114)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 20315)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 21857)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 22253)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 22411)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 24911)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 25380)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 26027)))),
                     @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 26376)))),
+                    // zig fmt: on
                 } ++ @as([3]u16, @splat(0)),
                 [13]u16{
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 5370)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 6889)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 7247)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 7393)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 9498)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 21114)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 21402)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 21753)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 21981)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 24780)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 25386)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 26517)))),
+                    // zig fmt: off
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 5370)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 6889)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 7247)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 7393)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 9498)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 21114)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 21402)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 21753)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 21981)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 24780)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 25386)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 26517)))),
                     @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 27176)))),
+                    // zig fmt: on
                 } ++ @as([3]u16, @splat(0)),
                 [13]u16{
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 4816)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 4961)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 7204)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 7326)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 8765)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 8930)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 20169)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 20682)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 20803)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 23188)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 23763)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 24455)))),
+                    // zig fmt: off
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 4816)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 4961)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 7204)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 7326)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 8765)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 8930)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 20169)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 20682)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 20803)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 23188)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 23763)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 24455)))),
                     @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 24940)))),
+                    // zig fmt: on
                 } ++ @as([3]u16, @splat(0)),
                 [13]u16{
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 6608)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 6740)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 8529)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 9049)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 9257)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 9356)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 9735)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 18827)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 19059)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 22336)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 23204)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 23964)))),
+                    // zig fmt: off
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 6608)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 6740)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 8529)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 9049)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 9257)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 9356)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 9735)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 18827)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 19059)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 22336)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 23204)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 23964)))),
                     @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 24793)))),
+                    // zig fmt: on
                 } ++ @as([3]u16, @splat(0)),
                 [13]u16{
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 5998)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 7419)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 7781)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 8933)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 9255)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 9549)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 9753)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 10417)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 18898)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 22494)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 23139)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 24764)))),
+                    // zig fmt: off
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 5998)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 7419)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 7781)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 8933)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 9255)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 9549)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 9753)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 10417)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 18898)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 22494)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 23139)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 24764)))),
                     @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 25989)))),
+                    // zig fmt: on
                 } ++ @as([3]u16, @splat(0)),
                 [13]u16{
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 10660)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 11298)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 12550)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 12957)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 13322)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 13624)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 14040)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 15004)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 15534)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 20714)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 21789)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 23443)))),
+                    // zig fmt: off
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 10660)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 11298)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 12550)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 12957)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 13322)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 13624)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 14040)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 15004)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 15534)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 20714)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 21789)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 23443)))),
                     @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 24861)))),
+                    // zig fmt: on
                 } ++ @as([3]u16, @splat(0)),
                 [13]u16{
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 10522)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 11530)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 12552)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 12963)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 13378)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 13779)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 14245)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 15235)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 15902)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 20102)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 22696)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 23774)))),
+                    // zig fmt: off
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 10522)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 11530)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 12552)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 12963)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 13378)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 13779)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 14245)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 15235)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 15902)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 20102)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 22696)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 23774)))),
                     @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 25838)))),
+                    // zig fmt: on
                 } ++ @as([3]u16, @splat(0)),
                 [13]u16{
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 10099)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 10691)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 12639)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 13049)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 13386)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 13665)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 14125)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 15163)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 15636)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 19676)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 20474)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 23519)))),
+                    // zig fmt: off
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 10099)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 10691)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 12639)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 13049)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 13386)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 13665)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 14125)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 15163)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 15636)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 19676)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 20474)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 23519)))),
                     @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 25208)))),
+                    // zig fmt: on
                 } ++ @as([3]u16, @splat(0)),
                 [13]u16{
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 3144)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 5087)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 7382)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 7504)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 7593)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 7690)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 7801)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 8064)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 8232)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 9248)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 9875)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 10521)))),
+                    // zig fmt: off
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 3144)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 5087)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 7382)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 7504)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 7593)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 7690)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 7801)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 8064)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 8232)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 9248)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 9875)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 10521)))),
                     @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 29048)))),
+                    // zig fmt: on
                 } ++ @as([3]u16, @splat(0)),
             },
         },
         .partition = [5][4][16]u16{
             [4][16]u16{
                 [7]u16{
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 27899)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 28219)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 28529)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 32484)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 32539)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 32619)))),
+                    // zig fmt: off
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 27899)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 28219)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 28529)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 32484)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 32539)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 32619)))),
                     @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 32639)))),
+                    // zig fmt: on
                 } ++ @as([9]u16, @splat(0)),
                 [7]u16{
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 6607)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 6990)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 8268)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 32060)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 32219)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 32338)))),
+                    // zig fmt: off
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 6607)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 6990)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 8268)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 32060)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 32219)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 32338)))),
                     @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 32371)))),
+                    // zig fmt: on
                 } ++ @as([9]u16, @splat(0)),
                 [7]u16{
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 5429)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 6676)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 7122)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 32027)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 32227)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 32531)))),
+                    // zig fmt: off
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 5429)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 6676)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 7122)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 32027)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 32227)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 32531)))),
                     @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 32582)))),
+                    // zig fmt: on
                 } ++ @as([9]u16, @splat(0)),
                 [7]u16{
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 711)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 966)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 1172)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 32448)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 32538)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 32617)))),
+                    // zig fmt: off
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 711)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 966)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 1172)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 32448)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 32538)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 32617)))),
                     @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 32664)))),
+                    // zig fmt: on
                 } ++ @as([9]u16, @splat(0)),
             },
             [4][16]u16{
                 [9]u16{
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 20137)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 21547)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 23078)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 29566)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 29837)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 30261)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 30524)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 30892)))),
+                    // zig fmt: off
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 20137)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 21547)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 23078)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 29566)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 29837)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 30261)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 30524)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 30892)))),
                     @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 31724)))),
+                    // zig fmt: on
                 } ++ @as([7]u16, @splat(0)),
                 [9]u16{
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 6732)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 7490)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 9497)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 27944)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 28250)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 28515)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 28969)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 29630)))),
+                    // zig fmt: off
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 6732)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 7490)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 9497)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 27944)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 28250)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 28515)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 28969)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 29630)))),
                     @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 30104)))),
+                    // zig fmt: on
                 } ++ @as([7]u16, @splat(0)),
                 [9]u16{
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 5945)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 7663)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 8348)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 28683)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 29117)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 29749)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 30064)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 30298)))),
+                    // zig fmt: off
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 5945)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 7663)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 8348)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 28683)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 29117)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 29749)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 30064)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 30298)))),
                     @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 32238)))),
+                    // zig fmt: on
                 } ++ @as([7]u16, @splat(0)),
                 [9]u16{
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 870)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 1212)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 1487)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 31198)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 31394)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 31574)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 31743)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 31881)))),
+                    // zig fmt: off
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 870)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 1212)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 1487)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 31198)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 31394)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 31574)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 31743)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 31881)))),
                     @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 32332)))),
+                    // zig fmt: on
                 } ++ @as([7]u16, @splat(0)),
             },
             [4][16]u16{
                 [9]u16{
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 18462)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 20920)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 23124)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 27647)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 28227)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 29049)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 29519)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 30178)))),
+                    // zig fmt: off
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 18462)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 20920)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 23124)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 27647)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 28227)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 29049)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 29519)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 30178)))),
                     @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 31544)))),
+                    // zig fmt: on
                 } ++ @as([7]u16, @splat(0)),
                 [9]u16{
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 7689)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 9060)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 12056)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 24992)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 25660)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 26182)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 26951)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 28041)))),
+                    // zig fmt: off
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 7689)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 9060)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 12056)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 24992)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 25660)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 26182)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 26951)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 28041)))),
                     @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 29052)))),
+                    // zig fmt: on
                 } ++ @as([7]u16, @splat(0)),
                 [9]u16{
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 6015)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 9009)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 10062)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 24544)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 25409)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 26545)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 27071)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 27526)))),
+                    // zig fmt: off
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 6015)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 9009)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 10062)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 24544)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 25409)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 26545)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 27071)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 27526)))),
                     @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 32047)))),
+                    // zig fmt: on
                 } ++ @as([7]u16, @splat(0)),
                 [9]u16{
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 1394)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 2208)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 2796)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 28614)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 29061)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 29466)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 29840)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 30185)))),
+                    // zig fmt: off
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 1394)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 2208)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 2796)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 28614)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 29061)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 29466)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 29840)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 30185)))),
                     @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 31899)))),
+                    // zig fmt: on
                 } ++ @as([7]u16, @splat(0)),
             },
             [4][16]u16{
                 [9]u16{
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 15597)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 20929)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 24571)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 26706)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 27664)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 28821)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 29601)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 30571)))),
+                    // zig fmt: off
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 15597)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 20929)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 24571)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 26706)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 27664)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 28821)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 29601)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 30571)))),
                     @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 31902)))),
+                    // zig fmt: on
                 } ++ @as([7]u16, @splat(0)),
                 [9]u16{
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 7925)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 11043)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 16785)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 22470)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 23971)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 25043)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 26651)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 28701)))),
+                    // zig fmt: off
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 7925)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 11043)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 16785)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 22470)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 23971)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 25043)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 26651)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 28701)))),
                     @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 29834)))),
+                    // zig fmt: on
                 } ++ @as([7]u16, @splat(0)),
                 [9]u16{
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 5414)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 13269)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 15111)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 20488)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 22360)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 24500)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 25537)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 26336)))),
+                    // zig fmt: off
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 5414)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 13269)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 15111)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 20488)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 22360)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 24500)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 25537)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 26336)))),
                     @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 32117)))),
+                    // zig fmt: on
                 } ++ @as([7]u16, @splat(0)),
                 [9]u16{
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 2662)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 6362)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 8614)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 20860)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 23053)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 24778)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 26436)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 27829)))),
+                    // zig fmt: off
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 2662)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 6362)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 8614)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 20860)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 23053)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 24778)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 26436)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 27829)))),
                     @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 31171)))),
+                    // zig fmt: on
                 } ++ @as([7]u16, @splat(0)),
             },
             [4][16]u16{
@@ -1731,838 +1599,743 @@ pub const default_cdf: CdfDefaultContext = CdfDefaultContext{
         },
         .cfl_alpha = [6][16]u16{
             [15]u16{
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 7637)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 20719)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 31401)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 32481)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 32657)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 32688)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 32692)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 32696)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 32700)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 32704)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 32708)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 32712)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 32716)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 32720)))),
+                // zig fmt: off
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 7637)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 20719)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 31401)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 32481)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 32657)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 32688)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 32692)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 32696)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 32700)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 32704)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 32708)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 32712)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 32716)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 32720)))),
                 @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 32724)))),
+                // zig fmt: on
             } ++ @as([1]u16, @splat(0)),
             [15]u16{
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 14365)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 23603)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 28135)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 31168)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 32167)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 32395)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 32487)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 32573)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 32620)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 32647)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 32668)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 32672)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 32676)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 32680)))),
+                // zig fmt: off
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 14365)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 23603)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 28135)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 31168)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 32167)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 32395)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 32487)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 32573)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 32620)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 32647)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 32668)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 32672)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 32676)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 32680)))),
                 @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 32684)))),
+                // zig fmt: on
             } ++ @as([1]u16, @splat(0)),
             [15]u16{
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 11532)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 22380)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 28445)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 31360)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 32349)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 32523)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 32584)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 32649)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 32673)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 32677)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 32681)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 32685)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 32689)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 32693)))),
+                // zig fmt: off
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 11532)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 22380)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 28445)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 31360)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 32349)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 32523)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 32584)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 32649)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 32673)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 32677)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 32681)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 32685)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 32689)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 32693)))),
                 @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 32697)))),
+                // zig fmt: on
             } ++ @as([1]u16, @splat(0)),
             [15]u16{
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 26990)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 31402)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 32282)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 32571)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 32692)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 32696)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 32700)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 32704)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 32708)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 32712)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 32716)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 32720)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 32724)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 32728)))),
+                // zig fmt: off
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 26990)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 31402)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 32282)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 32571)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 32692)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 32696)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 32700)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 32704)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 32708)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 32712)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 32716)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 32720)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 32724)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 32728)))),
                 @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 32732)))),
+                // zig fmt: on
             } ++ @as([1]u16, @splat(0)),
             [15]u16{
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 17248)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 26058)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 28904)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 30608)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 31305)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 31877)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 32126)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 32321)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 32394)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 32464)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 32516)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 32560)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 32576)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 32593)))),
+                // zig fmt: off
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 17248)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 26058)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 28904)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 30608)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 31305)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 31877)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 32126)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 32321)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 32394)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 32464)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 32516)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 32560)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 32576)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 32593)))),
                 @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 32622)))),
+                // zig fmt: on
             } ++ @as([1]u16, @splat(0)),
             [15]u16{
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 14738)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 21678)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 25779)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 27901)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 29024)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 30302)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 30980)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 31843)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 32144)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 32413)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 32520)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 32594)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 32622)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 32656)))),
+                // zig fmt: off
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 14738)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 21678)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 25779)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 27901)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 29024)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 30302)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 30980)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 31843)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 32144)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 32413)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 32520)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 32594)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 32622)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 32656)))),
                 @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 32660)))),
+                // zig fmt: on
             } ++ @as([1]u16, @splat(0)),
         },
         .txtp_inter1 = [2][16]u16{
             [15]u16{
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 4458)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 5560)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 7695)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 9709)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 13330)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 14789)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 17537)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 20266)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 21504)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 22848)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 23934)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 25474)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 27727)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 28915)))),
+                // zig fmt: off
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 4458)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 5560)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 7695)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 9709)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 13330)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 14789)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 17537)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 20266)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 21504)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 22848)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 23934)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 25474)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 27727)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 28915)))),
                 @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 30631)))),
+                // zig fmt: on
             } ++ @as([1]u16, @splat(0)),
             [15]u16{
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 1645)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 2573)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 4778)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 5711)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 7807)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 8622)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 10522)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 15357)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 17674)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 20408)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 22517)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 25010)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 27116)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 28856)))),
+                // zig fmt: off
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 1645)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 2573)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 4778)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 5711)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 7807)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 8622)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 10522)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 15357)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 17674)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 20408)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 22517)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 25010)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 27116)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 28856)))),
                 @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 30749)))),
+                // zig fmt: on
             } ++ @as([1]u16, @splat(0)),
         },
         .txtp_inter2 = [11]u16{
-            @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 770)))),
-            @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 2421)))),
-            @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 5225)))),
-            @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 12907)))),
-            @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 15819)))),
-            @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 18927)))),
-            @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 21561)))),
-            @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 24089)))),
-            @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 26595)))),
-            @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 28526)))),
+            // zig fmt: off
+            @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 770)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 2421)))),
+            @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 5225)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 12907)))),
+            @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 15819)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 18927)))),
+            @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 21561)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 24089)))),
+            @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 26595)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 28526)))),
             @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 30529)))),
+            // zig fmt: on
         } ++ @as([5]u16, @splat(0)),
         .txtp_intra1 = [2][13][8]u16{
             [13][8]u16{
                 [6]u16{
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 1535)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 8035)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 9461)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 12751)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 23467)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 27825)))),
+                    // zig fmt: off
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 1535)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 8035)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 9461)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 12751)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 23467)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 27825)))),
+                    // zig fmt: on
                 } ++ @as([2]u16, @splat(0)),
                 [6]u16{
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 564)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 3335)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 9709)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 10870)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 18143)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 28094)))),
+                    // zig fmt: off
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 564)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 3335)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 9709)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 10870)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 18143)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 28094)))),
+                    // zig fmt: on
                 } ++ @as([2]u16, @splat(0)),
                 [6]u16{
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 672)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 3247)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 3676)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 11982)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 19415)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 23127)))),
+                    // zig fmt: off
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 672)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 3247)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 3676)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 11982)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 19415)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 23127)))),
+                    // zig fmt: on
                 } ++ @as([2]u16, @splat(0)),
                 [6]u16{
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 5279)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 13885)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 15487)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 18044)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 23527)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 30252)))),
+                    // zig fmt: off
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 5279)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 13885)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 15487)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 18044)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 23527)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 30252)))),
+                    // zig fmt: on
                 } ++ @as([2]u16, @splat(0)),
                 [6]u16{
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 4423)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 6074)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 7985)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 10416)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 25693)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 29298)))),
+                    // zig fmt: off
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 4423)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 6074)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 7985)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 10416)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 25693)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 29298)))),
+                    // zig fmt: on
                 } ++ @as([2]u16, @splat(0)),
                 [6]u16{
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 1486)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 4241)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 9460)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 10662)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 16456)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 27694)))),
+                    // zig fmt: off
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 1486)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 4241)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 9460)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 10662)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 16456)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 27694)))),
+                    // zig fmt: on
                 } ++ @as([2]u16, @splat(0)),
                 [6]u16{
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 439)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 2838)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 3522)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 6737)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 18058)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 23754)))),
+                    // zig fmt: off
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 439)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 2838)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 3522)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 6737)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 18058)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 23754)))),
+                    // zig fmt: on
                 } ++ @as([2]u16, @splat(0)),
                 [6]u16{
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 1190)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 4233)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 4855)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 11670)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 20281)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 24377)))),
+                    // zig fmt: off
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 1190)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 4233)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 4855)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 11670)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 20281)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 24377)))),
+                    // zig fmt: on
                 } ++ @as([2]u16, @splat(0)),
                 [6]u16{
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 1045)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 4312)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 8647)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 10159)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 18644)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 29335)))),
+                    // zig fmt: off
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 1045)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 4312)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 8647)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 10159)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 18644)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 29335)))),
+                    // zig fmt: on
                 } ++ @as([2]u16, @splat(0)),
                 [6]u16{
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 202)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 3734)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 4747)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 7298)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 17127)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 24016)))),
+                    // zig fmt: off
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 202)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 3734)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 4747)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 7298)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 17127)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 24016)))),
+                    // zig fmt: on
                 } ++ @as([2]u16, @splat(0)),
                 [6]u16{
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 447)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 4312)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 6819)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 8884)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 16010)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 23858)))),
+                    // zig fmt: off
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 447)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 4312)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 6819)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 8884)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 16010)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 23858)))),
+                    // zig fmt: on
                 } ++ @as([2]u16, @splat(0)),
                 [6]u16{
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 277)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 4369)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 5255)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 8905)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 16465)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 22271)))),
+                    // zig fmt: off
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 277)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 4369)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 5255)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 8905)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 16465)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 22271)))),
+                    // zig fmt: on
                 } ++ @as([2]u16, @splat(0)),
                 [6]u16{
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 3409)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 5436)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 10599)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 15599)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 19687)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 24040)))),
+                    // zig fmt: off
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 3409)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 5436)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 10599)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 15599)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 19687)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 24040)))),
+                    // zig fmt: on
                 } ++ @as([2]u16, @splat(0)),
             },
             [13][8]u16{
                 [6]u16{
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 1870)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 13742)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 14530)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 16498)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 23770)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 27698)))),
+                    // zig fmt: off
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 1870)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 13742)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 14530)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 16498)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 23770)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 27698)))),
+                    // zig fmt: on
                 } ++ @as([2]u16, @splat(0)),
                 [6]u16{
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 326)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 8796)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 14632)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 15079)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 19272)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 27486)))),
+                    // zig fmt: off
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 326)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 8796)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 14632)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 15079)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 19272)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 27486)))),
+                    // zig fmt: on
                 } ++ @as([2]u16, @splat(0)),
                 [6]u16{
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 484)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 7576)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 7712)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 14443)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 19159)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 22591)))),
+                    // zig fmt: off
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 484)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 7576)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 7712)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 14443)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 19159)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 22591)))),
+                    // zig fmt: on
                 } ++ @as([2]u16, @splat(0)),
                 [6]u16{
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 1126)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 15340)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 15895)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 17023)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 20896)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 30279)))),
+                    // zig fmt: off
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 1126)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 15340)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 15895)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 17023)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 20896)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 30279)))),
+                    // zig fmt: on
                 } ++ @as([2]u16, @splat(0)),
                 [6]u16{
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 655)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 4854)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 5249)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 5913)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 22099)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 27138)))),
+                    // zig fmt: off
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 655)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 4854)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 5249)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 5913)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 22099)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 27138)))),
+                    // zig fmt: on
                 } ++ @as([2]u16, @splat(0)),
                 [6]u16{
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 1299)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 6458)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 8885)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 9290)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 14851)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 25497)))),
+                    // zig fmt: off
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 1299)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 6458)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 8885)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 9290)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 14851)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 25497)))),
+                    // zig fmt: on
                 } ++ @as([2]u16, @splat(0)),
                 [6]u16{
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 311)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 5295)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 5552)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 6885)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 16107)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 22672)))),
+                    // zig fmt: off
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 311)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 5295)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 5552)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 6885)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 16107)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 22672)))),
+                    // zig fmt: on
                 } ++ @as([2]u16, @splat(0)),
                 [6]u16{
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 883)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 8059)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 8270)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 11258)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 17289)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 21549)))),
+                    // zig fmt: off
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 883)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 8059)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 8270)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 11258)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 17289)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 21549)))),
+                    // zig fmt: on
                 } ++ @as([2]u16, @splat(0)),
                 [6]u16{
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 741)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 7580)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 9318)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 10345)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 16688)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 29046)))),
+                    // zig fmt: off
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 741)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 7580)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 9318)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 10345)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 16688)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 29046)))),
+                    // zig fmt: on
                 } ++ @as([2]u16, @splat(0)),
                 [6]u16{
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 110)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 7406)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 7915)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 9195)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 16041)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 23329)))),
+                    // zig fmt: off
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 110)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 7406)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 7915)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 9195)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 16041)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 23329)))),
+                    // zig fmt: on
                 } ++ @as([2]u16, @splat(0)),
                 [6]u16{
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 363)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 7974)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 9357)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 10673)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 15629)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 24474)))),
+                    // zig fmt: off
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 363)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 7974)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 9357)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 10673)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 15629)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 24474)))),
+                    // zig fmt: on
                 } ++ @as([2]u16, @splat(0)),
                 [6]u16{
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 153)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 7647)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 8112)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 9936)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 15307)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 19996)))),
+                    // zig fmt: off
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 153)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 7647)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 8112)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 9936)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 15307)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 19996)))),
+                    // zig fmt: on
                 } ++ @as([2]u16, @splat(0)),
                 [6]u16{
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 3511)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 6332)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 11165)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 15335)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 19323)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 23594)))),
+                    // zig fmt: off
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 3511)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 6332)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 11165)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 15335)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 19323)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 23594)))),
+                    // zig fmt: on
                 } ++ @as([2]u16, @splat(0)),
             },
         },
         .txtp_intra2 = [3][13][8]u16{
             [13][8]u16{
                 [4]u16{
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 6554)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 13107)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 19661)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 26214)))),
+                    // zig fmt: off
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 6554)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 13107)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 19661)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 26214)))),
+                    // zig fmt: on
                 } ++ @as([4]u16, @splat(0)),
                 [4]u16{
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 6554)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 13107)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 19661)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 26214)))),
+                    // zig fmt: off
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 6554)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 13107)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 19661)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 26214)))),
+                    // zig fmt: on
                 } ++ @as([4]u16, @splat(0)),
                 [4]u16{
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 6554)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 13107)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 19661)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 26214)))),
+                    // zig fmt: off
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 6554)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 13107)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 19661)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 26214)))),
+                    // zig fmt: on
                 } ++ @as([4]u16, @splat(0)),
                 [4]u16{
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 6554)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 13107)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 19661)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 26214)))),
+                    // zig fmt: off
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 6554)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 13107)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 19661)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 26214)))),
+                    // zig fmt: on
                 } ++ @as([4]u16, @splat(0)),
                 [4]u16{
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 6554)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 13107)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 19661)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 26214)))),
+                    // zig fmt: off
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 6554)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 13107)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 19661)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 26214)))),
+                    // zig fmt: on
                 } ++ @as([4]u16, @splat(0)),
                 [4]u16{
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 6554)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 13107)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 19661)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 26214)))),
+                    // zig fmt: off
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 6554)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 13107)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 19661)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 26214)))),
+                    // zig fmt: on
                 } ++ @as([4]u16, @splat(0)),
                 [4]u16{
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 6554)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 13107)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 19661)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 26214)))),
+                    // zig fmt: off
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 6554)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 13107)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 19661)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 26214)))),
+                    // zig fmt: on
                 } ++ @as([4]u16, @splat(0)),
                 [4]u16{
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 6554)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 13107)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 19661)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 26214)))),
+                    // zig fmt: off
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 6554)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 13107)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 19661)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 26214)))),
+                    // zig fmt: on
                 } ++ @as([4]u16, @splat(0)),
                 [4]u16{
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 6554)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 13107)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 19661)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 26214)))),
+                    // zig fmt: off
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 6554)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 13107)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 19661)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 26214)))),
+                    // zig fmt: on
                 } ++ @as([4]u16, @splat(0)),
                 [4]u16{
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 6554)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 13107)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 19661)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 26214)))),
+                    // zig fmt: off
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 6554)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 13107)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 19661)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 26214)))),
+                    // zig fmt: on
                 } ++ @as([4]u16, @splat(0)),
                 [4]u16{
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 6554)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 13107)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 19661)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 26214)))),
+                    // zig fmt: off
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 6554)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 13107)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 19661)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 26214)))),
+                    // zig fmt: on
                 } ++ @as([4]u16, @splat(0)),
                 [4]u16{
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 6554)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 13107)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 19661)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 26214)))),
+                    // zig fmt: off
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 6554)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 13107)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 19661)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 26214)))),
+                    // zig fmt: on
                 } ++ @as([4]u16, @splat(0)),
                 [4]u16{
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 6554)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 13107)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 19661)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 26214)))),
-                } ++ @as([4]u16, @splat(0)),
-            },
-            [13][8]u16{
-                [4]u16{
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 6554)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 13107)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 19661)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 26214)))),
-                } ++ @as([4]u16, @splat(0)),
-                [4]u16{
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 6554)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 13107)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 19661)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 26214)))),
-                } ++ @as([4]u16, @splat(0)),
-                [4]u16{
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 6554)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 13107)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 19661)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 26214)))),
-                } ++ @as([4]u16, @splat(0)),
-                [4]u16{
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 6554)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 13107)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 19661)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 26214)))),
-                } ++ @as([4]u16, @splat(0)),
-                [4]u16{
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 6554)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 13107)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 19661)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 26214)))),
-                } ++ @as([4]u16, @splat(0)),
-                [4]u16{
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 6554)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 13107)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 19661)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 26214)))),
-                } ++ @as([4]u16, @splat(0)),
-                [4]u16{
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 6554)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 13107)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 19661)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 26214)))),
-                } ++ @as([4]u16, @splat(0)),
-                [4]u16{
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 6554)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 13107)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 19661)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 26214)))),
-                } ++ @as([4]u16, @splat(0)),
-                [4]u16{
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 6554)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 13107)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 19661)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 26214)))),
-                } ++ @as([4]u16, @splat(0)),
-                [4]u16{
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 6554)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 13107)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 19661)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 26214)))),
-                } ++ @as([4]u16, @splat(0)),
-                [4]u16{
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 6554)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 13107)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 19661)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 26214)))),
-                } ++ @as([4]u16, @splat(0)),
-                [4]u16{
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 6554)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 13107)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 19661)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 26214)))),
-                } ++ @as([4]u16, @splat(0)),
-                [4]u16{
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 6554)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 13107)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 19661)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 26214)))),
+                    // zig fmt: off
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 6554)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 13107)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 19661)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 26214)))),
+                    // zig fmt: on
                 } ++ @as([4]u16, @splat(0)),
             },
             [13][8]u16{
                 [4]u16{
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 1127)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 12814)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 22772)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 27483)))),
+                    // zig fmt: off
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 6554)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 13107)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 19661)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 26214)))),
+                    // zig fmt: on
                 } ++ @as([4]u16, @splat(0)),
                 [4]u16{
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 145)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 6761)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 11980)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 26667)))),
+                    // zig fmt: off
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 6554)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 13107)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 19661)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 26214)))),
+                    // zig fmt: on
                 } ++ @as([4]u16, @splat(0)),
                 [4]u16{
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 362)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 5887)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 11678)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 16725)))),
+                    // zig fmt: off
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 6554)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 13107)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 19661)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 26214)))),
+                    // zig fmt: on
                 } ++ @as([4]u16, @splat(0)),
                 [4]u16{
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 385)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 15213)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 18587)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 30693)))),
+                    // zig fmt: off
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 6554)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 13107)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 19661)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 26214)))),
+                    // zig fmt: on
                 } ++ @as([4]u16, @splat(0)),
                 [4]u16{
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 25)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 2914)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 23134)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 27903)))),
+                    // zig fmt: off
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 6554)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 13107)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 19661)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 26214)))),
+                    // zig fmt: on
                 } ++ @as([4]u16, @splat(0)),
                 [4]u16{
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 60)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 4470)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 11749)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 23991)))),
+                    // zig fmt: off
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 6554)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 13107)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 19661)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 26214)))),
+                    // zig fmt: on
                 } ++ @as([4]u16, @splat(0)),
                 [4]u16{
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 37)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 3332)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 14511)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 21448)))),
+                    // zig fmt: off
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 6554)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 13107)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 19661)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 26214)))),
+                    // zig fmt: on
                 } ++ @as([4]u16, @splat(0)),
                 [4]u16{
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 157)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 6320)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 13036)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 17439)))),
+                    // zig fmt: off
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 6554)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 13107)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 19661)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 26214)))),
+                    // zig fmt: on
                 } ++ @as([4]u16, @splat(0)),
                 [4]u16{
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 119)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 6719)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 12906)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 29396)))),
+                    // zig fmt: off
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 6554)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 13107)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 19661)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 26214)))),
+                    // zig fmt: on
                 } ++ @as([4]u16, @splat(0)),
                 [4]u16{
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 47)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 5537)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 12576)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 21499)))),
+                    // zig fmt: off
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 6554)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 13107)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 19661)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 26214)))),
+                    // zig fmt: on
                 } ++ @as([4]u16, @splat(0)),
                 [4]u16{
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 269)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 6076)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 11258)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 23115)))),
+                    // zig fmt: off
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 6554)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 13107)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 19661)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 26214)))),
+                    // zig fmt: on
                 } ++ @as([4]u16, @splat(0)),
                 [4]u16{
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 83)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 5615)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 12001)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 17228)))),
+                    // zig fmt: off
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 6554)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 13107)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 19661)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 26214)))),
+                    // zig fmt: on
                 } ++ @as([4]u16, @splat(0)),
                 [4]u16{
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 1968)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 5556)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 12023)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 18547)))),
+                    // zig fmt: off
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 6554)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 13107)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 19661)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 26214)))),
+                    // zig fmt: on
+                } ++ @as([4]u16, @splat(0)),
+            },
+            [13][8]u16{
+                [4]u16{
+                    // zig fmt: off
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 1127)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 12814)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 22772)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 27483)))),
+                    // zig fmt: on
+                } ++ @as([4]u16, @splat(0)),
+                [4]u16{
+                    // zig fmt: off
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 145)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 6761)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 11980)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 26667)))),
+                    // zig fmt: on
+                } ++ @as([4]u16, @splat(0)),
+                [4]u16{
+                    // zig fmt: off
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 362)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 5887)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 11678)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 16725)))),
+                    // zig fmt: on
+                } ++ @as([4]u16, @splat(0)),
+                [4]u16{
+                    // zig fmt: off
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 385)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 15213)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 18587)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 30693)))),
+                    // zig fmt: on
+                } ++ @as([4]u16, @splat(0)),
+                [4]u16{
+                    // zig fmt: off
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 25)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 2914)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 23134)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 27903)))),
+                    // zig fmt: on
+                } ++ @as([4]u16, @splat(0)),
+                [4]u16{
+                    // zig fmt: off
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 60)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 4470)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 11749)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 23991)))),
+                    // zig fmt: on
+                } ++ @as([4]u16, @splat(0)),
+                [4]u16{
+                    // zig fmt: off
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 37)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 3332)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 14511)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 21448)))),
+                    // zig fmt: on
+                } ++ @as([4]u16, @splat(0)),
+                [4]u16{
+                    // zig fmt: off
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 157)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 6320)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 13036)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 17439)))),
+                    // zig fmt: on
+                } ++ @as([4]u16, @splat(0)),
+                [4]u16{
+                    // zig fmt: off
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 119)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 6719)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 12906)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 29396)))),
+                    // zig fmt: on
+                } ++ @as([4]u16, @splat(0)),
+                [4]u16{
+                    // zig fmt: off
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 47)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 5537)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 12576)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 21499)))),
+                    // zig fmt: on
+                } ++ @as([4]u16, @splat(0)),
+                [4]u16{
+                    // zig fmt: off
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 269)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 6076)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 11258)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 23115)))),
+                    // zig fmt: on
+                } ++ @as([4]u16, @splat(0)),
+                [4]u16{
+                    // zig fmt: off
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 83)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 5615)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 12001)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 17228)))),
+                    // zig fmt: on
+                } ++ @as([4]u16, @splat(0)),
+                [4]u16{
+                    // zig fmt: off
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 1968)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 5556)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 12023)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 18547)))),
+                    // zig fmt: on
                 } ++ @as([4]u16, @splat(0)),
             },
         },
         .cfl_sign = [7]u16{
-            @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 1418)))),
-            @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 2123)))),
-            @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 13340)))),
-            @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 18405)))),
-            @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 26972)))),
-            @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 28343)))),
+            // zig fmt: off
+            @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 1418)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 2123)))),
+            @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 13340)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 18405)))),
+            @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 26972)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 28343)))),
             @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 32294)))),
+            // zig fmt: on
         } ++ @as([1]u16, @splat(0)),
         .angle_delta = [8][8]u16{
             [6]u16{
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 2180)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 5032)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 7567)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 22776)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 26989)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 30217)))),
+                // zig fmt: off
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 2180)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 5032)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 7567)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 22776)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 26989)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 30217)))),
+                // zig fmt: on
             } ++ @as([2]u16, @splat(0)),
             [6]u16{
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 2301)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 5608)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 8801)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 23487)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 26974)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 30330)))),
+                // zig fmt: off
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 2301)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 5608)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 8801)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 23487)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 26974)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 30330)))),
+                // zig fmt: on
             } ++ @as([2]u16, @splat(0)),
             [6]u16{
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 3780)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 11018)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 13699)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 19354)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 23083)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 31286)))),
+                // zig fmt: off
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 3780)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 11018)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 13699)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 19354)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 23083)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 31286)))),
+                // zig fmt: on
             } ++ @as([2]u16, @splat(0)),
             [6]u16{
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 4581)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 11226)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 15147)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 17138)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 21834)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 28397)))),
+                // zig fmt: off
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 4581)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 11226)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 15147)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 17138)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 21834)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 28397)))),
+                // zig fmt: on
             } ++ @as([2]u16, @splat(0)),
             [6]u16{
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 1737)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 10927)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 14509)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 19588)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 22745)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 28823)))),
+                // zig fmt: off
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 1737)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 10927)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 14509)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 19588)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 22745)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 28823)))),
+                // zig fmt: on
             } ++ @as([2]u16, @splat(0)),
             [6]u16{
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 2664)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 10176)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 12485)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 17650)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 21600)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 30495)))),
+                // zig fmt: off
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 2664)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 10176)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 12485)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 17650)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 21600)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 30495)))),
+                // zig fmt: on
             } ++ @as([2]u16, @splat(0)),
             [6]u16{
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 2240)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 11096)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 15453)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 20341)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 22561)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 28917)))),
+                // zig fmt: off
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 2240)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 11096)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 15453)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 20341)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 22561)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 28917)))),
+                // zig fmt: on
             } ++ @as([2]u16, @splat(0)),
             [6]u16{
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 3605)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 10428)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 12459)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 17676)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 21244)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 30655)))),
+                // zig fmt: off
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 3605)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 10428)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 12459)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 17676)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 21244)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 30655)))),
+                // zig fmt: on
             } ++ @as([2]u16, @splat(0)),
         },
         .filter_intra = [4]u16{
-            @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 8949)))),
-            @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 12776)))),
-            @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 17211)))),
-            @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 29558)))),
+            // zig fmt: off
+            @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 8949)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 12776)))),
+            @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 17211)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 29558)))),
+            // zig fmt: on
         } ++ @as([4]u16, @splat(0)),
         .seg_id = [3][8]u16{
             [7]u16{
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 5622)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 7893)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 16093)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 18233)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 27809)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 28373)))),
+                // zig fmt: off
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 5622)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 7893)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 16093)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 18233)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 27809)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 28373)))),
                 @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 32533)))),
+                // zig fmt: on
             } ++ @as([1]u16, @splat(0)),
             [7]u16{
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 14274)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 18230)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 22557)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 24935)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 29980)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 30851)))),
+                // zig fmt: off
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 14274)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 18230)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 22557)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 24935)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 29980)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 30851)))),
                 @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 32344)))),
+                // zig fmt: on
             } ++ @as([1]u16, @splat(0)),
             [7]u16{
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 27527)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 28487)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 28723)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 28890)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 32397)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 32647)))),
+                // zig fmt: off
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 27527)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 28487)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 28723)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 28890)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 32397)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 32647)))),
                 @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 32679)))),
+                // zig fmt: on
             } ++ @as([1]u16, @splat(0)),
         },
         .pal_sz = [2][7][8]u16{
             [7][8]u16{
                 [6]u16{
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 7952)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 13000)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 18149)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 21478)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 25527)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 29241)))),
+                    // zig fmt: off
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 7952)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 13000)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 18149)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 21478)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 25527)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 29241)))),
+                    // zig fmt: on
                 } ++ @as([2]u16, @splat(0)),
                 [6]u16{
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 7139)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 11421)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 16195)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 19544)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 23666)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 28073)))),
+                    // zig fmt: off
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 7139)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 11421)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 16195)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 19544)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 23666)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 28073)))),
+                    // zig fmt: on
                 } ++ @as([2]u16, @splat(0)),
                 [6]u16{
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 7788)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 12741)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 17325)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 20500)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 24315)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 28530)))),
+                    // zig fmt: off
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 7788)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 12741)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 17325)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 20500)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 24315)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 28530)))),
+                    // zig fmt: on
                 } ++ @as([2]u16, @splat(0)),
                 [6]u16{
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 8271)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 14064)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 18246)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 21564)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 25071)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 28533)))),
+                    // zig fmt: off
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 8271)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 14064)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 18246)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 21564)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 25071)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 28533)))),
+                    // zig fmt: on
                 } ++ @as([2]u16, @splat(0)),
                 [6]u16{
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 12725)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 19180)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 21863)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 24839)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 27535)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 30120)))),
+                    // zig fmt: off
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 12725)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 19180)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 21863)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 24839)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 27535)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 30120)))),
+                    // zig fmt: on
                 } ++ @as([2]u16, @splat(0)),
                 [6]u16{
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 9711)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 14888)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 16923)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 21052)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 25661)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 27875)))),
+                    // zig fmt: off
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 9711)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 14888)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 16923)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 21052)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 25661)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 27875)))),
+                    // zig fmt: on
                 } ++ @as([2]u16, @splat(0)),
                 [6]u16{
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 14940)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 20797)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 21678)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 24186)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 27033)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 28999)))),
+                    // zig fmt: off
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 14940)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 20797)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 21678)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 24186)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 27033)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 28999)))),
+                    // zig fmt: on
                 } ++ @as([2]u16, @splat(0)),
             },
             [7][8]u16{
                 [6]u16{
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 8713)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 19979)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 27128)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 29609)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 31331)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 32272)))),
+                    // zig fmt: off
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 8713)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 19979)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 27128)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 29609)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 31331)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 32272)))),
+                    // zig fmt: on
                 } ++ @as([2]u16, @splat(0)),
                 [6]u16{
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 5839)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 15573)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 23581)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 26947)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 29848)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 31700)))),
+                    // zig fmt: off
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 5839)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 15573)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 23581)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 26947)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 29848)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 31700)))),
+                    // zig fmt: on
                 } ++ @as([2]u16, @splat(0)),
                 [6]u16{
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 4426)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 11260)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 17999)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 21483)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 25863)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 29430)))),
+                    // zig fmt: off
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 4426)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 11260)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 17999)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 21483)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 25863)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 29430)))),
+                    // zig fmt: on
                 } ++ @as([2]u16, @splat(0)),
                 [6]u16{
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 3228)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 9464)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 14993)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 18089)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 22523)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 27420)))),
+                    // zig fmt: off
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 3228)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 9464)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 14993)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 18089)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 22523)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 27420)))),
+                    // zig fmt: on
                 } ++ @as([2]u16, @splat(0)),
                 [6]u16{
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 3768)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 8886)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 13091)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 17852)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 22495)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 27207)))),
+                    // zig fmt: off
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 3768)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 8886)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 13091)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 17852)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 22495)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 27207)))),
+                    // zig fmt: on
                 } ++ @as([2]u16, @splat(0)),
                 [6]u16{
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 2464)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 8451)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 12861)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 21632)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 25525)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 28555)))),
+                    // zig fmt: off
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 2464)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 8451)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 12861)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 21632)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 25525)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 28555)))),
+                    // zig fmt: on
                 } ++ @as([2]u16, @splat(0)),
                 [6]u16{
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 1269)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 5435)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 10433)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 18963)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 21700)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 25865)))),
+                    // zig fmt: off
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 1269)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 5435)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 10433)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 18963)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 21700)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 25865)))),
+                    // zig fmt: on
                 } ++ @as([2]u16, @splat(0)),
             },
         },
@@ -2636,160 +2409,150 @@ pub const default_cdf: CdfDefaultContext = CdfDefaultContext{
                 },
                 [5][8]u16{
                     [4]u16{
-                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 24779)))),
-                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 26955)))),
-                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 28576)))),
-                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 30282)))),
+                        // zig fmt: off
+                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 24779)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 26955)))),
+                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 28576)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 30282)))),
+                        // zig fmt: on
                     } ++ @as([4]u16, @splat(0)),
                     [4]u16{
-                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 8669)))),
-                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 20364)))),
-                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 24073)))),
-                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 28093)))),
+                        // zig fmt: off
+                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 8669)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 20364)))),
+                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 24073)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 28093)))),
+                        // zig fmt: on
                     } ++ @as([4]u16, @splat(0)),
                     [4]u16{
-                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 4255)))),
-                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 27565)))),
-                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 29377)))),
-                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 31067)))),
+                        // zig fmt: off
+                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 4255)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 27565)))),
+                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 29377)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 31067)))),
+                        // zig fmt: on
                     } ++ @as([4]u16, @splat(0)),
                     [4]u16{
-                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 19864)))),
-                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 23674)))),
-                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 26716)))),
-                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 29530)))),
+                        // zig fmt: off
+                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 19864)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 23674)))),
+                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 26716)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 29530)))),
+                        // zig fmt: on
                     } ++ @as([4]u16, @splat(0)),
                     [4]u16{
-                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 31646)))),
-                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 31893)))),
-                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 32147)))),
-                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 32426)))),
+                        // zig fmt: off
+                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 31646)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 31893)))),
+                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 32147)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 32426)))),
+                        // zig fmt: on
                     } ++ @as([4]u16, @splat(0)),
                 },
                 [5][8]u16{
                     [5]u16{
-                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 23132)))),
-                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 25407)))),
-                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 26970)))),
-                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 28435)))),
+                        // zig fmt: off
+                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 23132)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 25407)))),
+                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 26970)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 28435)))),
                         @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 30073)))),
+                        // zig fmt: on
                     } ++ @as([3]u16, @splat(0)),
                     [5]u16{
-                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 7443)))),
-                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 17242)))),
-                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 20717)))),
-                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 24762)))),
+                        // zig fmt: off
+                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 7443)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 17242)))),
+                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 20717)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 24762)))),
                         @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 27982)))),
+                        // zig fmt: on
                     } ++ @as([3]u16, @splat(0)),
                     [5]u16{
-                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 6300)))),
-                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 24862)))),
-                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 26944)))),
-                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 28784)))),
+                        // zig fmt: off
+                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 6300)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 24862)))),
+                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 26944)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 28784)))),
                         @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 30671)))),
+                        // zig fmt: on
                     } ++ @as([3]u16, @splat(0)),
                     [5]u16{
-                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 18916)))),
-                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 22895)))),
-                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 25267)))),
-                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 27435)))),
+                        // zig fmt: off
+                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 18916)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 22895)))),
+                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 25267)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 27435)))),
                         @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 29652)))),
+                        // zig fmt: on
                     } ++ @as([3]u16, @splat(0)),
                     [5]u16{
-                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 31270)))),
-                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 31550)))),
-                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 31808)))),
-                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 32059)))),
+                        // zig fmt: off
+                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 31270)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 31550)))),
+                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 31808)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 32059)))),
                         @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 32353)))),
+                        // zig fmt: on
                     } ++ @as([3]u16, @splat(0)),
                 },
                 [5][8]u16{
                     [6]u16{
-                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 23105)))),
-                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 25199)))),
-                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 26464)))),
-                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 27684)))),
-                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 28931)))),
-                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 30318)))),
+                        // zig fmt: off
+                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 23105)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 25199)))),
+                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 26464)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 27684)))),
+                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 28931)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 30318)))),
+                        // zig fmt: on
                     } ++ @as([2]u16, @splat(0)),
                     [6]u16{
-                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 6950)))),
-                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 15447)))),
-                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 18952)))),
-                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 22681)))),
-                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 25567)))),
-                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 28563)))),
+                        // zig fmt: off
+                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 6950)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 15447)))),
+                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 18952)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 22681)))),
+                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 25567)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 28563)))),
+                        // zig fmt: on
                     } ++ @as([2]u16, @splat(0)),
                     [6]u16{
-                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 7560)))),
-                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 23474)))),
-                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 25490)))),
-                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 27203)))),
-                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 28921)))),
-                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 30708)))),
+                        // zig fmt: off
+                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 7560)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 23474)))),
+                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 25490)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 27203)))),
+                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 28921)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 30708)))),
+                        // zig fmt: on
                     } ++ @as([2]u16, @splat(0)),
                     [6]u16{
-                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 18544)))),
-                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 22373)))),
-                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 24457)))),
-                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 26195)))),
-                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 28119)))),
-                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 30045)))),
+                        // zig fmt: off
+                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 18544)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 22373)))),
+                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 24457)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 26195)))),
+                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 28119)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 30045)))),
+                        // zig fmt: on
                     } ++ @as([2]u16, @splat(0)),
                     [6]u16{
-                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 31198)))),
-                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 31451)))),
-                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 31670)))),
-                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 31882)))),
-                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 32123)))),
-                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 32391)))),
+                        // zig fmt: off
+                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 31198)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 31451)))),
+                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 31670)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 31882)))),
+                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 32123)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 32391)))),
+                        // zig fmt: on
                     } ++ @as([2]u16, @splat(0)),
                 },
                 [5][8]u16{
                     [7]u16{
-                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 21689)))),
-                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 23883)))),
-                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 25163)))),
-                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 26352)))),
-                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 27506)))),
-                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 28827)))),
+                        // zig fmt: off
+                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 21689)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 23883)))),
+                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 25163)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 26352)))),
+                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 27506)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 28827)))),
                         @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 30195)))),
+                        // zig fmt: on
                     } ++ @as([1]u16, @splat(0)),
                     [7]u16{
-                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 6892)))),
-                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 15385)))),
-                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 17840)))),
-                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 21606)))),
-                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 24287)))),
-                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 26753)))),
+                        // zig fmt: off
+                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 6892)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 15385)))),
+                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 17840)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 21606)))),
+                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 24287)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 26753)))),
                         @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 29204)))),
+                        // zig fmt: on
                     } ++ @as([1]u16, @splat(0)),
                     [7]u16{
-                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 5651)))),
-                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 23182)))),
-                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 25042)))),
-                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 26518)))),
-                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 27982)))),
-                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 29392)))),
+                        // zig fmt: off
+                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 5651)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 23182)))),
+                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 25042)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 26518)))),
+                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 27982)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 29392)))),
                         @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 30900)))),
+                        // zig fmt: on
                     } ++ @as([1]u16, @splat(0)),
                     [7]u16{
-                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 19349)))),
-                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 22578)))),
-                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 24418)))),
-                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 25994)))),
-                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 27524)))),
-                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 29031)))),
+                        // zig fmt: off
+                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 19349)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 22578)))),
+                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 24418)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 25994)))),
+                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 27524)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 29031)))),
                         @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 30448)))),
+                        // zig fmt: on
                     } ++ @as([1]u16, @splat(0)),
                     [7]u16{
-                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 31028)))),
-                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 31270)))),
-                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 31504)))),
-                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 31705)))),
-                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 31927)))),
-                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 32153)))),
+                        // zig fmt: off
+                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 31028)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 31270)))),
+                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 31504)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 31705)))),
+                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 31927)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 32153)))),
                         @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 32392)))),
+                        // zig fmt: on
                     } ++ @as([1]u16, @splat(0)),
                 },
             },
@@ -2862,160 +2625,150 @@ pub const default_cdf: CdfDefaultContext = CdfDefaultContext{
                 },
                 [5][8]u16{
                     [4]u16{
-                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 22980)))),
-                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 25479)))),
-                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 27781)))),
-                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 29986)))),
+                        // zig fmt: off
+                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 22980)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 25479)))),
+                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 27781)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 29986)))),
+                        // zig fmt: on
                     } ++ @as([4]u16, @splat(0)),
                     [4]u16{
-                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 8413)))),
-                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 21408)))),
-                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 24859)))),
-                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 28874)))),
+                        // zig fmt: off
+                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 8413)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 21408)))),
+                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 24859)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 28874)))),
+                        // zig fmt: on
                     } ++ @as([4]u16, @splat(0)),
                     [4]u16{
-                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 2257)))),
-                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 29449)))),
-                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 30594)))),
-                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 31598)))),
+                        // zig fmt: off
+                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 2257)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 29449)))),
+                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 30594)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 31598)))),
+                        // zig fmt: on
                     } ++ @as([4]u16, @splat(0)),
                     [4]u16{
-                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 19189)))),
-                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 21202)))),
-                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 25915)))),
-                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 28620)))),
+                        // zig fmt: off
+                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 19189)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 21202)))),
+                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 25915)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 28620)))),
+                        // zig fmt: on
                     } ++ @as([4]u16, @splat(0)),
                     [4]u16{
-                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 31844)))),
-                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 32044)))),
-                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 32281)))),
-                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 32518)))),
+                        // zig fmt: off
+                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 31844)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 32044)))),
+                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 32281)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 32518)))),
+                        // zig fmt: on
                     } ++ @as([4]u16, @splat(0)),
                 },
                 [5][8]u16{
                     [5]u16{
-                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 22217)))),
-                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 24567)))),
-                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 26637)))),
-                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 28683)))),
+                        // zig fmt: off
+                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 22217)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 24567)))),
+                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 26637)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 28683)))),
                         @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 30548)))),
+                        // zig fmt: on
                     } ++ @as([3]u16, @splat(0)),
                     [5]u16{
-                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 7307)))),
-                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 16406)))),
-                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 19636)))),
-                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 24632)))),
+                        // zig fmt: off
+                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 7307)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 16406)))),
+                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 19636)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 24632)))),
                         @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 28424)))),
+                        // zig fmt: on
                     } ++ @as([3]u16, @splat(0)),
                     [5]u16{
-                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 4441)))),
-                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 25064)))),
-                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 26879)))),
-                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 28942)))),
+                        // zig fmt: off
+                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 4441)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 25064)))),
+                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 26879)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 28942)))),
                         @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 30919)))),
+                        // zig fmt: on
                     } ++ @as([3]u16, @splat(0)),
                     [5]u16{
-                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 17210)))),
-                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 20528)))),
-                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 23319)))),
-                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 26750)))),
+                        // zig fmt: off
+                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 17210)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 20528)))),
+                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 23319)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 26750)))),
                         @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 29582)))),
+                        // zig fmt: on
                     } ++ @as([3]u16, @splat(0)),
                     [5]u16{
-                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 30674)))),
-                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 30953)))),
-                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 31396)))),
-                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 31735)))),
+                        // zig fmt: off
+                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 30674)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 30953)))),
+                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 31396)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 31735)))),
                         @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 32207)))),
+                        // zig fmt: on
                     } ++ @as([3]u16, @splat(0)),
                 },
                 [5][8]u16{
                     [6]u16{
-                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 21239)))),
-                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 23168)))),
-                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 25044)))),
-                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 26962)))),
-                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 28705)))),
-                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 30506)))),
+                        // zig fmt: off
+                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 21239)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 23168)))),
+                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 25044)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 26962)))),
+                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 28705)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 30506)))),
+                        // zig fmt: on
                     } ++ @as([2]u16, @splat(0)),
                     [6]u16{
-                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 6545)))),
-                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 15012)))),
-                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 18004)))),
-                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 21817)))),
-                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 25503)))),
-                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 28701)))),
+                        // zig fmt: off
+                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 6545)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 15012)))),
+                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 18004)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 21817)))),
+                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 25503)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 28701)))),
+                        // zig fmt: on
                     } ++ @as([2]u16, @splat(0)),
                     [6]u16{
-                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 3448)))),
-                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 26295)))),
-                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 27437)))),
-                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 28704)))),
-                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 30126)))),
-                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 31442)))),
+                        // zig fmt: off
+                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 3448)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 26295)))),
+                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 27437)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 28704)))),
+                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 30126)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 31442)))),
+                        // zig fmt: on
                     } ++ @as([2]u16, @splat(0)),
                     [6]u16{
-                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 15889)))),
-                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 18323)))),
-                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 21704)))),
-                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 24698)))),
-                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 26976)))),
-                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 29690)))),
+                        // zig fmt: off
+                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 15889)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 18323)))),
+                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 21704)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 24698)))),
+                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 26976)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 29690)))),
+                        // zig fmt: on
                     } ++ @as([2]u16, @splat(0)),
                     [6]u16{
-                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 30988)))),
-                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 31204)))),
-                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 31479)))),
-                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 31734)))),
-                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 31983)))),
-                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 32325)))),
+                        // zig fmt: off
+                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 30988)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 31204)))),
+                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 31479)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 31734)))),
+                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 31983)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 32325)))),
+                        // zig fmt: on
                     } ++ @as([2]u16, @splat(0)),
                 },
                 [5][8]u16{
                     [7]u16{
-                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 21442)))),
-                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 23288)))),
-                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 24758)))),
-                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 26246)))),
-                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 27649)))),
-                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 28980)))),
+                        // zig fmt: off
+                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 21442)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 23288)))),
+                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 24758)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 26246)))),
+                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 27649)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 28980)))),
                         @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 30563)))),
+                        // zig fmt: on
                     } ++ @as([1]u16, @splat(0)),
                     [7]u16{
-                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 5863)))),
-                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 14933)))),
-                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 17552)))),
-                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 20668)))),
-                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 23683)))),
-                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 26411)))),
+                        // zig fmt: off
+                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 5863)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 14933)))),
+                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 17552)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 20668)))),
+                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 23683)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 26411)))),
                         @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 29273)))),
+                        // zig fmt: on
                     } ++ @as([1]u16, @splat(0)),
                     [7]u16{
-                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 3415)))),
-                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 25810)))),
-                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 26877)))),
-                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 27990)))),
-                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 29223)))),
-                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 30394)))),
+                        // zig fmt: off
+                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 3415)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 25810)))),
+                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 26877)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 27990)))),
+                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 29223)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 30394)))),
                         @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 31618)))),
+                        // zig fmt: on
                     } ++ @as([1]u16, @splat(0)),
                     [7]u16{
-                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 17965)))),
-                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 20084)))),
-                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 22232)))),
-                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 23974)))),
-                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 26274)))),
-                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 28402)))),
+                        // zig fmt: off
+                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 17965)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 20084)))),
+                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 22232)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 23974)))),
+                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 26274)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 28402)))),
                         @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 30390)))),
+                        // zig fmt: on
                     } ++ @as([1]u16, @splat(0)),
                     [7]u16{
-                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 31190)))),
-                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 31329)))),
-                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 31516)))),
-                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 31679)))),
-                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 31825)))),
-                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 32026)))),
+                        // zig fmt: off
+                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 31190)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 31329)))),
+                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 31516)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 31679)))),
+                        @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 31825)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 32026)))),
                         @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 32322)))),
+                        // zig fmt: on
                     } ++ @as([1]u16, @splat(0)),
                 },
             },
@@ -3381,289 +3134,220 @@ pub const default_cdf: CdfDefaultContext = CdfDefaultContext{
         } ++ @as([1]u16, @splat(0)),
         .y_mode = [4][16]u16{
             [12]u16{
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 22801)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 23489)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 24293)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 24756)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 25601)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 26123)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 26606)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 27418)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 27945)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 29228)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 29685)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 30349)))),
+                // zig fmt: off
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 22801)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 23489)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 24293)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 24756)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 25601)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 26123)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 26606)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 27418)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 27945)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 29228)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 29685)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 30349)))),
+                // zig fmt: on
             } ++ @as([4]u16, @splat(0)),
             [12]u16{
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 18673)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 19845)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 22631)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 23318)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 23950)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 24649)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 25527)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 27364)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 28152)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 29701)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 29984)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 30852)))),
+                // zig fmt: off
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 18673)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 19845)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 22631)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 23318)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 23950)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 24649)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 25527)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 27364)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 28152)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 29701)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 29984)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 30852)))),
+                // zig fmt: on
             } ++ @as([4]u16, @splat(0)),
             [12]u16{
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 19770)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 20979)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 23396)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 23939)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 24241)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 24654)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 25136)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 27073)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 27830)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 29360)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 29730)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 30659)))),
+                // zig fmt: off
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 19770)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 20979)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 23396)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 23939)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 24241)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 24654)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 25136)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 27073)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 27830)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 29360)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 29730)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 30659)))),
+                // zig fmt: on
             } ++ @as([4]u16, @splat(0)),
             [12]u16{
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 20155)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 21301)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 22838)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 23178)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 23261)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 23533)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 23703)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 24804)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 25352)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 26575)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 27016)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 28049)))),
+                // zig fmt: off
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 20155)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 21301)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 22838)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 23178)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 23261)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 23533)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 23703)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 24804)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 25352)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 26575)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 27016)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 28049)))),
+                // zig fmt: on
             } ++ @as([4]u16, @splat(0)),
         },
         .wedge_idx = [9][16]u16{
             [15]u16{
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 2438)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 4440)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 6599)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 8663)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 11005)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 12874)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 15751)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 18094)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 20359)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 22362)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 24127)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 25702)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 27752)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 29450)))),
+                // zig fmt: off
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 2438)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 4440)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 6599)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 8663)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 11005)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 12874)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 15751)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 18094)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 20359)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 22362)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 24127)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 25702)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 27752)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 29450)))),
                 @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 31171)))),
+                // zig fmt: on
             } ++ @as([1]u16, @splat(0)),
             [15]u16{
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 806)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 3266)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 6005)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 6738)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 7218)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 7367)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 7771)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 14588)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 16323)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 17367)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 18452)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 19422)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 22839)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 26127)))),
+                // zig fmt: off
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 806)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 3266)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 6005)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 6738)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 7218)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 7367)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 7771)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 14588)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 16323)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 17367)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 18452)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 19422)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 22839)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 26127)))),
                 @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 29629)))),
+                // zig fmt: on
             } ++ @as([1]u16, @splat(0)),
             [15]u16{
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 2779)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 3738)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 4683)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 7213)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 7775)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 8017)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 8655)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 14357)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 17939)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 21332)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 24520)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 27470)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 29456)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 30529)))),
+                // zig fmt: off
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 2779)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 3738)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 4683)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 7213)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 7775)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 8017)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 8655)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 14357)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 17939)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 21332)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 24520)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 27470)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 29456)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 30529)))),
                 @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 31656)))),
+                // zig fmt: on
             } ++ @as([1]u16, @splat(0)),
             [15]u16{
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 1684)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 3625)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 5675)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 7108)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 9302)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 11274)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 14429)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 17144)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 19163)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 20961)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 22884)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 24471)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 26719)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 28714)))),
+                // zig fmt: off
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 1684)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 3625)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 5675)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 7108)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 9302)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 11274)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 14429)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 17144)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 19163)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 20961)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 22884)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 24471)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 26719)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 28714)))),
                 @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 30877)))),
+                // zig fmt: on
             } ++ @as([1]u16, @splat(0)),
             [15]u16{
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 1142)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 3491)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 6277)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 7314)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 8089)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 8355)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 9023)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 13624)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 15369)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 16730)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 18114)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 19313)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 22521)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 26012)))),
+                // zig fmt: off
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 1142)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 3491)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 6277)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 7314)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 8089)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 8355)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 9023)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 13624)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 15369)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 16730)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 18114)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 19313)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 22521)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 26012)))),
                 @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 29550)))),
+                // zig fmt: on
             } ++ @as([1]u16, @splat(0)),
             [15]u16{
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 2742)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 4195)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 5727)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 8035)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 8980)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 9336)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 10146)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 14124)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 17270)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 20533)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 23434)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 25972)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 27944)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 29570)))),
+                // zig fmt: off
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 2742)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 4195)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 5727)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 8035)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 8980)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 9336)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 10146)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 14124)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 17270)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 20533)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 23434)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 25972)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 27944)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 29570)))),
                 @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 31416)))),
+                // zig fmt: on
             } ++ @as([1]u16, @splat(0)),
             [15]u16{
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 1727)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 3948)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 6101)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 7796)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 9841)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 12344)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 15766)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 18944)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 20638)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 22038)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 23963)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 25311)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 26988)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 28766)))),
+                // zig fmt: off
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 1727)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 3948)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 6101)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 7796)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 9841)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 12344)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 15766)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 18944)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 20638)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 22038)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 23963)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 25311)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 26988)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 28766)))),
                 @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 31012)))),
+                // zig fmt: on
             } ++ @as([1]u16, @splat(0)),
             [15]u16{
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 154)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 987)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 1925)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 2051)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 2088)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 2111)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 2151)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 23033)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 23703)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 24284)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 24985)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 25684)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 27259)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 28883)))),
+                // zig fmt: off
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 154)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 987)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 1925)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 2051)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 2088)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 2111)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 2151)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 23033)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 23703)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 24284)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 24985)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 25684)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 27259)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 28883)))),
                 @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 30911)))),
+                // zig fmt: on
             } ++ @as([1]u16, @splat(0)),
             [15]u16{
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 1135)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 1322)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 1493)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 2635)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 2696)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 2737)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 2770)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 21016)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 22935)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 25057)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 27251)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 29173)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 30089)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 30960)))),
+                // zig fmt: off
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 1135)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 1322)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 1493)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 2635)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 2696)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 2737)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 2770)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 21016)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 22935)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 25057)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 27251)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 29173)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 30089)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 30960)))),
                 @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 31933)))),
+                // zig fmt: on
             } ++ @as([1]u16, @splat(0)),
         },
         .comp_inter_mode = [8][8]u16{
             [7]u16{
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 7760)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 13823)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 15808)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 17641)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 19156)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 20666)))),
+                // zig fmt: off
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 7760)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 13823)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 15808)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 17641)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 19156)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 20666)))),
                 @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 26891)))),
+                // zig fmt: on
             } ++ @as([1]u16, @splat(0)),
             [7]u16{
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 10730)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 19452)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 21145)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 22749)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 24039)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 25131)))),
+                // zig fmt: off
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 10730)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 19452)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 21145)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 22749)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 24039)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 25131)))),
                 @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 28724)))),
+                // zig fmt: on
             } ++ @as([1]u16, @splat(0)),
             [7]u16{
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 10664)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 20221)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 21588)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 22906)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 24295)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 25387)))),
+                // zig fmt: off
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 10664)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 20221)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 21588)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 22906)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 24295)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 25387)))),
                 @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 28436)))),
+                // zig fmt: on
             } ++ @as([1]u16, @splat(0)),
             [7]u16{
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 13298)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 16984)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 20471)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 24182)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 25067)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 25736)))),
+                // zig fmt: off
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 13298)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 16984)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 20471)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 24182)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 25067)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 25736)))),
                 @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 26422)))),
+                // zig fmt: on
             } ++ @as([1]u16, @splat(0)),
             [7]u16{
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 18904)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 23325)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 25242)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 27432)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 27898)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 28258)))),
+                // zig fmt: off
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 18904)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 23325)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 25242)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 27432)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 27898)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 28258)))),
                 @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 30758)))),
+                // zig fmt: on
             } ++ @as([1]u16, @splat(0)),
             [7]u16{
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 10725)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 17454)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 20124)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 22820)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 24195)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 25168)))),
+                // zig fmt: off
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 10725)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 17454)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 20124)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 22820)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 24195)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 25168)))),
                 @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 26046)))),
+                // zig fmt: on
             } ++ @as([1]u16, @splat(0)),
             [7]u16{
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 17125)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 24273)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 25814)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 27492)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 28214)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 28704)))),
+                // zig fmt: off
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 17125)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 24273)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 25814)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 27492)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 28214)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 28704)))),
                 @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 30592)))),
+                // zig fmt: on
             } ++ @as([1]u16, @splat(0)),
             [7]u16{
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 13046)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 23214)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 24505)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 25942)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 27435)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 28442)))),
+                // zig fmt: off
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 13046)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 23214)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 24505)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 25942)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 27435)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 28442)))),
                 @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 29330)))),
+                // zig fmt: on
             } ++ @as([1]u16, @splat(0)),
         },
         .filter = [2][8][4]u16{
@@ -4284,16 +3968,13 @@ pub const default_cdf: CdfDefaultContext = CdfDefaultContext{
     .mv = struct_unnamed_61{
         .comp = CdfMvComponent{
             .classes = [10]u16{
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 28672)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 30976)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 31858)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 32320)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 32551)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 32656)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 32740)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 32757)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 32762)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 32767)))),
+                // zig fmt: off
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 28672)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 30976)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 31858)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 32320)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 32551)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 32656)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 32740)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 32757)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 32762)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 32767)))),
+                // zig fmt: on
             } ++ @as([6]u16, @splat(0)),
             .sign = [1]u16{
                 @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 16384)))),
@@ -4366,362 +4047,262 @@ pub const default_cdf: CdfDefaultContext = CdfDefaultContext{
     .kfym = [5][5][16]u16{
         [5][16]u16{
             [12]u16{
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 15588)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 17027)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 19338)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 20218)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 20682)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 21110)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 21825)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 23244)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 24189)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 28165)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 29093)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 30466)))),
+                // zig fmt: off
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 15588)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 17027)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 19338)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 20218)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 20682)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 21110)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 21825)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 23244)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 24189)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 28165)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 29093)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 30466)))),
+                // zig fmt: on
             } ++ @as([4]u16, @splat(0)),
             [12]u16{
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 12016)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 18066)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 19516)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 20303)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 20719)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 21444)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 21888)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 23032)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 24434)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 28658)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 30172)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 31409)))),
+                // zig fmt: off
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 12016)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 18066)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 19516)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 20303)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 20719)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 21444)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 21888)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 23032)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 24434)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 28658)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 30172)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 31409)))),
+                // zig fmt: on
             } ++ @as([4]u16, @splat(0)),
             [12]u16{
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 10052)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 10771)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 22296)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 22788)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 23055)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 23239)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 24133)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 25620)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 26160)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 29336)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 29929)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 31567)))),
+                // zig fmt: off
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 10052)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 10771)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 22296)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 22788)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 23055)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 23239)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 24133)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 25620)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 26160)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 29336)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 29929)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 31567)))),
+                // zig fmt: on
             } ++ @as([4]u16, @splat(0)),
             [12]u16{
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 14091)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 15406)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 16442)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 18808)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 19136)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 19546)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 19998)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 22096)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 24746)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 29585)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 30958)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 32462)))),
+                // zig fmt: off
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 14091)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 15406)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 16442)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 18808)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 19136)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 19546)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 19998)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 22096)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 24746)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 29585)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 30958)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 32462)))),
+                // zig fmt: on
             } ++ @as([4]u16, @splat(0)),
             [12]u16{
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 12122)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 13265)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 15603)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 16501)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 18609)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 20033)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 22391)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 25583)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 26437)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 30261)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 31073)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 32475)))),
+                // zig fmt: off
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 12122)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 13265)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 15603)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 16501)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 18609)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 20033)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 22391)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 25583)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 26437)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 30261)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 31073)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 32475)))),
+                // zig fmt: on
             } ++ @as([4]u16, @splat(0)),
         },
         [5][16]u16{
             [12]u16{
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 10023)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 19585)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 20848)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 21440)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 21832)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 22760)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 23089)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 24023)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 25381)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 29014)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 30482)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 31436)))),
+                // zig fmt: off
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 10023)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 19585)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 20848)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 21440)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 21832)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 22760)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 23089)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 24023)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 25381)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 29014)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 30482)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 31436)))),
+                // zig fmt: on
             } ++ @as([4]u16, @splat(0)),
             [12]u16{
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 5983)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 24099)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 24560)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 24886)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 25066)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 25795)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 25913)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 26423)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 27610)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 29905)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 31276)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 31794)))),
+                // zig fmt: off
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 5983)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 24099)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 24560)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 24886)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 25066)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 25795)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 25913)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 26423)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 27610)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 29905)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 31276)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 31794)))),
+                // zig fmt: on
             } ++ @as([4]u16, @splat(0)),
             [12]u16{
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 7444)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 12781)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 20177)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 20728)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 21077)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 21607)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 22170)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 23405)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 24469)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 27915)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 29090)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 30492)))),
+                // zig fmt: off
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 7444)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 12781)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 20177)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 20728)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 21077)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 21607)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 22170)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 23405)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 24469)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 27915)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 29090)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 30492)))),
+                // zig fmt: on
             } ++ @as([4]u16, @splat(0)),
             [12]u16{
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 8537)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 14689)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 15432)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 17087)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 17408)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 18172)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 18408)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 19825)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 24649)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 29153)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 31096)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 32210)))),
+                // zig fmt: off
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 8537)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 14689)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 15432)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 17087)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 17408)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 18172)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 18408)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 19825)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 24649)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 29153)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 31096)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 32210)))),
+                // zig fmt: on
             } ++ @as([4]u16, @splat(0)),
             [12]u16{
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 7543)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 14231)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 15496)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 16195)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 17905)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 20717)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 21984)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 24516)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 26001)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 29675)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 30981)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 31994)))),
+                // zig fmt: off
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 7543)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 14231)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 15496)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 16195)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 17905)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 20717)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 21984)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 24516)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 26001)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 29675)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 30981)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 31994)))),
+                // zig fmt: on
             } ++ @as([4]u16, @splat(0)),
         },
         [5][16]u16{
             [12]u16{
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 12613)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 13591)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 21383)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 22004)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 22312)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 22577)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 23401)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 25055)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 25729)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 29538)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 30305)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 32077)))),
+                // zig fmt: off
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 12613)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 13591)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 21383)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 22004)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 22312)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 22577)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 23401)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 25055)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 25729)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 29538)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 30305)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 32077)))),
+                // zig fmt: on
             } ++ @as([4]u16, @splat(0)),
             [12]u16{
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 9687)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 13470)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 18506)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 19230)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 19604)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 20147)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 20695)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 22062)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 23219)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 27743)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 29211)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 30907)))),
+                // zig fmt: off
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 9687)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 13470)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 18506)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 19230)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 19604)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 20147)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 20695)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 22062)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 23219)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 27743)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 29211)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 30907)))),
+                // zig fmt: on
             } ++ @as([4]u16, @splat(0)),
             [12]u16{
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 6183)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 6505)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 26024)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 26252)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 26366)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 26434)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 27082)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 28354)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 28555)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 30467)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 30794)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 32086)))),
+                // zig fmt: off
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 6183)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 6505)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 26024)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 26252)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 26366)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 26434)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 27082)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 28354)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 28555)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 30467)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 30794)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 32086)))),
+                // zig fmt: on
             } ++ @as([4]u16, @splat(0)),
             [12]u16{
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 10718)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 11734)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 14954)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 17224)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 17565)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 17924)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 18561)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 21523)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 23878)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 28975)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 30287)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 32252)))),
+                // zig fmt: off
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 10718)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 11734)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 14954)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 17224)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 17565)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 17924)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 18561)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 21523)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 23878)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 28975)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 30287)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 32252)))),
+                // zig fmt: on
             } ++ @as([4]u16, @splat(0)),
             [12]u16{
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 9194)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 9858)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 16501)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 17263)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 18424)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 19171)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 21563)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 25961)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 26561)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 30072)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 30737)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 32463)))),
+                // zig fmt: off
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 9194)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 9858)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 16501)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 17263)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 18424)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 19171)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 21563)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 25961)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 26561)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 30072)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 30737)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 32463)))),
+                // zig fmt: on
             } ++ @as([4]u16, @splat(0)),
         },
         [5][16]u16{
             [12]u16{
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 12602)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 14399)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 15488)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 18381)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 18778)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 19315)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 19724)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 21419)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 25060)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 29696)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 30917)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 32409)))),
+                // zig fmt: off
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 12602)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 14399)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 15488)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 18381)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 18778)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 19315)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 19724)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 21419)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 25060)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 29696)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 30917)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 32409)))),
+                // zig fmt: on
             } ++ @as([4]u16, @splat(0)),
             [12]u16{
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 8203)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 13821)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 14524)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 17105)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 17439)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 18131)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 18404)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 19468)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 25225)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 29485)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 31158)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 32342)))),
+                // zig fmt: off
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 8203)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 13821)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 14524)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 17105)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 17439)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 18131)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 18404)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 19468)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 25225)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 29485)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 31158)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 32342)))),
+                // zig fmt: on
             } ++ @as([4]u16, @splat(0)),
             [12]u16{
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 8451)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 9731)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 15004)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 17643)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 18012)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 18425)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 19070)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 21538)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 24605)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 29118)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 30078)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 32018)))),
+                // zig fmt: off
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 8451)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 9731)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 15004)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 17643)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 18012)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 18425)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 19070)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 21538)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 24605)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 29118)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 30078)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 32018)))),
+                // zig fmt: on
             } ++ @as([4]u16, @splat(0)),
             [12]u16{
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 7714)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 9048)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 9516)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 16667)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 16817)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 16994)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 17153)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 18767)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 26743)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 30389)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 31536)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 32528)))),
+                // zig fmt: off
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 7714)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 9048)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 9516)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 16667)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 16817)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 16994)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 17153)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 18767)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 26743)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 30389)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 31536)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 32528)))),
+                // zig fmt: on
             } ++ @as([4]u16, @splat(0)),
             [12]u16{
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 8843)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 10280)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 11496)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 15317)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 16652)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 17943)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 19108)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 22718)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 25769)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 29953)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 30983)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 32485)))),
+                // zig fmt: off
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 8843)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 10280)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 11496)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 15317)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 16652)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 17943)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 19108)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 22718)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 25769)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 29953)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 30983)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 32485)))),
+                // zig fmt: on
             } ++ @as([4]u16, @splat(0)),
         },
         [5][16]u16{
             [12]u16{
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 12578)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 13671)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 15979)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 16834)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 19075)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 20913)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 22989)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 25449)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 26219)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 30214)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 31150)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 32477)))),
+                // zig fmt: off
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 12578)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 13671)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 15979)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 16834)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 19075)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 20913)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 22989)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 25449)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 26219)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 30214)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 31150)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 32477)))),
+                // zig fmt: on
             } ++ @as([4]u16, @splat(0)),
             [12]u16{
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 9563)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 13626)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 15080)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 15892)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 17756)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 20863)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 22207)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 24236)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 25380)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 29653)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 31143)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 32277)))),
+                // zig fmt: off
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 9563)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 13626)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 15080)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 15892)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 17756)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 20863)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 22207)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 24236)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 25380)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 29653)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 31143)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 32277)))),
+                // zig fmt: on
             } ++ @as([4]u16, @splat(0)),
             [12]u16{
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 8356)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 8901)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 17616)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 18256)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 19350)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 20106)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 22598)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 25947)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 26466)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 29900)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 30523)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 32261)))),
+                // zig fmt: off
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 8356)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 8901)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 17616)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 18256)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 19350)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 20106)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 22598)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 25947)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 26466)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 29900)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 30523)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 32261)))),
+                // zig fmt: on
             } ++ @as([4]u16, @splat(0)),
             [12]u16{
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 10835)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 11815)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 13124)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 16042)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 17018)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 18039)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 18947)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 22753)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 24615)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 29489)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 30883)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 32482)))),
+                // zig fmt: off
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 10835)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 11815)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 13124)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 16042)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 17018)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 18039)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 18947)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 22753)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 24615)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 29489)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 30883)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 32482)))),
+                // zig fmt: on
             } ++ @as([4]u16, @splat(0)),
             [12]u16{
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 7618)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 8288)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 9859)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 10509)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 15386)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 18657)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 22903)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 28776)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 29180)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 31355)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 31802)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 32593)))),
+                // zig fmt: off
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 7618)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 8288)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 9859)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 10509)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 15386)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 18657)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 22903)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 28776)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 29180)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 31355)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 31802)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 32593)))),
+                // zig fmt: on
             } ++ @as([4]u16, @splat(0)),
         },
     },
@@ -4731,241 +4312,215 @@ pub const default_coef_cdf: [4]CdfCoefContext = [4]CdfCoefContext{
         .eob_bin_16 = [2][2][8]u16{
             [2][8]u16{
                 [4]u16{
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 840)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 1039)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 1980)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 4895)))),
+                    // zig fmt: off
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 840)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 1039)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 1980)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 4895)))),
+                    // zig fmt: on
                 } ++ @as([4]u16, @splat(0)),
                 [4]u16{
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 370)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 671)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 1883)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 4471)))),
+                    // zig fmt: off
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 370)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 671)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 1883)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 4471)))),
+                    // zig fmt: on
                 } ++ @as([4]u16, @splat(0)),
             },
             [2][8]u16{
                 [4]u16{
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 3247)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 4950)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 9688)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 14563)))),
+                    // zig fmt: off
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 3247)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 4950)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 9688)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 14563)))),
+                    // zig fmt: on
                 } ++ @as([4]u16, @splat(0)),
                 [4]u16{
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 1904)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 3354)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 7763)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 14647)))),
+                    // zig fmt: off
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 1904)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 3354)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 7763)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 14647)))),
+                    // zig fmt: on
                 } ++ @as([4]u16, @splat(0)),
             },
         },
         .eob_bin_32 = [2][2][8]u16{
             [2][8]u16{
                 [5]u16{
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 400)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 520)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 977)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 2102)))),
+                    // zig fmt: off
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 400)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 520)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 977)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 2102)))),
                     @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 6542)))),
+                    // zig fmt: on
                 } ++ @as([3]u16, @splat(0)),
                 [5]u16{
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 210)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 405)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 1315)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 3326)))),
+                    // zig fmt: off
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 210)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 405)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 1315)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 3326)))),
                     @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 7537)))),
+                    // zig fmt: on
                 } ++ @as([3]u16, @splat(0)),
             },
             [2][8]u16{
                 [5]u16{
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 2636)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 4273)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 7588)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 11794)))),
+                    // zig fmt: off
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 2636)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 4273)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 7588)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 11794)))),
                     @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 20401)))),
+                    // zig fmt: on
                 } ++ @as([3]u16, @splat(0)),
                 [5]u16{
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 1786)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 3179)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 6902)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 11357)))),
+                    // zig fmt: off
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 1786)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 3179)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 6902)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 11357)))),
                     @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 19054)))),
+                    // zig fmt: on
                 } ++ @as([3]u16, @splat(0)),
             },
         },
         .eob_bin_64 = [2][2][8]u16{
             [2][8]u16{
                 [6]u16{
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 329)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 498)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 1101)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 1784)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 3265)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 7758)))),
+                    // zig fmt: off
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 329)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 498)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 1101)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 1784)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 3265)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 7758)))),
+                    // zig fmt: on
                 } ++ @as([2]u16, @splat(0)),
                 [6]u16{
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 335)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 730)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 1459)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 5494)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 8755)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 12997)))),
+                    // zig fmt: off
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 335)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 730)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 1459)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 5494)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 8755)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 12997)))),
+                    // zig fmt: on
                 } ++ @as([2]u16, @splat(0)),
             },
             [2][8]u16{
                 [6]u16{
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 3505)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 5304)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 10086)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 13814)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 17684)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 23370)))),
+                    // zig fmt: off
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 3505)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 5304)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 10086)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 13814)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 17684)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 23370)))),
+                    // zig fmt: on
                 } ++ @as([2]u16, @splat(0)),
                 [6]u16{
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 1563)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 2700)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 4876)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 10911)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 14706)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 22480)))),
+                    // zig fmt: off
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 1563)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 2700)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 4876)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 10911)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 14706)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 22480)))),
+                    // zig fmt: on
                 } ++ @as([2]u16, @splat(0)),
             },
         },
         .eob_bin_128 = [2][2][8]u16{
             [2][8]u16{
                 [7]u16{
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 219)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 482)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 1140)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 2091)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 3680)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 6028)))),
+                    // zig fmt: off
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 219)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 482)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 1140)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 2091)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 3680)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 6028)))),
                     @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 12586)))),
+                    // zig fmt: on
                 } ++ @as([1]u16, @splat(0)),
                 [7]u16{
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 371)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 699)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 1254)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 4830)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 9479)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 12562)))),
+                    // zig fmt: off
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 371)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 699)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 1254)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 4830)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 9479)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 12562)))),
                     @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 17497)))),
+                    // zig fmt: on
                 } ++ @as([1]u16, @splat(0)),
             },
             [2][8]u16{
                 [7]u16{
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 5245)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 7456)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 12880)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 15852)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 20033)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 23932)))),
+                    // zig fmt: off
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 5245)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 7456)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 12880)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 15852)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 20033)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 23932)))),
                     @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 27608)))),
+                    // zig fmt: on
                 } ++ @as([1]u16, @splat(0)),
                 [7]u16{
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 2054)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 3472)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 5869)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 14232)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 18242)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 20590)))),
+                    // zig fmt: off
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 2054)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 3472)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 5869)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 14232)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 18242)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 20590)))),
                     @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 26752)))),
+                    // zig fmt: on
                 } ++ @as([1]u16, @splat(0)),
             },
         },
         .eob_bin_256 = [2][2][16]u16{
             [2][16]u16{
                 [8]u16{
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 310)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 584)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 1887)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 3589)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 6168)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 8611)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 11352)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 15652)))),
+                    // zig fmt: off
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 310)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 584)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 1887)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 3589)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 6168)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 8611)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 11352)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 15652)))),
+                    // zig fmt: on
                 } ++ @as([8]u16, @splat(0)),
                 [8]u16{
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 998)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 1850)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 2998)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 5604)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 17341)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 19888)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 22899)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 25583)))),
+                    // zig fmt: off
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 998)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 1850)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 2998)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 5604)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 17341)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 19888)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 22899)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 25583)))),
+                    // zig fmt: on
                 } ++ @as([8]u16, @splat(0)),
             },
             [2][16]u16{
                 [8]u16{
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 2520)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 3240)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 5952)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 8870)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 12577)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 17558)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 19954)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 24168)))),
+                    // zig fmt: off
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 2520)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 3240)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 5952)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 8870)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 12577)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 17558)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 19954)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 24168)))),
+                    // zig fmt: on
                 } ++ @as([8]u16, @splat(0)),
                 [8]u16{
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 2203)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 4130)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 7435)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 10739)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 20652)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 23681)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 25609)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 27261)))),
+                    // zig fmt: off
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 2203)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 4130)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 7435)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 10739)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 20652)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 23681)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 25609)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 27261)))),
+                    // zig fmt: on
                 } ++ @as([8]u16, @splat(0)),
             },
         },
         .eob_bin_512 = [2][16]u16{
             [9]u16{
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 641)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 983)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 3707)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 5430)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 10234)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 14958)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 18788)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 23412)))),
+                // zig fmt: off
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 641)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 983)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 3707)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 5430)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 10234)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 14958)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 18788)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 23412)))),
                 @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 26061)))),
+                // zig fmt: on
             } ++ @as([7]u16, @splat(0)),
             [9]u16{
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 5095)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 6446)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 9996)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 13354)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 16017)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 17986)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 20919)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 26129)))),
+                // zig fmt: off
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 5095)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 6446)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 9996)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 13354)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 16017)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 17986)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 20919)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 26129)))),
                 @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 29140)))),
+                // zig fmt: on
             } ++ @as([7]u16, @splat(0)),
         },
         .eob_bin_1024 = [2][16]u16{
             [10]u16{
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 393)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 421)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 751)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 1623)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 3160)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 6352)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 13345)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 18047)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 22571)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 25830)))),
+                // zig fmt: off
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 393)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 421)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 751)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 1623)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 3160)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 6352)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 13345)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 18047)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 22571)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 25830)))),
+                // zig fmt: on
             } ++ @as([6]u16, @splat(0)),
             [10]u16{
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 1865)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 1988)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 2930)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 4242)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 10533)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 16538)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 21354)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 27255)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 28546)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 31784)))),
+                // zig fmt: off
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 1865)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 1988)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 2930)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 4242)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 10533)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 16538)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 21354)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 27255)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 28546)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 31784)))),
+                // zig fmt: on
             } ++ @as([6]u16, @splat(0)),
         },
         .eob_base_tok = [5][2][4][4]u16{
@@ -8706,241 +8261,215 @@ pub const default_coef_cdf: [4]CdfCoefContext = [4]CdfCoefContext{
         .eob_bin_16 = [2][2][8]u16{
             [2][8]u16{
                 [4]u16{
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 2125)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 2551)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 5165)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 8946)))),
+                    // zig fmt: off
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 2125)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 2551)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 5165)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 8946)))),
+                    // zig fmt: on
                 } ++ @as([4]u16, @splat(0)),
                 [4]u16{
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 513)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 765)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 1859)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 6339)))),
+                    // zig fmt: off
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 513)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 765)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 1859)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 6339)))),
+                    // zig fmt: on
                 } ++ @as([4]u16, @splat(0)),
             },
             [2][8]u16{
                 [4]u16{
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 7637)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 9498)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 14259)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 19108)))),
+                    // zig fmt: off
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 7637)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 9498)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 14259)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 19108)))),
+                    // zig fmt: on
                 } ++ @as([4]u16, @splat(0)),
                 [4]u16{
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 2497)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 4096)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 8866)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 16993)))),
+                    // zig fmt: off
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 2497)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 4096)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 8866)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 16993)))),
+                    // zig fmt: on
                 } ++ @as([4]u16, @splat(0)),
             },
         },
         .eob_bin_32 = [2][2][8]u16{
             [2][8]u16{
                 [5]u16{
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 989)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 1249)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 2019)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 4151)))),
+                    // zig fmt: off
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 989)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 1249)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 2019)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 4151)))),
                     @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 10785)))),
+                    // zig fmt: on
                 } ++ @as([3]u16, @splat(0)),
                 [5]u16{
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 313)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 441)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 1099)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 2917)))),
+                    // zig fmt: off
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 313)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 441)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 1099)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 2917)))),
                     @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 8562)))),
+                    // zig fmt: on
                 } ++ @as([3]u16, @splat(0)),
             },
             [2][8]u16{
                 [5]u16{
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 8394)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 10352)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 13932)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 18855)))),
+                    // zig fmt: off
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 8394)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 10352)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 13932)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 18855)))),
                     @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 26014)))),
+                    // zig fmt: on
                 } ++ @as([3]u16, @splat(0)),
                 [5]u16{
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 2578)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 4124)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 8181)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 13670)))),
+                    // zig fmt: off
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 2578)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 4124)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 8181)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 13670)))),
                     @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 24234)))),
+                    // zig fmt: on
                 } ++ @as([3]u16, @splat(0)),
             },
         },
         .eob_bin_64 = [2][2][8]u16{
             [2][8]u16{
                 [6]u16{
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 1260)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 1446)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 2253)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 3712)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 6652)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 13369)))),
+                    // zig fmt: off
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 1260)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 1446)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 2253)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 3712)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 6652)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 13369)))),
+                    // zig fmt: on
                 } ++ @as([2]u16, @splat(0)),
                 [6]u16{
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 401)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 605)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 1029)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 2563)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 5845)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 12626)))),
+                    // zig fmt: off
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 401)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 605)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 1029)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 2563)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 5845)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 12626)))),
+                    // zig fmt: on
                 } ++ @as([2]u16, @splat(0)),
             },
             [2][8]u16{
                 [6]u16{
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 8609)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 10612)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 14624)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 18714)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 22614)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 29024)))),
+                    // zig fmt: off
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 8609)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 10612)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 14624)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 18714)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 22614)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 29024)))),
+                    // zig fmt: on
                 } ++ @as([2]u16, @splat(0)),
                 [6]u16{
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 1923)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 3127)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 5867)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 9703)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 14277)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 27100)))),
+                    // zig fmt: off
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 1923)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 3127)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 5867)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 9703)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 14277)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 27100)))),
+                    // zig fmt: on
                 } ++ @as([2]u16, @splat(0)),
             },
         },
         .eob_bin_128 = [2][2][8]u16{
             [2][8]u16{
                 [7]u16{
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 685)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 933)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 1488)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 2714)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 4766)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 8562)))),
+                    // zig fmt: off
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 685)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 933)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 1488)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 2714)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 4766)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 8562)))),
                     @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 19254)))),
+                    // zig fmt: on
                 } ++ @as([1]u16, @splat(0)),
                 [7]u16{
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 217)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 352)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 618)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 2303)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 5261)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 9969)))),
+                    // zig fmt: off
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 217)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 352)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 618)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 2303)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 5261)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 9969)))),
                     @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 17472)))),
+                    // zig fmt: on
                 } ++ @as([1]u16, @splat(0)),
             },
             [2][8]u16{
                 [7]u16{
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 8045)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 11200)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 15497)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 19595)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 23948)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 27408)))),
+                    // zig fmt: off
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 8045)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 11200)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 15497)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 19595)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 23948)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 27408)))),
                     @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 30938)))),
+                    // zig fmt: on
                 } ++ @as([1]u16, @splat(0)),
                 [7]u16{
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 2310)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 4160)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 7471)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 14997)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 17931)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 20768)))),
+                    // zig fmt: off
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 2310)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 4160)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 7471)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 14997)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 17931)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 20768)))),
                     @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 30240)))),
+                    // zig fmt: on
                 } ++ @as([1]u16, @splat(0)),
             },
         },
         .eob_bin_256 = [2][2][16]u16{
             [2][16]u16{
                 [8]u16{
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 1448)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 2109)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 4151)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 6263)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 9329)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 13260)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 17944)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 23300)))),
+                    // zig fmt: off
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 1448)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 2109)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 4151)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 6263)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 9329)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 13260)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 17944)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 23300)))),
+                    // zig fmt: on
                 } ++ @as([8]u16, @splat(0)),
                 [8]u16{
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 399)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 1019)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 1749)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 3038)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 10444)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 15546)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 22739)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 27294)))),
+                    // zig fmt: off
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 399)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 1019)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 1749)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 3038)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 10444)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 15546)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 22739)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 27294)))),
+                    // zig fmt: on
                 } ++ @as([8]u16, @splat(0)),
             },
             [2][16]u16{
                 [8]u16{
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 6402)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 8148)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 12623)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 15072)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 18728)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 22847)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 26447)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 29377)))),
+                    // zig fmt: off
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 6402)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 8148)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 12623)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 15072)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 18728)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 22847)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 26447)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 29377)))),
+                    // zig fmt: on
                 } ++ @as([8]u16, @splat(0)),
                 [8]u16{
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 1674)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 3252)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 5734)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 10159)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 22397)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 23802)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 24821)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 30940)))),
+                    // zig fmt: off
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 1674)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 3252)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 5734)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 10159)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 22397)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 23802)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 24821)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 30940)))),
+                    // zig fmt: on
                 } ++ @as([8]u16, @splat(0)),
             },
         },
         .eob_bin_512 = [2][16]u16{
             [9]u16{
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 1230)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 2278)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 5035)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 7776)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 11871)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 15346)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 19590)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 24584)))),
+                // zig fmt: off
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 1230)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 2278)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 5035)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 7776)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 11871)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 15346)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 19590)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 24584)))),
                 @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 28749)))),
+                // zig fmt: on
             } ++ @as([7]u16, @splat(0)),
             [9]u16{
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 7265)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 9979)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 15819)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 19250)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 21780)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 23846)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 26478)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 28396)))),
+                // zig fmt: off
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 7265)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 9979)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 15819)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 19250)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 21780)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 23846)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 26478)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 28396)))),
                 @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 31811)))),
+                // zig fmt: on
             } ++ @as([7]u16, @splat(0)),
         },
         .eob_bin_1024 = [2][16]u16{
             [10]u16{
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 696)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 948)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 3145)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 5702)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 9706)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 13217)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 17851)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 21856)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 25692)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 28034)))),
+                // zig fmt: off
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 696)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 948)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 3145)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 5702)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 9706)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 13217)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 17851)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 21856)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 25692)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 28034)))),
+                // zig fmt: on
             } ++ @as([6]u16, @splat(0)),
             [10]u16{
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 2672)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 3591)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 9330)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 17084)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 22725)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 24284)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 26527)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 28027)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 28377)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 30876)))),
+                // zig fmt: off
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 2672)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 3591)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 9330)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 17084)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 22725)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 24284)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 26527)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 28027)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 28377)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 30876)))),
+                // zig fmt: on
             } ++ @as([6]u16, @splat(0)),
         },
         .eob_base_tok = [5][2][4][4]u16{
@@ -12681,241 +12210,215 @@ pub const default_coef_cdf: [4]CdfCoefContext = [4]CdfCoefContext{
         .eob_bin_16 = [2][2][8]u16{
             [2][8]u16{
                 [4]u16{
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 4016)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 4897)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 8881)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 14968)))),
+                    // zig fmt: off
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 4016)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 4897)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 8881)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 14968)))),
+                    // zig fmt: on
                 } ++ @as([4]u16, @splat(0)),
                 [4]u16{
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 716)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 1105)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 2646)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 10056)))),
+                    // zig fmt: off
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 716)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 1105)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 2646)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 10056)))),
+                    // zig fmt: on
                 } ++ @as([4]u16, @splat(0)),
             },
             [2][8]u16{
                 [4]u16{
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 11139)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 13270)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 18241)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 23566)))),
+                    // zig fmt: off
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 11139)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 13270)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 18241)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 23566)))),
+                    // zig fmt: on
                 } ++ @as([4]u16, @splat(0)),
                 [4]u16{
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 3192)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 5032)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 10297)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 19755)))),
+                    // zig fmt: off
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 3192)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 5032)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 10297)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 19755)))),
+                    // zig fmt: on
                 } ++ @as([4]u16, @splat(0)),
             },
         },
         .eob_bin_32 = [2][2][8]u16{
             [2][8]u16{
                 [5]u16{
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 2515)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 3003)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 4452)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 8162)))),
+                    // zig fmt: off
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 2515)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 3003)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 4452)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 8162)))),
                     @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 16041)))),
+                    // zig fmt: on
                 } ++ @as([3]u16, @splat(0)),
                 [5]u16{
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 574)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 821)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 1836)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 5089)))),
+                    // zig fmt: off
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 574)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 821)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 1836)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 5089)))),
                     @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 13128)))),
+                    // zig fmt: on
                 } ++ @as([3]u16, @splat(0)),
             },
             [2][8]u16{
                 [5]u16{
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 13468)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 16303)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 20361)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 25105)))),
+                    // zig fmt: off
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 13468)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 16303)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 20361)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 25105)))),
                     @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 29281)))),
+                    // zig fmt: on
                 } ++ @as([3]u16, @splat(0)),
                 [5]u16{
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 3542)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 5502)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 10415)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 16760)))),
+                    // zig fmt: off
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 3542)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 5502)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 10415)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 16760)))),
                     @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 25644)))),
+                    // zig fmt: on
                 } ++ @as([3]u16, @splat(0)),
             },
         },
         .eob_bin_64 = [2][2][8]u16{
             [2][8]u16{
                 [6]u16{
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 2374)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 2772)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 4583)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 7276)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 12288)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 19706)))),
+                    // zig fmt: off
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 2374)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 2772)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 4583)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 7276)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 12288)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 19706)))),
+                    // zig fmt: on
                 } ++ @as([2]u16, @splat(0)),
                 [6]u16{
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 497)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 810)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 1315)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 3000)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 7004)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 15641)))),
+                    // zig fmt: off
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 497)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 810)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 1315)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 3000)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 7004)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 15641)))),
+                    // zig fmt: on
                 } ++ @as([2]u16, @splat(0)),
             },
             [2][8]u16{
                 [6]u16{
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 15050)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 17126)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 21410)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 24886)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 28156)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 30726)))),
+                    // zig fmt: off
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 15050)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 17126)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 21410)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 24886)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 28156)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 30726)))),
+                    // zig fmt: on
                 } ++ @as([2]u16, @splat(0)),
                 [6]u16{
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 4034)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 6290)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 10235)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 14982)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 21214)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 28491)))),
+                    // zig fmt: off
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 4034)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 6290)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 10235)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 14982)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 21214)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 28491)))),
+                    // zig fmt: on
                 } ++ @as([2]u16, @splat(0)),
             },
         },
         .eob_bin_128 = [2][2][8]u16{
             [2][8]u16{
                 [7]u16{
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 1366)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 1738)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 2527)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 5016)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 9355)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 15797)))),
+                    // zig fmt: off
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 1366)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 1738)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 2527)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 5016)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 9355)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 15797)))),
                     @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 24643)))),
+                    // zig fmt: on
                 } ++ @as([1]u16, @splat(0)),
                 [7]u16{
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 354)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 558)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 944)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 2760)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 7287)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 14037)))),
+                    // zig fmt: off
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 354)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 558)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 944)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 2760)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 7287)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 14037)))),
                     @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 21779)))),
+                    // zig fmt: on
                 } ++ @as([1]u16, @splat(0)),
             },
             [2][8]u16{
                 [7]u16{
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 13627)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 16246)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 20173)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 24429)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 27948)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 30415)))),
+                    // zig fmt: off
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 13627)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 16246)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 20173)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 24429)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 27948)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 30415)))),
                     @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 31863)))),
+                    // zig fmt: on
                 } ++ @as([1]u16, @splat(0)),
                 [7]u16{
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 6275)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 9889)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 14769)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 23164)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 27988)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 30493)))),
+                    // zig fmt: off
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 6275)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 9889)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 14769)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 23164)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 27988)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 30493)))),
                     @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 32272)))),
+                    // zig fmt: on
                 } ++ @as([1]u16, @splat(0)),
             },
         },
         .eob_bin_256 = [2][2][16]u16{
             [2][16]u16{
                 [8]u16{
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 3089)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 3920)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 6038)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 9460)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 14266)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 19881)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 25766)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 29176)))),
+                    // zig fmt: off
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 3089)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 3920)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 6038)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 9460)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 14266)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 19881)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 25766)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 29176)))),
+                    // zig fmt: on
                 } ++ @as([8]u16, @splat(0)),
                 [8]u16{
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 1084)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 2358)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 3488)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 5122)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 11483)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 18103)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 26023)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 29799)))),
+                    // zig fmt: off
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 1084)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 2358)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 3488)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 5122)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 11483)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 18103)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 26023)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 29799)))),
+                    // zig fmt: on
                 } ++ @as([8]u16, @splat(0)),
             },
             [2][16]u16{
                 [8]u16{
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 11514)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 13794)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 17480)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 20754)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 24361)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 27378)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 29492)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 31277)))),
+                    // zig fmt: off
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 11514)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 13794)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 17480)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 20754)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 24361)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 27378)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 29492)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 31277)))),
+                    // zig fmt: on
                 } ++ @as([8]u16, @splat(0)),
                 [8]u16{
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 6571)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 9610)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 15516)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 21826)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 29092)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 30829)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 31842)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 32708)))),
+                    // zig fmt: off
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 6571)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 9610)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 15516)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 21826)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 29092)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 30829)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 31842)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 32708)))),
+                    // zig fmt: on
                 } ++ @as([8]u16, @splat(0)),
             },
         },
         .eob_bin_512 = [2][16]u16{
             [9]u16{
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 2624)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 3936)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 6480)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 9686)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 13979)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 17726)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 23267)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 28410)))),
+                // zig fmt: off
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 2624)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 3936)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 6480)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 9686)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 13979)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 17726)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 23267)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 28410)))),
                 @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 31078)))),
+                // zig fmt: on
             } ++ @as([7]u16, @splat(0)),
             [9]u16{
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 12015)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 14769)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 19588)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 22052)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 24222)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 25812)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 27300)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 29219)))),
+                // zig fmt: off
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 12015)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 14769)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 19588)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 22052)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 24222)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 25812)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 27300)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 29219)))),
                 @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 32114)))),
+                // zig fmt: on
             } ++ @as([7]u16, @splat(0)),
         },
         .eob_bin_1024 = [2][16]u16{
             [10]u16{
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 2784)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 3831)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 7041)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 10521)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 14847)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 18844)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 23155)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 26682)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 29229)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 31045)))),
+                // zig fmt: off
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 2784)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 3831)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 7041)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 10521)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 14847)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 18844)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 23155)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 26682)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 29229)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 31045)))),
+                // zig fmt: on
             } ++ @as([6]u16, @splat(0)),
             [10]u16{
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 9577)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 12466)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 17739)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 20750)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 22061)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 23215)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 24601)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 25483)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 25843)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 32056)))),
+                // zig fmt: off
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 9577)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 12466)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 17739)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 20750)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 22061)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 23215)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 24601)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 25483)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 25843)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 32056)))),
+                // zig fmt: on
             } ++ @as([6]u16, @splat(0)),
         },
         .eob_base_tok = [5][2][4][4]u16{
@@ -16656,241 +16159,215 @@ pub const default_coef_cdf: [4]CdfCoefContext = [4]CdfCoefContext{
         .eob_bin_16 = [2][2][8]u16{
             [2][8]u16{
                 [4]u16{
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 6708)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 8958)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 14746)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 22133)))),
+                    // zig fmt: off
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 6708)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 8958)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 14746)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 22133)))),
+                    // zig fmt: on
                 } ++ @as([4]u16, @splat(0)),
                 [4]u16{
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 1222)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 2074)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 4783)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 15410)))),
+                    // zig fmt: off
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 1222)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 2074)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 4783)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 15410)))),
+                    // zig fmt: on
                 } ++ @as([4]u16, @splat(0)),
             },
             [2][8]u16{
                 [4]u16{
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 19575)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 21766)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 26044)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 29709)))),
+                    // zig fmt: off
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 19575)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 21766)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 26044)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 29709)))),
+                    // zig fmt: on
                 } ++ @as([4]u16, @splat(0)),
                 [4]u16{
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 7297)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 10767)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 19273)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 28194)))),
+                    // zig fmt: off
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 7297)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 10767)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 19273)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 28194)))),
+                    // zig fmt: on
                 } ++ @as([4]u16, @splat(0)),
             },
         },
         .eob_bin_32 = [2][2][8]u16{
             [2][8]u16{
                 [5]u16{
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 4617)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 5709)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 8446)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 13584)))),
+                    // zig fmt: off
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 4617)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 5709)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 8446)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 13584)))),
                     @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 23135)))),
+                    // zig fmt: on
                 } ++ @as([3]u16, @splat(0)),
                 [5]u16{
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 1156)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 1702)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 3675)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 9274)))),
+                    // zig fmt: off
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 1156)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 1702)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 3675)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 9274)))),
                     @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 20539)))),
+                    // zig fmt: on
                 } ++ @as([3]u16, @splat(0)),
             },
             [2][8]u16{
                 [5]u16{
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 22086)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 24282)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 27010)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 29770)))),
+                    // zig fmt: off
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 22086)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 24282)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 27010)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 29770)))),
                     @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 31743)))),
+                    // zig fmt: on
                 } ++ @as([3]u16, @splat(0)),
                 [5]u16{
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 7699)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 10897)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 20891)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 26926)))),
+                    // zig fmt: off
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 7699)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 10897)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 20891)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 26926)))),
                     @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 31628)))),
+                    // zig fmt: on
                 } ++ @as([3]u16, @splat(0)),
             },
         },
         .eob_bin_64 = [2][2][8]u16{
             [2][8]u16{
                 [6]u16{
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 6307)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 7541)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 12060)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 16358)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 22553)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 27865)))),
+                    // zig fmt: off
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 6307)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 7541)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 12060)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 16358)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 22553)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 27865)))),
+                    // zig fmt: on
                 } ++ @as([2]u16, @splat(0)),
                 [6]u16{
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 1289)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 2320)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 3971)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 7926)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 14153)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 24291)))),
+                    // zig fmt: off
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 1289)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 2320)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 3971)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 7926)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 14153)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 24291)))),
+                    // zig fmt: on
                 } ++ @as([2]u16, @splat(0)),
             },
             [2][8]u16{
                 [6]u16{
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 24212)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 25708)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 28268)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 30035)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 31307)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 32049)))),
+                    // zig fmt: off
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 24212)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 25708)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 28268)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 30035)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 31307)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 32049)))),
+                    // zig fmt: on
                 } ++ @as([2]u16, @splat(0)),
                 [6]u16{
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 8726)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 12378)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 19409)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 26450)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 30038)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 32462)))),
+                    // zig fmt: off
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 8726)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 12378)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 19409)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 26450)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 30038)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 32462)))),
+                    // zig fmt: on
                 } ++ @as([2]u16, @splat(0)),
             },
         },
         .eob_bin_128 = [2][2][8]u16{
             [2][8]u16{
                 [7]u16{
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 3472)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 4885)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 7489)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 12481)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 18517)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 24536)))),
+                    // zig fmt: off
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 3472)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 4885)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 7489)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 12481)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 18517)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 24536)))),
                     @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 29635)))),
+                    // zig fmt: on
                 } ++ @as([1]u16, @splat(0)),
                 [7]u16{
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 886)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 1731)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 3271)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 8469)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 15569)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 22126)))),
+                    // zig fmt: off
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 886)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 1731)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 3271)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 8469)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 15569)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 22126)))),
                     @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 28383)))),
+                    // zig fmt: on
                 } ++ @as([1]u16, @splat(0)),
             },
             [2][8]u16{
                 [7]u16{
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 24313)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 26062)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 28385)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 30107)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 31217)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 31898)))),
+                    // zig fmt: off
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 24313)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 26062)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 28385)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 30107)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 31217)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 31898)))),
                     @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 32345)))),
+                    // zig fmt: on
                 } ++ @as([1]u16, @splat(0)),
                 [7]u16{
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 9165)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 13282)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 21150)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 30286)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 31894)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 32571)))),
+                    // zig fmt: off
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 9165)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 13282)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 21150)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 30286)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 31894)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 32571)))),
                     @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 32712)))),
+                    // zig fmt: on
                 } ++ @as([1]u16, @splat(0)),
             },
         },
         .eob_bin_256 = [2][2][16]u16{
             [2][16]u16{
                 [8]u16{
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 5348)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 7113)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 11820)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 15924)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 22106)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 26777)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 30334)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 31757)))),
+                    // zig fmt: off
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 5348)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 7113)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 11820)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 15924)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 22106)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 26777)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 30334)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 31757)))),
+                    // zig fmt: on
                 } ++ @as([8]u16, @splat(0)),
                 [8]u16{
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 2453)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 4474)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 6307)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 8777)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 16474)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 22975)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 29000)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 31547)))),
+                    // zig fmt: off
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 2453)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 4474)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 6307)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 8777)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 16474)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 22975)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 29000)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 31547)))),
+                    // zig fmt: on
                 } ++ @as([8]u16, @splat(0)),
             },
             [2][16]u16{
                 [8]u16{
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 23110)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 24597)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 27140)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 28894)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 30167)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 30927)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 31392)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 32094)))),
+                    // zig fmt: off
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 23110)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 24597)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 27140)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 28894)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 30167)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 30927)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 31392)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 32094)))),
+                    // zig fmt: on
                 } ++ @as([8]u16, @splat(0)),
                 [8]u16{
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 9998)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 17661)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 25178)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 28097)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 31308)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 32038)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 32403)))),
-                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 32695)))),
+                    // zig fmt: off
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 9998)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 17661)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 25178)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 28097)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 31308)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 32038)))),
+                    @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 32403)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 32695)))),
+                    // zig fmt: on
                 } ++ @as([8]u16, @splat(0)),
             },
         },
         .eob_bin_512 = [2][16]u16{
             [9]u16{
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 5927)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 7809)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 10923)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 14597)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 19439)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 24135)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 28456)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 31142)))),
+                // zig fmt: off
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 5927)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 7809)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 10923)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 14597)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 19439)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 24135)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 28456)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 31142)))),
                 @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 32060)))),
+                // zig fmt: on
             } ++ @as([7]u16, @splat(0)),
             [9]u16{
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 21093)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 23043)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 25742)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 27658)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 29097)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 29716)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 30073)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 30820)))),
+                // zig fmt: off
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 21093)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 23043)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 25742)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 27658)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 29097)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 29716)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 30073)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 30820)))),
                 @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 31956)))),
+                // zig fmt: on
             } ++ @as([7]u16, @splat(0)),
         },
         .eob_bin_1024 = [2][16]u16{
             [10]u16{
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 6698)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 8334)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 11961)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 15762)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 20186)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 23862)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 27434)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 29326)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 31082)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 32050)))),
+                // zig fmt: off
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 6698)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 8334)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 11961)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 15762)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 20186)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 23862)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 27434)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 29326)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 31082)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 32050)))),
+                // zig fmt: on
             } ++ @as([6]u16, @splat(0)),
             [10]u16{
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 20569)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 22426)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 25569)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 26859)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 28053)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 28913)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 29486)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 29724)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 29807)))),
-                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 32570)))),
+                // zig fmt: off
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 20569)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 22426)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 25569)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 26859)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 28053)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 28913)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 29486)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 29724)))),
+                @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 29807)))), @bitCast(@as(c_short, @truncate(@as(c_int, 32768) - @as(c_int, 32570)))),
+                // zig fmt: on
             } ++ @as([6]u16, @splat(0)),
         },
         .eob_base_tok = [5][2][4][4]u16{
