@@ -47198,7 +47198,7 @@ int termite_metal_decode_runtime_gliner_boundary_device(
     if (!termite_metal_decode_runtime_gliner_boundary_ready(runtime)) return -17;
     if(runtime==NULL||input_handles==NULL||input_offsets==NULL||input_bytes==NULL||params==NULL||output_handle==NULL)return -1;
     if(runtime->gliner_boundary_f32_pipeline==nil)return -2;
-    if(params->kind>51u||output_elements==0||output_elements>INT32_MAX||work_items==0||work_items>INT32_MAX||simd_groups>1u)return -3;
+    if(params->kind>53u||output_elements==0||output_elements>INT32_MAX||work_items==0||work_items>INT32_MAX||simd_groups>1u)return -3;
     if(simd_groups&&(work_items%32u!=0u||runtime->gliner_boundary_f32_pipeline.threadExecutionWidth!=32u||runtime->gliner_boundary_f32_pipeline.maxTotalThreadsPerThreadgroup<32u))return -4;
     @autoreleasepool {
         id<MTLBuffer> output=(__bridge id<MTLBuffer>)output_handle;
