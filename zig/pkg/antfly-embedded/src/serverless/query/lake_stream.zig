@@ -1021,7 +1021,8 @@ pub const Stream = struct {
                     const lease = cached orelse blk: {
                         const owned = try reader.cache.decoded.create(64 * 1024 * 1024);
                         errdefer owned.release();
-                        owned.item.payload = .{ .prepared = try @import("lake_prepared_deletes.zig").Prepared.create(owned.item.budget.allocator(), request) };
+                        owned.item.payload = .{ .prepared = try @import("lake_prepared_deletes.zig").Prepared.createCached(owned.item.budget.allocator(), request, &reader.cache.delete_files, reader.scope, self.context) };
+                        owned.item.foreign_bytes = owned.item.payload.prepared.foreignBytes();
                         try self.context.ensureActive();
                         if (cacheable and std.mem.eql(u8, &version_key, &owned.item.payload.prepared.object_versions)) reader.cache.decoded.publish(key, owned);
                         break :blk owned;

@@ -26,6 +26,7 @@ pub const Payload = union(enum) {
     extension: *anyopaque,
     snapshot: @import("lake_iceberg_snapshot.zig").SnapshotWithDeletePlan,
     prepared: *@import("lake_prepared_deletes.zig").Prepared,
+    delete_file: *@import("lake_delete_file_index.zig").Index,
     page_directory: @import("lake_parquet_metadata.zig").PageDirectory,
     footer: @import("lake_parquet_metadata.zig").ParsedFooter,
     dictionary: @import("lake_parquet_page.zig").Dictionary,
@@ -68,6 +69,7 @@ pub const Item = struct {
             lease.release();
         }
         if (self.payload == .page_directory) self.payload.page_directory.deinit();
+        if (self.payload == .delete_file) self.payload.delete_file.destroy(self.budget.allocator());
         if (self.payload == .prepared) self.payload.prepared.destroy(self.budget.allocator());
         if (self.payload == .snapshot) self.payload.snapshot.deinit(self.budget.allocator());
         if (self.payload == .iceberg_chunk) self.payload.iceberg_chunk.deinit(self.budget.allocator());

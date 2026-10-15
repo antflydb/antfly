@@ -75,6 +75,8 @@ overflow_subtrees: u64 = 0,
 reductions: u64 = 0,
 admitted: u64 = 0,
 summary_cache_hits: u64 = 0,
+prefetch_reads: u64 = 8 * 1024 * 1024,
+prefetch_tasks: usize = 0,
 pending: ?Pending = null,
 selection: ?[]const Id = null,
 proof: ?*@import("lake_index_pack_proof.zig") = null,
@@ -529,6 +531,93 @@ fn bound(self: *Self, input_first: Id, input_last: Id) !?Node {
     }
     return null;
 }
+/// Warm immutable sibling/term pages with independent readers and scratch.
+/// Only the coordinator mutates scores, summaries, quotas and traversal order.
+fn prefetchSiblings(self: *Self, first: Id, left_end: Id, boundary: Id, last: Id) !void {
+    const io = self.cached.context.io orelse return;
+    if (self.prefetch_reads < 2 * 1024 * 1024) return;
+    const Term = struct { field: []const u8, term: []const u8 };
+    var terms: [8]Term = undefined;
+    var used: usize = 0;
+    var fields = self.plan.?.stats.fields.iterator();
+    gather: while (fields.next()) |field| {
+        var keys = field.value_ptr.frequencies.keyIterator();
+        while (keys.next()) |term| {
+            terms[used] = .{ .field = field.key_ptr.*, .term = term.* };
+            used += 1;
+            if (used == terms.len) break :gather;
+        }
+    }
+    if (used == 0) return;
+    const Warm = struct {
+        owner: *Self,
+        terms: []const Term,
+        first: Id,
+        last: Id,
+        reads: u64 = 1024 * 1024,
+        done: std.Io.Event = .unset,
+        fn read(raw: *anyopaque, a: A, store: *stores.ArtifactStore, ref: local.serverless_manifest_artifact_ref.ArtifactRef, _: u64, length: usize, _: Id, token: Token, budget: *u64) ![]u8 {
+            const warm: *@This() = @ptrCast(@alignCast(raw));
+            try warm.owner.cached.context.ensureActive();
+            try stores.chargeReadBudget(budget, length);
+            return artifacts.readArtifact(a, store.*, .{ .artifact_id = ref.artifact_id, .checksum = ref.checksum, .byte_len = ref.byte_len }, token, warm.owner.cached);
+        }
+        fn run(warm: *@This()) anyerror!void {
+            defer warm.done.set(warm.owner.cached.context.io.?);
+            var memory: local.sql_memory_budget = .{ .backing = @import("antfly_platform").allocator.processAllocator(std.heap.page_allocator), .limit = 2 * 1024 * 1024 };
+            var arena = std.heap.ArenaAllocator.init(memory.allocator());
+            defer arena.deinit();
+            var store = warm.owner.store;
+            var writes: u64 = 0;
+            var pages: page_store.PageStore = .{ .domain = warm.owner.root.domain, .artifacts = &store, .cancellation = warm.owner.token, .remaining_read_bytes = &warm.reads, .remaining_write_bytes = &writes, .read_cache = .{ .ptr = warm, .read = read } };
+            var cache: tree.Cache = .{ .alloc = memory.allocator(), .underlying = pages.store() };
+            defer cache.deinit();
+            const Fold = struct {
+                pub fn aggregate(_: *@This(), _: []const u8, _: u64) !void {}
+                pub fn record(_: *@This(), _: []const u8, _: []const u8) !void {}
+            };
+            for (warm.terms) |term| {
+                try warm.owner.check();
+                _ = arena.reset(.retain_capacity);
+                const a = arena.allocator();
+                const key = try corpus.statistics.keyAlloc(a, term.field, term.term);
+                const prefix = try corpus.term_directory.prefixAlloc(a, key);
+                const lower = try std.mem.concat(a, u8, &.{ prefix, &warm.first });
+                const upper = try std.mem.concat(a, u8, &.{ prefix, &warm.last, &.{0} });
+                var fold: Fold = .{};
+                try tree.reduceRange(a, cache.store(), warm.owner.root.term_directory.leaves, lower, upper, &fold);
+            }
+        }
+    };
+    var workers = [_]Warm{
+        .{ .owner = self, .terms = terms[0..used], .first = first, .last = left_end },
+        .{ .owner = self, .terms = terms[0..used], .first = boundary, .last = last },
+    };
+    const scheduler = local.sql_parallel_scheduler;
+    var tasks: [2]?scheduler.Task(anyerror!void) = @splat(null);
+    defer for (&tasks, &workers) |*handle, *worker| if (handle.*) |task_| {
+        var task = task_;
+        _ = task.cancel(io) catch {};
+        self.prefetch_reads += worker.reads;
+        self.charged_bytes += 1024 * 1024 - worker.reads;
+    };
+    for (&workers, &tasks) |*worker, *task| {
+        task.* = scheduler.global().submitIoTransient(io, 2 * 1024 * 1024, Warm.run, .{worker});
+        if (task.* != null) {
+            self.prefetch_reads -= 1024 * 1024;
+            self.prefetch_tasks += 1;
+        }
+    }
+    for (&tasks, &workers) |*handle, *worker| if (handle.*) |task_| {
+        try worker.done.wait(io);
+        var task = task_;
+        handle.* = null;
+        task.await(io) catch {}; // optional warming never proves absence
+        self.prefetch_reads += worker.reads;
+        self.charged_bytes += 1024 * 1024 - worker.reads;
+    };
+    try self.check();
+}
 pub fn next(self: *Self, cutoff: ?f32) !?Id {
     return self.nextRanked(cutoff, null);
 }
@@ -565,6 +654,7 @@ pub fn nextRanked(self: *Self, cutoff: ?f32, position: ?Position) !?Id {
             left_end[i] -%= 1;
             if (left_end[i] != 255) break;
         }
+        try self.prefetchSiblings(node.first, left_end, boundary, node.last);
         const left = try self.bound(node.first, left_end);
         const right = try self.bound(boundary, node.last);
         const fallback = depth_first or self.heap.items.len + @as(usize, @intFromBool(left != null)) + @as(usize, @intFromBool(right != null)) > self.frontier_limit;
@@ -682,7 +772,28 @@ test "external lake global frontier reaches late competitive segments and comple
     try std.testing.expectEqual(@as(u64, 1), frontier.admitted);
     try std.testing.expect(frontier.reductions > 0);
     try std.testing.expect(frontier.summary_cache_hits > 0);
-    try std.testing.expectEqual(@as(u64, 256 * 1024 * 1024) - frontier.reads, frontier.charged_bytes);
+    try std.testing.expectEqual(@as(u64, 256 * 1024 * 1024) - frontier.reads + (8 * 1024 * 1024 - frontier.prefetch_reads), frontier.charged_bytes);
+    var warm_cached = cached;
+    warm_cached.context.io = std.testing.io;
+    const warmed = (try create(a, root, store, warm_cached, .none, .{ .term = .{ .field = "body", .term = "common" } }, .{}, .{})).?;
+    defer warmed.deinit();
+    try std.testing.expectEqual(last, (try warmed.next(null)).?);
+    try std.testing.expect(warmed.prefetch_tasks > 0);
+    try std.testing.expect(warmed.prefetch_reads <= 8 * 1024 * 1024);
+    try std.testing.expectEqual(@as(u64, 256 * 1024 * 1024) - warmed.reads + (8 * 1024 * 1024 - warmed.prefetch_reads), warmed.charged_bytes);
+    // Ordinary task admission remains pinned until the handle is joined, so
+    // this deterministically saturates optional I/O warming without a sleep.
+    const Hold = struct {
+        fn run() void {}
+    };
+    var held = local.sql_parallel_scheduler.global().submitIo(std.testing.io, 32 * 1024 * 1024, Hold.run, .{}).?;
+    defer held.await(std.testing.io);
+    const saturated = (try create(a, root, store, warm_cached, .none, .{ .term = .{ .field = "body", .term = "common" } }, .{}, .{})).?;
+    defer saturated.deinit();
+    try std.testing.expectEqual(last, (try saturated.next(null)).?);
+    try std.testing.expectEqual(@as(usize, 0), saturated.prefetch_tasks);
+    try std.testing.expectEqual(@as(u64, 8 * 1024 * 1024), saturated.prefetch_reads);
+
     const strong = local.section_inverted.bm25Score(100, 100, 8192, 8192, 100, .{});
     try std.testing.expect((try frontier.next(strong)) == null);
     try std.testing.expect(frontier.pruned);

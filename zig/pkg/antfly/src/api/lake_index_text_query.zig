@@ -1920,6 +1920,7 @@ const Execution = struct {
         var batch: local.storage_db_query_search_exec.ComposedComponentBatch = .{ .alloc = a, .results = try a.alloc(?types.SearchResult, components.len) };
         @memset(batch.results, null);
         errdefer batch.deinit();
+        batch.execution_ns = try a.alloc(u64, components.len);
         const Worker = struct {
             budget: local.sql_memory_budget,
             arena: std.heap.ArenaAllocator = undefined,
@@ -1927,6 +1928,7 @@ const Execution = struct {
             source: local.serverless_query_lake_serving.ServingSource = undefined,
             parent: *local.serverless_query_lake_serving.ServingSource,
             component: local.storage_db_query_search_exec.ComposedComponent,
+            elapsed_ns: u64 = 0,
             result: ?types.SearchResult = null,
             task: ?scheduler.Task(anyerror!void) = null,
             failure: ?anyerror = null,
@@ -1947,7 +1949,11 @@ const Execution = struct {
                 return owner;
             }
             fn run(owner: *@This()) anyerror!void {
-                defer if (owner.execution.context.io) |io| owner.done.set(io);
+                const started = @import("antfly_platform").time.monotonicNs();
+                defer {
+                    owner.elapsed_ns = @import("antfly_platform").time.monotonicNs() - started;
+                    if (owner.execution.context.io) |io| owner.done.set(io);
+                }
                 const execution = &owner.execution;
                 try execution.context.ensureActive();
                 const req = owner.component.request;
@@ -2025,6 +2031,7 @@ const Execution = struct {
                 owned.ordered_window_complete = result.ordered_window_complete;
                 if (result.sort_profile) |profile| try owned.setOwnedSortProfile(profile);
                 batch.results[first + i] = owned;
+                batch.execution_ns[first + i] = worker.elapsed_ns;
                 worker.close();
                 slot.* = null;
             }

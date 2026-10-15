@@ -1015,3 +1015,32 @@ Constant-score match-all and bitmap leaves expose finite nonnegative score
 bounds within selective Boolean trees. Invalid or signed boosts retain
 conservative bounds. Independent full-admission ranked pages remain the oracle
 for score, tie and offset behavior.
+
+
+Cold snapshot catalogs merge the sorted manifest chunks and bulk-build their
+Cartesian tree. Each file allocates one node and hashes its priority once;
+construction takes O(N log M) merge work for N files across M chunks and O(N)
+tree work. Incremental snapshots retain path copying. Catalog construction and
+lazy canonical ordering retry allocation after evicting cache pins, while reader
+pins preserve ownership. Exhausting reclaimable entries uses the existing flat
+planning fallback rather than making cache residency a prerequisite for queries.
+
+Delete-file decoding has a separate immutable cache shared across selected data
+views. Its identity binds fresh provider ETag/version, complete delete recipe,
+schema, credential scope and decoding/application policy. Objects without a
+strong provider identity bypass it. Selected views apply sequence/partition
+rules and row bounds independently, own their position membership, and retain
+leases for borrowed equality keys. Loading is bounded to 64 MiB, each prepared
+view retains at most 256 MiB of foreign indexes, and residency includes leased
+bytes. Oversized indexes use streaming subset decoding with direct path lookup.
+Fresh object validation remains mandatory before cache lookup.
+
+Cold text-frontier traversal may warm sibling term-directory pages on two
+shared scheduler lanes. Each lane owns a 2 MiB workspace and 1 MiB read allowance;
+a query spends at most 8 MiB on optional warming, separately from required
+navigation. Scheduler saturation skips warming. Workers publish only immutable
+artifact bytes; the coordinator still authenticates and reduces metadata with
+private scoring/traversal state. Cancellation drains workers before request
+state is released. Benchmark component durations measure each worker's actual
+execution, including membership preparation, rather than result transfer;
+parallel durations can overlap and are not additive wall-clock time.

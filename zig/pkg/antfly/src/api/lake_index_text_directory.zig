@@ -919,7 +919,7 @@ test "external lake exact segment admission skips missing unrelated descriptors 
                 }
             }
             try std.testing.expectEqual(ordered.len, seen);
-            try std.testing.expectEqual(@as(u64, 256 * 1024 * 1024) - frontier.reads, frontier.charged_bytes);
+            try std.testing.expectEqual(@as(u64, 256 * 1024 * 1024) - frontier.reads + (8 * 1024 * 1024 - frontier.prefetch_reads), frontier.charged_bytes);
         }
     }
     // Broad admission reads only the compact routing tree. Physical metadata

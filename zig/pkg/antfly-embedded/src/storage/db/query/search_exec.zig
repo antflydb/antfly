@@ -679,10 +679,15 @@ pub const ComposedComponent = struct {
 pub const ComposedComponentBatch = struct {
     alloc: Allocator,
     results: []?types.SearchResult,
+    execution_ns: []u64 = &.{},
     position: usize = 0,
     pub fn deinit(self: *@This()) void {
         for (self.results) |*result| if (result.*) |*owned| owned.deinit();
         self.alloc.free(self.results);
+        self.alloc.free(self.execution_ns);
+    }
+    pub fn lastExecutionNs(self: *const @This()) ?u64 {
+        return if (self.position != 0 and self.execution_ns.len == self.results.len) self.execution_ns[self.position - 1] else null;
     }
     fn take(self: *@This()) !types.SearchResult {
         if (self.position >= self.results.len) return error.InvalidQueryRequest;
@@ -1047,7 +1052,7 @@ pub fn searchComposed(
             const phase_start_ns = if (bench_query_profile) platform_time.monotonicNs() else 0;
             const text_result = if (component_batch) |*batch| try batch.take() else try executor.search_text_query(executor.ctx, alloc, shared_req, text);
             owned_results.appendAssumeCapacity(text_result);
-            if (bench_query_profile) text_ns += platform_time.monotonicNs() - phase_start_ns;
+            if (bench_query_profile) text_ns += if (component_batch) |*batch| batch.lastExecutionNs() orelse (platform_time.monotonicNs() - phase_start_ns) else platform_time.monotonicNs() - phase_start_ns;
             composed_candidate_count += text_result.hits.len;
             if (requestHasSortPageOptions(shared_req)) {
                 try validateComposedExactSortComponent(shared_req, text_result);
@@ -1065,7 +1070,7 @@ pub fn searchComposed(
             const phase_start_ns = if (bench_query_profile) platform_time.monotonicNs() else 0;
             const text_result = if (component_batch) |*batch| try batch.take() else try executor.search_text(executor.ctx, alloc, shared_req);
             owned_results.appendAssumeCapacity(text_result);
-            if (bench_query_profile) text_ns += platform_time.monotonicNs() - phase_start_ns;
+            if (bench_query_profile) text_ns += if (component_batch) |*batch| batch.lastExecutionNs() orelse (platform_time.monotonicNs() - phase_start_ns) else platform_time.monotonicNs() - phase_start_ns;
             composed_candidate_count += text_result.hits.len;
             if (requestHasSortPageOptions(shared_req)) {
                 try validateComposedExactSortComponent(shared_req, text_result);
@@ -1087,7 +1092,7 @@ pub fn searchComposed(
             const phase_start_ns = if (bench_query_profile) platform_time.monotonicNs() else 0;
             const text_result = if (component_batch) |*batch| try batch.take() else try executor.search_text_query(executor.ctx, alloc, text_req, full_text_query.query);
             owned_results.appendAssumeCapacity(text_result);
-            if (bench_query_profile) text_ns += platform_time.monotonicNs() - phase_start_ns;
+            if (bench_query_profile) text_ns += if (component_batch) |*batch| batch.lastExecutionNs() orelse (platform_time.monotonicNs() - phase_start_ns) else platform_time.monotonicNs() - phase_start_ns;
             composed_candidate_count += text_result.hits.len;
             if (requestHasSortPageOptions(shared_req)) {
                 try validateComposedExactSortComponent(shared_req, text_result);
@@ -1124,7 +1129,7 @@ pub fn searchComposed(
             profile_dense_component,
         );
         owned_results.appendAssumeCapacity(dense_result);
-        if (bench_query_profile) dense_ns += platform_time.monotonicNs() - phase_start_ns;
+        if (bench_query_profile) dense_ns += if (component_batch) |*batch| batch.lastExecutionNs() orelse (platform_time.monotonicNs() - phase_start_ns) else platform_time.monotonicNs() - phase_start_ns;
         composed_candidate_count += dense_result.hits.len;
         const resolved_doc_set = try resolveComposedHitsToDocSet(alloc, shared_req, executor, &owned_resolved_sets, dense_result.hits);
         try named_sets.append(alloc, .{
@@ -1147,7 +1152,7 @@ pub fn searchComposed(
                 profile_dense_component,
             );
             owned_results.appendAssumeCapacity(dense_result);
-            if (bench_query_profile) dense_ns += platform_time.monotonicNs() - phase_start_ns;
+            if (bench_query_profile) dense_ns += if (component_batch) |*batch| batch.lastExecutionNs() orelse (platform_time.monotonicNs() - phase_start_ns) else platform_time.monotonicNs() - phase_start_ns;
             composed_candidate_count += dense_result.hits.len;
             const resolved_doc_set = try resolveComposedHitsToDocSet(alloc, shared_req, executor, &owned_resolved_sets, dense_result.hits);
             try named_sets.append(alloc, .{
@@ -1164,7 +1169,7 @@ pub fn searchComposed(
         const phase_start_ns = if (bench_query_profile) platform_time.monotonicNs() else 0;
         const sparse_result = if (component_batch) |*batch| try batch.take() else try executor.search_sparse(executor.ctx, alloc, vector_req, vector_req.sparse.?);
         owned_results.appendAssumeCapacity(sparse_result);
-        if (bench_query_profile) sparse_ns += platform_time.monotonicNs() - phase_start_ns;
+        if (bench_query_profile) sparse_ns += if (component_batch) |*batch| batch.lastExecutionNs() orelse (platform_time.monotonicNs() - phase_start_ns) else platform_time.monotonicNs() - phase_start_ns;
         composed_candidate_count += sparse_result.hits.len;
         const resolved_doc_set = try resolveComposedHitsToDocSet(alloc, shared_req, executor, &owned_resolved_sets, sparse_result.hits);
         try named_sets.append(alloc, .{
@@ -1181,7 +1186,7 @@ pub fn searchComposed(
             const phase_start_ns = if (bench_query_profile) platform_time.monotonicNs() else 0;
             const sparse_result = if (component_batch) |*batch| try batch.take() else try executor.search_sparse(executor.ctx, alloc, sparse_req, sparse_query.query);
             owned_results.appendAssumeCapacity(sparse_result);
-            if (bench_query_profile) sparse_ns += platform_time.monotonicNs() - phase_start_ns;
+            if (bench_query_profile) sparse_ns += if (component_batch) |*batch| batch.lastExecutionNs() orelse (platform_time.monotonicNs() - phase_start_ns) else platform_time.monotonicNs() - phase_start_ns;
             composed_candidate_count += sparse_result.hits.len;
             const resolved_doc_set = try resolveComposedHitsToDocSet(alloc, shared_req, executor, &owned_resolved_sets, sparse_result.hits);
             try named_sets.append(alloc, .{
@@ -33186,4 +33191,20 @@ test "external lake metadata navigation composed batches preserve component sema
     var result = try searchComposed(a, .{ .full_text = .{ .term = .{ .field = "body", .term = "common" } }, .dense = .{ .vector = &.{ 1, 0 }, .k = 2 }, .filter_query_json = "filter", .include_stored = false }, .{ .ctx = null, .search_components = Harness.batch, .search_text_query = Harness.text, .search_text = Harness.defaultText, .search_dense = Harness.dense, .search_sparse = Harness.sparse, .clone_named_set = Harness.clone, .fuse_named_sets = Harness.fuse, .attach_graph_results = Harness.graph });
     defer result.deinit();
     try std.testing.expectEqualStrings("component-0", result.hits[0].id);
+}
+
+test "external lake metadata navigation component timing belongs to completed execution" {
+    const a = std.testing.allocator;
+    var batch: ComposedComponentBatch = .{ .alloc = a, .results = try a.alloc(?types.SearchResult, 2) };
+    @memset(batch.results, null);
+    defer batch.deinit();
+    batch.execution_ns = try a.dupe(u64, &.{ 50 * std.time.ns_per_ms, 75 * std.time.ns_per_ms });
+    for (batch.results) |*result| result.* = .{ .alloc = a, .hits = &.{}, .total_hits = 0 };
+    try std.testing.expect(batch.lastExecutionNs() == null);
+    var first = try batch.take();
+    defer first.deinit();
+    try std.testing.expectEqual(@as(?u64, 50 * std.time.ns_per_ms), batch.lastExecutionNs());
+    var second = try batch.take();
+    defer second.deinit();
+    try std.testing.expectEqual(@as(?u64, 75 * std.time.ns_per_ms), batch.lastExecutionNs());
 }

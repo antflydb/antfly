@@ -49,6 +49,15 @@ const Node = struct {
         node.* = .{ .a = a, .file = file, .left = retain(left), .right = retain(right), .priority = std.mem.readInt(u64, hash[0..8], .little), .count = 1 + (if (left) |v| v.count else 0) + (if (right) |v| v.count else 0), .rows = file.row_count +| (if (left) |v| v.rows else 0) +| (if (right) |v| v.rows else 0), .bytes = file.byte_len +| (if (left) |v| v.bytes else 0) +| (if (right) |v| v.bytes else 0) };
         return node;
     }
+    fn summarize(node: ?*Node, depth: usize) !void {
+        const value = node orelse return;
+        if (depth == 256) return error.InvalidExternalSourceInventory;
+        try summarize(value.left, depth + 1);
+        try summarize(value.right, depth + 1);
+        value.count = 1 + (if (value.left) |n| n.count else 0) + (if (value.right) |n| n.count else 0);
+        value.rows = value.file.row_count +| (if (value.left) |n| n.rows else 0) +| (if (value.right) |n| n.rows else 0);
+        value.bytes = value.file.byte_len +| (if (value.left) |n| n.bytes else 0) +| (if (value.right) |n| n.bytes else 0);
+    }
     fn precedes(priority: u64, id: []const u8, other: *const Node) bool {
         return priority < other.priority or (priority == other.priority and std.mem.lessThan(u8, id, other.file.file_id));
     }
@@ -141,6 +150,7 @@ pub const Ordering = struct {
 };
 pub const Index = struct {
     a: A,
+    cache_owner: ?*Cache = null,
     refs: std.atomic.Value(usize) = .init(1),
     root: ?*Node = null,
     chunks: []Chunk = &.{},
@@ -232,6 +242,19 @@ pub const Index = struct {
             if (!std.mem.eql(u8, &identity, &order.identity)) return error.ExternalLakeSnapshotMismatch;
             return order;
         }
+        const order = while (true) {
+            break self.buildOrdering(source, snapshot, identity, context) catch |err| {
+                if (err != error.OutOfMemory) return err;
+                const cache = self.cache_owner orelse return err;
+                if (!cache.evictOne()) return err;
+                try context.ensureActive();
+                continue;
+            };
+        };
+        self.ordering.store(order, .release);
+        return order;
+    }
+    fn buildOrdering(self: *Index, source: []const u8, snapshot: []const u8, identity: [32]u8, context: Context) !*Ordering {
         const a = self.a;
         const order = try a.create(Ordering);
         errdefer a.destroy(order);
@@ -258,7 +281,6 @@ pub const Index = struct {
         }.less);
         try context.ensureActive();
         for (order.order, 0..) |file, i| order.ranks[file] = i;
-        self.ordering.store(order, .release);
         return order;
     }
     pub fn build(a: A, prior: ?*const Index, chunks: []const Chunk, context: Context) !*Index {
@@ -273,6 +295,10 @@ pub const Index = struct {
             slot.value_ptr.* = i;
             out.* = .{ .key = input.key, .lease = if (prior) |old| old.acquireChunk(input.key) orelse input.lease.retain() else input.lease.retain() };
             index.initialized_chunks = i + 1;
+        }
+        if (prior == null) {
+            try index.buildInitial(context);
+            return index;
         }
         index.root = Node.retain(if (prior) |old| old.root else null);
         if (prior) |old| for (old.chunks) |part| if (!index.by_key.contains(part.key)) {
@@ -295,6 +321,48 @@ pub const Index = struct {
         };
         return index;
     }
+    /// Merge sorted chunks and build a Cartesian tree in one pass. Each file
+    /// allocates one node and hashes its priority once; no path copies exist yet.
+    fn buildInitial(self: *Index, context: Context) !void {
+        const Head = struct { files: []const external.FileEntry, position: usize = 0 };
+        const Order = struct {
+            fn less(_: void, l: Head, r: Head) std.math.Order {
+                return std.mem.order(u8, l.files[l.position].file_id, r.files[r.position].file_id);
+            }
+        };
+        var queue: std.PriorityQueue(Head, void, Order.less) = .initContext({});
+        defer queue.deinit(self.a);
+        try queue.ensureUnusedCapacity(self.a, self.chunks.len);
+        for (self.chunks) |part| {
+            const files = part.lease.item.payload.iceberg_chunk.files;
+            if (files.len != 0) try queue.push(self.a, .{ .files = files });
+        }
+        var stack: [256]*Node = undefined;
+        var stack_len: usize = 0;
+        var previous: ?[]const u8 = null;
+        while (queue.pop()) |head_| {
+            try context.ensureActive();
+            var head = head_;
+            const file = &head.files[head.position];
+            if (previous) |id| if (!std.mem.lessThan(u8, id, file.file_id)) return error.InvalidExternalSourceInventory;
+            previous = file.file_id;
+            const node = try Node.create(self.a, file, null, null);
+            var left: ?*Node = null;
+            while (stack_len != 0 and Node.precedes(node.priority, file.file_id, stack[stack_len - 1])) {
+                stack_len -= 1;
+                left = stack[stack_len];
+            }
+            node.left = left; // transfer unpublished tree ownership
+            if (stack_len == 0) self.root = node else stack[stack_len - 1].right = node;
+            if (stack_len == stack.len) return error.InvalidExternalSourceInventory;
+            stack[stack_len] = node;
+            stack_len += 1;
+            self.new_files += 1;
+            head.position += 1;
+            if (head.position != head.files.len) try queue.push(self.a, head);
+        }
+        try Node.summarize(self.root, 0);
+    }
 };
 /// A bounded, data-only predecessor cache. The owner outlives every decoded
 /// snapshot and every structurally shared catalog node.
@@ -305,6 +373,36 @@ pub const Cache = struct {
     tick: u64 = 0,
     fn lock(self: *Cache) void {
         while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
+    }
+    /// Drop only the cache's pin. Active readers and shared tree nodes remain
+    /// valid; exhausting all reclaimable entries preserves the uncached fallback.
+    fn evictOne(self: *Cache) bool {
+        self.lock();
+        var target: ?usize = null;
+        for (self.entries, 0..) |entry, i| if (entry) |value| {
+            if (target == null or value.used < self.entries[target.?].?.used) target = i;
+        };
+        const index = target orelse {
+            self.mutex.unlock();
+            return false;
+        };
+        const retired = self.entries[index].?.index;
+        self.entries[index] = null;
+        self.mutex.unlock();
+        retired.release();
+        return true;
+    }
+    pub fn build(self: *Cache, key: [32]u8, prior: ?*const Index, chunks: []const Chunk, context: Context) !*Index {
+        const index = while (true) {
+            try context.ensureActive();
+            break Index.build(self.budget.allocator(), prior, chunks, context) catch |err| {
+                if (err != error.OutOfMemory or !self.evictOne()) return err;
+                continue;
+            };
+        };
+        index.cache_owner = self;
+        self.put(key, index);
+        return index;
     }
     pub fn get(self: *Cache, key: [32]u8) ?*Index {
         self.lock();
@@ -398,4 +496,24 @@ test "external lake metadata navigation persistent catalogs reuse chunks and def
         }
     };
     try @import("antfly_platform").allocator.checkAllAllocationFailures(a, Harness.run, .{ old, next.chunks });
+    var cache: Cache = .{ .budget = .{ .backing = a, .limit = 128 * 1024 } };
+    defer cache.deinit();
+    const resident = try cache.build(@splat(1), null, old.chunks, .{});
+    resident.release();
+    cache.budget.limit = cache.budget.live + cache.budget.live / 2;
+    const replacement = try cache.build(@splat(2), null, old.chunks, .{});
+    defer replacement.release();
+    try std.testing.expectEqual(old.count(), replacement.count());
+    try std.testing.expect(cache.get(@splat(1)) == null);
+    // Reader pins survive eviction, even if they prevent reclaiming quota.
+    try std.testing.expect(cache.evictOne());
+    try std.testing.expectEqual(old.count(), replacement.count());
+    const Cold = struct {
+        fn run(failing: A, chunks: []const Chunk) !void {
+            const index = try Index.build(failing, null, chunks, .{});
+            defer index.release();
+            try std.testing.expectEqual(@as(usize, 201), index.count());
+        }
+    };
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(a, Cold.run, .{next.chunks});
 }

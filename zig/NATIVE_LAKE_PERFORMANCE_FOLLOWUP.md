@@ -4558,3 +4558,45 @@ Python formatting/lint, whitespace, all 102 changed source license headers, and
 the Apache product boundary passed (2,054 source files). Provider qualification
 and archive-scale latency/RSS benchmarks remain deferred; this is functional
 and ownership qualification, not an archive-scale performance measurement.
+
+
+### Catalog admission, cold construction, and independent delete-file indexes
+
+Catalog and lazy-ordering allocations now evict predecessor-cache pins and retry
+before falling back. Active reader pins remain valid. Cold catalogs bulk-build
+one node per file through sorted manifest merging; incremental trees continue
+to copy only changed paths. Allocation-failure sweeps cover the bulk builder,
+and a quota-pressure regression verifies eviction and surviving reader pins.
+
+Selected Iceberg views share independently owned delete-file indexes keyed by
+strong provider identity, complete recipe/schema, credential scope and policy.
+Fresh object stats precede lookup. Views apply applicability and bounds locally;
+large or weakly identified files retain streaming decode. Per-loader admission
+is 64 MiB, foreign index leases are capped at 256 MiB per prepared view, and cache
+residency counts foreign bytes. Regression coverage checks selected-view reuse,
+zero additional range reads on reuse, streaming fallback, and same-size provider
+replacement. Streaming position deletes now use direct data-path lookup too.
+
+Text-frontier sibling metadata warming uses two scheduler lanes with independent
+2 MiB workspaces and 1 MiB read allowances. Optional reads total at most 8 MiB per
+query. Saturation skips warming, cancellation drains workers, and all authority,
+scoring and traversal reductions stay on the coordinator. A ranked-equivalence
+regression exercises the parallel path. Composed benchmark timings now carry
+actual completed worker execution durations, including membership preparation,
+instead of timing result transfer. Component durations may overlap.
+
+Live-provider retention qualification and archive-scale cold/warm latency and
+RSS benchmarks remain deferred. The bounded algorithms and fixture read counts
+establish ownership/correctness and removed work; they do not measure production
+archive speedups.
+
+
+Final qualification with origin/main `d0614ed7e5`: Debug CLI built; all 481 lake
+integration tests passed (178 shared-engine and 303 server), all 77 focused
+tests passed (17 and 60), and all 46 real Parquet/Iceberg E2Es passed in 312.91
+seconds. The E2Es ran on the host volume with production disk-admission rules.
+Pinned-compiler native error metadata, Zig/Python formatting and lint,
+whitespace, all 104 changed source license headers, and the Apache product
+boundary passed (2,060 source files). These results qualify behavior and
+ownership; representative archive-scale latency/RSS and live-provider retention
+qualification remain deferred.

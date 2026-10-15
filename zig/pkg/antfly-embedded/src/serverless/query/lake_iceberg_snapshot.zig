@@ -954,7 +954,7 @@ fn planSharedChunks(a: Allocator, request: SnapshotReadRequest, metadata: iceber
         offset += count;
     }
     if (request.catalogs) |cache| {
-        const catalog = catalog_api.Index.build(cache.budget.allocator(), prior, chunks.items, request.context) catch |err| switch (err) {
+        const catalog = cache.build(catalog_key, prior, chunks.items, request.context) catch |err| switch (err) {
             error.OutOfMemory => null,
             else => return err,
         };
@@ -969,7 +969,6 @@ fn planSharedChunks(a: Allocator, request: SnapshotReadRequest, metadata: iceber
             var delete_plan: IcebergDeletePlan = .{ .files = try deletes.toOwnedSlice(a) };
             errdefer delete_plan.deinit(a);
             try delete_plan.validate();
-            cache.put(catalog_key, index);
             return .{ .catalog = index, .inventory = inventory, .delete_plan = delete_plan };
         }
     }
