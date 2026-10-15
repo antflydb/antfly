@@ -378,38 +378,53 @@ pub const InstallationWitness = struct {
     }
 };
 
-fn requireWitnesses(signed: SignedReceipt, validation: ?ValidationWitness, installation: ?InstallationWitness) !void {
+/// One signature covers the complete canonical cleanup record. It is physical
+/// evidence, not an independent permission to cancel or lift the source fence.
+pub const CancellationWitness = struct {
+    record: local.storage_db_relational_index_owner_job.Canceled,
+    pub fn verifyFor(self: @This(), signed: SignedReceipt) !void {
+        try signed.verifySignature();
+        try self.verifyScope(signed);
+    }
+    fn verifyScope(self: @This(), signed: SignedReceipt) !void {
+        if (signed.receipt.owner.authority != .native or signed.receipt.action != .canceled or
+            !std.meta.eql(try self.record.receipt(), signed.receipt)) return error.InvalidIndexOwnerReceipt;
+    }
+};
+
+fn requireWitnesses(signed: SignedReceipt, validation: ?ValidationWitness, installation: ?InstallationWitness, cancellation: ?CancellationWitness) !void {
     const is_native = signed.receipt.owner.authority == .native;
     if ((is_native and signed.receipt.action == .validated) != (validation != null) or
-        (is_native and signed.receipt.action == .installed) != (installation != null)) return error.InvalidIndexOwnerReceipt;
+        (is_native and signed.receipt.action == .installed) != (installation != null) or
+        (is_native and signed.receipt.action == .canceled) != (cancellation != null)) return error.InvalidIndexOwnerReceipt;
 }
 
 /// One retained stage record, not a second independently committed journal.
 /// Native validation/installation retain mandatory bounded physical witnesses;
 /// neither bare receipts nor older private witness formats are accepted.
 pub const StoredProof = struct {
-    const magic = "AIVP\x02\x00\x00\x00";
+    const magic = "AIVP\x03\x00\x00\x00";
     bytes: [max_ack_bytes]u8,
     len: usize,
-    const Witnesses = struct { validation: ?ValidationWitness, installation: ?InstallationWitness };
-    pub const Decoded = struct { signed: SignedReceipt, validation: ?ValidationWitness, installation: ?InstallationWitness = null };
+    const Witnesses = struct { validation: ?ValidationWitness, installation: ?InstallationWitness, cancellation: ?CancellationWitness };
+    pub const Decoded = struct { signed: SignedReceipt, validation: ?ValidationWitness, installation: ?InstallationWitness = null, cancellation: ?CancellationWitness = null };
 
     pub fn slice(self: *const @This()) []const u8 {
         return self.bytes[0..self.len];
     }
-    pub fn encode(signed: SignedReceipt, validation: ?ValidationWitness, installation: ?InstallationWitness) !@This() {
-        try requireWitnesses(signed, validation, installation);
-        if (validation) |witness| try witness.verifyFor(signed) else if (installation) |witness| try witness.verifyFor(signed) else try signed.verifySignature();
-        return encodeCanonical(signed, validation, installation);
+    pub fn encode(signed: SignedReceipt, validation: ?ValidationWitness, installation: ?InstallationWitness, cancellation: ?CancellationWitness) !@This() {
+        try requireWitnesses(signed, validation, installation, cancellation);
+        if (validation) |witness| try witness.verifyFor(signed) else if (installation) |witness| try witness.verifyFor(signed) else if (cancellation) |witness| try witness.verifyFor(signed) else try signed.verifySignature();
+        return encodeCanonical(signed, validation, installation, cancellation);
     }
-    fn encodeCanonical(signed: SignedReceipt, validation: ?ValidationWitness, installation: ?InstallationWitness) !StoredProof {
+    fn encodeCanonical(signed: SignedReceipt, validation: ?ValidationWitness, installation: ?InstallationWitness, cancellation: ?CancellationWitness) !StoredProof {
         var result: @This() = .{ .bytes = undefined, .len = 0 };
         const fixed = try signed.encode();
-        if (validation != null or installation != null) {
+        if (validation != null or installation != null or cancellation != null) {
             @memcpy(result.bytes[0..8], magic);
             @memcpy(result.bytes[8..][0..SignedReceipt.encoded_len], &fixed);
             var writer = std.Io.Writer.fixed(result.bytes[8 + SignedReceipt.encoded_len ..]);
-            std.json.Stringify.value(Witnesses{ .validation = validation, .installation = installation }, .{}, &writer) catch return error.InvalidIndexOwnerReceipt;
+            std.json.Stringify.value(Witnesses{ .validation = validation, .installation = installation, .cancellation = cancellation }, .{}, &writer) catch return error.InvalidIndexOwnerReceipt;
             result.len = 8 + SignedReceipt.encoded_len + writer.end;
         } else {
             @memcpy(result.bytes[0..SignedReceipt.encoded_len], &fixed);
@@ -420,7 +435,7 @@ pub const StoredProof = struct {
     pub fn decode(alloc: Allocator, raw: []const u8) !Decoded {
         if (raw.len == SignedReceipt.encoded_len) {
             const signed = try SignedReceipt.decode(raw);
-            requireWitnesses(signed, null, null) catch return error.InvalidCatalogRecord;
+            requireWitnesses(signed, null, null, null) catch return error.InvalidCatalogRecord;
             return .{ .signed = signed, .validation = null };
         }
         if (raw.len <= 8 + SignedReceipt.encoded_len or raw.len > max_ack_bytes or !std.mem.eql(u8, raw[0..8], magic)) return error.InvalidCatalogRecord;
@@ -432,12 +447,13 @@ pub const StoredProof = struct {
         defer parsed.deinit();
         // The fixed receipt decoder already verified its logical signature.
         const witnesses = parsed.value;
-        requireWitnesses(signed, witnesses.validation, witnesses.installation) catch return error.InvalidCatalogRecord;
+        requireWitnesses(signed, witnesses.validation, witnesses.installation, witnesses.cancellation) catch return error.InvalidCatalogRecord;
         if (witnesses.validation) |witness| witness.verifyPhysicalAndScope(signed) catch return error.InvalidCatalogRecord;
         if (witnesses.installation) |witness| witness.verifyPhysicalAndScope(signed) catch return error.InvalidCatalogRecord;
-        const canonical = try encodeCanonical(signed, witnesses.validation, witnesses.installation);
+        if (witnesses.cancellation) |witness| witness.verifyScope(signed) catch return error.InvalidCatalogRecord;
+        const canonical = try encodeCanonical(signed, witnesses.validation, witnesses.installation, witnesses.cancellation);
         if (!std.mem.eql(u8, raw, canonical.slice())) return error.InvalidCatalogRecord;
-        return .{ .signed = signed, .validation = witnesses.validation, .installation = witnesses.installation };
+        return .{ .signed = signed, .validation = witnesses.validation, .installation = witnesses.installation, .cancellation = witnesses.cancellation };
     }
 };
 pub const max_ack_status_bytes = 8192;
@@ -463,13 +479,14 @@ pub const Ack = struct {
     signed: SignedReceipt,
     validation: ?ValidationWitness = null,
     installation: ?InstallationWitness = null,
+    cancellation: ?CancellationWitness = null,
 
     pub fn validate(self: Ack) !void {
         if (self.table_id == 0 or self.signed.receipt.owner.namespace.table_id != self.table_id or
             self.expected_revision == 0 or self.expected_revision == std.math.maxInt(u64)) return error.InvalidGenerationPublication;
         try (progress.OwnerState{ .owner = self.signed.receipt.owner }).validate();
-        try requireWitnesses(self.signed, self.validation, self.installation);
-        if (self.validation) |witness| try witness.verifyFor(self.signed) else if (self.installation) |witness| try witness.verifyFor(self.signed) else try self.signed.verifySignature();
+        try requireWitnesses(self.signed, self.validation, self.installation, self.cancellation);
+        if (self.validation) |witness| try witness.verifyFor(self.signed) else if (self.installation) |witness| try witness.verifyFor(self.signed) else if (self.cancellation) |witness| try witness.verifyFor(self.signed) else try self.signed.verifySignature();
     }
 
     pub fn auditEvidence(self: @This()) ?AuditEvidence {
@@ -712,6 +729,31 @@ pub fn requireNativeReleaseReceipt(group: u64, incarnation: local.metadata_incar
         installed.signed.proof.reporter_incarnation != signed.proof.reporter_incarnation) return error.IndexOwnerReceiptChanged;
 }
 
+/// Shared live/recovery binding. Unvisited owners need no invented prior cut;
+/// visited owners cannot adopt a replacement root or another physical job by
+/// presenting a fresh cancellation signature.
+pub fn requireNativeCancellationWitness(group: u64, head: progress.Head, owner: progress.OwnerState, dispatch: Dispatch, witness: CancellationWitness, signed: SignedReceipt, prior: ?StoredProof.Decoded) !void {
+    if (group == 0) return error.InvalidCatalogRecord;
+    try head.validate();
+    try owner.validate();
+    try dispatch.requireOwner(owner.owner);
+    // Live apply validated the ACK; recovery decoded the signed fixed proof.
+    // Rejoin immutable scope here without repeating signature verification.
+    try witness.verifyScope(signed);
+    if (head.phase != .canceling and head.phase != .cancel_releasing and head.phase != .canceled) return error.GenerationPublicationChanged;
+    const decision: OwnerDecision = .{ .metadata_group_id = group, .metadata_incarnation = signed.proof.identity.metadata_incarnation, .head = head, .owner = owner, .disposition = .execute, .dispatch = dispatch };
+    const binding = witness.record.binding;
+    try decision.requireRetainedNativeBinding(binding);
+    if (witness.record.cleanup.claim_allocation != dispatch.native_claim_allocation) return error.PrivateIndexOwnerJobChanged;
+    if (prior) |accepted| {
+        const previous = accepted.signed;
+        if (previous.receipt.position != .native or witness.record.cleanup.position.sequence <= previous.receipt.position.native.sequence or
+            !std.meta.eql(previous.proof.identity, signed.proof.identity) or !std.meta.eql(previous.proof.authority, signed.proof.authority) or
+            previous.proof.root_generation != signed.proof.root_generation or previous.proof.reporter_incarnation != signed.proof.reporter_incarnation) return error.IndexOwnerReceiptChanged;
+        if (accepted.validation) |validation| if (!std.meta.eql(validation.outcome.binding, binding)) return error.PrivateIndexOwnerJobChanged;
+    }
+}
+
 pub const OwnerDecision = struct {
     pub const Attestation = struct {
         table_name: []const u8,
@@ -911,6 +953,8 @@ pub const OwnerDecision = struct {
             !observed.fence.eql(try privateIndexFence(dispatch.id, dispatch.owner)) or
             !std.mem.eql(u8, &observed.integrity_candidate, &self.head.candidate_digest) or
             !std.mem.eql(u8, &observed.integrity_reserved, &self.head.reservation_digest) or
+            !std.mem.eql(u8, &observed.schema_before, &dispatch.native_schema_digest) or
+            !std.mem.eql(u8, &observed.inputs_digest, &dispatch.native_inputs_digest) or
             observed.physical_reserved.schema_version != dispatch.table_guard.owner.schema_version or
             observed.physical_candidate.schema_version != dispatch.successor_schema_version) return error.PrivateIndexOwnerJobChanged;
     }
@@ -1329,7 +1373,7 @@ pub const Inputs = struct {
 /// The table guard and successor identity support indexed live-catalog checks;
 /// the complete owner descriptor is independently bound by fence_digest.
 pub const Dispatch = struct {
-    format_version: u16 = 1,
+    format_version: u16 = 2,
     id: Id,
     plan_digest: Digest,
     ordinal: u16,
@@ -1338,6 +1382,9 @@ pub const Dispatch = struct {
     table_name: []const u8,
     successor_schema_version: u32,
     successor_schema_digest: Digest,
+    native_inputs_digest: Digest,
+    native_schema_digest: Digest,
+    native_claim_allocation: u64,
     owner: Owner,
 
     pub fn nativeIdentity(self: Dispatch, expected: progress.Owner) !native_control.Identity {
@@ -1357,7 +1404,7 @@ pub const Dispatch = struct {
 
     fn requireOwner(d: Dispatch, expected: progress.Owner) !void {
         try (progress.OwnerState{ .owner = expected }).validate();
-        if (d.format_version != 1 or !std.mem.eql(u8, &d.id, &expected.plan_id) or
+        if (d.format_version != 2 or d.native_claim_allocation == 0 or std.mem.allEqual(u8, &d.native_schema_digest, 0) or std.mem.allEqual(u8, &d.native_inputs_digest, 0) or !std.mem.eql(u8, &d.id, &expected.plan_id) or
             !std.mem.eql(u8, &d.plan_digest, &expected.plan_digest) or d.ordinal != expected.ordinal or
             d.namespace_id == 0 or d.table_name.len == 0 or d.successor_schema_version == 0 or
             d.owner.range.group_id != expected.group_id or !d.owner.namespace.eql(expected.namespace) or
@@ -1552,6 +1599,8 @@ pub const Plan = struct {
         const dispatch = try a.alloc([]const u8, self.owners.len);
         const successor_version = try @import("../api/tables.zig").schemaVersion(self.after.schema_json);
         const successor_digest = digest(self.after.schema_json);
+        const native_inputs_digest = digest(candidate.inputs.bytes);
+        const native_claim_allocation = (try local.storage_db_relational_integrity_catalog.privateIndexAllocationFromReservation(candidate.reservation.value, head.reservation_digest, head.table_id)).allocation;
         for (self.owners, dispatch, 0..) |owner, *bytes, ordinal| bytes.* = try encodeBounded(a, Dispatch{
             .id = self.id,
             .plan_digest = plan_digest,
@@ -1561,6 +1610,9 @@ pub const Plan = struct {
             .table_name = self.before.name,
             .successor_schema_version = successor_version,
             .successor_schema_digest = successor_digest,
+            .native_inputs_digest = native_inputs_digest,
+            .native_schema_digest = candidate.native_before_schema_digest,
+            .native_claim_allocation = native_claim_allocation,
             .owner = owner,
         });
         const reservation: names.Entry.Reservation = .{ .successor = .{
@@ -1767,6 +1819,7 @@ pub fn verifyOwned(a: Allocator, txn: anytype, group: u64, table: u64) !Verified
         delivery_rows[0] = std.math.add(u64, delivery_rows[0], accepted.source_rows) catch return error.InvalidCatalogRecord;
         delivery_rows[1] = std.math.add(u64, delivery_rows[1], accepted.target_rows) catch return error.InvalidCatalogRecord;
         var installed_proof: ?StoredProof.Decoded = null;
+        var prior_cleanup: ?StoredProof.Decoded = null;
         for (owner.receipts, 0..) |logical, action_index| {
             const action: progress.Action = @fromBackingInt(@intCast(action_index));
             if (std.mem.allEqual(u8, &logical, 0)) {
@@ -1777,6 +1830,12 @@ pub fn verifyOwned(a: Allocator, txn: anytype, group: u64, table: u64) !Verified
             const retained = try storedProof(a, proof_bytes orelse return error.InvalidCatalogRecord, head, owner, action);
             const signed = retained.signed;
             if (action == .installed) installed_proof = retained;
+            if (action == .fenced or action == .reserved or action == .validated) prior_cleanup = retained;
+            if (retained.cancellation) |witness| {
+                var dispatch = try readDispatch(a, txn, group, owner.owner);
+                defer dispatch.deinit();
+                requireNativeCancellationWitness(group, head, owner, dispatch.value, witness, signed, prior_cleanup) catch return error.InvalidCatalogRecord;
+            }
             if (action == .released and owner.owner.authority == .native) {
                 requireNativeReleaseReceipt(group, std.fmt.bytesToHex(parsed.value.table_guard.incarnation, .lower), head, owner, installed_proof orelse return error.InvalidCatalogRecord, signed) catch return error.InvalidCatalogRecord;
             }
@@ -2127,12 +2186,12 @@ test "relational index publication native dispatch binds exact admitted fence an
         .integrity_before = admission.fence.catalog_digest,
         .integrity_reserved = admission.reservation_digest,
         .integrity_candidate = admission.candidate_digest,
-        .schema_before = @splat(3),
+        .schema_before = permission.dispatch.?.native_schema_digest,
         .physical_before = null,
         .physical_reserved = .{ .revision = 2, .schema_version = 1, .blob_digest = @splat(4) },
         .physical_candidate = .{ .revision = 2, .schema_version = 2, .blob_digest = @splat(5) },
         .index = .{ .generation = 2, .slot = 0 },
-        .inputs_digest = @splat(6),
+        .inputs_digest = permission.dispatch.?.native_inputs_digest,
     };
     const fence_control = try permission.nativeControl(request, binding);
     try std.testing.expectEqual(.fenced, fence_control.effect);

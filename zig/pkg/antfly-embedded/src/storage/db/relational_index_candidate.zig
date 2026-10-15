@@ -34,6 +34,7 @@ pub const Candidate = struct {
     next: catalog.Update,
     reservation: catalog.Update,
     definition_digest: [32]u8,
+    native_before_schema_digest: [32]u8,
     inputs: inputs_mod.Prepared,
 
     pub fn deinit(self: *Candidate) void {
@@ -60,6 +61,15 @@ pub const Candidate = struct {
             after.version != (std.math.add(u32, before.version, 1) catch return error.InvalidIndexPublicationCandidate))
             return error.InvalidIndexPublicationCandidate;
         const definition_digest = try validatePhysicalPair(alloc, after, name);
+        // Public JSON identity and native schema framing are different values.
+        // Derive this bridge from the already parsed declaration, once during
+        // candidate preparation, never in metadata's serialized ACK section.
+        const runtime = try schema_api.deriveRuntimeTableSchema(alloc, before);
+        defer native_schema.freeSchema(alloc, runtime);
+        const schema_bytes = try native_schema.serializeSchema(alloc, runtime);
+        defer alloc.free(schema_bytes);
+        var native_before_schema_digest: [32]u8 = undefined;
+        std.crypto.hash.Blake3.hash(schema_bytes, &native_before_schema_digest, .{});
         var current = try compiler.compileCatalog(alloc, before, table_id, predecessor);
         defer current.deinit();
         if (!std.mem.eql(u8, current.value, predecessor)) return error.IntegrityCatalogChanged;
@@ -69,7 +79,7 @@ pub const Candidate = struct {
         var reservation = try catalog.prepareIndexReservation(alloc, predecessor, next.catalog, name);
         errdefer reservation.deinit();
         const inputs = try inputs_mod.Prepared.init(alloc, .{ .before_json = before_json, .after_json = after_json, .predecessor = predecessor, .name = name });
-        return .{ .next = next, .reservation = reservation, .definition_digest = definition_digest, .inputs = inputs };
+        return .{ .next = next, .reservation = reservation, .definition_digest = definition_digest, .native_before_schema_digest = native_before_schema_digest, .inputs = inputs };
     }
 };
 

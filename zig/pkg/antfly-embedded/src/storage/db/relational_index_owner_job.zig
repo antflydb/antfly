@@ -214,6 +214,7 @@ pub const Binding = struct {
 };
 
 pub fn prepare(id: [16]u8, plan_digest: Digest, owner_digest: Digest, ordinal: u16, fence: topology.Fence, authority: publication.Authority, candidate: *const candidate_mod.Candidate, physical: *const physical_catalog.PrivateAddition) !Binding {
+    if (!std.mem.eql(u8, &candidate.native_before_schema_digest, &physical.reservation.schema_digest)) return error.RelationalIndexCatalogSchemaMismatch;
     const before = candidate.reservation.expected orelse return error.InvalidPrivateIndexOwnerJob;
     const binding: Binding = .{
         .id = id,

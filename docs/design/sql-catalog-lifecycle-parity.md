@@ -8244,3 +8244,46 @@ leaks. Formatting, diff, licensing, Apache boundary, control-catalog and origina
 inventory integrity checks pass. Intermediate compile failures were the missing
 prepared-operation dispatcher branch and fixture/inspection syntax; no failing
 or empty-selection run is counted as qualification.
+
+### Signed cleanup witnesses and bounded metadata verification
+
+Native canceled acknowledgments now require the complete cleanup record covered
+by the root signature. A bare canceled receipt is rejected. The private retained
+proof format is version 3; validation, installation and cancellation keep their
+mandatory witnesses in the same atomic metadata stage record, without a second
+journal or support for older private witness formats.
+
+Admission's fixed owner projection (version 2) stores the native manifest digest,
+native before-schema digest and burned claim allocation. The shared candidate
+compiler derives the native schema identity from its already parsed declaration;
+native admission checks it against the actual physical reservation. Public JSON
+schema identity remains separate. All forward and cancellation binding checks use
+these admitted identities without schema-sized recompilation in the ACK section.
+
+Live cancellation apply joins the witness to the current catalog/range/lock and
+the latest visited stage's root. A validated owner's physical binding must remain
+identical; unvisited owners need no invented prior receipt. Cold recovery repeats
+the same immutable joins and cannot accept a changed claim allocation even when
+an injected record has consistent signatures, receipt hashes and owner hashes.
+The signed completion receiver uses fresh metadata permission and the applying
+lease's generation. Pending replication or signing failure yields no ACK while
+preserving the original durable completion cut for retry.
+
+Qualification passes for exact accepted retries, per-write head/owner/proof
+abort faults, raw-witness rejection, schema/manifest substitution, cold consistent
+forgery rejection, reader-capability cleanup and actual leased-owner signing.
+The first real-owner run correctly rejected comparing a native binary schema
+digest with a public JSON digest; the shared compiler bridge fixes that mismatch
+without weakening either identity check. Mounted scheduling and final cohort
+fence release remain unfinished. No original SQL credit or public activation is
+claimed by this checkpoint.
+
+The frozen-source full Debug gate passed 159/159 build steps in
+`/private/tmp/antfly-index-cancellation-witness-full-debug-5.log`: 261 test executions
+across metadata, native/storage, ABI, runtime and standalone lanes, with no failures
+or leaks. Formatting, diff, Apache boundary, licensing, control-catalog and original
+inventory integrity checks pass. The broader intermediate run exposed a negative
+fixture expecting the internal catalog error at the snapshot boundary; the final
+fixture asserts both `InvalidCatalogRecord` internally and `InvalidMetadataSnapshot`
+at snapshot validation. Production rejection was retained unchanged. Original
+accounting remains 483 implemented / 862 unresolved.
