@@ -562,22 +562,24 @@ pub fn extractNativeFileToStagingDirectoryWithBase(
     staging_root: []const u8,
     base: ?NativeBaseBlobSource,
 ) !void {
-    return extractNativeFileToStagingDirectoryOptions(alloc, io, source, source_size, staging_root, base, .none);
+    return extractNativeFileToStagingDirectoryOptions(alloc, io, source, source_size, staging_root, base, .none, false);
 }
 
+/// Cancellable inspection uses private scratch; existing restore entry points
+/// retain their portable path handling and default directory permissions.
 pub fn extractNativeFileToStagingDirectoryCancellable(alloc: std.mem.Allocator, io: std.Io, source: std.Io.File, source_size: u64, staging_root: []const u8, cancellation: @import("antfly_cancellation").CancellationToken) !void {
-    return extractNativeFileToStagingDirectoryOptions(alloc, io, source, source_size, staging_root, null, cancellation);
+    return extractNativeFileToStagingDirectoryOptions(alloc, io, source, source_size, staging_root, null, cancellation, true);
 }
 
-fn extractNativeFileToStagingDirectoryOptions(alloc: std.mem.Allocator, io: std.Io, source: std.Io.File, source_size: u64, staging_root: []const u8, base: ?NativeBaseBlobSource, cancellation: @import("antfly_cancellation").CancellationToken) !void {
+fn extractNativeFileToStagingDirectoryOptions(alloc: std.mem.Allocator, io: std.Io, source: std.Io.File, source_size: u64, staging_root: []const u8, base: ?NativeBaseBlobSource, cancellation: @import("antfly_cancellation").CancellationToken, private_scratch: bool) !void {
     try cancellation.check();
     if (pathExists(io, staging_root)) return error.PathAlreadyExists;
     const blob_root = try std.fmt.allocPrint(alloc, "{s}.afb2-blobs", .{staging_root});
     defer alloc.free(blob_root);
     if (pathExists(io, blob_root)) return error.PathAlreadyExists;
-    _ = try std.Io.Dir.cwd().createDirPathStatus(io, staging_root, .fromMode(0o700));
+    if (private_scratch) try createPrivateExtractionDirectory(io, staging_root) else try fs_paths.createDirPathPortable(io, staging_root);
     errdefer std.Io.Dir.cwd().deleteTree(io, staging_root) catch {};
-    _ = try std.Io.Dir.cwd().createDirPathStatus(io, blob_root, .fromMode(0o700));
+    if (private_scratch) try createPrivateExtractionDirectory(io, blob_root) else try fs_paths.createDirPathPortable(io, blob_root);
     defer std.Io.Dir.cwd().deleteTree(io, blob_root) catch {};
 
     const trailer = try readTrailerFromFile(io, source, source_size);
@@ -821,6 +823,17 @@ fn finishExtractedBlob(
     }
 }
 
+fn createPrivateExtractionDirectory(io: std.Io, path: []const u8) !void {
+    // Keep the shared path helper's support for symlinked absolute ancestors.
+    // Create only the new leaf with private permissions, without a chmod window.
+    if (std.fs.path.dirname(path)) |parent| try fs_paths.createDirPathPortable(io, parent);
+    if (std.fs.path.isAbsolute(path)) {
+        try std.Io.Dir.createDirAbsolute(io, path, .fromMode(0o700));
+    } else {
+        try std.Io.Dir.cwd().createDir(io, path, .fromMode(0o700));
+    }
+}
+
 fn pathExists(io: std.Io, path: []const u8) bool {
     var dir = if (std.fs.path.isAbsolute(path))
         std.Io.Dir.openDirAbsolute(io, path, .{}) catch return false
@@ -871,6 +884,35 @@ test "AFB2 native directory round trips through staged extraction" {
     const restored = try std.Io.Dir.cwd().readFileAlloc(io, restored_dense_path, alloc, .limited(1024));
     defer alloc.free(restored);
     try std.testing.expectEqualStrings("searchable-dense-generation", restored);
+
+    if (@import("builtin").os.tag != .windows) {
+        // Absolute temporary roots may contain symlinks (for example /tmp on
+        // macOS). Both existing restore and private inspection must accept them.
+        try output_tmp.dir.symLink(io, ".", "directory-link", .{ .is_directory = true });
+        const output_root = try output_tmp.dir.realPathFileAlloc(io, ".", alloc);
+        defer alloc.free(output_root);
+        const legacy = try std.fmt.allocPrint(alloc, "{s}/directory-link/legacy", .{output_root});
+        defer alloc.free(legacy);
+        const private = try std.fmt.allocPrint(alloc, "{s}/directory-link/private", .{output_root});
+        defer alloc.free(private);
+        const reference = try std.fmt.allocPrint(alloc, "{s}/directory-link/reference", .{output_root});
+        defer alloc.free(reference);
+        try fs_paths.createDirPathPortable(io, reference);
+        try extractNativeFileToStagingDirectory(alloc, io, archive_file, archive.items.len, legacy);
+        try extractNativeFileToStagingDirectoryCancellable(alloc, io, archive_file, archive.items.len, private, .none);
+        const reference_stat = try std.Io.Dir.cwd().statFile(io, reference, .{});
+        const legacy_stat = try std.Io.Dir.cwd().statFile(io, legacy, .{});
+        const private_stat = try std.Io.Dir.cwd().statFile(io, private, .{});
+        try std.testing.expectEqual(reference_stat.permissions.toMode(), legacy_stat.permissions.toMode());
+        try std.testing.expectEqual(@as(std.posix.mode_t, 0o700), private_stat.permissions.toMode() & 0o777);
+        for ([_][]const u8{ legacy, private }) |root| {
+            const content_path = try std.fmt.allocPrint(alloc, "{s}/indexes/dense/segment.bin", .{root});
+            defer alloc.free(content_path);
+            const content = try std.Io.Dir.cwd().readFileAlloc(io, content_path, alloc, .limited(1024));
+            defer alloc.free(content);
+            try std.testing.expectEqualStrings("searchable-dense-generation", content);
+        }
+    }
 }
 
 const TestBaseBlobContext = struct {
