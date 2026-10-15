@@ -248,7 +248,84 @@ pub const SignedReceipt = struct {
 };
 pub const max_bytes = 8 * 1024 * 1024;
 pub const max_command_bytes = max_bytes + 16 * 1024;
-pub const max_ack_bytes = 4096;
+pub const max_ack_bytes = 32 * 1024;
+
+pub const ValidationWitness = struct {
+    outcome: native_control.AuditOutcome,
+    signed: SignedAudit,
+
+    /// Consistency and signatures only. Accepting apply must independently
+    /// join frozen provenance and current root authority in its transaction.
+    pub fn verifyFor(self: @This(), receipt: SignedReceipt) !void {
+        if (receipt.receipt.action != .validated or receipt.receipt.position != .native) return error.InvalidIndexOwnerReceipt;
+        try receipt.verifySignature();
+        return self.verifyPhysicalAndScope(receipt);
+    }
+    fn verifyPhysicalAndScope(self: @This(), receipt: SignedReceipt) !void {
+        _ = try self.signed.verifiedDigest(self.outcome);
+        const command = try self.outcome.logicalCommand();
+        if (!std.meta.eql(try command.receipt(receipt.receipt.position.native), receipt.receipt) or
+            !std.meta.eql(self.signed.proof.identity, receipt.proof.identity) or
+            !std.meta.eql(self.signed.proof.authority, receipt.proof.authority) or
+            self.signed.proof.reporter_incarnation != receipt.proof.reporter_incarnation or
+            self.signed.proof.root_generation != receipt.proof.root_generation) return error.InvalidIndexOwnerReceipt;
+    }
+};
+
+/// One retained stage record, not a second independently committed journal.
+/// Existing non-validation receipts retain their fixed codec. Native validation
+/// has a mandatory bounded witness; no bare/legacy validation record is accepted.
+pub const StoredProof = struct {
+    const magic = "AIVP\x01\x00\x00\x00";
+    bytes: [max_ack_bytes]u8,
+    len: usize,
+    pub const Decoded = struct { signed: SignedReceipt, validation: ?ValidationWitness };
+
+    pub fn slice(self: *const @This()) []const u8 {
+        return self.bytes[0..self.len];
+    }
+    pub fn encode(signed: SignedReceipt, validation: ?ValidationWitness) !@This() {
+        const required = signed.receipt.owner.authority == .native and signed.receipt.action == .validated;
+        if (required != (validation != null)) return error.InvalidIndexOwnerReceipt;
+        if (validation) |witness| try witness.verifyFor(signed) else try signed.verifySignature();
+        return encodeCanonical(signed, validation);
+    }
+    fn encodeCanonical(signed: SignedReceipt, validation: ?ValidationWitness) !StoredProof {
+        var result: @This() = .{ .bytes = undefined, .len = 0 };
+        const fixed = try signed.encode();
+        if (validation) |witness| {
+            @memcpy(result.bytes[0..8], magic);
+            @memcpy(result.bytes[8..][0..SignedReceipt.encoded_len], &fixed);
+            var writer = std.Io.Writer.fixed(result.bytes[8 + SignedReceipt.encoded_len ..]);
+            std.json.Stringify.value(witness, .{}, &writer) catch return error.InvalidIndexOwnerReceipt;
+            result.len = 8 + SignedReceipt.encoded_len + writer.end;
+        } else {
+            @memcpy(result.bytes[0..SignedReceipt.encoded_len], &fixed);
+            result.len = fixed.len;
+        }
+        return result;
+    }
+    pub fn decode(alloc: Allocator, raw: []const u8) !Decoded {
+        if (raw.len == SignedReceipt.encoded_len) {
+            const signed = try SignedReceipt.decode(raw);
+            if (signed.receipt.owner.authority == .native and signed.receipt.action == .validated) return error.InvalidCatalogRecord;
+            return .{ .signed = signed, .validation = null };
+        }
+        if (raw.len <= 8 + SignedReceipt.encoded_len or raw.len > max_ack_bytes or !std.mem.eql(u8, raw[0..8], magic)) return error.InvalidCatalogRecord;
+        const signed = try SignedReceipt.decode(raw[8..][0..SignedReceipt.encoded_len]);
+        if (signed.receipt.owner.authority != .native or signed.receipt.action != .validated) return error.InvalidCatalogRecord;
+        var parsed = std.json.parseFromSlice(ValidationWitness, alloc, raw[8 + SignedReceipt.encoded_len ..], .{ .ignore_unknown_fields = false, .max_value_len = 128 }) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => return error.InvalidCatalogRecord,
+        };
+        defer parsed.deinit();
+        // The fixed receipt decoder already verified its logical signature.
+        parsed.value.verifyPhysicalAndScope(signed) catch return error.InvalidCatalogRecord;
+        const canonical = try encodeCanonical(signed, parsed.value);
+        if (!std.mem.eql(u8, raw, canonical.slice())) return error.InvalidCatalogRecord;
+        return .{ .signed = signed, .validation = parsed.value };
+    }
+};
 pub const max_ack_status_bytes = 8192;
 
 /// Only use for reads or definitely-not-proposed mutations. The transport
@@ -269,12 +346,15 @@ pub const Ack = struct {
     table_id: u64,
     expected_revision: u64,
     signed: SignedReceipt,
+    validation: ?ValidationWitness = null,
 
     pub fn validate(self: Ack) !void {
         if (self.table_id == 0 or self.signed.receipt.owner.namespace.table_id != self.table_id or
             self.expected_revision == 0 or self.expected_revision == std.math.maxInt(u64)) return error.InvalidGenerationPublication;
         try (progress.OwnerState{ .owner = self.signed.receipt.owner }).validate();
-        try self.signed.verifySignature();
+        const required = self.signed.receipt.owner.authority == .native and self.signed.receipt.action == .validated;
+        if (required != (self.validation != null)) return error.InvalidIndexOwnerReceipt;
+        if (self.validation) |witness| try witness.verifyFor(self.signed) else try self.signed.verifySignature();
     }
 };
 
@@ -283,6 +363,8 @@ pub const Ack = struct {
 pub const AckStatus = struct {
     head: progress.Head,
     owner: progress.OwnerState,
+    validation_digest: ?Digest = null,
+    replication_pending: bool = false,
 
     pub fn isAcknowledged(self: AckStatus, request: Ack) !bool {
         try request.validate();
@@ -307,7 +389,11 @@ pub const AckStatus = struct {
         if (!std.mem.eql(u8, &stored, &try receipt.digest())) return error.GenerationPublicationChanged;
         const root = self.owner.attestations[@backingInt(receipt.action)];
         if (std.mem.allEqual(u8, &root, 0)) return error.InvalidCatalogRecord;
-        return std.mem.eql(u8, &root, &try request.signed.commitment());
+        if (request.validation) |witness| {
+            const retained = self.validation_digest orelse return error.InvalidCatalogRecord;
+            if (!std.mem.eql(u8, &retained, &witness.signed.outcome_digest)) return false;
+        }
+        return !self.replication_pending and std.mem.eql(u8, &root, &try request.signed.commitment());
     }
 };
 
@@ -750,14 +836,18 @@ pub fn proofKey(buf: []u8, group: u64, table: u64, ordinal: u16, action: progres
 
 /// Retained historical proof, not a fresh ownership grant. All returned fields
 /// are fixed-size values; no parsed allocation or borrowed JSON escapes.
-pub fn storedReceipt(bytes: []const u8, head: progress.Head, owner: progress.OwnerState, action: progress.Action) !SignedReceipt {
-    const signed = try SignedReceipt.decode(bytes);
+pub fn storedReceipt(alloc: Allocator, bytes: []const u8, head: progress.Head, owner: progress.OwnerState, action: progress.Action) !SignedReceipt {
+    return (try storedProof(alloc, bytes, head, owner, action)).signed;
+}
+pub fn storedProof(alloc: Allocator, bytes: []const u8, head: progress.Head, owner: progress.OwnerState, action: progress.Action) !StoredProof.Decoded {
+    const decoded = try StoredProof.decode(alloc, bytes);
+    const signed = decoded.signed;
     if (signed.receipt.action != action or !std.meta.eql(signed.receipt.owner, owner.owner) or
         !std.mem.eql(u8, &signed.receipt.candidate_digest, &head.candidate_digest) or
         !std.mem.eql(u8, &signed.receipt.reservation_digest, &head.reservation_digest) or
         !std.mem.eql(u8, &try signed.receipt.digest(), &owner.receipts[@backingInt(action)]) or
         !std.mem.eql(u8, &try signed.commitment(), &owner.attestations[@backingInt(action)])) return error.InvalidCatalogRecord;
-    return signed;
+    return decoded;
 }
 pub fn inputsKey(buf: []u8, group: u64, table: u64) ![]const u8 {
     return std.fmt.bufPrint(buf, "{s}inputs:{d}:{x:0>16}", .{ prefix, group, table });
@@ -1400,7 +1490,17 @@ pub fn verifyOwned(a: Allocator, txn: anytype, group: u64, table: u64) !Verified
                 continue;
             }
             const proof_bytes = try optionalGet(txn, try proofKey(&buf, group, table, @intCast(i), action));
-            const signed = try storedReceipt(proof_bytes orelse return error.InvalidCatalogRecord, head, owner, action);
+            const retained = try storedProof(a, proof_bytes orelse return error.InvalidCatalogRecord, head, owner, action);
+            const signed = retained.signed;
+            if (retained.validation) |witness| {
+                const frozen = @import("relational_index_delivery_journal.zig").frozenTargetForRecovery(a, txn, group, head, owner, signed.proof.identity.metadata_incarnation) catch |err| switch (err) {
+                    error.OutOfMemory => return err,
+                    else => return error.InvalidCatalogRecord,
+                };
+                if (!std.mem.eql(u8, &try frozen.expected.digest(), &try witness.outcome.expected.digest()) or
+                    frozen.source_members != witness.outcome.audit.source_members.? or
+                    witness.outcome.audit.canonical_position.?.sequence <= frozen.source_position.sequence) return error.InvalidCatalogRecord;
+            }
             if (!std.mem.eql(u8, &signed.proof.identity.metadata_incarnation, &std.fmt.bytesToHex(parsed.value.table_guard.incarnation, .lower))) return error.InvalidCatalogRecord;
             // Usually all stages share one grant. Cache only a fixed-size
             // immutable identity in this pinned view, never a borrowed value.

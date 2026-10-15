@@ -7467,3 +7467,55 @@ all failpoints and leak assertions remain exercised. Boundary, license,
 inventory, generated control-catalog, formatting and diff checks passed.
 These are macOS Debug results; no additional original SQL or distributed
 failover/restore qualification is claimed.
+
+### Atomic native validation acceptance and retained physical evidence
+
+Native validation ACKs now require both the stable signed logical receipt and
+the completed signed physical audit. Accepting apply joins them to the current
+native writer/reporter/root generation, indexed runtime seal cut, live table
+and range authority, and frozen source/target completion in its own transaction.
+Preflight success is not an authorization token. The head, owner and retained
+proof are staged atomically through the existing metadata command/outbox path.
+
+Native validation uses a bounded AIVP v1 stage-proof record containing the fixed
+logical receipt and canonical physical witness. It occupies the existing proof
+key, so snapshot registration, terminal replacement and cleanup do not acquire
+a parallel journal. Bare native validation records are rejected; other actions
+and Raft proofs keep their existing fixed codec. Historical recovery verifies
+the witness and its frozen provenance without granting live execution or root
+adoption. Exact ACK status includes the retained physical digest, and a different
+witness cannot replace evidence under the same root grant. The metadata decoder
+floor is 49, not a complete native activation capability.
+
+ACK status stays pending while the metadata standby outbox is unflushed, and
+owner execution permission is withheld during that window. This prevents a
+physical stage from consuming an unmirrored metadata phase. Checks are bounded
+point reads plus bounded proof decoding; no table/cohort scan is introduced in
+the hot applying transaction. Canonical record verification does not repeat
+signature verification solely to reconstruct canonical bytes.
+
+Still unfinished are automatic worker submission/recovery of validation ACKs,
+full latest-stage re-attestation and native capability barriers, restore/adoption
+enforcement beyond retained metadata verification, install/release, durable
+terminal failure, missing-root repair, actual data-Raft execution, terminal
+catalog publication and complete distributed faults. Public UNIQUE activation
+remains guarded. Original dispositions remain 483 implemented / 862 unresolved.
+
+Qualification: `/private/tmp/antfly-validation-ack-full-debug.log` passed
+159/159 Debug steps. After tightening the same-root-grant comparison to use
+identity/writer/reporter/generation rather than signature bytes, the final
+metadata run `/private/tmp/antfly-validation-ack-debug-v3.log` passed 69/69
+steps, including all 48 publication and four ACK tests. The durable completion
+fixture accepts a joined native validation ACK, requires the indexed runtime
+to observe its later seal cut, rejects validly re-signed frozen-scope changes,
+and injects failure before/after each of the three staged writes. Aborts leave
+head/owner/proof unchanged. Duplicate/lost-reply status and cold reopen preserve
+the exact witness; substituted, corrupt and bare witnesses are rejected.
+
+A synthetic pending metadata outbox keeps status pending and withholds owner
+execution. Physical witnesses in this metadata fixture are synthetic; this
+qualifies the accepting read/write set, not distributed physical production or
+standby transport failure. The independent real LSM/C-ABI gates remain green.
+Boundary, license, inventory, generated control-catalog, formatting and diff
+checks passed. These are macOS Debug results, not original SQL case credit or
+complete native publication/restore qualification.

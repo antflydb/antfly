@@ -597,9 +597,16 @@ pub fn targetExpectation(alloc: std.mem.Allocator, reader: anytype, group: u64, 
     return (try frozenTarget(alloc, reader, group, head, owner, incarnation)).expected;
 }
 pub fn frozenTarget(alloc: std.mem.Allocator, reader: anytype, group: u64, head: progress.Head, owner: progress.OwnerState, incarnation: Digest) !FrozenTarget {
+    if (head.phase != .building) return error.GenerationPublicationChanged;
+    return frozenTargetForRecovery(alloc, reader, group, head, owner, incarnation);
+}
+
+/// Historical provenance only: callers verify retained signatures/enrollment.
+/// This grants no current execution, root adoption or publication permission.
+pub fn frozenTargetForRecovery(alloc: std.mem.Allocator, reader: anytype, group: u64, head: progress.Head, owner: progress.OwnerState, incarnation: Digest) !FrozenTarget {
     try head.validate();
     try owner.validate();
-    if (head.phase != .building or head.completed_sources != head.owner_count or head.completion_revision == 0) return error.GenerationPublicationChanged;
+    if (head.completed_sources != head.owner_count or head.completion_revision == 0) return error.GenerationPublicationChanged;
     if (owner.owner.authority != .native or !owner.source_completed or owner.owner.namespace.table_id != head.table_id or owner.owner.ordinal >= head.owner_count or
         !std.mem.eql(u8, &owner.owner.plan_id, &head.plan_id) or !equal(owner.owner.plan_digest, head.plan_digest)) return error.InvalidCatalogRecord;
     var buf: [192]u8 = undefined;
