@@ -627,6 +627,7 @@ fn requireReservedState(txn: anytype, binding: Binding) !void {
 /// Structural recovery is not metadata authentication or permission to publish.
 /// Work is bounded by catalog size, never the number of primary rows.
 pub fn verifyRecovery(alloc: std.mem.Allocator, txn: anytype, active: ?*const physical_catalog.Loaded) !void {
+    try @import("relational_index_release.zig").Record.verifyRecovery(alloc, txn);
     const binding = try load(txn);
     try cancellation.verifyRecovery(txn, binding);
     _ = try loadCancellationCleanup(txn, binding);

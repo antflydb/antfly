@@ -30,10 +30,11 @@ const integrity = @import("relational_integrity_contract.zig");
 const Allocator = std.mem.Allocator;
 const pages = @import("relational_index_jobs.zig");
 const validation = @import("relational_index_validation.zig");
+const release = @import("relational_index_release.zig");
 const resources = @import("../resource_manager.zig");
 const RequestContext = @import("../../api/operation.zig").RequestContext;
 const Waiters = @import("../admission_waiter.zig").Fifo(void);
-pub const envelope_version = 29;
+pub const envelope_version = 30;
 pub const max_response_bytes = 32 * 1024;
 pub const max_cancellation_wire_bytes = 32 * 1024;
 pub const max_encoded_inputs = std.base64.standard.Encoder.calcSize(inputs.max_bytes);
@@ -316,6 +317,7 @@ pub const Effect = union(enum) {
     generation_validation: validation.Command,
     validation_seal: validation.SealCommand,
     install: validation.InstallCommand,
+    release: release.Intent,
 
     pub fn namespace(self: Effect) @FieldType(Native, "namespace") {
         return switch (self) {
@@ -326,6 +328,7 @@ pub const Effect = union(enum) {
             .generation_validation => |value| value.binding.fence.namespace,
             .validation_seal => |value| value.binding.fence.namespace,
             .install => |value| value.validation.command.binding.fence.namespace,
+            .release => |value| value.installed.position.namespace,
             .build => |value| value.binding.fence.namespace,
             .cancel_intent => |value| value.fence.namespace,
             .cancel_cleanup => |value| value.fence.namespace,
@@ -341,6 +344,7 @@ pub const Effect = union(enum) {
             .generation_validation => |value| try value.validate(),
             .validation_seal => |value| try value.validate(),
             .install => |value| try value.validate(),
+            .release => |value| try value.validate(),
             .build => |value| try value.validate(),
             .cancel_intent => |value| try value.validate(),
             .cancel_cleanup => |value| {
@@ -359,6 +363,7 @@ pub const Effect = union(enum) {
             .generation_validation => validation.max_wire_bytes,
             .validation_seal => validation.Seal.max_wire_bytes,
             .install => validation.Installed.max_wire_bytes,
+            .release => release.Record.max_wire_bytes,
             else => max_cancellation_wire_bytes,
         };
     }
@@ -1077,6 +1082,78 @@ pub const InstallationResponse = union(enum) {
             if (!std.meta.eql(value.logical.command.intent(), request.intent) or
                 !std.meta.eql(try audited_physical.logicalCommand(), request.intent.validation.command)) return error.InvalidPrivateIndexNativeReceipt;
         }
+    }
+};
+
+pub const ReleaseOutcome = struct {
+    intent: release.Intent,
+    position: Native,
+    duplicate: bool,
+    replication_pending: bool = false,
+    error_name: ?[]const u8 = null,
+    receipt: ?@import("relational_index_publication_progress.zig").Receipt = null,
+    pub fn validate(self: @This()) !void {
+        const expected = try self.intent.receipt(self.position);
+        if (self.replication_pending and self.error_name == null) return error.InvalidPrivateIndexNativeReceipt;
+        if (self.receipt) |value| {
+            if (self.replication_pending or self.error_name != null or !std.meta.eql(value, expected)) return error.InvalidPrivateIndexNativeReceipt;
+        } else if (!self.replication_pending and self.error_name == null) return error.InvalidPrivateIndexNativeReceipt;
+    }
+};
+
+pub const PreparedRelease = struct {
+    pub const ApplyOutcome = ReleaseOutcome;
+    alloc: Allocator,
+    intent: release.Intent,
+    context: RequestContext = .{},
+    payload: ?[]u8 = null,
+    prefix_len: usize = 0,
+
+    pub fn init(alloc: Allocator, core: *@import("core.zig").DBCore, intent: release.Intent, context: RequestContext) !@This() {
+        try context.ensureActive();
+        try intent.validate();
+        var read = try core.store.beginReadTxn();
+        defer read.abort();
+        if (try release.Record.load(alloc, &read, intent) != null) try release.Record.verifyRecovery(alloc, &read) else try intent.requireInstalled(alloc, &read);
+        return .{ .alloc = alloc, .intent = intent, .context = context };
+    }
+    pub fn deinit(self: *@This()) void {
+        if (self.payload) |bytes| self.alloc.free(bytes);
+        self.* = undefined;
+    }
+    pub fn validate(self: *const @This()) !void {
+        try self.context.ensureActive();
+        try self.intent.validate();
+    }
+    pub fn namespace(self: *const @This()) @FieldType(Native, "namespace") {
+        return self.intent.installed.position.namespace;
+    }
+    pub fn validateReplay(self: *const @This(), position: Native) !void {
+        try (Frame{ .effect = .{ .release = self.intent }, .position = position }).validate();
+        _ = try self.intent.receipt(position);
+    }
+    pub fn replayDuplicateOutcome(self: *const @This(), position: Native) ReleaseOutcome {
+        return .{ .intent = self.intent, .position = position, .duplicate = true };
+    }
+    pub fn stage(self: *@This(), _: anytype, txn: anytype, position: ?Native) !ReleaseOutcome {
+        try self.validate();
+        const result = try release.Record.stage(self.alloc, txn, self.intent, position);
+        return .{ .intent = self.intent, .position = result.record.position, .duplicate = result.duplicate };
+    }
+    pub fn hasPublicationReceipt(_: *const @This()) bool {
+        return true;
+    }
+    pub fn populateReceipt(self: *const @This(), txn: anytype, outcome: *ReleaseOutcome) !void {
+        const record = (try release.Record.load(self.alloc, txn, self.intent)) orelse return error.InvalidPrivateIndexNativeReceipt;
+        if (!std.meta.eql(record.position, outcome.position)) return error.InvalidPrivateIndexNativeReceipt;
+        try release.Record.verifyRecovery(self.alloc, txn);
+        outcome.receipt = try self.intent.receipt(record.position);
+    }
+    pub fn preparePayload(self: *@This()) !void {
+        try prepareNativePayload(self, "release", self.intent, release.Record.max_wire_bytes);
+    }
+    pub fn finalizePayload(self: *@This(), position: Native) ![]const u8 {
+        return finalizeNativePayload(self, position);
     }
 };
 

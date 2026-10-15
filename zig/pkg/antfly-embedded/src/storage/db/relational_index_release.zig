@@ -79,6 +79,9 @@ pub const Intent = struct {
 /// data still matches an old build audit, nor a replacement-root capability.
 pub const Record = struct {
     pub const key = owner.key ++ ":released";
+    /// A bounded cleanup objective, not permission to delete live claims.
+    /// A later full companion pass may clear it only at this exact native cut.
+    pub const retirement_pending_key = owner.key ++ ":released-companions-dirty";
     pub const max_wire_bytes = 32 * 1024;
     intent: Intent,
     position: positions.Native,
@@ -126,6 +129,12 @@ pub const Record = struct {
     /// retained terminal receipt cannot stand in for this requested intent.
     pub fn load(alloc: std.mem.Allocator, txn: anytype, intent: Intent) !?@This() {
         try intent.validate();
+        const record = (try loadRaw(alloc, txn)) orelse return null;
+        if (!std.meta.eql(record.intent, intent)) return null;
+        return record;
+    }
+
+    fn loadRaw(alloc: std.mem.Allocator, txn: anytype) !?@This() {
         const bytes = txn.get(key) catch |err| switch (err) {
             error.NotFound => return null,
             else => return err,
@@ -133,8 +142,75 @@ pub const Record = struct {
         const record = try decode(alloc, bytes);
         const source = try authority.require(txn, .native, @import("online_source_contract.zig").namespaceBytes(record.position.namespace));
         if (source.sequence < record.position.sequence) return error.InvalidPrivateIndexNativeReceipt;
-        if (!std.meta.eql(record.intent, intent)) return null;
         return record;
+    }
+
+    pub fn verifyRecovery(alloc: std.mem.Allocator, txn: anytype) !void {
+        const maybe_record = try loadRaw(alloc, txn);
+        const topology = @import("relational_integrity_topology.zig");
+        const bytes = txn.get(topology.receipt_key) catch |err| switch (err) {
+            error.NotFound => {
+                if (maybe_record != null) return error.IntegrityTopologyFenceMissing;
+                return;
+            },
+            else => return err,
+        };
+        const receipt = try topology.Fence.decode(bytes);
+        const record = maybe_record orelse {
+            if (receipt.role == .index_build and (try owner.load(txn)) == null) return error.InvalidPrivateIndexNativeReceipt;
+            return;
+        };
+        const binding = record.intent.installed.command.validation.command.binding;
+        if (receipt.admission_epoch < binding.fence.admission_epoch or
+            ((receipt.role == .index_build or receipt.admission_epoch == binding.fence.admission_epoch) and !receipt.eql(binding.fence))) return error.IntegrityTopologyChanged;
+        if (try owner.load(txn)) |current| {
+            var original = current;
+            original.phase = .reserved;
+            if (std.meta.eql(original, binding)) return error.InvalidPrivateIndexOwnerJob;
+        }
+    }
+
+    /// Caller owns commit/abort and stages transport markers/outboxes in THIS
+    /// transaction. No row scan, artifact GC or metadata ACK occurs here.
+    pub fn stage(alloc: std.mem.Allocator, txn: anytype, intent: Intent, replay: ?positions.Native) !struct { record: Record, duplicate: bool } {
+        try intent.validate();
+        if (replay) |position| _ = try intent.receipt(position);
+        if (try load(alloc, txn, intent)) |previous| {
+            if (replay) |position| if (!std.meta.eql(position, previous.position)) return error.InvalidPrivateIndexNativeReceipt;
+            try verifyRecovery(alloc, txn);
+            return .{ .record = previous, .duplicate = true };
+        }
+        try intent.requireInstalled(alloc, txn);
+        const binding = intent.installed.command.validation.command.binding;
+        const expected = intent.installed.command.validation.command.expected;
+        const claims = @import("relational_index_private_claims.zig");
+        const stream = claims.SourceStream;
+        const head = (try stream.load(txn, binding)) orelse return error.PrivateIndexRootRecoveryRequired;
+        const consumed = (try stream.loadConsumption(txn, binding, head)) orelse return error.PrivateIndexRootRecoveryRequired;
+        if (head.state != .ready or head.pending() != 0 or
+            !std.mem.eql(u8, &head.progress_digest, &expected.source_progress_digest) or
+            !std.mem.eql(u8, &try consumed.prefix().digest(), &expected.source_consumption_digest)) return error.PrivateIndexTargetValidationRequired;
+        const namespace = @import("online_source_contract.zig").namespaceBytes(binding.fence.namespace);
+        const source = try authority.require(txn, .native, namespace);
+        const position: positions.Native = .{ .namespace = binding.fence.namespace, .sequence = std.math.add(u64, source.sequence, 1) catch return error.InvalidControlReceiptPosition };
+        if (replay) |supplied| if (!std.meta.eql(supplied, position)) return error.InvalidPrivateIndexNativeReceipt;
+        const record: Record = .{ .intent = intent, .position = position };
+        const encoded = try record.encode();
+        try @import("relational_integrity_topology.zig").stageInstalledIndexRelease(alloc, txn, intent.installed);
+        const sequence = try authority.advance(txn, namespace, if (replay) |supplied| supplied.sequence else null);
+        std.debug.assert(sequence == position.sequence);
+        try txn.put(key, encoded.slice());
+        try txn.put(retirement_pending_key, &try (positions.Position{ .native = position }).encode());
+        // These are private retry/proof slots, never primary/index rows or live
+        // UNIQUE claims. Preserve schema-version history and active progress.
+        for ([_][]const u8{ owner.key, @import("relational_index_inputs.zig").key, validation.Installed.key, validation.Seal.key, stream.head_key, stream.consumption_key, @import("relational_index_owner_control.zig").PreparedBuild.checkpoint_key }) |retired| try txn.delete(retired);
+        for ([_]owner.NativeEffect{ .admitted, .fenced, .reserved }) |effect| try txn.delete(&owner.nativeEffectKey(effect));
+        try txn.delete(&claims.InventoryValidation.key(binding));
+        try txn.delete(&validation.key(binding));
+        try txn.delete(&claims.registrationKey(expected.generation));
+        const physical = @import("relational_index_catalog.zig");
+        if (!std.mem.eql(u8, &binding.physical_reserved.blob_digest, &binding.physical_candidate.blob_digest)) try txn.delete(&physical.blobKey(binding.physical_reserved.blob_digest));
+        return .{ .record = record, .duplicate = false };
     }
 };
 

@@ -1037,6 +1037,205 @@ fn testInstalledIndexCheckpoint(database: *db_mod.DB, root_path: []const u8, int
     return reloaded;
 }
 
+/// Storage/replay qualification only, not metadata release permission or root
+/// adoption. Each fixture owns separate identity files and copied logical KV.
+fn testNativeIndexRelease(source: *db_mod.DB, installed: @import("relational_index_validation.zig").Installed) !void {
+    const release_mod = @import("relational_index_release.zig");
+    const topology = @import("relational_integrity_topology.zig");
+    const jobs = @import("relational_index_owner_job.zig");
+    const authority = @import("../source_authority.zig");
+    const binding = installed.command.validation.command.binding;
+    const intent: release_mod.Intent = .{ .installed = installed, .metadata_decision = @splat(11) };
+    const options: db_mod.OpenOptions = .{ .start_optional_runtimes = false, .primary_backend = .{ .lsm = .{} }, .online_source_authority = .native, .identity_namespace = binding.fence.namespace };
+    var primary_dir = try @import("../../common/test_directory.zig").TestDirectory.init("native-index-release-primary");
+    defer primary_dir.cleanup();
+    var primary = try db_mod.DB.open(alloc, primary_dir.path(), options);
+    var primary_open = true;
+    defer if (primary_open) primary.close();
+    try seedNativeIndexFixture(source, &primary);
+    primary.close();
+    primary_open = false;
+    primary = try db_mod.DB.open(alloc, primary_dir.path(), options);
+    primary_open = true;
+    const Fault = struct {
+        txn: *docstore.DocStore.Txn,
+        fail_at: ?usize = null,
+        after: bool = false,
+        writes: usize = 0,
+        fn before(self: *@This()) !void {
+            if (self.fail_at == self.writes + 1 and !self.after) return error.TestReleaseWriteFailed;
+        }
+        fn completed(self: *@This()) !void {
+            self.writes += 1;
+            if (self.fail_at == self.writes and self.after) return error.TestReleaseWriteFailed;
+        }
+        pub fn get(self: *@This(), key: []const u8) ![]const u8 {
+            return self.txn.get(key);
+        }
+        pub fn put(self: *@This(), key: []const u8, value: []const u8) !void {
+            try self.before();
+            try self.txn.put(key, value);
+            try self.completed();
+        }
+        pub fn delete(self: *@This(), key: []const u8) !void {
+            try self.before();
+            try self.txn.delete(key);
+            try self.completed();
+        }
+    };
+    const write_count = count: {
+        var txn = try primary.core.store.beginWriteTxn();
+        defer txn.abort();
+        var counter: Fault = .{ .txn = &txn };
+        _ = try release_mod.Record.stage(alloc, &counter, intent, null);
+        break :count counter.writes;
+    };
+    try std.testing.expect(write_count > 10);
+    for (1..write_count + 1) |fail_at| for ([_]bool{ false, true }) |after| {
+        {
+            var txn = try primary.core.store.beginWriteTxn();
+            defer txn.abort();
+            var fault: Fault = .{ .txn = &txn, .fail_at = fail_at, .after = after };
+            try std.testing.expectError(error.TestReleaseWriteFailed, release_mod.Record.stage(alloc, &fault, intent, null));
+            try std.testing.expectEqual(if (after) fail_at else fail_at - 1, fault.writes);
+        }
+        var read = try primary.core.store.beginReadTxn();
+        defer read.abort();
+        try intent.requireInstalled(alloc, &read);
+        try std.testing.expect(try release_mod.Record.load(alloc, &read, intent) == null);
+        try std.testing.expectEqual(installed.position.sequence, (try authority.load(&read)).?.sequence);
+    };
+    var barrier: @import("antfly_runtime_abi").mutation_barrier.MutationBarrier = .{};
+    var publisher: TestNativeIndexPublisher = .{ .barrier = &barrier, .lsn = 7 };
+    defer if (publisher.payload) |bytes| alloc.free(bytes);
+    defer if (primary_open) {
+        primary.local_execution.replication_async_batch_mirror = null;
+    };
+    primary.local_execution.replication_async_batch_mirror = publisher.asMirror();
+    const pending = pending: {
+        var prepared = try primary.prepareNativeIndexOwnerRelease(intent, .{});
+        defer prepared.deinit();
+        break :pending try primary.applyPreparedNativeIndexOwnerRelease(&prepared, null);
+    };
+    try pending.validate();
+    try std.testing.expect(!pending.duplicate and pending.replication_pending and pending.receipt == null);
+    try std.testing.expectEqualStrings("TestPublicationUnavailable", pending.error_name.?);
+    try std.testing.expectEqual(@as(usize, 1), publisher.attempts);
+    try std.testing.expectEqual(installed.position.sequence + 1, pending.position.sequence);
+    {
+        var read = try primary.core.store.beginReadTxn();
+        defer read.abort();
+        try std.testing.expect(try jobs.load(&read) == null);
+        try std.testing.expect(try topology.current(&read) == null);
+        try std.testing.expectError(error.NotFound, read.get(@import("relational_index_inputs.zig").key));
+        try std.testing.expectError(error.NotFound, read.get(@import("relational_index_validation.zig").Installed.key));
+        try release_mod.Record.verifyRecovery(alloc, &read);
+        try std.testing.expectEqual(pending.position, (try release_mod.Record.load(alloc, &read, intent)).?.position);
+        const dirty = try @import("receipt_position.zig").Position.decode(try read.get(release_mod.Record.retirement_pending_key));
+        try std.testing.expectEqual(pending.position, dirty.native);
+    }
+    primary.local_execution.replication_async_batch_mirror = null;
+    primary.close();
+    primary_open = false;
+    primary = try db_mod.DB.open(alloc, primary_dir.path(), options);
+    primary_open = true;
+    publisher.fail = false;
+    primary.local_execution.replication_async_batch_mirror = publisher.asMirror();
+    try primary.flushDurableReplicationOutboxes();
+    try std.testing.expectEqual(@as(usize, 2), publisher.attempts);
+    try std.testing.expectEqual(@as(usize, 1), publisher.completed);
+    var prepared_retry = try primary.prepareNativeIndexOwnerRelease(intent, .{});
+    defer prepared_retry.deinit();
+    const recovered = try primary.applyPreparedNativeIndexOwnerRelease(&prepared_retry, null);
+    try recovered.validate();
+    try std.testing.expect(recovered.duplicate and !recovered.replication_pending);
+    try std.testing.expectEqualDeep(try intent.receipt(pending.position), recovered.receipt.?);
+    primary.local_execution.replication_async_batch_mirror = null;
+    try std.testing.expectError(error.ForeignKeyCoordinationRequired, primary.batch(.{ .writes = &.{.{ .key = "after-release", .value = "{\"id\":99,\"email\":\"after-release@example.com\"}" }} }));
+    const catalog = @import("relational_integrity_catalog.zig");
+    const integrity = @import("relational_integrity.zig");
+    const catalog_bytes = (try primary.core.getStoreValue(alloc, catalog.key)).?;
+    defer alloc.free(catalog_bytes);
+    var active_catalog = try catalog.decode(alloc, catalog_bytes);
+    defer active_catalog.deinit();
+    const generation = active_catalog.find(.unique, "email_idx").?.generation;
+    const generation_set = @import("relational_integrity_activation.zig").generationSet(active_catalog);
+    var active_view = primary.core.acquireSchemaView().?;
+    defer active_view.release();
+    var tuple_plan = try @import("relational_index_keys.zig").TuplePlan.init(alloc, active_view.tableSchema().*, active_view.physicalLayout(), &.{.{ .column = "email" }});
+    defer tuple_plan.deinit();
+    var tuple: std.ArrayList(u8) = .empty;
+    defer tuple.deinit(alloc);
+    _ = try tuple_plan.appendValues(alloc, &tuple, &.{.{ .string = "after-release@example.com" }});
+    const create = try primary.beginTransactionWithId(@splat(91), 100);
+    try primary.writeTransaction(create, .{
+        .relational_schema_version = 2,
+        .relational_integrity_generation_set = generation_set,
+        .writes = &.{.{ .key = "after-release", .value = "{\"id\":99,\"email\":\"after-release@example.com\"}" }},
+        .integrity_commands = &.{.{ .address = try integrity.Address.init(generation, tuple.items), .operation = .{ .establish = .{ .tuple = tuple.items, .parent_table = "items", .parent_key = "after-release", .schema_version = 2 } } }},
+    });
+    try primary.commitTransaction(create, 200);
+    const written = (try primary.get(alloc, "after-release")).?;
+    defer alloc.free(written);
+    try std.testing.expectEqualStrings("{\"id\":99,\"email\":\"after-release@example.com\"}", written);
+    tuple.clearRetainingCapacity();
+    _ = try tuple_plan.appendValues(alloc, &tuple, &.{.{ .string = "0@example.com" }});
+    const duplicate = try primary.beginTransactionWithId(@splat(92), 300);
+    try std.testing.expectError(error.UniqueConstraintViolation, primary.writeTransaction(duplicate, .{
+        .relational_schema_version = 2,
+        .relational_integrity_generation_set = generation_set,
+        .writes = &.{.{ .key = "duplicate-live", .value = "{\"id\":100,\"email\":\"0@example.com\"}" }},
+        .integrity_commands = &.{.{ .address = try integrity.Address.init(generation, tuple.items), .operation = .{ .establish = .{ .tuple = tuple.items, .parent_table = "items", .parent_key = "duplicate-live", .schema_version = 2 } } }},
+    }));
+    try primary.abortTransaction(duplicate, 400);
+    try std.testing.expect(try primary.get(alloc, "duplicate-live") == null);
+    {
+        var old_layout = (try primary.core.acquireSchemaVersionView(1)).?;
+        defer old_layout.release();
+        try std.testing.expectEqual(@as(u32, 1), old_layout.version());
+        var read = try primary.core.store.beginReadTxn();
+        defer read.abort();
+        try release_mod.Record.verifyRecovery(alloc, &read);
+    }
+    var standby_dir = try @import("../../common/test_directory.zig").TestDirectory.init("native-index-release-standby");
+    defer standby_dir.cleanup();
+    var standby = try db_mod.DB.open(alloc, standby_dir.path(), options);
+    var standby_open = true;
+    defer if (standby_open) standby.close();
+    try seedNativeIndexFixture(source, &standby);
+    standby.close();
+    standby_open = false;
+    standby = try db_mod.DB.open(alloc, standby_dir.path(), options);
+    standby_open = true;
+    const native = @import("relational_index_owner_control.zig");
+    var packet: native.PreparedRelease = .{ .alloc = alloc, .intent = intent };
+    defer packet.deinit();
+    try packet.preparePayload();
+    var wrong_position = pending.position;
+    wrong_position.sequence += 1;
+    var frame: @import("replication_record.zig").Record = .{ .kind = .batch_mutation, .payload_codec = .json, .cluster_id = 1, .timeline_id = 1, .epoch = 1, .lsn = 7, .previous_lsn = 6, .payload = try packet.finalizePayload(wrong_position) };
+    try std.testing.expectError(error.InvalidPrivateIndexNativeReceipt, replication_ingress.applyRecord(&standby, frame));
+    try std.testing.expectEqual(@as(u64, 6), try standby.replicationAppliedSequence());
+    frame.payload = publisher.payload.?;
+    try replication_ingress.applyRecord(&standby, frame);
+    try replication_ingress.applyRecord(&standby, frame);
+    frame.lsn = 8;
+    frame.previous_lsn = 7;
+    try replication_ingress.applyRecord(&standby, frame);
+    try std.testing.expectEqual(@as(u64, 8), try standby.replicationAppliedSequence());
+    standby.close();
+    standby_open = false;
+    standby = try db_mod.DB.open(alloc, standby_dir.path(), options);
+    standby_open = true;
+    {
+        var read = try standby.core.store.beginReadTxn();
+        defer read.abort();
+        try release_mod.Record.verifyRecovery(alloc, &read);
+        try std.testing.expect(try jobs.load(&read) == null and try topology.current(&read) == null);
+        try std.testing.expectEqual(pending.position.sequence, (try authority.load(&read)).?.sequence);
+    }
+}
+
 fn testInstalledIndexHistoryAllocations(allocator: std.mem.Allocator, txn: *docstore.DocStore.Txn, binding: @import("relational_index_owner_job.zig").Binding) !void {
     var history = try @import("relational_index_validation.zig").Installed.History.init(allocator, txn, binding);
     defer history.deinit();
@@ -2708,6 +2907,7 @@ test "relational index build pages identity dispatch caches immutable candidates
                     const source_row = (try db.get(alloc, "row000")).?;
                     defer alloc.free(source_row);
                     try std.testing.expectEqualStrings(source_row, installed_row);
+                    try testNativeIndexRelease(&installed_db, committed);
                 }
                 var read = try db.core.store.beginReadTxn();
                 defer read.abort();

@@ -8008,6 +8008,14 @@ pub const DB = struct {
                     defer prepared.deinit();
                     _ = try self.applyPreparedNativeIndexOwnerInstallation(&prepared, .{ .position = frame.position, .lsn = sequence });
                 },
+                .release => |intent| {
+                    var prepared = self.prepareNativeIndexOwnerRelease(intent, .{}) catch |err| {
+                        if (try self.replicationMutationAlreadyApplied(sequence)) return;
+                        return err;
+                    };
+                    defer prepared.deinit();
+                    _ = try self.applyPreparedNativeIndexOwnerRelease(&prepared, .{ .position = frame.position, .lsn = sequence });
+                },
                 .control => |command| {
                     var prepared = self.prepareNativeIndexOwnerControl(command) catch |err| {
                         // Another replay may retire inputs during preparation.
@@ -8591,6 +8599,18 @@ pub const DB = struct {
 
     pub fn applyPreparedNativeIndexOwnerInstallation(self: *DB, prepared: *native_index_control.PreparedInstall, replay: ?NativeIndexReplay) !native_index_control.InstallOutcome {
         return self.applyPreparedNativeIndexEffect(prepared, replay);
+    }
+
+    /// Trusted owner adapter only: metadata must independently grant release
+    /// after accepting installation on every owner and this exact live root.
+    pub fn prepareNativeIndexOwnerRelease(self: *DB, intent: @import("relational_index_release.zig").Intent, context: @import("../../api/operation.zig").RequestContext) !native_index_control.PreparedRelease {
+        return native_index_control.PreparedRelease.init(self.alloc, self.core, intent, context);
+    }
+
+    pub fn applyPreparedNativeIndexOwnerRelease(self: *DB, prepared: *native_index_control.PreparedRelease, replay: ?NativeIndexReplay) !native_index_control.ReleaseOutcome {
+        const outcome = try self.applyPreparedNativeIndexEffect(prepared, replay);
+        if (self.backend_runtime.io()) |io| self.native_index_build_cache.evict(io);
+        return outcome;
     }
 
     /// Host-only bounded installation step, including exact installed retries.

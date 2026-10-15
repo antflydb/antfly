@@ -252,6 +252,20 @@ pub fn stageRelease(txn: anytype, expected: Fence) !void {
     }
 }
 
+/// Index publication is not an ordinary topology release. Require the exact
+/// actual installed cut before the terminal owner transaction can lift it.
+pub fn stageInstalledIndexRelease(alloc: std.mem.Allocator, txn: anytype, installed: @import("relational_index_validation.zig").Installed) !void {
+    const binding = installed.command.validation.command.binding;
+    const actual = (try @import("relational_index_validation.zig").Installed.load(alloc, txn, binding)) orelse return error.PrivateIndexTargetValidationRequired;
+    if (!std.meta.eql(actual, installed)) return error.InvalidPrivateIndexNativeReceipt;
+    try actual.requireCurrent(alloc, txn);
+    try @import("artifact_reconcile_intent.zig").requireAbsent(txn);
+    try @import("relational_integrity_generation_retirement.zig").requireClear(txn);
+    if (try optional(txn, receipt_key)) |bytes| if ((try Fence.decode(bytes)).admission_epoch >= binding.fence.admission_epoch) return error.IntegrityTopologyCompleted;
+    try stageReceipt(txn, binding.fence);
+    try txn.delete(fence_key);
+}
+
 /// Cancelling an ambiguously delivered begin consumes its epoch even if the
 /// begin has not arrived yet. Never releases another live lifecycle owner.
 pub fn stageCancel(txn: anytype, expected: Fence) !void {
