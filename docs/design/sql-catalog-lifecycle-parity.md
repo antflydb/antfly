@@ -8017,3 +8017,26 @@ steps. The earlier broader run encountered a corrected name-shadowing compile
 error in this addition and is not a passing gate. Boundary, licensing, inventory,
 control-catalog, formatting and diff checks pass. Original dispositions remain
 483 implemented / 862 unresolved; no new case closure or benchmark is claimed.
+
+Full qualification of commit `997fee6f44` subsequently passed 159/159 Debug
+steps in `/private/tmp/antfly-audited-install-full-debug.log`.
+
+### Private installation interface
+
+Kernel ABI 89 adds bounded native installation. The compiled boundary requires
+a host-selected signing scope, rejects foreign owner groups and malformed or
+oversized inputs, propagates deadline/cancellation, and preallocates its response
+before a durable effect. The leased-owner adapter supplies its provisioned root
+directory and returns the generation of the same applying lease, alongside an
+owned, validated physical/logical response. Remote requests do not select paths,
+physical schema hashes, replay positions or completed audit summaries.
+
+An isolated C-ABI fixture covers expired requests, missing/oversized root scope,
+wrong owner/signing identity, bounded first installation and receipt-stable
+installed retries after reopening. The adapter's deadline/cancellation test
+also instantiates the new path before any owner acquisition. The focused gate
+passed 88/88 Debug steps in `/private/tmp/antfly-install-interface-debug.log`;
+boundary, licensing, inventory, formatting and control-catalog checks pass.
+Authenticated receiver dispatch, installed witness
+acceptance/retention, release coordination and full public/distributed SQL
+qualification remain unfinished; no original-case dispositions change.

@@ -19,7 +19,7 @@
 const failure_abi = @import("runtime_failure_abi");
 
 // Storage layouts evolve independently of the shared failure envelope.
-pub const abi_version: u32 = 88;
+pub const abi_version: u32 = 89;
 pub const Status = failure_abi.Status;
 pub const FailureBoundary = failure_abi.FailureBoundary;
 pub const FailureIdentity = failure_abi.FailureIdentity;
@@ -1191,16 +1191,16 @@ pub const NativeFkGenerationControlRequest = extern struct {
 /// Private compiled-owner entry point. The receiving server independently
 /// authenticates the coordinator and obtains a fresh metadata owner decision.
 /// Admission supplies raw immutable inputs; physical IDs are chosen locally.
-pub const NativeIndexOwnerOperation = enum(u32) { admit = 1, fence = 2, reserve = 3, inspect = 4, receipt = 5, cancel_intent = 6, cancel_cleanup = 7, cancel_gc_page = 8, cancel_admit = 9, cancel_fence = 10, cancel_reserve = 11, cancel_inspect = 12, cancel_claim_gc_page = 13, claims = 14, build = 15, source = 16, consume = 17, _ };
+pub const NativeIndexOwnerOperation = enum(u32) { admit = 1, fence = 2, reserve = 3, inspect = 4, receipt = 5, cancel_intent = 6, cancel_cleanup = 7, cancel_gc_page = 8, cancel_admit = 9, cancel_fence = 10, cancel_reserve = 11, cancel_inspect = 12, cancel_claim_gc_page = 13, claims = 14, build = 15, source = 16, consume = 17, install = 18, _ };
 pub const NativeIndexOwnerControlRequest = extern struct {
     version: u32 = abi_version,
     operation: NativeIndexOwnerOperation,
     table_name: BorrowedBytes = .{},
     request_json: BorrowedBytes = .{},
     /// Raw immutable inputs for admission; bounded host-selected AuditRoot
-    /// JSON for validation. Remote callers never select this filesystem scope.
+    /// JSON for validation/installation. Remote callers never select this filesystem scope.
     manifest: BorrowedBytes = .{},
-    /// Used by bounded build/source/consume operations; callbacks are never retained.
+    /// Used by bounded build/source/consume/install operations; callbacks are never retained.
     control: ControlledJsonOperationRequest = .{},
 };
 

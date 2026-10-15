@@ -1112,11 +1112,11 @@ test "capi system write cursor sees pending catalog rows and preserves abort" {
 }
 
 test "storage owner native index rejects prior ABI before dereferencing request fields" {
-    for ([_]u32{ 0, 77 }) |version| {
+    for ([_]u32{ 0, kernel_owner_abi.abi_version - 1 }) |version| for ([_]kernel_owner_abi.NativeIndexOwnerOperation{ .build, .install }) |operation| {
         var response: kernel_owner_abi.OwnedBytes = .{ .ptr = @ptrFromInt(1), .len = 1 };
         try std.testing.expectEqual(kernel_owner_abi.Status.invalid_abi, server_api.storageOwnerNativeIndexControlJson(null, &.{
             .version = version,
-            .operation = .build,
+            .operation = operation,
             .table_name = .{ .ptr = @ptrFromInt(1), .len = 1 },
             .request_json = .{ .ptr = @ptrFromInt(1), .len = 1 },
             .manifest = .{ .ptr = @ptrFromInt(1), .len = 1 },
@@ -1124,6 +1124,107 @@ test "storage owner native index rejects prior ABI before dereferencing request 
         }, &response));
         try std.testing.expect(response.ptr == null);
         try std.testing.expectEqual(@as(u64, 0), response.len);
+    };
+}
+
+/// Isolated kernel-interface qualification, not metadata permission or restore
+/// adoption. Copy logical KV fixtures only; never copy identity/audit files.
+fn testNativeIndexInstallationInterface(source: *db_mod.DB, intent: @import("antfly_local_sources").storage_db_relational_index_validation.InstallIntent) !void {
+    const a = std.testing.allocator;
+    const local = @import("antfly_local_sources");
+    const native = local.storage_db_relational_index_owner_control;
+    var directory = try TestDirectory.init("native-index-install-capi");
+    defer directory.cleanup();
+    const options: db_mod.OpenOptions = .{ .start_optional_runtimes = false, .primary_backend = .{ .lsm = .{} }, .online_source_authority = .native, .identity_namespace = intent.validation.command.binding.fence.namespace };
+    var handle: Handle = .{ .alloc = a, .db = try db_mod.DB.open(a, directory.path(), options), .storage_owner_table_name = @constCast("items"), .storage_owner_group_id = 11 };
+    var opened = true;
+    defer if (opened) handle.db.close();
+    {
+        var read = try source.core.store.beginReadTxn();
+        defer read.abort();
+        var cursor = try read.openCursor();
+        defer cursor.close();
+        var txn = try handle.db.core.store.runtime_store.beginWrite();
+        errdefer txn.abort();
+        var item = try cursor.first();
+        while (item) |entry| : (item = try cursor.next()) try txn.put(entry.key, entry.value);
+        try txn.commit();
+    }
+    handle.db.close();
+    opened = false;
+    handle.db = try db_mod.DB.open(a, directory.path(), options);
+    opened = true;
+    try std.testing.expect(handle.db.root_incarnation != source.root_incarnation);
+    const id = try registerTestHandle(&handle);
+    defer unregisterTestHandle(id);
+    const signer = try local.storage_db_root_signing_identity.loadOrCreate(a, std.testing.io, directory.path());
+    const root: native.AuditRoot = .{ .root_dir = directory.path(), .root_incarnation = signer.root_incarnation };
+    const root_json = try std.json.Stringify.valueAlloc(a, root, .{});
+    defer a.free(root_json);
+    const installation: native.InstallationRequest = .{ .intent = intent, .budget = .{ .records = 1, .time_ns = std.time.ns_per_s } };
+    const encoded = try std.json.Stringify.valueAlloc(a, installation, .{});
+    defer a.free(encoded);
+    var request: kernel_owner_abi.NativeIndexOwnerControlRequest = .{ .operation = .install, .table_name = .fromSlice("items"), .request_json = .fromSlice(encoded), .manifest = .fromSlice(root_json), .control = .{ .has_execution_deadline = 1, .execution_deadline_ns = 0 } };
+    var response: kernel_owner_abi.OwnedBytes = .{};
+    try std.testing.expectEqual(kernel_owner_abi.Status.deadline_exceeded, server_api.storageOwnerNativeIndexControlJson(id, &request, &response));
+    try std.testing.expect(response.ptr == null);
+    request.control = .{};
+    request.manifest = .{};
+    try std.testing.expectEqual(kernel_owner_abi.Status.invalid_argument, server_api.storageOwnerNativeIndexControlJson(id, &request, &response));
+    request.manifest = .{ .ptr = @ptrFromInt(1), .len = native.AuditRoot.max_wire_bytes + 1 };
+    try std.testing.expectEqual(kernel_owner_abi.Status.invalid_argument, server_api.storageOwnerNativeIndexControlJson(id, &request, &response));
+    request.manifest = .fromSlice(root_json);
+    handle.storage_owner_group_id = 99;
+    try std.testing.expectEqual(kernel_owner_abi.Status.invalid_argument, server_api.storageOwnerNativeIndexControlJson(id, &request, &response));
+    handle.storage_owner_group_id = 11;
+    {
+        var wrong_root = root;
+        wrong_root.root_incarnation ^= 1;
+        const wrong_json = try std.json.Stringify.valueAlloc(a, wrong_root, .{});
+        defer a.free(wrong_json);
+        var rejected = request;
+        rejected.manifest = .fromSlice(wrong_json);
+        try std.testing.expectEqual(kernel_owner_abi.Status.private_index_root_recovery_required, server_api.storageOwnerNativeIndexControlJson(id, &rejected, &response));
+        try std.testing.expect(response.ptr == null);
+        try std.testing.expectEqual(@as(u32, 1), handle.db.core.schema.?.version);
+    }
+    var committed: ?native.InstallOutcome = null;
+    var incomplete: usize = 0;
+    for (0..64) |_| {
+        try std.testing.expectEqual(kernel_owner_abi.Status.ok, server_api.storageOwnerNativeIndexControlJson(id, &request, &response));
+        const output = response;
+        defer freeRawBuffer(output.ptr, output.len);
+        var result = try std.json.parseFromSlice(native.InstallationResponse, a, output.slice(), .{ .ignore_unknown_fields = false });
+        defer result.deinit();
+        try result.value.validateFor(installation);
+        try std.testing.expectEqual(handle.db.root_incarnation, result.value.physicalAudit().audit.physical_root_incarnation);
+        if (result.value == .installed) {
+            try std.testing.expect(incomplete > 0);
+            try std.testing.expect(!result.value.installed.logical.duplicate);
+            try std.testing.expect(result.value.installed.logical.receipt != null);
+            committed = result.value.installed.logical;
+            break;
+        }
+        incomplete += 1;
+        try std.testing.expectEqual(@as(u32, 1), handle.db.core.schema.?.version);
+    }
+    try std.testing.expect(committed != null);
+    try std.testing.expectEqual(@as(u32, 2), handle.db.core.schema.?.version);
+    handle.db.close();
+    opened = false;
+    handle.db = try db_mod.DB.open(a, directory.path(), options);
+    opened = true;
+    for (0..2) |_| {
+        try std.testing.expectEqual(kernel_owner_abi.Status.ok, server_api.storageOwnerNativeIndexControlJson(id, &request, &response));
+        const output = response;
+        defer freeRawBuffer(output.ptr, output.len);
+        var result = try std.json.parseFromSlice(native.InstallationResponse, a, output.slice(), .{ .ignore_unknown_fields = false });
+        defer result.deinit();
+        try result.value.validateFor(installation);
+        try std.testing.expect(result.value == .installed);
+        try std.testing.expect(result.value.installed.logical.duplicate);
+        try std.testing.expectEqualDeep(committed.?.receipt.?, result.value.installed.logical.receipt.?);
+        try std.testing.expectEqual(committed.?.position, result.value.installed.logical.position);
     }
 }
 
@@ -1632,6 +1733,12 @@ test "storage owner native index raw admission and bounded controls preserve loc
             }
         }
         try std.testing.expect(audited);
+        {
+            var sealed_read = try handle.db.core.store.beginReadTxn();
+            defer sealed_read.abort();
+            const sealed = (try local.storage_db_relational_index_validation.Seal.load(a, &sealed_read, source_read.binding)).?;
+            try testNativeIndexInstallationInterface(&handle.db, .{ .validation = sealed, .metadata_decision = @splat(7) });
+        }
         {
             try std.testing.expectEqual(kernel_owner_abi.Status.ok, server_api.storageOwnerNativeIndexControlJson(id, &validate_request, &validated));
             defer freeRawBuffer(validated.ptr, validated.len);
