@@ -18,6 +18,25 @@ const Allocator = std.mem.Allocator;
 const Value = std.json.Value;
 const EmbeddingFields = @import("embedding_fields.zig").EmbeddingFields;
 const View = @import("json_view.zig").View;
+const plan_mod = @import("json_projection_plan.zig");
+
+/// Owns independently reclaimable cursors, including primed selections which
+/// are replaced or never serialized. Retire before the enclosing row arena.
+pub const Owner = struct {
+    alloc: Allocator,
+    work: Allocator,
+    cursors: ?*FanoutRows = null,
+
+    pub fn init(alloc: Allocator) Owner {
+        return .{ .alloc = alloc, .work = @import("antfly_platform").allocator.reclaimingScratch(alloc) };
+    }
+    pub fn deinit(self: *Owner) void {
+        while (self.cursors) |rows| {
+            self.cursors = rows.next_owned;
+            rows.deinit();
+        }
+    }
+};
 
 /// Row-owned projection structure. Terminal values borrow immutable sources;
 /// containers become mutable only when an ordered selector needs to change one.
@@ -129,10 +148,15 @@ pub const Output = union(enum) {
 
     /// Apply includes in caller order. Object selections merge; every array
     /// selection produces a fresh compact array, preserving legacy replacement.
-    pub fn include(a: Allocator, dst: *Object, name: []const u8, source: Source, path: []const []const u8) anyerror!void {
-        return includeWithBase(a, .{ .map = dst }, name, source, path);
+    pub fn include(owner: *Owner, dst: *Object, name: []const u8, source: Source, path: []const []const u8) anyerror!void {
+        const selected = if (source == .span and path.len > 1) try plan_mod.compile(owner.alloc, &.{.{ .parts = path }}) else null;
+        return includePlanned(owner, dst, name, source, path, selected);
     }
-    fn includeWithBase(a: Allocator, target: Target, name: []const u8, source: Source, path: []const []const u8) anyerror!void {
+    pub fn includePlanned(owner: *Owner, dst: *Object, name: []const u8, source: Source, path: []const []const u8, selected: ?*const plan_mod.Selector) anyerror!void {
+        return includeWithBase(owner, .{ .map = dst }, name, source, path, selected);
+    }
+    fn includeWithBase(owner: *Owner, target: Target, name: []const u8, source: Source, path: []const []const u8, selected: ?*const plan_mod.Selector) anyerror!void {
+        const a = owner.alloc;
         const dst = target.map;
         if (path.len == 0 or (source == .embedding_stream and path.len == 1 and std.mem.eql(u8, path[0], "*"))) return put(a, dst, name, .{ .borrowed = source });
         switch (source.kind()) {
@@ -145,8 +169,8 @@ pub const Output = union(enum) {
                 if (std.mem.eql(u8, path[0], "*")) {
                     var all: Object = .empty;
                     try copyObject(a, &all, source);
-                    for (all.keys(), all.values()) |key, child| try includeWithBase(a, nested, key, child.borrowed, path[1..]);
-                } else if (try source.field(a, path[0])) |child| try includeWithBase(a, nested, path[0], child, path[1..]);
+                    for (all.keys(), all.values()) |key, child| try includeWithBase(owner, nested, key, child.borrowed, path[1..], childSelector(selected, path[0]));
+                } else if (try source.field(a, path[0])) |child| try includeWithBase(owner, nested, path[0], child, path[1..], childSelector(selected, path[0]));
             },
             '[' => {
                 var result: std.ArrayListUnmanaged(Output) = .empty;
@@ -156,27 +180,25 @@ pub const Output = union(enum) {
                         try result.append(a, .{ .borrowed = item });
                     } else if (item.kind() == '{') {
                         var object: Object = .empty;
-                        try includeObjectPath(a, &object, item, path[1..]);
+                        try includeObjectPath(owner, &object, item, path[1..], childSelector(selected, path[0]));
                         if (object.count() != 0) try result.append(a, .{ .object = object });
                     }
                 } else {
-                    // Keep the primed cursor at a stable address. All of its
-                    // allocations belong to the enclosing row arena, including
-                    // abandoned/replaced selectors and failed preparations.
-                    // Serialization resumes it instead of replaying nested
-                    // survival checks. No-survivor selectors leave dst alone.
+                    // Cursor records stay stable in the row. Their navigation
+                    // arenas use independent backing, never a parent arena.
+                    // Register before priming so errors and abandoned outputs
+                    // retire the complete cursor tree through its owner.
                     const fanout = try a.create(Fanout);
-                    fanout.* = .{ .source = source, .path = path, .selector = if (source == .span and path.len > 1) try @import("json_projection_plan.zig").compile(a, &.{.{ .parts = path }}) else null };
+                    fanout.* = .{ .source = source, .path = path, .selector = if (path.len > 1) selected else null };
                     const rows = try a.create(FanoutRows);
-                    rows.* = FanoutRows.initOwned(a, fanout.*);
-                    // Primed rows may be replaced or abandoned. Their retained
-                    // navigation belongs to a; no independent scratch escapes.
-                    defer rows.preparation.deinit();
+                    rows.* = FanoutRows.initOwned(owner.work, fanout.*);
+                    rows.next_owned = owner.cursors;
+                    owner.cursors = rows;
                     if (try rows.next()) |first| {
                         fanout.prepared = rows;
                         fanout.first = first;
                         try put(a, dst, name, .{ .fanout = fanout });
-                    }
+                    } else rows.deinit();
                     return;
                 }
                 if (result.items.len != 0) try put(a, dst, name, .{ .array = result });
@@ -184,23 +206,29 @@ pub const Output = union(enum) {
             else => {},
         }
     }
-    fn includeObjectPath(a: Allocator, dst: *Object, source: Source, path: []const []const u8) !void {
+    fn childSelector(selected: ?*const plan_mod.Selector, name: []const u8) ?*const plan_mod.Selector {
+        return if (selected) |s| s.fields.get(name) else null;
+    }
+    fn includeObjectPath(owner: *Owner, dst: *Object, source: Source, path: []const []const u8, selected: ?*const plan_mod.Selector) !void {
+        const a = owner.alloc;
         if (std.mem.eql(u8, path[0], "*")) {
             var all: Object = .empty;
             try copyObject(a, &all, source);
-            for (all.keys(), all.values()) |name, value| try include(a, dst, name, value.borrowed, path[1..]);
-        } else if (try source.field(a, path[0])) |child| try include(a, dst, path[0], child, path[1..]);
+            for (all.keys(), all.values()) |name, value| try includePlanned(owner, dst, name, value.borrowed, path[1..], childSelector(selected, path[0]));
+        } else if (try source.field(a, path[0])) |child| try includePlanned(owner, dst, path[0], child, path[1..], childSelector(selected, path[0]));
     }
 
-    pub fn includeRoot(a: Allocator, dst: *Object, view: *View, path: []const []const u8) !void {
-        if (path.len == 0) return;
-        for (view.root_sources) |*source| if (std.mem.eql(u8, source.name, path[0])) {
-            return include(a, dst, source.name, source.outputSource(), path[1..]);
+    pub fn includeRoot(owner: *Owner, dst: *Object, view: *View, path: plan_mod.Path) !void {
+        if (path.parts.len == 0) return;
+        const selected = childSelector(path.selector, path.parts[0]);
+        for (view.root_sources) |*source| if (std.mem.eql(u8, source.name, path.parts[0])) {
+            return includePlanned(owner, dst, source.name, source.outputSource(), path.parts[1..], selected);
         };
-        if (try view.field(&view.root, path[0])) |node| try include(a, dst, path[0], .{ .span = .{ .view = view, .node = node } }, path[1..]);
+        if (try view.field(&view.root, path.parts[0])) |node| try includePlanned(owner, dst, path.parts[0], .{ .span = .{ .view = view, .node = node } }, path.parts[1..], selected);
     }
 
-    pub fn includePreparedRootExcept(a: Allocator, dst: *Object, view: *View, excluded: []const []const u8) !void {
+    pub fn includePreparedRootExcept(owner: *Owner, dst: *Object, view: *View, excluded: []const []const u8) !void {
+        const a = owner.alloc;
         if (omitted(excluded, "*")) return;
         const children = view.root.children orelse &.{};
         const names = try a.alloc([]const u8, children.len);
@@ -208,7 +236,7 @@ pub const Output = union(enum) {
         while (it.next()) |entry| if (entry.value_ptr.* < names.len) {
             names[entry.value_ptr.*] = entry.key_ptr.*;
         };
-        for (names) |name| if (!omitted(excluded, name)) try includeRoot(a, dst, view, &.{name});
+        for (names) |name| if (!omitted(excluded, name)) try includeRoot(owner, dst, view, .{ .parts = &.{name} });
         for (view.root_sources) |*source| {
             if (omitted(excluded, source.name) or dst.contains(source.name)) continue;
             try put(a, dst, source.name, .{ .borrowed = source.outputSource() });
@@ -289,11 +317,7 @@ pub const Output = union(enum) {
                 if (first) |object| {
                     try (Output{ .object = object }).write(context, writer);
                     count = 1;
-                    // Only the primed row uses its enclosing arena. Subsequent
-                    // siblings share independently reclaimable bounded scratch.
-                    rows.arena.deinit();
-                    rows.arena = .init(context.work);
-                    rows.preparation = .init(context.work);
+                    // next() retires the first row and its nested cursors.
                 }
                 while (try rows.next()) |object| {
                     if (count != 0) try writer.writeByte(',');
@@ -507,10 +531,13 @@ const StreamContext = struct {
 /// Each returned object borrows this iterator's row arena and view until next.
 /// In particular, navigation never enters a retained native column-page view.
 const FanoutRows = struct {
+    next_owned: ?*FanoutRows = null,
+    active: bool = true,
     source: Source,
     path: []const []const u8,
     selector: ?*const @import("json_projection_plan.zig").Selector,
     arena: std.heap.ArenaAllocator,
+    owner: Owner,
     preparation: View.PreparationWorkspace,
     scanner: ?std.json.Scanner = null,
     started: bool = false,
@@ -520,20 +547,25 @@ const FanoutRows = struct {
         return initOwned(@import("antfly_platform").allocator.reclaimingScratch(a), fanout);
     }
     fn initOwned(work: Allocator, fanout: Output.Fanout) FanoutRows {
-        return .{ .source = fanout.source, .path = fanout.path, .selector = fanout.selector, .arena = .init(work), .preparation = .init(work), .scanner = switch (fanout.source) {
+        return .{ .source = fanout.source, .path = fanout.path, .selector = fanout.selector, .arena = .init(work), .owner = .init(work), .preparation = .init(work), .scanner = switch (fanout.source) {
             .span => |span| std.json.Scanner.initCompleteInput(work, span.node.raw),
             .logical, .embeddings, .embedding_stream, .vector, .component => null,
         } };
     }
     fn deinit(self: *FanoutRows) void {
+        if (!self.active) return;
+        self.active = false;
+        self.owner.deinit();
         if (self.scanner) |*scanner| scanner.deinit();
         self.preparation.deinit();
         self.arena.deinit();
     }
     fn next(self: *FanoutRows) anyerror!?Output.Object {
         while (true) {
+            self.owner.deinit();
             try resetScratch(&self.arena);
             const a = self.arena.allocator();
+            self.owner = .init(a);
             const item: Source = switch (self.source) {
                 .vector => return null,
                 .embeddings, .embedding_stream, .component => unreachable,
@@ -595,7 +627,7 @@ const FanoutRows = struct {
             };
             if (item.kind() != '{') continue;
             var object: Output.Object = .empty;
-            try Output.includeObjectPath(a, &object, item, self.path);
+            try Output.includeObjectPath(&self.owner, &object, item, self.path, self.selector);
             if (object.count() != 0) return object;
         }
     }
@@ -697,15 +729,17 @@ fn overlayAppendScenario(a: Allocator) !void {
     replacement.parse_numbers = true;
     const extra: Value = .{ .integer = 7 };
     var root: Output.Object = .empty;
-    try Output.include(scratch, &root, "v", .{ .span = .{ .view = &base, .node = &base.root } }, &.{});
+    var projection_owner = Owner.init(scratch);
+    defer projection_owner.deinit();
+    try Output.include(&projection_owner, &root, "v", .{ .span = .{ .view = &base, .node = &base.root } }, &.{});
     // Select from a different source into a borrowed base. Existing members
     // retain base order; new members append in first insertion order.
-    try Output.include(scratch, &root, "v", .{ .span = .{ .view = &replacement, .node = &replacement.root } }, &.{"z"});
-    try Output.include(scratch, &root, "v", .{ .span = .{ .view = &replacement, .node = &replacement.root } }, &.{"x"});
-    try Output.include(scratch, &root, "v", .{ .span = .{ .view = &base, .node = &base.root } }, &.{ "a", "1" });
+    try Output.include(&projection_owner, &root, "v", .{ .span = .{ .view = &replacement, .node = &replacement.root } }, &.{"z"});
+    try Output.include(&projection_owner, &root, "v", .{ .span = .{ .view = &replacement, .node = &replacement.root } }, &.{"x"});
+    try Output.include(&projection_owner, &root, "v", .{ .span = .{ .view = &base, .node = &base.root } }, &.{ "a", "1" });
     var extra_source: Value = .{ .object = .empty };
     try extra_source.object.put(scratch, "last", extra);
-    try Output.include(scratch, &root, "v", .{ .logical = &extra_source }, &.{"last"});
+    try Output.include(&projection_owner, &root, "v", .{ .logical = &extra_source }, &.{"last"});
     const bytes = try (Output{ .object = root }).serialize(scratch, a);
     defer a.free(bytes);
     try std.testing.expectEqualStrings("{\"v\":{\"a\":[2],\"b\":{\"x\":1,\"y\":2},\"z\":3,\"x\":9,\"last\":7}}", bytes);
@@ -774,8 +808,10 @@ test "public graph metric borrowed wire streaming sparse overlays validate disca
     for ([_][]const u8{ "{\"dup\":1,\"d\\u0075p\":2}", "{\"dup\":[1,]}", "{\"dup\":}" }) |raw| {
         var base = View.init(arena.allocator(), raw);
         var root: Output.Object = .empty;
-        try Output.include(arena.allocator(), &root, "v", .{ .span = .{ .view = &base, .node = &base.root } }, &.{});
-        try Output.include(arena.allocator(), &root, "v", .{ .logical = &replacement }, &.{"dup"});
+        var projection_owner = Owner.init(arena.allocator());
+        defer projection_owner.deinit();
+        try Output.include(&projection_owner, &root, "v", .{ .span = .{ .view = &base, .node = &base.root } }, &.{});
+        try Output.include(&projection_owner, &root, "v", .{ .logical = &replacement }, &.{"dup"});
         if ((Output{ .object = root }).serialize(arena.allocator(), a)) |bytes| {
             a.free(bytes);
             return error.TestExpectedError;
@@ -829,7 +865,9 @@ fn fanoutOrderingScenario(a: Allocator) !void {
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
     var object: Output.Object = .empty;
-    try Output.include(arena.allocator(), &object, "items", .{ .logical = parsed.value.object.getPtr("items").? }, &.{ "nested", "z" });
+    var projection_owner = Owner.init(arena.allocator());
+    defer projection_owner.deinit();
+    try Output.include(&projection_owner, &object, "items", .{ .logical = parsed.value.object.getPtr("items").? }, &.{ "nested", "z" });
     const result = try (Output{ .object = object }).serialize(arena.allocator(), a);
     defer a.free(result);
     var expected = try query.lookupJson(a, raw, .{ .fields = &.{"items.nested.z"}, .include_all_fields = false });
@@ -874,8 +912,10 @@ test "public graph metric borrowed wire streaming fused overlay consumes exactly
     var replacement: Value = .{ .object = .empty };
     try replacement.object.put(arena.allocator(), "last", .{ .bool = true });
     var object: Output.Object = .empty;
-    try Output.include(arena.allocator(), &object, "v", .{ .span = .{ .view = &view, .node = &view.root } }, &.{});
-    try Output.include(arena.allocator(), &object, "v", .{ .logical = &replacement }, &.{"last"});
+    var projection_owner = Owner.init(arena.allocator());
+    defer projection_owner.deinit();
+    try Output.include(&projection_owner, &object, "v", .{ .span = .{ .view = &view, .node = &view.root } }, &.{});
+    try Output.include(&projection_owner, &object, "v", .{ .logical = &replacement }, &.{"last"});
     const bytes = try (Output{ .object = object }).serialize(arena.allocator(), a);
     defer a.free(bytes);
     try std.testing.expectEqualStrings("{\"v\":{\"ab\":{\"s\":\"\\na\",\"n\":1e2},\"arr\":[1,true,null,{\"z\":2}],\"last\":true}}", bytes);
@@ -897,7 +937,9 @@ test "public graph metric borrowed wire streaming fanout validates unprepared si
     defer arena.deinit();
     var view = View.init(arena.allocator(), "[{\"x\":1},{\"x\":2,\"\\u0078\":3}]");
     var object: Output.Object = .empty;
-    try Output.include(arena.allocator(), &object, "items", .{ .span = .{ .view = &view, .node = &view.root } }, &.{"x"});
+    var projection_owner = Owner.init(arena.allocator());
+    defer projection_owner.deinit();
+    try Output.include(&projection_owner, &object, "items", .{ .span = .{ .view = &view, .node = &view.root } }, &.{"x"});
     try std.testing.expectError(error.DuplicateField, (Output{ .object = object }).serialize(arena.allocator(), a));
 }
 
@@ -987,11 +1029,13 @@ test "public graph metric borrowed wire primed nested fanout survives replacemen
             var view: View = .init(scratch, raw);
             var root: Output.Object = .empty;
             const source: Source = .{ .span = .{ .view = &view, .node = &view.root } };
-            try Output.include(scratch, &root, "items", source, &.{ "x", "x", "leaf" });
+            var projection_owner = Owner.init(scratch);
+            defer projection_owner.deinit();
+            try Output.include(&projection_owner, &root, "items", source, &.{ "x", "x", "leaf" });
             // Abandon a live prepared chain, then preserve its replacement when
             // a later selector produces no surviving objects.
-            try Output.include(scratch, &root, "items", source, &.{ "x", "x", "leaf" });
-            try Output.include(scratch, &root, "items", source, &.{"absent"});
+            try Output.include(&projection_owner, &root, "items", source, &.{ "x", "x", "leaf" });
+            try Output.include(&projection_owner, &root, "items", source, &.{"absent"});
             const output: Output = .{ .object = root };
             var storage: [32]u8 = undefined;
             var failed: std.Io.Writer = .fixed(&storage);
@@ -1008,6 +1052,42 @@ test "public graph metric borrowed wire primed nested fanout survives replacemen
     };
     try Fixture.run(std.testing.allocator);
     try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Fixture.run, .{});
+}
+
+test "public graph metric borrowed wire nested fanout ownership bounds priming and reuses immutable suffix plans" {
+    const a = std.testing.allocator;
+    const query = @import("../document_query.zig");
+    const counters = @import("../../lite/test_allocator.zig");
+    const fields: []const []const u8 = &.{"items.x.x.x.x.x.x.x.x.m"};
+    var plan = (try query.SpanProjectionPlan.init(a, .{ .fields = fields, .include_all_fields = false })).?;
+    defer plan.deinit();
+    const selected = plan.paths[0].selector.?;
+    const capacity = plan.arena.queryCapacity();
+    for ([_]bool{ false, true }) |survives| {
+        for ([_]usize{ 1, 100 }) |count| {
+            var input: std.Io.Writer.Allocating = .init(a);
+            defer input.deinit();
+            try input.writer.writeAll("{\"items\":[");
+            for (0..count) |i| {
+                if (i != 0) try input.writer.writeByte(',');
+                for (0..8) |_| try input.writer.writeAll("{\"x\":[");
+                try input.writer.writeAll(if (survives) "{\"m\":1,\"absent\":0}" else "{\"absent\":0}");
+                for (0..8) |_| try input.writer.writeAll("]}");
+            }
+            try input.writer.writeAll("]}");
+            var no_resize: counters.NoResizeAllocator = .{ .backing = a };
+            var budget: counters.BudgetAllocator = .{ .backing = no_resize.allocator(), .limit = 512 * 1024 };
+            var actual = try query.lookupJsonWithPlan(budget.allocator(), a, input.written(), &plan);
+            defer actual.deinit(a);
+            var expected = try query.lookupJson(a, input.written(), .{ .fields = fields, .include_all_fields = false });
+            defer expected.deinit(a);
+            try std.testing.expectEqualStrings(expected.json, actual.json);
+            try std.testing.expectEqual(@as(usize, 0), budget.live);
+            try std.testing.expectEqual(capacity, plan.arena.queryCapacity());
+            try std.testing.expectEqual(selected, plan.paths[0].selector.?);
+            std.debug.print("NESTED_PRIMING survives={} count={d} peak={d} allocations={d}\n", .{ survives, count, budget.peak, budget.alloc_calls });
+        }
+    }
 }
 
 test "public graph metric borrowed wire streaming writer reuses wide escaped key tables" {

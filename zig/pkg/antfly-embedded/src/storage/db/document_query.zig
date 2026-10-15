@@ -85,6 +85,9 @@ pub const SpanProjectionPlan = struct {
             if (!omit) try paths.append(a, .{ .parts = parts.items });
         }
         const selector = try @import("query/json_projection_plan.zig").compile(a, paths.items);
+        for (paths.items) |*path| {
+            if (path.parts.len > 2) path.selector = if (paths.items.len == 1) selector else try @import("query/json_projection_plan.zig").compile(a, &.{path.*});
+        }
         return .{
             .arena = arena,
             .selector = selector,
@@ -124,10 +127,12 @@ pub fn lookupJsonWithSourcesPolicy(alloc: Allocator, output: Allocator, raw: []c
     for (sources, overlays) |source, *overlay| overlay.* = source;
     view.root_sources = overlays;
     const Projection = @import("query/projection_output.zig").Output;
+    var projection_owner = @import("query/projection_output.zig").Owner.init(a);
+    defer projection_owner.deinit();
     var projected: Projection.Object = .empty;
     if (plan.include_all or plan.passthrough) {
-        try Projection.includePreparedRootExcept(a, &projected, &view, plan.excluded);
-    } else for (plan.paths) |path| try Projection.includeRoot(a, &projected, &view, path.parts);
+        try Projection.includePreparedRootExcept(&projection_owner, &projected, &view, plan.excluded);
+    } else for (plan.paths) |path| try Projection.includeRoot(&projection_owner, &projected, &view, path);
     return .{ .json = try (Projection{ .object = projected }).serializeWithPolicy(a, output, exact) };
 }
 

@@ -28,6 +28,7 @@ pub const Plan = struct {
     arena: std.heap.ArenaAllocator,
     paths: []const []const []const u8 = &.{},
     selectors: ?*const @import("json_projection_plan.zig").Selector = null,
+    path_selectors: []const ?*const @import("json_projection_plan.zig").Selector = &.{},
 
     /// Positive selections share one contract across row and column readers.
     /// A hyphen inside a name is literal; only a leading hyphen is exclusion.
@@ -61,11 +62,14 @@ pub const Plan = struct {
         const compiled = try scratch.alloc(@import("json_projection_plan.zig").Path, paths.len);
         for (paths, compiled) |parts, *path| path.* = .{ .parts = parts };
         const selectors = try @import("json_projection_plan.zig").compile(scratch, compiled);
+        const path_selectors = try scratch.alloc(?*const @import("json_projection_plan.zig").Selector, paths.len);
+        for (compiled, path_selectors) |path, *selected| selected.* = if (path.parts.len > 2) (if (compiled.len == 1) selectors else try @import("json_projection_plan.zig").compile(scratch, &.{path})) else null;
         return .{
             .selectors = selectors,
             .base = try codec.OrdinalProjectionPlan.init(alloc, table, layout, roots),
             .arena = arena,
             .paths = paths,
+            .path_selectors = path_selectors,
         };
     }
 
@@ -112,6 +116,8 @@ pub const Plan = struct {
     }
     pub fn projectSourcesPolicy(self: Plan, alloc: std.mem.Allocator, scratch: std.mem.Allocator, source: Sources, exact: bool) ![]u8 {
         const Projection = @import("projection_output.zig").Output;
+        var projection_owner = @import("projection_output.zig").Owner.init(scratch);
+        defer projection_owner.deinit();
         var result: Projection.Object = .empty;
         if (self.paths.len == 0) {
             var output = std.Io.Writer.Allocating.init(scratch);
@@ -137,12 +143,12 @@ pub const Plan = struct {
                     if (selected.fields.count() != 0) try value.json.prepareProjectionWithOptions(selected, .visited, .any_container, .{ .defer_fanout = true });
                 };
             };
-            for (self.paths) |parts| {
+            for (self.paths, self.path_selectors) |parts, selected| {
                 if (parts.len == 0) continue;
                 const value = source.getPtr(parts[0]) orelse continue;
                 switch (value.*) {
-                    .json => |view| try Projection.include(scratch, &result, parts[0], .{ .span = .{ .view = view, .node = &view.root } }, parts[1..]),
-                    .logical => |*logical| try Projection.include(scratch, &result, parts[0], .{ .logical = logical }, parts[1..]),
+                    .json => |view| try Projection.includePlanned(&projection_owner, &result, parts[0], .{ .span = .{ .view = view, .node = &view.root } }, parts[1..], if (selected) |s| s.fields.get(parts[0]) else null),
+                    .logical => |*logical| try Projection.includePlanned(&projection_owner, &result, parts[0], .{ .logical = logical }, parts[1..], null),
                 }
             }
         }
