@@ -4885,6 +4885,7 @@ test "capi SQL background embedding releases the file gate and fences stale resu
             break :blk guard.connection.?.owner;
         };
         var captured_runtime: std.meta.Child(@FieldType(db_mod.DB, "enrichment_runtime")) = undefined;
+        var captured_database: *db_mod.DB = undefined;
         {
             const guard = public.enterHandle(handle, .exclusive).?;
             defer guard.leave();
@@ -4898,6 +4899,7 @@ test "capi SQL background embedding releases the file gate and fences stale resu
             });
             try guard.handle.db.reconfigureEnrichmentRuntimePaused(.{ .dense_embedder = gate.interface() });
             captured_runtime = guard.handle.db.enrichment_runtime.?;
+            captured_database = &guard.handle.db;
             try guard.handle.db.batch(.{ .writes = &.{.{ .key = "doc", .value = "{\"body\":\"original\"}" }}, .sync_level = .write });
             connection.maintenance_pending = true;
         }
@@ -4952,9 +4954,38 @@ test "capi SQL background embedding releases the file gate and fences stale resu
             defer staging.release(staging.ptr);
             const artifact = try @import("antfly_local_sources").storage_internal_keys.embeddingArtifactKeyForDocumentAlloc(alloc, "doc", "body_dense");
             defer alloc.free(artifact);
+            const before = connection.publication_stats.generated_refused;
             if (source_changed) {
                 try std.testing.expectError(error.EnrichmentWaitCanceled, staging.guard_key(staging.ptr, artifact));
-            } else try staging.guard_key(staging.ptr, artifact);
+                try std.testing.expectEqual(before + 1, connection.publication_stats.generated_refused);
+                // Multiple guards in one refused store lease count once.
+                try std.testing.expectError(error.EnrichmentWaitCanceled, staging.guard_key(staging.ptr, artifact));
+                try std.testing.expectEqual(before + 1, connection.publication_stats.generated_refused);
+            } else {
+                try staging.guard_key(staging.ptr, artifact);
+                try std.testing.expectEqual(before, connection.publication_stats.generated_refused);
+            }
+        }
+        if (source_changed) {
+            // Projection-only effects do not appear in changed_doc_keys, but
+            // they still must reject a source replaced since capture.
+            try std.testing.expectError(error.EnrichmentWaitCanceled, captured_database.derivedAsyncAppendDerivedBatchRecord(.{
+                .documents = &.{.{ .key = "doc", .action = .preserve_base_document }},
+            }));
+            const guard = public.enterHandle(handle, .read).?;
+            defer guard.leave();
+            try std.testing.expectEqual(@as(u64, 1), connection.publication_stats.replay_refused);
+        }
+        {
+            const port = captured_runtime.generated_publication.?;
+            // A missing lease rejects both the staging and final commit ports.
+            try std.testing.expectError(error.EnrichmentLeaseFenceLost, port.acquire_store(port.ptr, .{ .lease_key = "__antfly_test_missing_lease", .owner_id = "review", .epoch = 1 }, 0));
+            try std.testing.expectError(error.EnrichmentWaitCanceled, port.commit(port.ptr, .{}, &.{}, &.{}, &.{}, .{ .lease_key = "__antfly_test_missing_lease", .owner_id = "review", .epoch = 1 }));
+            const guard = public.enterHandle(handle, .read).?;
+            defer guard.leave();
+            const expected_refusals: u64 = if (source_changed) 3 else 2;
+            try std.testing.expectEqual(expected_refusals, connection.publication_stats.generated_refused);
+            try std.testing.expect(connection.publication_stats.refused >= expected_refusals);
         }
         gate.allowed.set(shared.handleLockIo());
         background.join();
@@ -5477,7 +5508,8 @@ test "capi SQL batched conflict validation reclaims prior row scratch" {
 test "capi SQL index publication accepts unrelated primary commits and fences changed inputs" {
     if (builtin.single_threaded or builtin.os.tag == .freestanding) return error.SkipZigTest;
     const alloc = std.testing.allocator;
-    for ([_]bool{ false, true }) |index_changed| {
+    for ([_]enum { bookkeeping, append, conflicting_index }{ .bookkeeping, .append, .conflicting_index }) |mode| {
+        const index_changed = mode == .conflicting_index;
         const Gate = struct {
             entered: std.atomic.Value(bool) = .init(false),
             started: std.Io.Event = .unset,
@@ -5486,17 +5518,55 @@ test "capi SQL index publication accepts unrelated primary commits and fences ch
             fn notify(ptr: *anyopaque, root: *shared.Handle) void {
                 const self: *@This() = @ptrCast(@alignCast(ptr));
                 if (self.entered.swap(true, .acq_rel)) return;
+                _ = root.db.core.nextDerivedAppendSequence(); // Prime the detached allocator.
                 self.started.set(shared.handleLockIo());
                 self.allowed.waitTimeout(shared.handleLockIo(), .{ .duration = .{ .raw = .fromSeconds(10), .clock = .awake } }) catch |err| {
                     self.publication_error = err;
                     return;
                 };
+                // Lease/progress transactions must also survive a moved primary
+                // checkpoint before the first immutable segment is published.
+                var txn = root.db.core.store.beginWriteTxn() catch |err| {
+                    self.publication_error = err;
+                    return;
+                };
+                var committed = false;
+                defer if (!committed) txn.abort();
+                txn.put("__antfly_test_detached_progress", "progress") catch |err| {
+                    self.publication_error = err;
+                    return;
+                };
+                txn.commit() catch |err| {
+                    self.publication_error = err;
+                    return;
+                };
+                committed = true;
                 // Deliver already prepared immutable bytes through the same
                 // storage port used by full-text segments, after foreground
                 // commits have moved the primary checkpoint.
                 root.db.core.index_manager.text_lsm_storage.?.writeFileAbsolute("__antfly_lite/indexes/body_text/prepared.bin", "prepared index bytes") catch |err| {
+                    std.debug.print("detached index bytes failed: {s}\n", .{@errorName(err)});
                     self.publication_error = err;
+                    return;
                 };
+                // Reserving on the detached cache used to fail after the
+                // foreground commits. Both generic and resolver producers must
+                // allocate through the current coordinator instead.
+                const sequence = root.db.derivedAsyncAppendDerivedBatchRecord(.{}) catch |err| {
+                    std.debug.print("detached generic append failed: {s}\n", .{@errorName(err)});
+                    self.publication_error = err;
+                    return;
+                };
+                const runtime = root.db.resolution_runtime.?;
+                const resolved = runtime.write_fn(runtime.write_ctx, .{ .inputs = .{}, .batch = .{}, .artifact_writes = &.{.{ .key = "__antfly_test_resolver_artifact", .value = "resolver" }}, .target_hints = &.{} }) catch |err| {
+                    std.debug.print("detached resolver append failed: {s}\n", .{@errorName(err)});
+                    self.publication_error = err;
+                    return;
+                };
+                if (resolved <= sequence or root.db.core.nextDerivedSequence() < resolved) {
+                    self.publication_error = error.TestExpectedIncreasingSequence;
+                    return;
+                }
             }
         };
         var gate: Gate = .{};
@@ -5551,7 +5621,7 @@ test "capi SQL index publication accepts unrelated primary commits and fences ch
         };
         try gate.started.waitTimeout(shared.handleLockIo(), .{ .duration = .{ .raw = .fromSeconds(5), .clock = .awake } });
         for (0..8) |i| {
-            if (index_changed) {
+            if (mode != .bookkeeping) {
                 const statement = try std.fmt.allocPrint(alloc, "INSERT INTO \"default\" (_id,body) VALUES ('other{d}','unrelated')", .{i});
                 defer alloc.free(statement);
                 try sqlFkRecoveryStatement(handle, statement);
@@ -5588,6 +5658,20 @@ test "capi SQL index publication accepts unrelated primary commits and fences ch
             // must yield and retry, preserving the foreground artifact.
             if (!owner.maintenance_pending) return error.TestIndexChangeNotPending;
         }
+        if (!index_changed) {
+            // Prove progress in the captured turn, before any quiet-time drain.
+            const guard = public.enterHandle(handle, .exclusive).?;
+            defer guard.leave();
+            const progress = (try guard.handle.db.core.getStoreValue(alloc, "__antfly_test_detached_progress")) orelse return error.TestExpectedProgress;
+            defer alloc.free(progress);
+            try std.testing.expectEqualStrings("progress", progress);
+            try std.testing.expect(owner.publication_stats.rebased > 0);
+            const resolved = (try guard.handle.db.core.getStoreValue(alloc, "__antfly_test_resolver_artifact")) orelse return error.TestExpectedResolverArtifact;
+            defer alloc.free(resolved);
+            try std.testing.expectEqualStrings("resolver", resolved);
+            try std.testing.expect(owner.publication_stats.replay_attempts >= 2);
+            try std.testing.expectEqual(@as(u64, 0), owner.publication_stats.replay_refused);
+        }
         for (0..64) |_| {
             if (!try owner.maintenanceTurnForTest()) break;
         }
@@ -5604,12 +5688,266 @@ test "capi SQL index publication accepts unrelated primary commits and fences ch
         defer result.deinit();
         try std.testing.expect(result.hits.len != 0);
         try std.testing.expectEqualStrings("original", result.hits[0].id);
-        if (index_changed) {
+        if (mode != .bookkeeping) {
             var unrelated = try guard.handle.db.search(alloc, .{ .index_name = "body_text", .full_text = .{ .match = .{ .field = "body", .text = "unrelated" } }, .limit = 10 });
             defer unrelated.deinit();
             try std.testing.expectEqual(@as(usize, 8), unrelated.hits.len);
         }
     }
+}
+
+test "capi SQL resolver input read sets fence negative reads and range phantoms" {
+    const alloc = std.testing.allocator;
+    var directory = try TestDirectory.init("capi-sql-resolver-read-set");
+    defer directory.cleanup();
+    const path = try tempTestAflitePath(alloc, directory.path(), "database");
+    defer alloc.free(path);
+    defer cleanupTestFile(path);
+    var options: capi.OpenOptions = .{};
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_open_options_init(&options));
+    options.storage_kind = capi.storage_kind_lite;
+    options.profile = capi.profile_hosted;
+    var handle: ?*anyopaque = null;
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_create_with_options(path, &options, &handle));
+    defer antfly_db_close(handle);
+    const guard = public.enterHandle(handle, .exclusive).?;
+    defer guard.leave();
+    try guard.handle.db.reconfigureEnrichmentRuntimePaused(.{ .enable_without_producers = true });
+    const runtime = guard.handle.db.resolution_runtime.?;
+    try @import("antfly_local_sources").storage_db_resolution_runtime.testReplayReadTracking(runtime.store_handle.store);
+}
+
+test "capi SQL resolver publication fences captured inputs and resolver generations" {
+    if (builtin.single_threaded or builtin.os.tag == .freestanding) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    const resolution = @import("antfly_local_sources").storage_db_resolution_runtime;
+    const k = @import("antfly_local_sources").storage_internal_keys;
+    const Mode = enum { unchanged, unrelated, source, sibling, override, candidate, catalog, mixed, mixed_conflict, repeated };
+    for ([_]Mode{ .unchanged, .unrelated, .source, .sibling, .override, .candidate, .catalog, .mixed, .mixed_conflict, .repeated }) |mode| {
+        errdefer std.debug.print("resolver publication fence mode={s}\n", .{@tagName(mode)});
+        var directory = try TestDirectory.init("capi-sql-resolver-input-fence");
+        defer directory.cleanup();
+        const path = try tempTestAflitePath(alloc, directory.path(), "database");
+        defer alloc.free(path);
+        defer cleanupTestFile(path);
+        var options: capi.OpenOptions = .{};
+        try std.testing.expectEqual(capi.ErrorCode.ok, antfly_open_options_init(&options));
+        options.storage_kind = capi.storage_kind_lite;
+        options.profile = capi.profile_native;
+        var handle: ?*anyopaque = null;
+        try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_create_with_options(path, &options, &handle));
+        defer antfly_db_close(handle);
+        const owner = blk: {
+            const guard = public.enterHandle(handle, .exclusive).?;
+            defer guard.leave();
+            break :blk guard.connection.?.owner;
+        };
+        owner.stopping.store(true, .release);
+        owner.wake.set(shared.handleLockIo());
+        owner.worker.?.join();
+        owner.worker = null;
+        owner.stopping.store(false, .release);
+        const source = try k.artifactNamedPrefixAlloc(alloc, "doc", "asset", "mentions");
+        defer alloc.free(source);
+        const out = try k.resolutionArtifactKeyAlloc(alloc, "doc", "resolution");
+        defer alloc.free(out);
+        {
+            const guard = public.enterHandle(handle, .exclusive).?;
+            defer guard.leave();
+            _ = try guard.handle.db.core.upsertResolver(.{ .name = "review", .table = "default", .source_artifact = "mentions", .resolution_artifact = "resolution", .key_template = "{{ slug _entity.text }}", .config_generation = 1, .promote = false, .labels = &.{"Person"} });
+            _ = try guard.handle.db.core.upsertResolver(.{ .name = "sibling", .table = "default", .source_artifact = "mentions", .resolution_artifact = "sibling", .key_template = "{{ slug _entity.text }}", .config_generation = 1, .promote = false, .labels = &.{"Org"} });
+            try guard.handle.db.batch(.{ .writes = &.{.{ .key = "doc", .value = "{\"body\":\"unchanged\"}" }}, .sync_level = .write });
+            var txn = try guard.handle.db.core.store.beginWriteTxn();
+            errdefer txn.abort();
+            try txn.put(source, "{\"entities\":[{\"id\":\"e0\",\"label\":\"Person\",\"text\":\"Old Name\"}]}");
+            try txn.commit();
+            if (mode == .mixed or mode == .mixed_conflict) {
+                // A second source is already resolved, making the captured record
+                // contain both changed and unchanged decisions.
+                try guard.handle.db.batch(.{ .writes = &.{.{ .key = "doc2", .value = "{}" }}, .sync_level = .write });
+                const second = try k.artifactNamedPrefixAlloc(alloc, "doc2", "asset", "mentions");
+                defer alloc.free(second);
+                var second_txn = try guard.handle.db.core.store.beginWriteTxn();
+                errdefer second_txn.abort();
+                try second_txn.put(second, "{\"entities\":[{\"id\":\"e0\",\"label\":\"Person\",\"text\":\"Old Name\"}]}");
+                try second_txn.commit();
+                const runtime = guard.handle.db.resolution_runtime.?;
+                var borrowed = runtime.store_handle.store;
+                var adapter: resolution.DbArtifactStore(@TypeOf(borrowed)) = .{ .store = &borrowed, .index_manager = guard.handle.db.core.index_manager };
+                const configs = try guard.handle.db.core.listResolvers(alloc);
+                defer {
+                    for (configs) |*cfg| cfg.deinit(alloc);
+                    alloc.free(configs);
+                }
+                try resolution.processRecordKeys(alloc, configs, adapter.artifactStore(), null, &.{second}, runtime.write_ctx, runtime.write_fn, null, null);
+            }
+        }
+        const Probe = struct {
+            handle: ?*anyopaque,
+            mode: Mode,
+            source: []const u8,
+            out: []const u8,
+            rejection: ?anyerror = null,
+            failure: ?anyerror = null,
+            fn notify(ptr: *anyopaque, root: *shared.Handle) void {
+                const self: *@This() = @ptrCast(@alignCast(ptr));
+                self.run(root) catch |err| {
+                    self.failure = err;
+                };
+            }
+            fn run(self: *@This(), root: *shared.Handle) !void {
+                {
+                    const guard = public.enterHandle(self.handle, .exclusive).?;
+                    defer guard.leave();
+                    if (self.mode == .catalog) {
+                        _ = try guard.handle.db.core.upsertResolver(.{ .name = "review", .table = "default", .source_artifact = "mentions", .resolution_artifact = "resolution", .key_template = "changed/{{ slug _entity.text }}", .config_generation = 2, .promote = false, .labels = &.{"Person"} });
+                    } else if (self.mode == .candidate) {
+                        try guard.handle.db.batch(.{ .writes = &.{.{ .key = "old_name", .value = "{\"name\":\"Canonical\"}" }}, .sync_level = .write });
+                    } else if (self.mode != .unchanged and self.mode != .mixed and self.mode != .repeated) {
+                        const a = std.heap.c_allocator;
+                        const key = switch (self.mode) {
+                            .source => try a.dupe(u8, self.source),
+                            .mixed_conflict => try k.artifactNamedPrefixAlloc(a, "doc2", "asset", "mentions"),
+                            .sibling => try k.resolutionArtifactKeyAlloc(a, "doc", "sibling"),
+                            .override => try resolution.reviewOverrideArtifactKeyAlloc(a, "doc", "mentions", "resolution"),
+                            else => try a.dupe(u8, "unrelated"),
+                        };
+                        defer a.free(key);
+                        var txn = try guard.handle.db.core.store.beginWriteTxn();
+                        errdefer txn.abort();
+                        try txn.put(key, "{\"entities\":[]}");
+                        try txn.commit();
+                    }
+                }
+                const runtime = root.db.resolution_runtime.?;
+                var borrowed = runtime.store_handle.store;
+                var adapter: resolution.DbArtifactStore(@TypeOf(borrowed)) = .{ .store = &borrowed, .index_manager = root.db.core.index_manager };
+                const a = std.heap.c_allocator;
+                const resolvers = try root.db.core.listResolvers(a);
+                defer {
+                    for (resolvers) |*cfg| cfg.deinit(a);
+                    a.free(resolvers);
+                }
+                const second = try k.artifactNamedPrefixAlloc(a, "doc2", "asset", "mentions");
+                defer a.free(second);
+                const changed = if (self.mode == .mixed or self.mode == .mixed_conflict) &[_][]const u8{ self.source, second } else &[_][]const u8{self.source};
+                const replay_before = root.db.core.nextDerivedSequence();
+                resolution.processRecordKeys(a, resolvers, adapter.artifactStore(), null, changed, runtime.write_ctx, runtime.write_fn, null, null) catch |err| {
+                    if (err != error.EnrichmentWaitCanceled and err != error.EnrichmentSourceChanged) return err;
+                    self.rejection = err;
+                };
+                if (self.mode == .repeated) {
+                    // Refreshing the detached checkpoint after the first
+                    // publication makes its output the second record's input.
+                    // Both records must finish in this same captured turn.
+                    try resolution.processRecordKeys(a, resolvers, adapter.artifactStore(), null, changed, runtime.write_ctx, runtime.write_fn, null, null);
+                }
+                // Inspect before the ordinary maintenance pass can retry from
+                // a new snapshot and publish a fresh, valid decision.
+                const guard = public.enterHandle(self.handle, .read).?;
+                defer guard.leave();
+                if (self.mode == .mixed) {
+                    try std.testing.expectEqual(replay_before + 2, root.db.core.nextDerivedSequence());
+                    try std.testing.expectEqual(@as(u64, 1), guard.connection.?.owner.publication_stats.replay_attempts);
+                    try std.testing.expectEqual(@as(u64, 0), guard.connection.?.owner.publication_stats.replay_refused);
+                }
+                const value = try guard.handle.db.core.getStoreValue(a, self.out);
+                defer if (value) |bytes| a.free(bytes);
+                if (self.rejection != null) try std.testing.expect(value == null) else try std.testing.expect(value != null);
+            }
+        };
+        var probe: Probe = .{ .handle = handle, .mode = mode, .source = source, .out = out };
+        owner.test_after_capture = .{ .ptr = &probe, .notify = Probe.notify };
+        owner.maintenance_pending = true;
+        _ = try owner.maintenanceTurnForTest();
+        owner.test_after_capture = null;
+        if (probe.failure) |err| return err;
+        try std.testing.expectEqual(mode != .unchanged and mode != .unrelated and mode != .mixed and mode != .repeated, probe.rejection != null);
+    }
+}
+
+test "capi SQL maintenance advances every captured full text prefix during steady appends" {
+    if (builtin.single_threaded or builtin.os.tag == .freestanding) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var directory = try TestDirectory.init("capi-sql-steady-append-progress");
+    defer directory.cleanup();
+    const path = try tempTestAflitePath(alloc, directory.path(), "database");
+    defer alloc.free(path);
+    defer cleanupTestFile(path);
+    var options: capi.OpenOptions = .{};
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_open_options_init(&options));
+    options.storage_kind = capi.storage_kind_lite;
+    options.profile = capi.profile_native;
+    var handle: ?*anyopaque = null;
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_create_with_options(path, &options, &handle));
+    defer antfly_db_close(handle);
+    const owner = blk: {
+        const guard = public.enterHandle(handle, .exclusive).?;
+        defer guard.leave();
+        break :blk guard.connection.?.owner;
+    };
+    owner.stopping.store(true, .release);
+    owner.wake.set(shared.handleLockIo());
+    owner.worker.?.join();
+    owner.worker = null;
+    owner.stopping.store(false, .release);
+    {
+        const guard = public.enterHandle(handle, .exclusive).?;
+        defer guard.leave();
+        try guard.handle.db.addIndex(.{ .name = "body_text", .kind = .full_text, .config_json = "{\"field\":\"body\"}" });
+        try guard.handle.db.batch(.{ .writes = &.{.{ .key = "original", .value = "{\"body\":\"needle\"}" }}, .sync_level = .write });
+    }
+    const Append = struct {
+        handle: ?*anyopaque,
+        count: usize = 0,
+        target: u64 = 0,
+        failure: ?anyerror = null,
+        fn notify(ptr: *anyopaque, root: *shared.Handle) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.target = root.db.core.nextDerivedSequence();
+            self.append() catch |err| {
+                self.failure = err;
+            };
+        }
+        fn append(self: *@This()) !void {
+            const guard = public.enterHandle(self.handle, .exclusive).?;
+            defer guard.leave();
+            var key: [64]u8 = undefined;
+            const name = try std.fmt.bufPrint(&key, "append{d}", .{self.count});
+            try guard.handle.db.batch(.{ .writes = &.{.{ .key = name, .value = "{\"body\":\"continuous\"}" }}, .sync_level = .write });
+            self.count += 1;
+        }
+    };
+    var append: Append = .{ .handle = handle };
+    owner.test_after_capture = .{ .ptr = &append, .notify = Append.notify };
+    defer owner.test_after_capture = null;
+    for (0..4) |_| {
+        owner.maintenance_pending = true;
+        _ = try owner.maintenanceTurnForTest();
+        if (append.failure) |err| return err;
+        // A foreground append moves the tip in every turn. Inspect durable
+        // coverage before another maintenance turn or any search/idle drain.
+        const guard = public.enterHandle(handle, .exclusive).?;
+        defer guard.leave();
+        const debt = try guard.handle.db.listDerivedReplayDebt(alloc);
+        defer {
+            for (debt) |*item| item.deinit(alloc);
+            alloc.free(debt);
+        }
+        var found = false;
+        for (debt) |item| if (std.mem.eql(u8, item.index_name, "body_text")) {
+            found = true;
+            try std.testing.expect(item.applied_sequence >= append.target);
+        };
+        try std.testing.expect(found);
+        const json = try public.pendingWorkStatsJson(guard.handle);
+        defer freeRawBuffer(json.ptr, json.len);
+        const parsed = try std.json.parseFromSlice(std.json.Value, alloc, json.ptr.?[0..json.len], .{});
+        defer parsed.deinit();
+        try std.testing.expect(parsed.value.object.get("index_replay_debt").?.array.items.len != 0);
+        try std.testing.expect(parsed.value.object.get("background_publications").?.object.get("rebased").?.integer > 0);
+    }
+    try std.testing.expectEqual(@as(usize, 4), append.count);
 }
 
 test "capi SQL missing namespace forces coordinated catalog validation" {
