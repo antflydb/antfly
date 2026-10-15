@@ -517,7 +517,8 @@ pub const ModelRegistry = struct {
     }
 
     /// Pull a model from HuggingFace Hub, reporting progress to `progress_sink`
-    /// on the calling thread.
+    /// on the calling thread. Companion pulls recurse through this boundary,
+    /// so its error set must be explicit.
     pub fn pullWithProgress(
         self: *ModelRegistry,
         io: std.Io,
@@ -527,7 +528,7 @@ pub const ModelRegistry = struct {
         capabilities_csv: ?[]const u8,
         projector_selection: download.ProjectorSelection,
         caller_sink: download.ProgressSink,
-    ) !void {
+    ) anyerror!void {
         // Both CLIs and the linked engine use this path. Preserve the cause
         // and report it here before a caller reduces it to a startup error.
         return self.pullWithProgressImpl(io, ref_str, hub_config, tasks_csv, capabilities_csv, projector_selection, caller_sink) catch |err| {

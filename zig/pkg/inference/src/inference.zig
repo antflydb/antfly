@@ -18,6 +18,8 @@
 // models run on Antfly's own ONNX implementation.
 
 const std = @import("std");
+pub const pull_diagnostics = @import("registry/pull_diagnostics.zig");
+
 const build_options = @import("build_options");
 
 extern fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;

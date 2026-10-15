@@ -3617,7 +3617,7 @@ pub fn linkedInferencePullModel(context: *const inference_bridge.PullModelContex
 }
 
 fn pullErrorMessage(err: anyerror) []const u8 {
-    if (@import("../registry/pull_diagnostics.zig").glinerMessage(err)) |message| return message;
+    if (inference.pull_diagnostics.glinerMessage(err)) |message| return message;
     return switch (err) {
         error.HubModelNotFound => "the model was not found on the hub",
         error.HubAccessDenied => "the hub denied access; the model may be private or gated, so set token or HF_TOKEN",
