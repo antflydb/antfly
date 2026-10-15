@@ -608,19 +608,17 @@ fn resetScratch(arena: *std.heap.ArenaAllocator) Allocator.Error!void {
 /// duplicate-key entry survives its container; completed depths are reusable.
 const StreamContext = struct {
     work: Allocator,
-    tokens: std.heap.ArenaAllocator,
     scanners: std.heap.ArenaAllocator,
     keys: @import("antfly-json").ObjectKeyWorkspace(FrameState),
     resources: Resources,
     const FrameState = struct { object: bool, key: bool = true, count: usize = 0 };
     fn init(scratch: Allocator) StreamContext {
         const work = @import("antfly_platform").allocator.reclaimingScratch(scratch);
-        return .{ .work = work, .tokens = .init(work), .scanners = .init(work), .keys = .init(work), .resources = .init(work) };
+        return .{ .work = work, .scanners = .init(work), .keys = .init(work), .resources = .init(work) };
     }
     fn deinit(self: *StreamContext) void {
         self.resources.deinit();
         self.keys.deinit();
-        self.tokens.deinit();
         self.scanners.deinit();
     }
     fn writeSpan(self: *StreamContext, writer: *std.Io.Writer, raw: []const u8, parse_numbers: bool) !void {
@@ -631,6 +629,40 @@ const StreamContext = struct {
         try self.writeValue(writer, &scanner, raw.len, parse_numbers);
         if (try scanner.next() != .end_of_document) return error.SyntaxError;
     }
+    /// The scanner owns escape and surrogate validation. Coalesce its decoded
+    /// chunks into fixed scratch, then use the standard encoder for canonical
+    /// escaping. No scalar-sized buffer or private scanner state is needed.
+    fn writeString(writer: *std.Io.Writer, scanner: *std.json.Scanner) !void {
+        var buffer: [4096]u8 = undefined;
+        var used: usize = 0;
+        try writer.writeByte('"');
+        while (true) {
+            const token = try scanner.next();
+            switch (token) {
+                .string => |chunk| {
+                    try stringChunk(writer, &buffer, &used, chunk);
+                    try std.json.Stringify.encodeJsonStringChars(buffer[0..used], .{}, writer);
+                    try writer.writeByte('"');
+                    return;
+                },
+                .partial_string => |chunk| try stringChunk(writer, &buffer, &used, chunk),
+                .partial_string_escaped_1 => |chunk| try stringChunk(writer, &buffer, &used, &chunk),
+                .partial_string_escaped_2 => |chunk| try stringChunk(writer, &buffer, &used, &chunk),
+                .partial_string_escaped_3 => |chunk| try stringChunk(writer, &buffer, &used, &chunk),
+                .partial_string_escaped_4 => |chunk| try stringChunk(writer, &buffer, &used, &chunk),
+                else => return error.SyntaxError,
+            }
+        }
+    }
+    fn stringChunk(writer: *std.Io.Writer, buffer: []u8, used: *usize, chunk: []const u8) !void {
+        if (chunk.len >= buffer.len or chunk.len > buffer.len - used.*) {
+            try std.json.Stringify.encodeJsonStringChars(buffer[0..used.*], .{}, writer);
+            used.* = 0;
+        }
+        if (chunk.len >= buffer.len) return std.json.Stringify.encodeJsonStringChars(chunk, .{}, writer);
+        @memcpy(buffer[used.*..][0..chunk.len], chunk);
+        used.* += chunk.len;
+    }
     fn writeValue(self: *StreamContext, writer: *std.Io.Writer, scanner: *std.json.Scanner, max_len: usize, parse_numbers: bool) !void {
         errdefer self.keys.deinit();
         var root_seen = false;
@@ -638,12 +670,16 @@ const StreamContext = struct {
         // keys until its object ends. Retention is capped at every reuse.
         var depth: usize = 0;
         while (!root_seen or depth != 0) {
-            try resetScratch(&self.tokens);
             const expecting_key = depth != 0 and self.keys.stack.items[depth - 1].state.object and self.keys.stack.items[depth - 1].state.key;
-            const token = if (expecting_key)
+            // Keep decoded scalar strings out of the token arena. Object names
+            // still need owned bytes until their duplicate-key frame ends.
+            const string_value = !expecting_key and try scanner.peekNextTokenType() == .string;
+            const token = if (string_value)
+                std.json.Token{ .string = "" }
+            else if (expecting_key)
                 try self.keys.nextKey(depth - 1, scanner, max_len)
             else
-                try scanner.nextAllocMax(self.tokens.allocator(), .alloc_if_needed, max_len);
+                try scanner.next();
             if (token == .end_of_document) {
                 if (!root_seen or depth != 0) return error.SyntaxError;
                 break;
@@ -687,7 +723,7 @@ const StreamContext = struct {
                     try self.keys.enter(depth, .{ .object = token == .object_begin });
                     depth += 1;
                 },
-                .string, .allocated_string => |s| try std.json.Stringify.value(s, .{}, writer),
+                .string, .allocated_string => |s| if (string_value) try writeString(writer, scanner) else try std.json.Stringify.value(s, .{}, writer),
                 .number, .allocated_number => |s| try std.json.Stringify.value(if (parse_numbers) Value.parseFromNumberSlice(s) else Value{ .number_string = s }, .{}, writer),
                 .true => try writer.writeAll("true"),
                 .false => try writer.writeAll("false"),
@@ -1529,4 +1565,46 @@ test "public graph metric borrowed wire lossy validated fanout index bounds scra
     defer actual.deinit(a);
     try std.testing.expectEqualStrings(expected.json, actual.json);
     try std.testing.expectEqual(@as(usize, 0), budget.live);
+}
+
+test "public graph metric borrowed wire escaped scalar emission uses fixed scratch and standard Unicode semantics" {
+    const a = std.testing.allocator;
+    const query = @import("../document_query.zig");
+    const counters = @import("../../lite/test_allocator.zig");
+    var raw = std.Io.Writer.Allocating.init(a);
+    defer raw.deinit();
+    try raw.writer.writeAll("{\"payload\":{\"text\":\"");
+    // Exercise coalescing and all decoded-chunk widths, including surrogate pairs.
+    for (0..8192) |_| try raw.writer.writeAll("a\\u0061\\u00e9\\u4e2d\\uD834\\uDD1E\\n\\t\\b\\f\\r\\u0000\\\"\\\\\\/");
+    try raw.writer.writeAll("\"}}");
+    const opts = @import("../types.zig").LookupOptions{ .fields = &.{"payload.text"}, .include_all_fields = false };
+    var expected = try query.lookupJson(a, raw.written(), opts);
+    defer expected.deinit(a);
+    var plan = (try query.SpanProjectionPlan.init(a, opts)).?;
+    defer plan.deinit();
+    var budget: counters.BudgetAllocator = .{ .backing = a, .limit = 32 * 1024 };
+    var actual = try query.lookupJsonWithPlan(budget.allocator(), a, raw.written(), &plan);
+    defer actual.deinit(a);
+    try std.testing.expectEqualStrings(expected.json, actual.json);
+    try std.testing.expectEqual(@as(usize, 0), budget.live);
+    var context = StreamContext.init(a);
+    defer context.deinit();
+    for ([_][]const u8{ "\"\"", "\"plain\"", "\"\\u0000\\u007f\\u0080\\udbff\\udfff\"", "\"é中𝄞\"" }) |input| {
+        var parsed = try std.json.parseFromSlice(Value, a, input, .{});
+        defer parsed.deinit();
+        const canonical = try std.json.Stringify.valueAlloc(a, parsed.value, .{});
+        defer a.free(canonical);
+        var output = std.Io.Writer.Allocating.init(a);
+        defer output.deinit();
+        try context.writeSpan(&output.writer, input, true);
+        try std.testing.expectEqualStrings(canonical, output.written());
+    }
+    var short: [2]u8 = undefined;
+    var failed = std.Io.Writer.fixed(&short);
+    try std.testing.expectError(error.WriteFailed, context.writeSpan(&failed, "\"\\u0061\\u0062\\u0063\"", true));
+    for ([_][]const u8{ "\"\\ud800\"", "\"\\udc00\"", "\"\\uZZZZ\"", "\"unterminated", "\"\\q\"" }) |input| {
+        var output = std.Io.Writer.Allocating.init(a);
+        defer output.deinit();
+        if (context.writeSpan(&output.writer, input, true)) |_| return error.ExpectedSyntaxFailure else |_| {}
+    }
 }

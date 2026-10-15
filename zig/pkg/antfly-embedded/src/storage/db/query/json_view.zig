@@ -535,11 +535,12 @@ pub const View = struct {
                 if ((frame.object and frame.key and token == .object_end) or (!frame.object and token == .array_end)) {
                     _ = try scanner.next();
                     if (options.ranges) |ranges| {
-                        if (policy == .all and !frame.object and frame.node == null and frame.selected != null and frame.selected.?.fanout != null)
-                            try ranges.remember(raw[frame.container_start..scanner.cursor]);
+                        if (!frame.object and frame.node == null and frame.selected != null and frame.selected.?.fanout != null) {
+                            if (policy == .all) try ranges.remember(raw[frame.container_start..scanner.cursor]) else try ranges.rememberSelected(raw[frame.container_start..scanner.cursor], frame.selected.?.fanout.?);
+                        }
                     }
                     if (view.validated_ranges) |ranges| {
-                        if (!frame.object and frame.selected != null and frame.selected.?.fanout != null) ranges.refill(raw[frame.container_start..scanner.cursor]);
+                        if (!frame.object and frame.selected != null and frame.selected.?.fanout != null) try ranges.refillSelected(raw[frame.container_start..scanner.cursor], frame.selected.?.fanout.?);
                     }
                     try frame.finishContainer(alloc);
                     try keys.finishFrame(depth - 1);
@@ -578,7 +579,7 @@ pub const View = struct {
                 // only its validated extent, not another descendant traversal.
                 if (token == .array_begin and options.defer_fanout and selected_plan != null and selected_plan.?.fanout != null and selected_plan.?.indices.count() == 0) {
                     const start = scanner.cursor;
-                    if (view.validated_ranges) |ranges| if (try ranges.skip(scanner, true)) {
+                    if (view.validated_ranges) |ranges| if (try ranges.skipSelected(scanner, selected_plan.?.fanout.?)) {
                         if (selected_node) |node| node.* = .{ .raw = raw[start..scanner.cursor], .state = .{ .fanout_keys_validated = true } };
                         if (depth != 0) try frames.items[depth - 1].state.finishValue(alloc, raw, scanner.cursor);
                         continue;

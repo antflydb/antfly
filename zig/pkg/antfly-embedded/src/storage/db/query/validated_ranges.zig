@@ -23,6 +23,8 @@ pub const ValidatedRanges = struct {
     alloc: std.mem.Allocator,
     entries: []Entry = &.{},
     capacity: usize = 64,
+    scope_ids: []u32 = &.{},
+    scopes: @import("validation_scopes.zig").Scopes = .{},
     primary: ?Ref = null,
     additional: ?*Certificate = null,
     const Certificate = struct { value: Ref, next: ?*Certificate };
@@ -53,17 +55,33 @@ pub const ValidatedRanges = struct {
             const raw = scanner.input[scanner.cursor..][0..entry.len];
             if (!self.proof.contains(raw)) return false;
             if (!require_all_keys and (raw[0] == '[' or raw[0] == '{')) return false;
+            return advance(scanner, entry.len);
+        }
+        /// Array extents validated under visited-key policy need a contract
+        /// covering this exact requested subtree. IDs reference owned snapshots,
+        /// and source containment prevents sharing authority between columns.
+        pub fn skipSelected(self: @This(), scanner: *std.json.Scanner, required: *const @import("json_projection_plan.zig").Selector) !bool {
+            if (required.fields.count() == 0) return false;
+            if (self.proof.all_keys) return self.skip(scanner, true);
+            const cache = self.cache;
+            if (scanner.diagnostics != null or cache.entries.len == 0 or cache.scope_ids.len == 0) return false;
+            const start = @intFromPtr(scanner.input.ptr) + scanner.cursor;
+            const slot = index(start, cache.capacity);
+            const entry = cache.entries[slot];
+            if (entry.start != start or entry.len == 0 or entry.len > scanner.input.len - scanner.cursor or !self.proof.contains(scanner.input[scanner.cursor..][0..entry.len])) return false;
+            if (!cache.scopes.covers(cache.scope_ids[slot], required)) return false;
+            return advance(scanner, entry.len);
+        }
+        fn advance(scanner: *std.json.Scanner, len: usize) !bool {
             const input = scanner.input;
             const cursor = scanner.cursor;
-            // Advance value state with a tiny scalar while preserving the
-            // parent stack. Only the certified source extent is elided; no
-            // private scanner state or stack representation is modified.
+            // Let the standard scanner update its value and parent state.
             scanner.input = "null";
             scanner.cursor = 0;
             defer scanner.input = input;
             errdefer scanner.cursor = cursor;
             try scanner.skipValue();
-            scanner.cursor = cursor + entry.len;
+            scanner.cursor = cursor + len;
             return true;
         }
         /// Refill only after a fallback has consumed a complete value. This
@@ -73,6 +91,11 @@ pub const ValidatedRanges = struct {
             if ((raw[0] == '[' or raw[0] == '{') and !self.proof.all_keys) return;
             self.cache.store(raw);
         }
+        pub fn refillSelected(self: @This(), raw: []const u8, selected: *const @import("json_projection_plan.zig").Selector) !void {
+            if (self.cache.entries.len == 0 or !self.proof.contains(raw)) return;
+            if (self.proof.all_keys) return self.refill(raw);
+            try self.cache.rememberSelected(raw, selected);
+        }
     };
 
     pub fn init(alloc: std.mem.Allocator) @This() {
@@ -81,6 +104,9 @@ pub const ValidatedRanges = struct {
     pub fn deinit(self: *@This()) void {
         self.alloc.free(self.entries);
         self.entries = &.{};
+        self.alloc.free(self.scope_ids);
+        self.scope_ids = &.{};
+        self.scopes.deinit(self.alloc);
         while (self.additional) |certificate| {
             self.additional = certificate.next;
             self.alloc.destroy(certificate);
@@ -94,6 +120,8 @@ pub const ValidatedRanges = struct {
         if (capacity > self.capacity) {
             self.alloc.free(self.entries);
             self.entries = &.{};
+            self.alloc.free(self.scope_ids);
+            self.scope_ids = &.{};
             self.capacity = capacity;
         }
     }
@@ -102,7 +130,9 @@ pub const ValidatedRanges = struct {
     }
     fn store(self: *@This(), raw: []const u8) void {
         const start = @intFromPtr(raw.ptr);
-        self.entries[index(start, self.capacity)] = .{ .start = start, .len = raw.len };
+        const slot = index(start, self.capacity);
+        self.entries[slot] = .{ .start = start, .len = raw.len };
+        if (self.scope_ids.len != 0) self.scope_ids[slot] = 0;
     }
     pub fn remember(self: *@This(), raw: []const u8) !void {
         if (self.entries.len == 0) {
@@ -111,6 +141,19 @@ pub const ValidatedRanges = struct {
             self.entries = entries;
         }
         self.store(raw);
+    }
+    /// Small extents cannot repay contract capture. Keep ordinary shallow and
+    /// tiny native projections allocation-free when they need no syntax cache.
+    pub fn rememberSelected(self: *@This(), raw: []const u8, selected: *const @import("json_projection_plan.zig").Selector) !void {
+        if (raw.len < 256 or raw[0] != '[') return;
+        const id = (try self.scopes.intern(self.alloc, selected)) orelse return;
+        if (id == 0) return;
+        if (self.scope_ids.len == 0) {
+            self.scope_ids = try self.alloc.alloc(u32, self.capacity);
+            @memset(self.scope_ids, 0);
+        }
+        try self.remember(raw);
+        self.scope_ids[index(@intFromPtr(raw.ptr), self.capacity)] = id;
     }
     /// Publish only after complete syntax and the requested duplicate-key
     /// validation succeeds. Empty caches add no work to the emission path.
@@ -248,4 +291,47 @@ test "public graph metric borrowed wire published certificates remain immutable 
     try std.testing.expect(second.proof.all_keys);
     cache.deinit();
     try std.testing.expectEqual(counted.allocated_bytes, counted.freed_bytes);
+}
+
+test "public graph metric borrowed wire visited array proofs are source and selector scoped" {
+    const a = std.testing.allocator;
+    var cache = ValidatedRanges.init(a);
+    defer cache.deinit();
+    var source = std.Io.Writer.Allocating.init(a);
+    defer source.deinit();
+    try source.writer.writeByte('[');
+    for (0..64) |i| {
+        if (i != 0) try source.writer.writeByte(',');
+        try source.writer.writeAll("{\"y\":1,\"ignored\":{\"a\":1,\"a\":2}}");
+    }
+    try source.writer.writeByte(']');
+    const raw = source.written();
+    {
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        const selected = try @import("json_projection_plan.zig").compile(arena.allocator(), &.{.{ .parts = &.{"y"} }});
+        try cache.rememberSelected(raw, selected);
+    }
+    const checked = cache.validated(raw, false).?;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const wanted = try @import("json_projection_plan.zig").compile(arena.allocator(), &.{.{ .parts = &.{"y"} }});
+    const stronger = try @import("json_projection_plan.zig").compile(arena.allocator(), &.{.{ .parts = &.{ "ignored", "a" } }});
+    var scanner = std.json.Scanner.initCompleteInput(a, raw);
+    defer scanner.deinit();
+    _ = try scanner.peekNextTokenType();
+    try std.testing.expect(!try checked.skip(&scanner, true));
+    try std.testing.expect(!try checked.skipSelected(&scanner, stronger));
+    try std.testing.expect(try checked.skipSelected(&scanner, wanted));
+    try std.testing.expectEqual(.end_of_document, try scanner.next());
+    var foreign = std.json.Scanner.initCompleteInput(a, raw);
+    defer foreign.deinit();
+    _ = try foreign.peekNextTokenType();
+    const narrow = cache.validated(raw[1..], false).?;
+    try std.testing.expect(!try narrow.skipSelected(&foreign, wanted));
+    // A scalar/syntax-only overwrite must erase the previous scope identity.
+    try cache.remember(raw);
+    try std.testing.expect(!try checked.skipSelected(&foreign, wanted));
+    try checked.refillSelected(raw, wanted);
+    try std.testing.expect(try checked.skipSelected(&foreign, wanted));
 }

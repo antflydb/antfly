@@ -394,3 +394,47 @@ test "public graph metric borrowed wire native columns share bounded cache witho
     try std.testing.expect(first.validated_ranges == null and second.validated_ranges == null);
     try std.testing.expectEqual(@as(usize, 0), owner.queryCapacity());
 }
+
+test "public graph metric borrowed wire native scoped fanout preserves ignored duplicates and failure ownership" {
+    const a = std.testing.allocator;
+    const columns = [_]schema.RelationalColumn{.{ .name = "payload", .path = "payload", .column_type = .json, .is_json = true, .json_kind = .any }};
+    const table: schema.TableSchema = .{ .version = 1, .storage_mode = .relational, .relational_columns = &columns };
+    var layout = try codec.PhysicalLayout.init(a, table);
+    defer layout.deinit();
+    var input = std.Io.Writer.Allocating.init(a);
+    defer input.deinit();
+    var expected = std.Io.Writer.Allocating.init(a);
+    defer expected.deinit();
+    try input.writer.writeAll("{\"items\":[{\"x\":[");
+    try expected.writer.writeAll("{\"payload\":{\"items\":[{\"x\":[");
+    for (0..64) |i| {
+        if (i != 0) {
+            try input.writer.writeByte(',');
+            try expected.writer.writeByte(',');
+        }
+        try input.writer.writeAll("{\"y\":1,\"ignored\":{\"d\":0,\"d\":1}}");
+        try expected.writer.writeAll("{\"y\":1}");
+    }
+    try input.writer.writeAll("]}]}");
+    try expected.writer.writeAll("]}]}}");
+    var plan = try Plan.init(a, table, &layout, &.{"payload.items.x.y"});
+    defer plan.deinit();
+    var owner = std.heap.ArenaAllocator.init(a);
+    defer owner.deinit();
+    var view = JsonView.init(owner.allocator(), input.written());
+    var source: Plan.Sources = .empty;
+    try source.put(owner.allocator(), "payload", .{ .json = &view });
+    const Check = struct {
+        fn run(scratch: std.mem.Allocator, output: std.mem.Allocator, p: Plan, sources: Plan.Sources, want: []const u8) !void {
+            const result = try p.projectSourcesPolicy(output, scratch, sources, true);
+            defer output.free(result);
+            try std.testing.expectEqualStrings(want, result);
+        }
+    };
+    try Check.run(a, a, plan, source, expected.written());
+    try std.testing.checkAllAllocationFailures(a, Check.run, .{ a, plan, source, expected.written() });
+    try std.testing.expect(view.root.children == null and view.validated_ranges == null);
+    var stronger = try Plan.init(a, table, &layout, &.{ "payload.items.x.y", "payload.items.x.ignored.d" });
+    defer stronger.deinit();
+    try std.testing.expectError(error.DuplicateField, stronger.projectSources(a, owner.allocator(), source));
+}
