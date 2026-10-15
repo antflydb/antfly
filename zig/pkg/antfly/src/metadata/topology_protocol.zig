@@ -103,7 +103,11 @@ const std = @import("std");
 /// Complete native install/release activation remains a separate barrier.
 /// Version 50 decodes metadata-revision hints on signed validation replies.
 /// This enables validation ACK scheduling, not full native install/release.
-pub const current_version: u16 = 50;
+/// Version 51 decodes the atomic index publication decision. It consumes the
+/// pending namespace source and installs the admitted metadata descriptor;
+/// native installation/release and public producer activation remain separate.
+pub const current_version: u16 = 51;
+pub const index_publication_decision_version: u16 = 51;
 pub const index_publication_head_version: u16 = 50;
 pub const index_delivery_version: u16 = 50;
 pub const schema_reader_publication_version: u16 = 39;

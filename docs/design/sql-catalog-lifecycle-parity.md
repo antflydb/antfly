@@ -7645,3 +7645,59 @@ metadata publication decision. Boundary, license, inventory, generated
 control-catalog, formatting and diff checks passed. Original dispositions remain
 483 implemented / 862 unresolved; native install/release and full public index
 activation remain unfinished.
+
+### Atomic metadata index publication decision
+
+`decide_relational_index_publication` selects only the immutable successor
+already admitted for an exact table/job/revision. Its fixed-size command carries
+no replacement schema, owner list or synthetic receipt. Decoder floor 51 gates
+the command; an irreversible installing/releasing/published head also retains
+that floor on snapshot export/import. Earlier building heads retain floor 50.
+Neither floor advertises full native installation or public producer readiness.
+
+Preparation checks the accepted all-owner validation counter, adopted namespace
+writer, exact lifecycle lock, pending source, current predecessor descriptor,
+logical binding/incarnation, pending index name and policy/schema-reader
+admission. It rejects an unmirrored metadata predecessor. Accepted validation
+ACKs remain durable logical prepare facts: this decision does not attest a new
+physical root or authorize root adoption. Install receivers must independently
+establish their current physical authority and exact retained validation cut.
+
+The shared namespace writer commits the successor descriptor, head transition
+and removal of the pending source atomically, consuming the reserved relation
+and constraint names in that same transaction. The lifecycle lock remains;
+installed/released counters are not manufactured. A stale preflight loses its
+CAS before writes; an already committed decision is recovered without replaying
+DDL or advancing the namespace/source cut. No owner-cohort or primary-row scan
+is introduced. Decision input projection owns only the table/guard fields it
+needs, skipping the base64 predecessor catalog rather than allocating another
+schema-sized catalog copy under metadata apply.
+
+Automatic decision dispatch, authenticated native install/release, coupled
+activation and full public SQL qualification remain unfinished. Public UNIQUE
+creation stays guarded. This metadata transition alone changes no original SQL
+dispositions (483 implemented / 862 unresolved).
+
+Qualification: `/private/tmp/antfly-index-decision-final-debug.log` passed
+159/159 macOS Debug build steps, including 50 publication, four ACK, six C-ABI,
+ten native page/lifecycle, three leased-owner, 46 runtime-contract and 104
+standalone tests. The decision fixture starts from actual durable accepted
+paired validation evidence (its physical audit values are synthetic), exercises
+committed Raft replay and standalone commit, and verifies exact namespace/name
+consumption, retained lifecycle exclusion and zero fabricated install/release
+ACKs. Aborting after full namespace staging preserves the byte-identical prior
+snapshot. Duplicate replay at a later Raft index preserves the source/root cut;
+lost-reply recovery and reopen preserve the one decision revision. Incomplete
+validation, stale job/revision, pending replication, truncated/trailing wire
+bytes and a lowered snapshot decoder floor are rejected. Activation downgrade
+uses the existing no-op semantics and leaves floor 51 intact.
+
+The decision projection owns borrowed strings across later reads and retains
+exhaustive allocation-failure/leak checks. A synthetic 1 MiB omitted catalog
+field projects within a 64 KiB fixed allocator; full-input decoding under that
+same cap returns OutOfMemory. This measures decoder allocation shape, not
+production query/DDL latency or an admitted synthetic catalog. The first broad
+run's three TLS failures were sandbox-denied loopback binds; the final run had
+loopback permission and passed without skips. Boundary, license, inventory,
+generated control-catalog, formatting and diff checks passed. No original SQL
+case credit or complete native/public activation is claimed.

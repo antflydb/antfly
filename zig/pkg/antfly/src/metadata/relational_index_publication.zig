@@ -40,7 +40,35 @@ fn readerRequirements(before: records.TableRecord, after: records.TableRecord) !
 }
 pub const Id = progress.Id;
 pub const Digest = progress.Digest;
+/// A decision selects only the already admitted immutable successor. It cannot
+/// introduce a different schema, owner cohort or validation receipt.
+pub const DecidePublish = struct {
+    table_id: u64,
+    id: Id,
+    expected_revision: u64,
+
+    pub fn validate(self: @This()) !void {
+        if (self.table_id == 0 or std.mem.allEqual(u8, &self.id, 0) or self.expected_revision == 0 or
+            self.expected_revision == std.math.maxInt(u64)) return error.InvalidGenerationPublication;
+    }
+};
 pub const RootProof = @import("relational_index_root_attestation.zig").Proof;
+
+test "relational index publication decision requires an exact nonzero job and usable revision" {
+    const valid: DecidePublish = .{ .table_id = 1, .id = @splat(2), .expected_revision = 3 };
+    try valid.validate();
+    var invalid = valid;
+    invalid.table_id = 0;
+    try std.testing.expectError(error.InvalidGenerationPublication, invalid.validate());
+    invalid = valid;
+    invalid.id = @splat(0);
+    try std.testing.expectError(error.InvalidGenerationPublication, invalid.validate());
+    invalid = valid;
+    invalid.expected_revision = 0;
+    try std.testing.expectError(error.InvalidGenerationPublication, invalid.validate());
+    invalid.expected_revision = std.math.maxInt(u64);
+    try std.testing.expectError(error.InvalidGenerationPublication, invalid.validate());
+}
 
 /// Compact physical witness. The outcome is carried once in the enclosing
 /// progress reply; the signature binds every field through its ready digest.
@@ -996,6 +1024,29 @@ pub const Owner = struct {
     receipt_authority: progress.Authority,
 };
 
+/// The decision needs table declarations, not a second owned copy of the
+/// potentially multi-megabyte base64 predecessor catalog. Project from the
+/// existing immutable inputs without reading/decoding the owner cohort.
+pub const DecisionInputs = struct {
+    format_version: u16 = 1,
+    id: Id,
+    plan_digest: Digest,
+    namespace_id: u64,
+    index_name: []const u8,
+    table_guard: domain.RelationMutationGuard,
+    before: records.TableRecord,
+    after: records.TableRecord,
+};
+
+fn requireInputsHead(input: anytype, head: progress.Head) !void {
+    try head.validate();
+    if (!std.meta.eql(try readerRequirements(input.before, input.after), head.reader_requirements)) return error.InvalidCatalogRecord;
+    if (input.format_version != 1 or !std.mem.eql(u8, &input.id, &head.plan_id) or
+        !std.mem.eql(u8, &input.plan_digest, &head.plan_digest) or input.namespace_id == 0 or
+        input.before.table_id != head.table_id or input.after.table_id != head.table_id or
+        input.index_name.len == 0) return error.InvalidCatalogRecord;
+}
+
 /// Shared, immutable worker input. Decode once at admission, not once per page
 /// and not once per owner inside the durable metadata representation.
 pub const Inputs = struct {
@@ -1045,12 +1096,7 @@ pub const Inputs = struct {
     }
 
     fn requireHead(self: Inputs, head: progress.Head) !void {
-        try head.validate();
-        if (!std.meta.eql(try readerRequirements(self.before, self.after), head.reader_requirements)) return error.InvalidCatalogRecord;
-        if (self.format_version != 1 or !std.mem.eql(u8, &self.id, &head.plan_id) or
-            !std.mem.eql(u8, &self.plan_digest, &head.plan_digest) or self.namespace_id == 0 or
-            self.before.table_id != head.table_id or self.after.table_id != head.table_id or
-            self.index_name.len == 0) return error.InvalidCatalogRecord;
+        try requireInputsHead(self, head);
     }
 };
 
@@ -1125,6 +1171,18 @@ fn privateIndexFence(id: Id, owner: Owner) !local.storage_db_relational_integrit
 /// These reads own every decoded string before another transactional get can
 /// invalidate borrowed bytes. A projection is not authority by itself: callers
 /// must independently recheck the live phase, lifecycle lock and catalog cut.
+pub fn readDecisionInputs(a: Allocator, txn: anytype, group: u64, head: progress.Head) !std.json.Parsed(DecisionInputs) {
+    try head.validate();
+    var buf: [160]u8 = undefined;
+    const bytes = try txn.get(try inputsKey(&buf, group, head.table_id));
+    if (bytes.len == 0 or bytes.len > max_bytes) return error.InvalidCatalogRecord;
+    var parsed = try std.json.parseFromSlice(DecisionInputs, a, bytes, .{ .ignore_unknown_fields = true, .allocate = .alloc_always });
+    errdefer parsed.deinit();
+    try requireInputsHead(parsed.value, head);
+    try parsed.value.table_guard.validate();
+    return parsed;
+}
+
 pub fn readInputs(a: Allocator, txn: anytype, group: u64, head: progress.Head) !std.json.Parsed(Inputs) {
     try head.validate();
     var buf: [160]u8 = undefined;
@@ -2036,7 +2094,7 @@ test "relational index publication prepares owned immutable head owner and reser
     try std.testing.expectEqualSlices(u8, &prepared.head.plan_digest, &replay.head.plan_digest);
 }
 
-test "relational index publication worker projections use two point reads own borrowed bytes and clean every allocation failure" {
+test "relational index publication worker projections use three point reads own borrowed bytes and clean every allocation failure" {
     const Reader = struct {
         prepared: *const Prepared,
         scratch: []u8,
@@ -2062,8 +2120,12 @@ test "relational index publication worker projections use two point reads own bo
             defer inputs.deinit();
             var dispatch = try readDispatch(a, &reader, 13, p.owners[0].owner);
             defer dispatch.deinit();
+            var decision = try readDecisionInputs(a, &reader, 13, p.head);
+            defer decision.deinit();
             @memset(scratch, 0);
-            try std.testing.expectEqual(@as(usize, 2), reader.calls);
+            try std.testing.expectEqual(@as(usize, 3), reader.calls);
+            try std.testing.expectEqualDeep(inputs.value.before, decision.value.before);
+            try std.testing.expectEqualDeep(inputs.value.after, decision.value.after);
             try std.testing.expectEqualSlices(u8, &dispatch.value.table_guard.owner.schema_digest, &digest(inputs.value.before.schema_json));
             var candidate = try inputs.value.prepareCandidate(a, p.head);
             defer candidate.deinit();
@@ -2080,6 +2142,40 @@ test "relational index publication worker projections use two point reads own bo
     defer prepared.deinit();
     try Reader.exercise(a, &prepared);
     try @import("antfly_platform").allocator.checkAllAllocationFailures(a, Reader.exercise, .{&prepared});
+}
+
+test "relational index publication decision projection skips large predecessor payloads within bounded memory" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const plan = try testPlan(arena.allocator());
+    var prepared = try plan.prepare(a);
+    defer prepared.deinit();
+    var parsed = try std.json.parseFromSlice(Inputs, a, prepared.inputs, .{});
+    defer parsed.deinit();
+    // Synthetic opaque input tests decoder memory only, not an admitted or
+    // independently compiled catalog. Decisions do not reinterpret this field.
+    const omitted_payload = try arena.allocator().alloc(u8, 1024 * 1024);
+    @memset(omitted_payload, 'a');
+    parsed.value.catalog_before_b64 = omitted_payload;
+    const bytes = try std.json.Stringify.valueAlloc(a, parsed.value, .{});
+    defer a.free(bytes);
+    const Reader = struct {
+        bytes: []const u8,
+        pub fn get(self: @This(), _: []const u8) ![]const u8 {
+            return self.bytes;
+        }
+    };
+    var reader: Reader = .{ .bytes = bytes };
+    var memory: [64 * 1024]u8 = undefined;
+    var limited = std.heap.FixedBufferAllocator.init(&memory);
+    {
+        var projected = try readDecisionInputs(limited.allocator(), &reader, 13, prepared.head);
+        defer projected.deinit();
+        try std.testing.expectEqualDeep(parsed.value.after, projected.value.after);
+    }
+    limited.reset();
+    try std.testing.expectError(error.OutOfMemory, readInputs(limited.allocator(), &reader, 13, prepared.head));
 }
 
 test "relational index publication dispatch omits schema sized inputs and immutable projections replay exactly" {
