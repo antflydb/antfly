@@ -566,6 +566,7 @@ pub const PromotionRuntime = struct {
     }
 
     pub fn deinit(self: *PromotionRuntime) void {
+        if (comptime @import("../engine_selection.zig").enabled) return @import("antfly_source_root").antfly_sources.storage_engine.call("promotionDeinit", .{self}) catch @panic("incompatible storage owner");
         self.stop();
         self.store_handle.deinit();
         self.* = undefined;
@@ -636,6 +637,7 @@ pub const PromotionRuntime = struct {
     }
 
     pub fn start(self: *PromotionRuntime) !void {
+        if (comptime @import("../engine_selection.zig").enabled) return @import("antfly_source_root").antfly_sources.storage_engine.call("promotionStart", .{self});
         const io = self.io orelse return;
         self.worker_mutex.lockUncancelable(io);
         defer self.worker_mutex.unlock(io);
@@ -647,6 +649,7 @@ pub const PromotionRuntime = struct {
     }
 
     pub fn stop(self: *PromotionRuntime) void {
+        if (comptime @import("../engine_selection.zig").enabled) return @import("antfly_source_root").antfly_sources.storage_engine.call("promotionStop", .{self}) catch @panic("incompatible storage owner");
         self.shutdown_flag.store(true, .release);
         if (self.io) |io| {
             self.signalWorker(io);
@@ -705,6 +708,7 @@ pub const PromotionRuntime = struct {
     /// idempotent and safe to retry. `applied_sequence` is persisted only after
     /// durable upserts.
     pub fn catchUp(self: *PromotionRuntime) !void {
+        if (comptime @import("../engine_selection.zig").enabled) return @import("antfly_source_root").antfly_sources.storage_engine.call("promotionCatchUp", .{self});
         lockMutex(&self.catch_up_mutex);
         defer self.catch_up_mutex.unlock();
         return self.catchUpLocked(false);

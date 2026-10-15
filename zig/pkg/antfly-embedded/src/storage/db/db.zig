@@ -13,6 +13,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+const storage_engine = @import("../engine.zig");
 const snapshot_staging = @import("snapshot_staging.zig");
 const execution_resources = @import("execution_resources.zig");
 const read_projection = @import("read_projection.zig");
@@ -20,7 +21,7 @@ const read_projection = @import("read_projection.zig");
 // binding retains only open configuration, existing local codec/collector
 // entry points, and pointers to live cache and fault-injection state.
 const DBModule = @This();
-const local_mutation = @import("local_mutation.zig").ImplementationFor(struct {
+const MutationDependencies = struct {
     pub const OpenOptions = DBModule.OpenOptions;
     pub const appendDocumentChildRangeOutboxWrites = DBModule.appendDocumentChildRangeOutboxWrites;
     pub const appendJsonString = DBModule.appendJsonString;
@@ -83,7 +84,8 @@ const local_mutation = @import("local_mutation.zig").ImplementationFor(struct {
     pub const test_before_graph_replay_apply = &DBModule.test_before_graph_replay_apply;
     pub const test_fail_restore_projection_apply = &DBModule.test_fail_restore_projection_apply;
     pub const test_portable_runtime_batch_prelock_hook = &DBModule.test_portable_runtime_batch_prelock_hook;
-});
+};
+const local_mutation = @import("local_mutation.zig").ImplementationFor(MutationDependencies);
 const document_collectors = @import("document_collectors.zig");
 const materialized_sources = @import("materialized_sources.zig");
 const graph_restore_materialization = @import("graph_restore_materialization.zig");
@@ -2960,6 +2962,8 @@ test "db optional row policy authority preserves scoped secret denial and outage
     try std.testing.expectError(error.Unavailable, optionalRowPolicyAuthority(std.testing.allocator, &reader, "antfly.trusted_principal.secret"));
 }
 
+const GraphReplacementProgress = struct { job: index_manager_mod.GraphReplacementBuild, checkpoint_ns: u64 };
+
 pub const DB = struct {
     retained_query_lease: ?@import("native_query_cut.zig").Guard = null,
     retained_remote_query_lease: ?@import("native_query_cut_repository.zig").StorageLease = null,
@@ -2987,7 +2991,7 @@ pub const DB = struct {
     graph_replacement_mutex: std.Io.Mutex = .init,
     graph_replacement_manager: ?*index_manager_mod.IndexManager = null,
     graph_replacement_catalog_generation: u64 = 0,
-    graph_replacement_progress: ?struct { job: index_manager_mod.GraphReplacementBuild, checkpoint_ns: u64 } = null,
+    graph_replacement_progress: ?GraphReplacementProgress = null,
     index_backends: db_config.IndexBackendOptions,
     core: *db_core.DBCore,
     /// Immutable physical root identity, initialized before workers bind.
@@ -3206,6 +3210,7 @@ pub const DB = struct {
     };
 
     pub fn constraintValidationStatus(self: *DB) !ConstraintValidationStatus {
+        if (comptime storage_engine.enabled) return storage_engine.call("constraintValidationStatus", .{self});
         try self.lockApplySharedForPortableRuntime();
         defer self.core.unlockApplyShared();
         var view = self.core.acquireSchemaView() orelse return error.ConstraintNotFound;
@@ -3217,6 +3222,7 @@ pub const DB = struct {
     }
 
     pub fn validateConstraintsStep(self: *DB, budget: relational_constraint_jobs.Budget) !bool {
+        if (comptime storage_engine.enabled) return storage_engine.call("validateConstraintsStep", .{ self, budget });
         return self.validateConstraintsStepLocal(budget, false);
     }
 
@@ -3246,6 +3252,7 @@ pub const DB = struct {
 
     /// Retry only an observed failed epoch, never reset a newer declaration.
     pub fn retryConstraintValidation(self: *DB, schema_version: u32) !bool {
+        if (comptime storage_engine.enabled) return storage_engine.call("retryConstraintValidation", .{ self, schema_version });
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
         var replication_mutation = self.acquireReplicationMutationShared();
         defer if (replication_mutation) |*lease| lease.release();
@@ -3288,6 +3295,7 @@ pub const DB = struct {
     /// coverage are reconstructed independently on every replica; progress is
     /// never a hot-standby command and cannot make a different owner query-ready.
     pub fn buildRelationalIndexStep(self: *DB, name: []const u8, budget: RelationalIndexBuildBudget) !void {
+        if (comptime storage_engine.enabled) return storage_engine.call("buildRelationalIndexStep", .{ self, name, budget });
         return self.buildRelationalIndexStepLocal(name, budget, false);
     }
 
@@ -3309,6 +3317,7 @@ pub const DB = struct {
     }
 
     pub fn collectRelationalIndexGarbageStep(self: *DB) !bool {
+        if (comptime storage_engine.enabled) return storage_engine.call("collectRelationalIndexGarbageStep", .{self});
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
         var replication_mutation = self.acquireReplicationMutationShared();
         defer if (replication_mutation) |*lease| lease.release();
@@ -3329,6 +3338,7 @@ pub const DB = struct {
     /// Retry only the observed failed generation. Healthy/building retries
     /// are idempotent; an old admin request cannot reset a replacement index.
     pub fn retryRelationalIndexBuild(self: *DB, name: []const u8, generation: u64) !bool {
+        if (comptime storage_engine.enabled) return storage_engine.call("retryRelationalIndexBuild", .{ self, name, generation });
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
         var replication_mutation = self.acquireReplicationMutationShared();
         defer if (replication_mutation) |*lease| lease.release();
@@ -3366,6 +3376,34 @@ pub const DB = struct {
         return true;
     }
 
+    pub fn requireRewriteSourceManifest(self: *DB, alloc: Allocator, program: *const @import("relational_rewrite_program.zig").ProgramSet, cancellation: types.CancellationToken) !void {
+        if (comptime storage_engine.enabled) return storage_engine.call("requireRewriteSourceManifest", .{ self, alloc, program, cancellation });
+        var scratch = std.heap.ArenaAllocator.init(alloc);
+        defer scratch.deinit();
+        var read = try self.core.store.beginReadTxn();
+        defer read.abort();
+        const manifest = try @import("relational_rewrite_manifest.zig").read(scratch.allocator(), &read, cancellation);
+        try program.requireSourceManifest(alloc, manifest, try read.get("\x00\x00__metadata__:schema_json"));
+    }
+
+    pub fn verifyColdInitialChildSeed(self: *DB, expected: @import("relational_initial_child_publication.zig").Bootstrap) !void {
+        if (comptime storage_engine.enabled) return storage_engine.call("verifyColdInitialChildSeed", .{ self, expected });
+        var read = try self.core.store.beginReadTxn();
+        defer read.abort();
+        if (try @import("relational_initial_child_publication.zig").load(&read)) |record| {
+            if (!expected.matches(record) or record.row_count != 0) return error.SeedReplicaIdentityMismatch;
+        } else {
+            const hidden_catalog = read.get(@import("relational_integrity_catalog.zig").key) catch null;
+            const schema_json = read.get("\x00\x00__metadata__:schema_json") catch null;
+            if (hidden_catalog != null or schema_json != null) return error.SeedReplicaIdentityMismatch;
+        }
+    }
+
+    pub fn syncPrimaryStore(self: *DB) !void {
+        if (comptime storage_engine.enabled) return storage_engine.call("syncPrimaryStore", .{self});
+        try self.core.store.runtime_store.sync(true);
+    }
+
     pub const RelationalRows = @import("relational_rows.zig");
 
     /// One owner-local immutable visibility cut for delayed SQL scans. The
@@ -3380,6 +3418,7 @@ pub const DB = struct {
         schema_version: u32,
 
         pub fn deinit(self: *@This()) void {
+            if (comptime storage_engine.enabled) return storage_engine.call("relationalSnapshotDeinit", .{self}) catch @panic("incompatible storage owner");
             self.read.abort();
             if (self.row_policy_lease) |*lease| lease.release();
             self.* = undefined;
@@ -3387,6 +3426,7 @@ pub const DB = struct {
     };
 
     pub fn captureRelationalStatementSnapshot(self: *DB) !RelationalStatementSnapshot {
+        if (comptime storage_engine.enabled) return storage_engine.call("captureRelationalStatementSnapshot", .{self});
         // Capturing a visibility cut does not expose row bytes. A protected
         // statement captures only the owner policy epoch; each later scan
         // must present an authenticated proof for that same epoch and retain
@@ -3425,6 +3465,7 @@ pub const DB = struct {
     }
 
     pub fn beginRelationalRows(self: *DB, alloc: Allocator, request: RelationalRows.Request) !RelationalRows.Reader {
+        if (comptime storage_engine.enabled) return storage_engine.call("beginRelationalRows", .{ self, alloc, request });
         var row_policy_lease = try self.local_execution.row_policy_gate.enterRawRead();
         errdefer row_policy_lease.release();
         var reader = try self.beginRelationalRowsAtSnapshot(alloc, request, null);
@@ -3456,6 +3497,7 @@ pub const DB = struct {
     }
 
     pub fn relationalIndexBuildStatus(self: *DB, name: []const u8) !RelationalIndexBuildStatus {
+        if (comptime storage_engine.enabled) return storage_engine.call("relationalIndexBuildStatus", .{ self, name });
         try self.lockApplySharedForPortableRuntime();
         defer self.core.unlockApplyShared();
         var pinned = self.core.relational_indexes.acquire() orelse return error.IndexNotFound;
@@ -3594,6 +3636,7 @@ pub const DB = struct {
     /// containers must call `startQuarantineRetryWorkerIfNeeded` only after
     /// installing the value at its final address.
     pub fn open(alloc: Allocator, path: []const u8, requested_opts: OpenOptions) !DB {
+        if (comptime storage_engine.enabled) return storage_engine.call("open", .{ alloc, path, requested_opts });
         return blk: {
             var opts = requested_opts;
             if (opts.initial_child_bootstrap) |bootstrap| {
@@ -4237,6 +4280,7 @@ pub const DB = struct {
         target_path: []const u8,
         requested_options: OpenOptions,
     ) !NativeRestoreOpenPlan {
+        if (comptime storage_engine.enabled) return storage_engine.call("resolveNativeRestoreOpenPlan", .{ target_path, requested_options });
         var opts = requested_options;
         if (opts.backend_runtime) |runtime| {
             if (runtime.db_open_configurator) |configurator| {
@@ -4397,11 +4441,13 @@ pub const DB = struct {
     }
 
     pub fn authorizeOfflineVectorMigrationCandidate(self: *DB, stage: *const generation_lifecycle.StagedGeneration) !void {
+        if (comptime storage_engine.enabled) return storage_engine.call("authorizeOfflineVectorMigrationCandidate", .{ self, stage });
         try stage.validatePath(self.core.path);
         self.local_execution.vector_migration_offline_candidate = true;
     }
 
     pub fn vectorMigrationCommand(self: *DB, alloc: Allocator, command: vector_migration.contract.Command) ![]u8 {
+        if (comptime storage_engine.enabled) return storage_engine.call("vectorMigrationCommand", .{ self, alloc, command });
         try command.request.validate();
         if (command.action != .start and command.action != .cancel) {
             const raw = try self.vectorMigrationStatus(alloc) orelse return error.VectorMigrationNotFound;
@@ -4432,6 +4478,7 @@ pub const DB = struct {
     }
 
     pub fn vectorMigrationStatus(self: *DB, alloc: Allocator) !?[]u8 {
+        if (comptime storage_engine.enabled) return storage_engine.call("vectorMigrationStatus", .{ self, alloc });
         lockApplyShared(self);
         defer self.core.unlockApplyShared();
         var job = (try vector_migration.load(alloc, self.core.store)) orelse return null;
@@ -4445,6 +4492,7 @@ pub const DB = struct {
     }
 
     pub fn startVectorMigration(self: *DB, request: vector_migration.contract.Request) !void {
+        if (comptime storage_engine.enabled) return storage_engine.call("startVectorMigration", .{ self, request });
         try request.validate();
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
         if (request.mode == .offline and !self.local_execution.vector_migration_offline_candidate) return error.VectorStoreRequiresOfflineCommand;
@@ -4513,6 +4561,7 @@ pub const DB = struct {
     }
 
     pub fn advanceVectorMigration(self: *DB, job_id: []const u8) anyerror!void {
+        if (comptime storage_engine.enabled) return storage_engine.call("advanceVectorMigration", .{ self, job_id });
         var zig017_return_error: ?anyerror = null;
         // Staging pins index/catalog lifetime but never holds table apply over
         // corpus-sized ANN work. Completion is checked again under apply.
@@ -4722,6 +4771,7 @@ pub const DB = struct {
     }
 
     pub fn publishVectorMigration(self: *DB, job_id: []const u8) !void {
+        if (comptime storage_engine.enabled) return storage_engine.call("publishVectorMigration", .{ self, job_id });
         var structural = self.beginIndexStructuralMutation("source ownership publication", "*");
         defer structural.deinit();
         try self.lockApplyForPortableRuntime();
@@ -4872,6 +4922,7 @@ pub const DB = struct {
     /// Creation/provisioning-only configuration. Existing persisted authority
     /// cannot be changed, and populated roots require an explicit migration.
     pub fn configureTableStorage(self: *DB, settings: table_storage_mod.Settings) !void {
+        if (comptime storage_engine.enabled) return storage_engine.call("configureTableStorage", .{ self, settings });
         if (settings.engine != .local) return error.ObjectStorageRequiresHostedTable;
         lockApply(self);
         defer self.core.unlockApply();
@@ -4918,6 +4969,10 @@ pub const DB = struct {
     /// Null means source storage is disabled. Contention is retryable, never
     /// evidence that a configured source store or its accounting is absent.
     pub fn sourceVectorStats(self: *DB) error{StorageBusy}!?vector_payload_store_mod.Stats {
+        if (comptime storage_engine.enabled) return storage_engine.call("sourceVectorStats", .{self}) catch |err| switch (err) {
+            error.StorageBusy => error.StorageBusy,
+            else => @panic("incompatible storage owner"),
+        };
         const source = self.local_execution.source_vectors.load(.acquire) orelse return null;
         return source.tryStatsSnapshot() orelse error.StorageBusy;
     }
@@ -4957,6 +5012,7 @@ pub const DB = struct {
     }
 
     pub fn close(self: *DB) void {
+        if (comptime storage_engine.enabled) return storage_engine.call("close", .{self}) catch unreachable;
         if (self.closed) return;
         self.closed = true;
         self.restore_decoder_cache.deinit(self.backend_runtime.filesystemIo() orelse std.Options.debug_io);
@@ -4969,6 +5025,7 @@ pub const DB = struct {
     /// should prefer this form whenever background workers are enabled: worker
     /// callbacks may retain the DB address until `closeOwned` joins them.
     pub fn openOwned(alloc: Allocator, path: []const u8, opts: OpenOptions) !*DB {
+        if (comptime storage_engine.enabled) return storage_engine.call("openOwned", .{ alloc, path, opts });
         const owned = try alloc.create(DB);
         errdefer alloc.destroy(owned);
         owned.* = try open(alloc, path, opts);
@@ -4982,6 +5039,7 @@ pub const DB = struct {
     /// point so newly added maintenance cannot accidentally retain a movable
     /// stack value.
     pub fn startResidentBackgroundWorkersIfNeeded(self: *DB) void {
+        if (comptime storage_engine.enabled) return storage_engine.call("startResidentBackgroundWorkersIfNeeded", .{self}) catch unreachable;
         self.stable_address = true;
         // TTL callbacks retain only stable context, never this movable wrapper.
         // The resident probe observes their atomic outbox notification.
@@ -4993,6 +5051,7 @@ pub const DB = struct {
     }
 
     pub fn closeOwned(self: *DB) void {
+        if (comptime storage_engine.enabled) return storage_engine.call("closeOwned", .{self}) catch unreachable;
         const owner_alloc = self.alloc;
         self.close();
         owner_alloc.destroy(self);
@@ -5106,6 +5165,7 @@ pub const DB = struct {
     }
 
     pub fn setQueryVisibilityHook(self: *DB, hook: ?QueryVisibilityHook) void {
+        if (comptime storage_engine.enabled) return storage_engine.call("setQueryVisibilityHook", .{ self, hook }) catch @panic("incompatible storage owner");
         if (self.async_context.visibility_observer.attach(hook)) |lease| {
             defer lease.release();
             if (comptime builtin.os.tag != .freestanding) self.replayPendingIndexRepairVisibility(lease.hook);
@@ -5292,9 +5352,10 @@ pub const DB = struct {
     pub const notifyQueryVisibilityEvent = local_mutation.notifyQueryVisibilityEvent;
 
     const EnrichmentOwner = @import("enrichment_runtime_owner.zig").Owner(EnrichmentAppendContext);
-    const DetachedEnrichmentRuntime = EnrichmentOwner.Bundle;
+    pub const DetachedEnrichmentRuntime = EnrichmentOwner.Bundle;
 
-    fn createDetachedEnrichmentRuntime(self: *DB, enrichment_cfg: *enrichment_runtime_mod.Config) !?DetachedEnrichmentRuntime {
+    pub fn createDetachedEnrichmentRuntime(self: *DB, enrichment_cfg: *enrichment_runtime_mod.Config) !?DetachedEnrichmentRuntime {
+        if (comptime storage_engine.enabled) return storage_engine.call("createDetachedEnrichmentRuntime", .{ self, enrichment_cfg });
         if (enrichment_cfg.dense_embedder == null and enrichment_cfg.sparse_embedder == null and enrichment_cfg.asset_producer == null and !enrichment_cfg.enable_without_producers) return null;
         // Producer ownership moves through reconfiguration, but execution and
         // security capabilities belong to the resident DB. Hydrate every
@@ -5386,6 +5447,7 @@ pub const DB = struct {
     };
 
     pub fn reconfigureEnrichmentRuntime(self: *DB, cfg: enrichment_runtime_mod.Config) !void {
+        if (comptime storage_engine.enabled) return storage_engine.call("reconfigureEnrichmentRuntime", .{ self, cfg });
         try self.reconfigureEnrichmentRuntimeWithOptions(cfg, .{});
     }
 
@@ -5395,6 +5457,7 @@ pub const DB = struct {
     /// admission is established. Starting here would make addIndex stop the
     /// new worker a second time and let corpus work delay control-plane DDL.
     pub fn reconfigureEnrichmentRuntimePaused(self: *DB, cfg: enrichment_runtime_mod.Config) !void {
+        if (comptime storage_engine.enabled) return storage_engine.call("reconfigureEnrichmentRuntimePaused", .{ self, cfg });
         try self.reconfigureEnrichmentRuntimeWithOptions(cfg, .{ .start_replacement = false });
     }
 
@@ -5452,6 +5515,7 @@ pub const DB = struct {
     }
 
     pub fn resumeEnrichmentRuntimeAfterReconfigure(self: *DB, operation: []const u8, index_name: []const u8) !void {
+        if (comptime storage_engine.enabled) return storage_engine.call("resumeEnrichmentRuntimeAfterReconfigure", .{ self, operation, index_name });
         if (self.enrichment_runtime == null) return;
         try self.restartEnrichmentAfterStructuralMutation(operation, index_name);
     }
@@ -5470,7 +5534,8 @@ pub const DB = struct {
         );
     }
 
-    fn initResolutionRuntime(self: *DB) !void {
+    pub fn initResolutionRuntime(self: *DB) !void {
+        if (comptime storage_engine.enabled) return storage_engine.call("initResolutionRuntime", .{self});
         // Always constructed so catalog/status/runUntilIdle APIs can observe
         // and drain replay. The background worker is started lazily only while
         // the resolver catalog is non-empty.
@@ -5512,7 +5577,8 @@ pub const DB = struct {
         if (self.enrichment_append_context) |ctx| ctx.resolution_runtime = runtime;
     }
 
-    fn initPromotionRuntime(self: *DB) !void {
+    pub fn initPromotionRuntime(self: *DB) !void {
+        if (comptime storage_engine.enabled) return storage_engine.call("initPromotionRuntime", .{self});
         // Always constructed (like the resolution runtime) so synchronous
         // drains and status APIs remain available. The background worker is
         // started lazily only while resolver replay can produce promotion work.
@@ -5548,7 +5614,8 @@ pub const DB = struct {
         );
     }
 
-    fn initOptionalTtlRuntime(self: *DB, cfg: ttl_runtime_mod.Config) !void {
+    pub fn initOptionalTtlRuntime(self: *DB, cfg: ttl_runtime_mod.Config) !void {
+        if (comptime storage_engine.enabled) return storage_engine.call("initOptionalTtlRuntime", .{ self, cfg });
         const batch_resources = self.core.batchExecutionResources();
         var context_value: TtlCleanupContext = .{
             .batch = .{
@@ -5593,6 +5660,7 @@ pub const DB = struct {
     /// The context must outlive the managed DB. This only swaps the callback;
     /// teardown drains TTL workers before releasing the owning service.
     pub fn setCoordinatedTtl(self: *DB, port: ?coordinated_ttl.Port) void {
+        if (comptime storage_engine.enabled) return storage_engine.call("setCoordinatedTtl", .{ self, port }) catch @panic("incompatible storage owner");
         const context = self.ttl_cleanup_context orelse return;
         const io = self.backend_runtime.io() orelse std.Options.debug_io;
         context.hook_mutex.lockUncancelable(io);
@@ -5613,7 +5681,8 @@ pub const DB = struct {
         );
     }
 
-    fn initOptionalTransactionRuntime(self: *DB, cfg: transaction_runtime_mod.Config) !void {
+    pub fn initOptionalTransactionRuntime(self: *DB, cfg: transaction_runtime_mod.Config) !void {
+        if (comptime storage_engine.enabled) return storage_engine.call("initOptionalTransactionRuntime", .{ self, cfg });
         var contexts: TransactionRecoveryContexts = .{
             .identity = try db_core.TransactionRecoveryIdentityContext.init(
                 self.runtime_alloc,
@@ -5632,7 +5701,8 @@ pub const DB = struct {
         self.transaction_runtime = self.transaction_owner.runtime.?;
     }
 
-    fn initOptionalTextMergeRuntime(self: *DB, cfg: text_merge_runtime_mod.Config) !void {
+    pub fn initOptionalTextMergeRuntime(self: *DB, cfg: text_merge_runtime_mod.Config) !void {
+        if (comptime storage_engine.enabled) return storage_engine.call("initOptionalTextMergeRuntime", .{ self, cfg });
         if (!self.start_index_workers) return;
         if (!cfg.enabled) return;
         const resources = self.core.asyncResources();
@@ -5648,7 +5718,8 @@ pub const DB = struct {
         self.async_context.text_merge_runtime = runtime;
     }
 
-    fn initOptionalSparseCompactionRuntime(self: *DB, cfg: sparse_compaction_runtime_mod.Config) !void {
+    pub fn initOptionalSparseCompactionRuntime(self: *DB, cfg: sparse_compaction_runtime_mod.Config) !void {
+        if (comptime storage_engine.enabled) return storage_engine.call("initOptionalSparseCompactionRuntime", .{ self, cfg });
         if (!self.start_index_workers) return;
         if (!cfg.enabled) return;
         const resources = self.core.asyncResources();
@@ -5664,7 +5735,8 @@ pub const DB = struct {
         self.async_context.sparse_compaction_runtime = runtime;
     }
 
-    fn initOptionalGraphMetricRuntime(self: *DB, cfg: graph_metric_runtime_mod.Config) !void {
+    pub fn initOptionalGraphMetricRuntime(self: *DB, cfg: graph_metric_runtime_mod.Config) !void {
+        if (comptime storage_engine.enabled) return storage_engine.call("initOptionalGraphMetricRuntime", .{ self, cfg });
         if (comptime builtin.os.tag == .freestanding) return;
         if (!self.start_index_workers) return;
         // Manual backends with only filesystem authority cannot own a
@@ -5684,7 +5756,8 @@ pub const DB = struct {
         resources.index_manager.graph_metric_notify = .{ .ptr = runtime, .notify = graph_metric_runtime_mod.GraphMetricRuntime.notifyOpaque };
     }
 
-    fn initOptionalRuntimes(self: *DB, opts: *OpenOptions) !void {
+    pub fn initOptionalRuntimes(self: *DB, opts: *OpenOptions) !void {
+        if (comptime storage_engine.enabled) return storage_engine.call("initOptionalRuntimes", .{ self, opts });
         // Created before enrichment so the enrichment append context can notify
         // it when extraction artifacts land.
         try self.initResolutionRuntime();
@@ -5714,7 +5787,8 @@ pub const DB = struct {
         try self.initOptionalGraphMetricRuntime(opts.graph_metric_maintenance);
     }
 
-    fn startOptionalRuntimes(self: *DB) !void {
+    pub fn startOptionalRuntimes(self: *DB) !void {
+        if (comptime storage_engine.enabled) return storage_engine.call("startOptionalRuntimes", .{self});
         try self.startResolverReplayRuntimesIfConfigured();
         if (self.enrichment_runtime) |runtime| {
             try runtime.start();
@@ -5734,6 +5808,7 @@ pub const DB = struct {
     /// deterministic scheduler drains them. Destruction still happens through
     /// the ordinary close path after the drain completes.
     pub fn beginTeardown(self: *DB) void {
+        if (comptime storage_engine.enabled) return storage_engine.call("beginTeardown", .{self}) catch @panic("incompatible storage owner");
         self.graph_cleanup_owner.stopping.store(true, .release);
         if (self.enrichment_runtime) |runtime| runtime.beginTeardown();
         if (self.transaction_runtime) |runtime| runtime.beginTeardown();
@@ -5741,6 +5816,7 @@ pub const DB = struct {
     }
 
     pub fn ensureTransactionRecoveryRuntime(self: *DB, cfg: transaction_runtime_mod.Config) !void {
+        if (comptime storage_engine.enabled) return storage_engine.call("ensureTransactionRecoveryRuntime", .{ self, cfg });
         if (!cfg.enabled or self.transaction_runtime != null) return;
         try self.lockApplyForPortableRuntime();
         defer self.core.unlockApply();
@@ -5779,6 +5855,7 @@ pub const DB = struct {
 
     /// Activate only after the serving owner installs candidate/sink hooks.
     pub fn activateResolverReplayRuntimes(self: *DB) !void {
+        if (comptime storage_engine.enabled) return storage_engine.call("activateResolverReplayRuntimes", .{self});
         self.resolver_workers_enabled = true;
         if (self.local_execution.optional_runtime_workers_enabled) try self.startResolverReplayRuntimesIfConfigured();
     }
@@ -5961,6 +6038,7 @@ pub const DB = struct {
 
     /// Admit an external recovery pass without exposing write-gate policy.
     pub fn admitTransactionRecovery(self: *DB) !?MutationBarrier.SharedLease {
+        if (comptime storage_engine.enabled) return storage_engine.call("admitTransactionRecovery", .{self});
         var lease = self.acquireReplicationMutationShared();
         errdefer if (lease) |*held| held.release();
         try self.enforceReplicationWriteGate();
@@ -5972,12 +6050,14 @@ pub const DB = struct {
     }
 
     pub fn recoverLocalTransactionRecords(self: *DB, cutoff_ns: u64, now_ns: u64) !transactions_mod.RecoveryStats {
+        if (comptime storage_engine.enabled) return storage_engine.call("recoverLocalTransactionRecords", .{ self, cutoff_ns, now_ns });
         try self.lockApplyForPortableRuntime();
         defer self.core.unlockApply();
         return try self.core.recoverTransactions(cutoff_ns, now_ns);
     }
 
     pub fn beginBulkIngestSession(self: *DB) !void {
+        if (comptime storage_engine.enabled) return storage_engine.call("beginBulkIngestSession", .{self});
         var replication_mutation = self.acquireReplicationMutationShared();
         defer if (replication_mutation) |*lease| lease.release();
         try self.enforceReplicationWriteGate();
@@ -6008,6 +6088,7 @@ pub const DB = struct {
     }
 
     pub fn finishBulkIngestSessionWithOptions(self: *DB, options: backend_types.BulkIngestFinishOptions) !void {
+        if (comptime storage_engine.enabled) return storage_engine.call("finishBulkIngestSessionWithOptions", .{ self, options });
         var replication_mutation = self.acquireReplicationMutationShared();
         defer if (replication_mutation) |*lease| lease.release();
         try self.enforceReplicationWriteGate();
@@ -6051,6 +6132,7 @@ pub const DB = struct {
     }
 
     pub fn beginDenseAutoBulkIngestSession(self: *DB) !void {
+        if (comptime storage_engine.enabled) return storage_engine.call("beginDenseAutoBulkIngestSession", .{self});
         var replication_mutation = self.acquireReplicationMutationShared();
         defer if (replication_mutation) |*lease| lease.release();
         try self.enforceReplicationWriteGate();
@@ -6065,6 +6147,7 @@ pub const DB = struct {
     }
 
     pub fn beginPrimaryStoreAutoBulkIngestSession(self: *DB) !void {
+        if (comptime storage_engine.enabled) return storage_engine.call("beginPrimaryStoreAutoBulkIngestSession", .{self});
         var replication_mutation = self.acquireReplicationMutationShared();
         defer if (replication_mutation) |*lease| lease.release();
         try self.enforceReplicationWriteGate();
@@ -6079,6 +6162,7 @@ pub const DB = struct {
     }
 
     pub fn finishPrimaryStoreAutoBulkIngestSessionWithOptions(self: *DB, options: backend_types.BulkIngestFinishOptions) !void {
+        if (comptime storage_engine.enabled) return storage_engine.call("finishPrimaryStoreAutoBulkIngestSessionWithOptions", .{ self, options });
         var replication_mutation = self.acquireReplicationMutationShared();
         defer if (replication_mutation) |*lease| lease.release();
         try self.enforceReplicationWriteGate();
@@ -6103,15 +6187,18 @@ pub const DB = struct {
     }
 
     pub fn rollPrimaryStoreAutoBulkIngestSessionWithOptions(self: *DB, options: backend_types.BulkIngestFinishOptions) !void {
+        if (comptime storage_engine.enabled) return storage_engine.call("rollPrimaryStoreAutoBulkIngestSessionWithOptions", .{ self, options });
         try self.finishPrimaryStoreAutoBulkIngestSessionWithOptions(options);
         try self.beginPrimaryStoreAutoBulkIngestSession();
     }
 
     pub fn finishDenseAutoBulkIngestSessionWithOptions(self: *DB, options: backend_types.BulkIngestFinishOptions) !void {
+        if (comptime storage_engine.enabled) return storage_engine.call("finishDenseAutoBulkIngestSessionWithOptions", .{ self, options });
         try self.finishDenseAutoBulkIngestSessionWithOptionsInternal(options, true);
     }
 
     pub fn rollDenseAutoBulkIngestSessionWithOptions(self: *DB, options: backend_types.BulkIngestFinishOptions) !void {
+        if (comptime storage_engine.enabled) return storage_engine.call("rollDenseAutoBulkIngestSessionWithOptions", .{ self, options });
         try self.finishDenseAutoBulkIngestSessionWithOptionsInternal(options, true);
         try self.beginDenseAutoBulkIngestSession();
     }
@@ -6165,6 +6252,7 @@ pub const DB = struct {
     }
 
     pub fn abortPrimaryStoreAutoBulkIngestSession(self: *DB) void {
+        if (comptime storage_engine.enabled) return storage_engine.call("abortPrimaryStoreAutoBulkIngestSession", .{self}) catch @panic("incompatible storage owner");
         var replication_mutation = self.acquireReplicationMutationShared();
         defer if (replication_mutation) |*lease| lease.release();
         lockApply(self);
@@ -6176,6 +6264,7 @@ pub const DB = struct {
     }
 
     pub fn abortBulkIngestSession(self: *DB) void {
+        if (comptime storage_engine.enabled) return storage_engine.call("abortBulkIngestSession", .{self}) catch @panic("incompatible storage owner");
         var replication_mutation = self.acquireReplicationMutationShared();
         defer if (replication_mutation) |*lease| lease.release();
         lockApply(self);
@@ -6193,6 +6282,7 @@ pub const DB = struct {
     }
 
     pub fn lsmMaintenanceScore(self: *DB) u64 {
+        if (comptime storage_engine.enabled) return storage_engine.call("lsmMaintenanceScore", .{self}) catch @panic("incompatible storage owner");
         lockApplyShared(self);
         defer self.core.unlockApplyShared();
         return @max(@intFromBool(self.source_pin_cleanup.epoch.load(.acquire) != 0), @max(
@@ -6202,6 +6292,7 @@ pub const DB = struct {
     }
 
     pub fn lsmMaintenanceDebtHint(self: *DB) u64 {
+        if (comptime storage_engine.enabled) return storage_engine.call("lsmMaintenanceDebtHint", .{self}) catch @panic("incompatible storage owner");
         return @max(@intFromBool(self.source_pin_cleanup.epoch.load(.acquire) != 0), @max(
             self.core.primary_store_owner.lsmMaintenanceDebtHint(),
             self.core.index_manager.lsmMaintenanceDebtHint(),
@@ -6209,10 +6300,12 @@ pub const DB = struct {
     }
 
     pub fn primaryLsmMaintenanceDebtHint(self: *DB) u64 {
+        if (comptime storage_engine.enabled) return storage_engine.call("primaryLsmMaintenanceDebtHint", .{self}) catch @panic("incompatible storage owner");
         return self.core.primary_store_owner.lsmMaintenanceDebtHint();
     }
 
     pub fn nextLsmMaintenanceWakeDelayNsBestEffort(self: *DB) ?u64 {
+        if (comptime storage_engine.enabled) return storage_engine.call("nextLsmMaintenanceWakeDelayNsBestEffort", .{self}) catch @panic("incompatible storage owner");
         var delay_ns = self.core.primary_store_owner.nextLsmMaintenanceWakeDelayNsBestEffort();
         if (self.core.index_manager.nextLsmMaintenanceWakeDelayNsBestEffort()) |candidate| {
             delay_ns = if (delay_ns) |current| @min(current, candidate) else candidate;
@@ -6225,10 +6318,12 @@ pub const DB = struct {
     }
 
     pub fn nextPrimaryLsmMaintenanceWakeDelayNsBestEffort(self: *DB) ?u64 {
+        if (comptime storage_engine.enabled) return storage_engine.call("nextPrimaryLsmMaintenanceWakeDelayNsBestEffort", .{self}) catch @panic("incompatible storage owner");
         return self.core.primary_store_owner.nextLsmMaintenanceWakeDelayNsBestEffort();
     }
 
     pub fn snapshotAsyncIndexingStats(self: *DB) types.AsyncIndexingStats {
+        if (comptime storage_engine.enabled) return storage_engine.call("snapshotAsyncIndexingStats", .{self}) catch @panic("incompatible storage owner");
         var async_stats = self.async_context.stats.snapshot();
         // Runtime status must carry the writer-owned native-vector lifecycle
         // fact. A cached materialization snapshot can have a stale HBC count
@@ -6299,6 +6394,7 @@ pub const DB = struct {
     }
 
     pub fn snapshotLsmMaintenanceStats(self: *DB) lsm_backend_mod.Backend.MaintenanceStats {
+        if (comptime storage_engine.enabled) return storage_engine.call("snapshotLsmMaintenanceStats", .{self}) catch @panic("incompatible storage owner");
         lockApplyShared(self);
         defer self.core.unlockApplyShared();
         return self.snapshotLsmMaintenanceStatsLocked();
@@ -6358,18 +6454,21 @@ pub const DB = struct {
     }
 
     pub fn snapshotLsmOwnerStatsAlloc(self: *DB, alloc: Allocator) ![]LsmOwnerStats {
+        if (comptime storage_engine.enabled) return storage_engine.call("snapshotLsmOwnerStatsAlloc", .{ self, alloc });
         lockApplyShared(self);
         defer self.core.unlockApplyShared();
         return try self.snapshotLsmOwnerStatsLockedAlloc(alloc);
     }
 
     pub fn trySnapshotLsmOwnerStatsAlloc(self: *DB, alloc: Allocator) !?[]LsmOwnerStats {
+        if (comptime storage_engine.enabled) return storage_engine.call("trySnapshotLsmOwnerStatsAlloc", .{ self, alloc });
         if (!self.core.tryLockApplyShared()) return null;
         defer self.core.unlockApplyShared();
         return try self.snapshotLsmOwnerStatsLockedAlloc(alloc);
     }
 
     pub fn trySnapshotLsmMaintenanceStats(self: *DB) ?lsm_backend_mod.Backend.MaintenanceStats {
+        if (comptime storage_engine.enabled) return storage_engine.call("trySnapshotLsmMaintenanceStats", .{self}) catch @panic("incompatible storage owner");
         if (!self.core.tryLockApplyShared()) return null;
         defer self.core.unlockApplyShared();
         return self.snapshotLsmMaintenanceStatsLocked();
@@ -6385,12 +6484,14 @@ pub const DB = struct {
     }
 
     pub fn snapshotLsmWriteStats(self: *DB) lsm_backend_mod.Backend.WriteStats {
+        if (comptime storage_engine.enabled) return storage_engine.call("snapshotLsmWriteStats", .{self}) catch @panic("incompatible storage owner");
         lockApplyShared(self);
         defer self.core.unlockApplyShared();
         return self.snapshotLsmWriteStatsLocked();
     }
 
     pub fn trySnapshotLsmWriteStats(self: *DB) ?lsm_backend_mod.Backend.WriteStats {
+        if (comptime storage_engine.enabled) return storage_engine.call("trySnapshotLsmWriteStats", .{self}) catch @panic("incompatible storage owner");
         if (!self.core.tryLockApplyShared()) return null;
         defer self.core.unlockApplyShared();
         return self.snapshotLsmWriteStatsLocked();
@@ -6427,6 +6528,7 @@ pub const DB = struct {
     }
 
     pub fn trySnapshotTextMemoryAttributionStats(self: *DB) ?index_manager_mod.TextMemoryAttributionStats {
+        if (comptime storage_engine.enabled) return storage_engine.call("trySnapshotTextMemoryAttributionStats", .{self}) catch @panic("incompatible storage owner");
         if (!self.core.tryLockApplyShared()) return null;
         defer self.core.unlockApplyShared();
         return self.core.index_manager.snapshotTextMemoryAttribution();
@@ -6457,6 +6559,7 @@ pub const DB = struct {
         alloc: Allocator,
         observation: index_manager_mod.IndexManager.DynamicFieldObservationQuery,
     ) ![]index_manager_mod.IndexManager.ObservedDynamicFieldCapabilitySet {
+        if (comptime storage_engine.enabled) return storage_engine.call("observedDynamicFieldCapabilitySetsAlloc", .{ self, alloc, observation });
         try observation.checkActive();
         if (observation.execution_deadline_ns != null or observation.cancellation != null) {
             if (!self.core.tryLockApplyShared()) return error.StorageReadTemporarilyUnavailable;
@@ -6487,6 +6590,7 @@ pub const DB = struct {
     }
 
     pub fn trySnapshotTextMergeStats(self: *DB) ?types.TextMergeStats {
+        if (comptime storage_engine.enabled) return storage_engine.call("trySnapshotTextMergeStats", .{self}) catch @panic("incompatible storage owner");
         if (!self.core.tryLockApplyShared()) return null;
         defer self.core.unlockApplyShared();
         var merge_stats = self.core.index_manager.textMergeStatsSnapshot();
@@ -6509,6 +6613,7 @@ pub const DB = struct {
     }
 
     pub fn runLsmMaintenanceStep(self: *DB) !bool {
+        if (comptime storage_engine.enabled) return storage_engine.call("runLsmMaintenanceStep", .{self});
         var replication_mutation = self.acquireReplicationMutationShared();
         defer if (replication_mutation) |*lease| lease.release();
         return try self.runLsmMaintenanceStepWithReplicationMutationHeld();
@@ -6543,6 +6648,7 @@ pub const DB = struct {
     }
 
     pub fn runLsmMaintenanceStepBestEffort(self: *DB) !bool {
+        if (comptime storage_engine.enabled) return storage_engine.call("runLsmMaintenanceStepBestEffort", .{self});
         var replication_mutation = self.acquireReplicationMutationShared();
         defer if (replication_mutation) |*lease| lease.release();
         var snapshot_replay = try self.acquireSnapshotReplayMutation();
@@ -6568,6 +6674,7 @@ pub const DB = struct {
     /// Source-pin deletion shares the LSM maintenance lane; it never creates a
     /// dedicated thread or monopolizes compaction while the corpus is large.
     pub fn runSourcePinCleanupStep(self: *DB) !bool {
+        if (comptime storage_engine.enabled) return storage_engine.call("runSourcePinCleanupStep", .{self});
         if (openModeRequiresReadOnlyBackends(self.open_mode) or !self.source_pin_cleanup.due(monotonicTimeNs())) return false;
         const units_before = self.source_pin_cleanup.work_units.load(.acquire);
         const work = @import("source_pin.zig").reconcileReleasedWithBudget(self, .{}) catch |err| {
@@ -6593,6 +6700,7 @@ pub const DB = struct {
     }
 
     pub fn runPrimaryLsmMaintenanceStep(self: *DB) !bool {
+        if (comptime storage_engine.enabled) return storage_engine.call("runPrimaryLsmMaintenanceStep", .{self});
         var replication_mutation = self.acquireReplicationMutationShared();
         defer if (replication_mutation) |*lease| lease.release();
         var snapshot_replay = try self.acquireSnapshotReplayMutation();
@@ -6607,6 +6715,7 @@ pub const DB = struct {
     }
 
     pub fn runPrimaryLsmMaintenanceStepBestEffort(self: *DB) !bool {
+        if (comptime storage_engine.enabled) return storage_engine.call("runPrimaryLsmMaintenanceStepBestEffort", .{self});
         var replication_mutation = self.acquireReplicationMutationShared();
         defer if (replication_mutation) |*lease| lease.release();
         var snapshot_replay = try self.acquireSnapshotReplayMutation();
@@ -6621,6 +6730,7 @@ pub const DB = struct {
     }
 
     pub fn hasActiveDenseBulkWork(self: *const DB) bool {
+        if (comptime storage_engine.enabled) return storage_engine.call("hasActiveDenseBulkWork", .{self}) catch @panic("incompatible storage owner");
         return asyncContextHasActiveDenseBulkWork(self.async_context);
     }
 
@@ -6633,6 +6743,7 @@ pub const DB = struct {
     }
 
     pub fn runDueLsmObsoleteReclaimUntilIdle(self: *DB, max_steps: usize) !usize {
+        if (comptime storage_engine.enabled) return storage_engine.call("runDueLsmObsoleteReclaimUntilIdle", .{ self, max_steps });
         var replication_mutation = self.acquireReplicationMutationShared();
         defer if (replication_mutation) |*lease| lease.release();
         var snapshot_replay = try self.acquireSnapshotReplayMutation();
@@ -7062,6 +7173,7 @@ pub const DB = struct {
     }
 
     pub fn batchReplicatedApply(self: *DB, req: types.BatchRequest) anyerror!void {
+        if (comptime storage_engine.enabled) return storage_engine.call("batchReplicatedApply", .{ self, req });
         try self.batchReplicatedApplyWithMarker(req, null);
     }
 
@@ -7071,6 +7183,7 @@ pub const DB = struct {
     /// Execute a committed ordered mutation. The receipt and primary effects
     /// share a store transaction; server replay policy is supplied by the caller.
     pub fn applyOrderedCommittedMutation(self: *DB, request: types.BatchRequest, identity: OrderedApplyReceipt, bypass_write_gate: bool) anyerror!void {
+        if (comptime storage_engine.enabled) return storage_engine.call("applyOrderedCommittedMutation", .{ self, request, identity, bypass_write_gate });
         if (request.graph_endpoint_cleanup and !request.graph_endpoint_cleanup_planned) return error.InvalidBatchRequest;
         try self.batchInternal(request, null, .{
             .validate_range_ownership = false,
@@ -7081,6 +7194,7 @@ pub const DB = struct {
     }
 
     pub fn recoverOrderedSourceAdmission(self: *DB, request: types.BatchRequest, identity: OrderedApplyReceipt, bypass_write_gate: bool) !void {
+        if (comptime storage_engine.enabled) return storage_engine.call("recoverOrderedSourceAdmission", .{ self, request, identity, bypass_write_gate });
         try self.applyOnlineSourceBatch(request, .{
             .validate_range_ownership = false,
             .wait_for_sync_level = false,
@@ -7095,6 +7209,7 @@ pub const DB = struct {
     /// Keep this distinct from the generic Raft path: native source roots
     /// must never acquire a fabricated Raft applied-entry watermark.
     pub fn batchNativeInitialChildApply(self: *DB, req: types.BatchRequest, receipt: OrderedApplyReceipt) !void {
+        if (comptime storage_engine.enabled) return storage_engine.call("batchNativeInitialChildApply", .{ self, req, receipt });
         const command = req.relational_topology orelse return error.InvalidInitialChildPublication;
         if (command.action != .provision_initial_child and command.action != .release_initial_child and command.action != .cancel_initial_child)
             return error.InvalidInitialChildPublication;
@@ -7165,6 +7280,7 @@ pub const DB = struct {
     /// publication fence, and its operation receipt commits with the effect,
     /// without advancing the unrelated Raft apply watermark.
     pub fn batchNativeFkGenerationApply(self: *DB, req: types.BatchRequest) !void {
+        if (comptime storage_engine.enabled) return storage_engine.call("batchNativeFkGenerationApply", .{ self, req });
         const command = req.relational_topology orelse return error.InvalidBatchRequest;
         if (command.fence.role != .child_generation_source and command.fence.role != .child_generation_parent and
             command.fence.role != .child_generation_dual) return error.InvalidBatchRequest;
@@ -7310,6 +7426,7 @@ pub const DB = struct {
     /// Pin primary data and its ordered receipt under the local apply lock.
     /// A server adapter supplies any surrounding protocol completion fence.
     pub fn pinTransferablePrimarySnapshot(self: *DB) !TransferablePrimarySnapshot {
+        if (comptime storage_engine.enabled) return storage_engine.call("pinTransferablePrimarySnapshot", .{self});
         try self.lockApplyForPortableRuntime();
         defer self.core.unlockApply();
         var namespace: [24]u8 = undefined;
@@ -7339,6 +7456,7 @@ pub const DB = struct {
     };
 
     pub fn verifyTransferablePrimarySnapshot(self: *DB, namespace: [24]u8, receipt: ?OrderedApplyReceipt) !void {
+        if (comptime storage_engine.enabled) return storage_engine.call("verifyTransferablePrimarySnapshot", .{ self, namespace, receipt });
         var actual_namespace: [24]u8 = undefined;
         doc_identity.encodeNamespace(&actual_namespace, self.core.identity_namespace);
         if (!std.mem.eql(u8, &actual_namespace, &namespace)) return error.InvalidSnapshot;
@@ -7352,12 +7470,14 @@ pub const DB = struct {
     }
 
     pub fn orderedApplyReceipt(self: *DB) !?OrderedApplyReceipt {
+        if (comptime storage_engine.enabled) return storage_engine.call("orderedApplyReceipt", .{self});
         lockApply(self);
         defer self.core.unlockApply();
         return try readOrderedApplyReceipt(self.alloc, self.core.store);
     }
 
     pub fn orderedMutationAlreadyApplied(self: *DB, identity: OrderedApplyReceipt) !bool {
+        if (comptime storage_engine.enabled) return storage_engine.call("orderedMutationAlreadyApplied", .{ self, identity });
         lockApply(self);
         defer self.core.unlockApply();
         return switch (try orderedApplyDisposition(
@@ -7432,6 +7552,7 @@ pub const DB = struct {
     /// data-Raft proposal has committed; it is never a substitute for the
     /// metadata read-index bundle or an owner ACK. It exposes no user rows.
     pub fn loadRowPolicyReceipt(self: *DB, generation: u64, phase: @import("../../system_catalog/policies.zig").Publication.Phase) !row_policy_bundle_mod.Receipt {
+        if (comptime storage_engine.enabled) return storage_engine.call("loadRowPolicyReceipt", .{ self, generation, phase });
         if (generation == 0) return error.InvalidRowPolicyReceipt;
         var key_buf: [128]u8 = undefined;
         const identity: row_policy_bundle_mod.Receipt = .{
@@ -7465,6 +7586,7 @@ pub const DB = struct {
     }
 
     pub fn applyReplicatedRowPolicyPublication(self: *DB, bundle_bytes: []const u8, request: @import("../../system_catalog/policies.zig").InstallRequest, identity: OrderedApplyReceipt) !?row_policy_bundle_mod.Receipt {
+        if (comptime storage_engine.enabled) return storage_engine.call("applyReplicatedRowPolicyPublication", .{ self, bundle_bytes, request, identity });
         return self.applyRowPolicyPublicationInternal(bundle_bytes, request, identity, null);
     }
 
@@ -7735,6 +7857,7 @@ pub const DB = struct {
     /// destination side of a split). The caller must hold structural ownership
     /// of the generation; ordinary Raft apply must never clear this fence.
     pub fn clearOrderedApplyReceipt(self: *DB) !void {
+        if (comptime storage_engine.enabled) return storage_engine.call("clearOrderedApplyReceipt", .{self});
         lockApply(self);
         defer self.core.unlockApply();
         try self.core.store.putBatch(&.{}, &.{internal_keys.ordered_document_applied_entry_key[0..]});
@@ -7851,6 +7974,7 @@ pub const DB = struct {
     /// Apply an already decoded committed batch. The mutation and its replay
     /// receipt remain in the same primary-store transaction.
     pub fn applyReplicatedBatch(self: *DB, mutation: replicated_mutation.Batch, sequence: u64) !void {
+        if (comptime storage_engine.enabled) return storage_engine.call("applyReplicatedBatch", .{ self, mutation, sequence });
         var request = mutation.request;
         var options: BatchExecutionOptions = .{
             .validate_range_ownership = false,
@@ -7873,12 +7997,14 @@ pub const DB = struct {
     /// Reconcile an ordered source inventory before applying its mutation.
     /// The store owns the admission fence; callers supply an exact receipt.
     pub fn reconcileReplicatedArtifactAdmission(self: *DB, request: types.BatchRequest, entry: OrderedApplyReceipt) !void {
+        if (comptime storage_engine.enabled) return storage_engine.call("reconcileReplicatedArtifactAdmission", .{ self, request, entry });
         const command = request.artifact_catalog orelse return;
         const context = try self.preflightArtifactAdmission(request, entry);
         if (!try self.reconcileOrderedArtifactCatalogWithContext(command, entry.index, context)) return error.ArtifactCatalogDrift;
     }
 
     pub fn applyReplicatedSchema(self: *DB, mutation: replication_effects_mod.SchemaMutation, sequence: u64) !void {
+        if (comptime storage_engine.enabled) return storage_engine.call("applyReplicatedSchema", .{ self, mutation, sequence });
         if (mutation.published_child) |published|
             try self.setPublishedChildSchemaReplicatedApplyWithMarker(mutation.schema, mutation.public_schema_json orelse return error.InvalidGenerationPublication, published, sequence)
         else
@@ -7886,6 +8012,7 @@ pub const DB = struct {
     }
 
     pub fn applyReplicatedRowPolicy(self: *DB, mutation: replication_effects_mod.RowPolicyMutation, sequence: u64) !void {
+        if (comptime storage_engine.enabled) return storage_engine.call("applyReplicatedRowPolicy", .{ self, mutation, sequence });
         _ = try self.applyRowPolicyPublicationInternal(
             mutation.bundle,
             mutation.request,
@@ -7908,10 +8035,12 @@ pub const DB = struct {
     }
 
     pub fn recoverReplicatedRestoreFinish(self: *DB, finish: @FieldType(@import("restore_staging_contract.zig").Control, "finish")) !void {
+        if (comptime storage_engine.enabled) return storage_engine.call("recoverReplicatedRestoreFinish", .{ self, finish });
         try self.prepareAppliedRestoreFinishReplay(.{ .restore_staging = .{ .finish = finish } });
     }
 
     pub fn applyReplicatedDerivedEffect(self: *DB, change: change_journal_mod.Record, primary: ?replication_effects_mod.primary_effect.View, sequence: u64) !u64 {
+        if (comptime storage_engine.enabled) return storage_engine.call("applyReplicatedDerivedEffect", .{ self, change, primary, sequence });
         var ctx = self.batchContext();
         return try appendReplicatedDerivedEffectContext(&ctx, change, primary, sequence);
     }
@@ -7937,6 +8066,7 @@ pub const DB = struct {
     }
 
     pub fn applyDocumentArtifactChildRangeBatch(self: *DB, child_batch: DocumentArtifactChildRangeApplyBatch) anyerror!u64 {
+        if (comptime storage_engine.enabled) return storage_engine.call("applyDocumentArtifactChildRangeBatch", .{ self, child_batch });
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
         var replication_mutation = self.acquireReplicationMutationShared();
         defer if (replication_mutation) |*lease| lease.release();
@@ -8103,7 +8233,8 @@ pub const DB = struct {
     /// apply lock instead of falling back to parse/extract/encode while holding
     /// the global serialization fence. The bound prevents catalog churn from
     /// turning one request into unbounded CPU/provider work.
-    fn batchInternal(self: *DB, req: types.BatchRequest, profile: ?*BatchProfile, opts: BatchExecutionOptions) anyerror!void {
+    pub fn batchInternal(self: *DB, req: types.BatchRequest, profile: ?*BatchProfile, opts: BatchExecutionOptions) anyerror!void {
+        if (comptime storage_engine.enabled) return storage_engine.call("batchInternal", .{ self, req, profile, opts });
         try types.validateGraphEndpointCleanupCommand(req);
         var lake_schema_view = self.core.acquireSchemaView();
         defer if (lake_schema_view) |*view| view.release();
@@ -8361,6 +8492,7 @@ pub const DB = struct {
 
     pub const batchInternalWithPreparationAllocator = local_mutation.batchInternalWithPreparationAllocator;
 
+    pub const PreparedBatchOwner = local_mutation.PreparedBatchOwner;
     pub const batchInternalPrepared = local_mutation.batchInternalPrepared;
 
     /// Exact source replays may omit derived journal work while each existing
@@ -8392,6 +8524,7 @@ pub const DB = struct {
     }
 
     pub fn setResolutionCandidateSource(self: *DB, src: ?resolution_runtime_mod.CandidateSource) void {
+        if (comptime storage_engine.enabled) return storage_engine.call("setResolutionCandidateSource", .{ self, src }) catch @panic("incompatible storage owner");
         self.resolution_candidate_source = src;
         if (self.resolution_append_context) |context| context.cache_source = src;
         if (self.resolution_runtime) |runtime| runtime.setCandidateSource(src);
@@ -8402,6 +8535,7 @@ pub const DB = struct {
     /// since managed DBs open lazily and cannot thread the sink through
     /// `OpenOptions`. No-op when this DB has no promotion runtime.
     pub fn setEntitySink(self: *DB, sink: ?promotion_runtime_mod.EntitySink) void {
+        if (comptime storage_engine.enabled) return storage_engine.call("setEntitySink", .{ self, sink }) catch @panic("incompatible storage owner");
         self.entity_sink = sink;
         if (self.promotion_runtime) |runtime| runtime.setSink(sink);
     }
@@ -8410,6 +8544,7 @@ pub const DB = struct {
     /// Serving-layer managed DBs use this to keep follower raft apply from
     /// turning replay into public entity-table writes.
     pub fn setPromotionOwner(self: *DB, owner: ?promotion_runtime_mod.PromotionOwner) void {
+        if (comptime storage_engine.enabled) return storage_engine.call("setPromotionOwner", .{ self, owner }) catch @panic("incompatible storage owner");
         self.promotion_owner = owner;
         if (self.promotion_runtime) |runtime| runtime.setOwner(owner);
     }
@@ -8760,6 +8895,7 @@ pub const DB = struct {
     pub const GeneratedArtifactCleanupAdvanceResult = @import("cleanup_job_owner.zig").Advance;
 
     pub fn advanceGeneratedArtifactCleanupPage(self: *DB, index_name: ?[]const u8) !GeneratedArtifactCleanupAdvanceResult {
+        if (comptime storage_engine.enabled) return storage_engine.call("advanceGeneratedArtifactCleanupPage", .{ self, index_name });
         return try advanceGeneratedArtifactCleanupContext(self.async_context, index_name);
     }
 
@@ -9200,6 +9336,7 @@ pub const DB = struct {
     pub const coalesceKeyValueRequest = local_mutation.coalesceKeyValueRequest;
 
     pub fn get(self: *DB, alloc: Allocator, key: []const u8) !?[]u8 {
+        if (comptime storage_engine.enabled) return storage_engine.call("get", .{ self, alloc, key });
         try self.maybeFinalizePendingRowPolicyPublication();
         var row_policy_lease = try self.local_execution.row_policy_gate.enterRawRead();
         defer row_policy_lease.release();
@@ -9287,6 +9424,7 @@ pub const DB = struct {
         doc_key: []const u8,
         artifact_name: []const u8,
     ) !?types.DocumentArtifactManifest {
+        if (comptime storage_engine.enabled) return storage_engine.call("getDocumentArtifactManifest", .{ self, alloc, doc_key, artifact_name });
         try self.maybeFinalizePendingRowPolicyPublication();
         var row_policy_lease = try self.local_execution.row_policy_gate.enterRawRead();
         defer row_policy_lease.release();
@@ -9321,6 +9459,7 @@ pub const DB = struct {
         alloc: Allocator,
         doc_key: []const u8,
     ) !types.DocumentArtifactManifestList {
+        if (comptime storage_engine.enabled) return storage_engine.call("listDocumentArtifactManifests", .{ self, alloc, doc_key });
         try self.maybeFinalizePendingRowPolicyPublication();
         var row_policy_lease = try self.local_execution.row_policy_gate.enterRawRead();
         defer row_policy_lease.release();
@@ -9377,6 +9516,7 @@ pub const DB = struct {
         artifact_name: []const u8,
         update: types.DocumentArtifactChildRangePlacementUpdate,
     ) !bool {
+        if (comptime storage_engine.enabled) return storage_engine.call("updateDocumentArtifactChildRangePlacement", .{ self, alloc, doc_key, artifact_name, update });
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
         var replication_mutation = self.acquireReplicationMutationShared();
         defer if (replication_mutation) |*lease| lease.release();
@@ -9472,6 +9612,7 @@ pub const DB = struct {
         doc_key: []const u8,
         artifact_name: []const u8,
     ) !bool {
+        if (comptime storage_engine.enabled) return storage_engine.call("reprocessDocumentArtifact", .{ self, alloc, doc_key, artifact_name });
         return self.reprocessDocumentArtifactWithCompletionWait(alloc, doc_key, artifact_name, false);
     }
 
@@ -10939,6 +11080,7 @@ pub const DB = struct {
         alloc: Allocator,
         req: types.ArtifactRepairListRequest,
     ) !types.ArtifactRepairListResult {
+        if (comptime storage_engine.enabled) return storage_engine.call("listArtifactRepairIssuesPage", .{ self, alloc, req });
         if (req.target == .index) return try self.listIndexRepairIssuesPage(alloc, req);
 
         var filtering_without_kind_index = false;
@@ -11036,6 +11178,7 @@ pub const DB = struct {
         index_name: ?[]const u8,
         limit: usize,
     ) ![]types.ArtifactRepairIssue {
+        if (comptime storage_engine.enabled) return storage_engine.call("listArtifactRepairIssues", .{ self, alloc, artifact_kind, index_name, limit });
         const page = try self.listArtifactRepairIssuesPage(alloc, .{
             .artifact_kind = artifact_kind,
             .index_name = index_name,
@@ -11220,6 +11363,7 @@ pub const DB = struct {
     }
 
     pub fn hasPendingIndexRepairIntents(self: *const DB, alloc: Allocator) !bool {
+        if (comptime storage_engine.enabled) return storage_engine.call("hasPendingIndexRepairIntents", .{ self, alloc });
         if (builtin.os.tag == .freestanding) return self.hasManagedIndexAdmissionMarker(alloc);
         const location = try self.indexRepairStateLocation();
         var state = index_repair_state.loadAt(alloc, location) catch |err| switch (err) {
@@ -11461,6 +11605,7 @@ pub const DB = struct {
     }
 
     pub fn indexRepairIntentSummary(self: *DB, alloc: Allocator) !IndexRepairIntentSummary {
+        if (comptime storage_engine.enabled) return storage_engine.call("indexRepairIntentSummary", .{ self, alloc });
         return self.indexRepairIntentSummaryForIndex(alloc, null);
     }
 
@@ -11473,6 +11618,7 @@ pub const DB = struct {
     }
 
     pub fn loadIndexRepairState(self: *const DB, alloc: Allocator) !index_repair_state.State {
+        if (comptime storage_engine.enabled) return storage_engine.call("loadIndexRepairState", .{ self, alloc });
         return try index_repair_state.loadAt(alloc, try self.indexRepairStateLocation());
     }
 
@@ -11937,6 +12083,7 @@ pub const DB = struct {
         alloc: Allocator,
         index_name: []const u8,
     ) !bool {
+        if (comptime storage_engine.enabled) return storage_engine.call("completedManagedDenseGenerationIsServiceable", .{ self, alloc, index_name });
         const cfg = self.core.index_manager.get(index_name) orelse return false;
         if (cfg.kind != .dense_vector) return false;
         return try self.managedGenerationIsServiceableAtLeast(
@@ -12886,6 +13033,7 @@ pub const DB = struct {
         alloc: Allocator,
         index_name: []const u8,
     ) !bool {
+        if (comptime storage_engine.enabled) return storage_engine.call("markDenseReplayArtifactRepairRequired", .{ self, alloc, index_name });
         return try self.markDenseReplayRepairRequired(
             alloc,
             index_name,
@@ -13112,6 +13260,7 @@ pub const DB = struct {
         alloc: Allocator,
         index_name: []const u8,
     ) !?u128 {
+        if (comptime storage_engine.enabled) return storage_engine.call("materializeManagedIndexAdmission", .{ self, alloc, index_name });
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
         const key = try internal_keys.managedIndexAdmissionKeyAlloc(alloc, index_name);
         defer alloc.free(key);
@@ -14294,6 +14443,7 @@ pub const DB = struct {
         alloc: Allocator,
         limit: usize,
     ) !StartupIndexRepairDiscovery {
+        if (comptime storage_engine.enabled) return storage_engine.call("discoverRecoverableStartupIndexFailures", .{ self, alloc, limit });
         var result: StartupIndexRepairDiscovery = .{};
         try self.ensureIndexRepairSchedulerDirectory(alloc);
         lockAtomic(&self.async_context.index_repair_scheduler_mutex);
@@ -14751,6 +14901,7 @@ pub const DB = struct {
         repair_id: u128,
         options: types.ArtifactRepairRunOptions,
     ) anyerror!IndexRepairAdvanceResult {
+        if (comptime storage_engine.enabled) return storage_engine.call("advanceIndexRepairIntent", .{ self, alloc, repair_id, options });
         return try self.advanceScheduledIndexRepairIntent(alloc, repair_id, options, null, false);
     }
 
@@ -15636,6 +15787,7 @@ pub const DB = struct {
         limit: usize,
         options: types.ArtifactRepairRunOptions,
     ) !StartupIndexRepairResult {
+        if (comptime storage_engine.enabled) return storage_engine.call("repairRecoverableStartupIndexFailures", .{ self, alloc, limit, options });
         var result: StartupIndexRepairResult = .{};
         const discovery = try self.discoverRecoverableStartupIndexFailures(alloc, limit);
         result.discovered = discovery.discovered;
@@ -15698,6 +15850,7 @@ pub const DB = struct {
         alloc: Allocator,
         req: types.ArtifactRepairRunRequest,
     ) !types.ArtifactRepairResult {
+        if (comptime storage_engine.enabled) return storage_engine.call("repairArtifactIssuesWithRequest", .{ self, alloc, req });
         return try self.repairArtifactIssuesWithRequestOptions(alloc, req, .{});
     }
 
@@ -15707,6 +15860,7 @@ pub const DB = struct {
         req: types.ArtifactRepairRunRequest,
         options: types.ArtifactRepairRunOptions,
     ) !types.ArtifactRepairResult {
+        if (comptime storage_engine.enabled) return storage_engine.call("repairArtifactIssuesWithRequestOptions", .{ self, alloc, req, options });
         return try self.repairArtifactIssuesWithRequestOptionsInternal(
             alloc,
             req,
@@ -16246,7 +16400,7 @@ pub const DB = struct {
         return result;
     }
 
-    const ShadowIndexReplacementResult = struct {
+    pub const ShadowIndexReplacementResult = struct {
         reprocessed: u64 = 0,
         applied_sequence: u64 = 0,
         unresolved_artifacts: u64 = 0,
@@ -16284,7 +16438,7 @@ pub const DB = struct {
         };
     }
 
-    fn rebuildIndexWithShadowReplacementOwned(
+    pub fn rebuildIndexWithShadowReplacementOwned(
         self: *DB,
         alloc: Allocator,
         cfg: types.IndexConfig,
@@ -16292,6 +16446,7 @@ pub const DB = struct {
         durable_repair_id: ?u128,
         yield_progress: *ShadowIndexReplacementResult,
     ) !ShadowIndexReplacementResult {
+        if (comptime storage_engine.enabled) return storage_engine.call("rebuildIndexWithShadowReplacementOwned", .{ self, alloc, cfg, options, durable_repair_id, yield_progress });
         try checkArtifactRepairCancelled(options);
         const working_set_plan = if (self.core.index_manager.resource_manager) |manager|
             try repairWorkingSetPlan(alloc, manager, cfg)
@@ -17612,6 +17767,7 @@ pub const DB = struct {
         artifact_kind: ?types.ArtifactRepairKind,
         limit: usize,
     ) !types.ArtifactRepairResult {
+        if (comptime storage_engine.enabled) return storage_engine.call("repairArtifactIssues", .{ self, alloc, artifact_kind, limit });
         return try self.repairArtifactIssuesWithRequest(alloc, .{
             .artifact_kind = artifact_kind,
             .limit = @intCast(@min(limit, std.math.maxInt(u32))),
@@ -17628,6 +17784,7 @@ pub const DB = struct {
         artifact_name: []const u8,
         req: types.DocumentArtifactTableReprocessRequest,
     ) !types.DocumentArtifactTableReprocessResult {
+        if (comptime storage_engine.enabled) return storage_engine.call("reprocessDocumentArtifactRange", .{ self, alloc, artifact_name, req });
         var cfg = (try self.getEnrichment(alloc, .asset, artifact_name)) orelse return error.NotFound;
         defer cfg.deinit(alloc);
 
@@ -17691,6 +17848,7 @@ pub const DB = struct {
     }
 
     pub fn getDocument(self: *DB, alloc: Allocator, key: []const u8, opts: types.LookupOptions) !?types.LookupResult {
+        if (comptime storage_engine.enabled) return storage_engine.call("getDocument", .{ self, alloc, key, opts });
         return try self.lookup(alloc, key, opts);
     }
 
@@ -18188,6 +18346,7 @@ pub const DB = struct {
     }
 
     pub fn lookup(self: *DB, alloc: Allocator, key: []const u8, opts: types.LookupOptions) !?types.LookupResult {
+        if (comptime storage_engine.enabled) return storage_engine.call("lookup", .{ self, alloc, key, opts });
         try checkLookupOptionsActive(opts);
         if (std.mem.eql(u8, opts.relational_topology_json, "{\"mode\":\"generation_handoff_identity\"}") and
             (key.len != 0 or opts.include_primary_digest or opts.relational_integrity_catalog or opts.relational_integrity_action or
@@ -18528,6 +18687,7 @@ pub const DB = struct {
     }
 
     pub fn getTimestamp(self: *DB, alloc: Allocator, key: []const u8) !u64 {
+        if (comptime storage_engine.enabled) return storage_engine.call("getTimestamp", .{ self, alloc, key });
         try self.maybeFinalizePendingRowPolicyPublication();
         var row_policy_lease = try self.local_execution.row_policy_gate.enterRawRead();
         defer row_policy_lease.release();
@@ -18538,6 +18698,7 @@ pub const DB = struct {
     }
 
     pub fn updateRange(self: *DB, byte_range: types.ByteRange) !void {
+        if (comptime storage_engine.enabled) return storage_engine.call("updateRange", .{ self, byte_range });
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
         var replication_mutation = self.acquireReplicationMutationShared();
         defer if (replication_mutation) |*lease| lease.release();
@@ -18568,6 +18729,7 @@ pub const DB = struct {
     }
 
     pub fn getRange(self: *DB) types.ByteRange {
+        if (comptime storage_engine.enabled) return storage_engine.call("getRange", .{self}) catch @panic("incompatible storage owner");
         return self.core.byteRange();
     }
 
@@ -18577,6 +18739,7 @@ pub const DB = struct {
     }
 
     pub fn findMedianKey(self: *DB, alloc: Allocator) ![]u8 {
+        if (comptime storage_engine.enabled) return storage_engine.call("findMedianKey", .{ self, alloc });
         const byte_range = self.getRange();
         const lower = try self.core.documentRangeLowerAlloc(byte_range.start);
         defer self.core.alloc.free(lower);
@@ -18643,6 +18806,7 @@ pub const DB = struct {
     }
 
     pub fn setSplitDeltaFinalSeq(self: *DB, seq: u64) !void {
+        if (comptime storage_engine.enabled) return storage_engine.call("setSplitDeltaFinalSeq", .{ self, seq });
         var replication_mutation = self.acquireReplicationMutationShared();
         defer if (replication_mutation) |*lease| lease.release();
         try self.enforceReplicationWriteGate();
@@ -18652,6 +18816,7 @@ pub const DB = struct {
     }
 
     pub fn clearSplitDeltaFinalSeq(self: *DB) !void {
+        if (comptime storage_engine.enabled) return storage_engine.call("clearSplitDeltaFinalSeq", .{self});
         var replication_mutation = self.acquireReplicationMutationShared();
         defer if (replication_mutation) |*lease| lease.release();
         try self.enforceReplicationWriteGate();
@@ -18661,12 +18826,14 @@ pub const DB = struct {
     }
 
     pub fn getSplitBootstrapMarker(self: *DB, alloc: Allocator) !?range_state_mod.SplitBootstrapMarker {
+        if (comptime storage_engine.enabled) return storage_engine.call("getSplitBootstrapMarker", .{ self, alloc });
         lockApplyShared(self);
         defer self.core.unlockApplyShared();
         return try self.core.loadSplitBootstrapMarker(alloc);
     }
 
     pub fn setSplitBootstrapMarker(self: *DB, marker: range_state_mod.SplitBootstrapMarker) !void {
+        if (comptime storage_engine.enabled) return storage_engine.call("setSplitBootstrapMarker", .{ self, marker });
         try self.lockApplyForPortableRuntime();
         defer self.core.unlockApply();
         try self.core.saveSplitBootstrapMarker(marker);
@@ -18749,6 +18916,7 @@ pub const DB = struct {
         byte_range: types.ByteRange,
         writes: []const types.BatchWrite,
     ) !void {
+        if (comptime storage_engine.enabled) return storage_engine.call("appendStagedSnapshotDocuments", .{ self, staged_generation, byte_range, writes });
         try staged_generation.validatePath(self.core.path);
         if (byte_range.start.len > 0 and byte_range.end.len > 0 and
             std.mem.order(u8, byte_range.start, byte_range.end) != .lt)
@@ -18772,6 +18940,7 @@ pub const DB = struct {
         staged_generation: *const generation_lifecycle.StagedGeneration,
         byte_range: types.ByteRange,
     ) !void {
+        if (comptime storage_engine.enabled) return storage_engine.call("finishStagedSnapshotRange", .{ self, staged_generation, byte_range });
         try staged_generation.validatePath(self.core.path);
         const range_value = try range_state_mod.encodeRangeAlloc(self.alloc, byte_range);
         defer self.alloc.free(range_value);
@@ -18797,6 +18966,7 @@ pub const DB = struct {
         base_delta_sequence: u64,
         marker: range_state_mod.SplitBootstrapMarker,
     ) !bool {
+        if (comptime storage_engine.enabled) return storage_engine.call("replaceSplitBootstrap", .{ self, alloc, byte_range, writes, base_delta_sequence, marker });
         lockAtomicWithBackoff(&self.generation_replace_mutex);
         defer self.generation_replace_mutex.unlock();
         try self.requireSupportedRelationalTopology();
@@ -18917,6 +19087,7 @@ pub const DB = struct {
         base_delta_sequence: u64,
         marker: range_state_mod.SplitBootstrapMarker,
     ) !bool {
+        if (comptime storage_engine.enabled) return storage_engine.call("completeSplitBootstrap", .{ self, alloc, byte_range, base_delta_sequence, marker });
         lockAtomicWithBackoff(&self.generation_replace_mutex);
         defer self.generation_replace_mutex.unlock();
 
@@ -19130,13 +19301,13 @@ pub const DB = struct {
         dest_dir2: []const u8,
         prepare_only: bool,
     ) !void {
+        if (comptime storage_engine.enabled) return storage_engine.call("split", .{ self, curr_range, split_key, dest_dir1, dest_dir2, prepare_only });
         if (self.local_execution.source_vectors.load(.acquire) != null) return error.VectorStoreLifecycleUnsupported;
         var replication_mutation = self.acquireReplicationMutationShared();
         defer if (replication_mutation) |*lease| lease.release();
         try self.enforceReplicationWriteGate();
         var snapshot_mutation = self.core.snapshot_admission.acquireMutation();
         defer snapshot_mutation.release();
-        _ = dest_dir1;
         while (true) {
             const target_sequence = self.core.nextDerivedSequence();
             try self.runMaintenanceUntil(target_sequence, .{});
@@ -19186,6 +19357,7 @@ pub const DB = struct {
     }
 
     pub fn snapshot(self: *DB, id: []const u8) !u64 {
+        if (comptime storage_engine.enabled) return storage_engine.call("snapshot", .{ self, id });
         var row_policy_lease = try self.local_execution.row_policy_gate.enterRaw();
         defer row_policy_lease.release();
         return try self.snapshotInternal(id, false, .none, null, null, false, null);
@@ -19196,6 +19368,7 @@ pub const DB = struct {
     /// so callers must drain before taking an exclusive mutation barrier.
     /// The deadline is in this DB's BackendRuntime.monotonicClock domain.
     pub fn drainSnapshotMaintenance(self: *DB, deadline_ns: u64) !void {
+        if (comptime storage_engine.enabled) return storage_engine.call("drainSnapshotMaintenance", .{ self, deadline_ns });
         while (true) {
             self.runMaintenanceUntilWithCancellation(
                 self.currentMaintenanceTargetSequence(),
@@ -19227,6 +19400,7 @@ pub const DB = struct {
     /// any follow-up work that raced with their capture barrier.
     /// The deadline is in this DB's BackendRuntime.monotonicClock domain.
     pub fn snapshotWithMaintenanceDeadline(self: *DB, id: []const u8, maintenance_deadline_ns: u64) !u64 {
+        if (comptime storage_engine.enabled) return storage_engine.call("snapshotWithMaintenanceDeadline", .{ self, id, maintenance_deadline_ns });
         var row_policy_lease = try self.local_execution.row_policy_gate.enterRaw();
         defer row_policy_lease.release();
         return try self.snapshotInternal(id, false, .none, maintenance_deadline_ns, null, false, null);
@@ -19239,6 +19413,7 @@ pub const DB = struct {
     }
 
     pub fn snapshotNativeWithCancellation(self: *DB, id: []const u8, cancellation: types.CancellationToken) !u64 {
+        if (comptime storage_engine.enabled) return storage_engine.call("snapshotNativeWithCancellation", .{ self, id, cancellation });
         var row_policy_lease = try self.local_execution.row_policy_gate.enterRaw();
         defer row_policy_lease.release();
         return try self.snapshotInternal(id, true, cancellation, null, null, false, null);
@@ -19247,6 +19422,7 @@ pub const DB = struct {
     /// Cohort capture verifies the exact durable owner fence and drained
     /// participant set under the same apply lock that pins the native root.
     pub fn snapshotRelationalCohort(self: *DB, id: []const u8, expected: @import("relational_integrity_topology.zig").Fence, cancellation: types.CancellationToken) !u64 {
+        if (comptime storage_engine.enabled) return storage_engine.call("snapshotRelationalCohort", .{ self, id, expected, cancellation });
         var row_policy_lease = try self.local_execution.row_policy_gate.enterRaw();
         defer row_policy_lease.release();
         if (expected.role != .backup_snapshot) return error.InvalidIntegrityTopologyFence;
@@ -19256,6 +19432,7 @@ pub const DB = struct {
     /// Seal an exact common-cut owner generation durably. No corpus copy or
     /// hashing is performed while the write fence is held.
     pub fn sealBackupCohort(self: *DB, id: []const u8, expected: @import("relational_integrity_topology.zig").Fence, cancellation: types.CancellationToken) !@import("native_backup_seal.zig").Handle {
+        if (comptime storage_engine.enabled) return storage_engine.call("sealBackupCohort", .{ self, id, expected, cancellation });
         var row_policy_lease = try self.local_execution.row_policy_gate.enterRaw();
         defer row_policy_lease.release();
         try validateSnapshotId(id);
@@ -19271,6 +19448,7 @@ pub const DB = struct {
     }
 
     pub fn exportBackupCohort(self: *DB, handle: @import("native_backup_seal.zig").Handle, id: []const u8, cancellation: types.CancellationToken) !u64 {
+        if (comptime storage_engine.enabled) return storage_engine.call("exportBackupCohort", .{ self, handle, id, cancellation });
         var row_policy_lease = try self.local_execution.row_policy_gate.enterRawRead();
         defer row_policy_lease.release();
         const checkpoint: RowPolicyOutputCheckpoint = .{ .upstream = cancellation, .lease = &row_policy_lease };
@@ -19313,6 +19491,7 @@ pub const DB = struct {
     /// Portable logical rows from the identical immutable cut used by native
     /// cohorts. The live root may already have resumed writes at this point.
     pub fn exportBackupCohortPortable(self: *DB, handle: @import("native_backup_seal.zig").Handle, writer: *std.Io.Writer, options: portable_backup.ExportOptions, cancellation: types.CancellationToken) !void {
+        if (comptime storage_engine.enabled) return storage_engine.call("exportBackupCohortPortable", .{ self, handle, writer, options, cancellation });
         if (options.source_generation_summary_output) |summary| summary.output.* = null;
         errdefer if (options.source_generation_summary_output) |summary| if (summary.output.*) |entries| {
             portable_backup.freeSourceGenerationAdmissionSummary(summary.alloc, entries);
@@ -19411,6 +19590,7 @@ pub const DB = struct {
         return cut.admitWithDurability(self.alloc, io, self.core.path, id, if (repository) |value| value.limits else .{}, cancellation, if (repository) |*value| .{ .ptr = value, .confirm = Confirm.durable } else null);
     }
     pub fn captureQueryCut(self: *DB, request: @import("native_query_cut.zig").Request, cancellation: types.CancellationToken) !void {
+        if (comptime storage_engine.enabled) return storage_engine.call("captureQueryCut", .{ self, request, cancellation });
         return self.captureQueryCutInternal(request, cancellation, true);
     }
     /// Called under source/replay admission and apply fences. A sequence alone
@@ -19573,6 +19753,7 @@ pub const DB = struct {
     }
 
     pub fn openQueryCut(self: *DB, request: @import("native_query_cut.zig").Request, cancellation: types.CancellationToken) !DB {
+        if (comptime storage_engine.enabled) return storage_engine.call("openQueryCut", .{ self, request, cancellation });
         const cut = @import("native_query_cut.zig");
         try request.validate(cut.nowMs());
         const origin = try request.namespace(self.core.identity_namespace);
@@ -19687,7 +19868,7 @@ pub const DB = struct {
         try self.ensurePrimaryOnlySnapshotLocked();
     }
 
-    fn snapshotInternal(
+    pub fn snapshotInternal(
         self: *DB,
         id: []const u8,
         include_generated: bool,
@@ -19697,6 +19878,7 @@ pub const DB = struct {
         backup_seal_only: bool,
         query_cut: ?@import("native_query_cut.zig").Request,
     ) !u64 {
+        if (comptime storage_engine.enabled) return storage_engine.call("snapshotInternal", .{ self, id, include_generated, cancellation, maintenance_deadline_ns, expected_topology_fence, backup_seal_only, query_cut });
         const seal_only = backup_seal_only or query_cut != null;
         if (query_cut == null) try self.ensurePrimaryOnlySnapshot();
         // Serialize only snapshot construction/publication. Normal writes can
@@ -20110,6 +20292,7 @@ pub const DB = struct {
     }
 
     pub fn sync(self: *DB, full: bool) !void {
+        if (comptime storage_engine.enabled) return storage_engine.call("sync", .{ self, full });
         if (full) if (self.local_execution.source_vectors.load(.acquire)) |source| try source.advanceMarkingSnapshot();
         lockApply(self);
         defer self.core.unlockApply();
@@ -20124,6 +20307,7 @@ pub const DB = struct {
     }
 
     pub fn syncIndexes(self: *DB, force: bool) !void {
+        if (comptime storage_engine.enabled) return storage_engine.call("syncIndexes", .{ self, force });
         try self.lockApplyForPortableRuntime();
         defer self.core.unlockApply();
         try self.core.index_manager.syncAll(force);
@@ -20172,6 +20356,7 @@ pub const DB = struct {
     /// Raw primary outcomes for a transition snapshot. Do not use public scan
     /// projection here: it can hydrate derived fields into the returned JSON.
     pub fn mergeDocumentsPage(self: *DB, alloc: Allocator, byte_range: types.ByteRange, after_key: ?[]const u8) ![]types.BatchWrite {
+        if (comptime storage_engine.enabled) return storage_engine.call("mergeDocumentsPage", .{ self, alloc, byte_range, after_key });
         lockApplyShared(self);
         defer self.core.unlockApplyShared();
         const lower = if (after_key) |key| try internal_keys.documentKeyAlloc(alloc, key) else try documentRangeLowerAlloc(alloc, byte_range.start);
@@ -20227,6 +20412,7 @@ pub const DB = struct {
         byte_range: types.ByteRange,
         after_key: ?[]const u8,
     ) ![]types.BatchWrite {
+        if (comptime storage_engine.enabled) return storage_engine.call("mergeCleanupKeysPage", .{ self, alloc, byte_range, after_key });
         lockApplyShared(self);
         defer self.core.unlockApplyShared();
         const lower = try documentRangeLowerAlloc(alloc, byte_range.start);
@@ -20272,6 +20458,7 @@ pub const DB = struct {
         byte_range: types.ByteRange,
         after_key: ?[]const u8,
     ) ![]types.BatchWrite {
+        if (comptime storage_engine.enabled) return storage_engine.call("mergeArtifactsPage", .{ self, alloc, byte_range, after_key });
         // Export only an admitted primary snapshot. Revalidate under the apply
         // lease so recovery publication cannot race the page's admission.
         try self.lockApplySharedForPortableRuntime();
@@ -20869,6 +21056,7 @@ pub const DB = struct {
         receipt: ?OrderedApplyReceipt,
         root_generation: u64,
     ) !void {
+        if (comptime storage_engine.enabled) return storage_engine.call("repairVerifiedPrimarySnapshot", .{ alloc, staged, namespace, receipt, root_generation });
         try staged.validatePath(staged.path());
         const options: OpenOptions = .{
             .staged_generation = staged,
@@ -20900,6 +21088,7 @@ pub const DB = struct {
         path: []const u8,
         opts: OpenOptions,
     ) !void {
+        if (comptime storage_engine.enabled) return storage_engine.call("restoreSnapshotToStagedGeneration", .{ staged_generation, alloc, snapshot_root, path, opts });
         try staged_generation.validatePath(path);
         var staged_opts = opts;
         staged_opts.staged_generation = staged_generation;
@@ -20916,6 +21105,7 @@ pub const DB = struct {
         opts: OpenOptions,
         expected_namespace: doc_identity.Namespace,
     ) !void {
+        if (comptime storage_engine.enabled) return storage_engine.call("restoreIdentityPreservingSnapshotToStagedGeneration", .{ staged_generation, alloc, snapshot_root, path, opts, expected_namespace });
         try staged_generation.validatePath(path);
         if (expected_namespace.table_id == 0 or opts.prefer_existing_identity_namespace or
             !(opts.identity_namespace orelse return error.IdentityNamespaceMismatch).eql(expected_namespace))
@@ -20932,10 +21122,12 @@ pub const DB = struct {
     /// The artifact digest is verified by the private restore RPC before this
     /// filesystem operation; it is then bound into the target owner's Scope.
     pub fn openVerifiedRestoreSource(staged_generation: *const generation_lifecycle.StagedGeneration, alloc: Allocator, snapshot_root: []const u8, path: []const u8, opts: OpenOptions, expected_namespace: doc_identity.Namespace) !DB {
+        if (comptime storage_engine.enabled) return storage_engine.call("openVerifiedRestoreSource", .{ staged_generation, alloc, snapshot_root, path, opts, expected_namespace });
         return openVerifiedRestoreSourceWithCancellation(staged_generation, alloc, snapshot_root, path, opts, expected_namespace, .none);
     }
 
     pub fn openVerifiedRestoreSourceWithCancellation(staged_generation: *const generation_lifecycle.StagedGeneration, alloc: Allocator, snapshot_root: []const u8, path: []const u8, opts: OpenOptions, expected_namespace: doc_identity.Namespace, cancellation: types.CancellationToken) !DB {
+        if (comptime storage_engine.enabled) return storage_engine.call("openVerifiedRestoreSourceWithCancellation", .{ staged_generation, alloc, snapshot_root, path, opts, expected_namespace, cancellation });
         try cancellation.check();
         try staged_generation.validatePath(path);
         if (expected_namespace.table_id == 0) return error.IdentityNamespaceMismatch;
@@ -21009,6 +21201,7 @@ pub const DB = struct {
         identity: RestoreIdentity,
         cancellation: types.CancellationToken,
     ) !void {
+        if (comptime storage_engine.enabled) return storage_engine.call("restoreSnapshotToDeferredRuntimeRepairWithIoAndCancellation", .{ staged_generation, alloc, io, snapshot_root, path, opts, identity, cancellation });
         try staged_generation.validatePath(path);
         var native_generation = try native_backup.validateAndMaterializeWithCancellation(
             alloc,
@@ -21047,6 +21240,7 @@ pub const DB = struct {
         native_generation: *native_backup.LoadedManifest,
         cancellation: types.CancellationToken,
     ) !void {
+        if (comptime storage_engine.enabled) return storage_engine.call("restoreMaterializedNativeGenerationToDeferredRuntimeRepairWithIoAndCancellation", .{ staged_generation, alloc, io, primary_snapshot_root, path, opts, identity, native_generation, cancellation });
         // Tree-materialized callers may already contain every projection.
         // Remove statically incompatible physical codecs before opening the
         // staged catalog; the manifest-first remote planner calls the primary
@@ -21089,6 +21283,7 @@ pub const DB = struct {
         native_generation: *native_backup.LoadedManifest,
         cancellation: types.CancellationToken,
     ) !void {
+        if (comptime storage_engine.enabled) return storage_engine.call("restoreMaterializedNativePrimaryAndPlanProjectionsWithIoAndCancellation", .{ staged_generation, alloc, io, primary_snapshot_root, path, opts, identity, native_generation, cancellation });
         try staged_generation.validatePath(path);
         try classifyIncompatibleNativeProjections(native_generation, opts);
         try restoreSnapshotStoreTo(
@@ -21122,6 +21317,7 @@ pub const DB = struct {
         native_generation: *native_backup.LoadedManifest,
         complete_runtime_repair: bool,
     ) !void {
+        if (comptime storage_engine.enabled) return storage_engine.call("finishMaterializedNativeGenerationWithIo", .{ staged_generation, alloc, io, path, opts, native_generation, complete_runtime_repair });
         try validateInstalledNativeBackupGeneration(
             staged_generation,
             alloc,
@@ -21164,6 +21360,7 @@ pub const DB = struct {
         opts: OpenOptions,
         cancellation: types.CancellationToken,
     ) !bool {
+        if (comptime storage_engine.enabled) return storage_engine.call("restoreSnapshotToLocalDeferredRuntimeRepairWithIoAndCancellation", .{ staged_generation, alloc, io, snapshot_root, path, opts, cancellation });
         try staged_generation.validatePath(path);
         var native_generation = try native_backup.validateAndMaterializeWithCancellation(
             alloc,
@@ -21532,6 +21729,7 @@ pub const DB = struct {
         path: []const u8,
         opts: OpenOptions,
     ) !bool {
+        if (comptime storage_engine.enabled) return storage_engine.call("recoverIncompleteRestoreImportIfNeededWithIo", .{ alloc, io, path, opts });
         if (try readRestoreStateForPathAllocWithIo(alloc, io, path)) |state_value| {
             var state = state_value;
             state.deinit(alloc);
@@ -21556,10 +21754,12 @@ pub const DB = struct {
     }
 
     pub fn readRestoreStateForPath(alloc: Allocator, path: []const u8) !?RestoreState {
+        if (comptime storage_engine.enabled) return storage_engine.call("readRestoreStateForPath", .{ alloc, path });
         return try readRestoreStateForPathAlloc(alloc, path);
     }
 
     pub fn readRestoreStateForPathWithIo(alloc: Allocator, io: Io, path: []const u8) !?RestoreState {
+        if (comptime storage_engine.enabled) return storage_engine.call("readRestoreStateForPathWithIo", .{ alloc, io, path });
         return try readRestoreStateForPathAllocWithIo(alloc, io, path);
     }
 
@@ -21572,6 +21772,7 @@ pub const DB = struct {
         snapshot_path: []const u8,
         group_id: u64,
     ) !void {
+        if (comptime storage_engine.enabled) return storage_engine.call("markRestorePrimaryRestoredForPathWithArtifact", .{ alloc, path, backup_id, location, artifact_sha256, snapshot_path, group_id });
         var io_impl = threadedIo();
         defer io_impl.deinit();
         return try markRestorePrimaryRestoredForPathWithArtifactWithIo(
@@ -21596,6 +21797,7 @@ pub const DB = struct {
         snapshot_path: []const u8,
         group_id: u64,
     ) !void {
+        if (comptime storage_engine.enabled) return storage_engine.call("markRestorePrimaryRestoredForPathWithArtifactWithIo", .{ alloc, io, path, backup_id, location, artifact_sha256, snapshot_path, group_id });
         return try markRestorePrimaryRestoredForPathWithIdentityWithIo(alloc, io, path, .{
             .backup_id = backup_id,
             .location = location,
@@ -21611,6 +21813,7 @@ pub const DB = struct {
         path: []const u8,
         identity: RestoreIdentity,
     ) !void {
+        if (comptime storage_engine.enabled) return storage_engine.call("markRestorePrimaryRestoredForPathWithIdentityWithIo", .{ alloc, io, path, identity });
         var state = try restoreStateAlloc(
             alloc,
             identity.backup_id,
@@ -21634,12 +21837,14 @@ pub const DB = struct {
     }
 
     pub fn restoreRuntimeRepairNeededForPath(alloc: Allocator, path: []const u8) !bool {
+        if (comptime storage_engine.enabled) return storage_engine.call("restoreRuntimeRepairNeededForPath", .{ alloc, path });
         var io_impl = threadedIo();
         defer io_impl.deinit();
         return try restoreRuntimeRepairNeededForPathWithIo(alloc, io_impl.io(), path);
     }
 
     pub fn restoreRuntimeRepairNeededForPathWithIo(alloc: Allocator, io: Io, path: []const u8) !bool {
+        if (comptime storage_engine.enabled) return storage_engine.call("restoreRuntimeRepairNeededForPathWithIo", .{ alloc, io, path });
         var state = (try readRestoreStateForPathAllocWithIo(alloc, io, path)) orelse return false;
         defer state.deinit(alloc);
         return state.primary_restored and !state.runtime_repair_complete;
@@ -21684,6 +21889,7 @@ pub const DB = struct {
     }
 
     pub fn restoreRuntimeRepairNeeded(self: *DB) !bool {
+        if (comptime storage_engine.enabled) return storage_engine.call("restoreRuntimeRepairNeeded", .{self});
         if (self.backend_runtime.filesystemIo()) |io| {
             return try restoreRuntimeRepairNeededForPathWithIo(self.alloc, io, self.core.path);
         }
@@ -21697,6 +21903,7 @@ pub const DB = struct {
     /// restore state so the fresh owner reconstructs the candidate before it
     /// can be sealed.
     pub fn prepareRestoreDurabilityRetryIfNeeded(self: *DB, alloc: Allocator) !bool {
+        if (comptime storage_engine.enabled) return storage_engine.call("prepareRestoreDurabilityRetryIfNeeded", .{ self, alloc });
         if (self.core.index_manager.hasLoadFailures()) return error.RestoreIndexLoadIncomplete;
         const retry_needed = try self.hasPendingDenseArtifactRebuild(alloc) or
             try self.denseArtifactWatermarkRepairNeeded(alloc) or
@@ -21751,6 +21958,7 @@ pub const DB = struct {
     }
 
     pub fn repairRestoreRuntimeStateStepIfNeeded(self: *DB, alloc: Allocator) !bool {
+        if (comptime storage_engine.enabled) return storage_engine.call("repairRestoreRuntimeStateStepIfNeeded", .{ self, alloc });
         if (self.backend_runtime.filesystemIo()) |io| {
             return try self.repairRestoreRuntimeStateStepIfNeededWithIo(alloc, io);
         }
@@ -21769,6 +21977,7 @@ pub const DB = struct {
         io: Io,
         repair_options: types.ArtifactRepairRunOptions,
     ) !bool {
+        if (comptime storage_engine.enabled) return storage_engine.call("repairRestoreRuntimeStateStepIfNeededWithIoAndRepairOptions", .{ self, alloc, io, repair_options });
         var state = (try readRestoreStateForPathAllocWithIo(alloc, io, self.core.path)) orelse return false;
         defer state.deinit(alloc);
         if (!state.primary_restored or state.runtime_repair_complete) return false;
@@ -22251,6 +22460,7 @@ pub const DB = struct {
     }
 
     pub fn setSchema(self: *DB, table_schema: schema_mod.TableSchema) !void {
+        if (comptime storage_engine.enabled) return storage_engine.call("setSchema", .{ self, table_schema });
         if (self.local_execution.initial_child_hidden.load(.acquire)) return error.InitialChildNotPublished;
         var row_policy_lease = try self.local_execution.row_policy_gate.enterRaw();
         defer row_policy_lease.release();
@@ -22492,6 +22702,7 @@ pub const DB = struct {
     /// authority. All schema/catalog/coverage effects must be exact no-ops; a
     /// changed descriptor returns false and must use setSchemaJson instead.
     pub fn rehydrateSchemaJson(self: *DB, schema_json: []const u8) !bool {
+        if (comptime storage_engine.enabled) return storage_engine.call("rehydrateSchemaJson", .{ self, schema_json });
         var parsed_schema = try public_table_schema.parseValidatedTableSchema(self.alloc, schema_json);
         defer parsed_schema.deinit(self.alloc);
         const runtime_schema = try public_table_schema.deriveRuntimeTableSchema(self.alloc, parsed_schema);
@@ -22521,6 +22732,7 @@ pub const DB = struct {
     }
 
     pub fn setSchemaJson(self: *DB, alloc: Allocator, schema_json: []const u8) !void {
+        if (comptime storage_engine.enabled) return storage_engine.call("setSchemaJson", .{ self, alloc, schema_json });
         return self.setSchemaJsonMode(alloc, schema_json, null, null);
     }
 
@@ -22914,6 +23126,7 @@ pub const DB = struct {
     /// direct metadata read-index decision. The schema, integrity catalog,
     /// Raft marker and source-fence release commit atomically.
     pub fn installPublishedChildSchema(self: *DB, alloc: Allocator, schema_json: []const u8, publication: PublishedChildSchema) !void {
+        if (comptime storage_engine.enabled) return storage_engine.call("installPublishedChildSchema", .{ self, alloc, schema_json, publication });
         if ((publication.fence.role != .child_generation_source and publication.fence.role != .child_generation_dual) or
             !publication.fence.namespace.eql(self.core.identity_namespace)) return error.InvalidIntegrityTopologyFence;
         var digest: [32]u8 = undefined;
@@ -23136,6 +23349,7 @@ pub const DB = struct {
     }
 
     pub fn getSchemaJson(self: *DB, alloc: Allocator) !?[]u8 {
+        if (comptime storage_engine.enabled) return storage_engine.call("getSchemaJson", .{ self, alloc });
         return try self.core.getStoreValue(alloc, public_schema_json_key);
     }
 
@@ -23155,15 +23369,18 @@ pub const DB = struct {
     }
 
     pub fn beginTransaction(self: *DB, timestamp_ns: u64) !transactions_mod.TxnId {
+        if (comptime storage_engine.enabled) return storage_engine.call("beginTransaction", .{ self, timestamp_ns });
         const txn_id = makeTxnId(self);
         return try self.beginTransactionWithIdAndParticipants(txn_id, timestamp_ns, &.{});
     }
 
     pub fn beginTransactionWithId(self: *DB, txn_id: transactions_mod.TxnId, timestamp_ns: u64) !transactions_mod.TxnId {
+        if (comptime storage_engine.enabled) return storage_engine.call("beginTransactionWithId", .{ self, txn_id, timestamp_ns });
         return try self.beginTransactionWithIdAndParticipants(txn_id, timestamp_ns, &.{});
     }
 
     pub fn beginTransactionWithParticipants(self: *DB, timestamp_ns: u64, participants: []const []const u8) !transactions_mod.TxnId {
+        if (comptime storage_engine.enabled) return storage_engine.call("beginTransactionWithParticipants", .{ self, timestamp_ns, participants });
         const txn_id = makeTxnId(self);
         return try self.beginTransactionWithIdAndParticipants(txn_id, timestamp_ns, participants);
     }
@@ -23203,6 +23420,7 @@ pub const DB = struct {
         participants: []const []const u8,
         coordinator: bool,
     ) !transactions_mod.TxnId {
+        if (comptime storage_engine.enabled) return storage_engine.call("beginTransactionWithIdAndParticipantsCreatedAtAndRole", .{ self, txn_id, timestamp_ns, created_at_ns, participants, coordinator });
         return try self.beginTransactionWithIdAndParticipantsCreatedAtRoleAndRetention(
             txn_id,
             timestamp_ns,
@@ -23226,6 +23444,7 @@ pub const DB = struct {
     }
 
     pub fn beginTransactionScoped(self: *DB, txn_id: transactions_mod.TxnId, timestamp_ns: u64, created_at_ns: u64, participants: []const []const u8, coordinator: bool, retain_terminal: bool, scope: ?[32]u8) !transactions_mod.TxnId {
+        if (comptime storage_engine.enabled) return storage_engine.call("beginTransactionScoped", .{ self, txn_id, timestamp_ns, created_at_ns, participants, coordinator, retain_terminal, scope });
         var row_policy_lease = try self.local_execution.row_policy_gate.enterRaw();
         defer row_policy_lease.release();
         var replication_mutation = self.acquireReplicationMutationShared();
@@ -23259,10 +23478,12 @@ pub const DB = struct {
         retain_terminal: bool,
         identity: OrderedApplyReceipt,
     ) !transactions_mod.TxnId {
+        if (comptime storage_engine.enabled) return storage_engine.call("beginReplicatedTransactionAtOrderedReceipt", .{ self, txn_id, timestamp_ns, created_at_ns, participants, coordinator, retain_terminal, identity });
         return self.beginReplicatedTransactionScoped(txn_id, timestamp_ns, created_at_ns, participants, coordinator, retain_terminal, identity, null);
     }
 
     pub fn beginReplicatedTransactionScoped(self: *DB, txn_id: transactions_mod.TxnId, timestamp_ns: u64, created_at_ns: u64, participants: []const []const u8, coordinator: bool, retain_terminal: bool, identity: OrderedApplyReceipt, scope: ?[32]u8) !transactions_mod.TxnId {
+        if (comptime storage_engine.enabled) return storage_engine.call("beginReplicatedTransactionScoped", .{ self, txn_id, timestamp_ns, created_at_ns, participants, coordinator, retain_terminal, identity, scope });
         lockApply(self);
         defer self.core.unlockApply();
         if (self.local_execution.initial_child_hidden.load(.acquire)) return error.InitialChildNotPublished;
@@ -23294,6 +23515,7 @@ pub const DB = struct {
         intents: []const transactions_mod.WriteIntent,
         predicates: []const transactions_mod.VersionPredicate,
     ) !void {
+        if (comptime storage_engine.enabled) return storage_engine.call("writeIntents", .{ self, txn_id, intents, predicates });
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
         var replication_mutation = self.acquireReplicationMutationShared();
         defer if (replication_mutation) |*lease| lease.release();
@@ -23374,6 +23596,7 @@ pub const DB = struct {
     }
 
     pub fn writeTransaction(self: *DB, txn_id: types.TxnId, req: types.TransactionIntentRequest) !void {
+        if (comptime storage_engine.enabled) return storage_engine.call("writeTransaction", .{ self, txn_id, req });
         if (self.local_execution.initial_child_hidden.load(.acquire)) return error.InitialChildNotPublished;
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
         var replication_mutation = self.acquireReplicationMutationShared();
@@ -23388,6 +23611,7 @@ pub const DB = struct {
         req: types.TransactionIntentRequest,
         identity: OrderedApplyReceipt,
     ) !void {
+        if (comptime storage_engine.enabled) return storage_engine.call("writeReplicatedTransactionAtOrderedReceipt", .{ self, txn_id, req, identity });
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
         try self.writeTransactionInternal(txn_id, req, identity);
     }
@@ -24097,10 +24321,12 @@ pub const DB = struct {
     // request coalescing is consolidated into coalesceKeyValueRequest above
 
     pub fn commitTransaction(self: *DB, txn_id: transactions_mod.TxnId, timestamp_ns: u64) !void {
+        if (comptime storage_engine.enabled) return storage_engine.call("commitTransaction", .{ self, txn_id, timestamp_ns });
         try self.resolveTransactionIntents(txn_id, .committed, timestamp_ns);
     }
 
     pub fn resolveTransactionIntents(self: *DB, txn_id: transactions_mod.TxnId, status: transactions_mod.TxnStatus, commit_version: u64) !void {
+        if (comptime storage_engine.enabled) return storage_engine.call("resolveTransactionIntents", .{ self, txn_id, status, commit_version });
         try self.resolveTransactionIntentsWithSyncLevel(txn_id, status, commit_version, .propose);
     }
 
@@ -24125,6 +24351,7 @@ pub const DB = struct {
         sync_level: types.SyncLevel,
         visibility_cancellation: types.CancellationToken,
     ) !void {
+        if (comptime storage_engine.enabled) return storage_engine.call("resolveTransactionIntentsWithSyncLevelAndCancellation", .{ self, txn_id, status, commit_version, sync_level, visibility_cancellation });
         // Resolution applies only a previously prepared durable decision.
         // Policy publication fences on outstanding schema/transaction leases,
         // so a preparing policy must not deadlock the very resolution needed
@@ -24150,6 +24377,7 @@ pub const DB = struct {
         identity: OrderedApplyReceipt,
         resolved_participant: ?[]const u8,
     ) !void {
+        if (comptime storage_engine.enabled) return storage_engine.call("resolveReplicatedTransactionAtOrderedReceipt", .{ self, txn_id, status, commit_version, sync_level, visibility_cancellation, identity, resolved_participant });
         try self.resolveTransactionIntentsInternal(
             txn_id,
             status,
@@ -24170,6 +24398,7 @@ pub const DB = struct {
     }
 
     pub fn getTransactionStatus(self: *DB, txn_id: transactions_mod.TxnId) !transactions_mod.TxnStatus {
+        if (comptime storage_engine.enabled) return storage_engine.call("getTransactionStatus", .{ self, txn_id });
         return try self.core.getTransactionStatus(txn_id);
     }
 
@@ -24178,16 +24407,19 @@ pub const DB = struct {
     }
 
     pub fn transactionDefersCoordinatorAcknowledgement(self: *DB, txn_id: transactions_mod.TxnId) !bool {
+        if (comptime storage_engine.enabled) return storage_engine.call("transactionDefersCoordinatorAcknowledgement", .{ self, txn_id });
         return try self.core.transactionDefersCoordinatorAcknowledgement(txn_id);
     }
 
     pub fn transactionRetainsCoordinatorAcknowledgement(self: *DB, txn_id: transactions_mod.TxnId) !bool {
+        if (comptime storage_engine.enabled) return storage_engine.call("transactionRetainsCoordinatorAcknowledgement", .{ self, txn_id });
         return try self.core.transactionRetainsCoordinatorAcknowledgement(txn_id);
     }
 
     /// Returns whether split or merge handoff would strand a pending decision,
     /// unresolved participant, intent, or hot-standby recovery outbox.
     pub fn hasTopologySensitiveTransactions(self: *DB) !bool {
+        if (comptime storage_engine.enabled) return storage_engine.call("hasTopologySensitiveTransactions", .{self});
         return try self.core.hasTopologySensitiveTransactions();
     }
 
@@ -24429,6 +24661,7 @@ pub const DB = struct {
     }
 
     pub fn relationalTopologyIdentity(self: *DB) !RelationalTopologyIdentity {
+        if (comptime storage_engine.enabled) return storage_engine.call("relationalTopologyIdentity", .{self});
         self.core.lockApplyShared();
         defer self.core.unlockApplyShared();
         var read = try self.core.store.beginProbeTxn();
@@ -24458,7 +24691,9 @@ pub const DB = struct {
         };
     }
 
-    pub fn relationalTopologyStatus(self: *DB) !struct { fence: ?@import("relational_integrity_topology.zig").Fence, drained: bool } {
+    pub const RelationalTopologyStatus = struct { fence: ?@import("relational_integrity_topology.zig").Fence, drained: bool };
+    pub fn relationalTopologyStatus(self: *DB) !RelationalTopologyStatus {
+        if (comptime storage_engine.enabled) return storage_engine.call("relationalTopologyStatus", .{self});
         self.core.lockApplyShared();
         defer self.core.unlockApplyShared();
         var read = try self.core.store.beginProbeTxn();
@@ -24524,6 +24759,7 @@ pub const DB = struct {
         upper: []const u8,
         primary_sequence: u64,
     ) !@import("relational_integrity_handoff.zig").Manifest {
+        if (comptime storage_engine.enabled) return storage_engine.call("relationalHandoffManifest", .{ self, alloc, source, destination, lower, upper, primary_sequence });
         self.core.lockApplyShared();
         defer self.core.unlockApplyShared();
         var read = try self.core.store.beginProbeTxn();
@@ -24552,6 +24788,7 @@ pub const DB = struct {
     }
 
     pub fn relationalHandoffPage(self: *DB, alloc: Allocator, manifest: @import("relational_integrity_handoff.zig").Manifest, progress: @import("relational_integrity_handoff.zig").Progress) !@import("relational_integrity_handoff.zig").Page {
+        if (comptime storage_engine.enabled) return storage_engine.call("relationalHandoffPage", .{ self, alloc, manifest, progress });
         self.core.lockApplyShared();
         defer self.core.unlockApplyShared();
         var read = try self.core.store.beginProbeTxn();
@@ -24570,6 +24807,7 @@ pub const DB = struct {
         command: @import("relational_integrity_topology.zig").Command,
         ordered_receipt: ?OrderedApplyReceipt,
     ) !void {
+        if (comptime storage_engine.enabled) return storage_engine.call("applyRelationalTopologyControl", .{ self, command, ordered_receipt });
         return self.applyRelationalTopologyControlWithReplication(command, ordered_receipt, null, null, null, null);
     }
 
@@ -24853,6 +25091,7 @@ pub const DB = struct {
     }
 
     pub fn alignOrderedArtifactCatalog(self: *DB, command: @import("artifact_inventory.zig").Command, configs: []const types.IndexConfig, context: @import("artifact_reconcile_intent.zig").Context) !void {
+        if (comptime storage_engine.enabled) return storage_engine.call("alignOrderedArtifactCatalog", .{ self, command, configs, context });
         var guard = self.beginIndexStructuralMutation("ordered artifact reconciliation", "");
         defer guard.deinit();
         try self.lockApplyForPortableRuntime();
@@ -24872,6 +25111,7 @@ pub const DB = struct {
     /// while reconciliation runs; physical projection publication remains
     /// fenced by the repair intent's root/config/control identity.
     pub fn advanceOrderedArtifactInitialBuild(self: *DB, configs: []const types.IndexConfig, context: @import("artifact_reconcile_intent.zig").Context) !void {
+        if (comptime storage_engine.enabled) return storage_engine.call("advanceOrderedArtifactInitialBuild", .{ self, configs, context });
         {
             var read = try self.core.store.beginReadTxn();
             defer read.abort();
@@ -24905,6 +25145,7 @@ pub const DB = struct {
         return self.addIndexForReconciliation(cfg, .managed, context, null, null);
     }
     pub fn reconcileArtifactDeleteIndex(self: *DB, name: []const u8, context: @import("artifact_reconcile_intent.zig").Context) !bool {
+        if (comptime storage_engine.enabled) return storage_engine.call("reconcileArtifactDeleteIndex", .{ self, name, context });
         return self.deleteIndexForReconciliation(name, context);
     }
     pub fn reconcileArtifactDeleteResolver(self: *DB, name: []const u8, context: @import("artifact_reconcile_intent.zig").Context) !bool {
@@ -24916,6 +25157,7 @@ pub const DB = struct {
         return self.deleteEnrichmentForReconciliation(kind, name, context);
     }
     pub fn reconcileArtifactAddEnrichment(self: *DB, cfg: types.EnrichmentConfig, context: @import("artifact_reconcile_intent.zig").Context) !void {
+        if (comptime storage_engine.enabled) return storage_engine.call("reconcileArtifactAddEnrichment", .{ self, cfg, context });
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
         var replication_mutation = self.acquireReplicationMutationShared();
         defer if (replication_mutation) |*lease| lease.release();
@@ -24947,6 +25189,7 @@ pub const DB = struct {
     /// The caller verifies this desired catalog against its metadata read-index
     /// before proposal. Ownership of catalogs belongs to the caller.
     pub fn artifactInventoryCommand(self: *DB, alloc: Allocator) !@import("artifact_inventory.zig").Command {
+        if (comptime storage_engine.enabled) return storage_engine.call("artifactInventoryCommand", .{ self, alloc });
         const inventory = @import("artifact_inventory.zig");
         var txn = try self.core.store.beginReadTxn();
         defer txn.abort();
@@ -25731,6 +25974,7 @@ pub const DB = struct {
     }
 
     pub fn onlineSourceStatus(self: *DB, scope: @import("online_source_contract.zig").Scope) !@import("online_source.zig").Progress {
+        if (comptime storage_engine.enabled) return storage_engine.call("onlineSourceStatus", .{ self, scope });
         var txn = try self.core.store.beginReadTxn();
         defer txn.abort();
         return try @import("online_source.zig").status(&txn, scope);
@@ -25756,6 +26000,7 @@ pub const DB = struct {
     }
 
     pub fn prepareOnlineSourcePublication(self: *DB, scope: @import("online_source_contract.zig").Scope, cancellation: types.CancellationToken) !@import("../source_snapshot.zig").Certificate {
+        if (comptime storage_engine.enabled) return storage_engine.call("prepareOnlineSourcePublication", .{ self, scope, cancellation });
         return @import("source_pin.zig").preparePublication(self, scope, cancellation);
     }
 
@@ -26344,6 +26589,7 @@ pub const DB = struct {
     }
 
     pub fn markTransactionParticipantResolved(self: *DB, txn_id: transactions_mod.TxnId, participant: []const u8) !void {
+        if (comptime storage_engine.enabled) return storage_engine.call("markTransactionParticipantResolved", .{ self, txn_id, participant });
         var replication_mutation = self.acquireReplicationMutationShared();
         defer if (replication_mutation) |*lease| lease.release();
         try self.enforceReplicationWriteGate();
@@ -26353,6 +26599,7 @@ pub const DB = struct {
     }
 
     pub fn markTransactionParticipantsResolved(self: *DB, txn_id: transactions_mod.TxnId, participants: []const []const u8) !void {
+        if (comptime storage_engine.enabled) return storage_engine.call("markTransactionParticipantsResolved", .{ self, txn_id, participants });
         var replication_mutation = self.acquireReplicationMutationShared();
         defer if (replication_mutation) |*lease| lease.release();
         try self.enforceReplicationWriteGate();
@@ -26367,6 +26614,7 @@ pub const DB = struct {
         participant: []const u8,
         identity: OrderedApplyReceipt,
     ) !void {
+        if (comptime storage_engine.enabled) return storage_engine.call("markReplicatedTransactionParticipantResolvedAtOrderedReceipt", .{ self, txn_id, participant, identity });
         lockApply(self);
         defer self.core.unlockApply();
         switch (try orderedApplyDisposition(try readOrderedApplyReceipt(self.alloc, self.core.store), identity)) {
@@ -26386,6 +26634,7 @@ pub const DB = struct {
     }
 
     pub fn markReplicatedTransactionParticipantsResolvedAtOrderedReceipt(self: *DB, txn_id: transactions_mod.TxnId, participants: []const []const u8, identity: OrderedApplyReceipt) !void {
+        if (comptime storage_engine.enabled) return storage_engine.call("markReplicatedTransactionParticipantsResolvedAtOrderedReceipt", .{ self, txn_id, participants, identity });
         lockApply(self);
         defer self.core.unlockApply();
         switch (try orderedApplyDisposition(try readOrderedApplyReceipt(self.alloc, self.core.store), identity)) {
@@ -26410,6 +26659,7 @@ pub const DB = struct {
         cutoff_timestamp: u64,
         retained_cutoff_timestamp: u64,
     ) !bool {
+        if (comptime storage_engine.enabled) return storage_engine.call("cleanupTransactionMetadataIfEligible", .{ self, txn_id, cutoff_timestamp, retained_cutoff_timestamp });
         try self.lockApplyForPortableRuntime();
         defer self.core.unlockApply();
         return try self.core.cleanupTransactionMetadataIfEligible(txn_id, cutoff_timestamp, retained_cutoff_timestamp);
@@ -26422,6 +26672,7 @@ pub const DB = struct {
         retained_cutoff_timestamp: u64,
         identity: OrderedApplyReceipt,
     ) !bool {
+        if (comptime storage_engine.enabled) return storage_engine.call("cleanupReplicatedTransactionAtOrderedReceipt", .{ self, txn_id, cutoff_timestamp, retained_cutoff_timestamp, identity });
         lockApply(self);
         defer self.core.unlockApply();
         switch (try orderedApplyDisposition(try readOrderedApplyReceipt(self.alloc, self.core.store), identity)) {
@@ -26443,6 +26694,7 @@ pub const DB = struct {
     }
 
     pub fn getUnresolvedTransactionParticipants(self: *DB, alloc: Allocator, txn_id: transactions_mod.TxnId) ![][]u8 {
+        if (comptime storage_engine.enabled) return storage_engine.call("getUnresolvedTransactionParticipants", .{ self, alloc, txn_id });
         return try self.core.getUnresolvedTransactionParticipants(alloc, txn_id);
     }
 
@@ -26512,6 +26764,7 @@ pub const DB = struct {
         edge_type: []const u8,
         direction: graph_mod.EdgeDirection,
     ) ![]graph_mod.Edge {
+        if (comptime storage_engine.enabled) return storage_engine.call("getEdges", .{ self, alloc, index_name, key, edge_type, direction });
         var row_policy_lease = try self.local_execution.row_policy_gate.enterRawRead();
         defer row_policy_lease.release();
         if (key.len == 0) return try alloc.alloc(graph_mod.Edge, 0);
@@ -27639,6 +27892,7 @@ pub const DB = struct {
     /// bounded build, replay, durable checkpoints and atomic activation. Return
     /// the admitted generation so waits cannot follow a reused target name.
     pub fn replaceGraphIndex(self: *DB, old: []const u8, cfg: types.IndexConfig) !u64 {
+        if (comptime storage_engine.enabled) return storage_engine.call("replaceGraphIndex", .{ self, old, cfg });
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
         var owner = self.acquireReplicationMutationShared();
         defer if (owner) |*lease| lease.release();
@@ -27822,6 +28076,7 @@ pub const DB = struct {
     /// One fair maintenance quantum. Opening a shadow reuses its durable graph;
     /// the saved source cursor and replay watermark never restart the corpus.
     pub fn advanceGraphReplacement(self: *DB) !bool {
+        if (comptime storage_engine.enabled) return storage_engine.call("advanceGraphReplacement", .{self});
         const pending = try self.advanceGraphReplacementUntil(null);
         if (pending) try self.core.index_manager.checkpointIo().sleep(.fromMilliseconds(1), .awake);
         return pending;
@@ -28194,6 +28449,7 @@ pub const DB = struct {
     }
 
     pub fn addIndex(self: *DB, cfg: types.IndexConfig) !void {
+        if (comptime storage_engine.enabled) return storage_engine.call("addIndex", .{ self, cfg });
         _ = try self.addIndexWithAdmission(cfg, .ordinary);
     }
 
@@ -28203,12 +28459,14 @@ pub const DB = struct {
     /// owner-side generation repair scheduler, while replay records writes
     /// after the admission fence.
     pub fn admitManagedIndex(self: *DB, cfg: types.IndexConfig) !?u128 {
+        if (comptime storage_engine.enabled) return storage_engine.call("admitManagedIndex", .{ self, cfg });
         return try self.addIndexWithAdmission(cfg, .managed);
     }
 
     /// Compatibility wrapper for callers that specifically admit full-text
     /// indexes. New managed-table code should use admitManagedIndex.
     pub fn admitManagedFullTextIndex(self: *DB, cfg: types.IndexConfig) !?u128 {
+        if (comptime storage_engine.enabled) return storage_engine.call("admitManagedFullTextIndex", .{ self, cfg });
         if (cfg.kind != .full_text) return error.InvalidArgument;
         return try self.admitManagedIndex(cfg);
     }
@@ -28224,6 +28482,7 @@ pub const DB = struct {
     }
 
     pub fn addEnrichment(self: *DB, cfg: types.EnrichmentConfig) !void {
+        if (comptime storage_engine.enabled) return storage_engine.call("addEnrichment", .{ self, cfg });
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
         var replication_mutation = self.acquireReplicationMutationShared();
         defer if (replication_mutation) |*lease| lease.release();
@@ -28241,6 +28500,7 @@ pub const DB = struct {
     }
 
     pub fn upsertEnrichment(self: *DB, cfg: types.EnrichmentConfig) !index_manager_mod.IndexManager.EnrichmentUpsertResult {
+        if (comptime storage_engine.enabled) return storage_engine.call("upsertEnrichment", .{ self, cfg });
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
         var replication_mutation = self.acquireReplicationMutationShared();
         defer if (replication_mutation) |*lease| lease.release();
@@ -28470,6 +28730,7 @@ pub const DB = struct {
     }
 
     pub fn removeResolverWithoutDrain(self: *DB, name: []const u8) !bool {
+        if (comptime storage_engine.enabled) return storage_engine.call("removeResolverWithoutDrain", .{ self, name });
         return self.removeResolverForReconciliation(name, null);
     }
 
@@ -29007,6 +29268,7 @@ pub const DB = struct {
     }
 
     pub fn listIndexes(self: *DB, alloc: Allocator) ![]types.IndexConfig {
+        if (comptime storage_engine.enabled) return storage_engine.call("listIndexes", .{ self, alloc });
         try self.lockApplySharedForPortableRuntime();
         defer self.core.unlockApplyShared();
         return try self.core.listIndexes(alloc);
@@ -29241,6 +29503,7 @@ pub const DB = struct {
     }
 
     pub fn listDerivedReplayDebt(self: *DB, alloc: Allocator) ![]DerivedReplayDebtStatus {
+        if (comptime storage_engine.enabled) return storage_engine.call("listDerivedReplayDebt", .{ self, alloc });
         try self.lockApplySharedForPortableRuntime();
         defer self.core.unlockApplyShared();
 
@@ -29400,6 +29663,7 @@ pub const DB = struct {
         text_query: types.TextQuery,
         options: types.TextKernelSearchOptions,
     ) !types.TextKernelResult {
+        if (comptime storage_engine.enabled) return storage_engine.call("searchTextKernel", .{ self, alloc, index_name, text_query, options });
         var row_policy_lease = try self.local_execution.row_policy_gate.enterUnsupportedSearch();
         defer row_policy_lease.release();
         try self.lockApplySharedForPortableRuntime();
@@ -29524,12 +29788,14 @@ pub const DB = struct {
     }
 
     pub fn getEnrichment(self: *DB, alloc: Allocator, kind: types.EnrichmentKind, name: []const u8) !?types.EnrichmentConfig {
+        if (comptime storage_engine.enabled) return storage_engine.call("getEnrichment", .{ self, alloc, kind, name });
         try self.lockApplySharedForPortableRuntime();
         defer self.core.unlockApplyShared();
         return try self.core.getEnrichment(alloc, kind, name);
     }
 
     pub fn listEnrichments(self: *DB, alloc: Allocator) ![]types.EnrichmentConfig {
+        if (comptime storage_engine.enabled) return storage_engine.call("listEnrichments", .{ self, alloc });
         try self.lockApplySharedForPortableRuntime();
         defer self.core.unlockApplyShared();
         return try self.core.listEnrichments(alloc);
@@ -29584,6 +29850,7 @@ pub const DB = struct {
     }
 
     pub fn listResolvers(self: *DB, alloc: Allocator) ![]index_manager_mod.ResolverConfig {
+        if (comptime storage_engine.enabled) return storage_engine.call("listResolvers", .{ self, alloc });
         try self.lockApplySharedForPortableRuntime();
         defer self.core.unlockApplyShared();
         return try self.core.listResolvers(alloc);
@@ -29833,6 +30100,7 @@ pub const DB = struct {
     }
 
     pub fn deleteIndex(self: *DB, name: []const u8) !bool {
+        if (comptime storage_engine.enabled) return storage_engine.call("deleteIndex", .{ self, name });
         if (self.core.index_manager.get(name) == null) return self.cancelReplacement(name);
         return self.deleteIndexForReconciliation(name, null);
     }
@@ -29957,6 +30225,7 @@ pub const DB = struct {
     }
 
     pub fn deleteEnrichment(self: *DB, kind: types.EnrichmentKind, name: []const u8) !bool {
+        if (comptime storage_engine.enabled) return storage_engine.call("deleteEnrichment", .{ self, kind, name });
         return self.deleteEnrichmentForReconciliation(kind, name, null);
     }
 
@@ -29977,6 +30246,7 @@ pub const DB = struct {
     }
 
     pub fn pendingWorkStats(self: *DB) db_core.PendingWorkStats {
+        if (comptime storage_engine.enabled) return storage_engine.call("pendingWorkStats", .{self}) catch @panic("incompatible storage owner");
         return .{
             .derived_target_sequence = self.core.nextDerivedSequence(),
             .has_async_indexes = self.executor.hasWorkers(),
@@ -30197,6 +30467,7 @@ pub const DB = struct {
     };
 
     pub fn runDerivedUntil(self: *DB, sequence: u64) !void {
+        if (comptime storage_engine.enabled) return storage_engine.call("runDerivedUntil", .{ self, sequence });
         try self.runDerivedUntilWithOptions(sequence, .{});
     }
 
@@ -30213,6 +30484,7 @@ pub const DB = struct {
     }
 
     pub fn runDerivedUntilTargets(self: *DB, sequence: u64, index_names: []const []const u8) !void {
+        if (comptime storage_engine.enabled) return storage_engine.call("runDerivedUntilTargets", .{ self, sequence, index_names });
         if (sequence == 0 or index_names.len == 0) return;
         if (!self.executor.hasWorkers()) return;
         self.executor.notifyIndexes(sequence, index_names);
@@ -30442,6 +30714,7 @@ pub const DB = struct {
     }
 
     pub fn waitForCurrentSyncLevelWithCancellation(self: *DB, sync_level: types.SyncLevel, cancellation: types.CancellationToken) !void {
+        if (comptime storage_engine.enabled) return storage_engine.call("waitForCurrentSyncLevelWithCancellation", .{ self, sync_level, cancellation });
         try self.executor.checkSyncLevelHealth(sync_level);
         const sequence = self.core.nextDerivedSequence();
         try self.markPrecomputedEnrichmentAppliedForSync(sync_level, sequence);
@@ -30456,6 +30729,7 @@ pub const DB = struct {
     pub const waitForResolvedTransactionSync = local_mutation.waitForResolvedTransactionSync;
 
     pub fn waitForResolvedTransactionSyncWithCancellation(self: *DB, sync_level: types.SyncLevel, sequence: u64, cancellation: types.CancellationToken) !void {
+        if (comptime storage_engine.enabled) return storage_engine.call("waitForResolvedTransactionSyncWithCancellation", .{ self, sync_level, sequence, cancellation });
         try self.executor.checkSyncLevelHealth(sync_level);
         if (sequence == 0 or sync_level == .propose or sync_level == .write) return;
         try self.markPrecomputedEnrichmentAppliedForSync(sync_level, sequence);
@@ -30516,6 +30790,7 @@ pub const DB = struct {
     }
 
     pub fn catchUpPendingDerivedReplay(self: *DB) !void {
+        if (comptime storage_engine.enabled) return storage_engine.call("catchUpPendingDerivedReplay", .{self});
         try replayPendingDerivedBatches(self, null, null, .{});
     }
 
@@ -30524,6 +30799,7 @@ pub const DB = struct {
         progress_ctx: *anyopaque,
         progress_hook: ReplayProgressHook,
     ) !void {
+        if (comptime storage_engine.enabled) return storage_engine.call("catchUpPendingDerivedReplayWithProgress", .{ self, progress_ctx, progress_hook, storage_engine.ReplayBoundary.local_dispatch });
         try replayPendingDerivedBatches(self, progress_ctx, progress_hook, .{});
     }
 
@@ -30539,6 +30815,7 @@ pub const DB = struct {
     }
 
     pub fn derivedAsyncAppendDerivedBatchRecord(self: *DB, derived_batch: derived_types.DerivedBatch) !u64 {
+        if (comptime storage_engine.enabled) return storage_engine.call("derivedAsyncAppendDerivedBatchRecord", .{ self, derived_batch });
         return try appendDerivedBatchRecord(self, derived_batch);
     }
 
@@ -30719,6 +30996,7 @@ pub const DB = struct {
     }
 
     pub fn runArtifactRepairMetadataMaintenanceUntilIdle(self: *DB) !void {
+        if (comptime storage_engine.enabled) return storage_engine.call("runArtifactRepairMetadataMaintenanceUntilIdle", .{self});
         while (try self.runArtifactRepairMetadataMaintenancePass()) {}
     }
 
@@ -30816,6 +31094,7 @@ pub const DB = struct {
     /// discovery and the ordinary maintenance scheduler advance the same
     /// durable cursor, so large old roots do not require repeated client calls.
     pub fn advanceArtifactFootprintPage(self: *DB) !bool {
+        if (comptime storage_engine.enabled) return storage_engine.call("advanceArtifactFootprintPage", .{self});
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return true;
         var budget = if (self.core.index_manager.resource_manager) |manager|
             resource_manager_mod.BudgetedAllocator.init(manager, .relational_preparation_working_set, self.alloc, 1)
@@ -31313,6 +31592,7 @@ pub const DB = struct {
     /// Fair bounded dispatch on the existing std.Io maintenance scheduler.
     /// Never scan every catalog entry or finish an entire index in one turn.
     pub fn runRelationalIndexMaintenancePass(self: *DB) !bool {
+        if (comptime storage_engine.enabled) return storage_engine.call("runRelationalIndexMaintenancePass", .{self});
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return false;
         if (self.independent_maintenance.stopping.load(.acquire)) return error.Canceled;
         const started = platform_time.monotonicNs();
@@ -31358,6 +31638,7 @@ pub const DB = struct {
     /// as the native worker. A clean sweep, rather than one no-work slice,
     /// proves that every current index has been considered.
     pub fn runRelationalIndexMaintenanceUntilIdle(self: *DB, cancellation: types.CancellationToken, deadline_ns: ?u64) !void {
+        if (comptime storage_engine.enabled) return storage_engine.call("runRelationalIndexMaintenanceUntilIdle", .{ self, cancellation, deadline_ns });
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
         const sweep = &self.local_execution.relational_index_maintenance_sweep;
         sweep.request();
@@ -31380,6 +31661,7 @@ pub const DB = struct {
     /// deadline on unrelated builds, CHECK validation, or index reclamation.
     /// Each round gives every required building index one bounded page.
     pub fn ensureRelationalIndexesReady(self: *DB, names: []const []const u8, cancellation: types.CancellationToken, deadline_ns: ?u64) !void {
+        if (comptime storage_engine.enabled) return storage_engine.call("ensureRelationalIndexesReady", .{ self, names, cancellation, deadline_ns });
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
         while (true) {
             try ensureSnapshotActive(cancellation);
@@ -31400,6 +31682,7 @@ pub const DB = struct {
     }
 
     pub fn runRelationalColumnMaintenancePass(self: *DB) !usize {
+        if (comptime storage_engine.enabled) return storage_engine.call("runRelationalColumnMaintenancePass", .{self});
         const started = self.independentMaintenanceNowNs();
         // Artifact repair can keep the shared worker on its active cadence;
         // enforce columnar backoff independently of that worker's sleep.
@@ -31423,6 +31706,7 @@ pub const DB = struct {
     /// Build disposable table-owned column blocks without holding the apply
     /// lock. The store's atomic primary-mutation fence governs publication.
     pub fn rebuildRelationalColumns(self: *DB) !bool {
+        if (comptime storage_engine.enabled) return storage_engine.call("rebuildRelationalColumns", .{self});
         return self.rebuildRelationalColumnsWithPolicy(false);
     }
 
@@ -31747,6 +32031,7 @@ pub const DB = struct {
     };
 
     pub fn runGraphMetricServiceMaintenanceJsonAlloc(self: *DB, alloc: Allocator, body: []const u8) ![]u8 {
+        if (comptime storage_engine.enabled) return storage_engine.call("runGraphMetricServiceMaintenanceJsonAlloc", .{ self, alloc, body });
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
         var parsed = std.json.parseFromSlice(GraphMetricServiceMaintenanceRequest, alloc, if (body.len == 0) "{}" else body, .{
             .allocate = .alloc_always,
@@ -31808,6 +32093,7 @@ pub const DB = struct {
     }
 
     pub fn refreshGraphMetric(self: *DB, alloc: Allocator, index_name: []const u8, metric_name: []const u8) !types.GraphMetricStatus {
+        if (comptime storage_engine.enabled) return storage_engine.call("refreshGraphMetric", .{ self, alloc, index_name, metric_name });
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
         lockApply(self);
         defer self.core.unlockApply();
@@ -31823,6 +32109,7 @@ pub const DB = struct {
     }
 
     pub fn rebuildGraphMetric(self: *DB, alloc: Allocator, index_name: []const u8, metric_name: []const u8) !types.GraphMetricStatus {
+        if (comptime storage_engine.enabled) return storage_engine.call("rebuildGraphMetric", .{ self, alloc, index_name, metric_name });
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
         lockApply(self);
         defer self.core.unlockApply();
@@ -31847,6 +32134,7 @@ pub const DB = struct {
         metric_name: []const u8,
         force: bool,
     ) !types.GraphMetricStatus {
+        if (comptime storage_engine.enabled) return storage_engine.call("scheduleGraphMetricBuild", .{ self, alloc, index_name, metric_name, force });
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
         const owned_status = blk: {
             lockApply(self);
@@ -31900,6 +32188,7 @@ pub const DB = struct {
     }
 
     pub fn pauseGraphMetricMaintenance(self: *DB, alloc: Allocator, index_name: []const u8, metric_name: []const u8) !types.GraphMetricStatus {
+        if (comptime storage_engine.enabled) return storage_engine.call("pauseGraphMetricMaintenance", .{ self, alloc, index_name, metric_name });
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
         lockApply(self);
         defer self.core.unlockApply();
@@ -31912,6 +32201,7 @@ pub const DB = struct {
     }
 
     pub fn resumeGraphMetricMaintenance(self: *DB, alloc: Allocator, index_name: []const u8, metric_name: []const u8) !types.GraphMetricStatus {
+        if (comptime storage_engine.enabled) return storage_engine.call("resumeGraphMetricMaintenance", .{ self, alloc, index_name, metric_name });
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
         lockApply(self);
         defer self.core.unlockApply();
@@ -31930,6 +32220,7 @@ pub const DB = struct {
         metric_name: []const u8,
         target_generation: u64,
     ) !types.GraphMetricStatus {
+        if (comptime storage_engine.enabled) return storage_engine.call("ensureGraphMetricPlannedBuild", .{ self, alloc, index_name, metric_name, target_generation });
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
         lockApply(self);
         defer self.core.unlockApply();
@@ -31950,6 +32241,7 @@ pub const DB = struct {
     }
 
     pub fn runGraphMetricPlannedWorkerPageStepAt(self: *DB, index_name: []const u8, metric_name: []const u8, worker_id: []const u8, now_ms: u64) !graph_mod.GraphIndex.GraphMetricBuildWorkerStepResult {
+        if (comptime storage_engine.enabled) return storage_engine.call("runGraphMetricPlannedWorkerPageStepAt", .{ self, index_name, metric_name, worker_id, now_ms });
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
         lockApply(self);
         defer self.core.unlockApply();
@@ -31968,6 +32260,7 @@ pub const DB = struct {
     }
 
     pub fn runGraphMetricPlannedCoordinatorStepAt(self: *DB, index_name: []const u8, metric_name: []const u8, now_ms: u64) !graph_mod.GraphIndex.GraphMetricBuildWorkerStepResult {
+        if (comptime storage_engine.enabled) return storage_engine.call("runGraphMetricPlannedCoordinatorStepAt", .{ self, index_name, metric_name, now_ms });
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
         lockApply(self);
         defer self.core.unlockApply();
@@ -31977,6 +32270,7 @@ pub const DB = struct {
     }
 
     pub fn failGraphMetricPlannedBuild(self: *DB, alloc: Allocator, index_name: []const u8, metric_name: []const u8, err: anyerror) !types.GraphMetricStatus {
+        if (comptime storage_engine.enabled) return storage_engine.call("failGraphMetricPlannedBuild", .{ self, alloc, index_name, metric_name, @errorName(err) });
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
         lockApply(self);
         defer self.core.unlockApply();
@@ -31988,6 +32282,7 @@ pub const DB = struct {
     }
 
     pub fn runGraphMetricPlannedDrain(self: *DB, alloc: Allocator, index_name: []const u8, metric_name: []const u8, target_generation: u64, options: graph_mod.GraphIndex.GraphMetricPlannedDrainOptions) !types.GraphMetricStatus {
+        if (comptime storage_engine.enabled) return storage_engine.call("runGraphMetricPlannedDrain", .{ self, alloc, index_name, metric_name, target_generation, options });
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
         lockApply(self);
         defer self.core.unlockApply();
@@ -32011,6 +32306,7 @@ pub const DB = struct {
     }
 
     pub fn runUntilIdle(self: *DB) !void {
+        if (comptime storage_engine.enabled) return storage_engine.call("runUntilIdle", .{self});
         const started_ns = platform_time.monotonicNs();
         const before = self.enrichmentThroughputSnapshot();
         defer self.logRunUntilIdleSummary(started_ns, before);
@@ -32078,6 +32374,7 @@ pub const DB = struct {
     /// quantum when its provider is retrying instead of becoming a second,
     /// indefinitely waiting owner of the same replay tail.
     pub fn runUntilIdleWithoutWaitingForEnrichmentRetries(self: *DB) !void {
+        if (comptime storage_engine.enabled) return storage_engine.call("runUntilIdleWithoutWaitingForEnrichmentRetries", .{self});
         try self.runUntilIdleWithReplayDrainOptions(.{});
     }
 
@@ -32089,6 +32386,7 @@ pub const DB = struct {
         self: *DB,
         cancellation: types.CancellationToken,
     ) !void {
+        if (comptime storage_engine.enabled) return storage_engine.call("runUntilIdleWithoutWaitingForEnrichmentRetriesWithCancellation", .{ self, cancellation });
         try self.runUntilIdleWithReplayDrainOptions(.{ .cancellation = cancellation });
     }
 
@@ -32096,11 +32394,13 @@ pub const DB = struct {
     /// relational debt after one page so its caller can release that lease
     /// before another turn; explicit runUntilIdle still proves full coverage.
     pub fn runBackgroundMaintenanceWithCancellation(self: *DB, cancellation: types.CancellationToken) !bool {
+        if (comptime storage_engine.enabled) return storage_engine.call("runBackgroundMaintenanceWithCancellation", .{ self, cancellation });
         try self.runUntilIdleWithReplayDrainOptions(.{ .cancellation = cancellation, .drain_relational_indexes = false });
         return self.hasPendingGraphReplacements() or self.local_execution.relational_index_maintenance_sweep.isPending();
     }
 
     pub fn rebuildDenseIndexesForTargetCoverage(self: *DB, alloc: Allocator) !usize {
+        if (comptime storage_engine.enabled) return storage_engine.call("rebuildDenseIndexesForTargetCoverage", .{ self, alloc });
         var snapshot_replay = try self.acquireSnapshotReplayMutation();
         defer snapshot_replay.release();
         var names = std.ArrayListUnmanaged([]u8).empty;
@@ -32121,6 +32421,7 @@ pub const DB = struct {
     }
 
     pub fn rebuildSparseIndexesForTargetCoverage(self: *DB, alloc: Allocator) !usize {
+        if (comptime storage_engine.enabled) return storage_engine.call("rebuildSparseIndexesForTargetCoverage", .{ self, alloc });
         var snapshot_replay = try self.acquireSnapshotReplayMutation();
         defer snapshot_replay.release();
         var names = std.ArrayListUnmanaged([]u8).empty;
@@ -32141,6 +32442,7 @@ pub const DB = struct {
     }
 
     pub fn rebuildGraphIndexesForTargetCoverage(self: *DB, alloc: Allocator) !void {
+        if (comptime storage_engine.enabled) return storage_engine.call("rebuildGraphIndexesForTargetCoverage", .{ self, alloc });
         var snapshot_replay = try self.acquireSnapshotReplayMutation();
         defer snapshot_replay.release();
         try applySplitGraphArtifactsInRange(
@@ -32167,6 +32469,7 @@ pub const DB = struct {
     pub const PostingRefreshProgress = hbc_mod.HBCIndex.PostingRefreshProgress;
 
     pub fn refreshDensePostingPayloadPageBestEffort(self: *DB) !PostingRefreshProgress {
+        if (comptime storage_engine.enabled) return storage_engine.call("refreshDensePostingPayloadPageBestEffort", .{self});
         // Clean scanning needs only the catalog lifetime and per-index
         // mutation owner. It must not close query admission or queue behind
         // a sustained stream of readers simply to discover an empty backlog.
@@ -32239,6 +32542,7 @@ pub const DB = struct {
     }
 
     pub fn publishCompletedDensePostingCheckpoints(self: *DB) !NativePublicationResult {
+        if (comptime storage_engine.enabled) return storage_engine.call("publishCompletedDensePostingCheckpoints", .{self});
         // Native backup closes and drains this same catalog barrier before
         // selecting/pinning generated files. It excludes publication until
         // hardlinks own the captured generation, without serializing ordinary
@@ -32263,6 +32567,7 @@ pub const DB = struct {
     }
 
     pub fn runVectorBlockMaintenanceForIdle(self: *DB) !usize {
+        if (comptime storage_engine.enabled) return storage_engine.call("runVectorBlockMaintenanceForIdle", .{self});
         return try self.publishVectorBlockBasesOnline(.{});
     }
 
@@ -32272,12 +32577,14 @@ pub const DB = struct {
     /// file construction never owns the table write fence. Posting
     /// reconstruction has its own durable repair owner.
     pub fn publishVectorBlockBasesOnline(self: *DB, options: index_manager_mod.IndexManager.OnlineVectorBlockPublicationOptions) !usize {
+        if (comptime storage_engine.enabled) return storage_engine.call("publishVectorBlockBasesOnline", .{ self, options });
         return (try self.publishVectorBlockBasesOnlineReported(options)).published;
     }
 
     pub const NativePublicationResult = types.NativePublicationResult;
 
     pub fn publishVectorBlockBasesOnlineReported(self: *DB, options: index_manager_mod.IndexManager.OnlineVectorBlockPublicationOptions) !NativePublicationResult {
+        if (comptime storage_engine.enabled) return storage_engine.call("publishVectorBlockBasesOnlineReported", .{ self, options });
         var catalog_lease = self.tryAcquireIndexCatalogReadLease() orelse return .{ .busy = true };
         defer catalog_lease.release();
         var session_lock = lockAtomicWithBackoffProfiled(
@@ -32316,6 +32623,7 @@ pub const DB = struct {
     /// recurring vector-maintenance lane must re-evaluate that lifecycle
     /// proof; otherwise a finite load depends on unrelated future writes.
     pub fn finalizeDenseProjectionLifecycleForIdle(self: *DB) !bool {
+        if (comptime storage_engine.enabled) return storage_engine.call("finalizeDenseProjectionLifecycleForIdle", .{self});
         // The recurring owner may construct files, but never while holding
         // the shared apply lease used by the small certification below.
         _ = try self.publishVectorBlockBasesOnline(.{});
@@ -32323,6 +32631,7 @@ pub const DB = struct {
     }
 
     pub fn publishVectorBlockBasesAtStableTip(self: *DB) !usize {
+        if (comptime storage_engine.enabled) return storage_engine.call("publishVectorBlockBasesAtStableTip", .{self});
         // The explicit idle drain and the background owner share one vector
         // store. Acquire the same publication claim before taking apply; a
         // writer lock alone cannot exclude a worker staging outside that lock.
@@ -32353,6 +32662,7 @@ pub const DB = struct {
     }
 
     pub fn nativeVectorProjectionMaintenanceNeeded(self: *DB) bool {
+        if (comptime storage_engine.enabled) return storage_engine.call("nativeVectorProjectionMaintenanceNeeded", .{self}) catch @panic("incompatible storage owner");
         return self.core.index_manager.vectorBlockBaseMaintenanceNeeded();
     }
 
@@ -33857,6 +34167,7 @@ pub const DB = struct {
     }
 
     pub fn hasPendingDenseArtifactRebuild(self: *DB, alloc: Allocator) !bool {
+        if (comptime storage_engine.enabled) return storage_engine.call("hasPendingDenseArtifactRebuild", .{ self, alloc });
         var plan = try self.collectDenseArtifactRebuildPlan(alloc);
         defer plan.deinit(alloc);
         // Stale resume metadata without a logical target is maintenance-only:
@@ -33870,6 +34181,7 @@ pub const DB = struct {
     /// delegated to an equivalent durable repair intent. The probe is
     /// read-only: cursor migration and query-gate changes happen in execution.
     pub fn denseArtifactRebuildMaintenanceNeeded(self: *DB, alloc: Allocator) !bool {
+        if (comptime storage_engine.enabled) return storage_engine.call("denseArtifactRebuildMaintenanceNeeded", .{ self, alloc });
         var plan = try self.collectDenseArtifactRebuildPlan(alloc);
         defer plan.deinit(alloc);
         if (plan.targets.len > 0 or plan.rebuild_state_cleanups.len > 0) return true;
@@ -33897,6 +34209,7 @@ pub const DB = struct {
         progress_ctx: ?*anyopaque,
         progress_hook: ?ReplayProgressHook,
     ) !bool {
+        if (comptime storage_engine.enabled) return storage_engine.call("runDenseArtifactRebuildMaintenanceWithProgress", .{ self, alloc, progress_ctx, progress_hook, storage_engine.ReplayBoundary.local_dispatch });
         const outcome = try self.rebuildDenseIndexesFromStoredEmbeddingArtifactsOutcomeWithProgress(
             alloc,
             progress_ctx,
@@ -34217,6 +34530,7 @@ pub const DB = struct {
     }
 
     pub fn replayGeneratedEnrichmentsFromStoredDocs(self: *DB, alloc: Allocator) !usize {
+        if (comptime storage_engine.enabled) return storage_engine.call("replayGeneratedEnrichmentsFromStoredDocs", .{ self, alloc });
         return (try self.appendGeneratedEnrichmentsFromStoredDocs(alloc, &.{}, true)).generated_ref_count;
     }
 
@@ -34233,6 +34547,7 @@ pub const DB = struct {
         alloc: Allocator,
         artifact_name: ?[]const u8,
     ) !GeneratedEnrichmentReplayAppendResult {
+        if (comptime storage_engine.enabled) return storage_engine.call("reprocessGeneratedEnrichmentFromStoredDocsWithProgress", .{ self, alloc, artifact_name });
         if (artifact_name) |name| {
             const force_artifacts = [_][]const u8{name};
             return try self.appendGeneratedEnrichmentsFromStoredDocs(alloc, &force_artifacts, false);
@@ -34258,6 +34573,7 @@ pub const DB = struct {
     /// (`markPrecomputedEnrichmentAppliedForSync` stays exactly as
     /// conservative as before).
     pub fn waitForSyncLevelWithCancellation(self: *DB, sync_level: types.SyncLevel, sequence: u64, sync_targets: ManagedSyncTargets, cancellation: types.CancellationToken, skip_enrichment_runtime_wait: bool) !void {
+        if (comptime storage_engine.enabled) return storage_engine.call("waitForSyncLevelWithCancellation", .{ self, sync_level, sequence, sync_targets, cancellation, skip_enrichment_runtime_wait });
         const timeout_ms = if (self.enrichment_runtime) |runtime|
             runtime.syncWaitTimeoutMs()
         else
@@ -35322,6 +35638,7 @@ pub const DB = struct {
     /// one apply-lock boundary. On contention, only readiness-neutral runtime
     /// diagnostics are overlaid and existing blockers remain intact.
     pub fn overlayRuntimeStatusBestEffort(self: *DB, stats_alloc: Allocator, runtime_stats: *types.DBStats) bool {
+        if (comptime storage_engine.enabled) return storage_engine.call("overlayRuntimeStatusBestEffort", .{ self, stats_alloc, runtime_stats }) catch @panic("incompatible storage owner");
         self.overlayRuntimeStatusRuntimeBestEffort(runtime_stats);
         if (!self.core.tryLockApplyShared()) {
             self.refreshIndexDocCountsFromDurableSnapshotBestEffort(stats_alloc, runtime_stats);
@@ -35408,6 +35725,7 @@ pub const DB = struct {
     }
 
     pub fn stats(self: *DB, alloc: Allocator) !types.DBStats {
+        if (comptime storage_engine.enabled) return storage_engine.call("stats", .{ self, alloc });
         if (self.open_mode == .status_only) {
             return try self.statusOnlyStats(alloc);
         }
@@ -35437,6 +35755,7 @@ pub const DB = struct {
     }
 
     pub fn runtimeStatusStatsConsistent(self: *DB, alloc: Allocator) !types.DBStats {
+        if (comptime storage_engine.enabled) return storage_engine.call("runtimeStatusStatsConsistent", .{ self, alloc });
         if (self.open_mode == .status_only) {
             return try self.statusOnlyStats(alloc);
         }
@@ -35452,6 +35771,7 @@ pub const DB = struct {
     }
 
     pub fn runtimeStatusStatsConsistentIfAvailable(self: *DB, alloc: Allocator) !?types.DBStats {
+        if (comptime storage_engine.enabled) return storage_engine.call("runtimeStatusStatsConsistentIfAvailable", .{ self, alloc });
         if (self.open_mode == .status_only) {
             return try self.statusOnlyStats(alloc);
         }
@@ -35476,6 +35796,7 @@ pub const DB = struct {
     }
 
     pub fn reassignIdentityNamespaceForInternalTransition(self: *DB, namespace: doc_identity.Namespace) !void {
+        if (comptime storage_engine.enabled) return storage_engine.call("reassignIdentityNamespaceForInternalTransition", .{ self, namespace });
         if (self.open_mode == .status_only) return error.UnsupportedOperation;
         lockApply(self);
         defer self.core.unlockApply();
@@ -35897,6 +36218,7 @@ pub const DB = struct {
     pub const restoreStagingStatus = local_mutation.restoreStagingStatus;
 
     pub fn restoreGenerationAdmissionReceipt(self: *DB) !?@import("restore_staging_contract.zig").GenerationAdmissionReceipt {
+        if (comptime storage_engine.enabled) return storage_engine.call("restoreGenerationAdmissionReceipt", .{self});
         var read = try self.core.store.beginReadTxn();
         defer read.abort();
         return @import("restore_generation_admissions.zig").loadReceipt(&read);
@@ -35906,6 +36228,7 @@ pub const DB = struct {
     /// the durable reservation. Initial empty schema/index admission must not
     /// emit a hot-standby mutation before its owner authorization exists.
     pub fn attachRestoreStagingReplicationMirror(self: *DB, mirror: ?ReplicationAsyncEffectMirror) !void {
+        if (comptime storage_engine.enabled) return storage_engine.call("attachRestoreStagingReplicationMirror", .{ self, mirror });
         if (!self.local_execution.restore_staging_required.load(.acquire)) return error.RestoreStagingScopeChanged;
         if (mirror != null and self.core.table_catalog.row_policy_phase != .disabled)
             return error.RowPolicyUnsupported;
@@ -35918,6 +36241,7 @@ pub const DB = struct {
     /// its primary checkpoint but before projection replay became durable.
     /// Processes one bounded apply window per index, with no external producers.
     pub fn prepareRestoreStagingIndexesStep(self: *DB, alloc: Allocator, scope: [32]u8) !bool {
+        if (comptime storage_engine.enabled) return storage_engine.call("prepareRestoreStagingIndexesStep", .{ self, alloc, scope });
         return self.prepareRestoreStagingIndexesStepLocal(alloc, scope, false);
     }
 
@@ -36003,12 +36327,14 @@ pub const DB = struct {
     /// The artifact is not available yet: this durable reservation admits no
     /// reads or writes, including scoped ones, until authenticated import binds it.
     pub fn reserveRestoreStaging(self: *DB, alloc: Allocator, plan_id: [16]u8, plan_digest: [32]u8, namespace: doc_identity.Namespace) !void {
+        if (comptime storage_engine.enabled) return storage_engine.call("reserveRestoreStaging", .{ self, alloc, plan_id, plan_digest, namespace });
         const staging = @import("restore_staging.zig");
         const scope: staging.Scope = .{ .plan_id = plan_id, .plan_digest = plan_digest, .target_namespace = namespace, .source_namespace = .{ .table_id = 0, .shard_id = 0, .range_id = 0 }, .source_artifact_digest = @splat(0), .target_schema_digest = @splat(0) };
         return self.reserveRestoreStagingScoped(alloc, scope);
     }
 
     pub fn reserveRestoreStagingScoped(self: *DB, alloc: Allocator, scope: @import("restore_staging.zig").Scope) !void {
+        if (comptime storage_engine.enabled) return storage_engine.call("reserveRestoreStagingScoped", .{ self, alloc, scope });
         const staging = @import("restore_staging.zig");
         const namespace = scope.target_namespace;
         try scope.validateReservation();
@@ -36047,12 +36373,14 @@ pub const DB = struct {
     /// Receiver-side authority check. A capability never substitutes for the
     /// durable owner marker and its fresh namespace; callers hold a resident DB lease.
     pub fn validateRestoreStagingScope(self: *DB, alloc: Allocator, scope: [32]u8) !void {
+        if (comptime storage_engine.enabled) return storage_engine.call("validateRestoreStagingScope", .{ self, alloc, scope });
         var txn = try self.core.store.beginReadTxn();
         defer txn.abort();
         try @import("restore_staging.zig").requireScope(alloc, &txn, scope, false);
     }
 
     pub fn beginRestoreStaging(self: *DB, alloc: Allocator, scope: @import("restore_staging.zig").Scope) !void {
+        if (comptime storage_engine.enabled) return storage_engine.call("beginRestoreStaging", .{ self, alloc, scope });
         return self.beginRestoreStagingWithMarker(alloc, scope, null, null, null);
     }
 
@@ -36061,6 +36389,7 @@ pub const DB = struct {
     /// import source-local migration progress. hot-standby begin carries the same mapping
     /// so followers reconstruct it before accepting row effects.
     pub fn installRestoreStagingReadSchema(self: *DB, alloc: Allocator, scope: @import("restore_staging.zig").Scope, read_json: []const u8) !void {
+        if (comptime storage_engine.enabled) return storage_engine.call("installRestoreStagingReadSchema", .{ self, alloc, scope, read_json });
         if (read_json.len == 0) return;
         try scope.validate();
         var previous = try public_table_schema.parseValidatedTableSchema(alloc, read_json);
@@ -36120,6 +36449,7 @@ pub const DB = struct {
     }
 
     pub fn installRestoreStagingBootstrap(self: *DB, alloc: Allocator, descriptor: @import("restore_staging.zig").OwnerBootstrap) !void {
+        if (comptime storage_engine.enabled) return storage_engine.call("installRestoreStagingBootstrap", .{ self, alloc, descriptor });
         const staging = @import("restore_staging.zig");
         try descriptor.validate();
         try @import("../../schema/restore_migration.zig").validate(alloc, descriptor.schema_json, descriptor.read_schema_json);
@@ -36160,6 +36490,7 @@ pub const DB = struct {
     }
 
     pub fn readRestoreStagingBootstrap(self: *DB, alloc: Allocator) !?std.json.Parsed(@import("restore_staging.zig").OwnerBootstrap) {
+        if (comptime storage_engine.enabled) return storage_engine.call("readRestoreStagingBootstrap", .{ self, alloc });
         const staging = @import("restore_staging.zig");
         const stored = try self.core.getStoreValue(alloc, staging.bootstrap_key);
         defer if (stored) |bytes| alloc.free(bytes);
@@ -36170,6 +36501,7 @@ pub const DB = struct {
     /// A cold, read-only physical proof for canceled initial FK retirement.
     /// This does not consult or synthesize a public catalog route.
     pub fn readInitialChildPublicationRecord(self: *DB) !?@import("relational_initial_child_publication.zig").Record {
+        if (comptime storage_engine.enabled) return storage_engine.call("readInitialChildPublicationRecord", .{self});
         var txn = try self.core.store.beginReadTxn();
         defer txn.abort();
         return @import("relational_initial_child_publication.zig").load(&txn);
@@ -36179,6 +36511,7 @@ pub const DB = struct {
     /// drained under an authenticated exact-root cancellation ticket. This is
     /// not a Raft receipt and must never be used to publish/release a child.
     pub fn cancelColdInitialChildForRetirement(self: *DB, expected: @import("relational_initial_child_publication.zig").Record, cancel_revision: u64) !void {
+        if (comptime storage_engine.enabled) return storage_engine.call("cancelColdInitialChildForRetirement", .{ self, expected, cancel_revision });
         const hidden = @import("relational_initial_child_publication.zig");
         try expected.validate();
         if (cancel_revision == 0 or expected.phase == .released) return error.InitialChildPublicationChanged;
@@ -36488,6 +36821,7 @@ pub const DB = struct {
     /// restore driver. Each page decodes its declared historical layout once
     /// and feeds logical rows through the target's normal preparation pipeline.
     pub fn importRestoreStagingPage(self: *DB, alloc: Allocator, scope: @import("restore_staging.zig").Scope, source: *DB, max_rows: usize, cancellation: types.CancellationToken) !@import("restore_staging.zig").Phase {
+        if (comptime storage_engine.enabled) return storage_engine.call("importRestoreStagingPage", .{ self, alloc, scope, source, max_rows, cancellation });
         var prepared = try self.prepareRestoreStagingPage(alloc, scope, source, max_rows, cancellation);
         defer prepared.deinit();
         if (prepared.batch) |req| try self.batchReplicatedApply(req);
@@ -36496,11 +36830,13 @@ pub const DB = struct {
     }
 
     pub fn prepareRestoreStagingPage(self: *DB, alloc: Allocator, scope: @import("restore_staging.zig").Scope, source: *DB, max_rows: usize, cancellation: types.CancellationToken) !@import("restore_staging.zig").PreparedPage {
+        if (comptime storage_engine.enabled) return storage_engine.call("prepareRestoreStagingPage", .{ self, alloc, scope, source, max_rows, cancellation });
         if (scope.rewrite != null or scope.empty_generation) return error.InvalidRestoreStagingCommand;
         return self.prepareRestoreStagingPageInternal(alloc, scope, source, max_rows, cancellation, null);
     }
 
     pub fn prepareRewriteStagingPage(self: *DB, alloc: Allocator, scope: @import("restore_staging.zig").Scope, source: *DB, max_rows: usize, cancellation: types.CancellationToken, program: *const @import("relational_rewrite_staging.zig").ProgramSet) !@import("restore_staging.zig").PreparedPage {
+        if (comptime storage_engine.enabled) return storage_engine.call("prepareRewriteStagingPage", .{ self, alloc, scope, source, max_rows, cancellation, program });
         try program.requireScope(scope);
         try @import("relational_rewrite_staging.zig").requireSnapshotSource(alloc, scope, source);
         return self.prepareRestoreStagingPageInternal(alloc, scope, source, max_rows, cancellation, program);
@@ -36799,6 +37135,7 @@ pub const DB = struct {
     /// Scope is retained as a tombstone after publication/cancellation. Late
     /// import RPCs can never initialize or mutate a recycled owner generation.
     pub fn finishRestoreStaging(self: *DB, alloc: Allocator, scope: @import("restore_staging.zig").Digest, phase: @import("restore_staging.zig").Phase) !@import("restore_staging.zig").Digest {
+        if (comptime storage_engine.enabled) return storage_engine.call("finishRestoreStaging", .{ self, alloc, scope, phase });
         return self.finishRestoreStagingWithMarker(alloc, scope, phase, null, null, null);
     }
 
@@ -36920,10 +37257,12 @@ pub const DB = struct {
         file_size: u64,
         target_identity: doc_identity.Namespace,
     ) !void {
+        if (comptime storage_engine.enabled) return storage_engine.call("importPortableFileIntoUnpublishedEmpty", .{ self, alloc, io, file, file_size, target_identity });
         return self.importPortableLogicalSourceFile(alloc, io, file, file_size, target_identity, null, .none);
     }
 
     pub fn importCohortPortableFileIntoUnpublishedEmpty(self: *DB, alloc: Allocator, io: Io, file: std.Io.File, file_size: u64, proof: portable_backup.CohortProof, cancellation: types.CancellationToken) !void {
+        if (comptime storage_engine.enabled) return storage_engine.call("importCohortPortableFileIntoUnpublishedEmpty", .{ self, alloc, io, file, file_size, proof, cancellation });
         return self.importPortableLogicalSourceFile(alloc, io, file, file_size, proof.namespace, proof, cancellation);
     }
 
@@ -36999,6 +37338,7 @@ pub const DB = struct {
         backup: []const u8,
         target_identity: doc_identity.Namespace,
     ) !void {
+        if (comptime storage_engine.enabled) return storage_engine.call("importPortableIntoEmpty", .{ self, alloc, backup, target_identity });
         if (self.open_mode == .status_only or self.open_mode == .query_readonly) return error.UnsupportedOperation;
         var stage = try PortableImportStage.init(alloc, self.core.path, backup, .{});
         defer stage.deinit();
@@ -37080,6 +37420,7 @@ pub const DB = struct {
     }
 
     pub fn currentIdentityReadGenerationForRequest(self: *DB, requested: ?u64) !u64 {
+        if (comptime storage_engine.enabled) return storage_engine.call("currentIdentityReadGenerationForRequest", .{ self, requested });
         const current_generation = try self.currentIdentityReadGeneration();
         if (requested) |generation| {
             if (generation != current_generation) {
@@ -37413,6 +37754,7 @@ pub const DB = struct {
     }
 
     pub fn diagnosticStats(self: *DB, alloc: Allocator) !types.DBStats {
+        if (comptime storage_engine.enabled) return storage_engine.call("diagnosticStats", .{ self, alloc });
         if (self.open_mode == .status_only) {
             return try self.statusOnlyStats(alloc);
         }
@@ -38275,7 +38617,7 @@ pub const DB = struct {
     }
 
     pub fn primaryDocCount(self: *DB, alloc: Allocator) !u64 {
-        _ = alloc;
+        if (comptime storage_engine.enabled) return storage_engine.call("primaryDocCount", .{ self, alloc });
         lockApplyShared(self);
         defer self.core.unlockApplyShared();
         return try self.scanPrimaryDocCount(self.core.byteRange());
@@ -38365,6 +38707,7 @@ pub const DB = struct {
     }
 
     pub fn generatedCoverageReplayNeeded(self: *DB, alloc: Allocator) !bool {
+        if (comptime storage_engine.enabled) return storage_engine.call("generatedCoverageReplayNeeded", .{ self, alloc });
         const configs = try self.generatedCoverageRecoveryConfigsAlloc(alloc);
         defer {
             for (configs) |*cfg| cfg.deinit(alloc);
@@ -38379,6 +38722,7 @@ pub const DB = struct {
     /// latency must not be reclassified as broad startup repair merely because
     /// the enrichment watermark is momentarily idle.
     pub fn generatedCoverageRecoveryOwnedByInitialBuild(self: *DB, alloc: Allocator) !bool {
+        if (comptime storage_engine.enabled) return storage_engine.call("generatedCoverageRecoveryOwnedByInitialBuild", .{ self, alloc });
         const configs = try self.generatedCoverageRecoveryConfigsAlloc(alloc);
         defer {
             for (configs) |*cfg| cfg.deinit(alloc);
@@ -38432,6 +38776,7 @@ pub const DB = struct {
     /// fenced cursor; the currently published partial generation remains
     /// serviceable until the replacement is atomically activated.
     pub fn ensureGeneratedCoverageRecoveryIntents(self: *DB, alloc: Allocator) !usize {
+        if (comptime storage_engine.enabled) return storage_engine.call("ensureGeneratedCoverageRecoveryIntents", .{ self, alloc });
         const configs = try self.generatedCoverageRecoveryConfigsAlloc(alloc);
         defer {
             for (configs) |*cfg| cfg.deinit(alloc);
@@ -38460,6 +38805,7 @@ pub const DB = struct {
     }
 
     pub fn scan(self: *DB, alloc: Allocator, from_key: []const u8, to_key: []const u8, opts: types.ScanOptions) !types.ScanResult {
+        if (comptime storage_engine.enabled) return storage_engine.call("scan", .{ self, alloc, from_key, to_key, opts });
         if (self.local_execution.initial_child_hidden.load(.acquire)) return error.InitialChildNotPublished;
         var collector = result_collectors.Scan{ .alloc = alloc, .include_documents = opts.include_documents };
         defer collector.deinit();
@@ -38475,6 +38821,7 @@ pub const DB = struct {
         replay: snapshot_admission_mod.SnapshotAdmission.CaptureLease,
 
         pub fn release(fence: *StatementReadFence) void {
+            if (comptime storage_engine.enabled) return storage_engine.call("statementFenceRelease", .{fence}) catch @panic("incompatible storage owner");
             fence.replay.release();
             fence.primary.release();
         }
@@ -38486,6 +38833,7 @@ pub const DB = struct {
     /// ALL earlier fences before retrying: a prepared transaction may need one
     /// of those owners to finish resolution. Never drain it under this fence.
     pub fn tryStatementReadFence(self: *DB) !?StatementReadFence {
+        if (comptime storage_engine.enabled) return storage_engine.call("tryStatementReadFence", .{self});
         return self.tryPrimaryReadFence(false);
     }
 
@@ -38493,6 +38841,7 @@ pub const DB = struct {
     /// the committed primary state. It need not wait for an open transaction
     /// to finish, while still excluding primary and replay mutation races.
     pub fn tryEmbeddedBackupReadFence(self: *DB) !?StatementReadFence {
+        if (comptime storage_engine.enabled) return storage_engine.call("tryEmbeddedBackupReadFence", .{self});
         return self.tryPrimaryReadFence(true);
     }
 
@@ -38525,6 +38874,7 @@ pub const DB = struct {
     pub const DocumentReadSession = @import("document_rows.zig").Session;
 
     pub fn openDocumentReadSession(self: *DB, alloc: Allocator, from_key: []const u8, to_key: []const u8, opts: types.ScanOptions) !*DocumentReadSession {
+        if (comptime storage_engine.enabled) return storage_engine.call("openDocumentReadSession", .{ self, alloc, from_key, to_key, opts });
         try self.maybeFinalizePendingRowPolicyPublication();
         var row_policy_lease = try self.local_execution.row_policy_gate.enterRawRead();
         errdefer row_policy_lease.release();
@@ -38548,10 +38898,12 @@ pub const DB = struct {
     }
 
     pub fn openRelationalReadSession(self: *DB, alloc: Allocator, from_key: []const u8, to_key: []const u8, opts: types.ScanOptions) !*RelationalReadSession {
+        if (comptime storage_engine.enabled) return storage_engine.call("openRelationalReadSession", .{ self, alloc, from_key, to_key, opts });
         return self.openRelationalReadSessionAtSnapshot(alloc, from_key, to_key, opts, null);
     }
 
     pub fn openRelationalReadSessionAtSnapshot(self: *DB, alloc: Allocator, from_key: []const u8, to_key: []const u8, opts: types.ScanOptions, statement: ?*RelationalStatementSnapshot) !*RelationalReadSession {
+        if (comptime storage_engine.enabled) return storage_engine.call("openRelationalReadSessionAtSnapshot", .{ self, alloc, from_key, to_key, opts, statement });
         try self.maybeFinalizePendingRowPolicyPublication();
         var verified_principal: ?std.json.Parsed(row_policy_authority_mod.Payload) = null;
         defer if (verified_principal) |*proof| proof.deinit();
@@ -38745,7 +39097,7 @@ pub const DB = struct {
             for (page.rows) |row| {
                 try session.checkpoint();
                 if (opts.cancellation) |cancellation| if (cancellation.isCancelled()) return error.Canceled;
-                try visitor.visit(visitor.context, .{
+                try visitor.visitEntry(.{
                     .id = row.key,
                     .hash = row.version,
                     .content_hash = if (opts.include_content_hashes) row.semantic_hash else null,
@@ -38773,6 +39125,7 @@ pub const DB = struct {
         opts: types.ScanOptions,
         visitor: types.ScanVisitor,
     ) !void {
+        if (comptime storage_engine.enabled) return storage_engine.call("scanVisit", .{ self, alloc, from_key, to_key, opts, visitor });
         if (self.local_execution.initial_child_hidden.load(.acquire)) return error.InitialChildNotPublished;
         if (opts.isRelational()) return self.scanRelationalRowsVisit(alloc, from_key, to_key, opts, visitor);
         var row_policy_lease = try self.local_execution.row_policy_gate.enterRaw();
@@ -39108,7 +39461,7 @@ pub const DB = struct {
                     null;
                 defer if (projected) |document| state.alloc.free(document);
 
-                try state.visitor.visit(state.visitor.context, .{
+                try state.visitor.visitEntry(.{
                     .id = raw_key,
                     // Relational hashes are the stable logical digest, not a
                     // hash of a transient JSON rendering. Document-mode rows
@@ -39170,6 +39523,7 @@ pub const DB = struct {
     }
 
     pub fn search(self: *DB, alloc: Allocator, req: types.SearchRequest) !types.SearchResult {
+        if (comptime storage_engine.enabled) return storage_engine.call("search", .{ self, alloc, req });
         return try self.searchWithExecutionContext(alloc, req, .{});
     }
 
@@ -39179,6 +39533,7 @@ pub const DB = struct {
     /// with multiple dense lanes intentionally leave it unset rather than
     /// publishing an ambiguous aggregate.
     pub fn searchWithDenseProfile(self: *DB, alloc: Allocator, req: types.SearchRequest) !SearchWithDenseProfileResult {
+        if (comptime storage_engine.enabled) return storage_engine.call("searchWithDenseProfile", .{ self, alloc, req });
         if (self.local_execution.initial_child_hidden.load(.acquire)) return error.InitialChildNotPublished;
         var row_policy_lease = try self.local_execution.row_policy_gate.enterUnsupportedSearch();
         defer row_policy_lease.release();
@@ -39215,6 +39570,7 @@ pub const DB = struct {
         alloc: Allocator,
         req: types.SearchRequest,
     ) !SearchWithCapturedRequestResult {
+        if (comptime storage_engine.enabled) return storage_engine.call("searchWithCapturedRequest", .{ self, alloc, req });
         return try self.searchWithCapturedRequestAndExecutionContext(alloc, req, .{});
     }
 
@@ -39228,6 +39584,7 @@ pub const DB = struct {
         /// Capture a primary typed reader under this lease's existing apply
         /// fence. Do not recursively acquire the fence behind a queued writer.
         pub fn relationalRows(self: *const QueryReadLease, alloc: Allocator, fields: []const []const u8, schema_version: u32) !RelationalRows.Reader {
+            if (comptime storage_engine.enabled) return storage_engine.call("relationalRowsUnderLease", .{ self, alloc, fields, schema_version });
             var view = self.db.core.acquireSchemaView() orelse return error.RelationalTableRequired;
             defer view.release();
             var reader = try RelationalRows.Reader.open(alloc, self.db.core.store, view, null, .{
@@ -39239,6 +39596,7 @@ pub const DB = struct {
         }
 
         pub fn search(self: QueryReadLease, alloc: Allocator, req: types.SearchRequest) !SearchWithDenseProfileResult {
+            if (comptime storage_engine.enabled) return storage_engine.call("searchLease", .{ self, alloc, req });
             const db = self.db;
             const snapshot_req = try db.searchRequestAtCurrentIdentityGeneration(req);
             if (!types.canonicalHierarchyExecutionWithinBudget(snapshot_req)) return error.InvalidQueryRequest;
@@ -39254,6 +39612,7 @@ pub const DB = struct {
         }
 
         pub fn release(self: *QueryReadLease) void {
+            if (comptime storage_engine.enabled) return storage_engine.call("queryReadLeaseRelease", .{self}) catch @panic("incompatible storage owner");
             const db = self.db;
             db.core.unlockApplyShared();
             if (db.async_context.resource_manager) |manager| manager.finishForegroundQuery();
@@ -39263,6 +39622,7 @@ pub const DB = struct {
     };
 
     pub fn beginQueryReadLease(self: *DB) !QueryReadLease {
+        if (comptime storage_engine.enabled) return storage_engine.call("beginQueryReadLease", .{self});
         if (self.local_execution.initial_child_hidden.load(.acquire)) return error.InitialChildNotPublished;
         var row_policy_lease = try self.local_execution.row_policy_gate.enterUnsupportedSearch();
         errdefer row_policy_lease.release();
@@ -39284,12 +39644,13 @@ pub const DB = struct {
         return (try self.searchWithCapturedRequestAndExecutionContext(alloc, req, exec_ctx)).result;
     }
 
-    fn searchWithCapturedRequestAndExecutionContext(
+    pub fn searchWithCapturedRequestAndExecutionContext(
         self: *DB,
         alloc: Allocator,
         req: types.SearchRequest,
         exec_ctx: types.ExecutionContext,
     ) !SearchWithCapturedRequestResult {
+        if (comptime storage_engine.enabled) return storage_engine.call("searchWithCapturedRequestAndExecutionContext", .{ self, alloc, req, exec_ctx });
         if (self.local_execution.initial_child_hidden.load(.acquire)) return error.InitialChildNotPublished;
         var row_policy_lease = try self.local_execution.row_policy_gate.enterUnsupportedSearch();
         defer row_policy_lease.release();
@@ -39340,6 +39701,7 @@ pub const DB = struct {
     }
 
     pub fn searchRequestAtCurrentIdentityGeneration(self: *DB, req: types.SearchRequest) !types.SearchRequest {
+        if (comptime storage_engine.enabled) return storage_engine.call("searchRequestAtCurrentIdentityGeneration", .{ self, req });
         var snapshot_req = req;
         snapshot_req.identity_read_generation = try self.currentIdentityReadGenerationForRequest(snapshot_req.identity_read_generation);
         try self.validateResolvedDocFilterWireContext(snapshot_req);
@@ -39791,11 +40153,12 @@ pub const DB = struct {
         return error.HierarchyCursorStale;
     }
 
-    fn navigateHierarchyChildren(
+    pub fn navigateHierarchyChildren(
         self: *DB,
         alloc: Allocator,
         req: types.SearchRequest,
     ) !types.SearchResult {
+        if (comptime storage_engine.enabled) return storage_engine.call("navigateHierarchyChildren", .{ self, alloc, req });
         const navigation = req.hierarchy_children orelse return error.InvalidQueryRequest;
         if (navigation.parent_level != .source or navigation.level != .unit) return error.UnsupportedQueryRequest;
 
@@ -40802,6 +41165,7 @@ pub const DB = struct {
     }
 
     pub fn collectSearchRequestTextStats(self: *DB, alloc: Allocator, req: types.SearchRequest) ![]const @import("../../search/distributed_stats.zig").TextFieldStats {
+        if (comptime storage_engine.enabled) return storage_engine.call("collectSearchRequestTextStats", .{ self, alloc, req });
         var row_policy_lease = try self.local_execution.row_policy_gate.enterUnsupportedSearch();
         defer row_policy_lease.release();
         try self.lockApplySharedForPortableRuntime();
@@ -40813,6 +41177,7 @@ pub const DB = struct {
     }
 
     pub fn preflightSearchRequest(self: *DB, alloc: Allocator, req: types.SearchRequest, max_work: u32) !db_query_search.RuntimePreflightSummary {
+        if (comptime storage_engine.enabled) return storage_engine.call("preflightSearchRequest", .{ self, alloc, req, max_work });
         return try self.preflightSearchRequestWithExecutionContext(alloc, req, max_work, .{});
     }
 
@@ -40823,6 +41188,7 @@ pub const DB = struct {
         max_work: u32,
         exec_ctx: types.ExecutionContext,
     ) !db_query_search.RuntimePreflightSummary {
+        if (comptime storage_engine.enabled) return storage_engine.call("preflightSearchRequestWithExecutionContext", .{ self, alloc, req, max_work, exec_ctx });
         return try self.collectPlanningStatsWithExecutionContext(alloc, req, max_work, exec_ctx);
     }
 
@@ -40842,6 +41208,7 @@ pub const DB = struct {
         max_work: u32,
         exec_ctx: types.ExecutionContext,
     ) !planning_stats_mod.PlanningStatsSummary {
+        if (comptime storage_engine.enabled) return storage_engine.call("collectPlanningStatsWithExecutionContext", .{ self, alloc, req, max_work, exec_ctx });
         var row_policy_lease = try self.local_execution.row_policy_gate.enterUnsupportedSearch();
         defer row_policy_lease.release();
         try self.lockApplySharedForPortableRuntime();
@@ -41454,7 +41821,8 @@ pub const DB = struct {
         return ordinals;
     }
 
-    fn searchDense(self: *DB, alloc: Allocator, req: types.SearchRequest, dense: types.DenseKnnQuery) !types.SearchResult {
+    pub fn searchDense(self: *DB, alloc: Allocator, req: types.SearchRequest, dense: types.DenseKnnQuery) !types.SearchResult {
+        if (comptime storage_engine.enabled) return storage_engine.call("searchDense", .{ self, alloc, req, dense });
         if (builtin.os.tag == .freestanding) return error.UnsupportedPlatform;
         const metric_name = self.denseQueryMetricIndexName(req);
         const start_ns = platform_time.monotonicNs();
@@ -41566,6 +41934,7 @@ pub const DB = struct {
     }
 
     pub fn searchDenseProfiled(self: *DB, alloc: Allocator, req: types.SearchRequest, dense: types.DenseKnnQuery) !db_query_search.ProfiledDenseSearchResult {
+        if (comptime storage_engine.enabled) return storage_engine.call("searchDenseProfiled", .{ self, alloc, req, dense });
         return (try self.searchDenseProfiledWithCapturedRequest(alloc, req, dense)).profiled;
     }
 
@@ -41577,6 +41946,7 @@ pub const DB = struct {
         req: types.SearchRequest,
         dense: types.DenseKnnQuery,
     ) !ProfiledDenseSearchWithCapturedRequestResult {
+        if (comptime storage_engine.enabled) return storage_engine.call("searchDenseProfiledWithCapturedRequest", .{ self, alloc, req, dense });
         var row_policy_lease = try self.local_execution.row_policy_gate.enterUnsupportedSearch();
         defer row_policy_lease.release();
         if (builtin.os.tag == .freestanding) return error.UnsupportedPlatform;
@@ -41687,7 +42057,8 @@ pub const DB = struct {
         };
     }
 
-    fn searchSparse(self: *DB, alloc: Allocator, req: types.SearchRequest, sparse: types.SparseKnnQuery) !types.SearchResult {
+    pub fn searchSparse(self: *DB, alloc: Allocator, req: types.SearchRequest, sparse: types.SparseKnnQuery) !types.SearchResult {
+        if (comptime storage_engine.enabled) return storage_engine.call("searchSparse", .{ self, alloc, req, sparse });
         if (builtin.os.tag == .freestanding) return error.UnsupportedPlatform;
         const metric_name = self.sparseQueryMetricIndexName(req);
         const start_ns = platform_time.monotonicNs();
@@ -42506,7 +42877,8 @@ pub const DB = struct {
         return null;
     }
 
-    fn trySnapshotDenseSearch(self: *DB, alloc: Allocator, req: types.SearchRequest, dense: types.DenseKnnQuery, include_profile: bool) !?SearchWithDenseProfileResult {
+    pub fn trySnapshotDenseSearch(self: *DB, alloc: Allocator, req: types.SearchRequest, dense: types.DenseKnnQuery, include_profile: bool) !?SearchWithDenseProfileResult {
+        if (comptime storage_engine.enabled) return storage_engine.call("trySnapshotDenseSearch", .{ self, alloc, req, dense, include_profile });
         const manager = self.async_context.resource_manager orelse return null;
         if (!manager.dense_query_snapshot) return null;
         if (!snapshotDenseRequestEligible(req)) {
@@ -43090,6 +43462,7 @@ pub const DB = struct {
         req: types.SearchRequest,
         keys: []const []const u8,
     ) ![]types.SearchHit {
+        if (comptime storage_engine.enabled) return storage_engine.call("graphHydrateKeysForInternalRead", .{ self, alloc, req, keys });
         lockApplyShared(self);
         defer self.core.unlockApplyShared();
         try self.requireGraphEndpointCleanupReady();
@@ -43153,6 +43526,7 @@ pub const DB = struct {
         ttl_now_ns: u64,
         max_scanned_rows: usize,
     ) !graph_mod.GraphIndex.IncomingProbeResult {
+        if (comptime storage_engine.enabled) return storage_engine.call("graphHasIncomingEdgesForInternalReadBoundedAt", .{ self, alloc, index_name, keys, expected, identity_read_generation, ttl_now_ns, max_scanned_rows });
         var row_policy_lease = try self.local_execution.row_policy_gate.enterRaw();
         defer row_policy_lease.release();
         try self.lockApplySharedForPortableRuntime();
@@ -43208,7 +43582,8 @@ pub const DB = struct {
         };
     }
 
-    fn searchGraph(self: *DB, alloc: Allocator, req: types.SearchRequest, graph_query: graph_query_mod.GraphQuery, base_hits: ?[]const types.SearchHit) !types.SearchResult {
+    pub fn searchGraph(self: *DB, alloc: Allocator, req: types.SearchRequest, graph_query: graph_query_mod.GraphQuery, base_hits: ?[]const types.SearchHit) !types.SearchResult {
+        if (comptime storage_engine.enabled) return storage_engine.call("searchGraph", .{ self, alloc, req, graph_query, base_hits });
         _ = req.index_name;
         const predicate_aware = graphRequestRequiresAdmission(req, graph_query.params.node_filter);
         var admission = GraphNodeAdmissionCache.init(self, alloc, req, graph_query.index_name, graph_query.params.node_filter);
@@ -44887,7 +45262,7 @@ const relationalColumns = local_mutation.relationalColumns;
 
 const encodeStoreLookupKeyAlloc = local_mutation.encodeStoreLookupKeyAlloc;
 
-const encodeStoreLookupKeyWithPinnedSchemaAlloc = execution_resources.encodeStoreLookupKeyWithPinnedSchemaAlloc;
+const encodeStoreLookupKeyWithPinnedSchemaAlloc = local_mutation.encodeStoreLookupKeyWithPinnedSchemaAlloc;
 
 const documentRangeLowerAlloc = local_mutation.documentRangeLowerAlloc;
 
@@ -45224,13 +45599,14 @@ fn remoteRenderConfig(
     var config: template_remote.RenderConfig = .{};
     if (maybe_db) |db| {
         if (comptime @hasField(template_remote.RenderConfig, "secret_store")) {
-            config.secret_store = db.secret_store;
+            config.secret_store = local_mutation.ownerField(db, "secret_store").*;
         }
         if (comptime @hasField(template_remote.RenderConfig, "remote_content")) {
-            config.remote_content = db.remote_content;
+            config.remote_content = local_mutation.ownerField(db, "remote_content").*;
         }
         if (comptime @hasField(template_remote.RenderConfig, "io")) {
-            config.io = db.backend_runtime.inferenceIo() orelse db.backend_runtime.io();
+            const runtime = local_mutation.ownerField(db, "backend_runtime").*;
+            config.io = runtime.inferenceIo() orelse runtime.io();
         }
     }
     if (comptime @hasField(template_remote.RenderConfig, "max_media_parts")) {
@@ -51014,9 +51390,9 @@ fn appendResolutionRecordWithHook(
     defer if (snapshot_replay) |*lease| lease.release();
 
     var cache_batch: ?resolution_runtime_mod.CandidateSource.CacheBatch = null;
-    if (ctx.cache_source) |source| if (source.vtable.embedding_cache_prepare) |prepare| {
-        cache_batch = prepare(source.ptr, batch_ctx.alloc, batch_ctx.store) catch null;
-    };
+    if (ctx.cache_source) |source| {
+        cache_batch = source.prepareCache(batch_ctx.alloc, batch_ctx.store) catch null;
+    }
     var cache_committed = false;
     defer if (cache_batch) |batch| batch.finish(batch.ptr, cache_committed);
     const extra_writes = if (cache_batch) |batch| batch.writes.len else 0;
@@ -51068,7 +51444,7 @@ fn appendResolutionRecordWithHook(
     releaseReplicationMutationShared(&replication_mutation);
 
     try deferred_replication_gates.waitForDurabilityAndAuthority(batch_ctx.replication_write_gate);
-    if (cache_batch == null) if (ctx.cache_source) |source| if (source.vtable.embedding_cache_flush) |flush| flush(source.ptr) catch {};
+    if (cache_batch == null) if (ctx.cache_source) |source| source.flushCache() catch {};
     before_handoff_publish.run();
     try publishResolutionHandoffContext(&batch_ctx, write);
     notifyResolverReplayRuntimesForCatalog(ctx.index_manager, ctx.resolution_runtime, ctx.promotion_runtime, sequence);
@@ -56204,8 +56580,9 @@ fn resetPath(path: []const u8) !void {
     try fs_paths.createDirPathPortable(io, path);
 }
 
-fn applyDerivedBatchToIndexAsync(ctx_ptr: *anyopaque, batch: derived_types.DerivedBatch, index_ref: index_manager_mod.ManagedIndexRef, token: derived_executor_mod.CatchUpSessionToken) !bool {
+pub fn applyDerivedBatchToIndexAsync(ctx_ptr: *anyopaque, batch: derived_types.DerivedBatch, index_ref: index_manager_mod.ManagedIndexRef, token: derived_executor_mod.CatchUpSessionToken) !bool {
     const ctx: *AsyncContext = @ptrCast(@alignCast(ctx_ptr));
+    if (comptime storage_engine.enabled) return storage_engine.call("applyDerivedBatchToIndexAsync", .{ ctx, batch, index_ref, token });
     if (!try batchAffectsManagedIndexForReplay(ctx.index_manager, batch, index_ref)) return false;
     if (index_ref.kind == .dense_vector and ctx.dense_admission.external_sessions.load(.acquire) != 0) {
         return error.ReplayDocumentNotVisible;

@@ -123,7 +123,9 @@ fn prepare(cursor: *Cursor, handle: *h.Handle, table_name: []const u8, request_j
     cursor.adapter = .{ .transaction = session, .handle = handle, .db = &handle.db, .table_name = try a.dupe(u8, table_name), .read_only = !h.liteOpenModeCanWrite(handle.open_mode) or (if (session) |value| value.read_only else false) };
     return request;
 }
-pub export fn antfly_db_sql_open_cursor_json(ptr: ?*anyopaque, request: h.capi.Slice, out_id: *u64, out: *h.capi.Buffer) h.capi.ErrorCode {
+pub fn antfly_db_sql_open_cursor_json(ptr: ?*anyopaque, request: h.capi.Slice, out_id: *u64, out: *h.capi.Buffer) callconv(.c) h.capi.ErrorCode {
+    if (comptime @import("../storage/engine_selection.zig").enabled)
+        return @call(.auto, @extern(*const @TypeOf(antfly_db_sql_open_cursor_json), .{ .name = "antfly_db_sql_open_cursor_json" }), .{ ptr, request, out_id, out });
     h.capi.clearLastError();
     out.* = .{};
     out_id.* = 0;
@@ -142,7 +144,9 @@ pub export fn antfly_db_sql_open_cursor_json(ptr: ?*anyopaque, request: h.capi.S
     };
     return .ok;
 }
-pub export fn antfly_db_sql_fetch_cursor_json(ptr: ?*anyopaque, id: u64, rows: u32, out: *h.capi.Buffer) h.capi.ErrorCode {
+pub fn antfly_db_sql_fetch_cursor_json(ptr: ?*anyopaque, id: u64, rows: u32, out: *h.capi.Buffer) callconv(.c) h.capi.ErrorCode {
+    if (comptime @import("../storage/engine_selection.zig").enabled)
+        return @call(.auto, @extern(*const @TypeOf(antfly_db_sql_fetch_cursor_json), .{ .name = "antfly_db_sql_fetch_cursor_json" }), .{ ptr, id, rows, out });
     h.capi.clearLastError();
     out.* = .{};
     const guard = api.enterHandlePinned(ptr, .exclusive) orelse return h.capi.recordError(.invalid_argument, @src().fn_name ++ ": invalid or closed database handle");
@@ -173,7 +177,9 @@ pub export fn antfly_db_sql_fetch_cursor_json(ptr: ?*anyopaque, id: u64, rows: u
     out.* = api.stringifyJson(.{ .result = page.output, .exhausted = page.exhausted }) catch |err| return h.capi.mapErrorContext(err, @src().fn_name);
     return .ok;
 }
-pub export fn antfly_db_sql_close_cursor(ptr: ?*anyopaque, id: u64) h.capi.ErrorCode {
+pub fn antfly_db_sql_close_cursor(ptr: ?*anyopaque, id: u64) callconv(.c) h.capi.ErrorCode {
+    if (comptime @import("../storage/engine_selection.zig").enabled)
+        return @call(.auto, @extern(*const @TypeOf(antfly_db_sql_close_cursor), .{ .name = "antfly_db_sql_close_cursor" }), .{ ptr, id });
     h.capi.clearLastError();
     const guard = api.enterHandlePinned(ptr, .exclusive) orelse return h.capi.recordError(.invalid_argument, @src().fn_name ++ ": invalid or closed database handle");
     if (guard.entry_error) |code| {
@@ -184,4 +190,12 @@ pub export fn antfly_db_sql_close_cursor(ptr: ?*anyopaque, id: u64) h.capi.Error
     const entry = guard.handle.sql_cursors.fetchRemove(id) orelse return h.capi.recordError(.invalid_argument, @src().fn_name ++ ": SQL cursor ID is unknown or closed");
     entry.value.close();
     return .ok;
+}
+
+comptime {
+    @import("exports.zig").publish(@This(), &.{
+        "antfly_db_sql_open_cursor_json",
+        "antfly_db_sql_fetch_cursor_json",
+        "antfly_db_sql_close_cursor",
+    });
 }

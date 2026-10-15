@@ -337,7 +337,7 @@ pub const Owner = struct {
         // collectRetired releases their old provider (even if addresses are reused).
         for (self.connections.items) |connection| {
             for (connection.table_handles.items) |id| {
-                const child, const slot = api.handle_registry.enter(id) orelse continue;
+                const child, const slot = api.handleRegistry().enter(id) orelse continue;
                 defer api.HandleRegistry.leave(slot);
                 h.invalidateQueryProducer(child);
             }

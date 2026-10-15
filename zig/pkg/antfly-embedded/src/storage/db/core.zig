@@ -3466,6 +3466,7 @@ pub const PinnedStoreSnapshot = union(enum) {
     lsm: lsm_backend_mod.Backend.NativeCheckpoint,
 
     pub fn deinit(self: *PinnedStoreSnapshot) void {
+        if (comptime @import("../engine_selection.zig").enabled) return @import("antfly_source_root").antfly_sources.storage_engine.call("pinnedSnapshotDeinit", .{self}) catch @panic("incompatible storage owner");
         switch (self.*) {
             .logical => |*snapshot| snapshot.deinit(),
             .lsm => |*snapshot| snapshot.deinit(),
@@ -3491,6 +3492,7 @@ pub const PinnedStoreSnapshot = union(enum) {
         cancellation: types.CancellationToken,
         sink: ?native_artifact_sink.Sink,
     ) !u64 {
+        if (comptime @import("../engine_selection.zig").enabled) return @import("antfly_source_root").antfly_sources.storage_engine.call("pinnedSnapshotMaterializeWithSink", .{ self, alloc, io, snapshot_root, cancellation, sink });
         return switch (self.*) {
             .logical => |*snapshot| try snapshot.materializeWithSink(alloc, io, snapshot_root, cancellation, sink),
             .lsm => |*snapshot| blk: {

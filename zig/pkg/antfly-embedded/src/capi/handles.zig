@@ -339,8 +339,8 @@ pub const ReadableLeaseHook = struct {
 /// `enterHandle` instead; this is for close and for internal callers (the
 /// storage-owner ABI, tests) that do not race close.
 pub fn asHandle(ptr: ?*anyopaque) ?*Handle {
-    const id = handle_registry.decode(ptr) orelse return null;
-    const slot = handle_registry.slotFor(id.index) orelse return null;
+    const id = handleRegistry().decode(ptr) orelse return null;
+    const slot = handleRegistry().slotFor(id.index) orelse return null;
     if (slot.state.load(.acquire) >> 1 != id.generation) return null;
     const handle = slot.handle.load(.acquire) orelse return null;
     if (handle.lite_connection) |connection| return connection.current orelse handle;
@@ -555,13 +555,17 @@ pub fn HandleRegistryOf(comptime T: type) type {
 pub const HandleRegistry = HandleRegistryOf(Handle);
 
 pub var handle_registry: HandleRegistry = .{};
+/// Access the one registry after the storage descriptor validates its layout.
+pub fn handleRegistry() *HandleRegistry {
+    if (comptime @import("../storage/engine_selection.zig").enabled)
+        return @ptrCast(@alignCast(@import("antfly_source_root").antfly_sources.storage_engine.call("registry", .{}) catch unreachable));
+    return &handle_registry;
+}
 
-/// Closes a handle id: rejects new calls, drains entered ones, frees it.
-/// Safe for stale ids and concurrent or repeated closes.
 pub fn closeHandleId(ptr: ?*anyopaque) void {
-    const handle, const id = handle_registry.beginClose(ptr) orelse return;
+    const handle, const id = handleRegistry().beginClose(ptr) orelse return;
     closeHandle(handle);
-    handle_registry.finishClose(id);
+    handleRegistry().finishClose(id);
 }
 
 /// The handle locks are called from arbitrary foreign threads, so they use

@@ -137,37 +137,13 @@ pub fn stepPortableDecoder(alloc: std.mem.Allocator, io: std.Io, artifact: std.I
     try cancellation.check();
     if (source.format != .portable or (source.cohort_seal == null) == (source.rewrite == null) or
         !std.mem.eql(u8, &try source.digest(alloc), &scope.source_descriptor_digest)) return error.RestoreSourceProofMissing;
-    const files = try std.fmt.allocPrint(alloc, "{s}/files", .{root});
-    defer alloc.free(files);
-    // The importer synchronizes each page's rows AND restart checkpoint before
-    // returning. This private decoder does not serve reads or acknowledge user
-    // writes: commit-time full durability would sync the very same WAL twice
-    // per page, burning the slice budget on redundant disk barriers.
-    var options = @import("antfly_local_sources").storage_db_config.portable_decoder_lsm_options_default;
-    options.read_runtime = @import("antfly_local_sources").storage_lsm_backend_storage_io.ReadRuntime.init(io);
-    var backend = try @import("antfly_local_sources").storage_lsm_backend.Backend.open(alloc, files, options);
-    defer backend.close();
-    var store = try @import("antfly_local_sources").storage_docstore.DocStore.openRuntime(alloc, try backend.runtimeStore(alloc, .{ .name = "docs" }));
-    defer store.close();
-    const portable = @import("antfly_local_sources").storage_portable_backup;
-    // A page may only advance a manifest/layout phase, without importing a
-    // row. Amortize decoder opens and coordinator RPCs across a bounded burst
-    // of these durable steps. A decoder reopen and coordinator RPC cost more
-    // than a small logical page on LSM, so allow a bounded 100 ms burst while
-    // retaining each page's own durable restart checkpoint. Cancellation is
-    // checked before every page and within the importer; neither limit may
-    // turn this into an unbounded owner request.
-    const started = std.Io.Clock.awake.now(io);
-    var complete = false;
-    for (0..16) |_| {
-        try cancellation.check();
-        complete = if (source.rewrite) |rewrite| try portable.importSourceCopyFilePage(alloc, &store, io, artifact, source.artifact_size_bytes, .{ .scope = rewrite.source_scope orelse return error.RestoreSourceProofMissing, .applied_index = rewrite.source_applied_index, .retained_start = rewrite.retained_start }, scope.digest(), 128, cancellation) else try portable.importCohortFilePage(alloc, &store, io, artifact, source.artifact_size_bytes, .{ .seal = source.cohort_seal.?, .namespace = scope.source_namespace }, scope.digest(), 128, cancellation);
-        if (complete or started.durationTo(std.Io.Clock.awake.now(io)).toNanoseconds() >= 100 * std.time.ns_per_ms) break;
-    }
-    if (complete) try bindPortableDecoderRange(alloc, &store, owner_range);
-    try fs.syncDirPortable(io, files);
-    try fs.syncDirPortable(io, root);
-    return complete;
+    const decoder = @import("antfly_local_sources").storage_portable_decoder;
+    const proof: decoder.Proof = if (source.rewrite) |rewrite| .{ .source_copy = .{
+        .scope = rewrite.source_scope orelse return error.RestoreSourceProofMissing,
+        .applied_index = rewrite.source_applied_index,
+        .retained_start = rewrite.retained_start,
+    } } else .{ .cohort = .{ .seal = source.cohort_seal.?, .namespace = scope.source_namespace } };
+    return decoder.step(alloc, io, artifact, .{ .proof = proof, .artifact_size = source.artifact_size_bytes, .scope = scope.digest(), .owner_range = owner_range, .root = root }, cancellation);
 }
 
 /// Portable archives intentionally omit routing metadata. Only a private,
@@ -175,28 +151,7 @@ pub fn stepPortableDecoder(alloc: std.mem.Allocator, io: std.Io, artifact: std.I
 /// immutable plan/bootstrap. Persist before decoder publication; a replay may
 /// confirm the same range but must never replace a different bound range.
 pub fn bindPortableDecoderRange(alloc: std.mem.Allocator, store: *@import("antfly_local_sources").storage_docstore.DocStore, owner_range: @import("antfly_local_sources").storage_docstore.ByteRange) !void {
-    const range_state = @import("antfly_local_sources").storage_db_range_state;
-    if (owner_range.end.len != 0 and std.mem.order(u8, owner_range.start, owner_range.end) != .lt) return error.RestoreStagingScopeChanged;
-    const encoded = try range_state.encodeRangeAlloc(alloc, owner_range);
-    defer alloc.free(encoded);
-    var txn = try store.beginWriteTxn();
-    var txn_open = true;
-    defer if (txn_open) txn.abort();
-    const existing = txn.get(range_state.range_key) catch |err| switch (err) {
-        error.NotFound => null,
-        else => return err,
-    };
-    if (existing) |bytes| {
-        if (!std.mem.eql(u8, bytes, encoded)) return error.RestoreStagingScopeChanged;
-        txn.abort();
-        txn_open = false;
-        try store.sync(true);
-        return;
-    }
-    try txn.put(range_state.range_key, encoded);
-    try txn.commit();
-    txn_open = false;
-    try store.sync(true);
+    return @import("antfly_local_sources").storage_portable_decoder.bindRange(alloc, store, owner_range);
 }
 
 pub fn stepWithBudget(alloc: std.mem.Allocator, io: std.Io, location: *backups.BackupLocation, source: @import("../metadata/restore_staging.zig").SourceArtifact, scope: staging.Scope, root: []const u8, cancellation: @import("antfly_cancellation").CancellationToken, byte_budget: usize) !?native.LoadedManifest {
