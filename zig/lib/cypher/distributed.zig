@@ -97,7 +97,10 @@ pub const ReadSet = struct {
         self.* = undefined;
     }
     pub fn backend(self: *ReadSet) b.Backend {
-        return .{ .ptr = self, .vtable = &.{ .bind = bind, .checkpoint = checkpoint, .scan = scan, .get = get, .expand = expand, .search = search } };
+        return .{ .ptr = self, .vtable = &.{ .bind = bind, .checkpoint = checkpoint, .scan = scan, .get = get, .expand = expand, .search = search, .set_work = setWork } };
+    }
+    fn setWork(ptr: *anyopaque, work: ?b.Work) void {
+        for (cast(ptr).snapshots) |snapshot| if (snapshot.backend.vtable.set_work) |configure| configure(snapshot.backend.ptr, work);
     }
     fn cast(ptr: *anyopaque) *ReadSet {
         return @ptrCast(@alignCast(ptr));

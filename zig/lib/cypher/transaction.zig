@@ -79,7 +79,28 @@ pub const Overlay = struct {
     }
     pub fn setExecutionWork(self: *Overlay, work: ?b.Work) void {
         self.work = work;
+        if (self.base.vtable.set_work) |configure| configure(self.base.ptr, work);
         if (work != null) self.capture_accounting = false;
+    }
+    pub fn valueWork(self: *Overlay, a: A) @import("value_work.zig").Work {
+        return .{ .a = a, .ptr = self, .charge = chargeMembership };
+    }
+    fn chargeMembership(ptr: *anyopaque, amount: usize) !void {
+        try cast(ptr).charge(amount);
+    }
+    fn remainingWork(ptr: *anyopaque) usize {
+        const self = cast(ptr);
+        if (self.work) |work| if (work.remaining) |remaining| return remaining(work.ptr);
+        return self.max_entities -| self.captured.intermediate_states;
+    }
+    fn captureValue(ptr: *anyopaque, _: v.Value) !void {
+        try cast(ptr).charge(1);
+    }
+    pub fn relabel(self: *Overlay, a: A, node: *v.Node) !void {
+        var work = self.valueWork(a);
+        var labels: std.ArrayList([]const u8) = .empty;
+        for (self.graph.?.labels) |label| if (try self.graph.?.admits(node, label.name, &work)) try labels.append(a, label.name);
+        node.labels = try labels.toOwnedSlice(a);
     }
     pub fn charge(self: *Overlay, amount: usize) !void {
         if (self.work) |work| return work.charge(work.ptr, amount);
@@ -102,6 +123,10 @@ pub const Overlay = struct {
         if (self.active) return error.CypherTransactionAlreadyActive;
         const a = self.alloc orelse return error.CypherSnapshotRequired;
         self.active = true;
+        // Native decoding and routed owner predicates run before execution.
+        // Charge that work to this capture, then release the borrowed meter.
+        if (self.base.vtable.set_work) |configure| configure(self.base.ptr, self.work orelse .{ .ptr = self, .charge = chargeMembership, .value = captureValue, .remaining = remainingWork });
+        defer if (self.base.vtable.set_work) |configure| configure(self.base.ptr, self.work);
         self.captured = if (self.base.vtable.startup_work) |work| work(self.base.ptr) else .{};
         errdefer rollback(ptr);
         for (self.graph.?.labels, 0..) |label, index| {
@@ -299,8 +324,9 @@ pub const Overlay = struct {
             examined += 1;
             last = node.value.identity.key;
             if (node.deleted) continue;
+            var membership = self.valueWork(a);
             const vertex = for (self.graph.?.labels) |label| {
-                if (self.graph.?.admits(node.value, label.name)) break true;
+                if (try self.graph.?.admits(node.value, label.name, &membership)) break true;
             } else false;
             if (vertex) try found.append(a, node.value);
         }
@@ -396,9 +422,10 @@ pub const Overlay = struct {
             tombstone.* = .{ .identity = identity };
             break :blk tombstone;
         };
+        var membership = self.valueWork(a);
         var labels: std.ArrayList([]const u8) = .empty;
         if (postimage != null) for (self.graph.?.labels) |label| {
-            if (self.graph.?.admits(copy, label.name)) try labels.append(a, label.name);
+            if (try self.graph.?.admits(copy, label.name, &membership)) try labels.append(a, label.name);
         };
         @constCast(copy).labels = labels.items;
         if (self.findNode(identity)) |node| {
@@ -424,6 +451,7 @@ pub const Overlay = struct {
                 node.dirty = true;
                 node.projection_cached = false;
                 if (self.base.vtable.normalize_node) |normalize| node.value.* = (try normalize(self.base.ptr, a, node.value, false)).*;
+                try self.relabel(a, node.value);
                 try self.refreshDocumentRelationships(a, node.value);
             },
             .relationship => |identity| {
@@ -480,9 +508,11 @@ pub const Overlay = struct {
                 const copy = try a.create(v.Node);
                 copy.* = node.*;
                 if (self.base.vtable.normalize_node) |normalize| copy.* = (try normalize(self.base.ptr, a, copy, true)).*;
+                try self.relabel(a, copy);
                 // Normalization may refresh labels. Validate the requested labels
                 // against defaults and generated values before staging the node.
-                for (node.labels) |name| if (!self.graph.?.admits(copy, name)) return error.CypherLabelPredicateViolation;
+                var membership = self.valueWork(a);
+                for (node.labels) |name| if (!try self.graph.?.admits(copy, name, &membership)) return error.CypherLabelPredicateViolation;
                 try self.appendNode(a, .{ .value = copy, .dirty = true, .created = true });
                 try self.refreshDocumentRelationships(a, copy);
             },

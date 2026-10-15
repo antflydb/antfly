@@ -97,7 +97,7 @@ fn executeBudget(budget: *Budget, backend: backend_mod.Backend, graph: catalog.G
         _ = lookup(parameters, name) orelse return error.MissingCypherParameter;
     }
     try backend.vtable.bind(backend.ptr, engine.a, graph);
-    if (backend.vtable.set_work) |configure| configure(backend.ptr, .{ .ptr = &engine, .charge = Engine.chargeWork, .value = Engine.chargeValue });
+    if (backend.vtable.set_work) |configure| configure(backend.ptr, .{ .ptr = &engine, .charge = Engine.chargeWork, .value = Engine.chargeValue, .remaining = Engine.remainingWork });
     defer if (backend.vtable.set_work) |configure| configure(backend.ptr, null);
     const writes = queryHasWrites(compiled.query);
     var transaction = false;
@@ -200,6 +200,9 @@ const Engine = struct {
     recursion: usize = 0,
     deletions: v.EntityMap(enum { pending, deleted }) = .empty,
     has_deletions: bool = false,
+    // Retained aliases keep identity; resolve postimages on access rather than
+    // walking every row after each mutation of a shared entity.
+    postimages: v.EntityMap(v.Value) = .empty,
     values: value_work.Work = undefined,
     strings: @import("string_work.zig").Runtime = undefined,
     fn chargeValue(ptr: *anyopaque, value: v.Value) !void {
@@ -207,6 +210,10 @@ const Engine = struct {
         // Planning validates and encodes properties before the durable decision.
         try self.values.output(value);
         try self.values.traversal(value);
+    }
+    fn remainingWork(ptr: *anyopaque) usize {
+        const self: *Engine = @ptrCast(@alignCast(ptr));
+        return self.limits.intermediate_states -| self.stats.intermediate_states;
     }
     fn chargeWork(ptr: *anyopaque, amount: usize) !void {
         const self: *Engine = @ptrCast(@alignCast(ptr));
@@ -343,12 +350,12 @@ const Engine = struct {
         if (self.isDeleted(.{ .node = raw })) return false;
         const node = if (self.backend.vtable.project_node) |project_node| (try project_node(self.backend.ptr, self.a, raw)) orelse return false else raw;
         const member = for (self.graph.labels) |label| {
-            if (self.graph.admits(node, label.name)) break true;
+            if (try self.graph.admits(node, label.name, &self.values)) break true;
         } else false;
         if (!member) return false;
         for (pattern.labels) |label| {
             if (self.graph.label(label) == null) return error.UnknownGraphLabel;
-            if (!self.graph.admits(node, label)) return false;
+            if (!try self.graph.admits(node, label, &self.values)) return false;
         }
         return true;
     }
@@ -500,7 +507,7 @@ const Engine = struct {
                 if (examined > self.limits.scanned_anchors -| self.stats.scanned_anchors) return error.CypherAnchorBudgetExceeded;
                 self.stats.scanned_anchors += examined;
                 for (page.items) |node| {
-                    if (!self.graph.admits(node, label.name)) continue;
+                    if (!try self.graph.admits(node, label.name, &self.values)) continue;
                     try chargeWork(self, 1 + node.identity.table.len / 64 + node.identity.key.len / 64);
                     if ((try seen.getOrPut(self.a, node.identity)).found_existing) continue;
                     if (!try self.nodeMatches(node, first)) continue;
@@ -606,7 +613,8 @@ const Engine = struct {
     }
     fn matchPath(self: *Engine, input: MatchState, path: ast.Path, mode: ast.PathMode, predicate: ?*const ast.Expr, output: *std.ArrayList(MatchState)) anyerror!void {
         const first = path.nodes[0];
-        if (first.alias) |alias| if (lookup(input.row, alias)) |bound| {
+        if (first.alias) |alias| if (lookup(input.row, alias)) |retained| {
+            const bound = try self.readValue(retained);
             if (bound == .null) return;
             if (bound != .node) return error.CypherTypeMismatch;
             if (!try self.nodeMatches(bound.node, first)) return;
@@ -644,7 +652,7 @@ const Engine = struct {
                 if (examined > self.limits.scanned_anchors -| self.stats.scanned_anchors) return error.CypherAnchorBudgetExceeded;
                 self.stats.scanned_anchors += examined;
                 for (page.items) |node| {
-                    if (!self.graph.admits(node, label.name)) continue;
+                    if (!try self.graph.admits(node, label.name, &self.values)) continue;
                     try chargeWork(self, 1 + node.identity.table.len / 64 + node.identity.key.len / 64);
                     if ((try seen.getOrPut(self.a, node.identity)).found_existing) continue;
                     if (!try self.nodeMatches(node, first)) continue;
@@ -700,8 +708,8 @@ const Engine = struct {
                 if (std.mem.eql(u8, mapping.name, type_name)) selected = true;
             }
             if (!selected) continue;
-            const outgoing = edge.direction != .in and self.graph.admits(current, mapping.source_label);
-            const incoming = edge.direction != .out and self.graph.admits(current, mapping.target_label);
+            const outgoing = edge.direction != .in and try self.graph.admits(current, mapping.source_label, &self.values);
+            const incoming = edge.direction != .out and try self.graph.admits(current, mapping.target_label, &self.values);
             if (!outgoing and !incoming) continue;
             var cursor: ?[]const u8 = null;
             while (true) {
@@ -723,7 +731,7 @@ const Engine = struct {
                     const target = if (traversing_out) relationship.target else if (incoming and relationship.target.eql(current.identity)) relationship.source else continue;
                     const reached = (try self.backend.vtable.get(self.backend.ptr, self.a, target)) orelse continue;
                     const target_label = if (traversing_out) mapping.target_label else mapping.source_label;
-                    if (!self.graph.admits(reached, target_label)) continue;
+                    if (!try self.graph.admits(reached, target_label, &self.values)) continue;
                     if (mode == .node_simple) {
                         var revisited = false;
                         for (nodes) |n| if (n.identity.eql(reached.identity)) {
@@ -777,10 +785,15 @@ const Engine = struct {
     }
     fn readValue(self: *Engine, value: v.Value) anyerror!v.Value {
         if (!(try self.values.info(value)).entities) return value;
-        if (self.backend.vtable.project_node != null or self.backend.vtable.get_relationship != null or self.has_deletions) try self.values.entityTraversal(value);
+        if (self.backend.vtable.project_node != null or self.backend.vtable.get_relationship != null or self.has_deletions or self.postimages.count() != 0) try self.values.entityTraversal(value);
         return self.readValueInner(value);
     }
-    fn readValueInner(self: *Engine, value: v.Value) anyerror!v.Value {
+    fn currentEntity(self: *Engine, value: v.Value) v.Value {
+        if (value != .node and value != .relationship) return value;
+        return self.postimages.get(v.EntityIdentity.fromValue(value) catch unreachable) orelse value;
+    }
+    fn readValueInner(self: *Engine, retained_value: v.Value) anyerror!v.Value {
+        const value = self.currentEntity(retained_value);
         if (!(try self.values.info(value)).entities) return value;
         const project_node = self.backend.vtable.project_node;
         if (self.isDeleted(value)) return switch (value) {
@@ -797,7 +810,7 @@ const Engine = struct {
             },
             else => unreachable,
         };
-        if (project_node == null and self.backend.vtable.get_relationship == null and !self.has_deletions) return value;
+        if (project_node == null and self.backend.vtable.get_relationship == null and !self.has_deletions and self.postimages.count() == 0) return value;
         return switch (value) {
             .node => |node| if (project_node) |project_read| if (try project_read(self.backend.ptr, self.a, node)) |visible| .{ .node = visible } else .null else value,
             .relationship => |retained| blk: {
@@ -852,7 +865,7 @@ const Engine = struct {
         // A statement can retain its own opaque write binding even when the
         // new values fail the read policy. Reading RHS expressions still
         // projects them; only a direct mutation target bypasses projection.
-        if (expression.value == .variable) return lookup(row, expression.value.variable) orelse error.UnboundCypherVariable;
+        if (expression.value == .variable) return self.currentEntity(lookup(row, expression.value.variable) orelse return error.UnboundCypherVariable);
         return self.eval(expression, row, null);
     }
     fn eval(self: *Engine, expression: *const ast.Expr, row: Row, group: ?[]const Row) anyerror!v.Value {
@@ -1025,7 +1038,7 @@ const Engine = struct {
                     const entry: v.Entry = switch (item) {
                         .all => continue,
                         .property => |name| .{ .name = name, .value = try self.values.property(base, name) },
-                        .variable => |name| .{ .name = name, .value = lookup(row, name) orelse return error.UnboundCypherVariable },
+                        .variable => |name| .{ .name = name, .value = try self.readValue(lookup(row, name) orelse return error.UnboundCypherVariable) },
                         .entry => |entry| .{ .name = entry.name, .value = try self.eval(entry.value, row, group) },
                     };
                     try chargeWork(self, 1 + entry.name.len / 64);
@@ -1635,7 +1648,7 @@ const Engine = struct {
                     mutable.* = .{ .identity = try self.backend.vtable.new_identity.?(self.backend.ptr, self.a, label.table, false), .labels = pattern.labels, .properties = try self.creationProperties(pattern.properties, row, merge) };
                     try self.mutate(.{ .create_node = mutable });
                     node.* = (try self.backend.vtable.get(self.backend.ptr, self.a, mutable.identity)) orelse return error.CypherDeletedEntity;
-                    for (pattern.labels) |name| if (!self.graph.admits(node.*, name)) return error.CypherLabelPredicateViolation;
+                    for (pattern.labels) |name| if (!try self.graph.admits(node.*, name, &self.values)) return error.CypherLabelPredicateViolation;
                     row = (try self.bind(row, pattern.alias, .{ .node = node.* })).?;
                 }
                 for (path.edges, relationships, 0..) |pattern, *relationship, i| {
@@ -1643,7 +1656,7 @@ const Engine = struct {
                     const mapping = self.graph.relationship(pattern.types[0]) orelse return error.UnknownGraphRelationship;
                     const source = nodes[if (pattern.direction == .out) i else i + 1];
                     const target = nodes[if (pattern.direction == .out) i + 1 else i];
-                    if (!self.graph.admits(source, mapping.source_label) or !self.graph.admits(target, mapping.target_label)) return error.CypherRelationshipEndpointMismatch;
+                    if (!try self.graph.admits(source, mapping.source_label, &self.values) or !try self.graph.admits(target, mapping.target_label, &self.values)) return error.CypherRelationshipEndpointMismatch;
                     const rel = try self.a.create(v.Relationship);
                     rel.* = .{ .identity = try self.backend.vtable.new_identity.?(self.backend.ptr, self.a, source.identity.table, true), .index = mapping.index, .type = mapping.name, .source = source.identity, .target = target.identity, .properties = try v.entityProperties(self.a, try self.creationProperties(pattern.properties, row, merge)) };
                     try self.mutate(.{ .create_relationship = rel });
@@ -1696,7 +1709,7 @@ const Engine = struct {
             node.* = base.node.*;
             node.properties = try properties.toOwnedSlice(self.a);
             var labels: std.ArrayList([]const u8) = .empty;
-            for (self.graph.labels) |label| if (self.graph.admits(node, label.name)) try labels.append(self.a, label.name);
+            for (self.graph.labels) |label| if (try self.graph.admits(node, label.name, &self.values)) try labels.append(self.a, label.name);
             node.labels = try labels.toOwnedSlice(self.a);
             return .{ .node = node };
         }
@@ -1705,100 +1718,29 @@ const Engine = struct {
         relationship.properties = try properties.toOwnedSlice(self.a);
         return .{ .relationship = relationship };
     }
-    const AliasIndex = v.EntityMap(std.ArrayList(usize));
-    fn indexAliases(self: *Engine, rows: []const Row) !AliasIndex {
-        var index: AliasIndex = .empty;
-        for (rows, 0..) |row, position| for (row) |entry| {
-            if (!(try self.values.info(entry.value)).entities) continue;
-            try self.values.entityTraversal(entry.value);
-            try self.indexAliasValue(&index, position, entry.value);
-        };
-        return index;
-    }
-    fn indexAliasValue(self: *Engine, index: *AliasIndex, position: usize, value: v.Value) anyerror!void {
-        if (!(try self.values.info(value)).entities) return;
-        switch (value) {
-            .node, .relationship => {
-                try chargeWork(self, 1);
-                const slot = try index.getOrPut(self.a, try v.EntityIdentity.fromValue(value));
-                if (!slot.found_existing) slot.value_ptr.* = .empty;
-                // A row can bind an entity repeatedly through paths/containers.
-                const positions = slot.value_ptr;
-                if (positions.items.len == 0 or positions.items[positions.items.len - 1] != position) try positions.append(self.a, position);
-            },
-            .path => |path| {
-                for (path.nodes) |node| try self.indexAliasValue(index, position, .{ .node = node });
-                for (path.relationships) |edge| try self.indexAliasValue(index, position, .{ .relationship = edge });
-            },
-            .list => |items| for (items) |item| try self.indexAliasValue(index, position, item),
-            .map => |map_entries| for (map_entries) |entry| try self.indexAliasValue(index, position, entry.value),
-            else => unreachable,
-        }
-    }
-    fn refreshRow(self: *Engine, row: Row, target: v.EntityIdentity, updated: v.Value) !Row {
-        const result = try self.a.dupe(v.Entry, row);
-        for (result) |*entry| {
-            if (!(try self.values.info(entry.value)).entities) continue;
-            try self.values.entityTraversal(entry.value);
-            entry.value = try self.refreshValue(entry.value, target, updated);
-        }
-        return result;
-    }
-    fn refreshValue(self: *Engine, value: v.Value, target: v.EntityIdentity, updated: v.Value) anyerror!v.Value {
-        if (!(try self.values.info(value)).entities) return value;
-        if (value == .node or value == .relationship) return if ((try v.EntityIdentity.fromValue(value)).eql(target)) updated else value;
-        return switch (value) {
-            .path => |path| blk: {
-                const nodes = try self.a.alloc(*const v.Node, path.nodes.len);
-                for (path.nodes, nodes) |node, *out| out.* = (try self.refreshValue(.{ .node = node }, target, updated)).node;
-                const relationships = try self.a.alloc(*const v.Relationship, path.relationships.len);
-                for (path.relationships, relationships) |relationship, *out| out.* = (try self.refreshValue(.{ .relationship = relationship }, target, updated)).relationship;
-                break :blk .{ .path = .{ .nodes = nodes, .relationships = relationships } };
-            },
-            .list => |items| blk: {
-                const out = try self.a.alloc(v.Value, items.len);
-                for (items, out) |item, *cell| cell.* = try self.refreshValue(item, target, updated);
-                break :blk .{ .list = out };
-            },
-            .map => |map_entries| blk: {
-                const refreshed = try self.a.dupe(v.Entry, map_entries);
-                for (refreshed) |*entry| entry.value = try self.refreshValue(entry.value, target, updated);
-                break :blk .{ .map = refreshed };
-            },
-            else => value,
-        };
-    }
     fn assign(self: *Engine, rows: []const Row, assignments: []const ast.Assignment) ![]const Row {
-        const output = try self.a.dupe(Row, rows);
-        const aliases = try self.indexAliases(output);
-        for (output) |*row| for (assignments) |assignment| {
+        for (rows) |row| for (assignments) |assignment| {
             const base_expression = if (assignment.target.value == .property) assignment.target.value.property.base else assignment.target;
-            const base = try self.mutationEntity(base_expression, row.*);
+            const base = try self.mutationEntity(base_expression, row);
             if (base == .null) continue;
             if (base != .node and base != .relationship) return error.CypherTypeMismatch;
             try self.requireLiveContents(base);
             if (base == .relationship and base.relationship.ownership != .explicit) return error.CypherDerivedRelationshipMutation;
-            const value = try self.eval(assignment.value, row.*, null);
+            const value = try self.eval(assignment.value, row, null);
             const properties: []const v.Entry = if (assignment.target.value == .property) try self.a.dupe(v.Entry, &.{.{ .name = assignment.target.value.property.name, .value = value }}) else if (value == .map) value.map else return error.CypherTypeMismatch;
             const target = try v.EntityIdentity.fromValue(base);
             const replace_all = assignment.target.value != .property and !assignment.merge;
             try self.mutate(.{ .set_properties = .{ .target = target, .properties = properties, .replace = replace_all } });
             const updated: v.Value = if (base == .node) .{ .node = (try self.backend.vtable.get(self.backend.ptr, self.a, base.node.identity)) orelse return error.CypherDeletedEntity } else try self.updatedProperties(base, properties, replace_all);
-            // Property mutation preserves entity identities, so this index
-            // remains valid throughout the complete SET/REMOVE clause.
-            if (aliases.get(target)) |positions| for (positions.items) |position| {
-                output[position] = try self.refreshRow(output[position], target, updated);
-            };
+            try self.postimages.put(self.a, target, updated);
         };
-        return output;
+        return rows;
     }
     fn remove(self: *Engine, rows: []const Row, expressions: []const *const ast.Expr) ![]const Row {
-        const output = try self.a.dupe(Row, rows);
-        const aliases = try self.indexAliases(output);
-        for (output) |*row| for (expressions) |expression| {
+        for (rows) |row| for (expressions) |expression| {
             if (expression.value != .property) return error.CypherRemoveRequiresProperty;
             const property = expression.value.property;
-            const base = try self.mutationEntity(property.base, row.*);
+            const base = try self.mutationEntity(property.base, row);
             if (base == .null) continue;
             if (base != .node and base != .relationship) return error.CypherTypeMismatch;
             try self.requireLiveContents(base);
@@ -1806,12 +1748,8 @@ const Engine = struct {
             const target = try v.EntityIdentity.fromValue(base);
             try self.mutate(.{ .remove_properties = .{ .target = target, .names = &.{property.name} } });
             const updated: v.Value = if (base == .node) .{ .node = (try self.backend.vtable.get(self.backend.ptr, self.a, base.node.identity)) orelse return error.CypherDeletedEntity } else try self.updatedProperties(base, &.{.{ .name = property.name, .value = .null }}, false);
-            // Property mutation preserves entity identities, so this index
-            // remains valid throughout the complete SET/REMOVE clause.
-            if (aliases.get(target)) |positions| for (positions.items) |position| {
-                output[position] = try self.refreshRow(output[position], target, updated);
-            };
+            try self.postimages.put(self.a, target, updated);
         };
-        return output;
+        return rows;
     }
 };

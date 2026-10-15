@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import json
 import uuid
 from contextlib import closing
 
@@ -998,3 +999,46 @@ def test_native_capture_and_bulk_delete_fit_the_default_memory_ceiling(require_n
         assert deleted["rows"][0][0]["value"] == "8000"
         assert deleted["stats"]["intermediate_states"] < 400000
         assert database.sql("SELECT count(*) FROM docs")["rows"] == [["0"]]
+
+
+def test_nested_label_predicates_share_capture_and_runtime_work_limits(require_native, aflite_path):
+    meta = {f"field{i}": i for i in range(4000)}
+    with af.create_hosted(aflite_path) as database:
+        database.sql("CREATE TABLE docs (id TEXT, meta JSONB)")
+        database.sql("INSERT INTO docs (id,meta) VALUES ('one','" + json.dumps(meta) + "'::jsonb)")
+        database.graph_catalog_json(
+            {
+                "action": "put",
+                "name": "g",
+                "definition": {"labels": [{"name": "D", "table": "docs", "where": {"meta": meta}}]},
+            }
+        )
+        with pytest.raises(af.GraphError) as limited:
+            database.cypher_json("g", {"query": "MATCH (n:D) RETURN count(*)", "limits": {"intermediate_states": 100}})
+        assert limited.value.graph_code == "CypherStateBudgetExceeded"
+        result = database.cypher_json("g", {"query": "MATCH (n:D) RETURN count(*)"})
+        assert result["rows"][0][0]["value"] == "1"
+        assert 4000 < result["stats"]["intermediate_states"] < 400000
+
+
+def test_repeated_updates_of_shared_aliases_scale_linearly(require_native, aflite_path):
+    with af.create_hosted(aflite_path) as database:
+        database.sql("CREATE TABLE docs (id TEXT, age BIGINT)")
+        database.sql("INSERT INTO docs (id,age) VALUES ('one',0)")
+        database.graph_catalog_json(
+            {"action": "put", "name": "g", "definition": {"labels": [{"name": "D", "table": "docs"}]}}
+        )
+        previous = 0
+        for count in [400, 800, 1600]:
+            database.sql("UPDATE docs SET age=0 WHERE id='one'")
+            result = database.cypher_json(
+                "g",
+                {
+                    "query": f"MATCH (n:D) WITH n,[{{node:n}}] AS aliases,properties(n) AS snapshot UNWIND range(1,{count}) AS i SET n.age=n.age+1 RETURN count(*),sum(aliases[0].node.age),sum(snapshot.age)"
+                },
+            )
+            assert [cell["value"] for cell in result["rows"][0]] == [str(count), str(count * count), "0"]
+            work = result["stats"]["intermediate_states"]
+            if previous:
+                assert work < previous * 3
+            previous = work

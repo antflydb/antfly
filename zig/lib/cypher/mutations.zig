@@ -62,7 +62,8 @@ pub fn build(a: A, graph: root.catalog.Graph, overlay: *root.transaction.Overlay
         if (node.deleted) {
             if (!node.created) try entry.deletes.append(a, node.value.identity.key);
         } else {
-            for (node.value.labels) |label| if (!graph.admits(node.value, label)) return error.CypherLabelPredicateMismatch;
+            var membership = overlay.valueWork(a);
+            for (node.value.labels) |label| if (!try graph.admits(node.value, label, &membership)) return error.CypherLabelPredicateMismatch;
             try overlay.chargeValue(.{ .map = node.value.properties });
             try entry.writes.append(a, .{ .key = node.value.identity.key, .value = try document(a, node.value) });
         }

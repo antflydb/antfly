@@ -1,15 +1,15 @@
 import { Button, Card, CardContent, CardHeader, CardTitle, Label } from "@antfly/design-system";
 import {
-  GraphExecutionError,
   type GraphCatalogEntry,
+  GraphExecutionError,
   type GraphQueryRequest,
   type GraphQueryResult,
   type GraphValue,
 } from "@antfly/sdk";
 import { useContext, useEffect, useMemo, useRef, useState } from "react";
 import { useNavigate } from "react-router-dom";
-import { useApi } from "@/hooks/use-api-config";
 import { AuthContext } from "@/contexts/auth-context";
+import { useApi } from "@/hooks/use-api-config";
 
 function byteOffsetToUtf16(text: string, offset: number): number {
   let bytes = 0;
@@ -22,6 +22,34 @@ function byteOffsetToUtf16(text: string, offset: number): number {
     index += scalar.length;
   }
   return index;
+}
+
+// Only remove the optional execution mode. The compiler classifies effects;
+// this trivia scan keeps mode buttons usable with leading nested comments.
+export function graphQueryStatement(query: string): string {
+  let position = 0;
+  while (position < query.length) {
+    if (/\s/.test(query[position])) position++;
+    else if (query.startsWith("//", position)) {
+      const end = query.indexOf("\n", position + 2);
+      position = end < 0 ? query.length : end + 1;
+    } else if (query.startsWith("/*", position)) {
+      let depth = 1;
+      position += 2;
+      while (position < query.length && depth > 0) {
+        if (query.startsWith("/*", position)) {
+          depth++;
+          position += 2;
+        } else if (query.startsWith("*/", position)) {
+          depth--;
+          position += 2;
+        } else position++;
+      }
+      if (depth > 0) return query;
+    } else break;
+  }
+  const mode = /^(?:EXPLAIN|PROFILE)\b/i.exec(query.slice(position));
+  return mode ? query.slice(position + mode[0].length) : query;
 }
 
 const quote = (name: string) => `\`${name.replaceAll("`", "``")}\``;
@@ -176,6 +204,7 @@ export default function GraphQueryWorkbench({
   const [view, setView] = useState<"Table" | "Graph" | "JSON" | "Explain">("Table");
   const [busy, setBusy] = useState(false);
   const [message, setMessage] = useState("");
+  // biome-ignore lint/correctness/useExhaustiveDependencies: Reset requests and results whenever their authority or graph binding changes.
   useEffect(() => {
     sequence.current += 1;
     active.current?.abort();
@@ -245,7 +274,7 @@ export default function GraphQueryWorkbench({
       setMessage("Inspect the previous write transaction before submitting another statement.");
       return;
     }
-    const statement = query.replace(/^\s*(?:EXPLAIN|PROFILE)\s+/i, "");
+    const statement = graphQueryStatement(query);
     request.query = mode === "run" ? query : `${mode.toUpperCase()} ${statement}`;
     const token = ++sequence.current;
     const controller = new AbortController();
@@ -257,15 +286,15 @@ export default function GraphQueryWorkbench({
     setSelectedNode(undefined);
     setSelectedEntity(undefined);
     let writeId: string | undefined;
+    let submittedQuery = request.query;
     try {
-      const text = statement.replace(
-        /'(?:[^'\\]|\\.)*'|"(?:[^"\\]|\\.)*"|`(?:[^`]|``)*`|\/\*[\s\S]*?\*\/|\/\/[^\n]*/g,
-        " "
-      );
-      if (mode !== "explain" && /\b(?:CREATE|MERGE|SET|REMOVE|DELETE)\b/i.test(text)) {
+      // Classification comes from the compiler, including nested comments and
+      // escaped identifiers. Persist a recovery ID before sending any write.
+      if (mode !== "explain") {
+        submittedQuery = `EXPLAIN ${statement}`;
         const preview = await client.graphs.execute(
           graph.name,
-          { ...request, query: `EXPLAIN ${statement}` },
+          { ...request, query: submittedQuery },
           { signal: controller.signal }
         );
         if (sequence.current !== token) return;
@@ -279,6 +308,7 @@ export default function GraphQueryWorkbench({
           });
         }
       }
+      submittedQuery = request.query;
       const response = await client.graphs.execute(graph.name, request, {
         signal: controller.signal,
       });
@@ -350,10 +380,8 @@ export default function GraphQueryWorkbench({
         ) {
           const encoder = new TextEncoder();
           const prefixDifference =
-            mode === "run"
-              ? 0
-              : encoder.encode(request.query.slice(0, request.query.length - statement.length))
-                  .length - encoder.encode(query.slice(0, query.length - statement.length)).length;
+            encoder.encode(submittedQuery.slice(0, submittedQuery.length - statement.length))
+              .length - encoder.encode(query.slice(0, query.length - statement.length)).length;
           const start = byteOffsetToUtf16(
             query,
             Math.max(0, error.diagnostic.span.start - prefixDifference)
@@ -704,13 +732,16 @@ export default function GraphQueryWorkbench({
                     </thead>
                     <tbody>
                       {result.rows.slice(0, 1000).map((row, index) => (
+                        // biome-ignore lint/suspicious/noArrayIndexKey: Rows belong to an immutable result snapshot and have no unique key.
                         <tr key={index}>
                           {row.map((value, column) => (
+                            // biome-ignore lint/suspicious/noArrayIndexKey: Duplicate column names are legal; positions are fixed in a result.
                             <td key={column} className="max-w-80 whitespace-pre-wrap border-b p-2">
                               {["node", "relationship", "path", "map", "list"].includes(
                                 value.type
                               ) ? (
                                 <button
+                                  type="button"
                                   className="text-left underline decoration-dotted"
                                   onClick={() => {
                                     setSelectedEntity(value);
@@ -767,7 +798,7 @@ export default function GraphQueryWorkbench({
                       onChange={(event) => setZoom(Number(event.target.value))}
                     />
                   </label>
-                  <div className="flex flex-wrap gap-2" aria-label="Graph navigation">
+                  <div className="flex flex-wrap gap-2" role="group" aria-label="Graph navigation">
                     {[
                       ["Pan left", -80, 0],
                       ["Pan right", 80, 0],
@@ -921,7 +952,8 @@ export default function GraphQueryWorkbench({
                         );
                       })}
                       {visual.nodes.map(([id, node]) => {
-                        const p = positions.get(id)!;
+                        const p = positions.get(id);
+                        if (!p) return null;
                         return (
                           <g
                             key={id}

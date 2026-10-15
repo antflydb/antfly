@@ -21,11 +21,16 @@ test "graph definition binds equality label predicates and rejects ambiguous map
     defer arena.deinit();
     const a = arena.allocator();
     const graph = try catalog.parseDefinition(a, "people", 2, 7, "{\"labels\":[{\"name\":\"Employee\",\"table\":\"people\",\"where\":{\"kind\":\"employee\"}}]}");
+    const Counter = struct {
+        fn charge(_: *anyopaque, _: usize) !void {}
+    };
+    var token: u8 = 0;
+    var work: @import("value_work.zig").Work = .{ .a = a, .ptr = &token, .charge = Counter.charge };
     const employee: v.Node = .{ .identity = .{ .table = "people", .key = "a" }, .properties = &.{.{ .name = "kind", .value = .{ .string = "employee" } }} };
-    try std.testing.expect(graph.admits(&employee, "Employee"));
+    try std.testing.expect(try graph.admits(&employee, "Employee", &work));
     var other = employee;
     other.identity.table = "other";
-    try std.testing.expect(!graph.admits(&other, "Employee"));
+    try std.testing.expect(!try graph.admits(&other, "Employee", &work));
     try std.testing.expectError(error.DuplicateGraphLabel, catalog.parseDefinition(a, "bad", 1, 1, "{\"labels\":[{\"name\":\"D\",\"table\":\"a\"},{\"name\":\"D\",\"table\":\"b\"}]}"));
     try std.testing.expectError(error.InvalidGraphDefinition, catalog.parseDefinition(a, "bad", 1, 1, "{\"labels\":[{\"name\":\"D\",\"table\":\"a\",\"where\":false}]}"));
     const scoped = try catalog.parseDefinition(a, "scoped", 3, 1, "{\"labels\":[{\"name\":\"D\",\"table\":{\"database\":\"research\",\"namespace\":\"papers\",\"table\":\"docs\"}}]}");
@@ -34,4 +39,45 @@ test "graph definition binds equality label predicates and rejects ambiguous map
     try std.testing.expectEqualStrings("docs", scoped.labels[0].table);
     try std.testing.expectError(error.AmbiguousGraphRelationship, catalog.parseDefinition(a, "bad", 1, 1, "{\"labels\":[{\"name\":\"D\",\"table\":\"docs\"}],\"relationships\":[{\"name\":\"FIRST\",\"index\":\"links\",\"source_label\":\"D\",\"target_label\":\"D\",\"stored_type\":\"cites\"},{\"name\":\"SECOND\",\"index\":\"links\",\"source_label\":\"D\",\"target_label\":\"D\",\"stored_type\":\"cites\"}]}"));
     try std.testing.expectError(error.UnknownField, catalog.parseDefinition(a, "bad", 1, 1, "{\"labels\":[{\"name\":\"D\",\"table\":{\"table\":\"docs\",\"table_id\":42}}]}"));
+}
+
+test "nested label predicates use linear indexed equality with work and cancellation" {
+    const Counter = struct {
+        units: usize = 0,
+        limit: usize = 1_000_000,
+        canceled: bool = false,
+        fn charge(ptr: *anyopaque, amount: usize) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (self.canceled) return error.Canceled;
+            if (amount > self.limit -| self.units) return error.CypherStateBudgetExceeded;
+            self.units += amount;
+        }
+    };
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const predicate = try a.alloc(v.Entry, 4000);
+    const properties = try a.alloc(v.Entry, predicate.len);
+    for (predicate, 0..) |*entry, i| {
+        entry.* = .{ .name = try std.fmt.allocPrint(a, "field:{d}", .{i}), .value = .{ .integer = @intCast(i) } };
+        properties[properties.len - 1 - i] = entry.*;
+    }
+    const selected: catalog.Graph = .{ .name = "g", .incarnation = 1, .revision = 1, .relationships = &.{}, .labels = &.{.{ .name = "D", .table = "docs", .predicate = &.{.{ .name = "meta", .value = .{ .map = predicate } }} }} };
+    const node: v.Node = .{ .identity = .{ .table = "docs", .key = "a" }, .properties = &.{.{ .name = "meta", .value = .{ .map = properties } }} };
+    var counter: Counter = .{};
+    var work: @import("value_work.zig").Work = .{ .a = a, .ptr = &counter, .charge = Counter.charge };
+    try std.testing.expect(try selected.admits(&node, "D", &work));
+    try std.testing.expect(counter.units < 100_000);
+    counter.limit = counter.units + 10;
+    try std.testing.expectError(error.CypherStateBudgetExceeded, selected.admits(&node, "D", &work));
+    counter.canceled = true;
+    try std.testing.expectError(error.Canceled, selected.admits(&node, "D", &work));
+    counter = .{ .limit = 10 };
+    const nonmember: v.Node = .{ .identity = node.identity };
+    var uncached: @import("value_work.zig").Work = .{ .a = a, .ptr = &counter, .charge = Counter.charge };
+    try std.testing.expect(!try selected.admits(&nonmember, "D", &uncached));
+    counter = .{};
+    const left: v.Value = .{ .map = &.{ .{ .name = "a", .value = .null }, .{ .name = "b", .value = .{ .integer = 1 } } } };
+    try std.testing.expectEqual(@as(?bool, null), try work.equal(left, left));
+    try std.testing.expectEqual(@as(?bool, false), try work.equal(left, .{ .map = &.{ .{ .name = "b", .value = .{ .integer = 2 } }, .{ .name = "a", .value = .null } } }));
 }

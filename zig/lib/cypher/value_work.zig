@@ -210,12 +210,46 @@ pub const Work = struct {
     }
     pub fn equal(self: *Work, a: v.Value, b: v.Value) !?bool {
         try self.charge(self.ptr, 1);
+        // Missing properties and incompatible shapes cannot match. Do not
+        // traverse a large catalog predicate for each obvious nonmember.
+        if (a == .null or b == .null) return null;
+        if (v.Value.rank(a) != v.Value.rank(b)) return false;
+        if (a == .map and a.map.len != b.map.len) return false;
+        if (a == .list and a.list.len != b.list.len) return false;
         const left = try self.info(a);
         const right = try self.info(b);
-        if (a == .null or b == .null) return null;
         if (identical(a, b)) return if (left.unknown) null else true;
-        try self.charge(self.ptr, left.comparison_work +| right.comparison_work);
-        return v.Value.equal(a, b);
+        try self.charge(self.ptr, left.work +| right.work);
+        return self.equalInner(a, b, false);
+    }
+    fn equalInner(self: *Work, a: v.Value, b: v.Value, nulls_equal: bool) anyerror!?bool {
+        try self.charge(self.ptr, 1);
+        if (a == .null or b == .null) return if (nulls_equal) a == .null and b == .null else null;
+        if (a == .map and b == .map) {
+            if (a.map.len != b.map.len) return false;
+            var unknown = false;
+            for (a.map) |entry| {
+                const other = (try self.lookup(b.map, entry.name)) orelse return false;
+                if (try self.equalInner(entry.value, other, nulls_equal)) |same| {
+                    if (!same) return false;
+                } else unknown = true;
+            }
+            return if (unknown) null else true;
+        }
+        if (a == .list and b == .list) {
+            if (a.list.len != b.list.len) return false;
+            var unknown = false;
+            for (a.list, b.list) |left, right| {
+                if (try self.equalInner(left, right, nulls_equal)) |same| {
+                    if (!same) return false;
+                } else unknown = true;
+            }
+            return if (unknown) null else true;
+        }
+        // Scalar/path equality has bounded traversal, with checkpoints above
+        // each container member. Structural metadata reserves byte/path work.
+        try self.charge(self.ptr, (try self.info(a)).work +| (try self.info(b)).work);
+        return if (nulls_equal) v.Value.eql(a, b) else v.Value.equal(a, b);
     }
     pub fn eql(self: *Work, a: v.Value, b: v.Value) !bool {
         try self.charge(self.ptr, 1);
@@ -223,8 +257,8 @@ pub const Work = struct {
         const right = try self.info(b);
         if (left.hash != right.hash) return false;
         if (identical(a, b)) return true;
-        try self.charge(self.ptr, left.comparison_work +| right.comparison_work);
-        return v.Value.eql(a, b);
+        try self.charge(self.ptr, left.work +| right.work);
+        return (try self.equalInner(a, b, true)).?;
     }
     pub fn order(self: *Work, a: v.Value, b: v.Value) !std.math.Order {
         try self.charge(self.ptr, 1);

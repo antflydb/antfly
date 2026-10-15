@@ -529,22 +529,43 @@ def main():
                             {"query": "MATCH ()-[r:LINK]->() RETURN r"},
                         ),
                     )
-                    session = call(
-                        "/sql", {"statement": "BEGIN ISOLATION LEVEL READ COMMITTED"}
-                    )["session_id"]
-                    try:
-                        call(
+                    # This fixture never commits. A transient coherent-cut
+                    # failure can restart the complete transaction after its
+                    # staged changes have been explicitly rolled back.
+                    for attempt in range(40):
+                        session = call(
                             "/sql",
-                            {
-                                "statement": f"UPDATE {owned_table} SET ref=NULL WHERE _id='mixed/a'",
-                                "session_id": session,
-                            },
-                        )
-                        assert call(
-                            "/sql", {"statement": mixed_count, "session_id": session}
-                        )["rows"] == [["1"]]
-                    finally:
-                        call("/sql", {"statement": "ROLLBACK", "session_id": session})
+                            {"statement": "BEGIN ISOLATION LEVEL READ COMMITTED"},
+                        )["session_id"]
+                        try:
+                            call(
+                                "/sql",
+                                {
+                                    "statement": f"UPDATE {owned_table} SET ref=NULL WHERE _id='mixed/a'",
+                                    "session_id": session,
+                                },
+                            )
+                            assert call(
+                                "/sql",
+                                {"statement": mixed_count, "session_id": session},
+                            )["rows"] == [["1"]]
+                            break
+                        except AssertionError as error:
+                            detail = error.args[0]
+                            if not isinstance(detail, tuple) or len(detail) != 3:
+                                raise
+                            failure = json.loads(detail[2])
+                            if (
+                                attempt == 39
+                                or failure.get("code") not in ("53300", "40001")
+                                or failure.get("retryable") is not True
+                            ):
+                                raise
+                        finally:
+                            call(
+                                "/sql", {"statement": "ROLLBACK", "session_id": session}
+                            )
+                        time.sleep(0.1)
                     mixed = call(
                         f"/graphs/{mixed_graph}/query",
                         {

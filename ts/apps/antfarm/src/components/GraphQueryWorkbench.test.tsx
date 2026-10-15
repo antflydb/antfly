@@ -1,9 +1,9 @@
+import { type GraphCatalogEntry, GraphExecutionError, type GraphQueryResult } from "@antfly/sdk";
 import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { GraphExecutionError, type GraphCatalogEntry, type GraphQueryResult } from "@antfly/sdk";
-import GraphQueryWorkbench from "./GraphQueryWorkbench";
 import { AuthContext, type AuthContextType } from "../contexts/auth-context";
+import GraphQueryWorkbench, { graphQueryStatement } from "./GraphQueryWorkbench";
 
 const mocks = vi.hoisted(() => ({
   client: { graphs: { execute: vi.fn(), writeStatus: vi.fn() }, tables: { get: vi.fn() } },
@@ -47,6 +47,7 @@ function response(): GraphQueryResult {
     graph_incarnation: "1",
     graph_revision: "1",
     complete: true,
+    read_only: true,
   };
 }
 const show = (selected = "knowledge") => (
@@ -55,6 +56,14 @@ const show = (selected = "knowledge") => (
   </MemoryRouter>
 );
 describe("graph query workbench", () => {
+  it("removes modes after nested comments without inspecting statement keywords", () => {
+    expect(graphQueryStatement("/* a /* b */ c */ PROFILE/* mode */ MATCH (n) RETURN n")).toBe(
+      "/* mode */ MATCH (n) RETURN n"
+    );
+    expect(graphQueryStatement("/* a /* b */ c */ MATCH (n) RETURN n")).toBe(
+      "/* a /* b */ c */ MATCH (n) RETURN n"
+    );
+  });
   beforeEach(() => {
     localStorage.clear();
     mocks.client.graphs.execute.mockReset().mockResolvedValue(response());
@@ -177,7 +186,7 @@ describe("graph query workbench", () => {
     render(show());
     const editor = screen.getByLabelText("Cypher statement") as HTMLTextAreaElement;
     fireEvent.change(editor, { target: { value: source } });
-    fireEvent.click(screen.getByRole("button", { name: "Explain" }));
+    fireEvent.click(screen.getByRole("button", { name: "Run" }));
     await screen.findByText("Unknown variable nope at line 1, column 13");
     expect(editor.selectionStart).toBe(start);
     expect(editor.selectionEnd).toBe(start + 4);
@@ -217,7 +226,7 @@ describe("graph query workbench", () => {
         ],
       },
     };
-    mocks.client.graphs.execute.mockResolvedValueOnce({
+    mocks.client.graphs.execute.mockResolvedValueOnce(response()).mockResolvedValueOnce({
       ...response(),
       rows: [
         [
@@ -250,7 +259,7 @@ describe("graph query workbench", () => {
     mocks.client.graphs.execute.mockResolvedValueOnce(hydrated);
     fireEvent.click(screen.getByRole("button", { name: "Expand neighbors" }));
     await screen.findByText(/Added up to 50 neighbor rows/);
-    const request = mocks.client.graphs.execute.mock.calls[1][1];
+    const request = mocks.client.graphs.execute.mock.calls[2][1];
     expect(request.query).toContain("OPTIONAL MATCH");
     expect(request.query).toContain("LIMIT 50");
     expect(request.parameters).toEqual({ key: "b" });
@@ -258,7 +267,7 @@ describe("graph query workbench", () => {
     expect(screen.getByText(/9223372036854775807/).textContent).toContain("9223372036854775807");
   });
 
-  it("retains the write ID after cancellation and inspects its outcome without replay", async () => {
+  it("retains the write ID after nested-comment writes are canceled and inspects without replay", async () => {
     mocks.client.graphs.execute
       .mockResolvedValueOnce({ ...response(), read_only: false })
       .mockImplementationOnce(
@@ -273,7 +282,7 @@ describe("graph query workbench", () => {
       );
     render(show());
     fireEvent.change(screen.getByLabelText("Cypher statement"), {
-      target: { value: "CREATE (n:Document {id:'new'}) RETURN n" },
+      target: { value: "/* outer /* inner */ ' */ CREATE (n:Document {id:'new'}) RETURN n // '" },
     });
     fireEvent.click(screen.getByRole("button", { name: "Run" }));
     await waitFor(() => expect(mocks.client.graphs.execute).toHaveBeenCalledTimes(2));
@@ -355,7 +364,7 @@ describe("graph query workbench", () => {
     fireEvent.click(screen.getByRole("button", { name: "Run" }));
     await screen.findByText(/The write committed, but its result could not be delivered/);
     const stored = JSON.parse(
-      localStorage.getItem(`antfly:graph-write:${window.location.origin}`)!
+      localStorage.getItem(`antfly:graph-write:${window.location.origin}`) ?? "{}"
     );
     expect(stored.disposition).toBe("committed");
     expect(mocks.client.graphs.execute).toHaveBeenCalledTimes(2);
@@ -412,16 +421,16 @@ describe("graph query workbench", () => {
     fireEvent.click(screen.getByRole("tab", { name: "Graph" }));
     const first = screen
       .getByRole("button", { name: "Inspect relationship edge-1" })
-      .querySelector("path")!
-      .getAttribute("d");
+      .querySelector("path")
+      ?.getAttribute("d");
     const second = screen
       .getByRole("button", { name: "Inspect relationship edge-2" })
-      .querySelector("path")!
-      .getAttribute("d");
+      .querySelector("path")
+      ?.getAttribute("d");
     const loop = screen
       .getByRole("button", { name: "Inspect relationship loop" })
-      .querySelector("path")!
-      .getAttribute("d");
+      .querySelector("path")
+      ?.getAttribute("d");
     expect(first).not.toBe(second);
     expect(loop).toContain(" C ");
     fireEvent.change(screen.getByLabelText("Graph zoom"), { target: { value: "2" } });

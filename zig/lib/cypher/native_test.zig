@@ -22,6 +22,7 @@ const Edge = struct { source: []const u8, target: []const u8, edge_type: []const
 const Database = struct {
     open_mode: enum { writer, query_readonly } = .query_readonly,
     name: []const u8,
+    document_json: ?[]const u8 = null,
     core: Core = .{},
     pub fn hasRetainedQueryCut(db: *const @This()) bool {
         return db.open_mode == .query_readonly;
@@ -64,7 +65,7 @@ const Database = struct {
             const order = std.mem.order(u8, document.key, from);
             if (order == .lt or (order == .eq and !options.inclusive_from)) continue;
             if (output.items.len >= options.limit) break;
-            try output.append(a, .{ .id = try a.dupe(u8, document.key), .json = try a.dupe(u8, document.json) });
+            try output.append(a, .{ .id = try a.dupe(u8, document.key), .json = try a.dupe(u8, db.document_json orelse document.json) });
         }
         return .{ .documents = try output.toOwnedSlice(a) };
     }
@@ -75,7 +76,7 @@ const Database = struct {
         }
     };
     pub fn getDocument(db: *@This(), a: A, key: []const u8, _: anytype) !?Lookup {
-        for (documents) |document| if (std.mem.eql(u8, document.table, db.name) and std.mem.eql(u8, document.key, key)) return .{ .json = try a.dupe(u8, document.json) };
+        for (documents) |document| if (std.mem.eql(u8, document.table, db.name) and std.mem.eql(u8, document.key, key)) return .{ .json = try a.dupe(u8, db.document_json orelse document.json) };
         return null;
     }
     const Page = struct {
@@ -225,4 +226,53 @@ test "native graph paging preserves parallel and cross-table relationships and a
     docs.open_mode = .query_readonly;
     authority.revocations = 1;
     try std.testing.expectError(error.PermissionDenied, root.runtime.execute(std.testing.allocator, native.backend(), graph, &compiled, &.{}, .{}));
+}
+
+test "native capture and routed owner predicates share the statement work ceiling" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const entries = try a.alloc(v.Entry, 4000);
+    for (entries, 0..) |*entry, i| entry.* = .{ .name = try std.fmt.allocPrint(a, "field:{d}", .{i}), .value = .{ .integer = @intCast(i) } };
+    const selected: root.catalog.Graph = .{ .name = "g", .incarnation = 1, .revision = 1, .relationships = &.{}, .labels = &.{.{ .name = "D", .table = "docs", .predicate = &.{.{ .name = "meta", .value = .{ .map = entries } }} }} };
+    var docs: Database = .{ .name = "docs", .document_json = try std.json.Stringify.valueAlloc(a, v.Value{ .map = &.{.{ .name = "meta", .value = .{ .map = entries } }} }, .{}) };
+    var authority: Authority = .{};
+    var native: Native = .{ .tables = &.{.{ .name = "docs", .db = &docs }}, .authority = authority.callbacks(), .ttl_now_ns = 1 };
+    try std.testing.expectError(error.CypherStateBudgetExceeded, root.snapshot.Materialized.create(std.testing.allocator, native.backend(), selected, .{ .intermediate_states = 100 }));
+    const snapshot = try root.snapshot.Materialized.create(std.testing.allocator, native.backend(), selected, .{});
+    defer snapshot.deinit();
+    try std.testing.expect(snapshot.overlay.captured.intermediate_states > 4000);
+    try std.testing.expect(snapshot.overlay.captured.intermediate_states < 200_000);
+    const Channel = struct {
+        native: *Native,
+        graph: root.catalog.Graph,
+        fn call(ptr: *anyopaque, allocator: A, request: []const u8) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return (root.rpc.Owner{ .backend = self.native.backend(), .graph = self.graph, .table = "docs" }).execute(allocator, request);
+        }
+    };
+    var channel: Channel = .{ .native = &native, .graph = selected };
+    var client: root.rpc.Client = .{ .channel = .{ .ptr = &channel, .call = Channel.call }, .incarnation = 1, .revision = 1 };
+    try std.testing.expectError(error.CypherStateBudgetExceeded, root.snapshot.Materialized.create(std.testing.allocator, client.backend(), selected, .{ .intermediate_states = 100 }));
+    const remote = try root.snapshot.Materialized.create(std.testing.allocator, client.backend(), selected, .{});
+    defer remote.deinit();
+    try std.testing.expect(remote.overlay.captured.intermediate_states > 4000);
+    try std.testing.expect(remote.overlay.captured.intermediate_states < 200_000);
+    // An owner page can legitimately exceed the default ceiling when the
+    // coordinator grants a larger operator budget; RPC must not reclamp it.
+    const labels = try a.alloc(root.catalog.Label, 64);
+    for (labels, 0..) |*label, i| {
+        label.* = selected.labels[0];
+        label.name = try std.fmt.allocPrint(a, "D{d}", .{i});
+    }
+    var expanded = selected;
+    expanded.labels = labels;
+    channel.graph = expanded;
+    const backend = native.backend();
+    try backend.vtable.bind(backend.ptr, a, expanded);
+    try std.testing.expectError(error.CypherStateBudgetExceeded, root.snapshot.Materialized.create(std.testing.allocator, client.backend(), expanded, .{}));
+    const large = try root.snapshot.Materialized.create(std.testing.allocator, client.backend(), expanded, .{ .intermediate_states = 8_000_000 });
+    defer large.deinit();
+    try std.testing.expect(large.overlay.captured.intermediate_states > 1_000_000);
+    try std.testing.expect(large.overlay.captured.intermediate_states < 8_000_000);
 }

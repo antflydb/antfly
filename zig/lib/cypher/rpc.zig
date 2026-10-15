@@ -35,13 +35,14 @@ pub const Request = struct {
     search: ?std.json.Value = null,
     prepared_search_json: []const u8 = "",
     max_examined: usize = 1_000_000,
+    max_work: usize = 1_000_000,
     document: ?std.json.Value = null,
     apply_defaults: bool = false,
     json_null_fields: []const []const u8 = &.{},
     include_relationships: bool = false,
 };
 pub const Projection = struct { node: ?*const v.Node, relationships: []const *const v.Relationship = &.{} };
-const Reply = struct { relationships: []const std.json.Value = &.{}, values: []const std.json.Value = &.{}, next: ?[]const u8 = null, examined: ?usize = null, scores: []const f64 = &.{}, approximate: bool = false };
+const Reply = struct { work: usize = 0, relationships: []const std.json.Value = &.{}, values: []const std.json.Value = &.{}, next: ?[]const u8 = null, examined: ?usize = null, scores: []const f64 = &.{}, approximate: bool = false };
 pub const Channel = struct { ptr: *anyopaque, call: *const fn (*anyopaque, A, []const u8) anyerror![]u8, checkpoint: ?*const fn (*anyopaque) anyerror!void = null };
 pub const Version = struct { incarnation: u64, revision: u64 };
 pub const Client = struct {
@@ -49,20 +50,30 @@ pub const Client = struct {
     incarnation: u64,
     revision: u64,
     allowed_versions: []const Version = &.{},
+    work: ?b.Work = null,
     pub fn backend(self: *Client) b.Backend {
-        return .{ .ptr = self, .vtable = &.{ .bind = bind, .checkpoint = checkpoint, .scan = scan, .get = get, .expand = expand, .search = search, .normalize_node = normalizeNode, .project_postimage = projectPostimage, .document_relationships = documentRelationships } };
+        return .{ .ptr = self, .vtable = &.{ .bind = bind, .checkpoint = checkpoint, .scan = scan, .get = get, .expand = expand, .search = search, .normalize_node = normalizeNode, .project_postimage = projectPostimage, .document_relationships = documentRelationships, .set_work = setWork } };
+    }
+    fn setWork(ptr: *anyopaque, work: ?b.Work) void {
+        cast(ptr).work = work;
     }
     fn cast(ptr: *anyopaque) *Client {
         return @ptrCast(@alignCast(ptr));
     }
     fn invoke(self: *Client, a: A, request: Request) !Reply {
-        const body = try std.json.Stringify.valueAlloc(a, request, .{});
+        var bounded = request;
+        if (self.work) |work| if (work.remaining) |remaining| {
+            bounded.max_work = remaining(work.ptr);
+        };
+        const body = try std.json.Stringify.valueAlloc(a, bounded, .{});
         defer a.free(body);
         if (body.len > 1 << 20) return error.CypherRequestTooLarge;
         const response = try self.channel.call(self.channel.ptr, a, body);
         defer a.free(response);
         if (response.len > 32 << 20) return error.CypherResponseTooLarge;
-        return std.json.parseFromSliceLeaky(Reply, a, response, .{ .allocate = .alloc_always });
+        const reply = try std.json.parseFromSliceLeaky(Reply, a, response, .{ .allocate = .alloc_always });
+        if (self.work) |work| try work.charge(work.ptr, reply.work);
+        return reply;
     }
     fn bind(ptr: *anyopaque, _: A, graph: catalog.Graph) !void {
         const self = cast(ptr);
@@ -177,6 +188,9 @@ pub const Owner = struct {
         if (request.graph_incarnation != self.graph.incarnation or request.graph_revision != self.graph.revision) return error.CatalogGenerationChanged;
         if (request.limit == 0 or request.limit > 1024) return error.CypherOwnerBudgetExceeded;
         try self.backend.vtable.checkpoint(self.backend.ptr);
+        var meter: b.Meter = .{ .a = scratch, .backend = self.backend, .limit = request.max_work };
+        if (self.backend.vtable.set_work) |configure| configure(self.backend.ptr, meter.work());
+        defer if (self.backend.vtable.set_work) |configure| configure(self.backend.ptr, null);
         var values: std.ArrayList(wire.Value) = .empty;
         var next: ?[]const u8 = null;
         var examined: ?usize = null;
@@ -233,7 +247,7 @@ pub const Owner = struct {
             },
         }
         try self.backend.vtable.checkpoint(self.backend.ptr);
-        const result = try std.json.Stringify.valueAlloc(a, .{ .values = values.items, .next = next, .examined = examined, .scores = scores.items, .approximate = approximate }, .{});
+        const result = try std.json.Stringify.valueAlloc(a, .{ .work = meter.units, .values = values.items, .next = next, .examined = examined, .scores = scores.items, .approximate = approximate }, .{});
         errdefer a.free(result);
         if (result.len > 32 << 20) return error.CypherResponseTooLarge;
         return result;

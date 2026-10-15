@@ -946,6 +946,12 @@ misrepresent the original query result.
   cuts are reclaimed after their final reader closes, including setup and
   execution failures, so completed queries do not consume retained-cut capacity.
   Published continuation cuts retain their existing expiry lifecycle.
+  Label predicates use indexed structural equality under the statement work
+  and cancellation meter, including native capture and routed owner projection.
+  Owner RPCs inherit the remaining work ceiling and return spent units to the
+  coordinator. Retained entity aliases resolve postimages by identity on access;
+  repeated writes to one shared entity do not refresh every referencing row.
+  Ordinary property maps remain immutable snapshots.
   Deleted entities retain identity for counts and identity functions, but
   property access, properties(), keys(), and labels() raise CypherDeletedEntity.
   Entity results after deletion contain no cached properties. Deletion is
@@ -977,8 +983,12 @@ misrepresent the original query result.
   active. The next signed committed mutation can finalize serving on a follower
   without a coordinator receipt probe; blocked apply defers until readers drain.
 - Unknown delivery outcomes require receipt reconciliation and never statement
-  replay. Workbench receipts are persisted per principal, and minimal status
-  reads continue to work after table permission removal.
+  replay. The workbench classifies each Run/Profile submission with server-side
+  EXPLAIN before execution, then persists a write ID when the compiler reports
+  effects; comment syntax cannot bypass receipt recovery. Workbench receipts are
+  persisted per principal, and minimal status reads continue to work after table
+  permission removal. Temporary SQL statement-cut unavailability retains its
+  retryable SQLSTATE 53300 identity across runtime archive callbacks.
 
 ## References
 

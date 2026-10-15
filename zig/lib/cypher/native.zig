@@ -53,9 +53,24 @@ pub fn Adapter(comptime DB: type, comptime GraphIndex: type, comptime EdgeScanCu
         /// A routed owner serves only its catalog-certified table partition;
         /// the coordinator binds the complete graph before opening any owner.
         partitioned: bool = false,
+        work: ?b.Work = null,
+        membership_units: usize = 0,
 
         pub fn backend(self: *Self) b.Backend {
-            return .{ .ptr = self, .vtable = &.{ .bind = bind, .checkpoint = checkpoint, .scan = scan, .get = get, .expand = expand, .search = search } };
+            return .{ .ptr = self, .vtable = &.{ .bind = bind, .checkpoint = checkpoint, .scan = scan, .get = get, .expand = expand, .search = search, .set_work = setWork } };
+        }
+        fn setWork(ptr: *anyopaque, work: ?b.Work) void {
+            cast(ptr).work = work;
+        }
+        fn chargeMembership(ptr: *anyopaque, amount: usize) !void {
+            const self = cast(ptr);
+            if (self.work) |work| return work.charge(work.ptr, amount);
+            try checkpoint(ptr);
+            if (amount > 1_000_000 -| self.membership_units) return error.CypherStateBudgetExceeded;
+            self.membership_units += amount;
+        }
+        pub fn valueWork(self: *Self, a: A) @import("value_work.zig").Work {
+            return .{ .a = a, .ptr = self, .charge = chargeMembership };
         }
         fn search(ptr: *anyopaque, a: A, table: []const u8, input: b.SearchInput) !b.SearchPage {
             const self = cast(ptr);
@@ -125,8 +140,9 @@ pub fn Adapter(comptime DB: type, comptime GraphIndex: type, comptime EdgeScanCu
             if (value != .map) return error.CypherInvalidDocument;
             const result = try a.create(v.Node);
             result.* = .{ .identity = .{ .table = try a.dupe(u8, table), .key = try a.dupe(u8, key) }, .properties = try v.entityProperties(a, value.map) };
+            var membership = self.valueWork(a);
             var labels: std.ArrayList([]const u8) = .empty;
-            for (self.graph.?.labels) |label| if (self.graph.?.admits(result, label.name)) try labels.append(a, label.name);
+            for (self.graph.?.labels) |label| if (try self.graph.?.admits(result, label.name, &membership)) try labels.append(a, label.name);
             result.labels = try labels.toOwnedSlice(a);
             return self.authority.project(self.authority.ptr, a, result);
         }

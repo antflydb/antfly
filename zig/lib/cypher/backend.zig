@@ -31,6 +31,37 @@ pub const Work = struct {
     ptr: *anyopaque,
     charge: *const fn (*anyopaque, usize) anyerror!void,
     value: *const fn (*anyopaque, v.Value) anyerror!void,
+    remaining: ?*const fn (*anyopaque) usize = null,
+};
+/// A bounded owner-call meter. Routed replies report these units to the
+/// coordinator so work spent behind an RPC is part of the statement ceiling.
+pub const Meter = struct {
+    a: std.mem.Allocator,
+    backend: Backend,
+    limit: usize = 1_000_000,
+    units: usize = 0,
+    pub fn work(self: *Meter) Work {
+        return .{ .ptr = self, .charge = charge, .value = value, .remaining = remaining };
+    }
+    fn charge(ptr: *anyopaque, amount: usize) !void {
+        const self: *Meter = @ptrCast(@alignCast(ptr));
+        // Owner checkpoints can validate index/schema authority. Amortize that
+        // cost over at most 64 work units, while checking large reservations
+        // before the corresponding traversal begins.
+        if (self.units == 0 or amount >= 64 or self.units / 64 != (self.units +| amount) / 64)
+            try self.backend.vtable.checkpoint(self.backend.ptr);
+        if (amount > self.limit -| self.units) return error.CypherStateBudgetExceeded;
+        self.units += amount;
+    }
+    fn value(ptr: *anyopaque, input: v.Value) !void {
+        const self: *Meter = @ptrCast(@alignCast(ptr));
+        var evaluator: @import("value_work.zig").Work = .{ .a = self.a, .ptr = self, .charge = charge };
+        try evaluator.output(input);
+    }
+    fn remaining(ptr: *anyopaque) usize {
+        const self: *Meter = @ptrCast(@alignCast(ptr));
+        return self.limit -| self.units;
+    }
 };
 pub const Mutation = union(enum) {
     create_node: *const v.Node,

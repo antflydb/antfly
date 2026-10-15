@@ -854,6 +854,7 @@ pub const Detail = enum(c_int) {
     invalid_cypher_parameters,
     missing_cypher_parameter,
     sql_write_capacity_unavailable,
+    sql_statement_read_unavailable,
 };
 
 pub const Status = extern struct {
@@ -876,6 +877,7 @@ pub fn statusFromError(err: anyerror) Status {
         error.InvalidCypherParameters => status(.invalid_argument, .invalid_cypher_parameters),
         error.MissingCypherParameter => status(.invalid_argument, .missing_cypher_parameter),
         error.SqlWriteCapacityUnavailable => status(.unavailable, .sql_write_capacity_unavailable),
+        error.SqlStatementReadUnavailable => status(.unavailable, .sql_statement_read_unavailable),
         error.CypherAggregateScope => status(.invalid_argument, .cypher_aggregate_scope),
         error.CypherAggregateWildcard => status(.invalid_argument, .cypher_aggregate_wildcard),
         error.CypherAmbiguousSearchTable => status(.invalid_argument, .cypher_ambiguous_search_table),
@@ -1693,6 +1695,7 @@ fn detailErrorName(comptime detail: Detail) []const u8 {
         .invalid_cypher_parameters => "InvalidCypherParameters",
         .missing_cypher_parameter => "MissingCypherParameter",
         .sql_write_capacity_unavailable => "SqlWriteCapacityUnavailable",
+        .sql_statement_read_unavailable => "SqlStatementReadUnavailable",
         .cypher_aggregate_scope => "CypherAggregateScope",
         .cypher_aggregate_wildcard => "CypherAggregateWildcard",
         .cypher_ambiguous_search_table => "CypherAmbiguousSearchTable",
@@ -2750,4 +2753,11 @@ test "storage callback boundaries retain capability integrity and bounded-read o
         try std.testing.expect(errorHasStableDetail(err));
         try std.testing.expectEqual(err, errorFromStatus(encoded));
     }
+}
+
+test "temporary SQL statement capture failure preserves retryable boundary identity" {
+    const transported = statusFromError(error.SqlStatementReadUnavailable);
+    try std.testing.expectEqual(@backingInt(Code.unavailable), transported.code);
+    try std.testing.expectEqual(error.SqlStatementReadUnavailable, errorFromStatus(transported));
+    try std.testing.expect(errorHasStableDetail(error.SqlStatementReadUnavailable));
 }

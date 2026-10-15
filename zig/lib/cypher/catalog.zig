@@ -98,10 +98,10 @@ pub const Graph = struct {
             if (r.identity) |identity| if (identity.incarnation == 0 or identity.config_hash == 0) return error.InvalidGraphDefinition;
         }
     }
-    pub fn admits(self: Graph, node: *const values.Node, label_name: []const u8) bool {
+    pub fn admits(self: Graph, node: *const values.Node, label_name: []const u8, work: *@import("value_work.zig").Work) !bool {
         const l = self.label(label_name) orelse return false;
         if (!std.mem.eql(u8, node.identity.table, l.table)) return false;
-        for (l.predicate) |entry| if (!(values.Value.equal((values.Value{ .node = node }).property(entry.name), entry.value) orelse false)) return false;
+        for (l.predicate) |entry| if (!(try work.equal(try work.property(.{ .node = node }, entry.name), entry.value) orelse false)) return false;
         return true;
     }
 };

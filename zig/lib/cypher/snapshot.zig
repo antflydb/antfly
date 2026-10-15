@@ -71,7 +71,10 @@ pub const Materialized = struct {
         return result;
     }
     pub fn backend(self: *Materialized) root.backend.Backend {
-        return .{ .ptr = self, .vtable = &.{ .bind = bind, .checkpoint = checkpoint, .scan = scan, .get = get, .expand = expand, .startup_work = startupWork, .normalize_node = normalizeNode, .document_relationships = documentRelationships } };
+        return .{ .ptr = self, .vtable = &.{ .bind = bind, .checkpoint = checkpoint, .scan = scan, .get = get, .expand = expand, .startup_work = startupWork, .normalize_node = normalizeNode, .document_relationships = documentRelationships, .set_work = setWork } };
+    }
+    fn setWork(ptr: *anyopaque, work: ?root.backend.Work) void {
+        cast(ptr).overlay.setExecutionWork(work);
     }
     fn cast(ptr: *anyopaque) *Materialized {
         return @ptrCast(@alignCast(ptr));

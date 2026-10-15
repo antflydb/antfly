@@ -244,19 +244,23 @@ pub fn Snapshot(comptime DB: type) type {
                 const value = try cypher.value.Value.fromJson(scratch.allocator(), document);
                 if (value != .map) return error.CypherInvalidDocument;
                 const node: cypher.value.Node = .{ .identity = identity, .properties = try cypher.value.entityProperties(scratch.allocator(), value.map) };
+                var meter: cypher.backend.Meter = .{ .a = scratch.allocator(), .backend = backend, .limit = input.max_work };
+                self.adapter.work = meter.work();
+                defer self.adapter.work = null;
+                var membership = self.adapter.valueWork(scratch.allocator());
                 var labels: std.ArrayList([]const u8) = .empty;
-                for (selected.labels) |label| if (selected.admits(&node, label.name)) try labels.append(scratch.allocator(), label.name);
+                for (selected.labels) |label| if (try selected.admits(&node, label.name, &membership)) try labels.append(scratch.allocator(), label.name);
                 var projected = node;
                 projected.labels = labels.items;
                 if (!input.include_relationships) {
                     try checkpoint(ptr);
-                    return std.json.Stringify.valueAlloc(a, .{ .values = &.{cypher.wire.Value{ .value = .{ .node = &projected } }} }, .{});
+                    return std.json.Stringify.valueAlloc(a, .{ .work = meter.units, .values = &.{cypher.wire.Value{ .value = .{ .node = &projected } }} }, .{});
                 }
                 const derived = try self.db.cypherDocumentRelationships(scratch.allocator(), selected, &projected);
                 const relationships = try scratch.allocator().alloc(cypher.wire.Value, derived.len);
                 for (derived, relationships) |edge, *out| out.* = .{ .value = .{ .relationship = edge } };
                 try checkpoint(ptr);
-                return std.json.Stringify.valueAlloc(a, .{ .values = &.{cypher.wire.Value{ .value = .{ .node = &projected } }}, .relationships = relationships }, .{});
+                return std.json.Stringify.valueAlloc(a, .{ .work = meter.units, .values = &.{cypher.wire.Value{ .value = .{ .node = &projected } }}, .relationships = relationships }, .{});
             }
             if (std.mem.eql(u8, header.operation, "normalize")) {
                 const input = try std.json.parseFromSliceLeaky(cypher.rpc.Request, scratch.allocator(), request, .{});

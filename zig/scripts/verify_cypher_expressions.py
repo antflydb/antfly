@@ -21,7 +21,8 @@ def main():
     )
     table = "cypher_expressions_" + uuid.uuid4().hex
     graph = table + "_graph"
-    created_table = created_graph = False
+    created_table = created_graph = created_filtered = False
+    filtered = graph + "_predicate"
     checks = 0
 
     def call(path, body=None, *, method="POST", status=None, retry_aborted=False):
@@ -382,8 +383,77 @@ def main():
         )
         assert sql["rows"] == [["row-1!"]], sql
         checks += 1
+        # Predicate evaluation participates in capture/owner work accounting,
+        # including nested maps whose equality used to scan quadratically.
+        meta = {f"field{i}": i for i in range(1000)}
+        encoded = json.dumps(meta)
+        call(
+            "/sql",
+            {
+                "statement": f"INSERT INTO {table} (id,payload) VALUES ('predicate','{encoded}'::JSONB)"
+            },
+            retry_aborted=True,
+        )
+        call(
+            f"/graphs/{filtered}",
+            {"labels": [{"name": "D", "table": table, "where": {"payload": meta}}]},
+        )
+        created_filtered = True
+        limited = call(
+            f"/graphs/{filtered}/query",
+            {
+                "query": "MATCH (n:D) RETURN count(*)",
+                "limits": {"intermediate_states": 100},
+            },
+            status=429,
+        )
+        assert limited["code"] == "CypherStateBudgetExceeded", limited
+        result = call(
+            f"/graphs/{filtered}/query", {"query": "MATCH (n:D) RETURN count(*)"}
+        )
+        assert strings(result) == [["1"]], result
+        assert 1000 < result["stats"]["intermediate_states"] < 100000, result["stats"]
+        checks += 2
+        session = call("/sql", {"statement": "BEGIN"})["session_id"]
+        try:
+            call(
+                "/sql",
+                {
+                    "statement": f"UPDATE {table} SET payload='{encoded}'::JSONB WHERE id='predicate'",
+                    "session_id": session,
+                },
+            )
+            staged = call(
+                "/sql",
+                {
+                    "statement": f"SELECT g.id FROM GRAPH_TABLE({filtered} MATCH (n IS D) COLUMNS(n.id AS id)) g",
+                    "session_id": session,
+                },
+            )
+            assert staged["rows"] == [["predicate"]], staged
+            checks += 1
+        finally:
+            call("/sql", {"statement": "ROLLBACK", "session_id": session})
+        previous = 0
+        for count in [100, 200, 400]:
+            call(
+                "/sql",
+                {"statement": f"UPDATE {table} SET rank=0 WHERE id='a'"},
+                retry_aborted=True,
+            )
+            result = query(
+                f"MATCH (n:Document {{id:'a'}}) WITH n,[{{node:n}}] AS aliases UNWIND range(1,{count}) AS i SET n.rank=n.rank+1 RETURN count(*),sum(aliases[0].node.rank)"
+            )
+            assert strings(result) == [[str(count), str(count * count)]], result
+            units = result["stats"]["intermediate_states"]
+            if previous:
+                assert units < previous * 3, result["stats"]
+            previous = units
+            checks += 1
         print(f"{checks} native Cypher/SQL expression checks passed")
     finally:
+        if created_filtered:
+            call(f"/graphs/{filtered}", method="DELETE")
         if created_graph:
             call(f"/graphs/{graph}", method="DELETE")
         if created_table:

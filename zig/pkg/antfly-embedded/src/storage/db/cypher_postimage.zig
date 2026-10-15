@@ -17,7 +17,7 @@
 const std = @import("std");
 const cypher = @import("cypher");
 const A = std.mem.Allocator;
-pub fn normalize(self: anytype, a: A, graph: cypher.catalog.Graph, node: *const cypher.value.Node, apply_defaults: bool) !*const cypher.value.Node {
+pub fn normalize(self: anytype, a: A, _: cypher.catalog.Graph, node: *const cypher.value.Node, apply_defaults: bool) !*const cypher.value.Node {
     try cypher.value.validatePropertyValue(.{ .map = node.properties });
     // Only the normalized property values survive this callback. Keep schema
     // expression and JSON decode buffers out of the statement's retained arena,
@@ -34,9 +34,8 @@ pub fn normalize(self: anytype, a: A, graph: cypher.catalog.Graph, node: *const 
     const value = try cypher.value.Value.fromJson(a, document);
     const result = try a.create(cypher.value.Node);
     result.* = .{ .identity = node.identity, .properties = try cypher.value.entityProperties(a, value.map) };
-    var labels: std.ArrayList([]const u8) = .empty;
-    for (graph.labels) |label| if (graph.admits(result, label.name)) try labels.append(a, label.name);
-    result.labels = labels.items;
+    // Membership is recomputed by the statement overlay after normalization,
+    // under its work/cancellation meter and with the complete graph binding.
     return result;
 }
 pub fn relationships(self: anytype, a: A, graph: cypher.catalog.Graph, node: *const cypher.value.Node) ![]const *const cypher.value.Relationship {

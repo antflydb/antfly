@@ -971,7 +971,7 @@ test "anchor deduplication shares identities across labels in exhaustive and goa
     }
 }
 
-test "bulk SET and REMOVE refresh only rows containing the changed entity" {
+test "bulk SET and REMOVE resolve nested aliases within linear work" {
     const Host = struct {
         overlay: *root.transaction.Overlay = undefined,
         count: usize,
@@ -1007,4 +1007,29 @@ test "bulk SET and REMOVE refresh only rows containing the changed entity" {
             try std.testing.expectEqual(@as(i64, @intCast(if (mode == 0) count else 0)), result.rows[0][0].integer);
         }
     }
+}
+
+test "shared retained entities resolve postimages with linear mutation work" {
+    var previous: usize = 0;
+    for ([_]usize{ 400, 800, 1600 }) |count| {
+        var fixture = Fixture.init();
+        defer fixture.arena.deinit();
+        var seed = try fixture.run("CREATE (:Person {age:0})");
+        seed.deinit();
+        const query = try std.fmt.allocPrint(fixture.arena.allocator(), "MATCH (n:Person) WITH n,[{{node:n}}] AS aliases,properties(n) AS snapshot UNWIND range(1,{d}) AS i SET n.age=n.age+1 RETURN count(*),sum(aliases[0].node.age),sum(snapshot.age)", .{count});
+        var result = try fixture.run(query);
+        defer result.deinit();
+        try std.testing.expectEqual(@as(i64, @intCast(count)), result.rows[0][0].integer);
+        try std.testing.expectEqual(@as(i64, @intCast(count * count)), result.rows[0][1].integer);
+        try std.testing.expectEqual(@as(i64, 0), result.rows[0][2].integer);
+        if (previous != 0) try std.testing.expect(result.stats.intermediate_states < previous * 3);
+        previous = result.stats.intermediate_states;
+    }
+    var fixture = Fixture.init();
+    defer fixture.arena.deinit();
+    var result = try fixture.run("CREATE p=(n:Person {age:0})-[r:KNOWS {age:0}]->(n) WITH p,n,r UNWIND range(1,800) AS i SET r.age=r.age+1,n.age=i REMOVE n.missing RETURN count(*),sum(relationships(p)[0].age),sum(nodes(p)[0].age)");
+    defer result.deinit();
+    try std.testing.expectEqual(@as(i64, 800), result.rows[0][0].integer);
+    try std.testing.expectEqual(@as(i64, 640000), result.rows[0][1].integer);
+    try std.testing.expectEqual(@as(i64, 640000), result.rows[0][2].integer);
 }

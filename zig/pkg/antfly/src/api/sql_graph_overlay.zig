@@ -65,6 +65,11 @@ pub const View = struct {
         const backend_inner = self.inner.backend();
         try backend_inner.vtable.bind(backend_inner.ptr, a, graph);
         try backend_inner.vtable.begin.?(backend_inner.ptr);
+        // Staged owner projection happens during bind, before the runtime can
+        // attach its meter. Keep the same capture ceiling through this phase.
+        const previous_work = self.client.work;
+        self.client.work = .{ .ptr = self, .charge = captureCharge, .value = captureValue, .remaining = captureRemaining };
+        defer self.client.work = previous_work;
         self.staged_rows = .empty;
         self.projected_fields = .empty;
         for (self.inner.relationships.items) |relationship| try self.indexField(a, relationship.value);
@@ -127,7 +132,8 @@ pub const View = struct {
                 const target = cypher.value.Identity{ .table = graph.label(mapping.target_label).?.table, .key = edge.target };
                 const source_node = (try backend_inner.vtable.get(backend_inner.ptr, a, source)) orelse continue;
                 const target_node = (try backend_inner.vtable.get(backend_inner.ptr, a, target)) orelse continue;
-                if (!graph.admits(source_node, mapping.source_label) or !graph.admits(target_node, mapping.target_label)) continue;
+                var membership = self.inner.valueWork(a);
+                if (!try graph.admits(source_node, mapping.source_label, &membership) or !try graph.admits(target_node, mapping.target_label, &membership)) continue;
                 if (producer(edge).len != 0 and (try backend_inner.vtable.get(backend_inner.ptr, a, .{ .table = effects.table, .key = producer(edge) })) == null) continue;
                 const raw = try std.json.parseFromSliceLeaky(std.json.Value, a, if (edge.metadata_json.len == 0) "{}" else edge.metadata_json, .{});
                 const metadata = try cypher.value.Value.fromJson(a, raw);
@@ -181,6 +187,18 @@ pub const View = struct {
     fn indexField(self: *View, a: A, relationship: *const cypher.value.Relationship) !void {
         try self.inner.charge(1);
         if (relationship.ownership == .field) try self.projected_fields.put(a, .{ .source = relationship.source, .index = relationship.index, .kind = relationship.type }, {});
+    }
+    fn captureCharge(ptr: *anyopaque, amount: usize) !void {
+        try cast(ptr).inner.charge(amount);
+    }
+    fn captureRemaining(ptr: *anyopaque) usize {
+        const self = cast(ptr);
+        return self.inner.max_entities -| self.inner.captured.intermediate_states;
+    }
+    fn captureValue(ptr: *anyopaque, value: cypher.value.Value) !void {
+        const self = cast(ptr);
+        var work = self.inner.valueWork(self.inner.alloc.?);
+        try work.output(value);
     }
     fn setWork(ptr: *anyopaque, work: ?cypher.backend.Work) void {
         cast(ptr).inner.setExecutionWork(work);
