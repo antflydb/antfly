@@ -232,7 +232,7 @@ const Cache = struct {
     /// graph and its gradient on almost every step.
     entries: std.ArrayListUnmanaged(Entry) = .empty,
     last: architecture.Layout = .{ .batch = 0, .sequence = 0, .options = 0, .questions = 0 },
-    const capacity = 32;
+    const capacity = 64;
     const Entry = struct { layout: architecture.Layout, program: *training.Program };
     fn get(self: *Cache, examples: []const training.Example) !*training.Program {
         const l = try training.bucketedLayout(examples, self.config);
@@ -486,10 +486,10 @@ const TokenBatches = struct {
         var start: usize = 0;
         while (start < order.len) {
             // Sorted by length, so the newest record sets the padded length,
-            // bucketed to 64 tokens as `training.bucketedLayout` does.
+            // bucketed as `training.bucketedLayout` does.
             var count: usize = 1;
             while (start + count < order.len and count < cap) : (count += 1) {
-                const sequence = std.mem.alignForward(usize, examples[order[start + count]].ids.len, 64);
+                const sequence = std.mem.alignForward(usize, examples[order[start + count]].ids.len, training.sequence_bucket);
                 if ((count + 1) * sequence > budget) break;
             }
             try starts.append(a, start);
