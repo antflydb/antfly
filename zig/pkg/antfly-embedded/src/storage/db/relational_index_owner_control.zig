@@ -1040,6 +1040,46 @@ pub const PreparedValidationSeal = struct {
     }
 };
 
+/// Private receiver input. Metadata supplies the logical intent; filesystem
+/// and physical-root identity come separately from the host's applying lease.
+pub const InstallationRequest = struct {
+    intent: validation.InstallIntent,
+    budget: pages.Budget,
+
+    pub fn validate(self: @This()) !void {
+        try self.intent.validate();
+        try self.budget.validate();
+    }
+};
+
+/// Installation never exposes a logical receipt without its complete local
+/// physical witness. Partial/failed scans are resumable observations only.
+pub const InstallationResponse = union(enum) {
+    audit: AuditOutcome,
+    installed: struct { physical: AuditOutcome, logical: InstallOutcome },
+
+    pub fn physicalAudit(self: @This()) AuditOutcome {
+        return switch (self) {
+            .audit => |value| value,
+            .installed => |value| value.physical,
+        };
+    }
+
+    pub fn validateFor(self: @This(), request: InstallationRequest) !void {
+        try request.validate();
+        const audited_physical = self.physicalAudit();
+        if (!std.meta.eql(audited_physical.binding, request.intent.validation.command.binding) or
+            !std.meta.eql(audited_physical.expected, request.intent.validation.command.expected)) return error.InvalidPrivateIndexNativeReceipt;
+        try audited_physical.audit.validateFor(audited_physical.expected, audited_physical.audit.root_incarnation);
+        if (self == .installed) {
+            const value = self.installed;
+            try value.logical.validate();
+            if (!std.meta.eql(value.logical.command.intent(), request.intent) or
+                !std.meta.eql(try audited_physical.logicalCommand(), request.intent.validation.command)) return error.InvalidPrivateIndexNativeReceipt;
+        }
+    }
+};
+
 pub const InstallOutcome = struct {
     command: validation.InstallCommand,
     position: Native,
@@ -1384,6 +1424,7 @@ pub const BuildCache = struct {
         refs: std.atomic.Value(usize) = .init(1),
         digest: [32]u8,
         prepared: ?Prepared = null,
+        history: ?validation.Installed.History = null,
 
         fn create(backing: Allocator, manager: ?*resources.ResourceManager, binding_digest: [32]u8) !*Entry {
             var header = if (manager) |value| try value.reserve(.relational_preparation_working_set, @sizeOf(Entry)) else null;
@@ -1399,6 +1440,7 @@ pub const BuildCache = struct {
         fn release(self: *Entry) void {
             if (self.refs.fetchSub(1, .acq_rel) != 1) return;
             if (self.prepared) |*value| value.deinit();
+            if (self.history) |*value| value.deinit();
             if (self.budget) |*value| value.deinit();
             const backing = self.backing;
             var header = self.header;
@@ -1415,6 +1457,9 @@ pub const BuildCache = struct {
         entry: *Entry,
         pub fn reservation(self: Lease) *const Prepared {
             return &self.entry.prepared.?;
+        }
+        pub fn installedHistory(self: Lease) ?*const validation.Installed.History {
+            return if (self.entry.history) |*value| value else null;
         }
         pub fn deinit(self: *Lease) void {
             self.entry.release();
@@ -1479,6 +1524,26 @@ pub const BuildCache = struct {
     /// Caller observes the actual durable reserved binding before acquisition;
     /// page preparation and commit must independently recheck it afterwards.
     pub fn acquire(self: *BuildCache, io: std.Io, backing: Allocator, manager: ?*resources.ResourceManager, core: anytype, request: BuildRequest, binding: jobs.Binding, context: RequestContext) !Lease {
+        return self.acquireMode(io, backing, manager, core, request, binding, context, request.binding_digest, false);
+    }
+
+    /// Audit-only acquisition: current installed state is checked even for
+    /// warm hits. The cached predecessor view grants no execution permission.
+    pub fn acquireInstalledAudit(self: *BuildCache, io: std.Io, backing: Allocator, manager: ?*resources.ResourceManager, core: anytype, request: BuildRequest, intent: validation.InstallIntent, context: RequestContext) !Lease {
+        try context.ensureActive();
+        try intent.validate();
+        const cache_digest = digest: {
+            var read = try core.store.beginReadTxn();
+            defer read.abort();
+            const record = (try validation.Installed.load(backing, &read, intent.validation.command.binding)) orelse return error.InvalidPrivateIndexNativeReceipt;
+            try record.requireCurrent(backing, &read);
+            if (!std.meta.eql(record.command.intent(), intent)) return error.InvalidPrivateIndexNativeReceipt;
+            break :digest try record.command.evidenceDigest();
+        };
+        return self.acquireMode(io, backing, manager, core, request, intent.validation.command.binding, context, cache_digest, true);
+    }
+
+    fn acquireMode(self: *BuildCache, io: std.Io, backing: Allocator, manager: ?*resources.ResourceManager, core: anytype, request: BuildRequest, binding: jobs.Binding, context: RequestContext, cache_digest: [32]u8, comptime installed_audit: bool) !Lease {
         try context.ensureActive();
         try request.requireBinding(binding);
         const epoch = while (true) {
@@ -1492,7 +1557,7 @@ pub const BuildCache = struct {
             if (manager) |value| if (self.reclaimer == 0) {
                 self.reclaimer = try value.registerReclaimer(.relational_preparation_working_set, self, reclaim);
             };
-            if (self.entry) |entry| if (std.mem.eql(u8, &entry.digest, &request.binding_digest)) {
+            if (self.entry) |entry| if ((entry.history != null) == installed_audit and std.mem.eql(u8, &entry.digest, &cache_digest)) {
                 entry.retain();
                 self.hits +|= 1;
                 self.mutex.unlock(io);
@@ -1519,12 +1584,31 @@ pub const BuildCache = struct {
             self.finish();
             self.mutex.unlock(io);
         }
-        const entry = try Entry.create(backing, manager, request.binding_digest);
+        const entry = try Entry.create(backing, manager, cache_digest);
         errdefer entry.release();
         const alloc = if (entry.budget) |*value| value.allocator() else backing;
-        var view = core.acquireSchemaView() orelse return error.RelationalTableRequired;
-        defer view.release();
-        {
+        if (comptime installed_audit) {
+            var read = try core.store.beginReadTxn();
+            defer read.abort();
+            const current = (try jobs.load(&read)) orelse return error.PrivateIndexJobRequired;
+            entry.history = validation.Installed.History.init(alloc, &read, current) catch |err| {
+                if (entry.budget) |value| if (value.denied()) return error.ResourceBudgetExceeded;
+                return err;
+            };
+            const history = &entry.history.?;
+            if (!std.meta.eql(history.binding, binding) or !std.mem.eql(u8, &try history.record.command.evidenceDigest(), &cache_digest)) return error.PrivateIndexOwnerJobChanged;
+            var historical = history.reader(&read);
+            var view = (try core.acquireSchemaVersionView(binding.physical_reserved.schema_version)) orelse return error.RelationalTableRequired;
+            defer view.release();
+            var command: Command = .{ .effect = .reserved, .binding = binding };
+            command.binding.phase = .fencing;
+            entry.prepared = Prepared.control(alloc, view, &historical, command) catch |err| {
+                if (entry.budget) |value| if (value.denied()) return error.ResourceBudgetExceeded;
+                return err;
+            };
+        } else {
+            var view = core.acquireSchemaView() orelse return error.RelationalTableRequired;
+            defer view.release();
             var read = try core.store.beginReadTxn();
             defer read.abort();
             try jobs.requireReserved(&read, binding);

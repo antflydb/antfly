@@ -7973,3 +7973,47 @@ passed 159/159 Debug steps, including native lifecycle, candidate, standalone,
 domain, C-ABI, leased-owner, ACK, publication and runtime suites. Boundary,
 license, inventory, formatting, diff and generated control-catalog checks
 passed. No throughput improvement or complete receiver qualification is claimed.
+
+### Cached installed-root checkpoint execution
+
+Installed auditing uses an audit-only mode of the existing single-flight,
+resource-accounted, evictable candidate cache. A cold acquisition owns the
+verified predecessor history and compiled plan. Its key binds the installed
+command's evidence identity; normal build and installed-audit entries are not
+interchangeable. Warm acquisition checks the actual installed record/intent,
+and each scan page opens a fresh read transaction and rechecks the real
+successor before constructing the read-only historical metadata view.
+
+Inventory and generation progress use the existing root-local signed checkpoint
+machinery. No LSM snapshot survives a request boundary; immutable metadata/plans
+remain cacheable without keeping retired storage versions pinned. Cache leases
+protect history/plan lifetime across concurrent eviction. Configured working-set
+denial remains a distinct ResourceBudgetExceeded result, not a generic process
+OOM. Before-install auditing continues using the existing reserved-owner path.
+
+The focused Debug fixture passed 56/56 steps, including bounded checkpoint
+completion, one cold compilation across many pages, stable ready-checkpoint
+reuse and safe eviction with a live lease. The expanded focused gate also
+qualifies restart and warm-cache current-fence failure. This is local audit
+execution, not metadata authorization, a portable publication certificate or
+replacement-root adoption permission. Authenticated receiver/C-ABI, installed
+ACK/release and distributed fault qualification remain unfinished. No public
+activation, throughput measurement or original-case credit is claimed.
+
+The bounded host-only installation step now consumes these checkpoints directly.
+Its input contains metadata's logical intent and a page budget; filesystem and
+signing scope remain host-selected arguments. Incomplete/failed scans return
+physical progress only. A complete scan must match the retained logical seal
+and the actual physical DB incarnation before resource-accounted preparation
+enters the shared schema/replication transaction. Installed retries take the
+same physical-audit path, and responses pair the physical witness with the
+logical outcome, withholding a receipt while replication is pending.
+
+The expanded Debug regression covers first installation after multiple audit
+pages, unchanged schema/reservation and zero publication attempts on incomplete
+pages, outbox failure/restart recovery, and complete installed retry responses.
+`/private/tmp/antfly-audited-install-step-debug-v2.log` passed 56/56 Debug
+steps. The earlier broader run encountered a corrected name-shadowing compile
+error in this addition and is not a passing gate. Boundary, licensing, inventory,
+control-catalog, formatting and diff checks pass. Original dispositions remain
+483 implemented / 862 unresolved; no new case closure or benchmark is claimed.

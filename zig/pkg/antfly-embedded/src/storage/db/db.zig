@@ -8249,6 +8249,80 @@ pub const DB = struct {
         };
     }
 
+    /// Root-local bounded auditing before/after installation. The receiving
+    /// owner still supplies independent metadata/root authorization. Each page
+    /// opens a fresh snapshot and checks the real successor before using the
+    /// cached immutable predecessor; no snapshot survives a request boundary.
+    pub fn stepNativeIndexOwnerInstallationAudit(self: *DB, table_name: []const u8, intent: @import("relational_index_validation.zig").InstallIntent, page_budget: @import("relational_index_jobs.zig").Budget, signing_root_dir: []const u8, signing_root_incarnation: u128, context: @import("../../api/operation.zig").RequestContext) !@import("relational_index_audit_checkpoint.zig").Summary {
+        const jobs = @import("relational_index_owner_job.zig");
+        try context.ensureActive();
+        try intent.validate();
+        try page_budget.validate();
+        if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
+        const binding = intent.validation.command.binding;
+        const expected = intent.validation.command.expected;
+        if (!std.mem.eql(u8, &@import("relational_integrity_contract.zig").hash(table_name), &expected.table_name_digest) or
+            !binding.fence.namespace.eql(self.core.identity_namespace)) return error.PrivateIndexOwnerJobChanged;
+        const identity: NativeIndexOwnerIdentity = .{ .id = binding.id, .plan_digest = binding.plan_digest, .owner_digest = binding.owner_digest, .ordinal = binding.ordinal, .namespace = binding.fence.namespace, .owner_group_id = binding.fence.owner_group_id };
+        var request = try NativeIndexOwnerBuildRequest.init(identity, binding, page_budget);
+        request.target_expectation = expected;
+        const installed = installed: {
+            var read = try self.core.store.beginReadTxn();
+            defer read.abort();
+            const current = (try jobs.load(&read)) orelse return error.PrivateIndexRootRecoveryRequired;
+            var original = current;
+            original.phase = .reserved;
+            if (!std.meta.eql(original, binding)) return error.PrivateIndexOwnerJobChanged;
+            if (current.phase == .reserved) {
+                try intent.validateBefore(self.alloc, &read);
+                break :installed false;
+            }
+            if (current.phase != .installed) return error.PrivateIndexOwnerJobChanged;
+            break :installed true;
+        };
+        if (!installed) return self.stepNativeIndexOwnerAudit(table_name, request, signing_root_dir, signing_root_incarnation, context);
+        const io = self.backend_runtime.io() orelse return error.UnsupportedPlatform;
+        var memory_budget = if (self.core.index_manager.resource_manager) |manager| resource_manager_mod.BudgetedAllocator.initReclaiming(manager, .relational_preparation_working_set, self.alloc, 1) else null;
+        defer if (memory_budget) |*value| value.deinit();
+        const task_alloc = if (memory_budget) |*value| value.allocator() else self.alloc;
+        return self.stepInstalledIndexAuditWithAllocator(task_alloc, io, request, intent, signing_root_dir, signing_root_incarnation, context) catch |err| {
+            if (memory_budget) |value| if (value.denied()) return error.ResourceBudgetExceeded;
+            return err;
+        };
+    }
+
+    fn stepInstalledIndexAuditWithAllocator(self: *DB, task_alloc: Allocator, io: std.Io, request: NativeIndexOwnerBuildRequest, intent: @import("relational_index_validation.zig").InstallIntent, signing_root_dir: []const u8, signing_root_incarnation: u128, context: @import("../../api/operation.zig").RequestContext) !@import("relational_index_audit_checkpoint.zig").Summary {
+        const verification = @import("relational_index_validation.zig");
+        const claims = @import("relational_index_private_claims.zig");
+        const checkpoint = @import("relational_index_audit_checkpoint.zig");
+        const binding = intent.validation.command.binding;
+        const expected = intent.validation.command.expected;
+        const page_budget = request.budget;
+        var lease = try self.native_index_build_cache.acquireInstalledAudit(io, self.alloc, self.core.index_manager.resource_manager, self.core, request, intent, context);
+        defer lease.deinit();
+        const history = lease.installedHistory() orelse return error.InvalidPrivateIndexOwnerJob;
+        var guard = try checkpoint.open(task_alloc, io, signing_root_dir, signing_root_incarnation, self.root_incarnation, binding, expected, context);
+        defer guard.deinit();
+        var state = try guard.load();
+        defer if (state) |*value| value.deinit();
+        {
+            var read = try self.core.store.beginReadTxn();
+            defer read.abort();
+            try history.record.requireCurrent(task_alloc, &read);
+            var historical = history.reader(&read);
+            if (state == null or state.?.inventory.fields.phase == .scanning or state.?.inventory.fields.phase == .claims) {
+                const next = try claims.InventoryValidation.auditPage(task_alloc, &historical, binding, expected, self.root_incarnation, if (state) |value| value.inventory else null, page_budget, context);
+                state = .{ .inventory = next };
+            } else if (state.?.inventory.fields.phase == .ready) {
+                const next = try verification.auditReadPage(task_alloc, self.core, &historical, binding, expected, &lease.reservation().artifacts.?.addition, self.root_incarnation, state.?.inventory, if (state.?.generation) |*value| value else null, page_budget, context);
+                if (state.?.generation) |*value| value.deinit();
+                state.?.generation = next;
+            }
+        }
+        try guard.save(state.?);
+        return guard.summary(state.?);
+    }
+
     fn stepNativeIndexOwnerAuditWithAllocator(self: *DB, alloc: Allocator, io: std.Io, request: NativeIndexOwnerBuildRequest, signing_root_dir: []const u8, signing_root_incarnation: u128, binding: @import("relational_index_owner_job.zig").Binding, expected: @import("relational_index_private_claims.zig").TargetExpectation, context: @import("../../api/operation.zig").RequestContext) !@import("relational_index_audit_checkpoint.zig").Summary {
         const checkpoint = @import("relational_index_audit_checkpoint.zig");
         const claims = @import("relational_index_private_claims.zig");
@@ -8517,6 +8591,40 @@ pub const DB = struct {
 
     pub fn applyPreparedNativeIndexOwnerInstallation(self: *DB, prepared: *native_index_control.PreparedInstall, replay: ?NativeIndexReplay) !native_index_control.InstallOutcome {
         return self.applyPreparedNativeIndexEffect(prepared, replay);
+    }
+
+    /// Host-only bounded installation step, including exact installed retries.
+    /// Each turn advances one authenticated local checkpoint page. Only a
+    /// complete physical scan matching metadata's retained logical seal may
+    /// enter the shared schema transaction. Caller-supplied audit summaries
+    /// cannot select or bypass this path. Metadata authority remains the
+    /// receiving server's independent responsibility.
+    pub fn stepNativeIndexOwnerInstallation(self: *DB, table_name: []const u8, request: native_index_control.InstallationRequest, signing_root_dir: []const u8, signing_root_incarnation: u128, context: @import("../../api/operation.zig").RequestContext) !native_index_control.InstallationResponse {
+        try context.ensureActive();
+        try request.validate();
+        if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
+        try self.enforceReplicationWriteGate();
+        const summary = try self.stepNativeIndexOwnerInstallationAudit(table_name, request.intent, request.budget, signing_root_dir, signing_root_incarnation, context);
+        const physical: native_index_control.AuditOutcome = .{ .binding = request.intent.validation.command.binding, .expected = request.intent.validation.command.expected, .audit = summary };
+        if (summary.physical_root_incarnation != self.root_incarnation or summary.root_incarnation != signing_root_incarnation) return error.PrivateIndexAuditScopeChanged;
+        const result: native_index_control.InstallationResponse = if (summary.inventory.phase == .ready and summary.generation != null and summary.generation.?.phase == .ready) installed: {
+            if (!std.meta.eql(try physical.logicalCommand(), request.intent.validation.command)) return error.InvalidPrivateIndexNativeReceipt;
+            var memory_budget = if (self.core.index_manager.resource_manager) |manager| resource_manager_mod.BudgetedAllocator.initReclaiming(manager, .relational_preparation_working_set, self.alloc, 1) else null;
+            defer if (memory_budget) |*value| value.deinit();
+            const task_alloc = if (memory_budget) |*value| value.allocator() else self.alloc;
+            var prepared = native_index_control.PreparedInstall.initIntent(task_alloc, self.core, request.intent, context) catch |err| {
+                if (memory_budget) |value| if (value.denied()) return error.ResourceBudgetExceeded;
+                return err;
+            };
+            defer prepared.deinit();
+            const outcome = self.applyPreparedNativeIndexOwnerInstallation(&prepared, null) catch |err| {
+                if (memory_budget) |value| if (value.denied()) return error.ResourceBudgetExceeded;
+                return err;
+            };
+            break :installed .{ .installed = .{ .physical = physical, .logical = outcome } };
+        } else .{ .audit = physical };
+        try result.validateFor(request);
+        return result;
     }
 
     /// Preparation owns its off-lock payload; only its bounded effect stages

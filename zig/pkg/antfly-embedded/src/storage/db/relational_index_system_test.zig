@@ -970,6 +970,69 @@ test "relational index build pages native owner control preserves committed cuts
     }
 }
 
+fn testInstalledIndexCheckpoint(database: *db_mod.DB, root_path: []const u8, intent: @import("relational_index_validation.zig").InstallIntent) !@import("relational_index_audit_checkpoint.zig").Summary {
+    const native = @import("relational_index_owner_control.zig");
+    const io = database.backend_runtime.io().?;
+    const signer = try @import("root_signing_identity.zig").loadOrCreate(alloc, io, root_path);
+    const start_compilations = database.native_index_build_cache.compilations;
+    const page_budget: @import("relational_index_jobs.zig").Budget = .{ .records = 4, .time_ns = std.time.ns_per_s };
+    const installation: native.InstallationRequest = .{ .intent = intent, .budget = page_budget };
+    var completed: ?@import("relational_index_audit_checkpoint.zig").Summary = null;
+    var partial_pages: usize = 0;
+    for (0..128) |_| {
+        const response = try database.stepNativeIndexOwnerInstallation("items", installation, root_path, signer.root_incarnation, .{});
+        try response.validateFor(installation);
+        const page = response.physicalAudit().audit;
+        completed = page;
+        try page.validateFor(intent.validation.command.expected, signer.root_incarnation);
+        if (response == .installed) {
+            try std.testing.expect(response.installed.logical.duplicate);
+            try std.testing.expect(response.installed.logical.receipt != null);
+            var mismatched = response;
+            mismatched.installed.physical.audit.physical_root_incarnation = 0;
+            try std.testing.expectError(error.InvalidRelationalIndexValidation, mismatched.validateFor(installation));
+        } else partial_pages += 1;
+        if (page.inventory.phase == .failed or (page.generation != null and (page.generation.?.phase == .ready or page.generation.?.phase == .failed))) break;
+    }
+    try std.testing.expect(partial_pages > 1);
+    try std.testing.expectEqual(@import("relational_index_validation.zig").Phase.ready, completed.?.generation.?.phase);
+    try std.testing.expectEqual(start_compilations + 1, database.native_index_build_cache.compilations);
+    try std.testing.expect(database.native_index_build_cache.hits > 1);
+    const repeated = try database.stepNativeIndexOwnerInstallation("items", installation, root_path, signer.root_incarnation, .{});
+    try std.testing.expect(repeated == .installed);
+    try std.testing.expectEqualDeep(completed.?, repeated.installed.physical.audit);
+    var changed_intent = intent;
+    changed_intent.metadata_decision[0] ^= 1;
+    try std.testing.expectError(error.InvalidPrivateIndexNativeReceipt, database.stepNativeIndexOwnerInstallationAudit("items", changed_intent, page_budget, root_path, signer.root_incarnation, .{}));
+    {
+        const fence_key = @import("relational_integrity_topology.zig").fence_key;
+        const saved_fence = try database.core.store.get(alloc, fence_key);
+        defer alloc.free(saved_fence);
+        try database.core.store.delete(fence_key);
+        defer database.core.store.put(fence_key, saved_fence) catch unreachable;
+        try std.testing.expectError(error.IntegrityTopologyFenceMissing, database.stepNativeIndexOwnerInstallationAudit("items", intent, page_budget, root_path, signer.root_incarnation, .{}));
+    }
+    const binding = intent.validation.command.binding;
+    const identity: native.Identity = .{ .id = binding.id, .plan_digest = binding.plan_digest, .owner_digest = binding.owner_digest, .ordinal = binding.ordinal, .namespace = binding.fence.namespace, .owner_group_id = binding.fence.owner_group_id };
+    var request = try native.BuildRequest.init(identity, binding, page_budget);
+    request.target_expectation = intent.validation.command.expected;
+    {
+        var lease = try database.native_index_build_cache.acquireInstalledAudit(io, alloc, database.core.index_manager.resource_manager, database.core, request, intent, .{});
+        defer lease.deinit();
+        database.native_index_build_cache.evict(io);
+        var read = try database.core.store.beginReadTxn();
+        defer read.abort();
+        const history = lease.installedHistory().?;
+        try history.record.requireCurrent(alloc, &read);
+        var historical = history.reader(&read);
+        try @import("relational_index_owner_job.zig").requireReserved(&historical, binding);
+    }
+    const reloaded = try database.stepNativeIndexOwnerInstallationAudit("items", intent, page_budget, root_path, signer.root_incarnation, .{});
+    try std.testing.expectEqualDeep(completed.?, reloaded);
+    try std.testing.expectEqual(start_compilations + 2, database.native_index_build_cache.compilations);
+    return reloaded;
+}
+
 fn testInstalledIndexHistoryAllocations(allocator: std.mem.Allocator, txn: *docstore.DocStore.Txn, binding: @import("relational_index_owner_job.zig").Binding) !void {
     var history = try @import("relational_index_validation.zig").Installed.History.init(allocator, txn, binding);
     defer history.deinit();
@@ -2491,10 +2554,26 @@ test "relational index build pages identity dispatch caches immutable candidates
                     mismatched_command.activation_digest[0] ^= 1;
                     try std.testing.expectError(error.InvalidPrivateIndexNativeReceipt, InstallPreparationChecks.run(&install_primary, mismatched_command));
                     const pending_install = pending_install: {
-                        var primary_prepared = try install_primary.prepareNativeIndexOwnerInstallationIntent(install_command.intent(), .{});
-                        defer primary_prepared.deinit();
-                        try std.testing.expectEqualDeep(install_command, primary_prepared.command);
-                        break :pending_install try install_primary.applyPreparedNativeIndexOwnerInstallation(&primary_prepared, null);
+                        const primary_signer = try @import("root_signing_identity.zig").loadOrCreate(alloc, install_primary.backend_runtime.io().?, install_primary_directory.path());
+                        const installation: native.InstallationRequest = .{ .intent = install_command.intent(), .budget = .{ .records = 4, .time_ns = std.time.ns_per_s } };
+                        var partial_pages: usize = 0;
+                        for (0..128) |_| {
+                            const response = try install_primary.stepNativeIndexOwnerInstallation("items", installation, install_primary_directory.path(), primary_signer.root_incarnation, .{});
+                            try response.validateFor(installation);
+                            if (response == .installed) {
+                                try std.testing.expect(partial_pages > 1);
+                                try std.testing.expectEqualDeep(install_command, response.installed.logical.command);
+                                break :pending_install response.installed.logical;
+                            }
+                            partial_pages += 1;
+                            try std.testing.expectEqual(@as(u32, 1), install_primary.core.schema.?.version);
+                            try std.testing.expectEqual(@as(usize, 0), install_publisher.attempts);
+                            var unchanged = try install_primary.core.store.beginReadTxn();
+                            defer unchanged.abort();
+                            try @import("relational_index_owner_job.zig").requireReserved(&unchanged, binding);
+                            try std.testing.expect(try Verification.Installed.load(alloc, &unchanged, binding) == null);
+                        }
+                        return error.TestInstallationDidNotComplete;
                     };
                     try pending_install.validate();
                     try std.testing.expect(!pending_install.duplicate and pending_install.replication_pending);
@@ -2611,6 +2690,15 @@ test "relational index build pages identity dispatch caches immutable candidates
                     try std.testing.expectError(error.InvalidPrivateIndexNativeReceipt, replication_ingress.applyRecord(&installed_db, install_record));
                     try std.testing.expectEqual(@as(u64, 6), try installed_db.replicationAppliedSequence());
                     try testInstalledIndexPhysicalAudit(&installed_db);
+                    const ready_checkpoint = try testInstalledIndexCheckpoint(&installed_db, install_directory.path(), install_command.intent());
+                    installed_db.close();
+                    installed_db_open = false;
+                    installed_db = try db_mod.DB.open(alloc, install_directory.path(), options);
+                    installed_db_open = true;
+                    const reopened_signer = try @import("root_signing_identity.zig").load(alloc, installed_db.backend_runtime.io().?, install_directory.path());
+                    const resumed_checkpoint = try installed_db.stepNativeIndexOwnerInstallationAudit("items", install_command.intent(), .{ .records = 4, .time_ns = std.time.ns_per_s }, install_directory.path(), reopened_signer.root_incarnation, .{});
+                    try std.testing.expectEqualDeep(ready_checkpoint, resumed_checkpoint);
+                    try std.testing.expectEqual(@as(u64, 1), installed_db.native_index_build_cache.compilations);
                     const installed_row = (try installed_db.get(alloc, "row000")).?;
                     defer alloc.free(installed_row);
                     const source_row = (try db.get(alloc, "row000")).?;
