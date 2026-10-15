@@ -7974,6 +7974,19 @@ pub const DB = struct {
                     defer prepared.deinit();
                     _ = try self.applyPreparedNativeIndexSourceConsumption(&prepared, .{ .position = frame.position, .lsn = sequence });
                 },
+                .inventory_validation => |command| {
+                    var prepared = blk: {
+                        var read = try self.core.store.beginReadTxn();
+                        defer read.abort();
+                        const page = @import("relational_index_private_claims.zig").InventoryValidation.Prepared.replay(self.alloc, &read, command) catch |err| {
+                            if (try self.replicationMutationAlreadyApplied(sequence)) return;
+                            return err;
+                        };
+                        break :blk native_index_control.PreparedInventoryValidation{ .alloc = self.alloc, .batch = page };
+                    };
+                    defer prepared.deinit();
+                    _ = try self.applyPreparedNativeIndexEffect(&prepared, .{ .position = frame.position, .lsn = sequence });
+                },
                 .control => |command| {
                     var prepared = self.prepareNativeIndexOwnerControl(command) catch |err| {
                         // Another replay may retire inputs during preparation.
@@ -8151,6 +8164,7 @@ pub const DB = struct {
         try self.enforceReplicationWriteGate();
         const binding = (try self.nativeIndexOwnerState(request.identity)) orelse return error.PrivateIndexRootRecoveryRequired;
         try request.requireBinding(binding);
+        if (request.target_expectation != null) return self.stepNativeIndexInventoryValidation(table_name, request, binding, context);
         const io = self.backend_runtime.io() orelse return error.UnsupportedPlatform;
         var lease = try self.native_index_build_cache.acquire(io, self.alloc, self.core.index_manager.resource_manager, self.core, request, binding, context);
         defer lease.deinit();
@@ -8188,6 +8202,48 @@ pub const DB = struct {
         // was canceled while its mirror was acknowledging the durable outbox.
         try response.validateFor(request);
         return response;
+    }
+
+    fn stepNativeIndexInventoryValidation(self: *DB, table_name: []const u8, request: NativeIndexOwnerBuildRequest, binding: @import("relational_index_owner_job.zig").Binding, context: @import("../../api/operation.zig").RequestContext) !NativeIndexOwnerBuildResponse {
+        const claims = @import("relational_index_private_claims.zig");
+        const expected = request.target_expectation.?;
+        if (!std.mem.eql(u8, &@import("relational_integrity_contract.zig").hash(table_name), &expected.table_name_digest)) return error.PrivateIndexOwnerJobChanged;
+        var budget = if (self.core.index_manager.resource_manager) |manager| resource_manager_mod.BudgetedAllocator.initReclaiming(manager, .relational_preparation_working_set, self.alloc, 1) else null;
+        defer if (budget) |*value| value.deinit();
+        const alloc = if (budget) |*value| value.allocator() else self.alloc;
+        const inventory_page = blk: {
+            var read = try self.core.store.beginReadTxn();
+            defer read.abort();
+            break :blk claims.InventoryValidation.Prepared.prepare(alloc, &read, binding, expected, request.budget, context) catch |err| {
+                if (budget) |value| if (value.denied()) return error.ResourceBudgetExceeded;
+                return err;
+            };
+        };
+        const outcome: native_index_control.InventoryOutcome = if (inventory_page) |value| blk: {
+            var prepared: native_index_control.PreparedInventoryValidation = .{ .alloc = alloc, .batch = value };
+            defer prepared.deinit();
+            break :blk self.applyPreparedNativeIndexEffect(&prepared, null) catch |err| {
+                if (budget) |working| if (working.denied()) return error.ResourceBudgetExceeded;
+                return err;
+            };
+        } else blk: {
+            try context.ensureActive();
+            try self.enforceReplicationWriteGate();
+            var read = try self.core.store.beginReadTxn();
+            defer read.abort();
+            const record = (try claims.InventoryValidation.load(alloc, &read, binding)) orelse return error.InvalidPrivateIndexClaimInventory;
+            if (!std.mem.eql(u8, &try record.expected.digest(), &try expected.digest())) return error.PrivateIndexOwnerJobChanged;
+            var result: native_index_control.InventoryOutcome = .{ .binding = binding, .record = record, .position = record.position, .duplicate = true };
+            if (try durable_outbox_store.hasPendingTxn(&read)) {
+                result.replication_pending = true;
+                result.error_name = "ReplicationOutboxPending";
+                self.local_execution.durable_replication_outbox_maybe.store(true, .release);
+                self.scheduleDurableReplicationOutboxRecovery();
+            }
+            break :blk result;
+        };
+        try outcome.validateFor(request);
+        return .{ .inventory = outcome };
     }
 
     /// Reservation retains its compiled candidate across bounded page prepares.

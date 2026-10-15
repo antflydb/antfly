@@ -46,12 +46,12 @@ pub const Request = struct {
     table_id: u64,
     group_id: u64,
     id: [16]u8,
-    operation: enum { fence, reserve, build, source },
+    operation: enum { fence, reserve, build, source, validate },
     build_budget: ?local.storage_db_relational_index_jobs.Budget = null,
 
     pub fn validate(self: Request, group_id: u64) !void {
         if (self.group_id != group_id) return error.GenerationPublicationChanged;
-        if (self.operation != .build and self.build_budget != null) return error.InvalidGenerationPublication;
+        if (self.operation != .build and self.operation != .validate and self.build_budget != null) return error.InvalidGenerationPublication;
         if (self.build_budget) |budget| try budget.validate();
         try self.lookup(.permission).validate();
     }
@@ -65,6 +65,7 @@ pub const Request = struct {
                 .fence => .fence,
                 .reserve => .reserve,
                 .build, .source => .build,
+                .validate => .validate,
             },
             .projection = projection,
         };
@@ -214,13 +215,18 @@ pub const ControlResponse = union(enum) {
             .acknowledged => return,
             .source => |value| return value.validate(request),
             .building => |value| {
-                if (request.operation != .build or value.root_generation == 0) return error.InvalidPrivateIndexNativeReceipt;
+                if ((request.operation != .build and request.operation != .validate) or value.root_generation == 0) return error.InvalidPrivateIndexNativeReceipt;
                 const binding = switch (value.outcome) {
                     .advanced => |item| item.binding,
                     .complete => |item| item.binding,
+                    .inventory => |item| item.binding,
                 };
                 if (binding.fence.namespace.table_id != request.table_id) return error.InvalidPrivateIndexNativeReceipt;
-                const build = try native.BuildRequest.init(.{ .id = request.id, .plan_digest = binding.plan_digest, .owner_digest = binding.owner_digest, .ordinal = binding.ordinal, .namespace = binding.fence.namespace, .owner_group_id = request.group_id }, binding, request.build_budget orelse .{});
+                var build = try native.BuildRequest.init(.{ .id = request.id, .plan_digest = binding.plan_digest, .owner_digest = binding.owner_digest, .ordinal = binding.ordinal, .namespace = binding.fence.namespace, .owner_group_id = request.group_id }, binding, request.build_budget orelse .{});
+                if (request.operation == .validate) {
+                    if (value.outcome != .inventory) return error.InvalidPrivateIndexNativeReceipt;
+                    build.target_expectation = value.outcome.inventory.record.expected;
+                } else if (value.outcome == .inventory) return error.InvalidPrivateIndexNativeReceipt;
                 try value.outcome.validateFor(build);
                 return;
             },
@@ -249,7 +255,7 @@ pub const ControlResponse = union(enum) {
             .effect = switch (request.operation) {
                 .fence => .fenced,
                 .reserve => .reserved,
-                .build, .source => return error.InvalidPrivateIndexNativeReceipt,
+                .build, .source, .validate => return error.InvalidPrivateIndexNativeReceipt,
             },
         });
         if (binding.fence.namespace.table_id != request.table_id) return error.InvalidPrivateIndexNativeReceipt;
@@ -759,7 +765,13 @@ pub fn claimStep(alloc: std.mem.Allocator, source: anytype, metadata: anytype, t
     var state = try source.nativeIndexOwnerState(alloc, request.group_id, table_name, identity, context);
     defer state.deinit();
     const command = try permission.value.nativeClaims(lookup, state.value orelse return error.PrivateIndexRootRecoveryRequired, request.claims);
-    const rooted = try source.applyNativeIndexOwnerClaimsAtRoot(alloc, request.group_id, table_name, command, context);
+    const rooted = source.applyNativeIndexOwnerClaimsAtRoot(alloc, request.group_id, table_name, command, context) catch |err| switch (err) {
+        // A delayed NEW claim after inventory freeze is stale owner work,
+        // not a transient receiver outage. Reuse the transport's typed 409
+        // contract; exact duplicates are still accepted by native storage.
+        error.PrivateIndexTargetSealed => return error.PrivateIndexOwnerJobChanged,
+        else => return err,
+    };
     errdefer rooted.outcome.deinit();
     try rooted.outcome.value.validateFor(command);
     // Preserve committed/pending progress even if cancellation arrived during
@@ -941,7 +953,7 @@ pub fn step(alloc: std.mem.Allocator, source: anytype, metadata: anytype, table_
         const receipt_request: native.ReceiptRequest = .{ .identity = grant.identity, .effect = switch (request.operation) {
             .fence => .fenced,
             .reserve => .reserved,
-            .build, .source => return error.InvalidGenerationPublication,
+            .build, .source, .validate => return error.InvalidGenerationPublication,
         } };
         var recovered = try source.nativeIndexOwnerReceiptAtRoot(alloc, request.group_id, table_name, receipt_request, context);
         errdefer recovered.deinit();
@@ -969,8 +981,9 @@ pub fn step(alloc: std.mem.Allocator, source: anytype, metadata: anytype, table_
     }
     var state = try source.nativeIndexOwnerState(alloc, request.group_id, table_name, identity, context);
     defer state.deinit();
-    if (request.operation == .build) {
-        const build = try permission.value.nativeBuild(hot_request, state.value orelse return error.PrivateIndexRootRecoveryRequired, request.build_budget orelse .{});
+    if (request.operation == .build or request.operation == .validate) {
+        const binding = state.value orelse return error.PrivateIndexRootRecoveryRequired;
+        const build = if (request.operation == .validate) try permission.value.nativeInventoryValidation(hot_request, binding, request.build_budget orelse .{}) else try permission.value.nativeBuild(hot_request, binding, request.build_budget orelse .{});
         const rooted = try source.stepNativeIndexOwnerBuildAtRoot(alloc, request.group_id, table_name, build, context);
         errdefer rooted.outcome.deinit();
         try rooted.outcome.value.validateFor(build);
@@ -981,7 +994,7 @@ pub fn step(alloc: std.mem.Allocator, source: anytype, metadata: anytype, table_
         const effect: @FieldType(native.ReceiptRequest, "effect") = switch (request.operation) {
             .fence => .fenced,
             .reserve => .reserved,
-            .build, .source => return error.InvalidGenerationPublication,
+            .build, .source, .validate => return error.InvalidGenerationPublication,
         };
         var recovered = try source.nativeIndexOwnerReceiptAtRoot(alloc, request.group_id, table_name, native.ReceiptRequest{ .identity = identity, .effect = effect }, context);
         if (recovered.outcome.value) |value| {
@@ -1028,6 +1041,7 @@ const TestDriver = struct {
     admissions: usize = 0,
     controls: usize = 0,
     claim_batches: usize = 0,
+    claims_sealed: bool = false,
     cancellations: usize = 0,
     cancel_state: ?jobs.CancellationState = null,
     cleanups: usize = 0,
@@ -1039,6 +1053,7 @@ const TestDriver = struct {
     produce_receipt: bool = false,
     pending: bool = false,
     build_pages: usize = 0,
+    inventory_pages: usize = 0,
     source_reads: usize = 0,
     source_failed: bool = false,
     acceptance_head: ?delivery_journal.Head = null,
@@ -1085,6 +1100,11 @@ const TestDriver = struct {
         }
         const request = call.relational_index_owner_decision;
         var value = self.value;
+        if (call.relational_index_owner_decision.operation == .validate) {
+            const consumed = self.consumed_record orelse return error.InvalidPrivateIndexClaimReceipt;
+            const member: local.storage_db_relational_integrity_contract.Claim = .{ .tuple = "logical\x00\xff\x80", .parent_table = value.dispatch.?.table_name, .parent_key = "row", .schema_version = self.binding.?.physical_candidate.schema_version };
+            value.target_expectation = .{ .metadata_incarnation = consumed.accepted.metadata_incarnation, .binding_digest = consumed.accepted.binding_digest, .generation = consumed.header.bytes[72..88].*, .completion_revision = value.head.completion_revision, .source_consumption_digest = try consumed.prefix().digest(), .source_progress_digest = consumed.header.progressDigest(), .table_name_digest = local.storage_db_relational_integrity_contract.hash(value.dispatch.?.table_name), .rows = 1, .inventory_xor = member.memberDigest(), .provenance = @splat(1) };
+        }
         var routes: [source_delivery.max_parts]jobs.private_claims.delivery.Target = undefined;
         if (request.claim_groups) |groups| {
             for (groups.items, routes[0..groups.items.len]) |group, *route| {
@@ -1134,6 +1154,7 @@ const TestDriver = struct {
     pub fn applyNativeIndexOwnerClaimsAtRoot(self: *TestDriver, alloc: std.mem.Allocator, _: u64, _: []const u8, command: native.ClaimCommand, context: operation.RequestContext) !@FieldType(ClaimResult, "applied") {
         try context.ensureActive();
         try command.validate();
+        if (self.claims_sealed) return error.PrivateIndexTargetSealed;
         self.claim_batches += 1;
         if (self.cancel_after_commit) |signal| signal.store(true, .release);
         return .{ .root_generation = self.root_generation, .outcome = try parsed(native.ClaimOutcome, alloc, .{
@@ -1167,6 +1188,12 @@ const TestDriver = struct {
         try context.ensureActive();
         const binding = self.binding orelse return error.PrivateIndexRootRecoveryRequired;
         try request.requireBinding(binding);
+        if (request.target_expectation) |expected| {
+            self.inventory_pages += 1;
+            const address = try local.storage_db_relational_integrity_contract.Address.init(expected.generation, "logical\x00\xff\x80");
+            const position: local.storage_db_receipt_position.Native = .{ .namespace = binding.fence.namespace, .sequence = 6 };
+            return .{ .root_generation = self.root_generation, .outcome = try parsed(native.BuildResponse, alloc, .{ .inventory = .{ .binding = binding, .record = .{ .expected = expected, .fields = .{ .phase = .ready, .rows = 1, .inventory_xor = expected.inventory_xor, .chain = @splat(7), .cursor = jobs.private_claims.inventoryKey(address) }, .position = position, .page_digest = @splat(8) }, .position = position, .duplicate = false } }) };
+        }
         self.build_pages += 1;
         if (self.cancel_after_commit) |signal| signal.store(true, .release);
         return .{ .root_generation = self.root_generation, .outcome = try parsed(native.BuildResponse, alloc, .{ .advanced = .{ .binding = binding, .page_digest = @splat(9), .position = .{ .namespace = binding.fence.namespace, .sequence = 4 }, .duplicate = false, .replication_pending = self.pending, .error_name = if (self.pending) "ReplicationOutboxPending" else null } }) };
@@ -1435,12 +1462,15 @@ fn testSchedulerDeliveryFault(alloc: std.mem.Allocator, permission: publication.
     try std.testing.expectEqual(@as(usize, if (before_commit) 2 else 1), driver.completion_requests);
     driver.value.head.completed_sources = driver.value.head.owner_count;
     driver.value.head.completion_revision = driver.value.head.revision;
-    const completed_calls = sender.calls;
+    driver.value.owner.source_delivery = driver.acceptance_head.?.decision_digest;
+    driver.value.owner.source_completed = true;
     for (0..12) |_| {
         now += 300 * std.time.ns_per_ms;
         _ = try coordinator.step(std.testing.io, alloc, null, &host, &transport, now);
     }
-    try std.testing.expectEqual(completed_calls, sender.calls);
+    try std.testing.expect(driver.inventory_pages != 0);
+    try std.testing.expectEqual(@as(usize, 1), driver.build_pages);
+    try std.testing.expectEqual(@as(usize, 1), driver.consumption_calls);
     try std.testing.expect(driver.value.head.phase == .building);
     host.active = false;
     const before = sender.calls;
@@ -1826,6 +1856,10 @@ test "relational index publication claim receiver binds fresh build permission w
     driver = .{ .value = permission, .binding = binding };
     try std.testing.expectError(error.GenerationPublicationChanged, claimStep(alloc, &driver, &driver, "wrong table", request, .{}));
     try std.testing.expectEqual(@as(usize, 0), driver.inspections);
+    driver.claims_sealed = true;
+    try std.testing.expectError(error.PrivateIndexOwnerJobChanged, claimStep(alloc, &driver, &driver, plan.before.name, request, .{}));
+    try std.testing.expectEqual(@as(usize, 0), driver.claim_batches);
+    driver.claims_sealed = false;
     driver.value.head = prepared.head;
     driver.value.owner = prepared.owners[0];
     try std.testing.expectError(error.GenerationPublicationChanged, claimStep(alloc, &driver, &driver, plan.before.name, request, .{}));

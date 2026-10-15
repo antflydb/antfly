@@ -975,6 +975,7 @@ test "relational index build pages identity dispatch caches immutable candidates
         const result = try db.stepNativeIndexOwnerBuild("items", request, .{});
         try result.validateFor(request);
         switch (result) {
+            .inventory => return error.UnexpectedInventoryValidation,
             .advanced => |value| {
                 pages += 1;
                 try std.testing.expect(pages <= 9);
@@ -1189,6 +1190,9 @@ test "relational index build pages identity dispatch caches immutable candidates
     {
         const Source = @import("relational_index_private_claims.zig").SourceStream;
         var previous: ?Source.Accepted = null;
+        var expected_xor: [32]u8 = @splat(0);
+        var duplicate_claim: ?db_mod.DB.PreparedNativeIndexOwnerClaims = null;
+        defer if (duplicate_claim) |*prepared| prepared.deinit();
         for (0..9) |i| {
             var source = try db.readNativeIndexClaimSource(alloc, identity, .{});
             defer source.deinit();
@@ -1203,6 +1207,10 @@ test "relational index build pages identity dispatch caches immutable candidates
                 const result = try db.applyPreparedNativeIndexOwnerClaims(&delivered, null);
                 try result.validateFor(delivered_command);
                 logical_digest = try delivered_command.digest();
+                for (delivered_command.claims) |claim| for (&expected_xor, claim.memberDigest()) |*byte, contribution| {
+                    byte.* ^= contribution;
+                };
+                if (i == 0) duplicate_claim = try db.prepareNativeIndexOwnerClaims(.{ .binding = binding, .claims = claims[0..1] });
             }
             const accepted = try sourceDecision(binding, header, previous, logical_digest);
             if (i == 0) {
@@ -1264,6 +1272,125 @@ test "relational index build pages identity dispatch caches immutable candidates
         const complete = try db.stepNativeIndexOwnerBuild("items", request, .{});
         try std.testing.expectEqual(@as(u64, 0), complete.complete.claim_batches_pending);
         try std.testing.expectEqual(last_position.?, complete.complete.position);
+        try std.testing.expectEqual(@as(u32, 1), db.core.schema.?.version);
+
+        // Expected logical membership comes from the delivered source, not
+        // from the target scan being verified. Metadata proof signing itself
+        // is covered by the publication tests, not fabricated by this fixture.
+        const private = @import("relational_index_private_claims.zig");
+        const Validation = private.InventoryValidation;
+        const consumed = source.consumed.?;
+        var validation_request = request;
+        validation_request.budget.records = 3;
+        validation_request.budget.time_ns = std.time.ns_per_s;
+        validation_request.target_expectation = .{
+            .metadata_incarnation = consumed.accepted.metadata_incarnation,
+            .binding_digest = consumed.accepted.binding_digest,
+            .generation = consumed.header.bytes[72..88].*,
+            .completion_revision = 123,
+            .source_consumption_digest = try consumed.prefix().digest(),
+            .source_progress_digest = consumed.header.progressDigest(),
+            .table_name_digest = @import("relational_integrity_contract.zig").hash("items"),
+            .rows = 32,
+            .inventory_xor = expected_xor,
+            .provenance = @splat(7),
+        };
+        const late_command: native.ClaimCommand = .{ .binding = binding, .claims = &.{.{ .parent_table = "items", .parent_key = "late", .tuple = "late", .schema_version = binding.physical_candidate.schema_version }} };
+        var late = try db.prepareNativeIndexOwnerClaims(late_command);
+        defer late.deinit();
+        const frozen = try db.stepNativeIndexOwnerBuild("items", validation_request, .{});
+        try frozen.validateFor(validation_request);
+        try std.testing.expectEqual(Validation.Phase.scanning, frozen.inventory.record.fields.phase);
+        try std.testing.expectEqual(@as(u64, 0), frozen.inventory.record.fields.rows);
+        try std.testing.expectError(error.PrivateIndexTargetSealed, db.applyPreparedNativeIndexOwnerClaims(&late, null));
+        const duplicate = try db.applyPreparedNativeIndexOwnerClaims(&duplicate_claim.?, null);
+        try std.testing.expect(duplicate.duplicate);
+        try std.testing.expectError(error.Canceled, db.stepNativeIndexOwnerBuild("items", validation_request, .{ .cancellation = .fromAtomic(&canceled) }));
+        try std.testing.expectError(error.DeadlineExceeded, db.stepNativeIndexOwnerBuild("items", validation_request, .{ .deadline_ns = 0 }));
+        var too_small = validation_request;
+        too_small.budget.bytes = 1;
+        try std.testing.expectError(error.InvalidRelationalIndexBudget, db.stepNativeIndexOwnerBuild("items", too_small, .{}));
+        var changed_expectation = validation_request;
+        changed_expectation.target_expectation.?.rows += 1;
+        try std.testing.expectError(error.PrivateIndexOwnerJobChanged, db.stepNativeIndexOwnerBuild("items", changed_expectation, .{}));
+        {
+            var denied = try manager.reserve(.relational_preparation_working_set, 16 * 1024 * 1024);
+            defer denied.release();
+            try std.testing.expectError(error.ResourceBudgetExceeded, db.stepNativeIndexOwnerBuild("items", validation_request, .{}));
+        }
+        {
+            var corrupt = try db.core.store.beginWriteTxn();
+            defer corrupt.abort();
+            const address = try @import("relational_integrity_contract.zig").Address.init(validation_request.target_expectation.?.generation, duplicate_claim.?.command.claims[0].tuple);
+            try corrupt.delete(&address.claimKey());
+            try std.testing.expectError(error.InvalidPrivateIndexClaimInventory, Validation.Prepared.prepare(alloc, &corrupt, binding, validation_request.target_expectation.?, .{ .records = 128, .time_ns = std.time.ns_per_s }, .{}));
+        }
+        // Exercise the actual normalized ingress and native mutation pipeline,
+        // not only the page recomputation helper. The transport marker and
+        // inventory cursor must commit together and exact replay is inert.
+        var prior_rows: u64 = 0;
+        {
+            const page = blk: {
+                var read = try db.core.store.beginReadTxn();
+                defer read.abort();
+                break :blk (try Validation.Prepared.prepare(alloc, &read, binding, validation_request.target_expectation.?, validation_request.budget, .{})).?;
+            };
+            var effect: native.PreparedInventoryValidation = .{ .alloc = alloc, .batch = page };
+            defer effect.deinit();
+            try effect.preparePayload();
+            const position: @import("receipt_position.zig").Native = .{ .namespace = binding.fence.namespace, .sequence = frozen.inventory.position.sequence + 1 };
+            const payload = try effect.finalizePayload(position);
+            const record: @import("replication_record.zig").Record = .{ .kind = .batch_mutation, .payload_codec = .json, .cluster_id = 1, .timeline_id = 1, .epoch = 1, .lsn = 1, .previous_lsn = 0, .payload = payload };
+            try replication_ingress.applyRecord(&db, record);
+            try replication_ingress.applyRecord(&db, record);
+            try std.testing.expectEqual(@as(u64, 1), try db.replicationAppliedSequence());
+            var read = try db.core.store.beginReadTxn();
+            defer read.abort();
+            const retained = (try Validation.load(alloc, &read, binding)).?;
+            try std.testing.expectEqual(position, retained.position);
+            try std.testing.expectEqualDeep(page.command.next, retained.fields);
+            prior_rows = retained.fields.rows;
+        }
+        var validation_pages: usize = 1;
+        while (true) {
+            // Normalized replay must recompute the physical page rather than
+            // accepting a supplied cursor or chain, even with a valid digest.
+            {
+                var read = try db.core.store.beginReadTxn();
+                defer read.abort();
+                const page = (try Validation.Prepared.prepare(alloc, &read, binding, validation_request.target_expectation.?, validation_request.budget, .{})).?;
+                _ = try Validation.Prepared.replay(alloc, &read, page.command);
+                var forged = page.command;
+                forged.next.chain[0] ^= 1;
+                try std.testing.expectError(error.InvalidPrivateIndexClaimInventory, Validation.Prepared.replay(alloc, &read, forged));
+            }
+            const result = try db.stepNativeIndexOwnerBuild("items", validation_request, .{});
+            try result.validateFor(validation_request);
+            const fields = result.inventory.record.fields;
+            validation_pages += 1;
+            try std.testing.expect(validation_pages <= 12);
+            try std.testing.expect(fields.rows >= prior_rows and fields.rows - prior_rows <= 3);
+            prior_rows = fields.rows;
+            if (validation_pages == 2) {
+                db.close();
+                db = try db_mod.DB.open(alloc, directory.path(), options);
+                var read = try db.core.store.beginReadTxn();
+                defer read.abort();
+                const retained = (try Validation.load(alloc, &read, binding)).?;
+                try std.testing.expectEqualDeep(result.inventory.record, retained);
+            }
+            if (fields.phase == .ready) {
+                try std.testing.expectEqual(@as(u64, 32), fields.rows);
+                try std.testing.expectEqualSlices(u8, &expected_xor, &fields.inventory_xor);
+                const observed = try db.stepNativeIndexOwnerBuild("items", validation_request, .{});
+                try observed.validateFor(validation_request);
+                try std.testing.expect(observed.inventory.duplicate);
+                try std.testing.expectEqual(result.inventory.position, observed.inventory.position);
+                break;
+            }
+            try std.testing.expectEqual(Validation.Phase.scanning, fields.phase);
+        }
+        // Inventory readiness alone cannot publish the candidate schema.
         try std.testing.expectEqual(@as(u32, 1), db.core.schema.?.version);
     }
     var cancellation = try db.prepareNativeIndexOwnerCancellation(native.Admission.fromBinding(binding));

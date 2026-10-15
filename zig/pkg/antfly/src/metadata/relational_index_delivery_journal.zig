@@ -172,7 +172,7 @@ pub const Head = struct {
     pub fn encode(self: Head) ![encoded_len]u8 {
         try self.validate();
         var bytes: [encoded_len]u8 = @splat(0);
-        @memcpy(bytes[0..8], "AIDA\x02\x00\x00\x00");
+        @memcpy(bytes[0..8], "AIDA\x03\x00\x00\x00");
         inline for (.{ "metadata_incarnation", "binding_digest", "scope_digest" }, 0..) |field, i| @memcpy(bytes[8 + i * 32 ..][0..32], &@field(self, field));
         inline for (.{ "ordinal", "rows", "batch_rows", "source_sequence" }, 0..) |field, i| std.mem.writeInt(u64, bytes[104 + i * 8 ..][0..8], @field(self, field), .little);
         inline for (.{ "batch_digest", "logical_digest", "previous_decision", "decision_digest", "accepted_root", "provenance" }, 0..) |field, i| @memcpy(bytes[136 + i * 32 ..][0..32], &@field(self, field));
@@ -183,7 +183,7 @@ pub const Head = struct {
         return bytes;
     }
     pub fn decode(bytes: []const u8) !Head {
-        if (bytes.len != encoded_len or !std.mem.eql(u8, bytes[0..8], "AIDA\x02\x00\x00\x00") or !std.mem.allEqual(u8, bytes[369..384], 0) or
+        if (bytes.len != encoded_len or !std.mem.eql(u8, bytes[0..8], "AIDA\x03\x00\x00\x00") or !std.mem.allEqual(u8, bytes[369..384], 0) or
             !std.mem.eql(u8, bytes[384..416], &hash(bytes[0..384]))) return error.InvalidPrivateIndexClaimInventory;
         var result: Head = undefined;
         inline for (.{ "metadata_incarnation", "binding_digest", "scope_digest" }, 0..) |field, i| @field(result, field) = bytes[8 + i * 32 ..][0..32].*;
@@ -229,7 +229,7 @@ pub const Inventory = struct {
 };
 
 pub const SourceRecord = struct {
-    pub const prefix_len = Head.encoded_len + jobs.Binding.encoded_len + 4;
+    pub const prefix_len = Head.encoded_len + jobs.Binding.encoded_len + Source.header_len + 4;
     pub const max_bytes = prefix_len + max_completion_bytes + delivery.max_wire_bytes;
     head: Head,
     signed: std.json.Parsed(delivery.Signed),
@@ -252,9 +252,9 @@ pub const SourceRecord = struct {
         const json = try std.json.Stringify.valueAlloc(alloc, signed, .{});
         defer alloc.free(json);
         if (json.len == 0 or json.len > delivery.max_wire_bytes) return error.InvalidCatalogRecord;
-        return std.mem.concat(alloc, u8, &.{ &try head.encode(), &try signed.data.source.encode(), &.{ 0, 0, 0, 0 }, json });
+        return std.mem.concat(alloc, u8, &.{ &try head.encode(), &try signed.data.source.encode(), &signed.data.header.bytes, &.{ 0, 0, 0, 0 }, json });
     }
-    pub const Prefix = struct { head: Head, binding: jobs.Binding, completion: ?Consumed, signed_bytes: []const u8 };
+    pub const Prefix = struct { head: Head, binding: jobs.Binding, header: Source.Header, completion: ?Consumed, signed_bytes: []const u8 };
     /// Bounded completion lookup never reparses all target delivery proofs.
     /// The owner directory independently anchors the complete retained bytes.
     pub fn peek(alloc: std.mem.Allocator, bytes: []const u8) !Prefix {
@@ -262,6 +262,9 @@ pub const SourceRecord = struct {
         const head = try Head.decode(bytes[0..Head.encoded_len]);
         const binding = try jobs.Binding.decode(bytes[Head.encoded_len..][0..jobs.Binding.encoded_len]);
         if (!equal(head.binding_digest, try bindingDigest(binding))) return error.InvalidCatalogRecord;
+        const header = try Source.Header.decode(bytes[Head.encoded_len + jobs.Binding.encoded_len ..][0..Source.header_len], binding, head.ordinal);
+        if (!equal(head.batch_digest, header.digest()) or !equal(head.scope_digest, header.bytes[40..72].*) or head.batch_rows != std.mem.readInt(u32, header.bytes[96..100], .little) or
+            head.source_sequence != (try header.position()).sequence or @backingInt(head.state) != header.bytes[184]) return error.InvalidCatalogRecord;
         const len = std.mem.readInt(u32, bytes[prefix_len - 4 ..][0..4], .little);
         if (len > max_completion_bytes or len >= bytes.len - prefix_len) return error.InvalidCatalogRecord;
         var complete: ?Consumed = null;
@@ -278,7 +281,7 @@ pub const SourceRecord = struct {
         }
         const signed_bytes = bytes[prefix_len + len ..];
         if (signed_bytes.len > delivery.max_wire_bytes) return error.InvalidCatalogRecord;
-        return .{ .head = head, .binding = binding, .completion = complete, .signed_bytes = signed_bytes };
+        return .{ .head = head, .binding = binding, .header = header, .completion = complete, .signed_bytes = signed_bytes };
     }
     pub fn completed(alloc: std.mem.Allocator, bytes: []const u8, consumed: Consumed) ![]u8 {
         const prefix_ = try peek(alloc, bytes);
@@ -301,6 +304,7 @@ pub const SourceRecord = struct {
         for (signed.value.data.parts.items) |part| try part.target.verifyRecorded(part.rows);
         try requireHead(head, signed.value);
         if (!std.mem.eql(u8, &try prefix_.binding.encode(), &try signed.value.data.source.encode())) return error.InvalidCatalogRecord;
+        if (!std.mem.eql(u8, &prefix_.header.bytes, &signed.value.data.header.bytes)) return error.InvalidCatalogRecord;
         const canonical = try std.json.Stringify.valueAlloc(alloc, signed.value, .{});
         defer alloc.free(canonical);
         if (!std.mem.eql(u8, canonical, prefix_.signed_bytes)) return error.InvalidCatalogRecord;
@@ -568,6 +572,10 @@ pub fn prepare(alloc: std.mem.Allocator, txn: anytype, group: u64, request: Requ
 fn anchored(reader: anytype, key: []const u8, expected: Digest) !?[]const u8 {
     const bytes = try optional(reader, key);
     if (bytes) |value| {
+        // Bound hashing before decoding either anchored record family. A
+        // corrupt persisted value must not turn a permission read into work
+        // proportional to an arbitrary blob's size.
+        if (value.len > SourceRecord.max_bytes) return error.InvalidCatalogRecord;
         if (!equal(hash(value), expected)) return error.InvalidCatalogRecord;
     } else if (nonzero(&expected)) return error.InvalidCatalogRecord;
     return bytes;
@@ -580,6 +588,49 @@ fn requireRetainedBinding(alloc: std.mem.Allocator, reader: anytype, group: u64,
     var dispatch = try publication.readDispatch(alloc, reader, group, owner.owner);
     defer dispatch.deinit();
     try (publication.OwnerDecision{ .metadata_group_id = group, .metadata_incarnation = @splat(0), .head = head, .owner = owner, .disposition = .execute, .dispatch = dispatch.value }).requireRetainedNativeBinding(binding);
+}
+
+/// O(1) final-input projection. EOF completion freezes metadata acceptance;
+/// it does not prove physical claims, close target writers or publish a schema.
+pub fn targetExpectation(alloc: std.mem.Allocator, reader: anytype, group: u64, head: progress.Head, owner: progress.OwnerState, incarnation: Digest) !jobs.private_claims.TargetExpectation {
+    try head.validate();
+    try owner.validate();
+    if (head.phase != .building or head.completed_sources != head.owner_count or head.completion_revision == 0) return error.GenerationPublicationChanged;
+    if (owner.owner.authority != .native or !owner.source_completed or owner.owner.namespace.table_id != head.table_id or owner.owner.ordinal >= head.owner_count or
+        !std.mem.eql(u8, &owner.owner.plan_id, &head.plan_id) or !equal(owner.owner.plan_digest, head.plan_digest)) return error.InvalidCatalogRecord;
+    var buf: [192]u8 = undefined;
+    const source = (try anchored(reader, try sourceKey(&buf, group, head.table_id, owner.owner.ordinal), owner.source_delivery)) orelse return error.InvalidCatalogRecord;
+    const prefix_ = try SourceRecord.peek(alloc, source);
+    const complete = prefix_.completion orelse return error.InvalidCatalogRecord;
+    if (!equal(prefix_.head.metadata_incarnation, incarnation) or prefix_.binding.ordinal != owner.owner.ordinal or
+        prefix_.binding.fence.owner_group_id != owner.owner.group_id or !std.mem.eql(u8, &prefix_.binding.id, &head.plan_id)) return error.InvalidCatalogRecord;
+    var dispatch = try publication.readDispatch(alloc, reader, group, owner.owner);
+    defer dispatch.deinit();
+    try (publication.OwnerDecision{ .metadata_group_id = group, .metadata_incarnation = incarnation, .head = head, .owner = owner, .disposition = .execute, .dispatch = dispatch.value }).requireRetainedNativeBinding(prefix_.binding);
+    const source_scope: Source.Scope = .{ .table_name = dispatch.value.table_name, .generation = prefix_.header.bytes[72..88].*, .schema_version = std.mem.readInt(u32, prefix_.header.bytes[88..92], .little), .tuple_fingerprint = prefix_.header.bytes[192..224].*, .nulls_not_distinct = prefix_.header.bytes[185] != 0 };
+    if (!equal(try source_scope.digest(), prefix_.head.scope_digest)) return error.InvalidCatalogRecord;
+    try requireEnrollment(alloc, reader, group, complete.proof, incarnation);
+    var result: jobs.private_claims.TargetExpectation = .{
+        .metadata_incarnation = incarnation,
+        .binding_digest = prefix_.head.binding_digest,
+        .generation = prefix_.header.bytes[72..88].*,
+        .completion_revision = head.completion_revision,
+        .source_consumption_digest = try complete.digest(),
+        .source_progress_digest = prefix_.header.progressDigest(),
+        .table_name_digest = hash(dispatch.value.table_name),
+        .rows = 0,
+        .inventory_xor = @splat(0),
+        .provenance = @splat(0),
+    };
+    if (try anchored(reader, try targetKey(&buf, group, head.table_id, owner.owner.ordinal), owner.target_inventory)) |bytes| {
+        const target = try TargetRecord.decode(bytes);
+        if (!std.mem.eql(u8, &try target.binding.encode(), &try prefix_.binding.encode()) or !equal(target.inventory.metadata_incarnation, incarnation)) return error.InvalidCatalogRecord;
+        result.rows = target.inventory.rows;
+        result.inventory_xor = target.inventory.inventory_xor;
+        result.provenance = target.inventory.provenance;
+    }
+    try result.requireBinding(prefix_.binding);
+    return result;
 }
 fn requireEnrollment(alloc: std.mem.Allocator, reader: anytype, group: u64, proof: publication.RootProof, incarnation: Digest) !void {
     const enrollment = @import("store_root_enrollment.zig");
@@ -676,4 +727,15 @@ test "relational index publication target inventory codec rejects invalid counts
     invalid = inventory;
     invalid.binding_digest = @splat(0);
     try std.testing.expectError(error.InvalidPrivateIndexClaimInventory, invalid.encode());
+    const Reader = struct {
+        bytes: []const u8,
+        fn get(self: *@This(), _: []const u8) ![]const u8 {
+            return self.bytes;
+        }
+    };
+    const oversized = try std.testing.allocator.alloc(u8, SourceRecord.max_bytes + 1);
+    defer std.testing.allocator.free(oversized);
+    @memset(oversized, 0);
+    var reader: Reader = .{ .bytes = oversized };
+    try std.testing.expectError(error.InvalidCatalogRecord, anchored(&reader, "oversized", @splat(0)));
 }

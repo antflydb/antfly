@@ -32,7 +32,7 @@ const pages = @import("relational_index_jobs.zig");
 const resources = @import("../resource_manager.zig");
 const RequestContext = @import("../../api/operation.zig").RequestContext;
 const Waiters = @import("../admission_waiter.zig").Fifo(void);
-pub const envelope_version = 24;
+pub const envelope_version = 25;
 pub const max_cancellation_wire_bytes = 32 * 1024;
 pub const max_encoded_inputs = std.base64.standard.Encoder.calcSize(inputs.max_bytes);
 pub const max_claim_wire_bytes = 6 * private_claims.max_bytes + 128 * 1024;
@@ -289,21 +289,7 @@ pub const ClaimCommand = struct {
     /// Logical member identity shared by source contributions and eventual
     /// target inventory seals. Independent of physical claim-value encoding.
     pub fn memberDigest(claim: integrity.Claim) integrity.Digest {
-        var state = std.crypto.hash.Blake3.init(.{});
-        state.update("antfly/private-unique-live-claim/v1");
-        state.update(&integrity.hash(claim.tuple));
-        var version: [4]u8 = undefined;
-        std.mem.writeInt(u32, &version, claim.schema_version, .little);
-        state.update(&version);
-        for ([_][]const u8{ claim.parent_table, claim.parent_key }) |field| {
-            var length: [8]u8 = undefined;
-            std.mem.writeInt(u64, &length, field.len, .little);
-            state.update(&length);
-            state.update(field);
-        }
-        var result: integrity.Digest = undefined;
-        state.final(&result);
-        return result;
+        return claim.memberDigest();
     }
 };
 
@@ -324,12 +310,14 @@ pub const Effect = union(enum) {
     claims: ClaimCommand,
     build: pages.Page.PrivateCommand,
     consume: ConsumeCommand,
+    inventory_validation: private_claims.InventoryValidation.Command,
 
     pub fn namespace(self: Effect) @FieldType(Native, "namespace") {
         return switch (self) {
             .control, .cancel_control => |value| value.binding.fence.namespace,
             .claims => |value| value.binding.fence.namespace,
             .consume => |value| value.binding.fence.namespace,
+            .inventory_validation => |value| value.binding.fence.namespace,
             .build => |value| value.binding.fence.namespace,
             .cancel_intent => |value| value.fence.namespace,
             .cancel_cleanup => |value| value.fence.namespace,
@@ -341,6 +329,7 @@ pub const Effect = union(enum) {
             .control, .cancel_control => |value| try value.validate(),
             .claims => |value| try value.validate(),
             .consume => |value| try value.validate(),
+            .inventory_validation => |value| try value.validate(),
             .build => |value| try value.validate(),
             .cancel_intent => |value| try value.validate(),
             .cancel_cleanup => |value| {
@@ -355,6 +344,7 @@ pub const Effect = union(enum) {
             .control, .cancel_control => max_control_wire_bytes,
             .claims => max_claim_wire_bytes,
             .build => pages.Page.PrivateCommand.max_wire_bytes,
+            .inventory_validation => private_claims.InventoryValidation.max_wire_bytes,
             else => max_cancellation_wire_bytes,
         };
     }
@@ -663,6 +653,7 @@ pub const BuildRequest = struct {
     identity: Identity,
     binding_digest: [32]u8,
     budget: pages.Budget = .{},
+    target_expectation: ?private_claims.TargetExpectation = null,
 
     pub fn init(identity: Identity, binding: jobs.Binding, budget: pages.Budget) !BuildRequest {
         const result: BuildRequest = .{ .identity = identity, .binding_digest = try bindingDigest(binding), .budget = budget };
@@ -673,9 +664,14 @@ pub const BuildRequest = struct {
         try self.identity.validate();
         try self.budget.validate();
         if (std.mem.allEqual(u8, &self.binding_digest, 0)) return error.InvalidPrivateIndexOwnerJob;
+        if (self.target_expectation) |expected| {
+            try expected.validate();
+            if (!std.mem.eql(u8, &expected.binding_digest, &self.binding_digest)) return error.PrivateIndexOwnerJobChanged;
+        }
     }
     pub fn requireBinding(self: BuildRequest, binding: jobs.Binding) !void {
         try self.validate();
+        if (self.target_expectation) |expected| try expected.requireBinding(binding);
         const identity = self.identity;
         if (binding.phase != .reserved or binding.authority != .native or
             !std.mem.eql(u8, &binding.id, &identity.id) or !std.mem.eql(u8, &binding.plan_digest, &identity.plan_digest) or
@@ -705,6 +701,7 @@ pub const BuildCompletion = struct {
     error_name: ?[]const u8 = null,
 
     pub fn validateFor(self: BuildCompletion, request: BuildRequest) !void {
+        if (request.target_expectation != null) return error.InvalidPrivateIndexNativeReceipt;
         try request.requireBinding(self.binding);
         try self.position.validate();
         if (!self.position.namespace.eql(request.identity.namespace) or
@@ -720,17 +717,78 @@ pub const BuildCompletion = struct {
 pub const BuildResponse = union(enum) {
     advanced: BuildOutcome,
     complete: BuildCompletion,
+    inventory: InventoryOutcome,
 
     pub fn validateFor(self: BuildResponse, request: BuildRequest) !void {
         switch (self) {
+            .inventory => |value| try value.validateFor(request),
             .complete => |value| try value.validateFor(request),
             .advanced => |value| {
+                if (request.target_expectation != null) return error.InvalidPrivateIndexNativeReceipt;
                 try request.requireBinding(value.binding);
                 try value.position.validate();
                 if (!value.position.namespace.eql(request.identity.namespace) or std.mem.allEqual(u8, &value.page_digest, 0) or
                     value.replication_pending != (value.error_name != null)) return error.InvalidPrivateIndexNativeReceipt;
             },
         }
+    }
+};
+
+/// Only the claims portion of physical validation. No schema/index-validation
+/// ACK can be produced from this record without the independent generation proof.
+pub const InventoryOutcome = struct {
+    binding: jobs.Binding,
+    record: private_claims.InventoryValidation.Record,
+    position: Native,
+    duplicate: bool,
+    replication_pending: bool = false,
+    error_name: ?[]const u8 = null,
+    pub fn validateFor(self: InventoryOutcome, request: BuildRequest) !void {
+        try request.requireBinding(self.binding);
+        const expected = request.target_expectation orelse return error.InvalidPrivateIndexNativeReceipt;
+        try self.record.validate();
+        if (!std.mem.eql(u8, &try expected.digest(), &try self.record.expected.digest()) or
+            !std.meta.eql(self.position, self.record.position) or !self.position.namespace.eql(request.identity.namespace) or
+            self.replication_pending != (self.error_name != null)) return error.InvalidPrivateIndexNativeReceipt;
+    }
+};
+
+pub const PreparedInventoryValidation = struct {
+    pub const ApplyOutcome = InventoryOutcome;
+    alloc: Allocator,
+    batch: private_claims.InventoryValidation.Prepared,
+    payload: ?[]u8 = null,
+    prefix_len: usize = 0,
+    pub fn deinit(self: *@This()) void {
+        if (self.payload) |bytes| self.alloc.free(bytes);
+        self.* = undefined;
+    }
+    pub fn validate(self: *const @This()) !void {
+        try self.batch.context.ensureActive();
+        try self.batch.command.validate();
+    }
+    pub fn namespace(self: *const @This()) @FieldType(Native, "namespace") {
+        return self.batch.command.binding.fence.namespace;
+    }
+    pub fn validateReplay(self: *const @This(), position: Native) !void {
+        try (Frame{ .effect = .{ .inventory_validation = self.batch.command }, .position = position }).validate();
+    }
+    pub fn replayDuplicateOutcome(self: *const @This(), position: Native) InventoryOutcome {
+        return .{ .binding = self.batch.command.binding, .record = .{ .expected = self.batch.command.expected, .fields = self.batch.command.next, .position = position, .page_digest = self.batch.command.digest() catch unreachable }, .position = position, .duplicate = true };
+    }
+    pub fn stage(self: *@This(), _: anytype, txn: anytype, replay: ?Native) !InventoryOutcome {
+        const result = try self.batch.stage(self.alloc, txn, replay);
+        return .{ .binding = self.batch.command.binding, .record = result.record, .position = result.record.position, .duplicate = result.duplicate };
+    }
+    pub fn hasPublicationReceipt(_: *const @This()) bool {
+        return false;
+    }
+    pub fn populateReceipt(_: *const @This(), _: anytype, _: *InventoryOutcome) !void {}
+    pub fn preparePayload(self: *@This()) !void {
+        try prepareNativePayload(self, "inventory_validation", self.batch.command, private_claims.InventoryValidation.max_wire_bytes);
+    }
+    pub fn finalizePayload(self: *@This(), position: Native) ![]const u8 {
+        return finalizeNativePayload(self, position);
     }
 };
 

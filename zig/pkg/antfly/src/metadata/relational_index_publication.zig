@@ -400,6 +400,7 @@ pub const OwnerDecision = struct {
     inputs: ?Inputs = null,
     native_signing: ?NativeSigningView = null,
     claim_routes: ?ClaimRoutes = null,
+    target_expectation: ?local.storage_db_relational_index_owner_job.private_claims.TargetExpectation = null,
     /// Read-only recovery of an already accepted latest stage. This is never
     /// execution permission, schema input, or an index allocation request.
     attestation: ?Attestation = null,
@@ -410,6 +411,13 @@ pub const OwnerDecision = struct {
         if (self.head.table_id != request.table_id or self.owner.owner.group_id != request.group_id or
             !std.mem.eql(u8, &self.head.plan_id, &request.id)) return error.GenerationPublicationChanged;
         if (try ownerPermission(self.head, self.owner, request.operation) != self.disposition) return error.InvalidCatalogRecord;
+        if (request.operation == .validate and self.disposition == .execute and self.owner.owner.authority == .native) {
+            const expected = self.target_expectation orelse return error.InvalidCatalogRecord;
+            try expected.validate();
+            if (self.head.completed_sources != self.head.owner_count or !self.owner.source_completed or
+                expected.completion_revision != self.head.completion_revision or
+                !std.mem.eql(u8, &expected.metadata_incarnation, &self.metadata_incarnation)) return error.InvalidCatalogRecord;
+        } else if (self.target_expectation != null) return error.InvalidCatalogRecord;
         if (request.claim_groups) |groups| {
             if (self.disposition == .execute) {
                 const routes = self.claim_routes orelse return error.InvalidCatalogRecord;
@@ -508,6 +516,23 @@ pub const OwnerDecision = struct {
         if (request.operation != .build) return error.InvalidGenerationPublication;
         try self.requireNativeBinding(request, observed);
         return native_control.BuildRequest.init(try self.nativeExecutionIdentity(request), observed, budget);
+    }
+
+    /// Frozen metadata input only; a receiver must inspect the physical binding
+    /// independently, then core must scan/seal the actual generation and claims.
+    pub fn nativeTargetExpectation(self: OwnerDecision, request: OwnerRequest, observed: local.storage_db_relational_index_owner_job.Binding) !local.storage_db_relational_index_owner_job.private_claims.TargetExpectation {
+        if (request.operation != .validate) return error.InvalidGenerationPublication;
+        try self.requireNativeBinding(request, observed);
+        const expected = self.target_expectation orelse return error.InvalidCatalogRecord;
+        try expected.requireBinding(observed);
+        return expected;
+    }
+    pub fn nativeInventoryValidation(self: OwnerDecision, request: OwnerRequest, observed: local.storage_db_relational_index_owner_job.Binding, budget: local.storage_db_relational_index_jobs.Budget) !native_control.BuildRequest {
+        const expected = try self.nativeTargetExpectation(request, observed);
+        var result = try native_control.BuildRequest.init(try self.nativeExecutionIdentity(request), observed, budget);
+        result.target_expectation = expected;
+        try result.validate();
+        return result;
     }
 
     fn requireNativeBinding(self: OwnerDecision, request: OwnerRequest, observed: local.storage_db_relational_index_owner_job.Binding) !void {

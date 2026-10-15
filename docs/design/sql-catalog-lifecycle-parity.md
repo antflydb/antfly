@@ -6957,3 +6957,68 @@ counter or XOR inventory is not physical-root validation or authority by itself.
 Public UNIQUE activation remains guarded. Original SQL dispositions remain
 483 implemented / 862 unresolved; this milestone claims no original SQL case or
 throughput benchmark.
+
+### Frozen target expectations and bounded physical claim inventory
+
+The metadata projection now derives a fixed target expectation only after the
+durable consumed-EOF cohort barrier. It binds the metadata incarnation, exact
+reserved binding, layout generation, completion revision, consumed source
+prefix, primary-build progress, table identity and accepted target membership.
+The source record retains the fixed EOF header alongside its binding; this
+projection does not decode the whole target proof array or scan the owner
+cohort. It still reads/hashes the bounded retained source record; fixed-size
+source-prefix storage is a remaining read-amplification opportunity, not a
+performance improvement claimed here. Anchored reads reject oversized records
+before hashing. AIDA v3 and decoder floor 43 cover the private metadata change. The
+source header exposes its progress digest through a named accessor so callers
+cannot accidentally interpret position padding as part of that digest.
+
+The receiver obtains this expectation independently from current metadata and
+inspects the actual native binding under the existing leased-owner facade.
+Native envelope 25 carries bounded inventory effects through the existing
+atomic mutation, authority-position and durable-outbox machinery. No new C
+selector, public route or row format is introduced.
+
+The first native turn freezes new claims. Exact duplicate claims remain
+permitted, including batches prepared before freezing. Subsequent turns scan at
+most 128 generation-local records and 1 MiB, honoring caller byte/time limits and
+cancellation. Each inventory entry must have its exact live claim, schema/table
+identity and valid native provenance. Progress retains a cursor, logical count
+and XOR, plus a strong ordered chain over physical claim hashes and provenance.
+Only fixed owned fields survive preparation; no read snapshot or row buffer
+survives between pages. Replay recomputes the actual frozen page and rejects a
+supplied cursor/chain that does not match it. Cancellation cleanup retires the
+generation-owned progress record.
+
+The real-LSM fixture derives expected membership from the delivered source. It
+qualifies freezing, exact duplicates, missing companions, changed expectations,
+byte/memory denial, cancellation/deadlines, three-record pages, forged replay
+chains and reopening with retained progress. An actual normalized replication
+ingress page commits the inventory cursor and transport marker together; exact
+replay is inert. Independent durable metadata tests reject projection before
+EOF completion and recover the exact expectation after reopen. Receiver tests
+preserve the existing typed conflict for a late new claim instead of reporting
+a transient receiver outage.
+
+The final-source aggregate gate in
+`/private/tmp/antfly-index-inventory-final-debug.log` passed 159/159 Debug steps,
+including 48 publication tests, eight native page tests, six C-ABI tests, 46
+runtime-contract tests, four ACK tests, three leased-owner tests and all 104
+standalone tests. It also passed the publication-progress target; suite counts
+overlap and must not be added as independent coverage. Boundary, license,
+original-inventory, control-catalog, formatting and diff checks passed. No
+ReleaseFast correctness result is substituted for this gate.
+
+Inventory readiness is deliberately **not** a physical-index validation ACK.
+The count/XOR is diagnostic, not standalone authenticated membership evidence.
+Still required are bounded secondary-generation verification, joining both
+proofs into authenticated native validation and its capability barrier,
+restore/adoption verification of
+the scanned prefix (including claim-only orphans), install/release, durable
+failure completion, missing-root repair, bounded parallel target fanout, actual
+data-Raft execution, terminal catalog publication and complete distributed
+fault coverage. Startup currently verifies the record's structure, binding,
+source EOF, progress and cut, not the entire retained scan prefix. Public UNIQUE
+activation remains guarded. Original SQL dispositions remain 483 implemented /
+862 unresolved; this work does not qualify another original SQL case or claim a
+throughput improvement.

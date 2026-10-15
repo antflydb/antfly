@@ -39,7 +39,7 @@ const idle_lifetime_ns = 60 * std.time.ns_per_s;
 const max_job_quanta = 4096;
 
 pub const Authority = struct { metadata_incarnation: [32]u8, binding_digest: [32]u8, writer_generation: u64 };
-const Stage = enum { refresh, control, acknowledge, resolve_ack, build, deliver };
+const Stage = enum { refresh, control, acknowledge, resolve_ack, build, deliver, inventory };
 const Owner = struct {
     ordinal: u16,
     stage: Stage = .refresh,
@@ -191,12 +191,8 @@ const Job = struct {
                 if (response.value != .head) return error.InvalidCatalogRecord;
                 try self.identity.requireHead(response.value.head);
                 owner.head = response.value.head;
-                if (response.value.head.completed_sources == response.value.head.owner_count) {
-                    // Every consumed EOF is durable. Do not rebuild/reconsume
-                    // sources while waiting for physical target validation.
-                    // This barrier is not permission to install or release.
-                    self.retireOwner(index);
-                    self.retry_at_ns = now_ns +| std.time.ns_per_s;
+                if (response.value.head.phase == .building and response.value.head.completed_sources == response.value.head.owner_count) {
+                    owner.stage = .inventory;
                     return;
                 }
                 owner.stage = switch (response.value.head.phase) {
@@ -264,6 +260,7 @@ const Job = struct {
                     }
                     if (response.value != .building) return error.InvalidPrivateIndexNativeReceipt;
                     const pending = switch (response.value.building.outcome) {
+                        .inventory => return error.InvalidPrivateIndexNativeReceipt,
                         .advanced => |value| value.replication_pending,
                         .complete => |value| blk: {
                             if (value.state == .failed) return error.PrivateIndexBuildFailed;
@@ -287,6 +284,31 @@ const Job = struct {
                 if (result == .pending) {
                     if (owner.stream.?.phase == prior) owner.retry_at_ns = now_ns +| retry_ns;
                 } else self.retireOwner(index);
+            },
+            .inventory => {
+                const request: execution.Request = .{ .table_id = self.identity.table_id, .group_id = identity.group_id, .id = self.identity.id, .operation = .validate, .build_budget = .{ .records = 128 } };
+                var response = try transport.control(alloc, self.table_name.?, request, context_);
+                defer response.deinit();
+                try response.value.validate(request);
+                if (response.value == .acknowledged) {
+                    self.retireOwner(index);
+                    return;
+                }
+                if (response.value != .building or response.value.building.outcome != .inventory) return error.InvalidPrivateIndexNativeReceipt;
+                const outcome = response.value.building.outcome.inventory;
+                if (outcome.replication_pending) {
+                    owner.retry_at_ns = now_ns +| retry_ns;
+                    return;
+                }
+                switch (outcome.record.fields.phase) {
+                    .scanning => {},
+                    .failed => return error.PrivateIndexTargetInventoryMismatch,
+                    .ready => {
+                        // Claims alone are not a generation/publication ACK.
+                        self.retireOwner(index);
+                        self.retry_at_ns = now_ns +| std.time.ns_per_s;
+                    },
+                }
             },
         }
     }

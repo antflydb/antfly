@@ -219,6 +219,25 @@ pub fn recordBody(key: []const u8, value: []const u8, magic: []const u8) ![]cons
 pub const Action = enum(u8) { restrict = 0, parent_delete = 1, parent_update = 2 };
 
 pub const Claim = struct {
+    /// Encoding-independent member identity shared by source contributions
+    /// and physical target inventory scans.
+    pub fn memberDigest(self: Claim) Digest {
+        var state = std.crypto.hash.Blake3.init(.{});
+        state.update("antfly/private-unique-live-claim/v1");
+        state.update(&hash(self.tuple));
+        var version: [4]u8 = undefined;
+        std.mem.writeInt(u32, &version, self.schema_version, .little);
+        state.update(&version);
+        for ([_][]const u8{ self.parent_table, self.parent_key }) |field| {
+            var length: [8]u8 = undefined;
+            std.mem.writeInt(u64, &length, field.len, .little);
+            state.update(&length);
+            state.update(field);
+        }
+        var result: Digest = undefined;
+        state.final(&result);
+        return result;
+    }
     tuple: []const u8,
     parent_table: []const u8,
     parent_key: []const u8,

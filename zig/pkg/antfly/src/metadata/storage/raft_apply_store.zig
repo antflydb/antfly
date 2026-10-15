@@ -4619,6 +4619,14 @@ pub const OwnerAckTestFixture = if (@import("builtin").is_test) struct {
                 try clone.snapshotBuilder().applyBatch(.{ .group_id = group, .commit_index = index, .entries_bytes = entries });
             }
             try clone.validateRelationalIndexSourceCompletion(group, bytes);
+            {
+                var read = try clone.store.beginReadTxn();
+                defer read.abort();
+                var key_buf: [192]u8 = undefined;
+                const head = try index_progress.Head.decode(try read.get(try index_publication.headKey(&key_buf, group, request.query.table_id)));
+                const owner = try index_progress.OwnerState.decode(try read.get(try index_publication.ownerKey(&key_buf, group, request.query.table_id, second.signed.data.source.ordinal)));
+                try std.testing.expectError(error.GenerationPublicationChanged, index_delivery.targetExpectation(alloc, &read, group, head, owner, request.consumed.metadata_incarnation));
+            }
             const before = try clone.snapshotBuilder().buildSnapshot(alloc, group);
             defer alloc.free(before);
             const Writer = struct {
@@ -4722,6 +4730,17 @@ pub const OwnerAckTestFixture = if (@import("builtin").is_test) struct {
         const head = try index_progress.Head.decode(try txn.get(try index_publication.headKey(&buf, group, request.query.table_id)));
         try std.testing.expectEqual(revision, head.completion_revision);
         try std.testing.expectEqual(@as(u16, 1), head.completed_sources);
+        const owner = try index_progress.OwnerState.decode(try txn.get(try index_publication.ownerKey(&buf, group, request.query.table_id, second.signed.data.source.ordinal)));
+        const expected = try index_delivery.targetExpectation(alloc, &txn, group, head, owner, request.consumed.metadata_incarnation);
+        try std.testing.expectEqual(@as(u64, 2), expected.rows);
+        try std.testing.expectEqual(revision, expected.completion_revision);
+        try std.testing.expectEqualSlices(u8, &try request.consumed.digest(), &expected.source_consumption_digest);
+        try std.testing.expectEqualSlices(u8, &second.signed.data.header.progressDigest(), &expected.source_progress_digest);
+        try expected.requireBinding(second.signed.data.source);
+        var incomplete = head;
+        incomplete.completed_sources = 0;
+        incomplete.completion_revision = 0;
+        try std.testing.expectError(error.GenerationPublicationChanged, index_delivery.targetExpectation(alloc, &txn, group, incomplete, owner, request.consumed.metadata_incarnation));
     }
 
     fn testDurableSourceAcceptance(alloc: std.mem.Allocator, group: u64, initial: []const u8, request: index_delivery.Request) !void {
@@ -17221,6 +17240,8 @@ pub const RaftApplyStore = struct {
         }
         decision.dispatch = d;
         if (owner.owner.authority == .native) decision.native_signing = try self.nativeIndexSigningViewTxn(&txn, group_id, incarnation);
+        if (owner.owner.authority == .native and request.operation == .validate)
+            decision.target_expectation = try index_delivery.targetExpectation(alloc, &txn, group_id, head, owner, incarnation);
         var route_arena = std.heap.ArenaAllocator.init(self.alloc);
         defer route_arena.deinit();
         if (request.claim_groups) |groups| {
