@@ -1229,6 +1229,7 @@ pub const ManagedEmbedder = struct {
         return .{
             .ptr = self,
             .dense_embed_fn = embedDense,
+            .computation_key_fn = documentComputationKey,
             .dense_embed_batch_fn = embedDenseBatch,
             .dense_embed_parts_fn = embedDenseParts,
             .dense_embed_part_items_fn = embedDensePartItems,
@@ -1565,6 +1566,23 @@ pub const ManagedEmbedder = struct {
         try capabilities.validate();
         if (capabilities.task != .embed) return error.InvalidInferenceCapabilities;
         return capabilities.model_revision;
+    }
+
+    fn documentComputationKey(ptr: *anyopaque, name: []const u8, text: []const u8, dims: u32) !?[32]u8 {
+        const self: *ManagedEmbedder = @ptrCast(@alignCast(ptr));
+        const entry = self.findArtifactEntry(name) orelse return null;
+        if (entry.sparse or entry.declaresMedia()) return null;
+        const revision = (try cacheRevision(ptr, self.alloc, name)) orelse return null;
+        var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+        hasher.update(&revision);
+        hashQueryCacheField(&hasher, "dense-document-computation-v1");
+        hashQueryCacheField(&hasher, EmbeddingTaskType.retrieval_document.canonical());
+        hashQueryCacheField(&hasher, entry.truncate);
+        hashQueryCacheU64(&hasher, dims);
+        hashQueryCacheField(&hasher, text);
+        var digest: [32]u8 = undefined;
+        hasher.final(&digest);
+        return digest;
     }
 
     fn recoveryIdentity(ptr: *anyopaque, embedding_name: []const u8) ?db_embedder.RecoveryIdentity {

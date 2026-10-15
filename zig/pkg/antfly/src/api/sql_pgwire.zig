@@ -1343,12 +1343,12 @@ const GuardedCatalog = struct {
         const generate = self.native.vtable.generate_row_id orelse return error.UnsupportedSqlExecution;
         return generate(self.native.ptr, alloc);
     }
-    fn resolveConflictOwners(raw: *anyopaque, alloc: std.mem.Allocator, table: catalog.Table, target: catalog.ConflictTarget, mutations: []const catalog.Mutation) ![]const catalog.ConflictOwner {
+    fn resolveConflictOwners(raw: *anyopaque, alloc: std.mem.Allocator, scratch_alloc: std.mem.Allocator, table: catalog.Table, target: catalog.ConflictTarget, mutations: []const catalog.Mutation) ![]const catalog.ConflictOwner {
         const self: *GuardedCatalog = @ptrCast(@alignCast(raw));
         try self.checkRead(table.physical_name);
         if (!Authority.allowsWrite(self.authority, table.physical_name)) return error.Forbidden;
         const resolve_owners = self.native.vtable.resolve_conflict_owners orelse return error.UnsupportedSqlShape;
-        return resolve_owners(self.native.ptr, alloc, table, target, mutations);
+        return resolve_owners(self.native.ptr, alloc, scratch_alloc, table, target, mutations);
     }
     fn checkpoint(raw: *anyopaque) !void {
         const self: *GuardedCatalog = @ptrCast(@alignCast(raw));
