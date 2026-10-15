@@ -4286,3 +4286,60 @@ Qualification after merging main `f56cf1f4c7`:
 
 Live-provider retention qualification and archive-scale latency/RSS benchmarks
 remain deferred; no benchmark speedup is claimed by these correctness fixtures.
+
+
+### Selective pattern navigation and coalesced discovery
+
+Pattern queries can now prove selective archive admission from the authenticated
+publication vocabulary before opening serving packs. Prefix, wildcard, regular
+expression, and fuzzy expansion share the scorer's whole-term matching semantics.
+The Boolean navigation plan retains complete vocabulary expansions separately
+from scoring: patterns still contribute their constant boost once per matching
+document, rather than a score per expanded term. Materialized prefix fields and
+ordinary fallback fields contribute a conservative union. Recent WAL windows
+remain independently admitted, including terms absent from the archive.
+
+Expansion examines at most 4,096 dictionary entries, retains at most 128 terms,
+and gives each matcher a 2 MiB workspace. Exceeding a bound or failing allocation
+returns unknown admission, preserving complete bounded-window execution. In
+particular, an automaton's allocation-induced dead state cannot prove absence.
+Broad patterns and exact counts still require complete membership work; this
+change targets selective patterns without claiming that all pattern queries
+become sublinear.
+
+Cold Iceberg snapshot planning now uses the decoded cache's shared construction
+admission and singleflight path. Readers of the same freshly authorized metadata
+share one immutable manifest/delete plan, including canonical file order and
+lookup metadata. Each waiter checks its own authority and cancellation. A failed
+or canceled leader releases construction ownership so another reader can retry.
+Fresh catalog-pointer validation remains mandatory, and a genuinely cold new
+snapshot still enumerates its manifests. No stale pointer TTL or provider client
+is retained in the cache.
+
+The coordinator also treats a missing generation-map page during directory
+availability checks as recoverable derived-artifact loss, allowing its existing
+fresh rebuild path to run. Provider authorization and transport failures retain
+their error semantics.
+
+Regressions cover selective and absent pattern admission, broad-expansion
+fallback, automaton allocation failure, coalesced cold discovery, missing cloud
+map recovery, and real Parquet pattern scores/ties against complete admission.
+
+
+Qualification on merged main `f56cf1f4c7` for selective pattern navigation:
+
+- Default shared-owner Debug CLI built successfully.
+- Full Debug lake integration passed 467 tests: 171 shared-engine and 296 server.
+- Focused checks passed 61 tests: 8 shared-engine and 53 server. The cold-plan
+  regression also passed separately with a deterministic blocked leader and a
+  confirmed second flight waiter, plus cancellation on a cached hit.
+- All 46 real Parquet/Iceberg E2Es passed in 309.26 seconds. The fragmented
+  Parquet test compares each pattern's scores, source rows, and ties against
+  independent complete admission, alongside existing projection, highlights,
+  transforms, cursor, retained-cut, and restart gates.
+- Pinned-compiler native error generation, Zig/Python formatting, Python lint,
+  whitespace, license headers, and the Apache product boundary passed.
+
+Provider retention qualification and archive-scale latency/RSS measurements
+remain deferred. These fixture checks establish correctness and bounded work;
+they do not claim an archive-scale timing improvement.

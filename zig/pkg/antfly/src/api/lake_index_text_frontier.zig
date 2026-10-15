@@ -113,7 +113,7 @@ fn initialize(a: A, root: corpus.Root, store: stores.ArtifactStore, cached: arti
         self.root.collection = .{ .documents = try std.math.add(u32, collection.documents, snapshot.scoringDocCount()), .fields = fields.items };
     }
     const query = try local.storage_db_query_search_exec.textQueryToSearchQuery(self.syntax.allocator(), text, analysis, schema);
-    self.plan = if (routed) try Plan.create(ba, query, .{ .ptr = self, .count = self.root.collection.?.documents, .average = average, .frequencies = frequencies }, .{}) else try Plan.prepare(ba, query, .{ .ptr = self, .count = self.root.collection.?.documents, .average = average, .frequencies = frequencies }, .{});
+    self.plan = if (routed) try Plan.create(ba, query, .{ .ptr = self, .count = self.root.collection.?.documents, .average = average, .frequencies = frequencies, .patterns = patternTerms }, .{}) else try Plan.prepare(ba, query, .{ .ptr = self, .count = self.root.collection.?.documents, .average = average, .frequencies = frequencies, .patterns = patternTerms }, .{});
     if (self.plan == null) {
         self.deinit();
         return null;
@@ -168,6 +168,54 @@ fn frequencies(raw: *anyopaque, _: A, field: []const u8, terms: []const []const 
         try snapshot.termDocFreqs(temporary.allocator(), field, terms, extra);
         for (out, extra) |*frequency, value| frequency.* = try std.math.add(u32, frequency.*, value);
     }
+}
+
+/// Discover selective pattern vocabulary once from the authenticated global
+/// dictionary, without touching a segment or posting payload. Broad/expensive
+/// expansions return unknown and preserve the complete bounded-window path.
+fn patternTerms(raw: *anyopaque, out: A, query: local.search_search.SearchQuery) !?[]const local.search_search.TermQuery {
+    const self: *Self = @ptrCast(@alignCast(raw));
+    const matcher = try local.search_search.TermPattern.create(self.a, query);
+    defer matcher.deinit();
+    var terms: std.ArrayList(local.search_search.TermQuery) = .empty;
+    var memory: local.sql_memory_budget = .{ .backing = self.a, .limit = 2 * 1024 * 1024 };
+    var scratch = std.heap.ArenaAllocator.init(memory.allocator());
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    if (matcher.field().len +| matcher.prefix.len > tree.max_key_bytes - 4) return null;
+    const field_key = try corpus.statistics.keyAlloc(a, matcher.field(), "");
+    const lower = try corpus.statistics.keyAlloc(a, matcher.field(), matcher.prefix);
+    var cursor = try tree.Cursor.init(a, self.cache.store(), self.root.term_statistics, lower, null);
+    defer cursor.deinit();
+    var examined: usize = 0;
+    while (try cursor.next()) |entry| {
+        try self.check();
+        if (!std.mem.startsWith(u8, entry.key, field_key)) break;
+        const term = entry.key[field_key.len..];
+        if (!std.mem.startsWith(u8, term, matcher.prefix)) break;
+        if (examined == 4096) return null;
+        examined += 1;
+        const matched = try matcher.matches(term);
+        if (matched) {
+            if (terms.items.len == 128) return null;
+            try terms.append(out, .{ .field = try out.dupe(u8, matcher.field()), .term = try out.dupe(u8, term) });
+        }
+        // A literal wildcard is one exact dictionary lookup, even when many
+        // longer terms share its bytes. Do not turn it into a prefix census.
+        if (matcher.wildcard) |literal| if (literal.exact) break;
+    }
+    // Materialized prefix fields override the ordinary field only in segments
+    // where they exist. Union both possibilities, keeping admission a superset.
+    if (matcher.filter == .prefix) if (matcher.filter.prefix.indexed_field) |field| {
+        const key = try corpus.statistics.keyAlloc(a, field, matcher.filter.prefix.prefix);
+        var indexed = try tree.Cursor.init(a, self.cache.store(), self.root.term_statistics, key, null);
+        defer indexed.deinit();
+        if (try indexed.next()) |entry| if (std.mem.eql(u8, entry.key, key)) {
+            if (terms.items.len == 128) return null;
+            try terms.append(out, .{ .field = try out.dupe(u8, field), .term = try out.dupe(u8, matcher.filter.prefix.prefix) });
+        };
+    };
+    return try terms.toOwnedSlice(out);
 }
 
 fn check(self: *Self) !void {
@@ -436,6 +484,45 @@ test "external lake global frontier reaches late competitive segments and comple
     // competitive cutoff exists. No unrelated inventory is admitted.
     try std.testing.expectEqual(@as(usize, 3), selected);
     try std.testing.expectEqual(@as(u64, 3), conjunction.admitted);
+    // Metadata-only pattern proofs open the same three rare segments. Their
+    // constant score is independent of expansion count and global BM25 DF.
+    for ([_]local.storage_db_types.TextQuery{
+        .{ .prefix = .{ .field = "body", .prefix = "ra" } },
+        .{ .wildcard = .{ .field = "body", .pattern = "ra?e" } },
+        .{ .regexp = .{ .field = "body", .pattern = "ra[a-z]e" } },
+        .{ .fuzzy = .{ .field = "body", .term = "raze", .max_edits = 1 } },
+    }) |pattern| {
+        const patterned = (try create(a, root, store, cached, .none, pattern, .{}, .{})).?;
+        defer patterned.deinit();
+        var matches: usize = 0;
+        while (try patterned.next(null)) |id| {
+            const ordinal = std.mem.readInt(u32, id[28..32], .big);
+            try std.testing.expect(ordinal == 3 or ordinal == 31 or ordinal == 8191);
+            matches += 1;
+        }
+        try std.testing.expectEqual(@as(usize, 3), matches);
+    }
+    const ManyTerms = struct {
+        position: u32 = 0,
+        key_bytes: [12]u8 = undefined,
+        count: [8]u8 = undefined,
+        pub fn next(self: *@This()) !?tree.Cursor.Record {
+            if (self.position == 129) return null;
+            self.key_bytes[0..8].* = "\x00\x00\x00\x04body".*;
+            std.mem.writeInt(u32, self.key_bytes[8..12], self.position, .big);
+            std.mem.writeInt(u64, &self.count, 1, .big);
+            self.position += 1;
+            return .{ .key = &self.key_bytes, .value = &self.count };
+        }
+    };
+    var many: ManyTerms = .{};
+    var broad_root = root;
+    broad_root.term_statistics = try tree.buildSorted(a, pages.store(), &many);
+    // Exhausting the proof bound must yield unknown, never a truncated union.
+    try std.testing.expect((try create(a, broad_root, store, cached, .none, .{ .prefix = .{ .field = "body", .prefix = "" } }, .{}, .{})) == null);
+    const absent = (try create(a, root, store, cached, .none, .{ .prefix = .{ .field = "body", .prefix = "missing" } }, .{}, .{})).?;
+    defer absent.deinit();
+    try std.testing.expect((try absent.next(null)) == null);
     const optional = try create(a, root, store, cached, .none, .{ .bool_query = .{ .should = &.{.{ .term = .{ .field = "body", .term = "common" } }}, .pure_should_optional = true } }, .{}, .{});
     try std.testing.expect(optional == null);
     // Accepted rows add global statistics exactly once, including terms absent

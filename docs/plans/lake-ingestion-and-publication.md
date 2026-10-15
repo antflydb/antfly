@@ -890,3 +890,13 @@ versioned digest of the entire GC cut: retention domain, floor, cutoff, and mark
 root. Changed evidence or legacy progress without that digest restarts enumeration,
 even when the numerical cutoff is unchanged. Prior reader-held map roots remain
 immutable and independently retained.
+
+
+Selective text patterns use publication-bound vocabulary and term-routing
+summaries to admit serving packs before reading postings. Bounded complete
+expansions are admission proofs; their terms never replace the pattern's scoring
+semantics. Broad expansion or allocation pressure retains complete admission.
+Cold Iceberg manifest plans use shared singleflight construction after fresh
+catalog resolution, so concurrent readers share immutable data without sharing
+request authority. Missing cloud generation-map pages are derived-artifact loss
+and admit rebuilding; provider authorization failures remain operational errors.

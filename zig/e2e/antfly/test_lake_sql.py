@@ -4634,7 +4634,8 @@ def test_broad_native_text_windows_preserve_scores_ties_counts_and_hydration(
             {
                 "body": "quasar " * (i % 4 + 1)
                 + "common " * (i % 3)
-                + ("beta " if i % 2 else "alpha "),
+                + ("beta " if i % 2 else "alpha ")
+                + ("navquasar " if i in (3, row_count - 2) else ""),
                 "amount": i,
                 "sparse_native": '{"1":1}',
             }
@@ -4823,6 +4824,30 @@ def test_broad_native_text_windows_preserve_scores_ties_counts_and_hydration(
             assert profiled["profile"]["sort"]["selection_reason"] == (
                 "bounded_global_text_frontier"
             ), profiled
+            # Pattern admission uses the global vocabulary and routing summaries,
+            # while the baseline oracle forces independent complete admission.
+            for pattern in (
+                {"prefix": "navquasa", "field": "body"},
+                {"wildcard": "navquasa?", "field": "body"},
+                {"regexp": "navquasa[a-z]", "field": "body"},
+                {"fuzzy": "navquasor", "field": "body", "fuzziness": 1},
+            ):
+                patterned = dict(direct, full_text_search=pattern, offset=0, limit=7)
+                found = call("POST", "/tables/profile_text/query", patterned)
+                complete = full_admission(dict(request, full_text_search=pattern))
+                assert [
+                    (h["_score"], h["_source"]["amount"]) for h in found["hits"]["hits"]
+                ] == [
+                    (h["_score"], h["_source"]["amount"])
+                    for h in complete["hits"]["hits"]
+                ]
+                assert {h["_source"]["amount"] for h in found["hits"]["hits"]} == {
+                    3,
+                    row_count - 2,
+                }
+                assert found["profile"]["sort"]["selection_reason"] == (
+                    "bounded_global_text_frontier"
+                ), found
             highlighted = call(
                 "POST",
                 "/tables/profile_text/query",
@@ -4993,6 +5018,7 @@ def test_broad_native_text_windows_preserve_scores_ties_counts_and_hydration(
                             "quasar " * (amount % 4 + 1)
                             + "common " * (amount % 3)
                             + ("beta " if amount % 2 else "alpha ")
+                            + ("navquasar " if amount in (3, row_count - 2) else "")
                         )
                 if "reranker" in shape:
                     assert (

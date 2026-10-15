@@ -3029,6 +3029,116 @@ const StreamingBoolNode = struct {
     }
 };
 
+/// The same whole-term matcher used by dictionary execution, exposed to
+/// metadata planners. It owns its automaton and borrows only query syntax.
+pub const TermPattern = struct {
+    const Regex = @import("regex.zig");
+    const Levenshtein = @import("levenshtein.zig").LevenshteinAutomaton;
+    const Wildcard = @import("wildcard.zig");
+    a: Allocator,
+    budget: @import("../sql/memory_budget.zig"),
+    allocation_failed: bool = false,
+    filter: query_mod.Filter = .{ .match_none = {} },
+    prefix: []const u8 = "",
+    wildcard: ?Wildcard.SearchPlan = null,
+    regex: ?Regex.RegexAutomaton = null,
+    fuzzy: ?Levenshtein = null,
+    impossible: bool = false,
+    pub fn create(a: Allocator, query: SearchQuery) !*TermPattern {
+        const self = try a.create(TermPattern);
+        self.* = .{ .a = a, .budget = .{ .backing = a, .limit = 2 * 1024 * 1024 } };
+        errdefer self.deinit();
+        const bounded = self.allocator();
+        self.filter = try searchQueryToFilterArena(bounded, query);
+        switch (self.filter) {
+            .prefix => |q| self.prefix = q.prefix,
+            .wildcard => |q| {
+                self.wildcard = try Wildcard.searchPlanAlloc(bounded, q.pattern);
+                self.prefix = self.wildcard.?.literal_prefix;
+            },
+            .regexp => |q| self.regex = Regex.compile(bounded, q.pattern) catch |err| switch (err) {
+                error.OutOfMemory => return err,
+                else => {
+                    self.impossible = true;
+                    return self;
+                },
+            },
+            .fuzzy => |q| {
+                if (q.prefix_len > q.term.len) self.impossible = true else self.prefix = q.term[0..q.prefix_len];
+                self.fuzzy = .{ .term = q.term, .max_distance = q.max_edits, .alloc = bounded };
+            },
+            else => return error.InvalidArgument,
+        }
+        return self;
+    }
+    pub fn field(self: *const TermPattern) []const u8 {
+        return switch (self.filter) {
+            inline .prefix, .wildcard, .regexp, .fuzzy => |q| q.field,
+            else => unreachable,
+        };
+    }
+    pub fn deinit(self: *TermPattern) void {
+        if (self.wildcard) |*plan| plan.deinit(self.allocator());
+        if (self.regex) |*regex| regex.deinit();
+        if (self.fuzzy) |*fuzzy| fuzzy.deinit();
+        std.debug.assert(self.budget.live == 0);
+        self.a.destroy(self);
+    }
+    /// FST automata encode allocation failure as a dead state. Track that
+    /// independently: a failed expansion must never become an absence proof.
+    pub fn matches(self: *TermPattern, term: []const u8) !bool {
+        if (self.allocation_failed) return error.OutOfMemory;
+        if (self.impossible or !std.mem.startsWith(u8, term, self.prefix)) return false;
+        const matched = switch (self.filter) {
+            .prefix => true,
+            .wildcard => |q| Wildcard.match(q.pattern, term),
+            .regexp, .fuzzy => blk: {
+                const automaton = if (self.regex) |*regex| regex.automaton() else self.fuzzy.?.automaton();
+                var state = automaton.start();
+                for (term) |byte| {
+                    state = automaton.accept(state, byte);
+                    if (!automaton.canMatch(state)) break :blk false;
+                }
+                break :blk automaton.isMatch(state);
+            },
+            else => unreachable,
+        };
+        if (self.allocation_failed) return error.OutOfMemory;
+        return matched;
+    }
+    fn allocator(self: *TermPattern) Allocator {
+        return .{ .ptr = self, .vtable = &.{ .alloc = allocate, .resize = resize, .remap = remap, .free = free } };
+    }
+    fn allocate(raw: *anyopaque, length: usize, alignment: std.mem.Alignment, ra: usize) ?[*]u8 {
+        const self: *TermPattern = @ptrCast(@alignCast(raw));
+        return self.budget.allocator().rawAlloc(length, alignment, ra) orelse {
+            self.allocation_failed = true;
+            return null;
+        };
+    }
+    fn resize(raw: *anyopaque, bytes: []u8, alignment: std.mem.Alignment, length: usize, ra: usize) bool {
+        return @as(*TermPattern, @ptrCast(@alignCast(raw))).budget.allocator().rawResize(bytes, alignment, length, ra);
+    }
+    fn remap(raw: *anyopaque, bytes: []u8, alignment: std.mem.Alignment, length: usize, ra: usize) ?[*]u8 {
+        return @as(*TermPattern, @ptrCast(@alignCast(raw))).budget.allocator().rawRemap(bytes, alignment, length, ra);
+    }
+    fn free(raw: *anyopaque, bytes: []u8, alignment: std.mem.Alignment, ra: usize) void {
+        @as(*TermPattern, @ptrCast(@alignCast(raw))).budget.allocator().rawFree(bytes, alignment, ra);
+    }
+};
+
+test "external lake metadata navigation pattern allocation failures never prove absence" {
+    const a = std.testing.allocator;
+    for ([_]SearchQuery{ .{ .regexp = .{ .field = "body", .pattern = "ra[a-z]+" } }, .{ .fuzzy = .{ .field = "body", .term = "raze" } } }) |query| {
+        var failure = std.testing.FailingAllocator.init(a, .{});
+        const matcher = try TermPattern.create(failure.allocator(), query);
+        defer matcher.deinit();
+        failure.fail_index = failure.alloc_index;
+        failure.resize_fail_index = failure.resize_index;
+        try std.testing.expectError(error.OutOfMemory, matcher.matches("rare"));
+    }
+}
+
 /// Metadata-only planning shares analysis and Boolean lowering with scoring.
 /// It owns no segment inventory, payload decoder, or source lease.
 pub const TextNavigationPlan = struct {
@@ -3037,6 +3147,8 @@ pub const TextNavigationPlan = struct {
         count: u32,
         average: *const fn (*anyopaque, []const u8) f32,
         frequencies: *const fn (*anyopaque, Allocator, []const u8, []const []const u8, []u32) anyerror!void,
+        /// null means incomplete expansion. An empty slice proves absence.
+        patterns: ?*const fn (*anyopaque, Allocator, SearchQuery) anyerror!?[]const TermQuery = null,
     };
     pub const Summaries = struct {
         ptr: *anyopaque,
@@ -3130,7 +3242,8 @@ pub const TextNavigationPlan = struct {
     // A baseline can match documents absent from every positive term.
     fn restricted(node: *const LoweredText) bool {
         switch (node.kind) {
-            .all, .bitmap, .filter => return false,
+            .all, .bitmap => return false,
+            .filter => return node.pattern_terms != null,
             .none, .term, .phrase => return true,
             .boolean => {
                 if (node.baseline != null) return false;
@@ -3174,7 +3287,18 @@ pub const TextNavigationPlan = struct {
         var possible = true;
         switch (node.kind) {
             .none => possible = false,
-            .all, .bitmap, .filter => return .{ .upper = std.math.inf(f32), .possible = true },
+            .all, .bitmap => return .{ .upper = std.math.inf(f32), .possible = true },
+            .filter => {
+                const terms = node.pattern_terms orelse return .{ .upper = std.math.inf(f32), .possible = true };
+                possible = false;
+                for (terms) |term| {
+                    const summary = try source.read(source.ptr, term.field, term.term, 1, self.config);
+                    possible = possible or summary.frequency != 0;
+                }
+                // Patterns score once per document, regardless of the number
+                // of expanded terms. Expansions are admission proofs only.
+                upper = node.boost;
+            },
             .term => {
                 const term = node.term.?;
                 const stats = try @constCast(&self.stats).get(term.field, term.term);
@@ -3239,8 +3363,17 @@ const StreamingBoolStats = struct {
     overrides: []const distributed_stats_mod.TextFieldStats = &.{},
     sealed: bool = false,
     lowered: ?*const LoweredText = null,
+    pattern_expansions: std.ArrayListUnmanaged(struct { query: SearchQuery, terms: ?[]const TermQuery }) = .empty,
     analyses: std.ArrayListUnmanaged(struct { text: []const u8, analyzer: *const analysis_mod.Analyzer, tokens: []const analysis_mod.Token }) = .empty,
     phrases: std.ArrayListUnmanaged(struct { field: []const u8, text: []const u8, analyzer: *const analysis_mod.Analyzer, filter: ?query_mod.Filter }) = .empty,
+    fn patternTerms(self: *@This(), query: SearchQuery) !?[]const TermQuery {
+        for (self.pattern_expansions.items) |entry| if (TextNavigationPlan.sameQuery(entry.query, query)) return entry.terms;
+        const source = self.metadata orelse return null;
+        const expand = source.patterns orelse return null;
+        const terms = try expand(source.ptr, self.a, query);
+        try self.pattern_expansions.append(self.a, .{ .query = query, .terms = terms });
+        return terms;
+    }
     fn analyzed(self: *@This(), text: []const u8, analyzer: *const analysis_mod.Analyzer) ![]const analysis_mod.Token {
         if (self.preparation) |prepared| for (prepared.stats.analyses.items) |entry| if (entry.analyzer == analyzer and std.mem.eql(u8, entry.text, text)) return entry.tokens;
         for (self.analyses.items) |entry| if (entry.analyzer == analyzer and std.mem.eql(u8, entry.text, text)) return entry.tokens;
@@ -3369,6 +3502,7 @@ const StreamingBoolStats = struct {
 const LoweredText = struct {
     kind: enum { none, all, term, bitmap, boolean, phrase, filter } = .none,
     filter: ?query_mod.Filter = null,
+    pattern_terms: ?[]const TermQuery = null,
     term: ?TermQuery = null,
     bitmap: ?*const roaring.RoaringBitmap = null,
     must: []const *const LoweredText = &.{},
@@ -3528,7 +3662,7 @@ const LoweredText = struct {
         }
         fn lower(self: *@This(), query: SearchQuery) anyerror!*const LoweredText {
             switch (query) {
-                inline .prefix, .wildcard, .regexp, .fuzzy => |q| return self.node(.{ .kind = .filter, .filter = try searchQueryToFilterArena(self.a, query), .boost = q.boost }),
+                inline .prefix, .wildcard, .regexp, .fuzzy => |q| return self.node(.{ .kind = .filter, .filter = try searchQueryToFilterArena(self.a, query), .pattern_terms = try self.stats.patternTerms(query), .boost = q.boost }),
                 .match_none => return self.node(.{}),
                 .match_all => return self.node(.{ .kind = .all }),
                 .doc_num => |d| return self.node(.{ .kind = if (d.bitmap != null) .bitmap else .none, .bitmap = d.bitmap, .boost = d.boost }),

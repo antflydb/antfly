@@ -449,15 +449,11 @@ pub const ServingSource = struct {
                     @import("lake_prepared_deletes.zig").Prepared.hashObjectVersion(&hash, uri, metadata_bytes, binding.snapshot_mode.pinnedSnapshotId() orelse "");
                     const key = hash.finalResult();
                     plan_identity = key;
-                    const lease = shared.decoded.lookup(key) orelse blk_lease: {
-                        const owned = try shared.decoded.create(64 * 1024 * 1024);
-                        errdefer owned.release();
-                        owned.item.payload = .{ .snapshot = try @import("lake_iceberg_snapshot.zig").planSnapshotInventoryAndDeletePlanFromMetadataAlloc(owned.item.budget.allocator(), .{ .client = client, .source_id = binding.table_id, .metadata_uri = uri, .requested_snapshot_id = binding.snapshot_mode.pinnedSnapshotId() }, metadata_bytes) };
-                        try prepareCachedPlan(owned.item);
-                        try context.ensureActive();
-                        shared.decoded.publish(key, owned);
-                        break :blk_lease owned;
-                    };
+                    var loader: SnapshotPlanLoader = .{ .client = client, .source = binding.table_id, .uri = uri, .snapshot = binding.snapshot_mode.pinnedSnapshotId(), .metadata = metadata_bytes };
+                    // Coalesce cold manifest discovery as well as warm residency.
+                    // Waiters retain their own authority, cancellation and lease;
+                    // the cache owns only the immutable inventory/delete plan.
+                    const lease = try shared.decoded.acquire(key, 64 * 1024 * 1024, context, .{ .ptr = &loader, .load = SnapshotPlanLoader.load });
                     plan_lease = lease;
                     snapshot = lease.item.payload.snapshot;
                 } else {
@@ -521,6 +517,19 @@ pub const ServingSource = struct {
         const local_plan = if (plan_lease == null) try PreparedPlan.init(alloc, inventory) else null;
         return .{ .alloc = alloc, .snapshot_pin = snapshot_pin, .store = store, .inventory = inventory, .scanner = scanner, .context_store = context_store, .partition_rules = partition_rules, .iceberg_schema = iceberg_schema, .plan_identity = plan_identity, .plan_lease = plan_lease, .local_plan = local_plan, .inventory_owned = plan_lease == null, .attachment_uri = attachment_uri, .catalog_metadata = retained_metadata, .lazy_versions = lazy_versions, .immutable_objects = binding.object_mutability == .immutable, .pinned_files = pinned_files };
     }
+
+    const SnapshotPlanLoader = struct {
+        client: @import("../../storage/object_storage.zig").ObjectStorage,
+        source: []const u8,
+        uri: []const u8,
+        snapshot: ?[]const u8,
+        metadata: []const u8,
+        fn load(raw: *anyopaque, item: *@import("lake_decoded_cache.zig").Item) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            item.payload = .{ .snapshot = try @import("lake_iceberg_snapshot.zig").planSnapshotInventoryAndDeletePlanFromMetadataAlloc(item.budget.allocator(), .{ .client = self.client, .source_id = self.source, .metadata_uri = self.uri, .requested_snapshot_id = self.snapshot }, self.metadata) };
+            try prepareCachedPlan(item);
+        }
+    };
 
     pub fn validateBinding(self: *const ServingSource, binding: @import("../external_source/catalog_binding.zig").Binding) !void {
         if (self.canonicalOrder() != null)
@@ -802,3 +811,57 @@ pub const ServingSource = struct {
         return false;
     }
 };
+
+test "external lake metadata navigation coalesces cold immutable snapshot discovery" {
+    const io = std.testing.io;
+    const cache_mod = @import("lake_decoded_cache.zig");
+    var cache: cache_mod.Cache = .{ .a = std.testing.allocator };
+    defer cache.deinit();
+    var memory = object_storage_api.MemoryObjectStorage.init(std.testing.allocator);
+    defer memory.deinit();
+    const metadata =
+        \\{"format-version":2,"table-uuid":"test","location":"s3://bucket/table","current-schema-id":0,"schemas":[{"schema-id":0,"type":"struct","fields":[{"id":1,"name":"id","required":true,"type":"long"}]}],"snapshots":[],"current-snapshot-id":-1}
+    ;
+    const State = struct {
+        loader: ServingSource.SnapshotPlanLoader,
+        started: std.Io.Event = .unset,
+        gate: std.Io.Event = .unset,
+        calls: std.atomic.Value(usize) = .init(0),
+        fn load(raw: *anyopaque, item: *cache_mod.Item) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            _ = self.calls.fetchAdd(1, .monotonic);
+            self.started.set(std.testing.io);
+            try self.gate.wait(std.testing.io);
+            try ServingSource.SnapshotPlanLoader.load(&self.loader, item);
+        }
+        fn read(self: *@This(), shared: *cache_mod.Cache) anyerror!cache_mod.Lease {
+            return shared.acquire(@splat(8), 64 * 1024 * 1024, .{ .io = std.testing.io }, .{ .ptr = self, .load = load });
+        }
+    };
+    var state: State = .{ .loader = .{ .client = memory.client(), .source = "source", .uri = "s3://bucket/table/metadata/v1.json", .snapshot = null, .metadata = metadata } };
+    var first = try io.concurrent(State.read, .{ &state, &cache });
+    defer if (first.any_future != null) if (first.cancel(io)) |lease| lease.release() else |_| {};
+    try state.started.wait(io);
+    var second = try io.concurrent(State.read, .{ &state, &cache });
+    defer if (second.any_future != null) if (second.cancel(io)) |lease| lease.release() else |_| {};
+    // Hold the leader until a second reader has actually joined its flight.
+    // A merely warm cache hit would not exercise construction coalescing.
+    while (true) {
+        while (!cache.mutex.tryLock()) try io.sleep(.fromMilliseconds(1), .awake);
+        const joined = if (cache.flights.get(@splat(8))) |flight| flight.refs > 1 else false;
+        cache.mutex.unlock();
+        if (joined) break;
+        try io.sleep(.fromMilliseconds(1), .awake);
+    }
+    state.gate.set(io);
+    const one = try first.await(io);
+    defer one.release();
+    const two = try second.await(io);
+    defer two.release();
+    try std.testing.expectEqual(one.item, two.item);
+    try std.testing.expectEqual(@as(usize, 1), state.calls.load(.acquire));
+    try std.testing.expect(one.item.file_order != null);
+    try std.testing.expectEqualStrings("source", one.item.payload.snapshot.inventory.source_id);
+    var canceled = std.atomic.Value(bool).init(true);
+    try std.testing.expectError(error.Canceled, cache.acquire(@splat(8), 64 * 1024 * 1024, .{ .io = io, .cancellation = object_storage_api.CancellationToken.fromAtomic(&canceled) }, .{ .ptr = &state, .load = State.load }));
+}

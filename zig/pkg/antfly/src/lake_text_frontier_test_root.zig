@@ -21,6 +21,7 @@ test {
     _ = @import("api/lake_source_navigation.zig");
     _ = @import("api/lake_retained_cut.zig");
     _ = @import("api/lake_index_publication.zig");
+    _ = @import("api/lake_index_coordinator.zig");
     _ = @import("api/lake_recent_vectors.zig");
     _ = @import("serverless/artifacts/cloud_generations.zig");
     _ = @import("api/lake_generation_envelope.zig");

@@ -129,7 +129,7 @@ fn durableDirectoryAvailable(a: A, store: *Store, ready: catalog.Publication, ca
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
     const document = @import("lake_index_directory.zig").loadDocument(arena.allocator(), handle, .{ .kind = .external_base_source, .artifact_id = directory.artifact_id, .checksum = directory.checksum, .byte_len = directory.byte_len }, cancellation, null) catch |err| switch (err) {
-        error.FileNotFound, error.NotFound, error.ArtifactIntegrityMismatch => return false,
+        error.FileNotFound, error.NotFound, error.ObjectNotFound, error.CloudGenerationMapUnavailable, error.ArtifactIntegrityMismatch => return false,
         else => return err,
     };
     const navigation = ready.source_navigation orelse return false;
@@ -732,4 +732,53 @@ test "external lake lease renewal extends a live fence and never replays an ambi
     try std.testing.expectError(error.MetadataMutationOutcomeUnknown, renewal.pulse());
     try std.testing.expectError(error.LakeIndexPublicationFenceChanged, Renewal.check(&renewal));
     try std.testing.expectEqual(@as(usize, 3), mock.calls);
+}
+
+test "external lake global frontier coordinator rebuilds missing cloud map directories" {
+    const a = std.testing.allocator;
+    const Provider = @import("../serverless/artifacts/cloud_generations_test_provider.zig").Provider;
+    const maps = @import("../serverless/artifacts/cloud_generations.zig");
+    var provider = Provider.init(a);
+    defer provider.deinit();
+    var client = provider.client();
+    try client.makeBucket("bucket");
+    var store: Store = .{ .opened = undefined, .implementation = try @import("../serverless/artifacts/object_store.zig").ObjectStore.initWithClient(a, client, "bucket", "native"), .identity = @splat(3), .locator = .{ .protocol = .s3, .connection = "test", .bucket = "bucket", .prefix = "native", .root = "test" } };
+    defer store.implementation.deinit();
+    const scope = try @import("../serverless/artifacts/store.zig").UploadScope.forPublication(@splat(4), 1, std.testing.io);
+    var writer: maps.Writer = .{ .a = a, .io = std.testing.io, .scope = scope, .reader = .{ .client = client, .bucket = "bucket", .prefix = "native" }, .complete = true };
+    defer writer.deinit();
+    store.implementation.cloud_writer = &writer;
+    var artifacts = store.artifactStore();
+    artifacts.upload_scope = scope;
+    var inventory = try artifacts.put("inventory");
+    defer inventory.deinit(a);
+    const directory = try @import("lake_index_directory.zig").publish(a, &artifacts, &.{}, .none);
+    defer a.free(directory.artifact_id);
+    defer a.free(directory.checksum);
+    const navigation_bytes = try std.json.Stringify.valueAlloc(a, @import("lake_source_navigation.zig").Root{ .domain = scope.domain, .source = "source", .schema = "schema", .snapshot = "snapshot", .count = 0 }, .{});
+    defer a.free(navigation_bytes);
+    var navigation = try artifacts.put(navigation_bytes);
+    defer navigation.deinit(a);
+    const map = (try writer.finish(.none)).?;
+    defer maps.freeRef(a, map);
+    store.implementation.cloud_writer = null;
+    const published: catalog.Publication = .{ .reader_protocol = catalog.native_reader_protocol, .namespace = @splat(4), .generation = 1, .token = @splat(1), .signature = .{ .desired = @splat(1), .source = @splat(2), .credentials = @splat(3), .store = store.identity }, .published_at_ms = 1, .base_source = .{ .external_parquet = .{ .format = .parquet_prefix, .source_uri = "s3://source/lake", .snapshot_id = "snapshot", .schema_fingerprint = "schema", .file_inventory_artifact = inventory.artifact_id } }, .inventory = .{ .kind = .external_base_source, .artifact_id = inventory.artifact_id, .checksum = inventory.checksum, .byte_len = inventory.byte_len }, .source_navigation = .{ .kind = .doc_values, .metadata_version = 2, .artifact_id = navigation.artifact_id, .checksum = navigation.checksum, .byte_len = navigation.byte_len }, .directory = directory, .cloud_generations = .{ .root = map, .complete = true } };
+    try std.testing.expect(try durableDirectoryAvailable(a, &store, published, .none));
+    const suffix = try @import("../serverless/artifacts/store.zig").storageSuffixAlloc(a, map.artifact_id);
+    defer a.free(suffix);
+    const version_key = try std.fmt.allocPrint(a, "native/{s}@{s}", .{ suffix, map.generation });
+    defer a.free(version_key);
+    var memory = provider.memory.client();
+    try memory.deleteObject("bucket", version_key, .{});
+    // A restore can leave derived map pages absent while its schema/source
+    // signature still matches. Availability must become false, admitting repair.
+    try std.testing.expect(!try durableDirectoryAvailable(a, &store, published, .none));
+    const Denied = struct {
+        fn call(_: *anyopaque) !void {
+            return error.AccessDenied;
+        }
+    };
+    var dummy: u8 = 0;
+    provider.get_hook = .{ .ptr = &dummy, .call = Denied.call };
+    try std.testing.expectError(error.AccessDenied, durableDirectoryAvailable(a, &store, published, .none));
 }
