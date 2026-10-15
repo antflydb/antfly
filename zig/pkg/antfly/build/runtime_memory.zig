@@ -40,6 +40,7 @@ pub const CompileMemoryProfile = struct {
     sanitize_thread: bool = false,
     // Opt-in only after the builder verifies SDK and all backend settings.
     macos_metal_blas_release: bool = false,
+    macos_shared_storage_sdk27: bool = false,
 };
 
 pub fn runtimeCompileMaxRss(unit: RuntimeLibraryUnit, profile: CompileMemoryProfile) usize {
@@ -52,7 +53,15 @@ pub fn runtimeCompileMaxRss(unit: RuntimeLibraryUnit, profile: CompileMemoryProf
         target.cpu.model == baseline_cpu.model and target.cpu.features.eql(baseline_cpu.features) and
         profile.optimize == .fast and profile.strip and !profile.sanitize_thread)
     {
-        // Wolfspider native SDK 26.4, stripped Metal/Accelerate ReleaseFast.
+        // SDK 26.4; SDK 27.0 is qualified only with both shared owners.
+        // SDK 27.0 shared storage adapter rounded MaxRSS: 9G. Reserve
+        // 14 GiB (over 50% headroom), allowing API and adapter to overlap.
+        if (profile.macos_shared_storage_sdk27) {
+            if (unit == .storage_kernel) return 14 * 1024 * 1024 * 1024;
+            // Overlap qualification rounded CLI MaxRSS to 2G.
+            if (unit == .cli) return 4 * 1024 * 1024 * 1024;
+        }
+        // Stripped Metal/Accelerate ReleaseFast.
         // Claims include >=25% above each rounded MaxRSS upper bound. The
         // paired cold build and overlap qualification live in COMPILATION.md.
         const gib: usize = switch (unit) {
@@ -264,4 +273,16 @@ test "default Linux CPU enrichment fits a three GiB build budget" {
     try std.testing.expectEqual(3 * gib, runtimeCompileMaxRss(.enrichment_compute, profile));
     profile.sanitize_thread = true;
     try std.testing.expect(runtimeCompileMaxRss(.enrichment_compute, profile) > 3 * gib);
+}
+
+test "SDK 27 shared adapter retains peak margin and overlaps the API" {
+    const macos = try std.zig.system.resolveTargetQuery(std.testing.io, .{ .cpu_arch = .aarch64, .cpu_model = .baseline, .os_tag = .macos });
+    var profile: CompileMemoryProfile = .{ .host = macos, .target = macos, .optimize = .fast, .strip = true, .cpu_inference = false, .macos_metal_blas_release = true, .macos_shared_storage_sdk27 = true };
+    const gib = 1024 * 1024 * 1024;
+    const adapter = runtimeCompileMaxRss(.storage_kernel, profile);
+    try std.testing.expect(adapter >= 10 * gib + 10 * gib / 4);
+    try std.testing.expect(adapter + runtimeCompileMaxRss(.api_kernel, profile) <= 28 * gib);
+    try std.testing.expect(runtimeCompileMaxRss(.cli, profile) >= 3 * gib + 3 * gib / 4);
+    profile.sanitize_thread = true;
+    try std.testing.expectEqual(28 * gib, runtimeCompileMaxRss(.storage_kernel, profile));
 }

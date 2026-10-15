@@ -887,6 +887,7 @@ pub fn create(b: *std.Build) ?Artifacts {
         .production_antfly_imports = production_antfly_imports,
         .antfly_client_pkg_mod = antfly_client_pkg_mod,
         .capi_mod = capi_mod,
+        .native_storage = embedded.native_storage,
         .native_enrichment = embedded.native_enrichment,
         .native_inference = embedded.native_inference,
     });

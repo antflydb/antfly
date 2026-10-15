@@ -65,6 +65,10 @@ PACKAGE_ENTRYPOINTS = (
 SOURCE_MODULES = {
     "antfly_media": ("zig/lib/media/src/mod.zig",),
     "antfly_video": ("zig/lib/video/src/mod.zig",),
+    "storage_ordinals": ("zig/pkg/antfly-embedded/src/storage/ordinals/root.zig",),
+    "storage_ordinal_options": (),
+    "storage_engine_options": (),
+    "storage_engine_errors": ("zig/pkg/inference/src/host/engine_errors.zig",),
     "antfly_apple_native": ("zig/lib/apple_native/src/mod.zig",),
     "root": tuple(SOURCE_ROOT + name for name in ENTRYPOINTS) + PACKAGE_ENTRYPOINTS,
     "antfly_local_sources": ("zig/pkg/antfly-embedded/src/source_catalog.zig",),

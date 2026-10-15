@@ -985,10 +985,10 @@ pub fn createDirPathPortable(io: anytype, path: []const u8) !void {
 /// caller's I/O implementation, including deterministic VOPR filesystems,
 /// instead of silently creating a native threaded storage lane.
 pub const IoStorage = struct {
-    io: std.Io,
+    receiver: @import("antfly_runtime_abi").io_abi.Receiver,
 
     pub fn init(io: std.Io) IoStorage {
-        return .{ .io = io };
+        return .{ .receiver = @import("antfly_runtime_abi").io_abi.Borrow.init(&io).receive() catch unreachable };
     }
 
     pub fn storage(self: *IoStorage) Storage {
@@ -1021,39 +1021,39 @@ pub const IoStorage = struct {
     }
 
     fn createDirPath(ptr: *anyopaque, path: []const u8) !void {
-        try fs_paths.createDirPathPortable(context(ptr).io, path);
+        try fs_paths.createDirPathPortable(context(ptr).receiver.io(), path);
     }
 
     fn readFileAlloc(ptr: *anyopaque, allocator: Allocator, path: []const u8, max_bytes: usize) ![]u8 {
-        return try std.Io.Dir.cwd().readFileAlloc(context(ptr).io, path, allocator, .limited(max_bytes));
+        return try std.Io.Dir.cwd().readFileAlloc(context(ptr).receiver.io(), path, allocator, .limited(max_bytes));
     }
 
     fn readFileRangeAlloc(ptr: *anyopaque, allocator: Allocator, path: []const u8, offset: u64, len: usize) ![]u8 {
-        return try readFileRangeWithIo(context(ptr).io, allocator, path, offset, len);
+        return try readFileRangeWithIo(context(ptr).receiver.io(), allocator, path, offset, len);
     }
 
     fn readFileRangeInto(ptr: *anyopaque, path: []const u8, offset: u64, out: []u8) !void {
-        try readFileRangeWithIoInto(context(ptr).io, path, offset, out);
+        try readFileRangeWithIoInto(context(ptr).receiver.io(), path, offset, out);
     }
 
     fn readFileRangeAtMostInto(ptr: *anyopaque, path: []const u8, offset: u64, out: []u8) !usize {
-        return try readFileRangeWithIoAtMostInto(context(ptr).io, path, offset, out);
+        return try readFileRangeWithIoAtMostInto(context(ptr).receiver.io(), path, offset, out);
     }
 
     fn fileSize(ptr: *anyopaque, path: []const u8) !u64 {
-        return try fileSizeWithIo(context(ptr).io, path);
+        return try fileSizeWithIo(context(ptr).receiver.io(), path);
     }
 
     fn readFileTrailerAlloc(ptr: *anyopaque, allocator: Allocator, path: []const u8, len: usize) !FileTrailer {
-        return try readFileTrailerWithIo(context(ptr).io, allocator, path, len);
+        return try readFileTrailerWithIo(context(ptr).receiver.io(), allocator, path, len);
     }
 
     fn writeFileAbsolute(ptr: *anyopaque, path: []const u8, contents: []const u8) !void {
-        try std.Io.Dir.cwd().writeFile(context(ptr).io, .{ .sub_path = path, .data = contents });
+        try std.Io.Dir.cwd().writeFile(context(ptr).receiver.io(), .{ .sub_path = path, .data = contents });
     }
 
     fn appendFileAbsolute(ptr: *anyopaque, path: []const u8, contents: []const u8, sync: bool) !void {
-        const io = context(ptr).io;
+        const io = context(ptr).receiver.io();
         var file = try fs_paths.createFilePortable(io, path, .{ .read = true, .truncate = false });
         defer file.close(io);
         const offset = try file.length(io);
@@ -1062,27 +1062,27 @@ pub const IoStorage = struct {
     }
 
     fn syncContentsAbsolute(ptr: *anyopaque, path: []const u8) !void {
-        try syncFileContentsPathWithIo(context(ptr).io, path);
+        try syncFileContentsPathWithIo(context(ptr).receiver.io(), path);
     }
 
     fn syncParentAbsolute(ptr: *anyopaque, path: []const u8) !void {
-        try syncParentPathWithIo(context(ptr).io, path);
+        try syncParentPathWithIo(context(ptr).receiver.io(), path);
     }
 
     fn renameAbsolute(ptr: *anyopaque, old_path: []const u8, new_path: []const u8) !void {
-        try std.Io.Dir.rename(std.Io.Dir.cwd(), old_path, std.Io.Dir.cwd(), new_path, context(ptr).io);
+        try std.Io.Dir.rename(std.Io.Dir.cwd(), old_path, std.Io.Dir.cwd(), new_path, context(ptr).receiver.io());
     }
 
     fn deleteFileAbsolute(ptr: *anyopaque, path: []const u8) !void {
-        try deleteFilePathWithIo(context(ptr).io, path);
+        try deleteFilePathWithIo(context(ptr).receiver.io(), path);
     }
 
     fn deleteTree(ptr: *anyopaque, path: []const u8) !void {
-        try std.Io.Dir.cwd().deleteTree(context(ptr).io, path);
+        try std.Io.Dir.cwd().deleteTree(context(ptr).receiver.io(), path);
     }
 
     fn nowNs(ptr: *anyopaque) u64 {
-        const value = std.Io.Clock.awake.now(context(ptr).io).toNanoseconds();
+        const value = std.Io.Clock.awake.now(context(ptr).receiver.io()).toNanoseconds();
         return if (value <= 0) 0 else @intCast(@min(value, std.math.maxInt(u64)));
     }
 
@@ -2213,647 +2213,643 @@ else
         }
     };
 
-pub const NativeStorage = if (!supports_native_storage)
-    struct {
-        pub const Lease = struct {
-            pub fn deinit(_: *Lease) void {}
-            pub fn storage(_: *Lease) Storage {
-                @panic("native storage is unavailable on this target");
-            }
-        };
-
-        pub fn init(_: Allocator, _: RuntimeKind) !NativeStorage {
-            return error.UnsupportedNativeStorageRuntime;
-        }
-
-        pub fn initWithPool(_: Allocator, _: RuntimeKind, _: ?*NativeStoragePool) !NativeStorage {
-            return error.UnsupportedNativeStorageRuntime;
-        }
-
-        pub fn deinit(_: *NativeStorage) void {}
-
-        pub fn snapshotStats(_: *const NativeStorage) NativeStorageStats {
-            return .{};
-        }
-
-        pub fn acquireFdPermit(_: *NativeStorage) !NativeFdPermit {
-            return error.UnsupportedNativeStorageRuntime;
-        }
-
-        pub fn acquireFdPermits(_: *NativeStorage, _: usize) !NativeFdPermit {
-            return error.UnsupportedNativeStorageRuntime;
-        }
-
-        pub fn acquireLease(_: *NativeStorage) !Lease {
-            return error.UnsupportedNativeStorageRuntime;
-        }
-
-        pub fn beginAtomicWriteWithPermit(_: *NativeStorage, _: Allocator, _: []const u8, _: *NativeFdPermit) !AtomicWriteSink {
-            return error.UnsupportedNativeStorageRuntime;
-        }
-
-        pub fn validateFdPermit(_: *NativeStorage, _: *const NativeFdPermit) !void {
-            return error.UnsupportedNativeStorageRuntime;
-        }
-
-        pub fn storage(_: *NativeStorage) Storage {
+// Named platform branches are part of the checked private native contract.
+pub const NativeStorage = if (!supports_native_storage) UnsupportedNativeStorage else if (supports_evented_runtime) EventedNativeStorage else ThreadedNativeStorage;
+const UnsupportedNativeStorage = struct {
+    pub const Lease = struct {
+        pub fn deinit(_: *Lease) void {}
+        pub fn storage(_: *Lease) Storage {
             @panic("native storage is unavailable on this target");
         }
+    };
+
+    pub fn init(_: Allocator, _: RuntimeKind) !NativeStorage {
+        return error.UnsupportedNativeStorageRuntime;
     }
-else blk: {
-    if (supports_evented_runtime) {
-        break :blk struct {
-            runtime: union(RuntimeKind) {
-                threaded: std.Io.Threaded,
-                evented: std.Io.Evented,
+
+    pub fn initWithPool(_: Allocator, _: RuntimeKind, _: ?*NativeStoragePool) !NativeStorage {
+        return error.UnsupportedNativeStorageRuntime;
+    }
+
+    pub fn deinit(_: *NativeStorage) void {}
+
+    pub fn snapshotStats(_: *const NativeStorage) NativeStorageStats {
+        return .{};
+    }
+
+    pub fn acquireFdPermit(_: *NativeStorage) !NativeFdPermit {
+        return error.UnsupportedNativeStorageRuntime;
+    }
+
+    pub fn acquireFdPermits(_: *NativeStorage, _: usize) !NativeFdPermit {
+        return error.UnsupportedNativeStorageRuntime;
+    }
+
+    pub fn acquireLease(_: *NativeStorage) !Lease {
+        return error.UnsupportedNativeStorageRuntime;
+    }
+
+    pub fn beginAtomicWriteWithPermit(_: *NativeStorage, _: Allocator, _: []const u8, _: *NativeFdPermit) !AtomicWriteSink {
+        return error.UnsupportedNativeStorageRuntime;
+    }
+
+    pub fn validateFdPermit(_: *NativeStorage, _: *const NativeFdPermit) !void {
+        return error.UnsupportedNativeStorageRuntime;
+    }
+
+    pub fn storage(_: *NativeStorage) Storage {
+        @panic("native storage is unavailable on this target");
+    }
+};
+const EventedNativeStorage = struct {
+    runtime: union(RuntimeKind) {
+        threaded: std.Io.Threaded,
+        evented: std.Io.Evented,
+    },
+    state: *NativeStorageState,
+
+    const native_vtable: Storage.VTable = .{
+        .create_dir_path = createDirPath,
+        .read_file_alloc = readFileAlloc,
+        .read_file_range_alloc = readFileRangeAlloc,
+        .begin_read_file_range_alloc_with_runtime = beginReadFileRangeAllocWithRuntime,
+        .read_file_range_into = readFileRangeInto,
+        .read_file_range_at_most_into = readFileRangeAtMostInto,
+        .file_size = fileSize,
+        .read_file_trailer_alloc = readFileTrailerAlloc,
+        .write_file_absolute = writeFileAbsolute,
+        .append_file_absolute = appendFileAbsolute,
+        .begin_atomic_write = beginAtomicWrite,
+        .begin_cold_sequential_read = beginColdSequentialRead,
+        .begin_cold_random_read = beginColdRandomRead,
+        .try_begin_cold_random_reads = tryBeginNativeColdRandomReads,
+        .cold_sequential_reader_capacity = coldSequentialReaderCapacity,
+        .sync_contents_absolute = syncFileContentsAbsolute,
+        .sync_parent_absolute = syncParentAbsolute,
+        .rename_absolute = renameAbsolute,
+        .delete_file_absolute = deleteFileAbsolute,
+        .delete_tree = deleteTree,
+        .list_file_names_alloc = listFileNamesAlloc,
+        .now_ns = nowNs,
+        .root_identity_alloc = nativeRootIdentityAlloc,
+        .rename_is_atomic = true,
+        .supports_host_path_generation_publication = true,
+        .supports_native_path_locks = true,
+    };
+
+    pub fn init(allocator: Allocator, kind: RuntimeKind) !NativeStorage {
+        return try initWithPool(allocator, kind, null);
+    }
+
+    pub fn initWithPool(allocator: Allocator, kind: RuntimeKind, pool: ?*NativeStoragePool) !NativeStorage {
+        var runtime = switch (kind) {
+            .threaded => .{ .threaded = threaded_io_limits.initService(allocator) },
+            .evented => blk2: {
+                var evented: std.Io.Evented = undefined;
+                try std.Io.Evented.init(&evented, allocator, .{});
+                break :blk2 .{ .evented = evented };
             },
-            state: *NativeStorageState,
-
-            const native_vtable: Storage.VTable = .{
-                .create_dir_path = createDirPath,
-                .read_file_alloc = readFileAlloc,
-                .read_file_range_alloc = readFileRangeAlloc,
-                .begin_read_file_range_alloc_with_runtime = beginReadFileRangeAllocWithRuntime,
-                .read_file_range_into = readFileRangeInto,
-                .read_file_range_at_most_into = readFileRangeAtMostInto,
-                .file_size = fileSize,
-                .read_file_trailer_alloc = readFileTrailerAlloc,
-                .write_file_absolute = writeFileAbsolute,
-                .append_file_absolute = appendFileAbsolute,
-                .begin_atomic_write = beginAtomicWrite,
-                .begin_cold_sequential_read = beginColdSequentialRead,
-                .begin_cold_random_read = beginColdRandomRead,
-                .try_begin_cold_random_reads = tryBeginNativeColdRandomReads,
-                .cold_sequential_reader_capacity = coldSequentialReaderCapacity,
-                .sync_contents_absolute = syncFileContentsAbsolute,
-                .sync_parent_absolute = syncParentAbsolute,
-                .rename_absolute = renameAbsolute,
-                .delete_file_absolute = deleteFileAbsolute,
-                .delete_tree = deleteTree,
-                .list_file_names_alloc = listFileNamesAlloc,
-                .now_ns = nowNs,
-                .root_identity_alloc = nativeRootIdentityAlloc,
-                .rename_is_atomic = true,
-                .supports_host_path_generation_publication = true,
-                .supports_native_path_locks = true,
-            };
-
-            pub fn init(allocator: Allocator, kind: RuntimeKind) !NativeStorage {
-                return try initWithPool(allocator, kind, null);
-            }
-
-            pub fn initWithPool(allocator: Allocator, kind: RuntimeKind, pool: ?*NativeStoragePool) !NativeStorage {
-                var runtime = switch (kind) {
-                    .threaded => .{ .threaded = threaded_io_limits.initService(allocator) },
-                    .evented => blk2: {
-                        var evented: std.Io.Evented = undefined;
-                        try std.Io.Evented.init(&evented, allocator, .{});
-                        break :blk2 .{ .evented = evented };
-                    },
-                };
-                errdefer switch (runtime) {
-                    .threaded => |*threaded| threaded.deinit(),
-                    .evented => |*evented| std.Io.Evented.deinit(evented),
-                };
-                return .{
-                    .runtime = runtime,
-                    .state = try NativeStorageState.create(allocator, kind, pool),
-                };
-            }
-
-            pub fn deinit(self: *NativeStorage) void {
-                self.state.closeStorageRef();
-                switch (self.runtime) {
-                    .threaded => |*threaded| threaded.deinit(),
-                    .evented => |*evented| std.Io.Evented.deinit(evented),
-                }
-                self.* = undefined;
-            }
-
-            pub fn snapshotStats(self: *const NativeStorage) NativeStorageStats {
-                return self.state.fdCacheConst().snapshotStats();
-            }
-
-            pub fn acquireFdPermit(self: *NativeStorage) !NativeFdPermit {
-                return try self.state.acquireFdPermit();
-            }
-
-            pub fn storage(self: *NativeStorage) Storage {
-                return .{
-                    .ptr = self,
-                    .vtable = &native_vtable,
-                };
-            }
-
-            fn createDirPath(ptr: *anyopaque, path: []const u8) !void {
-                const self: *NativeStorage = @ptrCast(@alignCast(ptr));
-                switch (self.runtime) {
-                    .threaded => |*threaded| try createDirPathPortable(threaded.io(), path),
-                    .evented => |*evented| try createDirPathPortable(evented.io(), path),
-                }
-            }
-
-            fn readFileAlloc(ptr: *anyopaque, allocator: Allocator, path: []const u8, max_bytes: usize) ![]u8 {
-                const self: *NativeStorage = @ptrCast(@alignCast(ptr));
-                return switch (self.runtime) {
-                    .threaded => |*threaded| try std.Io.Dir.cwd().readFileAlloc(threaded.io(), path, allocator, .limited(max_bytes)),
-                    .evented => |*evented| try std.Io.Dir.cwd().readFileAlloc(evented.io(), path, allocator, .limited(max_bytes)),
-                };
-            }
-
-            fn readFileRangeAlloc(ptr: *anyopaque, allocator: Allocator, path: []const u8, offset: u64, len: usize) ![]u8 {
-                const self: *NativeStorage = @ptrCast(@alignCast(ptr));
-                if (comptime supports_posix_fd_cache) {
-                    const state = try self.state.retain();
-                    defer state.release();
-                    return try state.fdCache().readRangeAlloc(state.cache_namespace, state.threaded.io(), allocator, path, offset, len);
-                }
-                return switch (self.runtime) {
-                    .threaded => |*threaded| try readFileRangeWithIo(threaded.io(), allocator, path, offset, len),
-                    .evented => |*evented| try readFileRangeWithIo(evented.io(), allocator, path, offset, len),
-                };
-            }
-
-            fn beginReadFileRangeAllocWithRuntime(ptr: *anyopaque, read_runtime: ?ReadRuntime, allocator: Allocator, path: []const u8, offset: u64, len: usize) !RangeReadFuture {
-                const self: *NativeStorage = @ptrCast(@alignCast(ptr));
-                const runtime = read_runtime orelse {
-                    const sync_storage: Storage = .{ .ptr = ptr, .vtable = &native_vtable };
-                    return try CompletedRangeReadFuture.create(sync_storage, allocator, path, offset, len);
-                };
-                return try NativeRangeReadFuture.create(runtime, self.state, allocator, path, offset, len);
-            }
-
-            fn readFileRangeInto(ptr: *anyopaque, path: []const u8, offset: u64, out: []u8) !void {
-                const self: *NativeStorage = @ptrCast(@alignCast(ptr));
-                if (comptime supports_posix_fd_cache) {
-                    const state = try self.state.retain();
-                    defer state.release();
-                    return try state.fdCache().readRangeInto(state.cache_namespace, state.threaded.io(), path, offset, out);
-                }
-                return switch (self.runtime) {
-                    .threaded => |*threaded| try readFileRangeWithIoInto(threaded.io(), path, offset, out),
-                    .evented => |*evented| try readFileRangeWithIoInto(evented.io(), path, offset, out),
-                };
-            }
-
-            fn readFileRangeAtMostInto(ptr: *anyopaque, path: []const u8, offset: u64, out: []u8) !usize {
-                const self: *NativeStorage = @ptrCast(@alignCast(ptr));
-                if (comptime supports_posix_fd_cache) {
-                    const state = try self.state.retain();
-                    defer state.release();
-                    return try state.fdCache().readRangeAtMostInto(state.cache_namespace, state.threaded.io(), path, offset, out);
-                }
-                return switch (self.runtime) {
-                    .threaded => |*threaded| try readFileRangeWithIoAtMostInto(threaded.io(), path, offset, out),
-                    .evented => |*evented| try readFileRangeWithIoAtMostInto(evented.io(), path, offset, out),
-                };
-            }
-
-            fn fileSize(ptr: *anyopaque, path: []const u8) !u64 {
-                const self: *NativeStorage = @ptrCast(@alignCast(ptr));
-                if (comptime supports_posix_fd_cache) {
-                    const state = try self.state.retain();
-                    defer state.release();
-                    return try state.fdCache().fileSize(state.cache_namespace, state.threaded.io(), path);
-                }
-                return switch (self.runtime) {
-                    .threaded => |*threaded| try fileSizeWithIo(threaded.io(), path),
-                    .evented => |*evented| try fileSizeWithIo(evented.io(), path),
-                };
-            }
-
-            fn readFileTrailerAlloc(ptr: *anyopaque, allocator: Allocator, path: []const u8, len: usize) !FileTrailer {
-                const self: *NativeStorage = @ptrCast(@alignCast(ptr));
-                if (comptime supports_posix_fd_cache) {
-                    const state = try self.state.retain();
-                    defer state.release();
-                    return try state.fdCache().readTrailerAlloc(state.cache_namespace, state.threaded.io(), allocator, path, len);
-                }
-                return switch (self.runtime) {
-                    .threaded => |*threaded| try readFileTrailerWithIo(threaded.io(), allocator, path, len),
-                    .evented => |*evented| try readFileTrailerWithIo(evented.io(), allocator, path, len),
-                };
-            }
-
-            fn writeFileAbsolute(ptr: *anyopaque, path: []const u8, contents: []const u8) !void {
-                const self: *NativeStorage = @ptrCast(@alignCast(ptr));
-                self.state.invalidatePath(path);
-                defer self.state.invalidatePath(path);
-                switch (self.runtime) {
-                    .threaded => |*threaded| try writeFileAbsoluteWithIo(threaded.io(), path, contents),
-                    .evented => |*evented| try writeFileAbsoluteWithIo(evented.io(), path, contents),
-                }
-            }
-
-            fn appendFileAbsolute(ptr: *anyopaque, path: []const u8, contents: []const u8, sync: bool) !void {
-                const self: *NativeStorage = @ptrCast(@alignCast(ptr));
-                self.state.invalidatePath(path);
-                defer self.state.invalidatePath(path);
-                switch (self.runtime) {
-                    .threaded => |*threaded| try appendFileAbsoluteWithIo(threaded.io(), path, contents, sync),
-                    .evented => |*evented| try appendFileAbsoluteWithIo(evented.io(), path, contents, sync),
-                }
-            }
-
-            fn beginAtomicWrite(ptr: *anyopaque, allocator: Allocator, path: []const u8) !AtomicWriteSink {
-                const self: *NativeStorage = @ptrCast(@alignCast(ptr));
-                return try NativeAtomicWriteSink.create(allocator, path, self.state);
-            }
-
-            fn beginColdSequentialRead(ptr: *anyopaque, allocator: Allocator, path: []const u8) !ColdSequentialReader {
-                const self: *NativeStorage = @ptrCast(@alignCast(ptr));
-                return try NativeColdSequentialReader.create(allocator, path, self.state, .sequential);
-            }
-
-            fn beginColdRandomRead(ptr: *anyopaque, allocator: Allocator, path: []const u8) !ColdSequentialReader {
-                const self: *NativeStorage = @ptrCast(@alignCast(ptr));
-                return try NativeColdSequentialReader.create(allocator, path, self.state, .random);
-            }
-
-            fn coldSequentialReaderCapacity(ptr: *anyopaque) usize {
-                const self: *NativeStorage = @ptrCast(@alignCast(ptr));
-                return nativeColdSequentialReaderCapacity(self.state);
-            }
-
-            fn syncFileContentsAbsolute(ptr: *anyopaque, path: []const u8) !void {
-                const self: *NativeStorage = @ptrCast(@alignCast(ptr));
-                switch (self.runtime) {
-                    .threaded => |*threaded| try syncFileContentsPathWithIo(threaded.io(), path),
-                    .evented => |*evented| try syncFileContentsPathWithIo(evented.io(), path),
-                }
-            }
-
-            fn syncParentAbsolute(ptr: *anyopaque, path: []const u8) !void {
-                const self: *NativeStorage = @ptrCast(@alignCast(ptr));
-                switch (self.runtime) {
-                    .threaded => |*threaded| try syncParentPathWithIo(threaded.io(), path),
-                    .evented => |*evented| try syncParentPathWithIo(evented.io(), path),
-                }
-            }
-
-            fn renameAbsolute(ptr: *anyopaque, old_path: []const u8, new_path: []const u8) !void {
-                const self: *NativeStorage = @ptrCast(@alignCast(ptr));
-                self.state.invalidateRename(old_path, new_path);
-                defer self.state.invalidateRename(old_path, new_path);
-                switch (self.runtime) {
-                    .threaded => |*threaded| try renamePathWithIo(threaded.io(), old_path, new_path),
-                    .evented => |*evented| try renamePathWithIo(evented.io(), old_path, new_path),
-                }
-            }
-
-            fn deleteFileAbsolute(ptr: *anyopaque, path: []const u8) !void {
-                const self: *NativeStorage = @ptrCast(@alignCast(ptr));
-                self.state.invalidatePath(path);
-                defer self.state.invalidatePath(path);
-                switch (self.runtime) {
-                    .threaded => |*threaded| try deleteFilePathWithIo(threaded.io(), path),
-                    .evented => |*evented| try deleteFilePathWithIo(evented.io(), path),
-                }
-            }
-
-            fn deleteTree(ptr: *anyopaque, path: []const u8) !void {
-                const self: *NativeStorage = @ptrCast(@alignCast(ptr));
-                self.state.invalidateTree(path);
-                defer self.state.invalidateTree(path);
-                switch (self.runtime) {
-                    .threaded => |*threaded| try std.Io.Dir.cwd().deleteTree(threaded.io(), path),
-                    .evented => |*evented| try std.Io.Dir.cwd().deleteTree(evented.io(), path),
-                }
-            }
-
-            fn listFileNamesAlloc(ptr: *anyopaque, allocator: Allocator, path: []const u8) ![][]u8 {
-                const self: *NativeStorage = @ptrCast(@alignCast(ptr));
-                return switch (self.runtime) {
-                    .threaded => |*threaded| try listFileNamesWithIo(allocator, threaded.io(), path),
-                    .evented => |*evented| try listFileNamesWithIo(allocator, evented.io(), path),
-                };
-            }
-
-            fn nowNs(ptr: *anyopaque) u64 {
-                const self: *NativeStorage = @ptrCast(@alignCast(ptr));
-                return switch (self.runtime) {
-                    .threaded => |*threaded| blk2: {
-                        const now = std.Io.Timestamp.now(threaded.io(), .awake);
-                        break :blk2 @intCast(now.toNanoseconds());
-                    },
-                    .evented => |*evented| blk2: {
-                        const now = std.Io.Timestamp.now(evented.io(), .awake);
-                        break :blk2 @intCast(now.toNanoseconds());
-                    },
-                };
-            }
+        };
+        errdefer switch (runtime) {
+            .threaded => |*threaded| threaded.deinit(),
+            .evented => |*evented| std.Io.Evented.deinit(evented),
+        };
+        return .{
+            .runtime = runtime,
+            .state = try NativeStorageState.create(allocator, kind, pool),
         };
     }
 
-    break :blk struct {
+    pub fn deinit(self: *NativeStorage) void {
+        self.state.closeStorageRef();
+        switch (self.runtime) {
+            .threaded => |*threaded| threaded.deinit(),
+            .evented => |*evented| std.Io.Evented.deinit(evented),
+        }
+        self.* = undefined;
+    }
+
+    pub fn snapshotStats(self: *const NativeStorage) NativeStorageStats {
+        return self.state.fdCacheConst().snapshotStats();
+    }
+
+    pub fn acquireFdPermit(self: *NativeStorage) !NativeFdPermit {
+        return try self.state.acquireFdPermit();
+    }
+
+    pub fn storage(self: *NativeStorage) Storage {
+        return .{
+            .ptr = self,
+            .vtable = &native_vtable,
+        };
+    }
+
+    fn createDirPath(ptr: *anyopaque, path: []const u8) !void {
+        const self: *NativeStorage = @ptrCast(@alignCast(ptr));
+        switch (self.runtime) {
+            .threaded => |*threaded| try createDirPathPortable(threaded.io(), path),
+            .evented => |*evented| try createDirPathPortable(evented.io(), path),
+        }
+    }
+
+    fn readFileAlloc(ptr: *anyopaque, allocator: Allocator, path: []const u8, max_bytes: usize) ![]u8 {
+        const self: *NativeStorage = @ptrCast(@alignCast(ptr));
+        return switch (self.runtime) {
+            .threaded => |*threaded| try std.Io.Dir.cwd().readFileAlloc(threaded.io(), path, allocator, .limited(max_bytes)),
+            .evented => |*evented| try std.Io.Dir.cwd().readFileAlloc(evented.io(), path, allocator, .limited(max_bytes)),
+        };
+    }
+
+    fn readFileRangeAlloc(ptr: *anyopaque, allocator: Allocator, path: []const u8, offset: u64, len: usize) ![]u8 {
+        const self: *NativeStorage = @ptrCast(@alignCast(ptr));
+        if (comptime supports_posix_fd_cache) {
+            const state = try self.state.retain();
+            defer state.release();
+            return try state.fdCache().readRangeAlloc(state.cache_namespace, state.threaded.io(), allocator, path, offset, len);
+        }
+        return switch (self.runtime) {
+            .threaded => |*threaded| try readFileRangeWithIo(threaded.io(), allocator, path, offset, len),
+            .evented => |*evented| try readFileRangeWithIo(evented.io(), allocator, path, offset, len),
+        };
+    }
+
+    fn beginReadFileRangeAllocWithRuntime(ptr: *anyopaque, read_runtime: ?ReadRuntime, allocator: Allocator, path: []const u8, offset: u64, len: usize) !RangeReadFuture {
+        const self: *NativeStorage = @ptrCast(@alignCast(ptr));
+        const runtime = read_runtime orelse {
+            const sync_storage: Storage = .{ .ptr = ptr, .vtable = &native_vtable };
+            return try CompletedRangeReadFuture.create(sync_storage, allocator, path, offset, len);
+        };
+        return try NativeRangeReadFuture.create(runtime, self.state, allocator, path, offset, len);
+    }
+
+    fn readFileRangeInto(ptr: *anyopaque, path: []const u8, offset: u64, out: []u8) !void {
+        const self: *NativeStorage = @ptrCast(@alignCast(ptr));
+        if (comptime supports_posix_fd_cache) {
+            const state = try self.state.retain();
+            defer state.release();
+            return try state.fdCache().readRangeInto(state.cache_namespace, state.threaded.io(), path, offset, out);
+        }
+        return switch (self.runtime) {
+            .threaded => |*threaded| try readFileRangeWithIoInto(threaded.io(), path, offset, out),
+            .evented => |*evented| try readFileRangeWithIoInto(evented.io(), path, offset, out),
+        };
+    }
+
+    fn readFileRangeAtMostInto(ptr: *anyopaque, path: []const u8, offset: u64, out: []u8) !usize {
+        const self: *NativeStorage = @ptrCast(@alignCast(ptr));
+        if (comptime supports_posix_fd_cache) {
+            const state = try self.state.retain();
+            defer state.release();
+            return try state.fdCache().readRangeAtMostInto(state.cache_namespace, state.threaded.io(), path, offset, out);
+        }
+        return switch (self.runtime) {
+            .threaded => |*threaded| try readFileRangeWithIoAtMostInto(threaded.io(), path, offset, out),
+            .evented => |*evented| try readFileRangeWithIoAtMostInto(evented.io(), path, offset, out),
+        };
+    }
+
+    fn fileSize(ptr: *anyopaque, path: []const u8) !u64 {
+        const self: *NativeStorage = @ptrCast(@alignCast(ptr));
+        if (comptime supports_posix_fd_cache) {
+            const state = try self.state.retain();
+            defer state.release();
+            return try state.fdCache().fileSize(state.cache_namespace, state.threaded.io(), path);
+        }
+        return switch (self.runtime) {
+            .threaded => |*threaded| try fileSizeWithIo(threaded.io(), path),
+            .evented => |*evented| try fileSizeWithIo(evented.io(), path),
+        };
+    }
+
+    fn readFileTrailerAlloc(ptr: *anyopaque, allocator: Allocator, path: []const u8, len: usize) !FileTrailer {
+        const self: *NativeStorage = @ptrCast(@alignCast(ptr));
+        if (comptime supports_posix_fd_cache) {
+            const state = try self.state.retain();
+            defer state.release();
+            return try state.fdCache().readTrailerAlloc(state.cache_namespace, state.threaded.io(), allocator, path, len);
+        }
+        return switch (self.runtime) {
+            .threaded => |*threaded| try readFileTrailerWithIo(threaded.io(), allocator, path, len),
+            .evented => |*evented| try readFileTrailerWithIo(evented.io(), allocator, path, len),
+        };
+    }
+
+    fn writeFileAbsolute(ptr: *anyopaque, path: []const u8, contents: []const u8) !void {
+        const self: *NativeStorage = @ptrCast(@alignCast(ptr));
+        self.state.invalidatePath(path);
+        defer self.state.invalidatePath(path);
+        switch (self.runtime) {
+            .threaded => |*threaded| try writeFileAbsoluteWithIo(threaded.io(), path, contents),
+            .evented => |*evented| try writeFileAbsoluteWithIo(evented.io(), path, contents),
+        }
+    }
+
+    fn appendFileAbsolute(ptr: *anyopaque, path: []const u8, contents: []const u8, sync: bool) !void {
+        const self: *NativeStorage = @ptrCast(@alignCast(ptr));
+        self.state.invalidatePath(path);
+        defer self.state.invalidatePath(path);
+        switch (self.runtime) {
+            .threaded => |*threaded| try appendFileAbsoluteWithIo(threaded.io(), path, contents, sync),
+            .evented => |*evented| try appendFileAbsoluteWithIo(evented.io(), path, contents, sync),
+        }
+    }
+
+    fn beginAtomicWrite(ptr: *anyopaque, allocator: Allocator, path: []const u8) !AtomicWriteSink {
+        const self: *NativeStorage = @ptrCast(@alignCast(ptr));
+        return try NativeAtomicWriteSink.create(allocator, path, self.state);
+    }
+
+    fn beginColdSequentialRead(ptr: *anyopaque, allocator: Allocator, path: []const u8) !ColdSequentialReader {
+        const self: *NativeStorage = @ptrCast(@alignCast(ptr));
+        return try NativeColdSequentialReader.create(allocator, path, self.state, .sequential);
+    }
+
+    fn beginColdRandomRead(ptr: *anyopaque, allocator: Allocator, path: []const u8) !ColdSequentialReader {
+        const self: *NativeStorage = @ptrCast(@alignCast(ptr));
+        return try NativeColdSequentialReader.create(allocator, path, self.state, .random);
+    }
+
+    fn coldSequentialReaderCapacity(ptr: *anyopaque) usize {
+        const self: *NativeStorage = @ptrCast(@alignCast(ptr));
+        return nativeColdSequentialReaderCapacity(self.state);
+    }
+
+    fn syncFileContentsAbsolute(ptr: *anyopaque, path: []const u8) !void {
+        const self: *NativeStorage = @ptrCast(@alignCast(ptr));
+        switch (self.runtime) {
+            .threaded => |*threaded| try syncFileContentsPathWithIo(threaded.io(), path),
+            .evented => |*evented| try syncFileContentsPathWithIo(evented.io(), path),
+        }
+    }
+
+    fn syncParentAbsolute(ptr: *anyopaque, path: []const u8) !void {
+        const self: *NativeStorage = @ptrCast(@alignCast(ptr));
+        switch (self.runtime) {
+            .threaded => |*threaded| try syncParentPathWithIo(threaded.io(), path),
+            .evented => |*evented| try syncParentPathWithIo(evented.io(), path),
+        }
+    }
+
+    fn renameAbsolute(ptr: *anyopaque, old_path: []const u8, new_path: []const u8) !void {
+        const self: *NativeStorage = @ptrCast(@alignCast(ptr));
+        self.state.invalidateRename(old_path, new_path);
+        defer self.state.invalidateRename(old_path, new_path);
+        switch (self.runtime) {
+            .threaded => |*threaded| try renamePathWithIo(threaded.io(), old_path, new_path),
+            .evented => |*evented| try renamePathWithIo(evented.io(), old_path, new_path),
+        }
+    }
+
+    fn deleteFileAbsolute(ptr: *anyopaque, path: []const u8) !void {
+        const self: *NativeStorage = @ptrCast(@alignCast(ptr));
+        self.state.invalidatePath(path);
+        defer self.state.invalidatePath(path);
+        switch (self.runtime) {
+            .threaded => |*threaded| try deleteFilePathWithIo(threaded.io(), path),
+            .evented => |*evented| try deleteFilePathWithIo(evented.io(), path),
+        }
+    }
+
+    fn deleteTree(ptr: *anyopaque, path: []const u8) !void {
+        const self: *NativeStorage = @ptrCast(@alignCast(ptr));
+        self.state.invalidateTree(path);
+        defer self.state.invalidateTree(path);
+        switch (self.runtime) {
+            .threaded => |*threaded| try std.Io.Dir.cwd().deleteTree(threaded.io(), path),
+            .evented => |*evented| try std.Io.Dir.cwd().deleteTree(evented.io(), path),
+        }
+    }
+
+    fn listFileNamesAlloc(ptr: *anyopaque, allocator: Allocator, path: []const u8) ![][]u8 {
+        const self: *NativeStorage = @ptrCast(@alignCast(ptr));
+        return switch (self.runtime) {
+            .threaded => |*threaded| try listFileNamesWithIo(allocator, threaded.io(), path),
+            .evented => |*evented| try listFileNamesWithIo(allocator, evented.io(), path),
+        };
+    }
+
+    fn nowNs(ptr: *anyopaque) u64 {
+        const self: *NativeStorage = @ptrCast(@alignCast(ptr));
+        return switch (self.runtime) {
+            .threaded => |*threaded| blk2: {
+                const now = std.Io.Timestamp.now(threaded.io(), .awake);
+                break :blk2 @intCast(now.toNanoseconds());
+            },
+            .evented => |*evented| blk2: {
+                const now = std.Io.Timestamp.now(evented.io(), .awake);
+                break :blk2 @intCast(now.toNanoseconds());
+            },
+        };
+    }
+};
+const ThreadedNativeStorage = struct {
+    state: *NativeStorageState,
+
+    pub const Lease = struct {
         state: *NativeStorageState,
+        active: bool = true,
 
-        pub const Lease = struct {
-            state: *NativeStorageState,
-            active: bool = true,
-
-            /// Returns a borrowed view whose lifetime is bounded by this lease.
-            pub fn storage(self: *Lease) Storage {
-                std.debug.assert(self.active);
-                return .{
-                    .ptr = self.state,
-                    .vtable = &threaded_only_vtable,
-                };
-            }
-
-            pub fn deinit(self: *Lease) void {
-                if (!self.active) return;
-                self.active = false;
-                self.state.release();
-                self.* = undefined;
-            }
-        };
-
-        const threaded_only_vtable: Storage.VTable = .{
-            .acquire_lease = acquireErasedLease,
-            .create_dir_path = createDirPath,
-            .read_file_alloc = readFileAlloc,
-            .read_file_range_alloc = readFileRangeAlloc,
-            .begin_read_file_range_alloc_with_runtime = beginReadFileRangeAllocWithRuntime,
-            .read_file_range_into = readFileRangeInto,
-            .read_file_range_at_most_into = readFileRangeAtMostInto,
-            .file_size = fileSize,
-            .read_file_trailer_alloc = readFileTrailerAlloc,
-            .write_file_absolute = writeFileAbsolute,
-            .append_file_absolute = appendFileAbsolute,
-            .begin_atomic_write = beginAtomicWrite,
-            .begin_cold_sequential_read = beginColdSequentialRead,
-            .begin_cold_random_read = beginColdRandomRead,
-            .try_begin_cold_random_reads = tryBeginNativeColdRandomReads,
-            .cold_sequential_reader_capacity = coldSequentialReaderCapacity,
-            .sync_contents_absolute = syncFileContentsAbsolute,
-            .sync_parent_absolute = syncParentAbsolute,
-            .rename_absolute = renameAbsolute,
-            .delete_file_absolute = deleteFileAbsolute,
-            .delete_tree = deleteTree,
-            .list_file_names_alloc = listFileNamesAlloc,
-            .now_ns = nowNs,
-            .root_identity_alloc = rootIdentityAlloc,
-            .rename_is_atomic = true,
-            .supports_host_path_generation_publication = true,
-            .supports_native_path_locks = true,
-        };
-
-        pub fn init(allocator: Allocator, kind: RuntimeKind) !NativeStorage {
-            return try initWithPool(allocator, kind, null);
-        }
-
-        pub fn initWithPool(allocator: Allocator, kind: RuntimeKind, pool: ?*NativeStoragePool) !NativeStorage {
-            return .{ .state = try NativeStorageState.create(allocator, kind, pool) };
-        }
-
-        pub fn deinit(self: *NativeStorage) void {
-            self.state.closeStorageRef();
-            self.* = undefined;
-        }
-
-        pub fn snapshotStats(self: *const NativeStorage) NativeStorageStats {
-            return self.state.fdCacheConst().snapshotStats();
-        }
-
-        pub fn acquireFdPermit(self: *NativeStorage) !NativeFdPermit {
-            return try self.state.acquireFdPermit();
-        }
-
-        pub fn acquireFdPermits(self: *NativeStorage, count: usize) !NativeFdPermit {
-            if (count == 0) return error.InvalidNativeFdPermit;
-            return try self.state.acquireFdPermits(count);
-        }
-
-        /// Keeps the native state and its threaded I/O runtime alive after the
-        /// owning NativeStorage begins shutdown. No new lease may be acquired
-        /// once shutdown has started.
-        pub fn acquireLease(self: *NativeStorage) !Lease {
-            return .{ .state = try self.state.acquireLease() };
-        }
-
-        fn acquireErasedLease(ptr: *anyopaque) !Storage.Lease {
-            const state: *NativeStorageState = @ptrCast(@alignCast(ptr));
-            const retained = try state.acquireLease();
-            return .{
-                .view = .{ .ptr = retained, .vtable = &threaded_only_vtable },
-                .release = releaseErasedLease,
-            };
-        }
-
-        fn releaseErasedLease(ptr: *anyopaque) void {
-            const state: *NativeStorageState = @ptrCast(@alignCast(ptr));
-            state.release();
-        }
-
-        pub fn beginAtomicWriteWithPermit(
-            self: *NativeStorage,
-            allocator: Allocator,
-            path: []const u8,
-            permit: *NativeFdPermit,
-        ) !AtomicWriteSink {
-            if (!permit.active or permit.count != 1 or permit.state != self.state) return error.InvalidNativeFdPermit;
-            return try NativeAtomicWriteSink.createWithPermit(allocator, path, self.state, permit);
-        }
-
-        pub fn validateFdPermit(self: *NativeStorage, permit: *const NativeFdPermit) !void {
-            if (!permit.active or permit.count != 1 or permit.state != self.state) return error.InvalidNativeFdPermit;
-        }
-
-        pub fn storage(self: *NativeStorage) Storage {
-            // The returned view borrows self.state; retained child operations
-            // keep the state alive independently until their own deinit.
+        /// Returns a borrowed view whose lifetime is bounded by this lease.
+        pub fn storage(self: *Lease) Storage {
+            std.debug.assert(self.active);
             return .{
                 .ptr = self.state,
                 .vtable = &threaded_only_vtable,
             };
         }
 
-        fn createDirPath(ptr: *anyopaque, path: []const u8) !void {
-            const state: *NativeStorageState = @ptrCast(@alignCast(ptr));
-            // Recursive directory creation opens the next directory before
-            // closing its parent.
-            var permit = try state.acquireFdPermits(2);
-            defer permit.release();
-            try createDirPathPortable(permit.io, path);
-        }
-
-        fn readFileAlloc(ptr: *anyopaque, allocator: Allocator, path: []const u8, max_bytes: usize) ![]u8 {
-            const state: *NativeStorageState = @ptrCast(@alignCast(ptr));
-            var permit = try state.acquireFdPermit();
-            defer permit.release();
-            return try std.Io.Dir.cwd().readFileAlloc(permit.io, path, allocator, .limited(max_bytes));
-        }
-
-        fn readFileRangeAlloc(ptr: *anyopaque, allocator: Allocator, path: []const u8, offset: u64, len: usize) ![]u8 {
-            const state: *NativeStorageState = @ptrCast(@alignCast(ptr));
-            const retained = try state.retain();
-            defer retained.release();
-            if (comptime supports_posix_fd_cache) {
-                return try retained.fdCache().readRangeAlloc(retained.cache_namespace, retained.threaded.io(), allocator, path, offset, len);
-            }
-            return try readFileRangeWithIo(retained.threaded.io(), allocator, path, offset, len);
-        }
-
-        fn beginReadFileRangeAllocWithRuntime(ptr: *anyopaque, read_runtime: ?ReadRuntime, allocator: Allocator, path: []const u8, offset: u64, len: usize) !RangeReadFuture {
-            const state: *NativeStorageState = @ptrCast(@alignCast(ptr));
-            const runtime = read_runtime orelse {
-                const sync_storage: Storage = .{ .ptr = ptr, .vtable = &threaded_only_vtable };
-                return try CompletedRangeReadFuture.create(sync_storage, allocator, path, offset, len);
-            };
-            return try NativeRangeReadFuture.create(runtime, state, allocator, path, offset, len);
-        }
-
-        fn readFileRangeInto(ptr: *anyopaque, path: []const u8, offset: u64, out: []u8) !void {
-            const state: *NativeStorageState = @ptrCast(@alignCast(ptr));
-            const retained = try state.retain();
-            defer retained.release();
-            if (comptime supports_posix_fd_cache) {
-                return try retained.fdCache().readRangeInto(retained.cache_namespace, retained.threaded.io(), path, offset, out);
-            }
-            return try readFileRangeWithIoInto(retained.threaded.io(), path, offset, out);
-        }
-
-        fn readFileRangeAtMostInto(ptr: *anyopaque, path: []const u8, offset: u64, out: []u8) !usize {
-            const state: *NativeStorageState = @ptrCast(@alignCast(ptr));
-            const retained = try state.retain();
-            defer retained.release();
-            if (comptime supports_posix_fd_cache) {
-                return try retained.fdCache().readRangeAtMostInto(retained.cache_namespace, retained.threaded.io(), path, offset, out);
-            }
-            return try readFileRangeWithIoAtMostInto(retained.threaded.io(), path, offset, out);
-        }
-
-        fn fileSize(ptr: *anyopaque, path: []const u8) !u64 {
-            const state: *NativeStorageState = @ptrCast(@alignCast(ptr));
-            const retained = try state.retain();
-            defer retained.release();
-            if (comptime supports_posix_fd_cache) {
-                return try retained.fdCache().fileSize(retained.cache_namespace, retained.threaded.io(), path);
-            }
-            return try fileSizeWithIo(retained.threaded.io(), path);
-        }
-
-        fn readFileTrailerAlloc(ptr: *anyopaque, allocator: Allocator, path: []const u8, len: usize) !FileTrailer {
-            const state: *NativeStorageState = @ptrCast(@alignCast(ptr));
-            const retained = try state.retain();
-            defer retained.release();
-            if (comptime supports_posix_fd_cache) {
-                return try retained.fdCache().readTrailerAlloc(retained.cache_namespace, retained.threaded.io(), allocator, path, len);
-            }
-            return try readFileTrailerWithIo(retained.threaded.io(), allocator, path, len);
-        }
-
-        fn writeFileAbsolute(ptr: *anyopaque, path: []const u8, contents: []const u8) !void {
-            const state: *NativeStorageState = @ptrCast(@alignCast(ptr));
-            var permit = try state.acquireFdPermits(createPathDescriptorCount(path));
-            defer permit.release();
-            permit.state.invalidatePath(path);
-            defer permit.state.invalidatePath(path);
-            try writeFileAbsoluteWithIo(permit.io, path, contents);
-        }
-
-        fn appendFileAbsolute(ptr: *anyopaque, path: []const u8, contents: []const u8, sync: bool) !void {
-            const state: *NativeStorageState = @ptrCast(@alignCast(ptr));
-            var permit = try state.acquireFdPermits(createPathDescriptorCount(path));
-            defer permit.release();
-            permit.state.invalidatePath(path);
-            defer permit.state.invalidatePath(path);
-            try appendFileAbsoluteWithIo(permit.io, path, contents, sync);
-        }
-
-        fn beginAtomicWrite(ptr: *anyopaque, allocator: Allocator, path: []const u8) !AtomicWriteSink {
-            const state: *NativeStorageState = @ptrCast(@alignCast(ptr));
-            return try NativeAtomicWriteSink.create(allocator, path, state);
-        }
-
-        fn beginColdSequentialRead(ptr: *anyopaque, allocator: Allocator, path: []const u8) !ColdSequentialReader {
-            const state: *NativeStorageState = @ptrCast(@alignCast(ptr));
-            return try NativeColdSequentialReader.create(allocator, path, state, .sequential);
-        }
-
-        fn beginColdRandomRead(ptr: *anyopaque, allocator: Allocator, path: []const u8) !ColdSequentialReader {
-            const state: *NativeStorageState = @ptrCast(@alignCast(ptr));
-            return try NativeColdSequentialReader.create(allocator, path, state, .random);
-        }
-
-        fn coldSequentialReaderCapacity(ptr: *anyopaque) usize {
-            const state: *NativeStorageState = @ptrCast(@alignCast(ptr));
-            return nativeColdSequentialReaderCapacity(state);
-        }
-
-        fn syncFileContentsAbsolute(ptr: *anyopaque, path: []const u8) !void {
-            const state: *NativeStorageState = @ptrCast(@alignCast(ptr));
-            var permit = try state.acquireFdPermit();
-            defer permit.release();
-            try syncFileContentsPathWithIo(permit.io, path);
-        }
-
-        fn syncParentAbsolute(ptr: *anyopaque, path: []const u8) !void {
-            const state: *NativeStorageState = @ptrCast(@alignCast(ptr));
-            var permit = try state.acquireFdPermit();
-            defer permit.release();
-            try syncParentPathWithIo(permit.io, path);
-        }
-
-        fn renameAbsolute(ptr: *anyopaque, old_path: []const u8, new_path: []const u8) !void {
-            const state: *NativeStorageState = @ptrCast(@alignCast(ptr));
-            const retained = try state.retain();
-            defer retained.release();
-            retained.invalidateRename(old_path, new_path);
-            defer retained.invalidateRename(old_path, new_path);
-            try renamePathWithIo(retained.threaded.io(), old_path, new_path);
-        }
-
-        fn deleteFileAbsolute(ptr: *anyopaque, path: []const u8) !void {
-            const state: *NativeStorageState = @ptrCast(@alignCast(ptr));
-            const retained = try state.retain();
-            defer retained.release();
-            retained.invalidatePath(path);
-            defer retained.invalidatePath(path);
-            if (comptime supports_posix_fd_cache) {
-                // unlink(2) does not open a descriptor. Keeping rollback
-                // deletion outside admission guarantees an unpublished file
-                // can be removed even while the FD budget is saturated.
-                try deleteFilePathPosix(path);
-            } else {
-                try deleteFilePathWithIo(retained.threaded.io(), path);
-            }
-        }
-
-        fn deleteTree(ptr: *anyopaque, path: []const u8) !void {
-            const state: *NativeStorageState = @ptrCast(@alignCast(ptr));
-            // The O(1)-memory traversal holds at most the active directory,
-            // its parent, and the next directory while descending.
-            var permit = try state.acquireFdPermits(3);
-            defer permit.release();
-            permit.state.invalidateTree(path);
-            defer permit.state.invalidateTree(path);
-            try std.Io.Dir.cwd().deleteTreeMinStackSize(permit.io, path);
-        }
-
-        fn listFileNamesAlloc(ptr: *anyopaque, allocator: Allocator, path: []const u8) ![][]u8 {
-            const state: *NativeStorageState = @ptrCast(@alignCast(ptr));
-            var permit = try state.acquireFdPermit();
-            defer permit.release();
-            return try listFileNamesWithIo(allocator, permit.io, path);
-        }
-
-        fn rootIdentityAlloc(ptr: *anyopaque, allocator: Allocator, root_dir: []const u8) ![]u8 {
-            const state: *NativeStorageState = @ptrCast(@alignCast(ptr));
-            var permit = try state.acquireFdPermit();
-            defer permit.release();
-            return try nativeRootIdentityAlloc(ptr, allocator, root_dir);
-        }
-
-        fn nowNs(ptr: *anyopaque) u64 {
-            const state: *NativeStorageState = @ptrCast(@alignCast(ptr));
-            const retained = state.retain() catch return 0;
-            defer retained.release();
-            const now = std.Io.Timestamp.now(retained.threaded.io(), .awake);
-            return @intCast(now.toNanoseconds());
+        pub fn deinit(self: *Lease) void {
+            if (!self.active) return;
+            self.active = false;
+            self.state.release();
+            self.* = undefined;
         }
     };
+
+    const threaded_only_vtable: Storage.VTable = .{
+        .acquire_lease = acquireErasedLease,
+        .create_dir_path = createDirPath,
+        .read_file_alloc = readFileAlloc,
+        .read_file_range_alloc = readFileRangeAlloc,
+        .begin_read_file_range_alloc_with_runtime = beginReadFileRangeAllocWithRuntime,
+        .read_file_range_into = readFileRangeInto,
+        .read_file_range_at_most_into = readFileRangeAtMostInto,
+        .file_size = fileSize,
+        .read_file_trailer_alloc = readFileTrailerAlloc,
+        .write_file_absolute = writeFileAbsolute,
+        .append_file_absolute = appendFileAbsolute,
+        .begin_atomic_write = beginAtomicWrite,
+        .begin_cold_sequential_read = beginColdSequentialRead,
+        .begin_cold_random_read = beginColdRandomRead,
+        .try_begin_cold_random_reads = tryBeginNativeColdRandomReads,
+        .cold_sequential_reader_capacity = coldSequentialReaderCapacity,
+        .sync_contents_absolute = syncFileContentsAbsolute,
+        .sync_parent_absolute = syncParentAbsolute,
+        .rename_absolute = renameAbsolute,
+        .delete_file_absolute = deleteFileAbsolute,
+        .delete_tree = deleteTree,
+        .list_file_names_alloc = listFileNamesAlloc,
+        .now_ns = nowNs,
+        .root_identity_alloc = rootIdentityAlloc,
+        .rename_is_atomic = true,
+        .supports_host_path_generation_publication = true,
+        .supports_native_path_locks = true,
+    };
+
+    pub fn init(allocator: Allocator, kind: RuntimeKind) !NativeStorage {
+        return try initWithPool(allocator, kind, null);
+    }
+
+    pub fn initWithPool(allocator: Allocator, kind: RuntimeKind, pool: ?*NativeStoragePool) !NativeStorage {
+        return .{ .state = try NativeStorageState.create(allocator, kind, pool) };
+    }
+
+    pub fn deinit(self: *NativeStorage) void {
+        self.state.closeStorageRef();
+        self.* = undefined;
+    }
+
+    pub fn snapshotStats(self: *const NativeStorage) NativeStorageStats {
+        return self.state.fdCacheConst().snapshotStats();
+    }
+
+    pub fn acquireFdPermit(self: *NativeStorage) !NativeFdPermit {
+        return try self.state.acquireFdPermit();
+    }
+
+    pub fn acquireFdPermits(self: *NativeStorage, count: usize) !NativeFdPermit {
+        if (count == 0) return error.InvalidNativeFdPermit;
+        return try self.state.acquireFdPermits(count);
+    }
+
+    /// Keeps the native state and its threaded I/O runtime alive after the
+    /// owning NativeStorage begins shutdown. No new lease may be acquired
+    /// once shutdown has started.
+    pub fn acquireLease(self: *NativeStorage) !Lease {
+        return .{ .state = try self.state.acquireLease() };
+    }
+
+    fn acquireErasedLease(ptr: *anyopaque) !Storage.Lease {
+        const state: *NativeStorageState = @ptrCast(@alignCast(ptr));
+        const retained = try state.acquireLease();
+        return .{
+            .view = .{ .ptr = retained, .vtable = &threaded_only_vtable },
+            .release = releaseErasedLease,
+        };
+    }
+
+    fn releaseErasedLease(ptr: *anyopaque) void {
+        const state: *NativeStorageState = @ptrCast(@alignCast(ptr));
+        state.release();
+    }
+
+    pub fn beginAtomicWriteWithPermit(
+        self: *NativeStorage,
+        allocator: Allocator,
+        path: []const u8,
+        permit: *NativeFdPermit,
+    ) !AtomicWriteSink {
+        if (!permit.active or permit.count != 1 or permit.state != self.state) return error.InvalidNativeFdPermit;
+        return try NativeAtomicWriteSink.createWithPermit(allocator, path, self.state, permit);
+    }
+
+    pub fn validateFdPermit(self: *NativeStorage, permit: *const NativeFdPermit) !void {
+        if (!permit.active or permit.count != 1 or permit.state != self.state) return error.InvalidNativeFdPermit;
+    }
+
+    pub fn storage(self: *NativeStorage) Storage {
+        // The returned view borrows self.state; retained child operations
+        // keep the state alive independently until their own deinit.
+        return .{
+            .ptr = self.state,
+            .vtable = &threaded_only_vtable,
+        };
+    }
+
+    fn createDirPath(ptr: *anyopaque, path: []const u8) !void {
+        const state: *NativeStorageState = @ptrCast(@alignCast(ptr));
+        // Recursive directory creation opens the next directory before
+        // closing its parent.
+        var permit = try state.acquireFdPermits(2);
+        defer permit.release();
+        try createDirPathPortable(permit.io, path);
+    }
+
+    fn readFileAlloc(ptr: *anyopaque, allocator: Allocator, path: []const u8, max_bytes: usize) ![]u8 {
+        const state: *NativeStorageState = @ptrCast(@alignCast(ptr));
+        var permit = try state.acquireFdPermit();
+        defer permit.release();
+        return try std.Io.Dir.cwd().readFileAlloc(permit.io, path, allocator, .limited(max_bytes));
+    }
+
+    fn readFileRangeAlloc(ptr: *anyopaque, allocator: Allocator, path: []const u8, offset: u64, len: usize) ![]u8 {
+        const state: *NativeStorageState = @ptrCast(@alignCast(ptr));
+        const retained = try state.retain();
+        defer retained.release();
+        if (comptime supports_posix_fd_cache) {
+            return try retained.fdCache().readRangeAlloc(retained.cache_namespace, retained.threaded.io(), allocator, path, offset, len);
+        }
+        return try readFileRangeWithIo(retained.threaded.io(), allocator, path, offset, len);
+    }
+
+    fn beginReadFileRangeAllocWithRuntime(ptr: *anyopaque, read_runtime: ?ReadRuntime, allocator: Allocator, path: []const u8, offset: u64, len: usize) !RangeReadFuture {
+        const state: *NativeStorageState = @ptrCast(@alignCast(ptr));
+        const runtime = read_runtime orelse {
+            const sync_storage: Storage = .{ .ptr = ptr, .vtable = &threaded_only_vtable };
+            return try CompletedRangeReadFuture.create(sync_storage, allocator, path, offset, len);
+        };
+        return try NativeRangeReadFuture.create(runtime, state, allocator, path, offset, len);
+    }
+
+    fn readFileRangeInto(ptr: *anyopaque, path: []const u8, offset: u64, out: []u8) !void {
+        const state: *NativeStorageState = @ptrCast(@alignCast(ptr));
+        const retained = try state.retain();
+        defer retained.release();
+        if (comptime supports_posix_fd_cache) {
+            return try retained.fdCache().readRangeInto(retained.cache_namespace, retained.threaded.io(), path, offset, out);
+        }
+        return try readFileRangeWithIoInto(retained.threaded.io(), path, offset, out);
+    }
+
+    fn readFileRangeAtMostInto(ptr: *anyopaque, path: []const u8, offset: u64, out: []u8) !usize {
+        const state: *NativeStorageState = @ptrCast(@alignCast(ptr));
+        const retained = try state.retain();
+        defer retained.release();
+        if (comptime supports_posix_fd_cache) {
+            return try retained.fdCache().readRangeAtMostInto(retained.cache_namespace, retained.threaded.io(), path, offset, out);
+        }
+        return try readFileRangeWithIoAtMostInto(retained.threaded.io(), path, offset, out);
+    }
+
+    fn fileSize(ptr: *anyopaque, path: []const u8) !u64 {
+        const state: *NativeStorageState = @ptrCast(@alignCast(ptr));
+        const retained = try state.retain();
+        defer retained.release();
+        if (comptime supports_posix_fd_cache) {
+            return try retained.fdCache().fileSize(retained.cache_namespace, retained.threaded.io(), path);
+        }
+        return try fileSizeWithIo(retained.threaded.io(), path);
+    }
+
+    fn readFileTrailerAlloc(ptr: *anyopaque, allocator: Allocator, path: []const u8, len: usize) !FileTrailer {
+        const state: *NativeStorageState = @ptrCast(@alignCast(ptr));
+        const retained = try state.retain();
+        defer retained.release();
+        if (comptime supports_posix_fd_cache) {
+            return try retained.fdCache().readTrailerAlloc(retained.cache_namespace, retained.threaded.io(), allocator, path, len);
+        }
+        return try readFileTrailerWithIo(retained.threaded.io(), allocator, path, len);
+    }
+
+    fn writeFileAbsolute(ptr: *anyopaque, path: []const u8, contents: []const u8) !void {
+        const state: *NativeStorageState = @ptrCast(@alignCast(ptr));
+        var permit = try state.acquireFdPermits(createPathDescriptorCount(path));
+        defer permit.release();
+        permit.state.invalidatePath(path);
+        defer permit.state.invalidatePath(path);
+        try writeFileAbsoluteWithIo(permit.io, path, contents);
+    }
+
+    fn appendFileAbsolute(ptr: *anyopaque, path: []const u8, contents: []const u8, sync: bool) !void {
+        const state: *NativeStorageState = @ptrCast(@alignCast(ptr));
+        var permit = try state.acquireFdPermits(createPathDescriptorCount(path));
+        defer permit.release();
+        permit.state.invalidatePath(path);
+        defer permit.state.invalidatePath(path);
+        try appendFileAbsoluteWithIo(permit.io, path, contents, sync);
+    }
+
+    fn beginAtomicWrite(ptr: *anyopaque, allocator: Allocator, path: []const u8) !AtomicWriteSink {
+        const state: *NativeStorageState = @ptrCast(@alignCast(ptr));
+        return try NativeAtomicWriteSink.create(allocator, path, state);
+    }
+
+    fn beginColdSequentialRead(ptr: *anyopaque, allocator: Allocator, path: []const u8) !ColdSequentialReader {
+        const state: *NativeStorageState = @ptrCast(@alignCast(ptr));
+        return try NativeColdSequentialReader.create(allocator, path, state, .sequential);
+    }
+
+    fn beginColdRandomRead(ptr: *anyopaque, allocator: Allocator, path: []const u8) !ColdSequentialReader {
+        const state: *NativeStorageState = @ptrCast(@alignCast(ptr));
+        return try NativeColdSequentialReader.create(allocator, path, state, .random);
+    }
+
+    fn coldSequentialReaderCapacity(ptr: *anyopaque) usize {
+        const state: *NativeStorageState = @ptrCast(@alignCast(ptr));
+        return nativeColdSequentialReaderCapacity(state);
+    }
+
+    fn syncFileContentsAbsolute(ptr: *anyopaque, path: []const u8) !void {
+        const state: *NativeStorageState = @ptrCast(@alignCast(ptr));
+        var permit = try state.acquireFdPermit();
+        defer permit.release();
+        try syncFileContentsPathWithIo(permit.io, path);
+    }
+
+    fn syncParentAbsolute(ptr: *anyopaque, path: []const u8) !void {
+        const state: *NativeStorageState = @ptrCast(@alignCast(ptr));
+        var permit = try state.acquireFdPermit();
+        defer permit.release();
+        try syncParentPathWithIo(permit.io, path);
+    }
+
+    fn renameAbsolute(ptr: *anyopaque, old_path: []const u8, new_path: []const u8) !void {
+        const state: *NativeStorageState = @ptrCast(@alignCast(ptr));
+        const retained = try state.retain();
+        defer retained.release();
+        retained.invalidateRename(old_path, new_path);
+        defer retained.invalidateRename(old_path, new_path);
+        try renamePathWithIo(retained.threaded.io(), old_path, new_path);
+    }
+
+    fn deleteFileAbsolute(ptr: *anyopaque, path: []const u8) !void {
+        const state: *NativeStorageState = @ptrCast(@alignCast(ptr));
+        const retained = try state.retain();
+        defer retained.release();
+        retained.invalidatePath(path);
+        defer retained.invalidatePath(path);
+        if (comptime supports_posix_fd_cache) {
+            // unlink(2) does not open a descriptor. Keeping rollback
+            // deletion outside admission guarantees an unpublished file
+            // can be removed even while the FD budget is saturated.
+            try deleteFilePathPosix(path);
+        } else {
+            try deleteFilePathWithIo(retained.threaded.io(), path);
+        }
+    }
+
+    fn deleteTree(ptr: *anyopaque, path: []const u8) !void {
+        const state: *NativeStorageState = @ptrCast(@alignCast(ptr));
+        // The O(1)-memory traversal holds at most the active directory,
+        // its parent, and the next directory while descending.
+        var permit = try state.acquireFdPermits(3);
+        defer permit.release();
+        permit.state.invalidateTree(path);
+        defer permit.state.invalidateTree(path);
+        try std.Io.Dir.cwd().deleteTreeMinStackSize(permit.io, path);
+    }
+
+    fn listFileNamesAlloc(ptr: *anyopaque, allocator: Allocator, path: []const u8) ![][]u8 {
+        const state: *NativeStorageState = @ptrCast(@alignCast(ptr));
+        var permit = try state.acquireFdPermit();
+        defer permit.release();
+        return try listFileNamesWithIo(allocator, permit.io, path);
+    }
+
+    fn rootIdentityAlloc(ptr: *anyopaque, allocator: Allocator, root_dir: []const u8) ![]u8 {
+        const state: *NativeStorageState = @ptrCast(@alignCast(ptr));
+        var permit = try state.acquireFdPermit();
+        defer permit.release();
+        return try nativeRootIdentityAlloc(ptr, allocator, root_dir);
+    }
+
+    fn nowNs(ptr: *anyopaque) u64 {
+        const state: *NativeStorageState = @ptrCast(@alignCast(ptr));
+        const retained = state.retain() catch return 0;
+        defer retained.release();
+        const now = std.Io.Timestamp.now(retained.threaded.io(), .awake);
+        return @intCast(now.toNanoseconds());
+    }
 };
 
 fn writeFileAbsoluteWithIo(io: anytype, path: []const u8, contents: []const u8) !void {

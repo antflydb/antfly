@@ -417,6 +417,7 @@ fn portableBlobIndex(blobs: []const PortableBlob, digest: [std.crypto.hash.sha2.
 /// The caller provides an allocator for temporary buffers. The output is
 /// appended to `out`.
 pub fn exportPortable(alloc: Allocator, store: *DocStore, out: *ArrayList(u8)) !void {
+    if (comptime @import("engine_selection.zig").enabled) return @import("antfly_source_root").antfly_sources.storage_engine.call("portableExport", .{ alloc, store, out });
     var allocating = std.Io.Writer.Allocating.fromArrayList(alloc, out);
     defer out.* = allocating.toArrayList();
     try exportPortableToWriter(alloc, store, &allocating.writer);
@@ -504,6 +505,7 @@ pub fn exportPortableToWriterWithOptions(
     sink_writer: *std.Io.Writer,
     options: ExportOptions,
 ) !void {
+    if (comptime @import("engine_selection.zig").enabled) return @import("antfly_source_root").antfly_sources.storage_engine.call("portableExportToWriterWithOptions", .{ alloc, store, sink_writer, options });
     var certificate_builder: ?source_snapshot.Builder = null;
     if (options.source_generation_summary_output) |output| output.output.* = null;
     if (options.source_copy != null and (options.cohort != null or options.source_certificate == null)) return error.InvalidBackupRequest;

@@ -362,7 +362,9 @@ pub fn closeAll(handle: *h.Handle) void {
     }
     handle.sql_sessions.deinit(handle.alloc);
 }
-pub export fn antfly_db_sql_session_open(ptr: ?*anyopaque, out: *u64) h.capi.ErrorCode {
+pub fn antfly_db_sql_session_open(ptr: ?*anyopaque, out: *u64) callconv(.c) h.capi.ErrorCode {
+    if (comptime @import("../storage/engine_selection.zig").enabled)
+        return @call(.auto, @extern(*const @TypeOf(antfly_db_sql_session_open), .{ .name = "antfly_db_sql_session_open" }), .{ ptr, out });
     h.capi.clearLastError();
     out.* = 0;
     const guard = api.enterHandle(ptr, .exclusive) orelse return h.capi.recordError(.invalid_argument, @src().fn_name ++ ": invalid or closed database handle");
@@ -390,7 +392,9 @@ pub export fn antfly_db_sql_session_open(ptr: ?*anyopaque, out: *u64) h.capi.Err
     out.* = id;
     return .ok;
 }
-pub export fn antfly_db_sql_session_close(ptr: ?*anyopaque, id: u64) h.capi.ErrorCode {
+pub fn antfly_db_sql_session_close(ptr: ?*anyopaque, id: u64) callconv(.c) h.capi.ErrorCode {
+    if (comptime @import("../storage/engine_selection.zig").enabled)
+        return @call(.auto, @extern(*const @TypeOf(antfly_db_sql_session_close), .{ .name = "antfly_db_sql_session_close" }), .{ ptr, id });
     h.capi.clearLastError();
     const guard = api.enterHandlePinned(ptr, .exclusive) orelse return h.capi.recordError(.invalid_argument, @src().fn_name ++ ": invalid or closed database handle");
     if (guard.entry_error) |code| {
@@ -405,4 +409,11 @@ pub export fn antfly_db_sql_session_close(ptr: ?*anyopaque, id: u64) h.capi.Erro
     entry.value.arena.deinit();
     handle.alloc.destroy(entry.value);
     return .ok;
+}
+
+comptime {
+    @import("exports.zig").publish(@This(), &.{
+        "antfly_db_sql_session_open",
+        "antfly_db_sql_session_close",
+    });
 }
