@@ -1393,6 +1393,9 @@ pub const Query = union(enum) {
 };
 
 pub const LookupOptions = struct {
+    /// Local output allocation policy; never parsed from public requests.
+    /// Raw copies and flat native projections already allocate exact bodies.
+    output_exact: bool = false,
     row_policy_principal_proof: []const u8 = "",
     row_policy_database: []const u8 = "",
     /// Private metadata-coordinator probe. Public HTTP lookup parsing must

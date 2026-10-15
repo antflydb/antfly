@@ -82,6 +82,9 @@ pub const Plan = struct {
     }
 
     pub fn projectWithOutput(self: Plan, scratch_alloc: std.mem.Allocator, output: std.mem.Allocator, row: codec.OrdinalRowView) ![]u8 {
+        return self.projectWithOutputPolicy(scratch_alloc, output, row, false);
+    }
+    pub fn projectWithOutputPolicy(self: Plan, scratch_alloc: std.mem.Allocator, output: std.mem.Allocator, row: codec.OrdinalRowView, exact: bool) ![]u8 {
         if (self.base.schema_version != row.table_schema.version) return error.RelationalRowSchemaMismatch;
         if (self.paths.len == 0) {
             const bytes = try row.projectAlloc(scratch_alloc, self.base);
@@ -101,10 +104,13 @@ pub const Plan = struct {
             } else .{ .logical = try row.materializeCellAlloc(scratch, cell) };
             try source.put(scratch, row.table_schema.relational_columns[ordinal].name, value);
         }
-        return self.projectSources(output, scratch, source);
+        return self.projectSourcesPolicy(output, scratch, source, exact);
     }
 
     pub fn projectSources(self: Plan, alloc: std.mem.Allocator, scratch: std.mem.Allocator, source: Sources) ![]u8 {
+        return self.projectSourcesPolicy(alloc, scratch, source, false);
+    }
+    pub fn projectSourcesPolicy(self: Plan, alloc: std.mem.Allocator, scratch: std.mem.Allocator, source: Sources, exact: bool) ![]u8 {
         const Projection = @import("projection_output.zig").Output;
         var result: Projection.Object = .empty;
         if (self.paths.len == 0) {
@@ -140,7 +146,7 @@ pub const Plan = struct {
                 }
             }
         }
-        return (Projection{ .object = result }).serialize(scratch, alloc);
+        return (Projection{ .object = result }).serializeWithPolicy(scratch, alloc, exact);
     }
 };
 
@@ -219,9 +225,9 @@ test "public graph metric borrowed wire native JSON sparse selectors reuse immut
     defer plan.deinit();
     const selector = plan.selectors.?;
     const capacity = plan.arena.queryCapacity();
-    for (0..16) |_| {
+    for (0..16) |mode| {
         var budget: Counter = .{ .backing = a, .limit = 64 * 1024 };
-        const result = try plan.projectWithOutput(budget.allocator(), a, row);
+        const result = try plan.projectWithOutputPolicy(budget.allocator(), a, row, mode % 2 == 0);
         defer a.free(result);
         try std.testing.expectEqualStrings("{\"payload\":{\"arr\":[19984]}}", result);
         try std.testing.expectEqual(@as(usize, 0), budget.live);

@@ -55,7 +55,9 @@ pub const SpecialFieldLoader = struct {
 };
 
 pub fn buildLookupFieldSelectionPlan(opts: types.LookupOptions) FieldSelectionPlan {
-    return buildFieldSelectionPlan(opts.fields, opts.include_all_fields);
+    var plan = buildFieldSelectionPlan(opts.fields, opts.include_all_fields);
+    plan.projection.output_exact = opts.output_exact;
+    return plan;
 }
 
 pub fn buildSearchFieldSelectionPlan(req: types.SearchRequest) FieldSelectionPlan {
@@ -268,11 +270,11 @@ fn projectWithSelectionAndOutput(alloc: Allocator, output: Allocator, doc_key: [
         sources[count] = .{ .name = "_embeddings", .embeddings = fields };
         count += 1;
     }
-    if (prepared) |plan| return (try document_query.lookupJsonWithSources(alloc, output, raw, plan, sources[0..count])).json;
+    if (prepared) |plan| return (try document_query.lookupJsonWithSourcesPolicy(alloc, output, raw, plan, sources[0..count], selection.projection.output_exact)).json;
     if (try document_query.SpanProjectionPlan.init(alloc, selection.projection)) |owned| {
         var plan = owned;
         defer plan.deinit();
-        return (try document_query.lookupJsonWithSources(alloc, output, raw, &plan, sources[0..count])).json;
+        return (try document_query.lookupJsonWithSourcesPolicy(alloc, output, raw, &plan, sources[0..count], selection.projection.output_exact)).json;
     }
     if (count == 0) return (try document_query.lookupJsonWithOutput(alloc, output, raw, selection.projection)).json;
     // Legacy selectors still decode the primary, but loaded special fields

@@ -109,6 +109,9 @@ pub fn lookupJsonWithPlan(alloc: Allocator, output: Allocator, raw: []const u8, 
 /// DOM of the primary document. Sources remain borrowed until serialization
 /// completes; projected containers are independent so later paths can mutate them.
 pub fn lookupJsonWithSources(alloc: Allocator, output: Allocator, raw: []const u8, plan: *const SpanProjectionPlan, sources: []const ProjectionSource) !types.LookupResult {
+    return lookupJsonWithSourcesPolicy(alloc, output, raw, plan, sources, false);
+}
+pub fn lookupJsonWithSourcesPolicy(alloc: Allocator, output: Allocator, raw: []const u8, plan: *const SpanProjectionPlan, sources: []const ProjectionSource, exact: bool) !types.LookupResult {
     if (plan.passthrough and sources.len == 0) return .{ .json = try output.dupe(u8, raw) };
     var arena = std.heap.ArenaAllocator.init(@import("antfly_platform").allocator.reclaimingScratch(alloc));
     defer arena.deinit();
@@ -125,7 +128,7 @@ pub fn lookupJsonWithSources(alloc: Allocator, output: Allocator, raw: []const u
     if (plan.include_all or plan.passthrough) {
         try Projection.includePreparedRootExcept(a, &projected, &view, plan.excluded);
     } else for (plan.paths) |path| try Projection.includeRoot(a, &projected, &view, path.parts);
-    return .{ .json = try (Projection{ .object = projected }).serialize(a, output) };
+    return .{ .json = try (Projection{ .object = projected }).serializeWithPolicy(a, output, exact) };
 }
 
 pub fn lookupJsonWithOutput(alloc: Allocator, output: Allocator, raw: []const u8, opts: types.LookupOptions) !types.LookupResult {
@@ -133,7 +136,7 @@ pub fn lookupJsonWithOutput(alloc: Allocator, output: Allocator, raw: []const u8
     if (try SpanProjectionPlan.init(alloc, opts)) |value| {
         var plan = value;
         defer plan.deinit();
-        return lookupJsonWithPlan(alloc, output, raw, &plan);
+        return lookupJsonWithSourcesPolicy(alloc, output, raw, &plan, &.{}, opts.output_exact);
     }
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, raw, .{});
     defer parsed.deinit();
@@ -959,4 +962,16 @@ test "public graph metric borrowed wire compact fanout object spans bound total 
     try std.testing.expect(std.mem.startsWith(u8, result.json, "{\"items\":[{\"a\":{\"b\":1}}"));
     try std.testing.expectEqual(@as(usize, 0), counter.live);
     std.debug.print("COMPACT_FANOUT rows=8000 scratch_peak={d}\n", .{counter.peak});
+}
+
+test "public graph metric borrowed wire exact policy keeps raw passthrough independent of scratch" {
+    const a = std.testing.allocator;
+    var plan = (try SpanProjectionPlan.init(a, .{})).?;
+    defer plan.deinit();
+    var refused = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
+    const raw = "{\"items\":[1,2,3]}";
+    var result = try lookupJsonWithSourcesPolicy(refused.allocator(), a, raw, &plan, &.{}, true);
+    defer result.deinit(a);
+    try std.testing.expectEqualStrings(raw, result.json);
+    try std.testing.expectEqual(@as(usize, 0), refused.alloc_index);
 }

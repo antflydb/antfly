@@ -217,10 +217,15 @@ pub const Output = union(enum) {
     }
 
     pub fn serialize(self: Output, scratch: Allocator, output: Allocator) ![]u8 {
+        return self.serializeWithPolicy(scratch, output, false);
+    }
+    /// Carry allocation policy through wrappers without unwrapping their
+    /// synchronization or quota accounting. Only growing writers need scratch.
+    pub fn serializeWithPolicy(self: Output, scratch: Allocator, output: Allocator, exact: bool) ![]u8 {
         const reclaimable = @import("antfly_platform").allocator.reclaimingScratch(output);
         // An arena cannot reclaim superseded growing buffers. Preserve one
         // exact allocation there; ordinary owners can take the writer buffer.
-        const arena_output = reclaimable.ptr != output.ptr or reclaimable.vtable != output.vtable;
+        const arena_output = exact or reclaimable.ptr != output.ptr or reclaimable.vtable != output.vtable;
         var writer = std.Io.Writer.Allocating.init(if (arena_output) @import("antfly_platform").allocator.reclaimingScratch(scratch) else output);
         defer writer.deinit();
         self.writeTo(scratch, &writer.writer) catch |err| switch (err) {

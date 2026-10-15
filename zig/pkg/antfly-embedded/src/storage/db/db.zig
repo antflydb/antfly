@@ -18588,7 +18588,7 @@ pub const DB = struct {
             null;
         const stored = if (direct_fields) |fields| blk: {
             const row = ordinal_row.?;
-            if (prepared) |plans| break :blk try (try plans.forRow(row, fields)).projectWithOutput(alloc, output, row);
+            if (prepared) |plans| break :blk try (try plans.forRow(row, fields)).projectWithOutputPolicy(alloc, output, row, opts.output_exact);
             var projection = try RelationalProjectionPlan.init(
                 alloc,
                 row.table_schema,
@@ -18596,7 +18596,7 @@ pub const DB = struct {
                 fields,
             );
             defer projection.deinit();
-            break :blk try projection.projectWithOutput(alloc, output, row);
+            break :blk try projection.projectWithOutputPolicy(alloc, output, row, opts.output_exact);
         } else blk: {
             if (opts.fields.len == 0 and opts.include_all_fields) {
                 if (ordinal_row) |row| {
@@ -39967,7 +39967,7 @@ pub const DB = struct {
     fn attachDistributedDocumentAuthorityAtSnapshot(self: *DB, alloc: Allocator, req: types.SearchRequest, result: *types.SearchResult, pinned: ?*docstore_mod.DocStore.Txn, schema_view: ?schema_registry_mod.SchemaView) !void {
         if (req.document_authority_mode == .none) return;
         if (req.document_output_allocator != null and req.document_authority_mode != .hydrate) return error.InvalidQueryRequest;
-        const lookup_opts: types.LookupOptions = .{ .fields = if (req.defer_stored_projection) &.{} else req.fields, .include_all_fields = req.defer_stored_projection or req.include_all_fields };
+        const lookup_opts: types.LookupOptions = .{ .output_exact = req.document_output_exact, .fields = if (req.defer_stored_projection) &.{} else req.fields, .include_all_fields = req.defer_stored_projection or req.include_all_fields };
         var plans = try LookupProjectionPlans.init(alloc, lookup_opts);
         defer plans.deinit();
         var read: ?docstore_mod.DocStore.Txn = if (pinned) |captured_read| try captured_read.forkRead() else try self.core.store.beginReadTxn();
@@ -40064,19 +40064,9 @@ pub const DB = struct {
             }
             if (!projection_scratch.reset(.{ .retain_with_limit = 64 * 1024 })) _ = projection_scratch.reset(.free_all);
             var projected: ?types.LookupResult = if (req.document_authority_mode == .hydrate or eager)
-                try self.lookupPrimarySnapshotWithPreparedProjection(projection_scratch.allocator(), if (req.document_output_exact) @import("antfly_platform").allocator.reclaimingScratch(projection_scratch.allocator()) else body_allocator, hit.id, lookup_opts, &read.?, schema_view, raw_primary, version, &plans)
+                try self.lookupPrimarySnapshotWithPreparedProjection(projection_scratch.allocator(), body_allocator, hit.id, lookup_opts, &read.?, schema_view, raw_primary, version, &plans)
             else
                 null;
-            if (req.document_output_exact) if (projected) |*document| {
-                const scratch_owner = @import("antfly_platform").allocator.reclaimingScratch(projection_scratch.allocator());
-                var value = document.*;
-                const temporary = value.json;
-                // Clear ownership before a potentially failing publication.
-                projected = null;
-                defer scratch_owner.free(temporary);
-                value.json = try body_allocator.dupe(u8, temporary);
-                projected = value;
-            };
             if (req.document_authority_mode == .candidates) if (projected) |*document| {
                 // Charge actual projected JSON, including native rows whose
                 // compact storage bytes can expand during serialization.
