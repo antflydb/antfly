@@ -75,9 +75,11 @@ formats):
   status surfaces —
   [pkg/antfly/src/metadata/METADATA.md](pkg/antfly/src/metadata/METADATA.md),
   [STATUS.md](STATUS.md), [STATUS_API.md](STATUS_API.md)
-- DB-backed shard transitions, durable replica state, LMDB/WAL paths, and LSM
+- DB-backed shard transitions, durable replica state, WAL paths, and LSM
   backend work —
-  [DB.md](DB.md), [lib/lmdb/src/LMDB.md](lib/lmdb/src/LMDB.md)
+  [DB.md](DB.md), [STORAGE.md](STORAGE.md) (the standalone LMDB library in
+  [lib/lmdb/src/LMDB.md](lib/lmdb/src/LMDB.md) is a test oracle, not a storage
+  backend)
 - table/index lifecycle, routed reads/writes, graph/query/retrieval surfaces,
   and OpenAPI-shaped API contracts —
   [SCHEMA.md](SCHEMA.md), [GRAPH.md](GRAPH.md), [OPENAPI.md](OPENAPI.md)

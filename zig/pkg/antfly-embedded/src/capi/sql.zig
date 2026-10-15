@@ -112,6 +112,8 @@ pub fn Adapter(comptime native: type) type {
             if (ddl_value.name.table.len == 0) {
                 if (ddl_value.schema_change.? != .drop_index) return error.InvalidSqlSyntax;
                 const name = ddl_value.schema_change.?.drop_index;
+                try tables.ensureDiscovered(handle);
+                if (handle.embedded_table_errors.count() != 0) return error.IntegrityCatalogUnavailable;
                 var found: ?[]const u8 = if (try ownsIndex(&handle.db, a, name)) "default" else null;
                 var iterator = handle.embedded_tables.valueIterator();
                 while (iterator.next()) |table| if (try ownsIndex(&table.*.db, a, name)) {
@@ -247,9 +249,10 @@ pub fn Adapter(comptime native: type) type {
             return view.hasCoordinatedConstraints();
         }
 
-        pub fn localRequiresCoordination(self: *Self) bool {
+        pub fn localRequiresCoordination(self: *Self) !bool {
             if (databaseRequiresCoordination(self.db)) return true;
             if (self.handle) |handle| {
+                try @import("tables.zig").ensureDiscovered(handle);
                 // A missing namespace may contain inbound constraints. Force
                 // the complete catalog check rather than treating it as empty.
                 if (handle.embedded_table_errors.count() != 0) return true;
@@ -263,7 +266,10 @@ pub fn Adapter(comptime native: type) type {
         pub fn localCatalog(self: *Self, alloc: std.mem.Allocator, version: u32) !LocalCatalog {
             // Coordinated constraints require the complete dependency catalog;
             // ordinary reads can proceed against healthy referenced tables.
-            if (self.handle) |handle| if (handle.embedded_table_errors.count() > 0) return error.IntegrityCatalogUnavailable;
+            if (self.handle) |handle| {
+                try @import("tables.zig").ensureDiscovered(handle);
+                if (handle.embedded_table_errors.count() > 0) return error.IntegrityCatalogUnavailable;
+            }
             const count = if (self.handle) |handle| handle.embedded_tables.count() + 1 else 1;
             const tables = try alloc.alloc(topology.TableRecord, count);
             const ranges = try alloc.alloc(topology.RangeRecord, count);

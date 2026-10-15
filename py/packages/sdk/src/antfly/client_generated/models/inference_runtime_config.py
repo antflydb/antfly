@@ -38,13 +38,15 @@ class InferenceRuntimeConfig:
         api_key (str | Unset): API key used when calling an authenticated shared Antfly inference API.
         models_dir (str | Unset): Base directory containing model subdirectories. Antfly inference auto-discovers models
             from:
-            - `{models_dir}/embedders/` - Embedding models (ONNX)
-            - `{models_dir}/chunkers/` - Chunking models (ONNX)
-            - `{models_dir}/rerankers/` - Reranking models (ONNX)
+            - `{models_dir}/{owner}/{name}/` - Models fetched with `antfly inference pull owner/name`
+            - `{models_dir}/embedders/` - Embedding models
+            - `{models_dir}/rerankers/` - Reranking models
             - `{models_dir}/extractors/` - Entity, relation, and structured extraction models
-            - `{models_dir}/rewriters/` - Seq2Seq rewriter models (ONNX)
+            - `{models_dir}/rewriters/` - Seq2Seq rewriter models
 
-            Defaults to ~/.antfly/inference/models (set via viper). If not set, only built-in fixed chunking is available.
+            Defaults to `$ANTFLY_INFERENCE_MODELS_DIR` when set, otherwise `~/.antfly/inference/models`
+            (`./models` when `$HOME` is unset). The `--models-dir` flag overrides both. The built-in `fixed`
+            chunker needs no models.
              Example: ~/.antfly/inference/models.
         ml_dir (str | Unset): Base directory containing Traditional ML predictor subdirectories. The `/ml/v1/*`
             API auto-discovers predictors from `{ml_dir}/{name}/tabular_model.json`.
