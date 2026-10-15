@@ -220,17 +220,29 @@ fn fusedAttentionPlanar(b: *B, control: Id, qkv: Id, l: Layout, h: u32, d: u32, 
 }
 
 /// Split-half RoPE tables for `positions` (one logical position per token),
-/// laid out `[tokens * heads, d/2]` to match `rope`.
+/// laid out `[tokens * heads, d/2]` to match `rope`. Every head of a token
+/// shares one row, computed once and copied.
 pub fn ropeTables(a: std.mem.Allocator, positions: []const i64, h: u32, d: u32, theta: f32) ![2][]f32 {
-    const cosine = try a.alloc(f32, positions.len * h * (d / 2));
+    const half = d / 2;
+    const cosine = try a.alloc(f32, positions.len * h * half);
     errdefer a.free(cosine);
     const sine = try a.alloc(f32, cosine.len);
-    for (0..positions.len * h) |row| for (0..d / 2) |i| {
-        const pos = positions[row / h];
-        const angle = @as(f32, @floatFromInt(pos)) / std.math.pow(f32, theta, @as(f32, @floatFromInt(2 * i)) / @as(f32, @floatFromInt(d)));
-        cosine[row * (d / 2) + i] = @cos(angle);
-        sine[row * (d / 2) + i] = @sin(angle);
-    };
+    errdefer a.free(sine);
+    const denominators = try a.alloc(f32, half);
+    defer a.free(denominators);
+    for (denominators, 0..) |*value, i| value.* = std.math.pow(f32, theta, @as(f32, @floatFromInt(2 * i)) / @as(f32, @floatFromInt(d)));
+    for (positions, 0..) |pos, token| {
+        const first = token * h * half;
+        for (denominators, 0..) |denominator, i| {
+            const angle = @as(f32, @floatFromInt(pos)) / denominator;
+            cosine[first + i] = @cos(angle);
+            sine[first + i] = @sin(angle);
+        }
+        for (1..h) |head| {
+            @memcpy(cosine[first + head * half ..][0..half], cosine[first..][0..half]);
+            @memcpy(sine[first + head * half ..][0..half], sine[first..][0..half]);
+        }
+    }
     return .{ cosine, sine };
 }
 
