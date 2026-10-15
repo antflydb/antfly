@@ -121,6 +121,9 @@ pub fn ensureDiscovered(handle: *h.Handle) !void {
 /// Background discovery isolates a broken namespace and exposes its error in
 /// pending-work diagnostics instead of stranding healthy tables' maintenance.
 pub fn loadAvailable(handle: *h.Handle) !void {
+    // An interrupted rescan must not leave a prior successful discovery cached
+    // after its failure diagnostics have been cleared.
+    handle.embedded_tables_discovered = false;
     try loadCatalog(handle);
     handle.embedded_table_errors.clearRetainingCapacity();
     var names = handle.embedded_table_records.keyIterator();

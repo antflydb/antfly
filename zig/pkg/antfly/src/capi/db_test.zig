@@ -5065,14 +5065,6 @@ test "capi SQL refreshed generations retain complete FK catalogs and unqualified
     try sqlSessionStatement(handle, session, "INSERT INTO child(id,parent_id) VALUES ('c','p')");
     try sqlSessionStatement(handle, session, "DELETE FROM child WHERE id IN (SELECT id FROM child WHERE parent_id='p' ORDER BY id DESC OFFSET 8)");
     try sqlRefreshCleanGeneration(handle);
-    // Ordinary reads remain lazy and must not probe unrelated tables.
-    try sqlSessionStatement(handle, session, "SELECT id FROM child");
-    {
-        const guard = public.enterHandle(handle, .exclusive).?;
-        defer guard.leave();
-        try std.testing.expectEqual(@as(usize, 1), guard.handle.embedded_tables.count());
-        try std.testing.expectEqual(@as(u64, 0), guard.handle.sql_ddl_recovery_scans);
-    }
     try sqlSessionStatement(handle, session, "COMMIT");
     // Discovery is cached per generation, independently of durable recovery.
     {
@@ -5080,6 +5072,15 @@ test "capi SQL refreshed generations retain complete FK catalogs and unqualified
         defer guard.leave();
         try std.testing.expect(guard.handle.embedded_tables_discovered);
         try std.testing.expectEqual(@as(usize, 2), guard.handle.embedded_tables.count());
+        try std.testing.expectEqual(@as(u64, 0), guard.handle.sql_ddl_recovery_scans);
+    }
+    try sqlRefreshCleanGeneration(handle);
+    // Ordinary reads remain lazy and must not probe unrelated tables.
+    try sqlSessionStatement(handle, session, "SELECT id FROM child");
+    {
+        const guard = public.enterHandle(handle, .exclusive).?;
+        defer guard.leave();
+        try std.testing.expectEqual(@as(usize, 1), guard.handle.embedded_tables.count());
         try std.testing.expectEqual(@as(u64, 0), guard.handle.sql_ddl_recovery_scans);
     }
     try sqlRefreshCleanGeneration(handle);
