@@ -6541,6 +6541,54 @@ test "lite persistent owned publication merge recovery and retained snapshot own
     try std.testing.expectEqual(@as(usize, 1), try persistentSearchHitCount(a, pinned, "beta"));
 }
 
+test "persistent reopen falls back to heap reads when foreign mapping is unavailable" {
+    const a = std.testing.allocator;
+    const lite_docs = @import("lite/docstore.zig");
+    const lite_indexes = @import("lite/index_storage.zig");
+    const Foreign = struct {
+        var map_calls: usize = 0;
+        fn map(_: *anyopaque, _: Allocator, _: []const u8) anyerror!@import("../segment_source.zig").MappedArtifact {
+            map_calls += 1;
+            return error.MappedArtifactUnavailable;
+        }
+        fn dispatch(contract: *const @import("antfly_runtime_abi").native_abi.CallContract, callback: *const anyopaque, args: *const anyopaque, output: ?*anyopaque) callconv(.c) @import("antfly_runtime_abi").error_abi.Status {
+            return @import("../runtime_callback_abi.zig").Boundary(storage_io.Storage.VTable).local_dispatch(contract, callback, args, output);
+        }
+    };
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/mapping-fallback.aflite", .{tmp.sub_path});
+    defer a.free(path);
+    var docs = try lite_docs.Store.createWithOptions(a, path, .{ .no_sync = true, .io = std.testing.io });
+    defer docs.close();
+    var storage = lite_indexes.Store.init(a, &docs);
+    var opts = PersistentIndexOptions{ .path = "/text", .io = std.testing.io, .main_lsm_storage = storage.storage(), .wal_storage = storage.storage(), .main_no_sync = true, .wal_no_sync = true };
+    {
+        var index = try PersistentIndex.open(a, opts);
+        defer index.close();
+        const bytes = try buildSimpleSegment(a, "doc:a", "alpha");
+        defer a.free(bytes);
+        try index.indexSegment(bytes);
+        try index.syncMain(true);
+    }
+    var foreign_storage = storage.storage();
+    var vtable = foreign_storage.vtable.*;
+    // Exercise the existing heap fallback on a provider without native leases.
+    vtable.open_leased_immutable_source = null;
+    vtable.map_immutable_artifact = Foreign.map;
+    foreign_storage.vtable = &vtable;
+    foreign_storage.boundary_dispatch = Foreign.dispatch;
+    opts.main_lsm_storage = foreign_storage;
+    opts.wal_storage = foreign_storage;
+    opts.read_only = true;
+    Foreign.map_calls = 0;
+    var index = try PersistentIndex.open(a, opts);
+    defer index.close();
+    try std.testing.expectEqual(@as(usize, 1), Foreign.map_calls);
+    try std.testing.expect(index.snapshot().segments[0].data == .heap);
+    try std.testing.expectEqual(@as(usize, 1), try persistentSearchHitCount(a, index.snapshot(), "alpha"));
+}
+
 test "lite persistent mapped read only fallback preserves unwritable directory queries" {
     if (builtin.os.tag != .linux and builtin.os.tag != .macos) return error.SkipZigTest;
     const a = std.testing.allocator;

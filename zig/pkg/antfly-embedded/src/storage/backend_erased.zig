@@ -640,7 +640,7 @@ pub const ProbeTxn = struct {
         if (keys.len != values.len) return error.InvalidBatch;
         @memset(values, null);
         if (self.vtable.get_many_sorted) |get_many_sorted| {
-            return try BoundaryAbi.call("get_many_sorted_with_block_cache_admission", self.boundary_dispatch, get_many_sorted, .{ self.ptr, keys, values });
+            return try BoundaryAbi.call("get_many_sorted", self.boundary_dispatch, get_many_sorted, .{ self.ptr, keys, values });
         }
         for (keys, 0..) |key, i| {
             values[i] = self.get(key) catch |err| blk: {
@@ -3149,4 +3149,107 @@ test "erased read scopes dispatch bounded reads and score operations by their ex
     var values: [1]?[]const u8 = undefined;
     try std.testing.expectError(error.NotFound, scope.getManySortedInto(&.{"missing"}, &.{&bytes}, &values));
     try std.testing.expectEqual(@as(usize, 7), Foreign.calls);
+}
+
+test "erased probes dispatch both batched read signatures and admission fallback" {
+    const Mock = struct {
+        fn abort(_: Allocator, _: *anyopaque) void {}
+        fn get(_: *anyopaque, _: []const u8) anyerror![]const u8 {
+            return error.TestUnexpectedResult;
+        }
+        fn many(_: *anyopaque, keys: []const []const u8, values: []?[]const u8) anyerror!void {
+            try std.testing.expectEqual(@as(usize, 2), keys.len);
+            try std.testing.expectEqualStrings("a", keys[0]);
+            try std.testing.expectEqualStrings("missing", keys[1]);
+            try std.testing.expect(values[0] == null and values[1] == null);
+            values[0] = "value";
+        }
+        fn admitted(ptr: *anyopaque, keys: []const []const u8, values: []?[]const u8, admission: backend_types.Namespace.BlockCacheAdmission) anyerror!void {
+            try std.testing.expectEqual(backend_types.Namespace.BlockCacheAdmission.transient, admission);
+            try many(ptr, keys, values);
+        }
+    };
+    const Foreign = TestForeignDispatch(ProbeTxn);
+    Foreign.calls = 0;
+    var state: u8 = 0;
+    var vtable: ProbeTxn.VTable = .{ .abort = Mock.abort, .get = Mock.get, .get_many_sorted = Mock.many, .get_many_sorted_with_block_cache_admission = Mock.admitted };
+    var probe: ProbeTxn = .{ .allocator = std.testing.allocator, .ptr = &state, .vtable = &vtable, .boundary_dispatch = Foreign.dispatch };
+    defer probe.abort();
+    var values: [2]?[]const u8 = .{ "stale", "stale" };
+    try probe.getManySorted(&.{ "a", "missing" }, &values);
+    try std.testing.expectEqualStrings("value", values[0].?);
+    try std.testing.expect(values[1] == null);
+    try probe.getManySortedWithBlockCacheAdmission(&.{ "a", "missing" }, &values, .transient);
+    try std.testing.expectEqualStrings("value", values[0].?);
+    try std.testing.expect(values[1] == null);
+    vtable.get_many_sorted_with_block_cache_admission = null;
+    try probe.getManySortedWithBlockCacheAdmission(&.{ "a", "missing" }, &values, .transient);
+    try std.testing.expectEqualStrings("value", values[0].?);
+    try std.testing.expect(values[1] == null);
+    try std.testing.expectEqual(@as(usize, 3), Foreign.calls);
+}
+
+test "retained chunks fall back to the owning read when foreign snapshot forks are unsupported" {
+    const Mock = struct {
+        fn abort(_: Allocator, _: *anyopaque) void {}
+        fn get(_: *anyopaque, key: []const u8) anyerror![]const u8 {
+            try std.testing.expectEqualStrings(&@import("retained_effects.zig").chunkKey(7, 2), key);
+            return "chunk";
+        }
+        fn cursor(_: Allocator, _: *anyopaque) anyerror!Cursor {
+            return error.TestUnexpectedResult;
+        }
+        fn fork(_: Allocator, _: *anyopaque) anyerror!ReadTxn {
+            return error.ReadSnapshotForkUnsupported;
+        }
+    };
+    const Foreign = TestForeignDispatch(ReadTxn);
+    Foreign.calls = 0;
+    var state: u8 = 0;
+    var read: ReadTxn = .{ .allocator = std.testing.allocator, .ptr = &state, .vtable = &.{ .abort = Mock.abort, .get = Mock.get, .open_cursor = Mock.cursor, .fork_read = Mock.fork }, .boundary_dispatch = Foreign.dispatch };
+    defer read.abort();
+    const source = @import("retained_effects.zig").chunkSource(&read);
+    var bytes: [5]u8 = undefined;
+    try std.testing.expectEqual(@as(usize, 5), try source.read_chunk(source.context, 7, 2, &bytes));
+    try std.testing.expectEqualStrings("chunk", &bytes);
+    try std.testing.expectEqual(@as(usize, 2), Foreign.calls);
+}
+
+test "score reads tolerate unsupported resets through the owning scope dispatcher" {
+    const Mock = struct {
+        resets: usize = 0,
+        closes: usize = 0,
+        raw: [8]u8 = .{ 0, 0, 0, 0, 0, 0, 8, 64 }, // 3.0, little endian
+        fn abort(_: Allocator, _: *anyopaque) void {}
+        fn get(ptr: *anyopaque, _: []const u8) anyerror![]const u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return &self.raw;
+        }
+        fn cursor(_: Allocator, _: *anyopaque) anyerror!Cursor {
+            return error.TestUnexpectedResult;
+        }
+        fn scope(a: Allocator, ptr: *anyopaque) anyerror!ReadScope {
+            return .{ .allocator = a, .ptr = ptr, .vtable = &.{ .close = close, .get = get, .reset = reset }, .boundary_dispatch = TestForeignDispatch(ReadScope).dispatch };
+        }
+        fn close(_: Allocator, ptr: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.closes += 1;
+        }
+        fn reset(ptr: *anyopaque) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.resets += 1;
+            return error.ReadScopeResetUnsupported;
+        }
+    };
+    const Foreign = TestForeignDispatch(ReadScope);
+    Foreign.calls = 0;
+    var state = Mock{};
+    var read: ReadTxn = .{ .allocator = std.testing.allocator, .ptr = &state, .vtable = &.{ .abort = Mock.abort, .get = Mock.get, .open_cursor = Mock.cursor, .open_read_scope = Mock.scope }, .boundary_dispatch = TestForeignDispatch(ReadTxn).dispatch };
+    defer read.abort();
+    var scores: [3]?f64 = undefined;
+    _ = try @import("../graph/score_read.zig").populate(std.testing.allocator, &read, &.{"p/"}, &.{ "b", "a", "b" }, &.{&scores});
+    try std.testing.expectEqualSlices(?f64, &.{ 3, 3, 3 }, &scores);
+    try std.testing.expectEqual(@as(usize, 1), state.resets);
+    try std.testing.expectEqual(@as(usize, 1), state.closes);
+    try std.testing.expect(Foreign.calls > 1);
 }

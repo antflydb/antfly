@@ -765,6 +765,9 @@ pub const Detail = enum(c_int) {
     invalid_atomic_write_offset,
     canceled_range_read,
     source_visitor_failed,
+    mapped_artifact_unavailable,
+    read_scope_reset_unsupported,
+    read_snapshot_fork_unsupported,
 };
 
 pub const Status = extern struct {
@@ -1463,6 +1466,9 @@ pub fn statusFromError(err: anyerror) Status {
         error.InvalidScratch => status(.invalid_argument, .invalid_scratch),
         error.InvalidAtomicWriteOffset => status(.invalid_argument, .invalid_atomic_write_offset),
         error.CanceledRangeRead => status(.cancelled, .canceled_range_read),
+        error.MappedArtifactUnavailable => status(.unsupported, .mapped_artifact_unavailable),
+        error.ReadScopeResetUnsupported => status(.unsupported, .read_scope_reset_unsupported),
+        error.ReadSnapshotForkUnsupported => status(.unsupported, .read_snapshot_fork_unsupported),
         error.SourceVisitorFailed => status(.internal, .source_visitor_failed),
         else => status(.internal, .none),
     };
@@ -1513,6 +1519,9 @@ fn detailErrorName(comptime detail: Detail) []const u8 {
         .crc_mismatch => "CrcMismatch",
         .invalid_data => "InvalidData",
         .mapped_artifact_unsupported => "MappedArtifactUnsupported",
+        .mapped_artifact_unavailable => "MappedArtifactUnavailable",
+        .read_scope_reset_unsupported => "ReadScopeResetUnsupported",
+        .read_snapshot_fork_unsupported => "ReadSnapshotForkUnsupported",
         .immutable_read_source_unsupported => "ImmutableReadSourceUnsupported",
         .directory_listing_unsupported => "DirectoryListingUnsupported",
         .unsupported_storage_lease => "UnsupportedStorageLease",
@@ -2478,7 +2487,7 @@ test "inference command and lifecycle errors retain their identities across engi
 }
 
 test "storage callback boundaries retain capability integrity and bounded-read outcomes" {
-    for ([_]anyerror{ error.CrcMismatch, error.InvalidData, error.MappedArtifactUnsupported, error.ImmutableReadSourceUnsupported, error.DirectoryListingUnsupported, error.UnsupportedStorageLease, error.DurableAtomicWriteUnsupported, error.DurableAtomicRenameUnsupported, error.DurableFileSyncUnsupported, error.DurableDirectorySyncUnsupported, error.StableFileLeaseUnsupported, error.ReadOnly, error.StorageClosed, error.CacheBudgetExceeded, error.BufferTooSmall, error.FileTooBig, error.InvalidScratch, error.InvalidAtomicWriteOffset, error.CanceledRangeRead }) |err| {
+    for ([_]anyerror{ error.CrcMismatch, error.InvalidData, error.MappedArtifactUnavailable, error.ReadScopeResetUnsupported, error.ReadSnapshotForkUnsupported, error.MappedArtifactUnsupported, error.ImmutableReadSourceUnsupported, error.DirectoryListingUnsupported, error.UnsupportedStorageLease, error.DurableAtomicWriteUnsupported, error.DurableAtomicRenameUnsupported, error.DurableFileSyncUnsupported, error.DurableDirectorySyncUnsupported, error.StableFileLeaseUnsupported, error.ReadOnly, error.StorageClosed, error.CacheBudgetExceeded, error.BufferTooSmall, error.FileTooBig, error.InvalidScratch, error.InvalidAtomicWriteOffset, error.CanceledRangeRead }) |err| {
         const encoded = statusFromError(err);
         try std.testing.expect(errorHasStableDetail(err));
         try std.testing.expectEqual(err, errorFromStatus(encoded));
