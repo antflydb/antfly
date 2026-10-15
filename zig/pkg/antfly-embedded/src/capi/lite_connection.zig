@@ -56,6 +56,14 @@ fn catalogStamp(database: *h.db_mod.DB) ![32]u8 {
         }
     }.less);
     hash.update(try std.json.Stringify.valueAlloc(a, indexes, .{}));
+    const resolvers = try database.core.listResolvers(a);
+    std.mem.sort(@TypeOf(resolvers[0]), resolvers, {}, struct {
+        fn less(_: void, lhs: @TypeOf(resolvers[0]), rhs: @TypeOf(resolvers[0])) bool {
+            return std.mem.lessThan(u8, lhs.name, rhs.name);
+        }
+    }.less);
+    hash.update("resolvers\x00");
+    hash.update(try std.json.Stringify.valueAlloc(a, resolvers, .{}));
     var digest: [32]u8 = undefined;
     hash.final(&digest);
     return digest;
@@ -205,7 +213,7 @@ pub const PreparedPublication = struct {
         try sameValue(&expected, &actual, key);
     }
 
-    fn publishReplay(ptr: *anyopaque, batch: h.db_mod.derived_types.DerivedBatch, artifact_keys: []const []const u8, request: *anyopaque, apply: *const fn (*anyopaque, *anyopaque) anyerror!u64) !u64 {
+    fn publishReplay(ptr: *anyopaque, batch: h.db_mod.derived_types.DerivedBatch, artifact_keys: []const []const u8, inputs: ?@import("../storage/db/replay_read_set.zig").View, request: *anyopaque, apply: *const fn (*anyopaque, *anyopaque) anyerror!u64) !u64 {
         const self: *@This() = @ptrCast(@alignCast(ptr));
         const io = h.handleLockIo();
         self.owner.gate.mutex.lockUncancelable(io);
@@ -220,6 +228,16 @@ pub const PreparedPublication = struct {
         var lease = try native.lockWriterPathWithIo(alloc, io, self.owner.path);
         defer lease.close();
         const database = try self.current();
+        // Computed resolver effects must explicitly carry their read set.
+        // Enqueue-only replay has no computed artifact writes to fence.
+        if (artifact_keys.len > 0 and inputs == null) return error.EnrichmentWaitCanceled;
+        if (inputs) |read_set| {
+            var live_inputs = try database.core.store.beginReadTxn();
+            defer live_inputs.abort();
+            try read_set.validate(&live_inputs);
+        }
+        // Release read pins before writing. The gate and path lease still
+        // fence every input until the commit below has completed.
         const journal = @import("../storage/db/derived/change_journal.zig");
         var record = try journal.recordFromDerivedBatch(alloc, batch, 0);
         defer journal.deinitRecord(alloc, &record);

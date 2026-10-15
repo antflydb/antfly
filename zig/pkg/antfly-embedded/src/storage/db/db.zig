@@ -49788,7 +49788,7 @@ fn appendDerivedBatchRecordContextWithAdmissions(ctx: *const BatchExecutionConte
             }
         };
         var request: Request = .{ .batch = batch, .producer = producer, .work = work, .unit_work = unit_work };
-        return port.publish(port.ptr, batch, &.{}, &request, Request.apply);
+        return port.publish(port.ptr, batch, &.{}, null, &request, Request.apply);
     };
     if (work != null and unit_work != null) return error.InvalidBatchRequest;
     var sync_targets = try collectManagedSyncTargets(ctx.alloc, ctx.index_manager, batch);
@@ -51429,7 +51429,7 @@ fn appendResolutionRecordWithProjection(
         defer guarded_keys.deinit(ctx.alloc);
         for (write.artifact_writes) |artifact| try guarded_keys.append(ctx.alloc, artifact.key);
         try guarded_keys.appendSlice(ctx.alloc, write.artifact_deletes);
-        return port.publish(port.ptr, write.batch, guarded_keys.items, &request, Request.apply);
+        return port.publish(port.ptr, write.batch, guarded_keys.items, write.inputs, &request, Request.apply);
     };
     if (write.artifact_writes.len == 0 and write.artifact_deletes.len == 0 and write.target_hints == null) {
         if (defer_projection) {

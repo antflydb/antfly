@@ -427,7 +427,9 @@ coordinator under that writer lease. It validates captured documents and
 artifact keys, reserves the replay sequence on the live runtime, and advances
 the detached replay watermark after a successful commit. Resolver primary
 effects and their replay record commit together; derived projection work runs
-outside the owner gate.
+outside the owner gate. Resolver publication also validates the inputs read
+during computation, including absent keys and scanned candidate ranges, and
+rejects changes to resolver configurations. Unrelated keys remain publishable.
 
 `antfly_db_pending_work_stats_json` includes `index_replay_debt` per namespace:
 each index reports its `applied_sequence`, `target_sequence`, and

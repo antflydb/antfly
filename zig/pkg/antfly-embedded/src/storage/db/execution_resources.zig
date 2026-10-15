@@ -168,6 +168,7 @@ pub const ReplayPublication = struct {
         *anyopaque,
         derived_types.DerivedBatch,
         []const []const u8,
+        ?@import("replay_read_set.zig").View,
         *anyopaque,
         *const fn (*anyopaque, *anyopaque) anyerror!u64,
     ) anyerror!u64,

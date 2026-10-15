@@ -5407,7 +5407,7 @@ test "capi SQL index publication accepts unrelated primary commits and fences ch
                     return;
                 };
                 const runtime = root.db.resolution_runtime.?;
-                const resolved = runtime.write_fn(runtime.write_ctx, .{ .batch = .{}, .artifact_writes = &.{.{ .key = "__antfly_test_resolver_artifact", .value = "resolver" }}, .target_hints = &.{} }) catch |err| {
+                const resolved = runtime.write_fn(runtime.write_ctx, .{ .inputs = .{}, .batch = .{}, .artifact_writes = &.{.{ .key = "__antfly_test_resolver_artifact", .value = "resolver" }}, .target_hints = &.{} }) catch |err| {
                     std.debug.print("detached resolver append failed: {s}\n", .{@errorName(err)});
                     self.publication_error = err;
                     return;
@@ -5542,6 +5542,140 @@ test "capi SQL index publication accepts unrelated primary commits and fences ch
             defer unrelated.deinit();
             try std.testing.expectEqual(@as(usize, 8), unrelated.hits.len);
         }
+    }
+}
+
+test "capi SQL resolver input read sets fence negative reads and range phantoms" {
+    const alloc = std.testing.allocator;
+    var directory = try TestDirectory.init("capi-sql-resolver-read-set");
+    defer directory.cleanup();
+    const path = try tempTestAflitePath(alloc, directory.path(), "database");
+    defer alloc.free(path);
+    defer cleanupTestFile(path);
+    var options: capi.OpenOptions = .{};
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_open_options_init(&options));
+    options.storage_kind = capi.storage_kind_lite;
+    options.profile = capi.profile_hosted;
+    var handle: ?*anyopaque = null;
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_create_with_options(path, &options, &handle));
+    defer antfly_db_close(handle);
+    const guard = public.enterHandle(handle, .exclusive).?;
+    defer guard.leave();
+    try guard.handle.db.reconfigureEnrichmentRuntimePaused(.{ .enable_without_producers = true });
+    const runtime = guard.handle.db.resolution_runtime.?;
+    try @import("antfly_local_sources").storage_db_resolution_runtime.testReplayReadTracking(runtime.store_handle.store);
+}
+
+test "capi SQL resolver publication fences captured inputs and resolver generations" {
+    if (builtin.single_threaded or builtin.os.tag == .freestanding) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    const resolution = @import("antfly_local_sources").storage_db_resolution_runtime;
+    const k = @import("antfly_local_sources").storage_internal_keys;
+    const Mode = enum { unchanged, unrelated, source, sibling, override, candidate, catalog };
+    for ([_]Mode{ .unchanged, .unrelated, .source, .sibling, .override, .candidate, .catalog }) |mode| {
+        errdefer std.debug.print("resolver publication fence mode={s}\n", .{@tagName(mode)});
+        var directory = try TestDirectory.init("capi-sql-resolver-input-fence");
+        defer directory.cleanup();
+        const path = try tempTestAflitePath(alloc, directory.path(), "database");
+        defer alloc.free(path);
+        defer cleanupTestFile(path);
+        var options: capi.OpenOptions = .{};
+        try std.testing.expectEqual(capi.ErrorCode.ok, antfly_open_options_init(&options));
+        options.storage_kind = capi.storage_kind_lite;
+        options.profile = capi.profile_native;
+        var handle: ?*anyopaque = null;
+        try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_create_with_options(path, &options, &handle));
+        defer antfly_db_close(handle);
+        const owner = blk: {
+            const guard = public.enterHandle(handle, .exclusive).?;
+            defer guard.leave();
+            break :blk guard.connection.?.owner;
+        };
+        owner.stopping.store(true, .release);
+        owner.wake.set(shared.handleLockIo());
+        owner.worker.?.join();
+        owner.worker = null;
+        owner.stopping.store(false, .release);
+        const source = try k.artifactNamedPrefixAlloc(alloc, "doc", "asset", "mentions");
+        defer alloc.free(source);
+        const out = try k.resolutionArtifactKeyAlloc(alloc, "doc", "resolution");
+        defer alloc.free(out);
+        {
+            const guard = public.enterHandle(handle, .exclusive).?;
+            defer guard.leave();
+            _ = try guard.handle.db.core.upsertResolver(.{ .name = "review", .table = "default", .source_artifact = "mentions", .resolution_artifact = "resolution", .key_template = "{{ slug _entity.text }}", .config_generation = 1, .promote = false, .labels = &.{"Person"} });
+            _ = try guard.handle.db.core.upsertResolver(.{ .name = "sibling", .table = "default", .source_artifact = "mentions", .resolution_artifact = "sibling", .key_template = "{{ slug _entity.text }}", .config_generation = 1, .promote = false, .labels = &.{"Org"} });
+            try guard.handle.db.batch(.{ .writes = &.{.{ .key = "doc", .value = "{\"body\":\"unchanged\"}" }}, .sync_level = .write });
+            var txn = try guard.handle.db.core.store.beginWriteTxn();
+            errdefer txn.abort();
+            try txn.put(source, "{\"entities\":[{\"id\":\"e0\",\"label\":\"Person\",\"text\":\"Old Name\"}]}");
+            try txn.commit();
+        }
+        const Probe = struct {
+            handle: ?*anyopaque,
+            mode: Mode,
+            source: []const u8,
+            out: []const u8,
+            rejection: ?anyerror = null,
+            failure: ?anyerror = null,
+            fn notify(ptr: *anyopaque, root: *shared.Handle) void {
+                const self: *@This() = @ptrCast(@alignCast(ptr));
+                self.run(root) catch |err| {
+                    self.failure = err;
+                };
+            }
+            fn run(self: *@This(), root: *shared.Handle) !void {
+                {
+                    const guard = public.enterHandle(self.handle, .exclusive).?;
+                    defer guard.leave();
+                    if (self.mode == .catalog) {
+                        _ = try guard.handle.db.core.upsertResolver(.{ .name = "review", .table = "default", .source_artifact = "mentions", .resolution_artifact = "resolution", .key_template = "changed/{{ slug _entity.text }}", .config_generation = 2, .promote = false, .labels = &.{"Person"} });
+                    } else if (self.mode == .candidate) {
+                        try guard.handle.db.batch(.{ .writes = &.{.{ .key = "old_name", .value = "{\"name\":\"Canonical\"}" }}, .sync_level = .write });
+                    } else if (self.mode != .unchanged) {
+                        const a = std.heap.c_allocator;
+                        const key = switch (self.mode) {
+                            .source => try a.dupe(u8, self.source),
+                            .sibling => try k.resolutionArtifactKeyAlloc(a, "doc", "sibling"),
+                            .override => try resolution.reviewOverrideArtifactKeyAlloc(a, "doc", "mentions", "resolution"),
+                            else => try a.dupe(u8, "unrelated"),
+                        };
+                        defer a.free(key);
+                        var txn = try guard.handle.db.core.store.beginWriteTxn();
+                        errdefer txn.abort();
+                        try txn.put(key, "{\"entities\":[]}");
+                        try txn.commit();
+                    }
+                }
+                const runtime = root.db.resolution_runtime.?;
+                var borrowed = runtime.store_handle.store;
+                var adapter: resolution.DbArtifactStore(@TypeOf(borrowed)) = .{ .store = &borrowed, .index_manager = root.db.core.index_manager };
+                const a = std.heap.c_allocator;
+                const resolvers = try root.db.core.listResolvers(a);
+                defer {
+                    for (resolvers) |*cfg| cfg.deinit(a);
+                    a.free(resolvers);
+                }
+                resolution.processRecordKeys(a, resolvers, adapter.artifactStore(), null, &.{self.source}, runtime.write_ctx, runtime.write_fn, null, null) catch |err| {
+                    if (err != error.EnrichmentWaitCanceled and err != error.EnrichmentSourceChanged) return err;
+                    self.rejection = err;
+                };
+                // Inspect before the ordinary maintenance pass can retry from
+                // a new snapshot and publish a fresh, valid decision.
+                const guard = public.enterHandle(self.handle, .read).?;
+                defer guard.leave();
+                const value = try guard.handle.db.core.getStoreValue(a, self.out);
+                defer if (value) |bytes| a.free(bytes);
+                if (self.rejection != null) try std.testing.expect(value == null) else try std.testing.expect(value != null);
+            }
+        };
+        var probe: Probe = .{ .handle = handle, .mode = mode, .source = source, .out = out };
+        owner.test_after_capture = .{ .ptr = &probe, .notify = Probe.notify };
+        owner.maintenance_pending = true;
+        _ = try owner.maintenanceTurnForTest();
+        owner.test_after_capture = null;
+        if (probe.failure) |err| return err;
+        try std.testing.expectEqual(mode != .unchanged and mode != .unrelated, probe.rejection != null);
     }
 }
 
