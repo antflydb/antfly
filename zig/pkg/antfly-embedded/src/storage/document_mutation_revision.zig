@@ -38,9 +38,9 @@ fn decodeContent(raw: []const u8) !Content {
 pub fn loadContent(txn: anytype, physical: []const u8) !?Content {
     if (!keys.isStoredDocumentRowKey(physical)) return null;
     const key = keyForPhysical(physical).?;
-    const raw = txn.get(&contentKey(key)) catch |err| switch (err) {
-        error.NotFound => return null,
-        else => return err,
+    const raw = txn.get(&contentKey(key)) catch |err| {
+        if (err == error.NotFound) return null;
+        return err;
     };
     const value = try decodeContent(raw);
     if (value.kind != physical[physical.len - 1] or value.revision != try load(txn, key)) return null;
@@ -149,9 +149,9 @@ pub fn keyForDocumentAlloc(alloc: std.mem.Allocator, document: []const u8) !Key 
 }
 
 pub fn load(txn: anytype, key: Key) !u64 {
-    const raw = txn.get(&key) catch |err| switch (err) {
-        error.NotFound => return 0,
-        else => return err,
+    const raw = txn.get(&key) catch |err| {
+        if (err == error.NotFound) return 0;
+        return err;
     };
     if (raw.len != 8) return error.InvalidDocumentMutationRevision;
     return std.mem.readInt(u64, raw[0..8], .little);
@@ -388,9 +388,9 @@ pub const Capture = struct {
                 .written => |value| value,
                 .deleted => null,
                 .unchanged => blk: {
-                    const raw = txn.get(&cached_key) catch |err| switch (err) {
-                        error.NotFound => break :blk null,
-                        else => return err,
+                    const raw = txn.get(&cached_key) catch |err| {
+                        if (err == error.NotFound) break :blk null;
+                        return err;
                     };
                     const value = try decodeContent(raw);
                     break :blk if (value.revision == old) value else null;
@@ -402,9 +402,8 @@ pub const Capture = struct {
                 value.revision = next;
                 try txn.put(&cached_key, &encodeContent(value.*));
             } else if (entry.value_ptr.* == .deleted) {
-                txn.delete(&cached_key) catch |err| switch (err) {
-                    error.NotFound => {},
-                    else => return err,
+                txn.delete(&cached_key) catch |err| {
+                    if (err != error.NotFound) return err;
                 };
             }
             var raw: [8]u8 = undefined;

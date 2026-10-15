@@ -1457,6 +1457,13 @@ fn fwdKeyAlloc(alloc: Allocator, doc_id: []const u8) ![]u8 {
     return key;
 }
 
+// Short IDs use the caller's stack buffer. Long IDs own the returned key;
+// callers free it only when it does not alias scratch.
+fn fwdKeyWithScratch(alloc: Allocator, scratch: []u8, doc_id: []const u8) ![]const u8 {
+    if (doc_id.len < scratch.len) return fwdKey(scratch, doc_id);
+    return try fwdKeyAlloc(alloc, doc_id);
+}
+
 fn fwdDocIdFromKey(key: []const u8) ?[]const u8 {
     if (key.len == 0 or key[0] != key_fwd) return null;
     return key[1..];
@@ -3772,12 +3779,30 @@ pub const SparseIndex = struct {
 
         var posting_count: usize = 0;
         phase_start_ns = nowNs();
+        // Legacy or long-ID docmaps may lack point locators. Resolve the
+        // whole batch in one segment walk instead of rescanning the corpus for
+        // each incoming ID. Complete maps use bounded point lookups below.
+        const checked_incomplete_map = !options.assume_new_doc_ids and !try completeLocatorMap(&txn);
+        if (checked_incomplete_map) {
+            const ids = try self.alloc.alloc([]const u8, writes.len);
+            defer self.alloc.free(ids);
+            for (writes, ids) |write, *id| id.* = write.doc_id;
+            const existing = try self.docNumsForDocIdsAlloc(self.alloc, &txn, ids);
+            defer self.alloc.free(existing);
+            if (existing.len != 0) {
+                self.write_profile.existence_check_ns += elapsedSince(phase_start_ns);
+                txn.abort();
+                return false;
+            }
+        }
         for (writes, 0..) |write, i| {
             if (last_index_by_doc.get(write.doc_id).? != i) continue;
             if (write.vec.indices.len != write.vec.values.len) return error.InvalidSparseVector;
-            if (!options.assume_new_doc_ids) {
-                var fwd_key_buf: [256]u8 = undefined;
-                const existing = txn.get(fwdKey(&fwd_key_buf, write.doc_id)) catch |err| switch (err) {
+            if (!options.assume_new_doc_ids and !checked_incomplete_map) {
+                // Bulk-built rows live in immutable docmaps and may have no
+                // mutable forward key. Check the complete identity lookup before
+                // treating a write as a new document.
+                const existing: ?u64 = self.lookupDocNumByDocId(&txn, write.doc_id) catch |err| switch (err) {
                     error.NotFound => null,
                     else => return err,
                 };
@@ -4092,7 +4117,8 @@ pub const SparseIndex = struct {
     ) !DeleteEffect {
         // Read forward entry
         var key_buf: [256]u8 = undefined;
-        const fk = fwdKey(&key_buf, doc_id);
+        const fk = try fwdKeyWithScratch(alloc, &key_buf, doc_id);
+        defer if (fk.ptr != &key_buf) alloc.free(fk);
         const fwd = self.lookupFwdEntryByDocIdAlloc(alloc, txn, doc_id) catch |err| switch (err) {
             error.NotFound => return .{}, // doc not found, nothing to delete
             else => return err,
@@ -4140,7 +4166,8 @@ pub const SparseIndex = struct {
         const fwd_data = try encodeFwdEntry(alloc, doc_num, vec.indices, vec.values);
         defer alloc.free(fwd_data);
         var fwd_key_buf: [256]u8 = undefined;
-        const fk = fwdKey(&fwd_key_buf, doc_id);
+        const fk = try fwdKeyWithScratch(alloc, &fwd_key_buf, doc_id);
+        defer if (fk.ptr != &fwd_key_buf) alloc.free(fk);
         try txnPut(txn, self.dbi, fk, fwd_data);
 
         // Write reverse entry (docNum → docID)
@@ -4675,6 +4702,16 @@ pub const SparseIndex = struct {
         return true;
     }
 
+    fn docNumDeletedChecked(self: *SparseIndex, txn: anytype, doc_num: u64) !bool {
+        _ = self;
+        var tombstone_buf: [16]u8 = undefined;
+        _ = txnGet(txn, {}, docTombstoneKey(&tombstone_buf, doc_num)) catch |err| {
+            if (err == error.NotFound) return false;
+            return err;
+        };
+        return true;
+    }
+
     fn resolveSearchCandidateDocIds(self: *SparseIndex, alloc: Allocator, txn: anytype, candidates: []SearchCandidate) !void {
         var wanted = std.AutoHashMapUnmanaged(u32, usize).empty;
         defer wanted.deinit(alloc);
@@ -4728,14 +4765,18 @@ pub const SparseIndex = struct {
 
     fn lookupDocNumByDocId(self: *SparseIndex, txn: anytype, doc_id: []const u8) !u64 {
         var key_buf: [256]u8 = undefined;
-        if (txnGet(txn, self.dbi, fwdKey(&key_buf, doc_id))) |fwd_data| {
+        const forward_key = try fwdKeyWithScratch(self.alloc, &key_buf, doc_id);
+        defer if (forward_key.ptr != &key_buf) self.alloc.free(forward_key);
+        if (txnGet(txn, self.dbi, forward_key)) |fwd_data| {
             const doc_num = try decodeFwdDocNum(fwd_data);
-            if (self.docNumDeleted(txn, doc_num)) return error.NotFound;
+            if (try self.docNumDeletedChecked(txn, doc_num)) return error.NotFound;
             return doc_num;
-        } else |_| {}
+        } else |err| {
+            if (err != error.NotFound) return err;
+        }
 
         if (try readLocator(txn, doc_id)) |locator| {
-            if (self.docNumDeleted(txn, locator.num)) return error.NotFound;
+            if (try self.docNumDeletedChecked(txn, locator.num)) return error.NotFound;
             return locator.num;
         }
         if (try completeLocatorMap(txn)) return error.NotFound;
@@ -4748,7 +4789,7 @@ pub const SparseIndex = struct {
 
             fn visit(ctx: *@This(), entry: DocMapLookup) !bool {
                 if (std.mem.eql(u8, entry.doc_id, ctx.wanted_doc_id)) {
-                    if (ctx.index.docNumDeleted(ctx.txn, entry.doc_num)) return false;
+                    if (try ctx.index.docNumDeletedChecked(ctx.txn, entry.doc_num)) return false;
                     ctx.found = entry.doc_num;
                     return true;
                 }
@@ -4770,15 +4811,19 @@ pub const SparseIndex = struct {
 
     fn lookupFwdEntryByDocIdAlloc(self: *SparseIndex, alloc: Allocator, txn: anytype, doc_id: []const u8) !DecodedFwdEntry {
         var key_buf: [256]u8 = undefined;
-        if (txnGet(txn, self.dbi, fwdKey(&key_buf, doc_id))) |fwd_data| {
+        const forward_key = try fwdKeyWithScratch(alloc, &key_buf, doc_id);
+        defer if (forward_key.ptr != &key_buf) alloc.free(forward_key);
+        if (txnGet(txn, self.dbi, forward_key)) |fwd_data| {
             const doc_num = try decodeFwdDocNum(fwd_data);
-            if (self.docNumDeleted(txn, doc_num)) return error.NotFound;
+            if (try self.docNumDeletedChecked(txn, doc_num)) return error.NotFound;
             return try decodeFwdEntry(alloc, fwd_data);
-        } else |_| {}
+        } else |err| {
+            if (err != error.NotFound) return err;
+        }
 
         if (try locatedForwardBytes(txn, doc_id)) |bytes| {
             const num = try decodeFwdDocNum(bytes);
-            if (self.docNumDeleted(txn, num)) return error.NotFound;
+            if (try self.docNumDeletedChecked(txn, num)) return error.NotFound;
             return try decodeFwdEntry(alloc, bytes);
         }
         if (try completeLocatorMap(txn)) return error.NotFound;
@@ -4792,7 +4837,7 @@ pub const SparseIndex = struct {
 
             fn visit(ctx: *@This(), entry: DocMapLookup) !bool {
                 if (std.mem.eql(u8, entry.doc_id, ctx.wanted_doc_id)) {
-                    if (ctx.index.docNumDeleted(ctx.txn, entry.doc_num)) return false;
+                    if (try ctx.index.docNumDeletedChecked(ctx.txn, entry.doc_num)) return false;
                     ctx.found = try decodeFwdEntry(ctx.alloc, entry.fwd_data);
                     return true;
                 }
@@ -5552,15 +5597,19 @@ pub const SparseIndex = struct {
             const gop = try wanted.getOrPut(alloc, doc_id);
             if (gop.found_existing) continue;
             var key_buf: [256]u8 = undefined;
-            if (txnGet(txn, self.dbi, fwdKey(&key_buf, doc_id))) |fwd_data| {
+            const forward_key = try fwdKeyWithScratch(alloc, &key_buf, doc_id);
+            defer if (forward_key.ptr != &key_buf) alloc.free(forward_key);
+            if (txnGet(txn, self.dbi, forward_key)) |fwd_data| {
                 const doc_num_u64 = try decodeFwdDocNum(fwd_data);
-                if (doc_num_u64 <= std.math.maxInt(u32) and !self.docNumDeleted(txn, doc_num_u64)) {
+                if (doc_num_u64 <= std.math.maxInt(u32) and !try self.docNumDeletedChecked(txn, doc_num_u64)) {
                     const doc_num: u32 = @intCast(doc_num_u64);
                     const seen_gop = try seen.getOrPut(alloc, doc_num);
                     if (!seen_gop.found_existing) try out.append(alloc, doc_num);
                 }
                 _ = wanted.remove(doc_id);
-            } else |_| {}
+            } else |err| {
+                if (err != error.NotFound) return err;
+            }
         }
         if (wanted.count() == 0) return try out.toOwnedSlice(alloc);
 
@@ -5573,8 +5622,8 @@ pub const SparseIndex = struct {
             out: *std.ArrayListUnmanaged(u32),
 
             fn visit(ctx: *@This(), entry: DocMapLookup) !bool {
-                if (!ctx.wanted.contains(entry.doc_id)) return false;
-                if (entry.doc_num <= std.math.maxInt(u32) and !ctx.index.docNumDeleted(ctx.txn, entry.doc_num)) {
+                if (!ctx.wanted.contains(entry.doc_id) or try ctx.index.docNumDeletedChecked(ctx.txn, entry.doc_num)) return false;
+                if (entry.doc_num <= std.math.maxInt(u32)) {
                     const doc_num: u32 = @intCast(entry.doc_num);
                     const seen_gop = try ctx.seen.getOrPut(ctx.alloc, doc_num);
                     if (!seen_gop.found_existing) try ctx.out.append(ctx.alloc, doc_num);
@@ -7188,6 +7237,94 @@ test "sparse split planning stats include bulk-built segment docs" {
     try std.testing.expectEqual(@as(usize, 2), stats.right_only_chunks);
     try std.testing.expectEqual(@as(usize, 0), stats.mixed_chunks);
     try std.testing.expectEqual(@as(usize, 3), stats.right_only_postings);
+}
+
+test "sparse identity lookups propagate authoritative read failures" {
+    const FaultyRead = struct {
+        read: *backend_erased.ReadTxn,
+        fail_tag: u8,
+        fn get(self: *@This(), key: []const u8) ![]const u8 {
+            if (key.len > 0 and key[0] == self.fail_tag) return error.InjectedReadFailure;
+            return try self.read.get(key);
+        }
+        fn openCursor(self: *@This()) !backend_erased.Cursor {
+            return try self.read.openCursor();
+        }
+    };
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = tmpPath(&path_buf, "identity-read-failure");
+    defer cleanupTmp(path);
+    var index = try SparseIndex.open(alloc, path, .{ .backend = .lsm });
+    defer index.close();
+    try index.batch(&.{.{ .doc_id = "doc", .vec = .{ .indices = &.{1}, .values = &.{2} } }}, &.{});
+    var read = try index.beginReadTxn();
+    defer read.abort();
+    for ([_]u8{ key_fwd, key_doc_tombstone }) |tag| {
+        var faulty = FaultyRead{ .read = &read, .fail_tag = tag };
+        // A mutable identity has no immutable locator. Neither a forward-key
+        // error nor an unreadable tombstone can establish its presence/absence.
+        try std.testing.expectError(error.InjectedReadFailure, index.lookupDocNumByDocId(&faulty, "doc"));
+        try std.testing.expectError(error.InjectedReadFailure, index.lookupFwdEntryByDocIdAlloc(alloc, &faulty, "doc"));
+        try std.testing.expectError(error.InjectedReadFailure, index.docNumsForDocIdsAlloc(alloc, &faulty, &.{"doc"}));
+    }
+}
+
+test "sparse forward keys use scratch for short IDs and bound long ID allocation" {
+    var scratch: [256]u8 = undefined;
+    const short: [255]u8 = @splat('s');
+    const stack_key = try fwdKeyWithScratch(std.testing.failing_allocator, &scratch, &short);
+    try std.testing.expect(stack_key.ptr == &scratch);
+    try std.testing.expectEqualStrings(&short, stack_key[1..]);
+    const long: [256]u8 = @splat('l');
+    try std.testing.expectError(error.OutOfMemory, fwdKeyWithScratch(std.testing.failing_allocator, &scratch, &long));
+    const heap_key = try fwdKeyWithScratch(std.testing.allocator, &scratch, &long);
+    defer std.testing.allocator.free(heap_key);
+    try std.testing.expectEqualStrings(&long, heap_key[1..]);
+}
+
+test "sparse long document IDs survive bulk incremental replacement deletion and reopen" {
+    const alloc = std.testing.allocator;
+    const identity: [512]u8 = @splat('x');
+    for ([_]usize{ 255, 256, 512 }) |length| {
+        const id = identity[0..length];
+        for ([_]bool{ false, true }) |bulk| {
+            var path_buf: [256]u8 = undefined;
+            const path = tmpPath(&path_buf, "long-document-id");
+            defer cleanupTmp(path);
+            var index = try SparseIndex.open(alloc, path, .{ .backend = .lsm });
+            defer index.close();
+            const options: BatchOptions = .{ .prefer_bulk_build = bulk };
+            try index.batchWithOptions(&.{.{ .doc_id = id, .vec = .{ .indices = &.{1}, .values = &.{2} } }}, &.{}, options);
+            try expectIncarnationSearch(&index, 1, &.{.{ .id = id, .score = 2 }}, false);
+            {
+                var read = try index.beginReadTxn();
+                defer read.abort();
+                const num = try index.lookupDocNumByDocId(&read, id);
+                const numbers = try index.docNumsForDocIdsAlloc(alloc, &read, &.{id});
+                defer alloc.free(numbers);
+                try std.testing.expectEqualSlices(u32, &.{@intCast(num)}, numbers);
+                const forward = try index.lookupFwdEntryByDocIdAlloc(alloc, &read, id);
+                defer alloc.free(forward.term_ids);
+                defer alloc.free(forward.weights);
+                try std.testing.expectEqualSlices(f32, &.{2}, forward.weights);
+            }
+            // A bulk-built row may have no mutable forward key. Replacement
+            // must find its immutable mapping rather than append a duplicate.
+            try index.batchWithOptions(&.{.{ .doc_id = id, .vec = .{ .indices = &.{1}, .values = &.{7} } }}, &.{}, options);
+            try expectIncarnationSearch(&index, 1, &.{.{ .id = id, .score = 7 }}, false);
+            index.close();
+            index = try SparseIndex.open(alloc, path, .{ .backend = .lsm });
+            try expectIncarnationSearch(&index, 1, &.{.{ .id = id, .score = 7 }}, false);
+            try index.batch(&.{}, &.{id});
+            try expectIncarnationSearch(&index, 1, &.{}, false);
+            // Older tombstoned docmaps must not hide a newer live mapping
+            // during the batch identity check.
+            try index.batchWithOptions(&.{.{ .doc_id = id, .vec = .{ .indices = &.{1}, .values = &.{3} } }}, &.{}, options);
+            try index.batchWithOptions(&.{.{ .doc_id = id, .vec = .{ .indices = &.{1}, .values = &.{9} } }}, &.{}, options);
+            try expectIncarnationSearch(&index, 1, &.{.{ .id = id, .score = 9 }}, false);
+        }
+    }
 }
 
 test "sparse empty search returns empty" {
