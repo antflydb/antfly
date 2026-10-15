@@ -28316,7 +28316,13 @@ pub const DB = struct {
         return @intCast(@max(0, std.Io.Timestamp.now(self.core.index_manager.checkpointIo(), .real).toNanoseconds()));
     }
 
+    const GraphReplacementIdentity = struct { name: []const u8, generation: u64 };
+
     fn advanceGraphReplacementUntil(self: *DB, deadline: ?u64) !bool {
+        return self.advanceGraphReplacementForIdentityUntil(deadline, null);
+    }
+
+    fn advanceGraphReplacementForIdentityUntil(self: *DB, deadline: ?u64, identity: ?GraphReplacementIdentity) !bool {
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return false;
         if (deadline) |end| if (self.graphReplacementWorkNow() >= end) return self.hasPendingGraphReplacements();
         if (!self.graph_replacement_mutex.tryLock()) return self.hasPendingGraphReplacements();
@@ -28324,6 +28330,9 @@ pub const DB = struct {
         const jobs = try self.graphReplacementStatusAlloc(self.alloc);
         defer jobs.deinit();
         for (jobs.value) |original| {
+            if (identity) |wanted| {
+                if (!std.mem.eql(u8, original.name, wanted.name) or original.generation != wanted.generation) continue;
+            }
             if (original.phase == .failed) continue;
             var saved = original;
             const retry_now = self.replacementRetryNow();
@@ -28718,7 +28727,7 @@ pub const DB = struct {
             if (self.resolution_runtime == null) try self.initResolutionRuntime();
             const resolution = self.resolution_runtime.?;
             resolution.notifySequence(self.core.nextDerivedSequence());
-            if ((!self.local_execution.optional_runtime_workers_enabled or !self.resolver_workers_enabled) and !resolution.worker_started.load(.acquire)) try resolution.catchUpOnce();
+            if ((!self.local_execution.optional_runtime_workers_enabled or !self.resolver_workers_enabled) and !resolution.worker_started.load(.acquire)) try resolution.catchUpOnce(deadline);
         }
     }
 
@@ -28749,8 +28758,11 @@ pub const DB = struct {
                 if (try self.graphReplacementGenerationCommitted(name, generation)) return;
                 return error.Busy;
             }
+            // A named wait advances its own reservation, avoiding unrelated
+            // corpus builds. Recheck its generation under scheduler ownership
+            // so cancellation/name reuse cannot redirect this quantum.
             try self.driveManualGraphReplacementReplay(pending.producer_replay_target, deadline);
-            _ = try self.advanceGraphReplacementUntil(deadline);
+            _ = try self.advanceGraphReplacementForIdentityUntil(deadline, .{ .name = name, .generation = generation });
             // The control IO also exists for manual/inline runtimes. Never
             // spin when there is no independent background IO runtime.
             try self.core.index_manager.checkpointIo().sleep(.fromMilliseconds(1), .awake);
@@ -30167,18 +30179,7 @@ pub const DB = struct {
         if (comptime storage_engine.enabled) return storage_engine.call("listResolvers", .{ self, alloc });
         try self.lockApplySharedForPortableRuntime();
         defer self.core.unlockApplyShared();
-        const all = try self.core.listResolvers(alloc);
-        defer alloc.free(all);
-        var result: std.ArrayList(index_manager_mod.ResolverConfig) = .empty;
-        errdefer result.deinit(alloc);
-        result.ensureTotalCapacity(alloc, all.len) catch |err| {
-            for (all) |*cfg| cfg.deinit(alloc);
-            return err;
-        };
-        for (all) |*cfg| {
-            if (cfg.replacement_index.len > 0) cfg.deinit(alloc) else result.appendAssumeCapacity(cfg.*);
-        }
-        return result.toOwnedSlice(alloc);
+        return self.core.index_manager.listPublicResolvers(alloc);
     }
 
     fn resolveDocSetForIdsAlloc(self: *DB, alloc: Allocator, doc_ids: []const []const u8) !doc_set.ResolvedDocSet {
@@ -137300,7 +137301,10 @@ test "capi resolver replacement builds while replay gates remain available" {
     defer tmp.cleanup();
     var runtime = try background_runtime_mod.BackendRuntimeHandle.init(alloc, .{ .backend = .manual, .borrowed_io = .{ .general = std.testing.io } });
     defer runtime.deinit();
-    var db = try DB.open(alloc, std.mem.span(tmp.path().ptr), .{ .backend_runtime = runtime.ptr(), .executor = .{ .backend = .manual }, .start_index_workers = false });
+    // This hook verifies ownership held by construction itself. Independent
+    // resolver workers may legitimately own the same gates, so drive them
+    // synchronously rather than racing their background wakeups.
+    var db = try DB.open(alloc, std.mem.span(tmp.path().ptr), .{ .backend_runtime = runtime.ptr(), .executor = .{ .backend = .manual }, .start_index_workers = false, .start_optional_runtime_workers = false });
     defer db.close();
     const config = "{\"source\":{\"artifact\":\"kg\",\"format\":\"extraction_graph\",\"mention_edge_type\":\"mentions\"},\"artifact\":{\"name\":\"kg\",\"kind\":\"asset\",\"source\":{\"type\":\"field\",\"value\":\"kg\"},\"content_type\":\"application/json\"},\"edge_types\":[{\"name\":\"mentions\"}]}";
     try db.addIndex(.{ .name = "old", .kind = .graph, .config_json = config });
@@ -139151,4 +139155,166 @@ test "inline resolver replacement replays staged sources absent from graph sourc
     const resolved = try db.core.store.get(a, key);
     defer a.free(resolved);
     try std.testing.expect(std.mem.indexOf(u8, resolved, "entity/ada") != null);
+}
+
+test "inline resolver replacement named wait bypasses earlier queued producer prerequisites" {
+    const a = std.testing.allocator;
+    var directory = try TestDirectory.init("review-multi-replacement");
+    defer directory.cleanup();
+    var runtime = try background_runtime_mod.BackendRuntimeHandle.init(a, .{ .backend = .manual, .borrowed_io = .{ .general = std.testing.io } });
+    defer runtime.deinit();
+    var db = try DB.open(a, directory.path(), .{ .backend_runtime = runtime.ptr(), .executor = .{ .backend = .manual }, .start_optional_runtimes = false, .start_optional_runtime_workers = false, .start_independent_maintenance = false });
+    defer db.close();
+    try db.addIndex(.{ .name = "old_a", .kind = .graph, .config_json = "{}" });
+    try db.addIndex(.{ .name = "old_b", .kind = .graph, .config_json = "{}" });
+    try db.batch(.{ .writes = &.{.{ .key = "doc:a", .value = "{\"relations\":[{\"type\":\"R\",\"target\":\"doc:b\"}]}" }} });
+    const config_a = "{\"source\":{\"artifact\":\"relations_a\",\"format\":\"extraction_relation\"},\"artifact\":{\"name\":\"relations_a\",\"kind\":\"asset\",\"source\":{\"type\":\"field\",\"value\":\"relations\"},\"content_type\":\"application/json\"}}";
+    const config_b = "{\"source\":{\"artifact\":\"relations_b\",\"format\":\"extraction_relation\"},\"artifact\":{\"name\":\"relations_b\",\"kind\":\"asset\",\"source\":{\"type\":\"field\",\"value\":\"relations\"},\"content_type\":\"application/json\"}}";
+    const generation_a = try db.replaceGraphIndex("old_a", .{ .name = "new_a", .kind = .graph, .config_json = config_a });
+    const generation_b = try db.replaceGraphIndex("old_b", .{ .name = "new_b", .kind = .graph, .config_json = config_b });
+    // Waiting only for the later name must finish without first building
+    // an unrelated replacement; no worker or separate drain is available.
+    try db.waitGraphReplacement("new_b", generation_b, 30_000);
+    try std.testing.expect(db.indexGeneration("new_a") == null);
+    try std.testing.expect(db.indexGeneration("old_a") != null);
+    try db.waitGraphReplacement("new_a", generation_a, 30_000);
+    try db.waitGraphReplacement("new_b", generation_b, 30_000);
+}
+
+test "inline resolver replacement resolution deadline resumes a large record across reopen" {
+    const a = std.testing.allocator;
+    const Clock = struct {
+        var now: u64 = 0;
+        fn read() u64 {
+            return now;
+        }
+        fn process(_: *anyopaque, _: Allocator, _: []const resolution_runtime_mod.ResolverConfig, _: resolver_lib.ArtifactStore, _: ?resolver_lib.CandidateProvider, keys: []const []const u8, _: ?resolution_runtime_mod.CandidateSource, _: ?embedder_mod.DenseEmbedder) anyerror!bool {
+            try std.testing.expectEqual(@as(usize, 1), keys.len);
+            var parsed = (try resolution_runtime_mod.parseSourceArtifactKeyAlloc(std.testing.allocator, keys[0])) orelse return error.TestUnexpectedResult;
+            defer parsed.deinit(std.testing.allocator);
+            now += 1;
+            return false;
+        }
+    };
+    var directory = try TestDirectory.init("replacement-resolution-deadline");
+    defer directory.cleanup();
+    var host = try background_runtime_mod.BackendRuntimeHandle.init(a, .{ .backend = .manual, .borrowed_io = .{ .general = std.testing.io } });
+    defer host.deinit();
+    const options: OpenOptions = .{ .backend_runtime = host.ptr(), .executor = .{ .backend = .manual }, .start_optional_runtime_workers = false, .start_independent_maintenance = false };
+    resolution_runtime_mod.test_replay_now_ns = Clock.read;
+    defer resolution_runtime_mod.test_replay_now_ns = null;
+    Clock.now = 0;
+    const count = 40;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    var source_keys: [count][]const u8 = undefined;
+    for (&source_keys, 0..) |*key, i| key.* = try internal_keys.artifactNamedPrefixAlloc(scratch, try std.fmt.allocPrint(scratch, "doc:{d:0>3}", .{i}), "asset", "kg");
+    var sequence: u64 = 0;
+    {
+        var db = try DB.open(a, directory.path(), options);
+        defer db.close();
+        _ = try db.upsertResolverWithResultOptions(.{ .name = "concepts", .table = "default", .source_artifact = "kg", .resolution_artifact = "resolved", .key_template = "entity/{{ uslug _entity.text }}", .promote = false }, .{ .drain_backfill = false });
+        try db.runUntilIdle();
+        for (source_keys) |key| try db.core.store.put(key, "{\"entities\":[{\"id\":\"a\",\"text\":\"Ada\",\"label\":\"person\"}]}");
+        sequence = try appendDerivedBatchRecord(&db, .{ .changed_artifact_keys = &source_keys });
+        const runtime = db.resolution_runtime.?;
+        runtime.notifySequence(sequence);
+        runtime.ordered_writer = .{ .ptr = &db, .process = Clock.process };
+        try runtime.catchUpOnce(0);
+        try std.testing.expect(runtime.replay_progress == null);
+        try runtime.catchUpOnce(1);
+        try std.testing.expectEqual(@as(usize, 1), runtime.replay_progress.?.next_key);
+        try std.testing.expect(runtime.applied_sequence.load(.acquire) < sequence);
+        const first = try internal_keys.resolutionArtifactKeyAlloc(a, "doc:000", "resolved");
+        defer a.free(first);
+        const value = try db.core.store.get(a, first);
+        defer a.free(value);
+        const second = try internal_keys.resolutionArtifactKeyAlloc(a, "doc:001", "resolved");
+        defer a.free(second);
+        try std.testing.expectError(error.NotFound, db.core.store.get(a, second));
+    }
+    {
+        var db = try DB.open(a, directory.path(), options);
+        defer db.close();
+        const runtime = db.resolution_runtime.?;
+        try std.testing.expectEqual(@as(usize, 1), runtime.replay_progress.?.next_key);
+        runtime.ordered_writer = .{ .ptr = &db, .process = Clock.process };
+        try runtime.catchUpOnce(2);
+        try std.testing.expectEqual(@as(usize, 2), runtime.replay_progress.?.next_key);
+        try runtime.catchUpOnce(std.math.maxInt(u64));
+        try std.testing.expectEqual(@as(usize, 34), runtime.replay_progress.?.next_key);
+        // Ordinary drains/workers must honor a manual owner's partial cut.
+        runtime.ordered_writer = .{ .ptr = db.resolution_append_context.?, .process = processOrderedResolutions };
+        try db.runUntilIdle();
+        try std.testing.expect(runtime.replay_progress == null);
+        try std.testing.expect(runtime.applied_sequence.load(.acquire) >= sequence);
+        for (0..count) |i| {
+            const key = try internal_keys.resolutionArtifactKeyAlloc(scratch, try std.fmt.allocPrint(scratch, "doc:{d:0>3}", .{i}), "resolved");
+            const value = try db.core.store.get(a, key);
+            defer a.free(value);
+            try std.testing.expect(std.mem.indexOf(u8, value, "entity/ada") != null);
+        }
+    }
+}
+
+test "inline resolver replacement wait isolates later backed off producer failures" {
+    const a = std.testing.allocator;
+    var directory = try TestDirectory.init("replacement-wait-producer-isolation");
+    defer directory.cleanup();
+    var host = try background_runtime_mod.BackendRuntimeHandle.init(a, .{ .backend = .manual, .borrowed_io = .{ .general = std.testing.io } });
+    defer host.deinit();
+    var db = try DB.open(a, directory.path(), .{ .backend_runtime = host.ptr(), .executor = .{ .backend = .manual }, .start_optional_runtimes = false, .start_optional_runtime_workers = false, .start_independent_maintenance = false });
+    defer db.close();
+    try db.addIndex(.{ .name = "old_a", .kind = .graph, .config_json = "{}" });
+    try db.addIndex(.{ .name = "old_b", .kind = .graph, .config_json = "{}" });
+    try db.batch(.{ .writes = &.{.{ .key = "doc:a", .value = "{\"relations\":[]}" }} });
+    const generation = try db.replaceGraphIndex("old_a", .{ .name = "new_a", .kind = .graph, .config_json = "{}" });
+    const config = "{\"source\":{\"artifact\":\"relations\",\"format\":\"extraction_relation\"},\"artifact\":{\"name\":\"relations\",\"kind\":\"asset\",\"source\":{\"type\":\"field\",\"value\":\"relations\"},\"content_type\":\"application/json\"}}";
+    _ = try db.replaceGraphIndex("old_b", .{ .name = "new_b", .kind = .graph, .config_json = config });
+    {
+        const jobs = try db.graphReplacementStatusAlloc(a);
+        defer jobs.deinit();
+        try std.testing.expect(try db.advanceGraphReplacementOnce(null, jobs.value[1]));
+    }
+    {
+        const jobs = try db.graphReplacementStatusAlloc(a);
+        defer jobs.deinit();
+        var backed_off = jobs.value[1];
+        try std.testing.expect(backed_off.producer_replay_target > 0);
+        backed_off.retry_after_ns = db.replacementRetryNow() + std.time.ns_per_hour;
+        try db.core.index_manager.saveGraphReplacementBuild(db.core.store, backed_off);
+    }
+    // An unrelated producer fault must not be observed by waiting for the
+    // first ready replacement, which needs no producer work at all.
+    db.enrichment_runtime.?.worker_failed = true;
+    try db.waitGraphReplacement("new_a", generation, 30_000);
+    try std.testing.expect(db.indexGeneration("new_a") != null);
+    try std.testing.expect(db.indexGeneration("old_b") != null);
+    try std.testing.expect(db.enrichment_runtime.?.worker_failed);
+}
+
+test "inline resolver replacement named scheduler rejects a reused reservation generation" {
+    const a = std.testing.allocator;
+    var directory = try TestDirectory.init("replacement-named-scheduler-generation");
+    defer directory.cleanup();
+    var host = try background_runtime_mod.BackendRuntimeHandle.init(a, .{ .backend = .manual, .borrowed_io = .{ .general = std.testing.io } });
+    defer host.deinit();
+    var db = try DB.open(a, directory.path(), .{ .backend_runtime = host.ptr(), .executor = .{ .backend = .manual }, .start_optional_runtimes = false, .start_independent_maintenance = false });
+    defer db.close();
+    try db.addIndex(.{ .name = "old", .kind = .graph, .config_json = "{}" });
+    const cfg: types.IndexConfig = .{ .name = "new", .kind = .graph, .config_json = "{}" };
+    const previous = try db.replaceGraphIndex("old", cfg);
+    try std.testing.expect(try db.cancelReplacement("new"));
+    try db.runUntilIdle();
+    const current = try db.replaceGraphIndex("old", cfg);
+    try std.testing.expect(current != previous);
+    // Model reuse between a waiter's observation and scheduler admission.
+    try std.testing.expect(try db.advanceGraphReplacementForIdentityUntil(null, .{ .name = "new", .generation = previous }));
+    try std.testing.expect(db.indexGeneration("new") == null);
+    const jobs = try db.graphReplacementStatusAlloc(a);
+    defer jobs.deinit();
+    try std.testing.expectEqual(current, jobs.value[0].generation);
+    try std.testing.expectEqual(@as(u64, 0), jobs.value[0].scanned);
+    try db.waitGraphReplacement("new", current, 30_000);
 }

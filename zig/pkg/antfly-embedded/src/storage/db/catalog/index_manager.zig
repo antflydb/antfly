@@ -12945,14 +12945,31 @@ pub const IndexManager = struct {
     }
 
     pub fn listResolvers(self: *const IndexManager, alloc: Allocator) ![]resolver_catalog.ResolverConfig {
-        const out = try alloc.alloc(resolver_catalog.ResolverConfig, self.resolvers.items.len);
+        return self.cloneResolverSelection(alloc, true);
+    }
+
+    /// Filter before cloning so private streams neither allocate public results
+    /// nor require another fallible shrinking allocation after ownership moves.
+    pub fn listPublicResolvers(self: *IndexManager, alloc: Allocator) ![]resolver_catalog.ResolverConfig {
+        self.catalog_mutex.lockShared();
+        defer self.catalog_mutex.unlockShared();
+        return self.cloneResolverSelection(alloc, false);
+    }
+
+    fn cloneResolverSelection(self: *const IndexManager, alloc: Allocator, include_staged: bool) ![]resolver_catalog.ResolverConfig {
+        var selected_count: usize = 0;
+        for (self.resolvers.items) |cfg| {
+            if (include_staged or cfg.replacement_index.len == 0) selected_count += 1;
+        }
+        const out = try alloc.alloc(resolver_catalog.ResolverConfig, selected_count);
         var initialized: usize = 0;
         errdefer {
             for (out[0..initialized]) |*cfg| cfg.deinit(alloc);
             alloc.free(out);
         }
-        for (self.resolvers.items, 0..) |cfg, i| {
-            out[i] = try resolver_catalog.ResolverConfig.clone(alloc, cfg);
+        for (self.resolvers.items) |cfg| {
+            if (!include_staged and cfg.replacement_index.len > 0) continue;
+            out[initialized] = try resolver_catalog.ResolverConfig.clone(alloc, cfg);
             initialized += 1;
         }
         return out;
@@ -48436,4 +48453,41 @@ test "inline resolver replacement fences explicit producer replay and upgrades l
         try std.testing.expectEqual(@as(u32, 1), try resolver_catalog.readMinimumReaderVersion(&txn, 1));
     }
     try std.testing.expect(manager.getEnrichment(.asset, "relations") != null);
+}
+
+test "inline resolver replacement public listing filters before cloning and unwinds OOM" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    defer a.free(path);
+    var manager = try IndexManager.init(a, path);
+    defer manager.deinit();
+    const public: ResolverConfig = .{ .name = "concepts", .table = "default", .source_artifact = "kg", .resolution_artifact = "resolved", .key_template = "entity/{{ _entity.text }}", .aliases = &.{.{ .key = "a", .target = "b" }}, .merges = &.{.{ .key = "c", .target = "d" }}, .labels = &.{"person"}, .scorer_json = "{}", .candidate_search = "prefix", .candidate_ann_index = "names", .name_embedding = "model", .fusion_combine = "max" };
+    try manager.resolvers.append(a, try ResolverConfig.clone(a, public));
+    var staged = public;
+    staged.name = "__antfly_replacement/new/1/concepts";
+    staged.replacement_index = "new";
+    staged.replacement_resolver = "concepts";
+    try manager.resolvers.append(a, try ResolverConfig.clone(a, staged));
+    const Check = struct {
+        fn run(alloc: Allocator, target: *IndexManager) !void {
+            const configs = try target.listPublicResolvers(alloc);
+            defer {
+                for (configs) |*cfg| cfg.deinit(alloc);
+                alloc.free(configs);
+            }
+            try std.testing.expectEqual(@as(usize, 1), configs.len);
+            try std.testing.expectEqualStrings("concepts", configs[0].name);
+            try std.testing.expectEqualStrings("b", configs[0].aliases[0].target);
+            try std.testing.expectEqualStrings("d", configs[0].merges[0].target);
+        }
+    };
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(a, Check.run, .{&manager});
+    const all = try manager.listResolvers(a);
+    defer {
+        for (all) |*cfg| cfg.deinit(a);
+        a.free(all);
+    }
+    try std.testing.expectEqual(@as(usize, 2), all.len);
 }

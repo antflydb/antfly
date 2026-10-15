@@ -1855,8 +1855,8 @@ fn resolutionCatchUp(self: *@import("db/resolution_runtime.zig").ResolutionRunti
     return .{ .value = self.catchUp() catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
 
-fn resolutionCatchUpOnce(self: *@import("db/resolution_runtime.zig").ResolutionRuntime) engine.Outcome(void) {
-    return .{ .value = self.catchUpOnce() catch |err| return .{ .failure = .init(@errorName(err)) } };
+fn resolutionCatchUpOnce(self: *@import("db/resolution_runtime.zig").ResolutionRuntime, deadline_ns: u64) engine.Outcome(void) {
+    return .{ .value = self.catchUpOnce(deadline_ns) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
 
 fn resolutionRequestReresolveBacklog(self: *@import("db/resolution_runtime.zig").ResolutionRuntime) engine.Outcome(void) {

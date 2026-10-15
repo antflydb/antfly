@@ -56,6 +56,46 @@ const SourceArtifactKind = resolver_catalog.ResolverSourceArtifactKind;
 /// so resolution records survive until the worker consumes them.
 pub const scope_name = "resolution";
 
+const replay_progress_key = "\x00\x00__metadata__:resolution_replay_progress";
+const ReplayProgress = struct {
+    base_applied_sequence: u64,
+    sequence: u64,
+    next_key: usize,
+};
+const PendingReplayRecord = struct {
+    sequence: u64,
+    raw: []u8,
+    decoded: change_journal_mod.DecodedRecord,
+
+    fn deinit(self: *@This(), alloc: Allocator) void {
+        self.decoded.deinit();
+        alloc.free(self.raw);
+    }
+};
+
+// One clock domain with DB wait deadlines; injectable for deterministic yield tests.
+pub var test_replay_now_ns: ?*const fn () u64 = null;
+fn replayNowNs() u64 {
+    if (builtin.is_test) if (test_replay_now_ns) |now| return now();
+    return @import("antfly_platform").time.monotonicNs();
+}
+
+fn loadReplayProgress(alloc: Allocator, store: *backend_erased.Store, applied: u64) !?ReplayProgress {
+    var read = try store.beginRead();
+    defer read.abort();
+    const raw = read.get(replay_progress_key) catch |err| switch (err) {
+        error.NotFound => return null,
+        else => return err,
+    };
+    var parsed = try std.json.parseFromSlice(ReplayProgress, alloc, raw, .{});
+    defer parsed.deinit();
+    const progress = parsed.value;
+    // Completion and cursor cleanup can straddle a crash. An older applied
+    // cut is authoritative only until the enclosing record is acknowledged.
+    if (progress.base_applied_sequence != applied or progress.sequence <= applied) return null;
+    return progress;
+}
+
 pub const ArtifactWrite = struct {
     key: []const u8,
     value: []const u8,
@@ -2380,6 +2420,10 @@ pub const ResolutionRuntime = struct {
     target_sequence: @import("antfly_platform").atomic.Value(u64),
     shutdown_flag: std.atomic.Value(bool),
     catch_up_mutex: std.atomic.Mutex = .unlocked,
+    replay_progress: ?ReplayProgress = null,
+    // Retain one decoded record across quanta: repeated small waits must not
+    // reparse an archive-sized batch for every source artifact.
+    pending_replay_record: ?PendingReplayRecord = null,
     /// The catalog transaction owns durability; this flag is only a wake hint.
     /// Catalog changes and cursor advancement share catch_up_mutex so an older
     /// window cannot clear a newer configuration's restart cursor.
@@ -2419,6 +2463,7 @@ pub const ResolutionRuntime = struct {
             .candidate_source = candidate_source,
             .embedder = embedder,
             .applied_sequence = .init(applied),
+            .replay_progress = try loadReplayProgress(alloc, &store_handle.store, applied),
             .target_sequence = .init(target),
             .shutdown_flag = .init(false),
             .backfill_pending = .init((try hasReresolveCursor(&store_handle.store, resolver_catalog.reresolve_resume_key)) or
@@ -2431,6 +2476,7 @@ pub const ResolutionRuntime = struct {
     pub fn deinit(self: *ResolutionRuntime) void {
         if (comptime @import("../engine_selection.zig").enabled) return @import("antfly_source_root").antfly_sources.storage_engine.call("resolutionDeinit", .{self}) catch @panic("incompatible storage owner");
         self.stop();
+        self.clearPendingReplayRecord();
         self.store_handle.deinit();
         self.* = undefined;
     }
@@ -2531,19 +2577,128 @@ pub const ResolutionRuntime = struct {
         return self.catchUpLocked(false, default_max_records_per_window);
     }
 
-    /// Cooperative manual maintenance: one journal record or one bounded
-    /// backfill page, without waiting behind another replay owner.
-    pub fn catchUpOnce(self: *ResolutionRuntime) !void {
-        if (comptime @import("../engine_selection.zig").enabled) return @import("antfly_source_root").antfly_sources.storage_engine.call("resolutionCatchUpOnce", .{self});
+    /// Cooperative maintenance checks the caller deadline between source
+    /// artifacts, preserving all sibling resolver decisions for each source.
+    pub fn catchUpOnce(self: *ResolutionRuntime, deadline_ns: u64) !void {
+        if (comptime @import("../engine_selection.zig").enabled) return @import("antfly_source_root").antfly_sources.storage_engine.call("resolutionCatchUpOnce", .{ self, deadline_ns });
         if (!self.catch_up_mutex.tryLock()) return;
         defer self.catch_up_mutex.unlock();
-        try self.catchUpLocked(true, 1);
+        if (replayNowNs() >= deadline_ns) return;
+        const applied = self.applied_sequence.load(.acquire);
+        if (applied >= self.target_sequence.load(.acquire)) {
+            if (self.backfill_pending.load(.acquire)) {
+                var tick = try self.runReresolveBacklogWindowLocked();
+                tick.deinit(self.alloc);
+            }
+            return;
+        }
+        try self.catchUpRecordPageLocked(deadline_ns);
+    }
+
+    fn clearPendingReplayRecord(self: *ResolutionRuntime) void {
+        if (self.pending_replay_record) |*record| record.deinit(self.alloc);
+        self.pending_replay_record = null;
+    }
+
+    fn saveReplayProgress(self: *ResolutionRuntime, progress: ?ReplayProgress) !void {
+        var write = try self.store_handle.store.beginWrite();
+        errdefer write.abort();
+        if (progress) |value| {
+            const raw = try std.json.Stringify.valueAlloc(self.alloc, value, .{});
+            defer self.alloc.free(raw);
+            try write.put(replay_progress_key, raw);
+        } else write.delete(replay_progress_key) catch |err| switch (err) {
+            error.NotFound => {},
+            else => return err,
+        };
+        try write.commit();
+        self.replay_progress = progress;
+    }
+
+    fn catchUpRecordPageLocked(self: *ResolutionRuntime, deadline_ns: ?u64) !void {
+        // Capture before reading replay: a later notification must never be
+        // acknowledged by an earlier empty scan.
+        const target = self.target_sequence.load(.acquire);
+        const applied = self.applied_sequence.load(.acquire);
+        if (self.pending_replay_record == null) {
+            const Capture = struct {
+                fn consume(ptr: *anyopaque, sequence: u64, payload: []const u8) anyerror!void {
+                    const runtime: *ResolutionRuntime = @ptrCast(@alignCast(ptr));
+                    if (runtime.pending_replay_record != null) return;
+                    const raw = try runtime.alloc.dupe(u8, payload);
+                    errdefer runtime.alloc.free(raw);
+                    const decoded = try change_journal_mod.decodeRecord(runtime.alloc, raw);
+                    runtime.pending_replay_record = .{ .sequence = sequence, .raw = raw, .decoded = decoded };
+                }
+            };
+            _ = try self.replay_source.forEachMatchingRecord(self.alloc, applied, .resolution, 1, self, Capture.consume);
+        }
+        const record = if (self.pending_replay_record) |*value| value else {
+            if (self.replay_progress != null) return error.InvalidResolutionReplayCursor;
+            try enrichment_state.saveAppliedSequence(self.store_handle.store, scope_name, target);
+            self.applied_sequence.store(target, .release);
+            return;
+        };
+        const keys = record.decoded.record.changed_artifact_keys;
+        var next: usize = 0;
+        if (self.replay_progress) |progress| {
+            if (progress.base_applied_sequence != applied or progress.sequence != record.sequence or progress.next_key > keys.len)
+                return error.InvalidResolutionReplayCursor;
+            next = progress.next_key;
+        }
+        const resolvers = try self.index_manager.listResolvers(self.alloc);
+        defer {
+            for (resolvers) |*cfg| cfg.deinit(self.alloc);
+            self.alloc.free(resolvers);
+        }
+        var das = DbArtifactStore(backend_erased.Store){ .store = &self.store_handle.store, .index_manager = self.index_manager };
+        const store = das.artifactStore();
+        const end = @min(keys.len, next +| 32);
+        const initial = next;
+        if (deadline_ns == null) {
+            // Ordinary drains keep batched publication throughput when taking
+            // over a manual owner's partial record.
+            if (next < end) try self.processReplayKeys(resolvers, store, keys[next..end]);
+            next = end;
+        } else while (next < end) {
+            if (replayNowNs() >= deadline_ns.?) break;
+            // A source is the atomic unit, including label routing and sibling
+            // dependencies. Ordered publication keeps its read-set validation.
+            try self.processReplayKeys(resolvers, store, keys[next .. next + 1]);
+            next += 1;
+        }
+        if (next == keys.len) {
+            try enrichment_state.saveAppliedSequence(self.store_handle.store, scope_name, record.sequence);
+            self.applied_sequence.store(record.sequence, .release);
+            const had_progress = self.replay_progress != null;
+            self.replay_progress = null;
+            self.clearPendingReplayRecord();
+            // A stale checkpoint after a crash or failed cleanup is ignored
+            // using its base cut, including by this still-resident runtime.
+            if (had_progress) try self.saveReplayProgress(null);
+        } else if (next > initial) {
+            // Checkpoint only after the source outputs and handoff are durable.
+            // A failure can repeat this small page, but cannot skip work.
+            try self.saveReplayProgress(.{ .base_applied_sequence = applied, .sequence = record.sequence, .next_key = next });
+        }
+    }
+
+    fn processReplayKeys(self: *ResolutionRuntime, resolvers: []const ResolverConfig, store: resolver_lib.ArtifactStore, keys: []const []const u8) !void {
+        if (self.ordered_writer) |writer| {
+            if (try writer.process(writer.ptr, self.alloc, resolvers, store, null, keys, self.candidate_source, self.embedder)) return;
+        }
+        try processRecordKeys(self.alloc, resolvers, store, null, keys, self.write_ctx, self.write_fn, self.candidate_source, self.embedder);
     }
 
     fn catchUpLocked(self: *ResolutionRuntime, single_window: bool, max_records: usize) !void {
         while (true) {
             const target = self.target_sequence.load(.acquire);
             const applied = self.applied_sequence.load(.acquire);
+            if (self.replay_progress != null or self.pending_replay_record != null) {
+                try self.catchUpRecordPageLocked(null);
+                if (single_window) return;
+                continue;
+            }
             if (applied >= target) {
                 if (!self.backfill_pending.load(.acquire)) return;
                 var tick = try self.runReresolveBacklogWindowLocked();

@@ -1324,8 +1324,18 @@ not direct graph sources. A missing enrichment runtime is
 created on demand, including after reopen; manual owners retain synchronous
 execution without starting background workers. The old graph and public resolver
 remain authoritative during the build. Explicit waits drive manual enrichment
-with the remaining caller deadline and bounded resolution quanta, without enabling
-background workers or resuming deliberately paused background owners.
+with the remaining caller deadline, without enabling background workers or
+resuming deliberately paused background owners. A named wait advances its own
+reservation and rechecks its generation under scheduler ownership, so an earlier
+corpus build or a cancelled-and-reused name cannot redirect its work.
+Resolution yields between source artifacts, after at most 32 keys per quantum,
+and checks the same monotonic deadline before each unit. Each source keeps its
+sibling resolver routing intact, including ordered receipt/read-set validation. An in-flight source/provider operation can overrun the deadline; a large
+journal batch cannot extend that into unbounded additional source operations.
+A durable intra-record cursor advances only after source output publication, and
+the resolution watermark stays pinned until the entire record completes. Restart
+and ordinary workers resume this cursor. The resident runtime retains one decoded
+record across quanta to avoid repeatedly parsing a large batch.
 Write-fenced and ordered owners leave prerequisites queued; waiting can still
 observe completion or reach its deadline without choosing local mutations.
 Producer replay yields after at most 4096 physical records, a 4 MiB byte budget,

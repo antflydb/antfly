@@ -295,41 +295,23 @@ pub const ResolverConfig = struct {
     }
 
     pub fn clone(alloc: Allocator, cfg: ResolverConfig) !ResolverConfig {
-        return .{
-            .name = try alloc.dupe(u8, cfg.name),
-            .table = try alloc.dupe(u8, cfg.table),
-            .source_artifact = try alloc.dupe(u8, cfg.source_artifact),
-            .source_artifact_kind = cfg.source_artifact_kind,
-            .resolution_artifact = try alloc.dupe(u8, cfg.resolution_artifact),
-            .key_template = try alloc.dupe(u8, cfg.key_template),
-            .aliases = try cloneAliases(alloc, cfg.aliases),
-            .merges = try cloneAliases(alloc, cfg.merges),
-            .merge_generation = cfg.merge_generation,
-            .merge_state_version = cfg.merge_state_version,
-            .resolution_generation = cfg.resolution_generation,
-            .namespace_generation = cfg.namespace_generation,
-            .inline_managed = cfg.inline_managed,
-            .retired = cfg.retired,
-            .replacement_index = if (cfg.replacement_index.len > 0) try alloc.dupe(u8, cfg.replacement_index) else "",
-            .replacement_resolver = if (cfg.replacement_resolver.len > 0) try alloc.dupe(u8, cfg.replacement_resolver) else "",
-            .promote = cfg.promote,
-            .retain_work = cfg.retain_work,
-            .max_work_bytes = cfg.max_work_bytes,
-            .labels = try cloneLabels(alloc, cfg.labels),
-            .type_must_match = cfg.type_must_match,
-            .scorer_json = if (cfg.scorer_json.len > 0) try alloc.dupe(u8, cfg.scorer_json) else "",
-            .candidate_search = if (cfg.candidate_search.len > 0) try alloc.dupe(u8, cfg.candidate_search) else "",
-            .candidate_ann_index = if (cfg.candidate_ann_index.len > 0) try alloc.dupe(u8, cfg.candidate_ann_index) else "",
-            .candidate_limit = cfg.candidate_limit,
-            .name_embedding = if (cfg.name_embedding.len > 0) try alloc.dupe(u8, cfg.name_embedding) else "",
-            .name_embedding_dims = cfg.name_embedding_dims,
-            .fusion_combine = if (cfg.fusion_combine.len > 0) try alloc.dupe(u8, cfg.fusion_combine) else "",
-            .fusion_trust = cfg.fusion_trust,
-            .fusion_prior = cfg.fusion_prior,
-            .fusion_prior_weight = cfg.fusion_prior_weight,
-            .min_confidence = cfg.min_confidence,
-            .config_generation = cfg.config_generation,
-        };
+        var owned = cfg;
+        // Establish an empty cleanup owner before the first allocation. Keep
+        // borrowed fields out of it until each clone has succeeded.
+        inline for (@typeInfo(ResolverConfig).@"struct".field_names, @typeInfo(ResolverConfig).@"struct".field_types) |name, T| {
+            if (T == []const u8 or T == []const []const u8 or T == []const resolver_lib.KeyAlias) @field(owned, name) = &.{};
+        }
+        errdefer owned.deinit(alloc);
+        inline for (@typeInfo(ResolverConfig).@"struct".field_names, @typeInfo(ResolverConfig).@"struct".field_types) |name, T| {
+            if (T == []const u8) {
+                @field(owned, name) = if (@field(cfg, name).len > 0) try alloc.dupe(u8, @field(cfg, name)) else "";
+            } else if (T == []const []const u8) {
+                @field(owned, name) = try cloneLabels(alloc, @field(cfg, name));
+            } else if (T == []const resolver_lib.KeyAlias) {
+                @field(owned, name) = try cloneAliases(alloc, @field(cfg, name));
+            }
+        }
+        return owned;
     }
 
     pub fn deinit(self: *ResolverConfig, alloc: Allocator) void {
