@@ -28696,7 +28696,10 @@ pub const DB = struct {
     }
 
     fn driveManualGraphReplacementReplay(self: *DB, producer_target: u64, deadline: u64) !void {
-        if (openModeRequiresReadOnlyBackends(self.open_mode) or monotonicTimeNs() >= deadline) return;
+        // A wait observes accepted work even when this owner cannot choose
+        // local effects. Leave denied/ordered work queued, as the replacement
+        // scheduler does, rather than turning the observation into a write.
+        if (monotonicTimeNs() >= deadline or !try self.canRunLocalGraphEndpointCleanup()) return;
         try self.enforceReplicationWriteGate();
         if (self.enrichment_runtime) |runtime| {
             if (!self.local_execution.optional_runtime_workers_enabled and !runtime.isStarted() and producer_target > runtime.stats().applied_sequence) {

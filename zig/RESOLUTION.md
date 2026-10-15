@@ -1326,6 +1326,8 @@ execution without starting background workers. The old graph and public resolver
 remain authoritative during the build. Explicit waits drive manual enrichment
 with the remaining caller deadline and bounded resolution quanta, without enabling
 background workers or resuming deliberately paused background owners.
+Write-fenced and ordered owners leave prerequisites queued; waiting can still
+observe completion or reach its deadline without choosing local mutations.
 Producer replay yields after at most 4096 physical records, a 4 MiB byte budget,
 or a 100 ms quantum (and honors an earlier caller deadline). Byte and time
 budgets are checked between records, so a single oversized record still makes
