@@ -52,6 +52,7 @@ pub const AntflyRootImports = struct {
     inference_engine: *std.Build.Module,
     shared_inference_core: bool = false,
     darwin_release_memory: bool = false,
+    darwin_shared_storage_sdk27: bool = false,
     sanitize_thread: bool = false,
     boundary_profile: @import("../embedded/storage_boundary.zig").Profile = .all,
     build_info: @import("../../lib/build_info/build_support.zig").BuildInfo,
@@ -412,6 +413,7 @@ pub const AntflyRootImports = struct {
     }
 
     pub fn configureServerless(self: @This(), b: *std.Build, mod: *std.Build.Module, link_libc: bool) void {
+        mod.addImport("antfly_resolver", self.resolver);
         self.configureDatabase(mod, link_libc);
         mod.addImport("antfly_provision_contract", self.provision_contract);
         inline for (object_runtime_imports) |field| self.addImport(mod, field);

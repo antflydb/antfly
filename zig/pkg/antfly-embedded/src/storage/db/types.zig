@@ -1603,6 +1603,14 @@ pub const ScanVisitEntry = struct {
 pub const ScanVisitor = struct {
     context: ?*anyopaque,
     visit: *const fn (context: ?*anyopaque, entry: ScanVisitEntry) anyerror!void,
+    callback_dispatch: @import("../named_callback.zig").Dispatch = NativeBoundary.local_dispatch,
+
+    const NativeCallbacks = struct { visit: @FieldType(ScanVisitor, "visit") };
+    const NativeBoundary = @import("../named_callback.zig").Boundary(NativeCallbacks);
+
+    pub fn visitEntry(self: ScanVisitor, entry: ScanVisitEntry) anyerror!void {
+        return NativeBoundary.call("visit", self.callback_dispatch, self.visit, .{ self.context, entry });
+    }
 };
 
 pub const ScanResult = struct {
@@ -1815,6 +1823,47 @@ pub const GraphQueryTransport = struct {
 };
 
 pub const document_authority = @import("query/document_authority.zig");
+pub const NativeKeyPredicate = struct {
+    callback_dispatch: @import("../named_callback.zig").Dispatch = NativeBoundary.local_dispatch,
+
+    ptr: *anyopaque,
+    allows: *const fn (*anyopaque, []const u8) anyerror!bool,
+    /// Changes only when exact query-owned constraints become materialized.
+    constraint_revision: ?*const fn (*anyopaque) u64 = null,
+    select_constraints: ?*const fn (*anyopaque, Allocator, SparseOrdinalLookup) anyerror!?SparseOrdinalSelection = null,
+    select_range: ?*const fn (*anyopaque, Allocator, SparseOrdinalLookup, u32, u32) anyerror!?SparseOrdinalSelection = null,
+    select_ordinals: ?*const fn (*anyopaque, Allocator, SparseOrdinalLookup) anyerror!?@import("../../encoding/roaring.zig").RoaringBitmap = null,
+    const NativeCallbacks = struct { allows: @FieldType(NativeKeyPredicate, "allows"), select_constraints: @FieldType(NativeKeyPredicate, "select_constraints"), select_range: @FieldType(NativeKeyPredicate, "select_range"), select_ordinals: @FieldType(NativeKeyPredicate, "select_ordinals") };
+    const NativeBoundary = @import("../named_callback.zig").Boundary(NativeCallbacks);
+    /// The proxy is synchronous and must never escape the storage call.
+    pub fn receiver(self: *const NativeKeyPredicate) NativeKeyPredicate {
+        return .{ .ptr = @ptrCast(@constCast(self)), .allows = receivedAllows, .constraint_revision = if (self.constraint_revision != null) receivedRevision else null, .select_constraints = if (self.select_constraints != null) receivedConstraints else null, .select_range = if (self.select_range != null) receivedRange else null, .select_ordinals = if (self.select_ordinals != null) receivedOrdinals else null };
+    }
+    fn source(ptr: *anyopaque) *const NativeKeyPredicate {
+        return @ptrCast(@alignCast(ptr));
+    }
+    fn receivedAllows(ptr: *anyopaque, key: []const u8) anyerror!bool {
+        const self = source(ptr);
+        return NativeBoundary.call("allows", self.callback_dispatch, self.allows, .{ self.ptr, key });
+    }
+    fn receivedRevision(ptr: *anyopaque) u64 {
+        const self = source(ptr);
+        return self.constraint_revision.?(self.ptr);
+    }
+    fn receivedConstraints(ptr: *anyopaque, alloc: Allocator, lookup: SparseOrdinalLookup) anyerror!?SparseOrdinalSelection {
+        const self = source(ptr);
+        return NativeBoundary.call("select_constraints", self.callback_dispatch, self.select_constraints.?, .{ self.ptr, alloc, lookup });
+    }
+    fn receivedRange(ptr: *anyopaque, alloc: Allocator, lookup: SparseOrdinalLookup, first: u32, last: u32) anyerror!?SparseOrdinalSelection {
+        const self = source(ptr);
+        return NativeBoundary.call("select_range", self.callback_dispatch, self.select_range.?, .{ self.ptr, alloc, lookup, first, last });
+    }
+    fn receivedOrdinals(ptr: *anyopaque, alloc: Allocator, lookup: SparseOrdinalLookup) anyerror!?@import("../../encoding/roaring.zig").RoaringBitmap {
+        const self = source(ptr);
+        return NativeBoundary.call("select_ordinals", self.callback_dispatch, self.select_ordinals.?, .{ self.ptr, alloc, lookup });
+    }
+};
+
 pub const SearchRequest = struct {
     pub fn hasHitEvaluation(self: @This()) bool {
         return self.evaluation_limit > 0 and !self.evaluation_graph;
@@ -1958,15 +2007,7 @@ pub const SearchRequest = struct {
     // avoid converting text-native doc nums through shard ordinals and back.
     resolved_text_doc_filter: ?*const anyopaque = null,
     /// Request-local native metadata membership, never serialized to workers.
-    native_key_predicate: ?struct {
-        ptr: *anyopaque,
-        allows: *const fn (*anyopaque, []const u8) anyerror!bool,
-        /// Changes only when exact query-owned constraints become materialized.
-        constraint_revision: ?*const fn (*anyopaque) u64 = null,
-        select_constraints: ?*const fn (*anyopaque, Allocator, SparseOrdinalLookup) anyerror!?SparseOrdinalSelection = null,
-        select_range: ?*const fn (*anyopaque, Allocator, SparseOrdinalLookup, u32, u32) anyerror!?SparseOrdinalSelection = null,
-        select_ordinals: ?*const fn (*anyopaque, Allocator, SparseOrdinalLookup) anyerror!?@import("../../encoding/roaring.zig").RoaringBitmap = null,
-    } = null,
+    native_key_predicate: ?NativeKeyPredicate = null,
     resolved_doc_filter_owned: bool = false,
     resolved_doc_filter_wire_context: ?ResolvedDocFilterWireContext = null,
     /// Request-local authorization hook used only by the distributed graph
@@ -2248,6 +2289,10 @@ pub const GraphTableReadAuthorization = struct {
 };
 
 pub const GraphTableReadAuthorizer = struct {
+    const NativeCallbacks = struct { authorize_table: @FieldType(GraphTableReadAuthorizer, "authorize_table") };
+    const NativeBoundary = @import("../named_callback.zig").Boundary(NativeCallbacks);
+    callback_dispatch: @import("../named_callback.zig").Dispatch = NativeBoundary.local_dispatch,
+
     ctx: ?*const anyopaque,
     authorize_table: *const fn (
         ctx: ?*const anyopaque,
@@ -2260,7 +2305,7 @@ pub const GraphTableReadAuthorizer = struct {
         alloc: std.mem.Allocator,
         table_name: []const u8,
     ) !GraphTableReadAuthorization {
-        return try self.authorize_table(self.ctx, alloc, table_name);
+        return try NativeBoundary.call("authorize_table", self.callback_dispatch, self.authorize_table, .{ self.ctx, alloc, table_name });
     }
 };
 
@@ -4026,11 +4071,15 @@ pub const RepairYieldCheck = struct {
 };
 
 pub const RepairActivationCheck = struct {
+    const NativeCallbacks = struct { is_current_owner: @FieldType(RepairActivationCheck, "is_current_owner") };
+    const NativeBoundary = @import("../named_callback.zig").Boundary(NativeCallbacks);
+    callback_dispatch: @import("../named_callback.zig").Dispatch = NativeBoundary.local_dispatch,
+
     ptr: *anyopaque,
     is_current_owner: *const fn (ptr: *anyopaque) anyerror!bool,
 
     pub fn current(self: RepairActivationCheck) !bool {
-        return try self.is_current_owner(self.ptr);
+        return try NativeBoundary.call("is_current_owner", self.callback_dispatch, self.is_current_owner, .{self.ptr});
     }
 };
 
@@ -4042,26 +4091,30 @@ pub const RepairCapacityObservation = resource_manager_mod.CapacityObservation;
 pub const RepairCapacitySource = resource_manager_mod.CapacitySource;
 
 pub const RepairCapacityCheck = struct {
+    const NativeCallbacks = struct { reconcile: @FieldType(RepairCapacityCheck, "reconcile"), revalidate: @FieldType(RepairCapacityCheck, "revalidate"), bind_candidate_root: @FieldType(RepairCapacityCheck, "bind_candidate_root") };
+    const NativeBoundary = @import("../named_callback.zig").Boundary(NativeCallbacks);
+    callback_dispatch: @import("../named_callback.zig").Dispatch = NativeBoundary.local_dispatch,
+
     ptr: *anyopaque,
     reconcile: *const fn (ptr: *anyopaque, candidate_bytes: u64) anyerror!void,
     revalidate: *const fn (ptr: *anyopaque) anyerror!void,
     bind_candidate_root: ?*const fn (ptr: *anyopaque, candidate_root: []const u8) anyerror!void = null,
 
     pub fn current(self: @This(), candidate_bytes: u64) !void {
-        return try self.reconcile(self.ptr, candidate_bytes);
+        return try NativeBoundary.call("reconcile", self.callback_dispatch, self.reconcile, .{ self.ptr, candidate_bytes });
     }
 
     /// Re-check the live capacity domain before another bounded build batch.
     /// Implementations keep the successful path O(1), but may reconcile exact
     /// candidate usage before returning an otherwise-conservative denial.
     pub fn boundary(self: @This()) !void {
-        return try self.revalidate(self.ptr);
+        return try NativeBoundary.call("revalidate", self.callback_dispatch, self.revalidate, .{self.ptr});
     }
 
     /// Binds the exact shadow-generation root whose materialized bytes consume
     /// this reservation. The path is borrowed for the synchronous repair run.
     pub fn bindCandidateRoot(self: @This(), candidate_root: []const u8) !void {
-        if (self.bind_candidate_root) |bind| try bind(self.ptr, candidate_root);
+        if (self.bind_candidate_root) |bind| try NativeBoundary.call("bind_candidate_root", self.callback_dispatch, bind, .{ self.ptr, candidate_root });
     }
 };
 
