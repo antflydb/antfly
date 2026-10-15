@@ -69,6 +69,7 @@ pub fn closeAll(handle: *h.Handle) void {
     handle.embedded_table_records.deinit(handle.alloc);
     handle.embedded_table_records = .empty;
     handle.embedded_catalog_loaded = false;
+    handle.embedded_tables_discovered = false;
 }
 
 /// Catalog discovery never opens an index/provider belonging to another table.
@@ -106,6 +107,15 @@ pub fn load(handle: *h.Handle) !void {
     try loadCatalog(handle);
     var names = handle.embedded_table_records.keyIterator();
     while (names.next()) |name| _ = try get(handle, name.*);
+    handle.embedded_tables_discovered = true;
+}
+
+/// Integrity and unqualified DDL need every namespace, including inbound FK
+/// owners. This is handle-local: a refreshed native view starts undiscovered
+/// even when its durable recovery state is known clean. Cache discovery so
+/// repeated statements do not enumerate/open every table again.
+pub fn ensureDiscovered(handle: *h.Handle) !void {
+    if (!handle.embedded_tables_discovered) try loadAvailable(handle);
 }
 
 /// Background discovery isolates a broken namespace and exposes its error in
@@ -120,6 +130,7 @@ pub fn loadAvailable(handle: *h.Handle) !void {
             continue;
         };
     }
+    handle.embedded_tables_discovered = true;
 }
 
 fn persist(handle: *h.Handle) !void {

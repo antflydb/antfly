@@ -157,6 +157,29 @@ def test_multi_table_stable_snapshot(require_native, aflite_path, tmp_path):
                     assert table.lookup("same") == {"value": value}
 
 
+@pytest.mark.parametrize("delete_action", ["", " ON DELETE CASCADE"])
+def test_issue_1141_fk_insert_subquery_delete_commit(require_native, aflite_path, delete_action):
+    with closing(dbapi.connect(aflite_path, autocommit=True)) as connection:
+        cursor = connection.cursor()
+        cursor.execute("CREATE TABLE parent (id TEXT PRIMARY KEY)")
+        cursor.execute(
+            f"CREATE TABLE child (id TEXT PRIMARY KEY, parent_id TEXT NOT NULL REFERENCES parent (id){delete_action})"
+        )
+        for i in range(400):
+            connection.autocommit = True
+            cursor.execute("INSERT INTO parent (id) VALUES ($1)", (f"p{i}",))
+            connection.autocommit = False
+            cursor.execute("INSERT INTO child (id, parent_id) VALUES ($1, $2)", (f"c{i}", f"p{i}"))
+            cursor.execute(
+                "DELETE FROM child WHERE id IN (SELECT id FROM child WHERE parent_id = $1 ORDER BY id DESC OFFSET 8)",
+                (f"p{i}",),
+            )
+            connection.commit()
+        connection.autocommit = True
+        cursor.execute("SELECT COUNT(*) FROM child")
+        assert cursor.fetchall() == [(400,)]
+
+
 def test_cross_table_foreign_keys_and_failed_transaction(require_native, aflite_path):
     connection = dbapi.connect(aflite_path, autocommit=True, no_sync=True)
     try:

@@ -5004,6 +5004,128 @@ test "capi SQL background embedding releases the file gate and fences stale resu
     }
 }
 
+// Force the same replacement path as a captured maintenance generation, without
+// relying on a background timer or hundreds of writes to win a scheduling race.
+fn sqlRefreshCleanGeneration(handle: ?*anyopaque) !void {
+    const guard = public.enterHandle(handle, .exclusive).?;
+    defer guard.leave();
+    try std.testing.expect(guard.entry_error == null);
+    try std.testing.expect(!guard.handle.sql_ddl_recovery_needed);
+    try std.testing.expect(!guard.handle.sql_commit_recovery_needed);
+    const connection = guard.connection.?;
+    const owner = connection.owner;
+    try std.testing.expect(owner.maintenance_snapshot == null);
+    const previous = guard.handle;
+    previous.maintenance_references += 1;
+    defer previous.maintenance_references -= 1;
+    owner.maintenance_snapshot = previous;
+    defer owner.maintenance_snapshot = null;
+    connection.detach();
+    const replacement = try owner.refresh();
+    try std.testing.expect(replacement != previous);
+    try std.testing.expect(!replacement.sql_ddl_recovery_needed);
+    try std.testing.expect(!replacement.sql_commit_recovery_needed);
+    try std.testing.expectEqual(@as(usize, 0), replacement.embedded_tables.count());
+    try std.testing.expect(!replacement.embedded_tables_discovered);
+}
+
+fn sqlSessionStatement(handle: ?*anyopaque, session_id: u64, statement: []const u8) !void {
+    const a = std.testing.allocator;
+    const request = try std.json.Stringify.valueAlloc(a, .{ .statement = statement, .session_id = session_id }, .{});
+    defer a.free(request);
+    var response: capi.Buffer = .{};
+    const status = antfly_db_sql_json(handle, .fromSlice(request), &response);
+    defer freeRawBuffer(response.ptr, response.len);
+    if (status != .ok) std.debug.print("session SQL failure {s}: {s}\n", .{ statement, if (response.ptr) |ptr| ptr[0..response.len] else "" });
+    try std.testing.expectEqual(capi.ErrorCode.ok, status);
+}
+
+test "capi SQL refreshed generations retain complete FK catalogs and unqualified indexes" {
+    const a = std.testing.allocator;
+    var directory = try TestDirectory.init("capi-sql-refreshed-integrity");
+    defer directory.cleanup();
+    const path = try tempTestAflitePath(a, directory.path(), "database");
+    defer a.free(path);
+    defer cleanupTestFile(path);
+    var options: capi.OpenOptions = .{};
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_open_options_init(&options));
+    options.storage_kind = capi.storage_kind_lite;
+    options.profile = capi.profile_hosted;
+    var handle: ?*anyopaque = null;
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_create_with_options(path, &options, &handle));
+    defer antfly_db_close(handle);
+    try sqlFkRecoveryStatement(handle, "CREATE TABLE parent(id TEXT PRIMARY KEY)");
+    try sqlFkRecoveryStatement(handle, "CREATE TABLE child(id TEXT PRIMARY KEY, parent_id TEXT NOT NULL REFERENCES parent(id) ON DELETE CASCADE)");
+    try sqlFkRecoveryStatement(handle, "INSERT INTO parent(id) VALUES ('p')");
+    var session: u64 = 0;
+    try std.testing.expectEqual(capi.ErrorCode.ok, struct {
+        extern fn antfly_db_sql_session_open(?*anyopaque, *u64) capi.ErrorCode;
+    }.antfly_db_sql_session_open(handle, &session));
+    try sqlSessionStatement(handle, session, "BEGIN ISOLATION LEVEL READ COMMITTED");
+    try sqlSessionStatement(handle, session, "INSERT INTO child(id,parent_id) VALUES ('c','p')");
+    try sqlSessionStatement(handle, session, "DELETE FROM child WHERE id IN (SELECT id FROM child WHERE parent_id='p' ORDER BY id DESC OFFSET 8)");
+    try sqlRefreshCleanGeneration(handle);
+    // Ordinary reads remain lazy and must not probe unrelated tables.
+    try sqlSessionStatement(handle, session, "SELECT id FROM child");
+    {
+        const guard = public.enterHandle(handle, .exclusive).?;
+        defer guard.leave();
+        try std.testing.expectEqual(@as(usize, 1), guard.handle.embedded_tables.count());
+        try std.testing.expectEqual(@as(u64, 0), guard.handle.sql_ddl_recovery_scans);
+    }
+    try sqlSessionStatement(handle, session, "COMMIT");
+    // Discovery is cached per generation, independently of durable recovery.
+    {
+        const guard = public.enterHandle(handle, .exclusive).?;
+        defer guard.leave();
+        try std.testing.expect(guard.handle.embedded_tables_discovered);
+        try std.testing.expectEqual(@as(usize, 2), guard.handle.embedded_tables.count());
+        try std.testing.expectEqual(@as(u64, 0), guard.handle.sql_ddl_recovery_scans);
+    }
+    try sqlRefreshCleanGeneration(handle);
+    // Inbound FK owners must be discovered even before the child is referenced
+    // in this generation. The cascade must be staged, then committed.
+    try sqlSessionStatement(handle, session, "BEGIN ISOLATION LEVEL READ COMMITTED");
+    try sqlSessionStatement(handle, session, "DELETE FROM parent WHERE id='p'");
+    try sqlSessionStatement(handle, session, "COMMIT");
+    {
+        const guard = public.enterHandle(handle, .exclusive).?;
+        defer guard.leave();
+        const child = &guard.handle.embedded_tables.get("child").?.db;
+        var result = try child.scan(a, "", "", .{ .limit = 10, .include_documents = true });
+        defer result.deinit(a);
+        try std.testing.expectEqual(@as(usize, 0), result.documents.len);
+    }
+    try sqlFkRecoveryStatement(handle, "CREATE INDEX child_parent_idx ON child(parent_id)");
+    try sqlRefreshCleanGeneration(handle);
+    try sqlFkRecoveryStatement(handle, "DROP INDEX child_parent_idx");
+    try sqlRefreshCleanGeneration(handle);
+    const ReadApi = struct {
+        extern fn antfly_db_sql_describe_json(?*anyopaque, capi.Slice, *capi.Buffer) capi.ErrorCode;
+        extern fn antfly_db_sql_open_cursor_json(?*anyopaque, capi.Slice, *u64, *capi.Buffer) capi.ErrorCode;
+        extern fn antfly_db_sql_close_cursor(?*anyopaque, u64) capi.ErrorCode;
+    };
+    const read_request = capi.Slice.fromSlice("{\"statement\":\"SELECT id FROM parent\"}");
+    var description: capi.Buffer = .{};
+    defer freeRawBuffer(description.ptr, description.len);
+    try std.testing.expectEqual(capi.ErrorCode.ok, ReadApi.antfly_db_sql_describe_json(handle, read_request, &description));
+    {
+        const guard = public.enterHandle(handle, .exclusive).?;
+        defer guard.leave();
+        try std.testing.expectEqual(@as(usize, 1), guard.handle.embedded_tables.count());
+    }
+    var cursor: u64 = 0;
+    var response: capi.Buffer = .{};
+    defer freeRawBuffer(response.ptr, response.len);
+    try std.testing.expectEqual(capi.ErrorCode.ok, ReadApi.antfly_db_sql_open_cursor_json(handle, read_request, &cursor, &response));
+    defer _ = ReadApi.antfly_db_sql_close_cursor(handle, cursor);
+    {
+        const guard = public.enterHandle(handle, .exclusive).?;
+        defer guard.leave();
+        try std.testing.expectEqual(@as(usize, 1), guard.handle.embedded_tables.count());
+    }
+}
+
 test "capi SQL recovery stays clean across row writes reads and cursors" {
     const alloc = std.testing.allocator;
     var directory = try TestDirectory.init("capi-sql-recovery-cache");
@@ -5478,9 +5600,9 @@ test "capi SQL missing namespace forces coordinated catalog validation" {
     const guard = public.enterHandle(handle, .exclusive).?;
     defer guard.leave();
     var adapter = @import("antfly_local_sources").capi_sql.Adapter(antfly){ .handle = guard.handle, .db = &guard.handle.db, .table_name = "default" };
-    try std.testing.expect(!adapter.localRequiresCoordination());
+    try std.testing.expect(!try adapter.localRequiresCoordination());
     try guard.handle.embedded_table_errors.put(guard.handle.alloc, "broken", "InvalidSchema");
-    try std.testing.expect(adapter.localRequiresCoordination());
+    try std.testing.expect(try adapter.localRequiresCoordination());
     try std.testing.expectError(error.IntegrityCatalogUnavailable, adapter.localCatalog(alloc, 1));
 }
 
