@@ -1537,7 +1537,8 @@ pub const AntflyApiHandler = struct {
         try ctx.setHeader("content-type", resp.content_type);
         for (resp.headers) |header| try ctx.setHeader(header.name, header.value);
         if (resp.public_cors) try ctx.setHeader("Access-Control-Allow-Origin", "*");
-        _ = ctx.response.body(resp.body);
+        _ = ctx.response.bodyOwned(alloc, resp.body);
+        resp.body = &.{};
         return ctx.response.build();
     }
 
@@ -2689,7 +2690,7 @@ pub const AntflyApiHandler = struct {
             const hex = std.fmt.bytesToHex(digest, .lower);
             try ctx.setHeader("X-Antfly-Primary-Digest", &hex);
         }
-        return jsonResponse(ctx, 200, result.json);
+        return ownedJsonResponse(ctx, 200, &result.json, ctx.allocator);
     }
 
     fn internalJoinJobState(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
@@ -3292,18 +3293,14 @@ pub const AntflyApiHandler = struct {
         return null;
     }
 
-    fn internalQueryResponse(ctx: *httpx.Context, result: *const query_api.QueryResponse) !httpx.Response {
-        var arena_impl = std.heap.ArenaAllocator.init(ctx.allocator);
-        defer arena_impl.deinit();
-        const response = try std.json.parseFromSliceLeaky(metadata_openapi.QueryResponses, arena_impl.allocator(), result.json, .{
-            .allocate = .alloc_always,
-        });
+    fn internalQueryResponse(ctx: *httpx.Context, result: *query_api.QueryResponse) !httpx.Response {
+        try @import("query_response_validation.zig").validate(ctx.allocator, result.json);
         if (result.identity_read_generation) |generation| {
             var buf: [32]u8 = undefined;
             const value = try std.fmt.bufPrint(&buf, "{d}", .{generation});
             try ctx.setHeader(query_api.QueryResponse.identity_read_generation_header, value);
         }
-        return ctx.json(response);
+        return ownedJsonResponse(ctx, 200, &result.json, ctx.allocator);
     }
 
     fn internalGroupQuery(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
@@ -3847,6 +3844,14 @@ pub const AntflyApiHandler = struct {
             .DELETE => .DELETE,
             else => null,
         };
+    }
+
+    fn ownedJsonResponse(ctx: *httpx.Context, status: u16, body: *[]u8, owner: std.mem.Allocator) !httpx.Response {
+        _ = ctx.status(status);
+        try ctx.setHeader("content-type", "application/json");
+        _ = ctx.response.bodyOwned(owner, body.*);
+        body.* = &.{};
+        return ctx.response.build();
     }
 
     fn jsonResponse(ctx: *httpx.Context, status: u16, body: []const u8) !httpx.Response {
@@ -18884,4 +18889,21 @@ test "httpx retrieval read failures preserve retryable JSON and conflict status"
         try std.testing.expectEqual(@as(u32, 1000), parsed.value.retry_after_ms);
         try std.testing.expect(try AntflyApiHandler.respondRetrievalReadError(&ctx, error.InvalidRetrievalAgentRequest) == null);
     }
+}
+
+test "public graph metric borrowed wire owned HTTP responses keep buffers through transport teardown" {
+    const a = std.testing.allocator;
+    var owner: std.testing.FailingAllocator = .init(a, .{});
+    var request = try httpx.Request.init(a, .GET, "/");
+    defer request.deinit();
+    var context: httpx.Context = .init(a, std.testing.io, &request);
+    defer context.deinit();
+    var owned = contextual_operations.json(try owner.allocator().dupe(u8, "{\"source\":{\"value\":1}}"), false);
+    const address = @intFromPtr(owned.body.ptr);
+    var response = try AntflyApiHandler.respondOwnedContextualResponse(&context, &owned, owner.allocator());
+    defer response.deinit();
+    try std.testing.expectEqual(address, @intFromPtr(response.body.?.ptr));
+    try std.testing.expectEqual(@as(usize, 0), owner.freed_bytes);
+    response.releaseBody();
+    try std.testing.expectEqual(owner.allocated_bytes, owner.freed_bytes);
 }

@@ -20,7 +20,7 @@ const runtime_mod = @import("../background_runtime.zig");
 /// data preparation and publication fences; server upload policy is already
 /// supplied through its separate dispatcher.
 pub const Owner = struct {
-    pub const Work = enum { upload, baseline, producer, footprint, repair, column, index };
+    pub const Work = enum { upload, baseline, producer, footprint, repair, column, index, authority };
     pub const Activity = struct {
         artifacts: bool = false,
         producers: bool = false,
@@ -116,6 +116,11 @@ pub const Owner = struct {
             else => std.log.warn("artifact upload recovery failed: {s}", .{@errorName(err)}),
         };
         if (self.stopping.load(.acquire)) return;
+        _ = port.run(port.ptr, .authority) catch |err| switch (err) {
+            error.NotLeader, error.ReadOnly, error.Canceled, error.WriterLocked, error.OnlineSourcePinPending, error.ResourceBudgetExceeded, error.DocumentAuthorityCursorChanged, error.PortableRuntimeActivationPending => {},
+            else => std.log.warn("document authority cache migration failed: {s}", .{@errorName(err)}),
+        };
+        if (self.stopping.load(.acquire)) return;
         _ = port.run(port.ptr, .baseline) catch |err| blk: {
             port.failed(port.ptr, .baseline);
             switch (err) {
@@ -204,7 +209,7 @@ test "independent maintenance gates all work and yields activation contention" {
     try std.testing.expectEqual(@as(usize, 0), fixture.calls.items.len);
     fixture.admitted = true;
     owner.run(port);
-    try std.testing.expectEqualSlices(Owner.Work, &.{ .upload, .baseline, .producer, .footprint, .repair }, fixture.calls.items);
+    try std.testing.expectEqualSlices(Owner.Work, &.{ .upload, .authority, .baseline, .producer, .footprint, .repair }, fixture.calls.items);
     try std.testing.expectEqual(@as(u64, 0), owner.repair_retry_after_ns);
 }
 
