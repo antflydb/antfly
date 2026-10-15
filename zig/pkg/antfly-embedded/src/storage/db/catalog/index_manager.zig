@@ -6296,7 +6296,14 @@ pub const IndexManager = struct {
             } else text_requires_root = true;
         }
 
-        const dense_fields = try alloc.alloc(DenseFieldWritePlan, self.dense_indexes.items.len);
+        // External indexes own no source-field extraction work. Compile them
+        // out once so preparation neither parses fields nor allocates vectors
+        // for them on every document, including relational preparation.
+        var dense_field_count: usize = 0;
+        for (self.dense_indexes.items) |entry| if (!entry.external) {
+            dense_field_count += 1;
+        };
+        const dense_fields = try alloc.alloc(DenseFieldWritePlan, dense_field_count);
         var dense_initialized: usize = 0;
         errdefer {
             for (dense_fields[0..dense_initialized]) |field| {
@@ -6305,12 +6312,17 @@ pub const IndexManager = struct {
             }
             alloc.free(dense_fields);
         }
-        for (self.dense_indexes.items, 0..) |entry, i| {
-            dense_fields[i] = try WritePlanSnapshot.cloneDense(alloc, entry);
+        for (self.dense_indexes.items) |entry| {
+            if (entry.external) continue;
+            dense_fields[dense_initialized] = try WritePlanSnapshot.cloneDense(alloc, entry);
             dense_initialized += 1;
         }
 
-        const sparse_fields = try alloc.alloc(SparseFieldWritePlan, self.sparse_indexes.items.len);
+        var sparse_field_count: usize = 0;
+        for (self.sparse_indexes.items) |entry| if (!entry.external) {
+            sparse_field_count += 1;
+        };
+        const sparse_fields = try alloc.alloc(SparseFieldWritePlan, sparse_field_count);
         var sparse_initialized: usize = 0;
         errdefer {
             for (sparse_fields[0..sparse_initialized]) |field| {
@@ -6319,8 +6331,9 @@ pub const IndexManager = struct {
             }
             alloc.free(sparse_fields);
         }
-        for (self.sparse_indexes.items, 0..) |entry, i| {
-            sparse_fields[i] = try WritePlanSnapshot.cloneSparse(alloc, entry);
+        for (self.sparse_indexes.items) |entry| {
+            if (entry.external) continue;
+            sparse_fields[sparse_initialized] = try WritePlanSnapshot.cloneSparse(alloc, entry);
             sparse_initialized += 1;
         }
 
@@ -15070,6 +15083,7 @@ pub const IndexManager = struct {
         extracted: *mapper.ExtractedWrite,
     ) !void {
         for (self.dense_indexes.items) |entry| {
+            if (entry.external) continue;
             if (hasExplicitDenseEmbedding(extracted.dense_embeddings, entry.config.name)) continue;
             const vector = (try mapper.extractDenseVectorField(alloc, doc_value, entry.field_name, entry.dims)) orelse continue;
             var vector_owned = true;
@@ -15089,6 +15103,7 @@ pub const IndexManager = struct {
         }
 
         for (self.sparse_indexes.items) |entry| {
+            if (entry.external) continue;
             if (hasExplicitSparseEmbedding(extracted.sparse_embeddings, entry.config.name)) continue;
             var sparse_vec = (try mapper.extractSparseVectorField(alloc, doc_value, entry.field_name)) orelse continue;
             errdefer sparse_vec.deinit(alloc);
@@ -15118,6 +15133,7 @@ pub const IndexManager = struct {
         extracted: *mapper.ExtractedWrite,
     ) !void {
         for (self.dense_indexes.items) |entry| {
+            if (entry.external) continue;
             if (hasExplicitDenseEmbedding(extracted.dense_embeddings, entry.config.name)) continue;
             const vector = (try mapper.extractDenseVectorFieldFromPrepared(alloc, row, root, entry.field_name, entry.dims)) orelse continue;
             errdefer alloc.free(vector);
@@ -15133,6 +15149,7 @@ pub const IndexManager = struct {
         }
 
         for (self.sparse_indexes.items) |entry| {
+            if (entry.external) continue;
             if (hasExplicitSparseEmbedding(extracted.sparse_embeddings, entry.config.name)) continue;
             var sparse_vec = (try mapper.extractSparseVectorFieldFromParsed(alloc, root, entry.field_name)) orelse continue;
             errdefer sparse_vec.deinit(alloc);
@@ -15164,6 +15181,7 @@ pub const IndexManager = struct {
             try appendOwnedString(alloc, &fields, entry.field_name);
         }
         for (self.sparse_indexes.items) |entry| {
+            if (entry.external) continue;
             if (try parseSparseGeneratorConfig(alloc, entry.config.config_json)) |generator| {
                 generator.deinit(alloc);
                 continue;

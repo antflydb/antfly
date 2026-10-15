@@ -58,6 +58,17 @@ test "modernbert training attention Metal forward and packed gradient match the 
         // Several 256-key chunks, 64-wide heads, and a local window.
         .{ .attrs = .{ .batch = 1, .seq_len = 600, .num_heads = 2, .head_dim = 64, .window = 64 }, .lengths = &.{590} },
         .{ .attrs = .{ .batch = 2, .seq_len = 300, .num_heads = 2, .head_dim = 64 }, .lengths = &.{ 300, 120 } },
+        // Exercise the flash kernels (head_dim 64, a multiple of 8): row
+        // lengths that don't land on a 32-query/key tile boundary, three
+        // batch rows with different valid lengths, and global attention.
+        .{ .attrs = .{ .batch = 3, .seq_len = 97, .num_heads = 2, .head_dim = 64 }, .lengths = &.{ 97, 65, 31 } },
+        // A tight local window with a short valid prefix: padded queries far
+        // past the window from every valid key get the zero-output, -inf-lse
+        // row (the flash forward kernel's lrow==0 path).
+        .{ .attrs = .{ .batch = 2, .seq_len = 64, .num_heads = 2, .head_dim = 64, .window = 10 }, .lengths = &.{ 64, 20 } },
+        // Trunk/branch segments (two disjoint ranges per query) at head_dim
+        // 64, with padding past the valid length.
+        .{ .attrs = .{ .batch = 1, .seq_len = 128, .num_heads = 1, .head_dim = 64 }, .lengths = &.{100}, .segments = true },
     };
     for (cases) |case| {
         errdefer std.debug.print("case batch={d} seq={d} heads={d} dim={d} window={d}\n", .{ case.attrs.batch, case.attrs.seq_len, case.attrs.num_heads, case.attrs.head_dim, case.attrs.window });

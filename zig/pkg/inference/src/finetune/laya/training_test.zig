@@ -157,7 +157,8 @@ fn exerciseGradientParity(a: std.mem.Allocator, use_fused_attention: bool) !void
     backward_inputs[combined.len] = .{ .node_id = program.gradients.id_map[program.seed], .value = seed };
     var backward = try train.executeFramed(a, &program.gradients.graph, cb, backward_inputs);
     defer backward.deinit(cb);
-    if (trace) try compareTraces(scratch, root, &program, cb, backward.outputs[program.wrt.len..], "backward");
+    // Past the gradients and the forward logits.
+    if (trace) try compareTraces(scratch, root, &program, cb, backward.outputs[program.wrt.len + 1 ..], "backward");
     var worst: f32 = 0;
     var mismatches: usize = 0;
     var worst_relative: f64 = 0;

@@ -1773,6 +1773,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                         values_equal and
                         extracted_write.dense_embeddings.len == 0 and
                         extracted_write.sparse_embeddings.len == 0 and
+                        extracted_write.deleted_embedding_indexes.len == 0 and
                         extracted_write.graph_writes.len == 0 and
                         extracted_write.mentioned_graph_indexes.len == 0)
                     {

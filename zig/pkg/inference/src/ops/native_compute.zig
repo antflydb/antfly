@@ -4931,6 +4931,11 @@ pub const vtable_impl = ComputeBackend.VTable{
     .layerNorm = &layerNormOp,
     .layerNormConsumeInput = &layerNormConsumeInputOp,
     .layerNormBackward = &layerNormBackwardOp,
+    .ropeTable = &ropeTableOp,
+    .qkvRopeTable = &qkvRopeTableOp,
+    .dropoutMask = &dropoutMaskOp,
+    .geglu = &gegluOp,
+    .gegluBackward = &gegluBackwardOp,
     .rmsNorm = &rmsNormOp,
     .multiplyScalar = &multiplyScalarOp,
     .reshape2d = &reshape2dOp,
@@ -6843,6 +6848,61 @@ fn layerNormBackwardOp(ctx: *anyopaque, input: CT, gamma: CT, beta: CT, dy: CT, 
     @memcpy(packed_grads[rows * dim .. (rows + 1) * dim], grads.dgamma[0..dim]);
     @memcpy(packed_grads[(rows + 1) * dim .. (rows + 2) * dim], grads.dbeta[0..dim]);
     return self.makeBuf(packed_grads, true);
+}
+
+fn ropeTableOp(ctx: *anyopaque, input: CT, cos: CT, sin: CT, width: usize, head_dim: usize, inverse: bool) anyerror!CT {
+    const self: *NativeCompute = @ptrCast(@alignCast(ctx));
+    const x = getData(input);
+    const output = try self.allocator.alloc(f32, x.len);
+    errdefer self.allocator.free(output);
+    try ops.rope_table.apply(output, x, getData(cos), getData(sin), width, head_dim, inverse);
+    const result = try self.makeOwnedBuf(output);
+    errdefer freeTensor(self, result);
+    return propagateLogicalShapeLike(self, result, input);
+}
+
+fn dropoutMaskOp(ctx: *anyopaque, shape: []const i32, probability: f32, seed: u64) anyerror!CT {
+    const self: *NativeCompute = @ptrCast(@alignCast(ctx));
+    var count: usize = 1;
+    for (shape) |dim| count *= @intCast(dim);
+    const values = try self.allocator.alloc(f32, count);
+    defer self.allocator.free(values);
+    try ops.dropout_mask.fill(values, probability, seed);
+    return fromFloat32ShapeOp(ctx, values, shape);
+}
+
+fn qkvRopeTableOp(ctx: *anyopaque, input: CT, cos: CT, sin: CT, width: usize, head_dim: usize, inverse: bool) anyerror!CT {
+    const self: *NativeCompute = @ptrCast(@alignCast(ctx));
+    const x = getData(input);
+    const output = try self.allocator.alloc(f32, x.len);
+    errdefer self.allocator.free(output);
+    try ops.rope_table.applyQkv(output, x, getData(cos), getData(sin), width, head_dim, inverse);
+    const result = try self.makeOwnedBuf(output);
+    errdefer freeTensor(self, result);
+    const rows: i64 = @intCast(x.len / (3 * width));
+    return if (inverse) self.withLogicalShape(result, &.{ rows, @intCast(3 * width) }) else self.withLogicalShape(result, &.{ 3 * rows, @intCast(width) });
+}
+
+fn gegluOp(ctx: *anyopaque, input: CT, width: usize) anyerror!CT {
+    const self: *NativeCompute = @ptrCast(@alignCast(ctx));
+    const x = getData(input);
+    const output = try self.allocator.alloc(f32, x.len / 2);
+    errdefer self.allocator.free(output);
+    try ops.geglu.forward(output, x, width);
+    const result = try self.makeOwnedBuf(output);
+    errdefer freeTensor(self, result);
+    return self.withLogicalShape(result, &.{ @intCast(x.len / (2 * width)), @intCast(width) });
+}
+
+fn gegluBackwardOp(ctx: *anyopaque, input: CT, dout: CT, width: usize) anyerror!CT {
+    const self: *NativeCompute = @ptrCast(@alignCast(ctx));
+    const x = getData(input);
+    const output = try self.allocator.alloc(f32, x.len);
+    errdefer self.allocator.free(output);
+    try ops.geglu.backward(output, x, getData(dout), width);
+    const result = try self.makeOwnedBuf(output);
+    errdefer freeTensor(self, result);
+    return propagateLogicalShapeLike(self, result, input);
 }
 
 fn geluOp(ctx: *anyopaque, input: CT) anyerror!CT {

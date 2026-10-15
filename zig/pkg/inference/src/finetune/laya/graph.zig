@@ -18,6 +18,7 @@
 //! action head are not part of the typed-decision training objective.
 const std = @import("std");
 const ml = @import("ml").graph;
+const platform = @import("antfly_platform");
 const modern = @import("../../architectures/modern_bert.zig");
 const B = ml.Builder;
 const Id = ml.NodeId;
@@ -157,8 +158,15 @@ fn norm(b: *B, x: Id, prefix: []const u8, dim: u32, eps: f32, bias: bool) !Id {
         @memset(zeros, 0);
         break :blk try b.tensorConst(zeros, Shape.init(.f32, &.{dim}));
     };
-    const fused = try b.layerNorm(x, w, z, dim, eps);
-    return b.graph.node(fused).vjp_alternate;
+    return trainingLayerNorm(b, x, w, z, dim, eps);
+}
+/// With `fuse_layer_norm_backward` the fused node has no decomposition and
+/// autodiff differentiates it with one fused backward node; otherwise use the
+/// primitive decomposition.
+fn trainingLayerNorm(b: *B, x: Id, gamma: Id, beta: Id, dim: u32, eps: f32) !Id {
+    const fused = try b.layerNorm(x, gamma, beta, dim, eps);
+    const alternate = b.graph.node(fused).vjp_alternate;
+    return if (alternate == ml.null_node) fused else alternate;
 }
 fn drop(b: *B, built: *Built, x: Id, probability: f32) !Id {
     if (probability == 0) return x;
@@ -195,7 +203,10 @@ fn attention(b: *B, built: *Built, q: Id, k: Id, v: Id, bias: Id, l: Layout, h: 
 /// and `dropout_probability` are graph-time attributes; visibility (global,
 /// local, or tree-packed) lives in `control` (`Inputs.segment_control`).
 fn fusedAttention(b: *B, control: Id, q: Id, k: Id, v: Id, l: Layout, h: u32, d: u32, window: u32, dropout_stream_id: u64, dropout_probability: f32) !Id {
-    const qkv = try b.concat(try b.concat(q, k, 0), v, 0);
+    return fusedAttentionPlanar(b, control, try b.concat(try b.concat(q, k, 0), v, 0), l, h, d, window, dropout_stream_id, dropout_probability);
+}
+/// `fusedAttention` on QKV already in the planar [3*tokens, h*d] layout.
+fn fusedAttentionPlanar(b: *B, control: Id, qkv: Id, l: Layout, h: u32, d: u32, window: u32, dropout_stream_id: u64, dropout_probability: f32) !Id {
     const attrs = ml.SegmentTrainingAttentionAttrs{
         .batch = l.batch,
         .seq_len = l.sequence,
@@ -209,17 +220,29 @@ fn fusedAttention(b: *B, control: Id, q: Id, k: Id, v: Id, l: Layout, h: u32, d:
 }
 
 /// Split-half RoPE tables for `positions` (one logical position per token),
-/// laid out `[tokens * heads, d/2]` to match `rope`.
+/// laid out `[tokens * heads, d/2]` to match `rope`. Every head of a token
+/// shares one row, computed once and copied.
 pub fn ropeTables(a: std.mem.Allocator, positions: []const i64, h: u32, d: u32, theta: f32) ![2][]f32 {
-    const cosine = try a.alloc(f32, positions.len * h * (d / 2));
+    const half = d / 2;
+    const cosine = try a.alloc(f32, positions.len * h * half);
     errdefer a.free(cosine);
     const sine = try a.alloc(f32, cosine.len);
-    for (0..positions.len * h) |row| for (0..d / 2) |i| {
-        const pos = positions[row / h];
-        const angle = @as(f32, @floatFromInt(pos)) / std.math.pow(f32, theta, @as(f32, @floatFromInt(2 * i)) / @as(f32, @floatFromInt(d)));
-        cosine[row * (d / 2) + i] = @cos(angle);
-        sine[row * (d / 2) + i] = @sin(angle);
-    };
+    errdefer a.free(sine);
+    const denominators = try a.alloc(f32, half);
+    defer a.free(denominators);
+    for (denominators, 0..) |*value, i| value.* = std.math.pow(f32, theta, @as(f32, @floatFromInt(2 * i)) / @as(f32, @floatFromInt(d)));
+    for (positions, 0..) |pos, token| {
+        const first = token * h * half;
+        for (denominators, 0..) |denominator, i| {
+            const angle = @as(f32, @floatFromInt(pos)) / denominator;
+            cosine[first + i] = @cos(angle);
+            sine[first + i] = @sin(angle);
+        }
+        for (1..h) |head| {
+            @memcpy(cosine[first + head * half ..][0..half], cosine[first..][0..half]);
+            @memcpy(sine[first + head * half ..][0..half], sine[first..][0..half]);
+        }
+    }
     return .{ cosine, sine };
 }
 
@@ -227,6 +250,11 @@ pub fn ropeTables(a: std.mem.Allocator, positions: []const i64, h: u32, d: u32, 
 // layout and an exact VJP without depending on inference-only fused kernels.
 // Tables are runtime inputs because tree-packed rows restart positions.
 fn rope(b: *B, x: Id, tables: [2]Id, l: Layout, h: u32, d: u32) !Id {
+    // One fused rotation forward and one inverse rotation backward, instead
+    // of the slice/multiply/concat primitives below and their VJPs.
+    // ANTFLY_LAYA_DECOMPOSED_ROPE keeps the primitives, for bisecting.
+    if (!platform.env.getenvBool("ANTFLY_LAYA_DECOMPOSED_ROPE"))
+        return b.ropeTable(x, tables[0], tables[1], d);
     const n = l.batch * l.sequence * h;
     const c = tables[0];
     const s = tables[1];
@@ -320,21 +348,39 @@ pub fn buildWithAttention(b: *B, cfg: modern.Config, l: Layout, head_dropout: f3
         const qkv = try linear(b, &result, normalized, try std.fmt.bufPrint(&names, "{s}.attn.Wqkv", .{prefix}), n, h, h * 3, false, encoder_lora);
         const global = layer % cfg.global_attn_every_n_layers == 0;
         const tables = result.inputs.rope[if (global) 0 else 1];
-        const q = try rope(b, try b.sliceLastDim(qkv, 0, h), tables, l, nh, h / nh);
-        const k = try rope(b, try b.sliceLastDim(qkv, h, h * 2), tables, l, nh, h / nh);
-        const v = try b.sliceLastDim(qkv, h * 2, h * 3);
         const upper = layer >= fuse_from;
-        const attn = if (use_fused_attention)
-            try fusedAttention(b, if (upper) result.inputs.upper_segment_control else result.inputs.segment_control, q, k, v, l, nh, h / nh, if (global) std.math.maxInt(u32) else cfg.local_attention_window / 2, @as(u64, layer), 0)
-        else
-            try attention(b, &result, q, k, v, if (upper)
-                (if (global) result.inputs.upper_encoder_bias else result.inputs.upper_local_bias)
-            else if (global) result.inputs.encoder_bias else result.inputs.local_bias, l, nh, h / nh, 0);
+        const control = if (upper) result.inputs.upper_segment_control else result.inputs.segment_control;
+        const window = if (global) std.math.maxInt(u32) else cfg.local_attention_window / 2;
+        // Fused attention reads planar QKV: one op rotates Q and K and lays
+        // out all three, instead of three slices, two rotations and two
+        // concats (and their VJPs) per layer.
+        const planar = use_fused_attention and !platform.env.getenvBool("ANTFLY_LAYA_DECOMPOSED_ROPE");
+        const attn = if (planar)
+            try fusedAttentionPlanar(b, control, try b.qkvRopeTable(qkv, tables[0], tables[1], h / nh), l, nh, h / nh, window, @as(u64, layer), 0)
+        else blk: {
+            const q = try rope(b, try b.sliceLastDim(qkv, 0, h), tables, l, nh, h / nh);
+            const k = try rope(b, try b.sliceLastDim(qkv, h, h * 2), tables, l, nh, h / nh);
+            const v = try b.sliceLastDim(qkv, h * 2, h * 3);
+            break :blk if (use_fused_attention)
+                try fusedAttention(b, control, q, k, v, l, nh, h / nh, window, @as(u64, layer), 0)
+            else
+                try attention(b, &result, q, k, v, if (upper)
+                    (if (global) result.inputs.upper_encoder_bias else result.inputs.upper_local_bias)
+                else if (global) result.inputs.encoder_bias else result.inputs.local_bias, l, nh, h / nh, 0);
+        };
         x = try b.add(x, try linear(b, &result, attn, try std.fmt.bufPrint(&names, "{s}.attn.Wo", .{prefix}), n, h, h, false, encoder_lora));
         const normed = try norm(b, x, try std.fmt.bufPrint(&names, "{s}.mlp_norm", .{prefix}), h, cfg.layer_norm_eps, false);
         const up = try linear(b, &result, normed, try std.fmt.bufPrint(&names, "{s}.mlp.Wi", .{prefix}), n, h, cfg.intermediate_size * 2, false, encoder_lora);
-        const gate = try b.geluExact(try b.sliceLastDim(up, 0, cfg.intermediate_size));
-        const product = try b.mul(gate, try b.sliceLastDim(up, cfg.intermediate_size, cfg.intermediate_size * 2));
+        // One fused GeGLU node forward and backward instead of two slices, a
+        // GELU and a multiply (whose VJPs pad back to the full width).
+        // ANTFLY_LAYA_DECOMPOSED_GEGLU keeps the primitives, for bisecting.
+        const product = if (!platform.env.getenvBool("ANTFLY_LAYA_DECOMPOSED_GEGLU"))
+            try b.geglu(up, cfg.intermediate_size)
+        else
+            try b.mul(
+                try b.geluExact(try b.sliceLastDim(up, 0, cfg.intermediate_size)),
+                try b.sliceLastDim(up, cfg.intermediate_size, cfg.intermediate_size * 2),
+            );
         x = try b.add(x, try linear(b, &result, product, try std.fmt.bufPrint(&names, "{s}.mlp.Wo", .{prefix}), n, cfg.intermediate_size, h, false, encoder_lora));
         try result.trace(b.graph.allocator, prefix, x);
     }
@@ -382,8 +428,8 @@ pub fn buildWithAttention(b: *B, cfg: modern.Config, l: Layout, head_dropout: f3
         const norm_w = try param(b, "pointer.norm", "weight", &.{h});
         const norm_b = try param(b, "pointer.norm", "bias", &.{h});
         const anchor_rows = try b.gather(x, result.inputs.anchors, Shape.init(.f32, &.{ l.questions * l.options, h }));
-        const anchor = b.graph.node(try b.layerNorm(anchor_rows, norm_w, norm_b, h, 1e-5)).vjp_alternate;
-        const options = b.graph.node(try b.layerNorm(m, norm_w, norm_b, h, 1e-5)).vjp_alternate;
+        const anchor = try trainingLayerNorm(b, anchor_rows, norm_w, norm_b, h, 1e-5);
+        const options = try trainingLayerNorm(b, m, norm_w, norm_b, h, 1e-5);
         const q = try linear(b, &result, anchor, "pointer.q", l.questions * l.options, h, p, true, null);
         const k = try linear(b, &result, options, "pointer.k", l.questions * l.options, h, p, true, null);
         const product = try b.mul(q, k);
