@@ -232,6 +232,9 @@ from .doc_id_query import DocIdQuery
 from .document_artifact_child_range import DocumentArtifactChildRange
 from .document_artifact_manifest import DocumentArtifactManifest
 from .document_artifact_manifest_list import DocumentArtifactManifestList
+from .document_artifact_publication_failed_error import DocumentArtifactPublicationFailedError
+from .document_artifact_publication_failed_error_code import DocumentArtifactPublicationFailedErrorCode
+from .document_artifact_publication_failed_error_error import DocumentArtifactPublicationFailedErrorError
 from .document_artifact_reprocess_failure import DocumentArtifactReprocessFailure
 from .document_artifact_reprocess_job import DocumentArtifactReprocessJob
 from .document_artifact_reprocess_job_phase import DocumentArtifactReprocessJobPhase
@@ -1742,6 +1745,9 @@ __all__ = (
     "DocumentArtifactChildRange",
     "DocumentArtifactManifest",
     "DocumentArtifactManifestList",
+    "DocumentArtifactPublicationFailedError",
+    "DocumentArtifactPublicationFailedErrorCode",
+    "DocumentArtifactPublicationFailedErrorError",
     "DocumentArtifactReprocessFailure",
     "DocumentArtifactReprocessJob",
     "DocumentArtifactReprocessJobPhase",

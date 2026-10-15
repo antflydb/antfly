@@ -16,6 +16,7 @@
 //! Independent local source owner of the public embedded C API.
 pub const antfly_sources = @import("source_owner_storage.zig");
 pub const runtime_impl = @import("capi_embedded_root.zig");
+pub const storage_engine = @import("storage/engine.zig");
 pub const capi = @import("capi/db.zig");
 comptime {
     _ = capi;

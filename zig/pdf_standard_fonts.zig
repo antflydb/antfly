@@ -15,3 +15,6 @@
 
 pub const regular = @embedFile("lib/pdf/fonts/roboto/Roboto-Regular.ttf");
 pub const bold = @embedFile("lib/pdf/fonts/roboto/Roboto-Bold.ttf");
+
+/// Inline fallback for targets without a native immutable-data archive.
+pub const glyphCodepoints = @import("lib/pdf/src/agl_lookup.zig").codepoints;

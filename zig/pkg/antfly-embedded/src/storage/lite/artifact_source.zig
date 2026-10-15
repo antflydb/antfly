@@ -236,7 +236,8 @@ pub const Registry = struct {
         defer a.free(marker_name);
         const marker_path = try std.fs.path.join(a, &.{ std.fs.path.dirname(self.path) orelse ".", marker_name });
         errdefer a.free(marker_path);
-        const marker: ?std.Io.File = if (owner.read_only) null else try self.createMarker(marker_path);
+        const reader_fenced = owner.read_only or owner.artifact_reader_fence;
+        const marker: ?std.Io.File = if (reader_fenced) null else try self.createMarker(marker_path);
         errdefer if (marker) |file| {
             file.close(runtime);
             std.Io.Dir.cwd().deleteFile(runtime, marker_path) catch {};
@@ -244,12 +245,12 @@ pub const Registry = struct {
         // Writable roots are protected by the catalog reference. Read-only
         // sources use the established external-reader lock, since they cannot
         // publish a lease and external writers must not reuse their pages.
-        var reader = try native.NativeFile.openWithIo(a, runtime, self.path, .{ .read_only = true, .internal_reader = !owner.read_only, .no_sync = true });
+        var reader = try native.NativeFile.openWithIo(a, runtime, self.path, .{ .read_only = true, .internal_reader = !reader_fenced, .no_sync = true });
         errdefer reader.close();
         reader.page_cache_enabled.store(false, .monotonic);
         var capture = Capture{ .allocator = a, .key = key, .lease_key = lease_key };
         errdefer capture.value.deinit(a);
-        if (owner.read_only) {
+        if (reader_fenced) {
             capture.checkpoint = reader.activeCheckpoint();
             capture.value = try reader.openIndexValue(a, key, capture.checkpoint);
         } else try owner.submitMutation(&capture, Capture.apply);

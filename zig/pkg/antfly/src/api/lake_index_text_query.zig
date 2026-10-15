@@ -417,10 +417,10 @@ const Execution = struct {
         if (self.overlay != null or self.active_recent) return null;
         if (self.vector_include_provider) |provider| if (provider.complete == null) return null;
         if (self.vector_exclude_provider) |provider| if (provider.complete == null) return null;
-        const translate = lookup.native_range orelse return null;
+        if (lookup.native_range == null) return null;
         var result: types.SparseOrdinalSelection = .{ .include = .init(a) };
         errdefer result.deinit();
-        if (!try translate(lookup.ptr, a, first, last, .{ .ptr = self, .allows = allowsVectorKey }, &result.include.?)) {
+        if (!try lookup.nativeRange(a, first, last, .{ .ptr = self, .allows = allowsVectorKey }, &result.include.?)) {
             result.deinit();
             return null;
         }
@@ -444,14 +444,14 @@ const Execution = struct {
                 defer selection.deinit();
                 if (subtract) |exclude| if (exclude.files.getPtr(file.key_ptr.*)) |excluded_blocks| if (excluded_blocks.getPtr(block.key_ptr.*)) |excluded| selection.andNotWith(excluded);
                 if (selection.isEmpty()) continue;
-                if (!points_only) if (lookup.bounded_block) |translate| {
-                    if (try translate(lookup.ptr, a, bytes_prefix, block.key_ptr.high, &selection, &result, work)) continue;
+                if (!points_only) if (lookup.bounded_block != null) {
+                    if (try lookup.boundedBlock(a, bytes_prefix, block.key_ptr.high, &selection, &result, work)) continue;
                 } else {
                     // A legacy block callback is safe only for a small mask.
                     // Broad generations require the work-accounted directory.
                     if (selection.cardinality() <= work.points) {
                         try work.takeBlock();
-                        if (try lookup.block(lookup.ptr, a, bytes_prefix, block.key_ptr.high, &selection, &result)) {
+                        if (try lookup.lookupBlock(a, bytes_prefix, block.key_ptr.high, &selection, &result)) {
                             work.points -= selection.cardinality();
                             continue;
                         }
@@ -465,7 +465,7 @@ const Execution = struct {
                     const row = (@as(u64, block.key_ptr.high) << 32) | low;
                     var key: [96]u8 = undefined;
                     const bytes = try std.fmt.bufPrint(&key, "lake2:{s}:{x:0>8}:{x:0>16}", .{ digest, block.key_ptr.group, row });
-                    if (try lookup.one(lookup.ptr, bytes)) |num| try result.add(num);
+                    if (try lookup.lookupOne(bytes)) |num| try result.add(num);
                 }
             }
         }
@@ -2397,7 +2397,7 @@ test "external lake sparse predicate planning defers exhausted masks to exact na
             while (row <= last) : (row += 1) {
                 var key: [96]u8 = undefined;
                 const encoded = try std.fmt.bufPrint(&key, "lake2:{s}:00000000:{x:0>16}", .{ @as([64]u8, @splat('0')), row });
-                if (try filter.allows(filter.ptr, encoded)) try result.add(row);
+                if (try filter.allowsKey(encoded)) try result.add(row);
             }
             return true;
         }
