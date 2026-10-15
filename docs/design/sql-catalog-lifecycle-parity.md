@@ -7850,3 +7850,28 @@ the cause, and the checks passed with host access. Existing outbox regressions
 passed, but install-specific primary outbox publication/fault coverage and the
 distributed authorization/ACK/release workflow still require qualification.
 No throughput result, public activation or new original-case credit is claimed.
+
+### Native installation primary outbox fault qualification
+
+The existing native test publisher and physical fixture seeding are shared by
+control and install tests. The real-LSM installation fixture now commits through
+the primary DB adapter with synchronous durable mirroring, deliberately fails
+publication, and verifies the schema/catalog/installed cut remain committed
+with exactly one durable outbox obligation and no installed receipt. The source
+fence remains held. No direct nondurable publisher path is accepted.
+
+After restart, successful outbox recovery publishes the identical payload and
+drains the obligation. An installed retry returns the original logical cut and
+receipt without republishing, advancing native time or changing the schema
+generation. The captured primary payload, rather than only a constructed frame,
+is replayed on the standby fixture, including duplicate/reopen/wrong-cut checks.
+The shared publisher also checks that completion can acquire its checkpoint
+barrier; no replication mutation lease survives into completion waiting.
+
+`/private/tmp/antfly-index-install-primary-debug.log` passed the focused 56/56
+Debug build steps, including 11 native lifecycle/outbox tests, 14 candidate
+tests and 46 runtime contracts. Production code is unchanged from the preceding
+159/159-qualified shared-install milestone. This is local storage/replication
+fault coverage with synthetic metadata authority, not distributed metadata/root
+authorization, installed ACK/release qualification or public SQL activation.
+No original-case credit or throughput improvement is claimed.

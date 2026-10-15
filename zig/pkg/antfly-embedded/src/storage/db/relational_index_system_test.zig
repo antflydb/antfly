@@ -59,6 +59,70 @@ test {
     _ = @import("antfly_server_test_sources").local_test_sources.storage_retained_read_registry;
 }
 
+const TestNativeIndexPublisher = struct {
+    const contract = @import("replication_contract.zig");
+    const outboxes = @import("durable_outbox.zig");
+    const Barrier = @import("antfly_runtime_abi").mutation_barrier.MutationBarrier;
+    fail: bool = true,
+    payload: ?[]u8 = null,
+    attempts: usize = 0,
+    completed: usize = 0,
+    barrier: *Barrier,
+    lsn: u64 = 2,
+
+    fn next(ptr: *anyopaque) u64 {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        return self.lsn;
+    }
+    fn identity(_: *anyopaque) contract.Publisher.Identity {
+        return .{ .table_id = 101, .shard_id = 11, .timeline_id = 1, .epoch = 1 };
+    }
+    fn publish(_: contract.AsyncEffectMirror, _: outboxes.Kind, _: []const u8, _: @import("doc_identity.zig").Namespace) !u64 {
+        return error.UnexpectedNonDurablePublication;
+    }
+    fn recover(mirror: contract.AsyncEffectMirror, kind: outboxes.Kind, pending: outboxes.DurableReplicationOutbox, _: @import("doc_identity.zig").Namespace) !u64 {
+        const self: *@This() = @ptrCast(@alignCast(mirror.publisher.ptr));
+        try std.testing.expectEqual(outboxes.Kind.restore_batch, kind);
+        try std.testing.expectEqual(self.lsn, pending.from_lsn);
+        if (self.payload) |previous| {
+            try std.testing.expectEqualSlices(u8, previous, pending.payload);
+        } else self.payload = try alloc.dupe(u8, pending.payload);
+        self.attempts += 1;
+        if (self.fail) return error.TestPublicationUnavailable;
+        return pending.from_lsn;
+    }
+    fn preflight(_: contract.AsyncEffectMirror, _: bool) !void {}
+    fn complete(mirror: contract.AsyncEffectMirror, _: u64) !void {
+        const self: *@This() = @ptrCast(@alignCast(mirror.publisher.ptr));
+        // Checkpoint capture must not be blocked by a lease held while
+        // waiting for standby acknowledgement.
+        var capture = self.barrier.tryAcquireExclusive() orelse return error.CheckpointCaptureBlockedByCompletionWait;
+        capture.release();
+        self.completed += 1;
+    }
+    fn asMirror(self: *@This()) contract.AsyncBatchMirror {
+        return .{
+            .publisher = .{ .ptr = self, .vtable = &.{ .next_lsn = next, .identity = identity, .publish = publish, .recover = recover, .preflight = preflight, .complete = complete } },
+            .mutation_barrier = self.barrier,
+            .requirements = .{ .synchronous = true, .durable_outbox = true, .preflight = true },
+        };
+    }
+};
+
+/// Test-only physical fixture seeding. Never use application mutation capture
+/// to mix restored rows and source-control records; no identity/audit files copy.
+fn seedNativeIndexFixture(source: *db_mod.DB, destination: *db_mod.DB) !void {
+    var read = try source.core.store.beginReadTxn();
+    defer read.abort();
+    var cursor = try read.openCursor();
+    defer cursor.close();
+    var txn = try destination.core.store.runtime_store.beginWrite();
+    errdefer txn.abort();
+    var item = try cursor.first();
+    while (item) |entry| : (item = try cursor.next()) try txn.put(entry.key, entry.value);
+    try txn.commit();
+}
+
 test "relational index build pages native owner control preserves committed cuts through standby replay and reopen" {
     const api = @import("../../schema/mod.zig");
     const compiler = @import("../../schema/relational_declarations.zig");
@@ -67,56 +131,9 @@ test "relational index build pages native owner control preserves committed cuts
     const jobs = @import("relational_index_owner_job.zig");
     const effects = @import("replication_effects.zig");
     const authority = @import("../source_authority.zig");
-    const contract = @import("replication_contract.zig");
-    const outboxes = @import("durable_outbox.zig");
     const outbox_store = @import("durable_outbox_store.zig");
     const Barrier = @import("antfly_runtime_abi").mutation_barrier.MutationBarrier;
-    const Publisher = struct {
-        fail: bool = true,
-        payload: ?[]u8 = null,
-        attempts: usize = 0,
-        completed: usize = 0,
-        barrier: *Barrier,
-        lsn: u64 = 2,
-
-        fn next(ptr: *anyopaque) u64 {
-            const self: *@This() = @ptrCast(@alignCast(ptr));
-            return self.lsn;
-        }
-        fn identity(_: *anyopaque) contract.Publisher.Identity {
-            return .{ .table_id = 101, .shard_id = 11, .timeline_id = 1, .epoch = 1 };
-        }
-        fn publish(_: contract.AsyncEffectMirror, _: outboxes.Kind, _: []const u8, _: @import("doc_identity.zig").Namespace) !u64 {
-            return error.UnexpectedNonDurablePublication;
-        }
-        fn recover(mirror: contract.AsyncEffectMirror, kind: outboxes.Kind, pending: outboxes.DurableReplicationOutbox, _: @import("doc_identity.zig").Namespace) !u64 {
-            const self: *@This() = @ptrCast(@alignCast(mirror.publisher.ptr));
-            try std.testing.expectEqual(outboxes.Kind.restore_batch, kind);
-            try std.testing.expectEqual(self.lsn, pending.from_lsn);
-            if (self.payload) |previous| {
-                try std.testing.expectEqualSlices(u8, previous, pending.payload);
-            } else self.payload = try alloc.dupe(u8, pending.payload);
-            self.attempts += 1;
-            if (self.fail) return error.TestPublicationUnavailable;
-            return pending.from_lsn;
-        }
-        fn preflight(_: contract.AsyncEffectMirror, _: bool) !void {}
-        fn complete(mirror: contract.AsyncEffectMirror, _: u64) !void {
-            const self: *@This() = @ptrCast(@alignCast(mirror.publisher.ptr));
-            // Checkpoint capture must not be blocked by a lease held while
-            // waiting for standby acknowledgement.
-            var capture = self.barrier.tryAcquireExclusive() orelse return error.CheckpointCaptureBlockedByCompletionWait;
-            capture.release();
-            self.completed += 1;
-        }
-        fn asMirror(self: *@This()) contract.AsyncBatchMirror {
-            return .{
-                .publisher = .{ .ptr = self, .vtable = &.{ .next_lsn = next, .identity = identity, .publish = publish, .recover = recover, .preflight = preflight, .complete = complete } },
-                .mutation_barrier = self.barrier,
-                .requirements = .{ .synchronous = true, .durable_outbox = true, .preflight = true },
-            };
-        }
-    };
+    const Publisher = TestNativeIndexPublisher;
     const before =
         \\{"version":1,"storage_mode":"relational","default_type":"row","checks":[{"name":"positive","column":"id","op":"gt","value":0}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"integer"},"email":{"type":"string"}},"additionalProperties":false}}}}
     ;
@@ -2328,20 +2345,7 @@ test "relational index build pages identity dispatch caches immutable candidates
                     var installed_db = try db_mod.DB.open(alloc, install_directory.path(), options);
                     var installed_db_open = true;
                     defer if (installed_db_open) installed_db.close();
-                    {
-                        var source_read = try db.core.store.beginReadTxn();
-                        defer source_read.abort();
-                        var source_cursor = try source_read.openCursor();
-                        defer source_cursor.close();
-                        // Seed physical fixture state without interpreting it
-                        // as one application mutation containing both producer
-                        // rows and retention/source-authority controls.
-                        var destination_txn = try installed_db.core.store.runtime_store.beginWrite();
-                        errdefer destination_txn.abort();
-                        var entry = try source_cursor.first();
-                        while (entry) |item| : (entry = try source_cursor.next()) try destination_txn.put(item.key, item.value);
-                        try destination_txn.commit();
-                    }
+                    try seedNativeIndexFixture(&db, &installed_db);
                     installed_db.close();
                     installed_db_open = false;
                     installed_db = try db_mod.DB.open(alloc, install_directory.path(), options);
@@ -2389,12 +2393,85 @@ test "relational index build pages identity dispatch caches immutable candidates
                     }
                     install_schema.deinit();
                     install_schema_owned = false;
+                    var install_primary_directory = try @import("../../common/test_directory.zig").TestDirectory.init("native-index-install-primary-outbox");
+                    defer install_primary_directory.cleanup();
+                    var install_primary = try db_mod.DB.open(alloc, install_primary_directory.path(), options);
+                    var install_primary_open = true;
+                    defer if (install_primary_open) install_primary.close();
+                    try seedNativeIndexFixture(&db, &install_primary);
+                    install_primary.close();
+                    install_primary_open = false;
+                    install_primary = try db_mod.DB.open(alloc, install_primary_directory.path(), options);
+                    install_primary_open = true;
+                    var install_barrier: @import("antfly_runtime_abi").mutation_barrier.MutationBarrier = .{};
+                    var install_publisher: TestNativeIndexPublisher = .{ .barrier = &install_barrier, .lsn = 5 };
+                    defer if (install_publisher.payload) |bytes| alloc.free(bytes);
+                    defer if (install_primary_open) {
+                        install_primary.local_execution.replication_async_batch_mirror = null;
+                    };
+                    install_primary.local_execution.replication_async_batch_mirror = install_publisher.asMirror();
+                    const pending_install = pending_install: {
+                        var primary_prepared = try install_primary.prepareNativeIndexOwnerInstallation(install_command, .{});
+                        defer primary_prepared.deinit();
+                        break :pending_install try install_primary.applyPreparedNativeIndexOwnerInstallation(&primary_prepared, null);
+                    };
+                    try pending_install.validate();
+                    try std.testing.expect(!pending_install.duplicate and pending_install.replication_pending);
+                    try std.testing.expect(pending_install.receipt == null);
+                    try std.testing.expectEqualStrings("TestPublicationUnavailable", pending_install.error_name.?);
+                    try std.testing.expectEqual(@as(usize, 1), install_publisher.attempts);
+                    try std.testing.expectEqual(@as(usize, 0), install_publisher.completed);
+                    try std.testing.expectEqual(@as(u32, 2), install_primary.core.schema.?.version);
+                    try std.testing.expectEqual(@as(u32, 2), install_primary.core.table_catalog.active_schema_version);
+                    {
+                        var install_pending_page = try @import("durable_outbox_store.zig").readPending(alloc, install_primary.core.store);
+                        defer install_pending_page.deinit(alloc);
+                        try std.testing.expectEqual(@as(usize, 1), install_pending_page.entries.len);
+                        var primary_read = try install_primary.core.store.beginReadTxn();
+                        defer primary_read.abort();
+                        const primary_installed = (try Verification.Installed.load(alloc, &primary_read, binding)).?;
+                        try primary_installed.requireCurrent(alloc, &primary_read);
+                        try std.testing.expectEqual(pending_install.position, primary_installed.position);
+                    }
+                    install_primary.local_execution.replication_async_batch_mirror = null;
+                    install_primary.close();
+                    install_primary_open = false;
+                    install_primary = try db_mod.DB.open(alloc, install_primary_directory.path(), options);
+                    install_primary_open = true;
+                    install_publisher.fail = false;
+                    install_primary.local_execution.replication_async_batch_mirror = install_publisher.asMirror();
+                    try install_primary.flushDurableReplicationOutboxes();
+                    try std.testing.expectEqual(@as(usize, 2), install_publisher.attempts);
+                    try std.testing.expectEqual(@as(usize, 1), install_publisher.completed);
+                    {
+                        var recovered_page = try @import("durable_outbox_store.zig").readPending(alloc, install_primary.core.store);
+                        defer recovered_page.deinit(alloc);
+                        try std.testing.expect(recovered_page.isEmpty());
+                    }
+                    const primary_catalog_generation = install_primary.core.table_catalog.generation;
+                    {
+                        var recovered_install = try install_primary.prepareNativeIndexOwnerInstallation(install_command, .{});
+                        defer recovered_install.deinit();
+                        const recovered_outcome = try install_primary.applyPreparedNativeIndexOwnerInstallation(&recovered_install, null);
+                        try recovered_outcome.validate();
+                        try std.testing.expect(recovered_outcome.duplicate and !recovered_outcome.replication_pending);
+                        try std.testing.expectEqual(pending_install.position, recovered_outcome.position);
+                        try std.testing.expectEqualDeep(try install_command.receipt(pending_install.position), recovered_outcome.receipt.?);
+                    }
+                    try std.testing.expectEqual(@as(usize, 2), install_publisher.attempts);
+                    try std.testing.expectEqual(primary_catalog_generation, install_primary.core.table_catalog.generation);
+                    {
+                        var recovered_read = try install_primary.core.store.beginReadTxn();
+                        defer recovered_read.abort();
+                        try std.testing.expectEqual(pending_install.position.sequence, (try authority.load(&recovered_read)).?.sequence);
+                    }
                     var install_packet: native.PreparedInstall = .{ .alloc = alloc, .command = install_command };
                     defer install_packet.deinit();
                     try install_packet.preparePayload();
                     const installed_position: @import("receipt_position.zig").Native = .{ .namespace = binding.fence.namespace, .sequence = sequence + 2 };
                     const install_payload = try install_packet.finalizePayload(installed_position);
-                    var install_record: @import("replication_record.zig").Record = .{ .kind = .batch_mutation, .payload_codec = .json, .cluster_id = 1, .timeline_id = 1, .epoch = 1, .lsn = 5, .previous_lsn = 4, .payload = install_payload };
+                    try std.testing.expectEqualSlices(u8, install_payload, install_publisher.payload.?);
+                    var install_record: @import("replication_record.zig").Record = .{ .kind = .batch_mutation, .payload_codec = .json, .cluster_id = 1, .timeline_id = 1, .epoch = 1, .lsn = 5, .previous_lsn = 4, .payload = install_publisher.payload.? };
                     {
                         var pinned_before = installed_db.core.schema_registry.acquire().?;
                         defer pinned_before.release();
