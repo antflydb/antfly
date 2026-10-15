@@ -204,6 +204,7 @@ test {
     _ = @import("ops/deberta_training_attention_device_test.zig");
     _ = @import("ops/modernbert_training_attention.zig");
     _ = @import("ops/modernbert_training_attention_device_test.zig");
+    _ = @import("ops/segment_training_attention_device_test.zig");
     _ = @import("graph/recomputed_training_test.zig");
     _ = @import("finetune/gliner/boundary_replay_bindings.zig");
     _ = @import("finetune/gliner/boundary_recomputed_graph.zig");
