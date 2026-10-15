@@ -2960,7 +2960,7 @@ def test_native_remote_indexed_metadata_predicates_above_id_list_limit(tmp_path)
                 == {"value": expected, "relation": "exact"}
             )
         # More than 4,096 matching rows can still occupy a small pack range.
-        # Compare compressed admission with an equivalent authoritative filter
+        # Compare lazy indexed admission with an equivalent authoritative filter
         # whose required-condition proof deliberately cannot be extracted.
         large_range = {"range": {"path": "/amount", "gte": count - 10000}}
         ranged_native = query(large_range, profile=True)
@@ -4829,7 +4829,7 @@ def test_broad_native_text_windows_preserve_scores_ties_counts_and_hydration(
                 "bounded_global_text_frontier"
             ), profiled
             # Pattern admission uses the global vocabulary and routing summaries,
-            # while the baseline oracle forces independent complete admission.
+            # with equivalent Boolean lowering for score and result comparisons.
             for pattern in (
                 {"prefix": "navquasa", "field": "body"},
                 {"wildcard": "navquasa?", "field": "body"},

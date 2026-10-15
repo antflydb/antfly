@@ -18,14 +18,21 @@ const std = @import("std");
 const tree = @import("../serverless/graph_segment/page_tree.zig");
 const A = std.mem.Allocator;
 const Bounds = struct { lower: []const u8, upper: []const u8 };
-fn decode(bytes: []const u8) !Bounds {
+fn decode(bytes: []const u8) !?Bounds {
     if (bytes.len < 12 or !std.mem.eql(u8, bytes[0..4], "LPR1")) return error.InvalidNativeLakeRowIndex;
     const n = std.mem.readInt(u32, bytes[4..8], .big);
     const m = std.mem.readInt(u32, bytes[8..12], .big);
-    if (n < 16 or m < 16 or n > tree.max_key_bytes or m > tree.max_key_bytes or @as(u64, n) + m + 12 != bytes.len) return error.InvalidNativeLakeRowIndex;
+    if (n == 0 and m == 0 and bytes.len == 12) return null;
+    if (n == 0 or m == 0 or bytes.len > tree.max_aggregate_bytes or @as(u64, n) + m + 12 != bytes.len) return error.InvalidNativeLakeRowIndex;
     const result: Bounds = .{ .lower = bytes[12..][0..n], .upper = bytes[12 + n ..] };
     if (std.mem.order(u8, result.lower, result.upper) == .gt) return error.InvalidNativeLakeRowIndex;
     return result;
+}
+fn unknown(a: A) ![]u8 {
+    const bytes = try a.alloc(u8, 12);
+    @memcpy(bytes[0..4], "LPR1");
+    @memset(bytes[4..], 0);
+    return bytes;
 }
 pub fn reduce(a: A, entries: []const tree.Entry, height: u8) ![]u8 {
     var result: ?Bounds = null;
@@ -33,19 +40,33 @@ pub fn reduce(a: A, entries: []const tree.Entry, height: u8) ![]u8 {
         const bounds: Bounds = if (height == 0) leaf: {
             if (entry.key.len < 32 or !std.mem.eql(u8, entry.key[0..16], entry.key[entry.key.len - 16 ..])) return error.InvalidNativeLakeRowIndex;
             break :leaf .{ .lower = entry.key[16..], .upper = entry.key[16..] };
-        } else if (entry.aggregate.len == 0) return a.alloc(u8, 0) else try decode(entry.aggregate);
+        } else if (entry.aggregate.len == 0) return unknown(a) else (try decode(entry.aggregate)) orelse return unknown(a);
         if (result) |*value| {
             if (std.mem.order(u8, bounds.lower, value.lower) == .lt) value.lower = bounds.lower;
             if (std.mem.order(u8, bounds.upper, value.upper) == .gt) value.upper = bounds.upper;
         } else result = bounds;
     }
     const value = result orelse return error.InvalidNativeLakeRowIndex;
-    const bytes = try a.alloc(u8, 12 + value.lower.len + value.upper.len);
+    // Long logical keys must not enlarge the authenticated page reduction.
+    // A lower prefix is <= its full key; the successor of an upper prefix is
+    // > every key starting with that prefix. No successor means unknown.
+    const prefix_bytes = (tree.max_aggregate_bytes - 12) / 2;
+    const lower = value.lower[0..@min(prefix_bytes, value.lower.len)];
+    var upper_buffer: [prefix_bytes]u8 = undefined;
+    const upper: []const u8 = if (value.upper.len <= prefix_bytes) value.upper else block: {
+        @memcpy(&upper_buffer, value.upper[0..prefix_bytes]);
+        var length = upper_buffer.len;
+        while (length != 0 and upper_buffer[length - 1] == 255) length -= 1;
+        if (length == 0) return unknown(a);
+        upper_buffer[length - 1] += 1;
+        break :block upper_buffer[0..length];
+    };
+    const bytes = try a.alloc(u8, 12 + lower.len + upper.len);
     @memcpy(bytes[0..4], "LPR1");
-    std.mem.writeInt(u32, bytes[4..8], @intCast(value.lower.len), .big);
-    std.mem.writeInt(u32, bytes[8..12], @intCast(value.upper.len), .big);
-    @memcpy(bytes[12..][0..value.lower.len], value.lower);
-    @memcpy(bytes[12 + value.lower.len ..], value.upper);
+    std.mem.writeInt(u32, bytes[4..8], @intCast(lower.len), .big);
+    std.mem.writeInt(u32, bytes[8..12], @intCast(upper.len), .big);
+    @memcpy(bytes[12..][0..lower.len], lower);
+    @memcpy(bytes[12 + lower.len ..], upper);
     return bytes;
 }
 /// null means bounded work could not establish absence. A necessary predicate
@@ -69,7 +90,7 @@ pub fn intersects(a: A, storage: tree.Store, root: ?tree.Ref, first: [16]u8, las
         pub fn descend(v: *@This(), bytes: []const u8, _: u64) !bool {
             try v.check();
             if (bytes.len == 0) return true;
-            const bounds = try decode(bytes);
+            const bounds = (try decode(bytes)) orelse return true;
             return std.mem.order(u8, bounds.upper, v.lower) != .lt and (v.upper == null or std.mem.order(u8, bounds.lower, v.upper.?) == .lt);
         }
         pub fn record(v: *@This(), key: []const u8, _: []const u8) !void {
@@ -116,4 +137,31 @@ test "external lake global frontier physical range probes include high tuple byt
     var last = first;
     last[15] = 19;
     try std.testing.expectEqual(@as(?bool, false), try intersects(a, storage, root, first, last, &.{ 255, 5 }, &.{ 255, 6 }));
+}
+
+test "external lake global frontier reverse reductions bound long keys and retain unknown legacy children" {
+    const a = std.testing.allocator;
+    var key: [4096]u8 = @splat(0);
+    @memset(key[16 .. key.len - 16], 'x');
+    const encoded = try reduce(a, &.{.{ .key = &key, .value = "" }}, 0);
+    defer a.free(encoded);
+    try std.testing.expect(encoded.len <= tree.max_aggregate_bytes);
+    const bounds = (try decode(encoded)).?;
+    try std.testing.expect(std.mem.order(u8, bounds.lower, key[16..]) != .gt);
+    try std.testing.expect(std.mem.order(u8, bounds.upper, key[16..]) != .lt);
+    const parent = try reduce(a, &.{.{ .key = &key, .aggregate = encoded }}, 1);
+    defer a.free(parent);
+    const parent_bounds = (try decode(parent)).?;
+    try std.testing.expect(std.mem.order(u8, parent_bounds.lower, key[16..]) != .gt);
+    try std.testing.expect(std.mem.order(u8, parent_bounds.upper, key[16..]) != .lt);
+    const legacy = try reduce(a, &.{.{ .key = &key, .aggregate = "" }}, 1);
+    defer a.free(legacy);
+    try std.testing.expectEqual(@as(?Bounds, null), try decode(legacy));
+    const mixed = try reduce(a, &.{ .{ .key = &key, .aggregate = encoded }, .{ .key = &key, .aggregate = legacy } }, 1);
+    defer a.free(mixed);
+    try std.testing.expectEqual(@as(?Bounds, null), try decode(mixed));
+    @memset(key[16 .. key.len - 16], 255);
+    const saturated = try reduce(a, &.{.{ .key = &key, .value = "" }}, 0);
+    defer a.free(saturated);
+    try std.testing.expectEqual(@as(?Bounds, null), try decode(saturated));
 }

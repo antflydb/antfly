@@ -982,3 +982,9 @@ scheduled composed lane, using that lane's allocator and workspace quota.
 Standalone vector queries retain archive/recent overlap. This prevents scheduler
 saturation from multiplying unadmitted nested caller workspaces. Regressions
 exercise nested execution, cancellation, and enclosing-quota exhaustion.
+
+Reverse-index tuple envelopes fit the existing 256-byte authenticated page
+reduction. Long lower keys use conservative prefixes; long upper keys use
+prefix successors. A saturated upper prefix or legacy child emits a nonempty
+unknown reduction, preserving publication compatibility and retaining candidate
+packs. Exact row membership remains authoritative after this lossy pruning.
