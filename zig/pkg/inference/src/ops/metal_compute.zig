@@ -1179,6 +1179,11 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
     boundary_linear_slots: std.AutoHashMapUnmanaged(DynamicLinearSlotKey, usize) = .empty,
     eager_quant_mirrors_preferred: bool = false,
     dynamic_layer_norm_slots: std.AutoHashMapUnmanaged(DynamicLayerNormSlotKey, usize) = .empty,
+    /// The last segment-attention control translated for the device kernels.
+    /// Every layer of a training step, forward and backward, shares one
+    /// control; matching it by content (never by identity) skips its
+    /// validation, translation and upload, which drained the frame each time.
+    segment_control_cache: ?SegmentControlCache = null,
     dynamic_rms_norm_slots: std.AutoHashMapUnmanaged(DynamicRmsNormSlotKey, usize) = .empty,
     next_dynamic_linear_slot: usize = metal_runtime.decoder_runtime_linear_slot_capacity,
     next_dynamic_layer_norm_slot: usize = metal_runtime.decoder_runtime_layer_norm_slot_capacity,
@@ -4504,7 +4509,14 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         storage.setDeviceWriteHook(metal_storage.deviceWriteHook());
     }
 
+    const SegmentControlCache = struct { raw: []i32, batch: u32, seq_len: u32, apply_dropout: bool, device: CT };
+
     pub fn deinit(self: *MetalCompute) void {
+        if (self.segment_control_cache) |cached| {
+            freeOp(self, cached.device);
+            self.allocator.free(cached.raw);
+            self.segment_control_cache = null;
+        }
         defer if (self.shared_provider_lease_io) |lock_io| {
             self.shared_provider_lease_io = null;
             unlockSharedMetalData(self.data, lock_io);
@@ -7538,6 +7550,12 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         // The device kernels hold one head row per 128-lane threadgroup.
         if (!self.provider_impl.hasDecoderRuntime() or attrs.head_dim > 128) return null;
         const storage = toBuf(control_ct).resident_index_storage orelse return null;
+        if (self.segment_control_cache) |cached| if (cached.batch == attrs.batch and cached.seq_len == attrs.seq_len and
+            std.mem.eql(i32, cached.raw, storage.values))
+        {
+            if (cached.apply_dropout and attrs.dropout_probability > 0) return null;
+            return try self.segmentAttentionWithControl(qkv_ct, cached.device, d_out_ct, attrs, control);
+        };
         const view = try segment.validateControl(attrs, storage.values, .{ .control = control });
         if (view.apply_dropout and attrs.dropout_probability > 0) return null;
         const device_attrs: @import("ml").graph.ModernBertTrainingAttentionAttrs = .{
@@ -7561,7 +7579,24 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         };
         const shape = [_]i32{@intCast(tokens * 7)};
         const device_control = try self.residentTrainingUpload(i32, words, &shape, .{}, true);
-        defer freeOp(self, device_control);
+        errdefer freeOp(self, device_control);
+        const raw = try self.allocator.dupe(i32, storage.values);
+        if (self.segment_control_cache) |previous| {
+            freeOp(self, previous.device);
+            self.allocator.free(previous.raw);
+        }
+        self.segment_control_cache = .{ .raw = raw, .batch = attrs.batch, .seq_len = attrs.seq_len, .apply_dropout = view.apply_dropout, .device = device_control };
+        return try self.segmentAttentionWithControl(qkv_ct, device_control, d_out_ct, attrs, control);
+    }
+
+    fn segmentAttentionWithControl(self: *MetalCompute, qkv_ct: CT, device_control: CT, d_out_ct: ?CT, attrs: @import("ml").graph.SegmentTrainingAttentionAttrs, control: ?@import("../execution_control.zig").InferenceExecutionControl) !CT {
+        const device_attrs: @import("ml").graph.ModernBertTrainingAttentionAttrs = .{
+            .batch = attrs.batch,
+            .seq_len = attrs.seq_len,
+            .num_heads = attrs.num_heads,
+            .head_dim = attrs.head_dim,
+            .window = attrs.window,
+        };
         var qkv = try self.ownedDeviceMetalTensorFromCt(qkv_ct);
         defer qkv.deinit();
         var d_out: ?MetalTensor = if (d_out_ct) |value| try self.ownedDeviceMetalTensorFromCt(value) else null;
