@@ -76,3 +76,102 @@ func TestCypherErrorsPreserveCommittedDeliveryOutcome(t *testing.T) {
 		t.Fatalf("lost write outcome: %v", err)
 	}
 }
+
+func TestGraphCatalogMutationsPreservePendingVisibility(t *testing.T) {
+	for _, operation := range []string{"create", "update", "drop"} {
+		t.Run(operation, func(t *testing.T) {
+			calls := 0
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				calls++
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusAccepted)
+				_, _ = io.WriteString(w, `{"status":"committed_visibility_pending"}`)
+			}))
+			defer server.Close()
+			client, _ := NewAntflyClient(server.URL, server.Client())
+			var outcome *oapi.CommittedMutationOutcome
+			var err error
+			switch operation {
+			case "drop":
+				outcome, err = client.DropGraph(context.Background(), "g")
+			default:
+				var result *GraphCatalogMutationResult
+				if operation == "create" {
+					result, err = client.CreateGraph(context.Background(), "g", GraphDefinition{})
+				} else {
+					result, err = client.UpdateGraph(context.Background(), "g", "1", GraphDefinition{})
+				}
+				if err == nil {
+					if result.Entry != nil {
+						t.Fatal("pending result fabricated a catalog entry")
+					}
+					outcome = result.Outcome
+				}
+			}
+			if err != nil || outcome == nil || outcome.Status != oapi.CommittedMutationOutcomeStatusCommittedVisibilityPending {
+				t.Fatalf("lost pending outcome: %+v, %v", outcome, err)
+			}
+			if calls != 1 {
+				t.Fatalf("mutation replayed: %d calls", calls)
+			}
+		})
+	}
+}
+
+func TestGraphCatalogMutationVisibleResultsAndMalformedResponses(t *testing.T) {
+	for _, tc := range []struct {
+		status int
+		body   string
+		valid  bool
+	}{
+		{201, `{"name":"g","graph_id":"1","revision":"1","definition":{"labels":[]}}`, true},
+		{202, `{"status":"unknown"}`, false},
+		{201, `{"status":"committed_visibility_pending"}`, false},
+		{409, `{"code":"CatalogGenerationChanged","message":"stale revision"}`, false},
+	} {
+		t.Run(tc.body, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.WriteHeader(tc.status)
+				_, _ = io.WriteString(w, tc.body)
+			}))
+			defer server.Close()
+			client, _ := NewAntflyClient(server.URL, server.Client())
+			result, err := client.CreateGraph(context.Background(), "g", GraphDefinition{})
+			if tc.valid {
+				if err != nil || result.Entry == nil || result.Entry.Name != "g" || result.Outcome != nil {
+					t.Fatalf("invalid visible result: %+v, %v", result, err)
+				}
+			} else if err == nil {
+				t.Fatalf("accepted invalid result: %+v", result)
+			}
+		})
+	}
+}
+
+func TestGraphCatalogUpdateRetainsRevisionAndDoesNotReplay(t *testing.T) {
+	calls := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		body, _ := io.ReadAll(r.Body)
+		if r.Method != http.MethodPut || !strings.Contains(string(body), `"expected_revision":"9223372036854775807"`) {
+			t.Errorf("lost graph revision: %s %s", r.Method, body)
+		}
+		w.WriteHeader(http.StatusConflict)
+		_, _ = io.WriteString(w, `{"code":"CatalogGenerationChanged","message":"stale revision"}`)
+	}))
+	defer server.Close()
+	client, _ := NewAntflyClient(server.URL, server.Client())
+	_, err := client.UpdateGraph(context.Background(), "g", "9223372036854775807", GraphDefinition{})
+	var diagnostic *CypherExecutionError
+	if !errors.As(err, &diagnostic) || diagnostic.StatusCode != 409 {
+		t.Fatalf("lost conflict: %v", err)
+	}
+	for _, invalid := range []string{"", "0", "01", "1.0", "-1"} {
+		if _, err := client.UpdateGraph(context.Background(), "g", invalid, GraphDefinition{}); err == nil {
+			t.Errorf("accepted invalid revision %q", invalid)
+		}
+	}
+	if calls != 1 {
+		t.Fatalf("mutation replayed: %d calls", calls)
+	}
+}

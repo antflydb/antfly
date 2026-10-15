@@ -88,7 +88,12 @@ pub fn localFor(consumer: *std.Build.Module) ?*std.Build.Module {
 fn attachStorageFinalLinks(b: *std.Build, step: *std.Build.Step, provider: *std.Build.Step.Compile, seen: *std.AutoHashMap(*std.Build.Step, void)) void {
     if ((seen.getOrPut(step) catch @panic("OOM")).found_existing) return;
     if (step.cast(std.Build.Step.Compile)) |artifact| {
-        if (artifact.kind == .exe or artifact.kind == .@"test" or (artifact.kind == .lib and artifact.linkage == .dynamic)) {
+        // A build graph can contain native products, host generators and the
+        // freestanding browser runtime. Never graft a native provider (and its
+        // framework/libc dependencies) into an artifact for another target.
+        if ((artifact.kind == .exe or artifact.kind == .@"test" or (artifact.kind == .lib and artifact.linkage == .dynamic)) and
+            compatibleTarget(artifact.root_module.resolved_target, provider.root_module.resolved_target))
+        {
             var linked = false;
             for (artifact.root_module.link_objects.items) |input| if (input == .other_step and input.other_step == provider) {
                 linked = true;
@@ -100,6 +105,12 @@ fn attachStorageFinalLinks(b: *std.Build, step: *std.Build.Step, provider: *std.
         }
     }
     for (step.dependencies.items) |dependency| attachStorageFinalLinks(b, dependency, provider, seen);
+}
+
+fn compatibleTarget(consumer: ?std.Build.ResolvedTarget, provider: ?std.Build.ResolvedTarget) bool {
+    const left = (consumer orelse return false).result;
+    const right = (provider orelse return false).result;
+    return left.cpu.arch == right.cpu.arch and left.os.tag == right.os.tag and left.abi == right.abi;
 }
 
 fn needsStorageProvider(b: *std.Build, module: *std.Build.Module, provider: *std.Build.Step.Compile, testing: bool, seen: *std.AutoHashMap(*std.Build.Module, void)) bool {

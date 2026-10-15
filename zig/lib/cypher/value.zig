@@ -104,25 +104,30 @@ pub const Value = union(enum) {
         for (entries) |entry| if (std.mem.eql(u8, entry.name, name)) return entry.value;
         return .null;
     }
-    pub fn clone(self: Value, a: std.mem.Allocator) std.mem.Allocator.Error!Value {
+    pub const CloneError = std.mem.Allocator.Error || error{CypherValueDepthExceeded};
+    pub fn clone(self: Value, a: std.mem.Allocator) CloneError!Value {
+        return self.cloneDepth(a, 0);
+    }
+    fn cloneDepth(self: Value, a: std.mem.Allocator, depth: usize) CloneError!Value {
+        if (depth > 64) return error.CypherValueDepthExceeded;
         return switch (self) {
             .null, .boolean, .integer, .number => self,
             .string => |s| .{ .string = try a.dupe(u8, s) },
             .list => |items| blk: {
                 const output = try a.alloc(Value, items.len);
-                for (items, output) |item, *out| out.* = try item.clone(a);
+                for (items, output) |item, *out| out.* = try item.cloneDepth(a, depth + 1);
                 break :blk .{ .list = output };
             },
             .map => |items| blk: {
                 const output = try a.alloc(Entry, items.len);
-                for (items, output) |item, *out| out.* = .{ .name = try a.dupe(u8, item.name), .value = try item.value.clone(a) };
+                for (items, output) |item, *out| out.* = .{ .name = try a.dupe(u8, item.name), .value = try item.value.cloneDepth(a, depth + 1) };
                 break :blk .{ .map = output };
             },
             .node => |n| blk: {
                 const copy = try a.create(Node);
                 const labels = try a.alloc([]const u8, n.labels.len);
                 for (n.labels, labels) |label, *out| out.* = try a.dupe(u8, label);
-                copy.* = .{ .identity = .{ .table = try a.dupe(u8, n.identity.table), .key = try a.dupe(u8, n.identity.key) }, .labels = labels, .properties = (try (Value{ .map = n.properties }).clone(a)).map };
+                copy.* = .{ .identity = .{ .table = try a.dupe(u8, n.identity.table), .key = try a.dupe(u8, n.identity.key) }, .labels = labels, .properties = (try (Value{ .map = n.properties }).cloneDepth(a, depth + 1)).map };
                 break :blk .{ .node = copy };
             },
             .relationship => |r| blk: {
@@ -134,14 +139,14 @@ pub const Value = union(enum) {
                 copy.source = .{ .table = try a.dupe(u8, r.source.table), .key = try a.dupe(u8, r.source.key) };
                 copy.target = .{ .table = try a.dupe(u8, r.target.table), .key = try a.dupe(u8, r.target.key) };
                 if (r.producer) |producer| copy.producer = .{ .table = try a.dupe(u8, producer.table), .key = try a.dupe(u8, producer.key) };
-                copy.properties = (try (Value{ .map = r.properties }).clone(a)).map;
+                copy.properties = (try (Value{ .map = r.properties }).cloneDepth(a, depth + 1)).map;
                 break :blk .{ .relationship = copy };
             },
             .path => |p| blk: {
                 const nodes = try a.alloc(*const Node, p.nodes.len);
                 const relationships = try a.alloc(*const Relationship, p.relationships.len);
-                for (p.nodes, nodes) |node, *out| out.* = (try (Value{ .node = node }).clone(a)).node;
-                for (p.relationships, relationships) |relationship, *out| out.* = (try (Value{ .relationship = relationship }).clone(a)).relationship;
+                for (p.nodes, nodes) |node, *out| out.* = (try (Value{ .node = node }).cloneDepth(a, depth + 1)).node;
+                for (p.relationships, relationships) |relationship, *out| out.* = (try (Value{ .relationship = relationship }).cloneDepth(a, depth + 1)).relationship;
                 break :blk .{ .path = .{ .nodes = nodes, .relationships = relationships } };
             },
         };
@@ -467,4 +472,17 @@ fn compareNumeric(a: Value, b: Value) std.math.Order {
         break :blk std.math.order(@as(f64, @floatFromInt(integer)), number);
     };
     return if (a == .integer) order_value else order_value.invert();
+}
+
+test "value cloning bounds stack depth independently of query execution" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var nested: Value = .{ .integer = 1 };
+    for (0..10000) |_| {
+        const items = try a.alloc(Value, 1);
+        items[0] = nested;
+        nested = .{ .list = items };
+    }
+    try std.testing.expectError(error.CypherValueDepthExceeded, nested.clone(a));
 }

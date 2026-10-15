@@ -1,11 +1,11 @@
 # Antfly Graph: Cypher compatibility, SQL composition, and exploration UX
 
-Status: production server and embedded implementation, 2026-10-14. Authenticated distributed
+Status: production server and embedded implementation, 2026-10-15. Authenticated distributed
 queries, native SQL GRAPH_TABLE, coordinated writes/search, and the query
 workbench are implemented. The compatibility matrix records supported behavior,
 qualification, and explicit limits against the pinned Cypher baseline.
 Repository observations were checked against `origin/main` at
-`1258e8cfcb83a638d69e869234bfa747e52f0029`.
+`89df7aff46cf6ae9fc948459a00cbeff08d81869`.
 
 ## Implementation status
 
@@ -100,6 +100,55 @@ ceilings, including statement-overlay capture work. Responses are bounded at
 decision, so an oversized RETURN rolls back instead of committing an undeliverable
 result. Final read delivery rechecks graph/table authority after encoding.
 
+Computed lists and maps have the same 64-level depth ceiling as input values.
+Query-owned metadata caches structural hashes, expanded traversal work, and
+entity presence by immutable allocation, so shared values created by `reduce`
+do not expand while being checked or hashed. Comparisons, output copying, and
+mutation property validation reserve their work against the intermediate-state
+budget before recursive traversal. Identical shared containers compare directly,
+including Cypher's unknown result for nested nulls. Entity projection and alias
+refresh skip ordinary data subtrees. Exceeding a ceiling returns an error and
+rolls back staged writes before any durable decision.
+
+Grouping, projection DISTINCT, DISTINCT aggregates, and UNION deduplication use
+hash buckets with exact, budgeted collision comparisons. Numeric hashes agree
+across INTEGER/FLOAT equality without collapsing distinct large integers into
+the same rounded floating-point bucket; map hashes ignore insertion order, and grouping
+still treats nulls as equal. Hash tables preserve the first encountered value
+and existing row order. Cancellation is checked during hashing, bucket lookup,
+and deduplication.
+
+The fresh native probe at 2,000/4,000/8,000 unique rows reports
+32,003/64,003/128,003 work units for grouping and 20,009/40,009/80,009 for
+UNION. At 8,000 rows, the same local Debug library probe dropped from roughly
+0.52s to 0.07s for grouping and 1.21s to 0.047s for UNION. Timings are diagnostic;
+regressions assert bounded linear work rather than machine-dependent latency.
+
+All public SDK graph catalog mutation helpers preserve committed-but-pending
+visibility outcomes. Go create/update return `GraphCatalogMutationResult` with
+exactly one of `Entry` or `Outcome`; Go drop returns an optional outcome. Python
+and TypeScript drop likewise return a pending outcome instead of silently
+reporting completed visibility. Pending mutations must be observed rather than
+replayed.
+
+The default host build keeps storage final links target-scoped, so native
+frameworks cannot enter the freestanding WASM artifact. Portable storage uses
+platform-wide atomics, local callback dispatch without a native error registry,
+and an explicit rejection of filesystem-managed roots. WASM smoke coverage also
+checks computed-depth rollback, shared-value equality, and linear grouping/UNION.
+
+Fresh graph replacement reservations persist their contributor-format version.
+Their private generations initialize the ordering marker without a primary-store
+migration scan, including resume before the first source-page checkpoint. Older
+jobs without that version retain the idempotent contributor migration. Lite and
+Directory process-exit recovery keep the same bounded-checkpoint deadlines.
+
+The 2026-10-15 follow-up qualifies 103 core Cypher tests, 942 SQL tests
+(with three skips), and 312 embedded database tests (with one skip). The
+authenticated two-owner campaign passes 47 expression checks and 66 graph
+read/write checks. SDK suites pass in Go, Python (308 tests), and TypeScript
+(495 tests, one skip); the focused workbench/SQL/catalog UI suite passes 31 tests.
+
 Run focused compiler, native, and WASM qualification with:
 
 ```sh
@@ -158,9 +207,9 @@ on one and two shards. The standalone HTTP campaign also passes all 66 checks;
 pgwire transaction composition and postimage-policy qualification pass.
 The final rebuild also passes schema defaults/generated-column/null
 normalization and protected full-text score-invariance checks. Native C/Lite
-export validation reports 111 public functions with no internal exports, and
+export validation reports 121 public functions with no internal exports, and
 the final hosted WASM smoke includes pre-commit rollback diagnostics.
-The workbench/catalog/SQL UI suite passes 29 tests and the production build.
+The workbench/catalog/SQL UI suite passes 31 tests and the production build.
 
 The focused `antfly-row-policy-follower-test` covers reader-drain deferral,
 signed follower writes, policy-phase retries at different Raft indexes, replay,

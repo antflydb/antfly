@@ -93,6 +93,50 @@ def main():
         )
         call(f"/graphs/{graph}", {"labels": [{"name": "Document", "table": table}]})
         created_graph = True
+        # Computed data must stay bounded through comparison, delivery, and
+        # write rollback, including when reduce builds shared containers.
+        result = query("WITH reduce(a=[1],x IN range(1,40)|[a,a]) AS a RETURN a=a")
+        assert result["rows"] == [[{"type": "boolean", "value": True}]], result
+        assert result["stats"]["intermediate_states"] < 1000, result["stats"]
+        checks += 1
+        for statement, status, code in (
+            (
+                "RETURN reduce(a=[],x IN range(1,10000)|[a])",
+                400,
+                "CypherValueDepthExceeded",
+            ),
+            (
+                "WITH reduce(a=[1],x IN range(1,40)|[a,a]) AS a,reduce(b=[1],x IN range(1,40)|[b,b]) AS b RETURN a=b",
+                429,
+                "CypherStateBudgetExceeded",
+            ),
+            (
+                "CREATE (n:Document {id:'bounded_rollback'}) WITH n,reduce(a=[],x IN range(1,10000)|[a]) AS a RETURN a",
+                400,
+                "CypherValueDepthExceeded",
+            ),
+        ):
+            failure = call(
+                f"/graphs/{graph}/query", {"query": statement}, status=status
+            )
+            assert failure["code"] == code, failure
+            checks += 1
+        assert (
+            query("MATCH (n:Document {id:'bounded_rollback'}) RETURN n")["rows"] == []
+        )
+        checks += 1
+        for statement, rows in (
+            ("UNWIND range(1,4000) AS x RETURN x,count(*)", 4000),
+            (
+                "UNWIND range(9223372036854771800,9223372036854775799) AS x RETURN x,count(*)",
+                4000,
+            ),
+            ("UNWIND range(1,4000) AS x RETURN x UNION RETURN 0 AS x", 4001),
+        ):
+            result = query(statement)
+            assert len(result["rows"]) == rows, result["stats"]
+            assert result["stats"]["intermediate_states"] < 100000, result["stats"]
+            checks += 1
         assert strings(
             query(
                 "MATCH (n:Document) WITH n.title AS title WHERE n.rank>1 RETURN title ORDER BY title"

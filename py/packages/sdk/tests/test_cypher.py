@@ -114,7 +114,7 @@ def test_graph_revision_update_is_lossless_and_never_replays_conflicts():
         assert len(calls) == 1
 
 
-@pytest.mark.parametrize("operation", ["create", "update"])
+@pytest.mark.parametrize("operation", ["create", "update", "drop"])
 def test_graph_catalog_mutations_preserve_committed_visibility_pending(operation):
     client = AntflyClient("http://graph.test")
     with httpx.Client(
@@ -129,6 +129,8 @@ def test_graph_catalog_mutations_preserve_committed_visibility_pending(operation
             client.graphs.create("knowledge", definition)
             if operation == "create"
             else client.graphs.update("knowledge", "1", definition)
+            if operation == "update"
+            else client.graphs.drop("knowledge")
         )
         assert isinstance(result, CommittedMutationOutcome)
         assert str(result.status) == "committed_visibility_pending"

@@ -1,5 +1,5 @@
-import { describe, expect, it } from "vitest";
 import type { SQLResponse } from "@antfly/sdk";
+import { describe, expect, it } from "vitest";
 import { sqlGraphValues } from "./SQLGraphPreview";
 
 const result = (rows: unknown[][]): SQLResponse => ({
@@ -51,4 +51,20 @@ describe("SQL returned graph values", () => {
     const path = { type: "path", value: { nodes: [node], relationships: [] } };
     expect(sqlGraphValues(result([[JSON.stringify(path)]]))).toEqual([path]);
   });
+});
+
+it("finds entity envelopes inside ordinary SQL JSON lists and maps", () => {
+  const node = {
+    type: "node",
+    value: {
+      identity: { table: "docs", key: "a" },
+      labels: ["Document"],
+      properties: { type: "map", value: {} },
+    },
+  };
+  const cell = { nested: [node], ordinary: { type: "node", value: "user data" } };
+  expect(sqlGraphValues(result([[cell]]))).toEqual([node]);
+  expect(sqlGraphValues(result([[JSON.stringify(cell)]]))).toEqual([node]);
+  const nullResult = { ...result([[cell]]), sql_nulls: [[true]] };
+  expect(sqlGraphValues(nullResult)).toEqual([]);
 });

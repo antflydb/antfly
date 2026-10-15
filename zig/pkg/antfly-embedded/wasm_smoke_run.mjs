@@ -117,5 +117,23 @@ try {
     if (error.diagnostic?.code !== "CypherDivisionByZero" || error.diagnostic?.write_outcome !== "not_started") throw error;
 }
 if (api.cypher("knowledge", { query: "MATCH (n:Document {id:'aborted'}) RETURN n" }).rows.length !== 0) throw new Error("WASM failed graph write published a row");
+for (const query of [
+    "RETURN reduce(a=[],x IN range(1,10000)|[a]) AS nested",
+    "CREATE (n:Document {id:'depth_rollback'}) WITH n,reduce(a=[],x IN range(1,10000)|[a]) AS a RETURN a",
+]) {
+    try { api.cypher("knowledge", { query }); throw new Error("WASM accepted an excessive value depth"); }
+    catch (error) { if (error.diagnostic?.code !== "CypherValueDepthExceeded") throw error; }
+}
+if (api.cypher("knowledge", { query: "MATCH (n:Document {id:'depth_rollback'}) RETURN n" }).rows.length !== 0) throw new Error("WASM depth failure published a row");
+const shared = api.cypher("knowledge", { query: "WITH reduce(a=[1],x IN range(1,40)|[a,a]) AS a RETURN a=a" });
+if (shared.rows[0][0].value !== true || shared.stats.intermediate_states >= 1000) throw new Error("WASM shared value comparison expanded its contents");
+for (const [query, count] of [
+    ["UNWIND range(1,1000) AS x RETURN x,count(*)", 1000],
+    ["UNWIND range(9223372036854774800,9223372036854775799) AS x RETURN x,count(*)", 1000],
+    ["UNWIND range(1,1000) AS x RETURN x UNION RETURN 0 AS x", 1001],
+]) {
+    const result = api.cypher("knowledge", { query });
+    if (result.rows.length !== count || result.stats.intermediate_states >= 30000) throw new Error("WASM deduplication exceeded linear work");
+}
 api.close();
 console.log("antfly embedded shared smoke passed: ok");

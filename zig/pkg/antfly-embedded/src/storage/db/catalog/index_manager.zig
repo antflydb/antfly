@@ -116,6 +116,11 @@ pub const GraphReplacementBuild = struct {
     old: []const u8 = "",
     config: ?types.IndexConfig = null,
     request_hash: u64 = 0,
+    // Fresh generations only receive ordered contributor snapshots. Persist
+    // that fact with their reservation so an interrupted first page can reopen
+    // without scanning the primary corpus for legacy contributors. Absent in
+    // older jobs: those still require the idempotent migration.
+    contribution_ordering_version: u8 = 0,
     phase: enum { building, catching_up, failed } = .building,
     resume_key_b64: ?[]const u8 = null,
     scanned: u64 = 0,
@@ -306,6 +311,7 @@ pub var test_replacement_swap_boundary: ?*const fn (ReplacementSwapBoundary) voi
 pub var test_text_backfill_batch_size: ?usize = null;
 pub var test_abort_text_backfill_after_batches: ?usize = null;
 pub var test_text_backfill_invocations: usize = 0;
+pub var test_graph_contributor_migrations: std.atomic.Value(usize) = .init(0);
 pub var test_inject_index_open_error: ?anyerror = null;
 pub var test_inject_index_removal_cleanup_error: ?anyerror = null;
 pub var test_inject_generated_artifact_cleanup_error: ?anyerror = null;
@@ -8352,7 +8358,7 @@ pub const IndexManager = struct {
             };
             self.catalog_mutex.unlockExclusive();
 
-            var opened = self.openConfiguredIndexDetached(store, task.cfg, true, false, false) catch |err| {
+            var opened = self.openConfiguredIndexDetached(store, task.cfg, true, false, false, false) catch |err| {
                 self.catalog_mutex.lockExclusive();
                 defer self.catalog_mutex.unlockExclusive();
                 self.completeIndexLoadNoLock(task.name);
@@ -11723,7 +11729,7 @@ pub const IndexManager = struct {
                 while (true) {
                     const index = state.next_index.fetchAdd(1, .monotonic);
                     if (index >= state.configs.len) return;
-                    const opened = state.manager.openConfiguredIndexDetached(state.store, state.configs[index], false, true, false) catch |err| {
+                    const opened = state.manager.openConfiguredIndexDetached(state.store, state.configs[index], false, true, false, false) catch |err| {
                         std.log.warn("load configured index failed name={s} kind={s} err={s}", .{
                             state.configs[index].name,
                             @tagName(state.configs[index].kind),
@@ -11966,7 +11972,7 @@ pub const IndexManager = struct {
         try self.provisionConfiguredIndexDirDurable(stored);
         const key = try std.fmt.allocPrint(self.alloc, "{s}{s}", .{ graph_replacement_build_prefix, stored.name });
         defer self.alloc.free(key);
-        const value = try std.json.Stringify.valueAlloc(self.alloc, GraphReplacementBuild{ .name = stored.name, .generation = stored.coverage_generation, .old = old, .config = stored, .request_hash = types.indexConfigHash(cfg), .applied_sequence = floor }, .{});
+        const value = try std.json.Stringify.valueAlloc(self.alloc, GraphReplacementBuild{ .name = stored.name, .generation = stored.coverage_generation, .old = old, .config = stored, .request_hash = types.indexConfigHash(cfg), .contribution_ordering_version = 1, .applied_sequence = floor }, .{});
         defer self.alloc.free(value);
         var runtime_store = try initRuntimeStore(self.alloc, store);
         defer runtime_store.deinit();
@@ -12357,7 +12363,14 @@ pub const IndexManager = struct {
         }
         if (enrichment_checkpoint == 0) try self.loadEnrichmentCatalog(store);
         if (resolver_checkpoint == 0 and self.retired_resolvers.items.len == 0) try self.loadResolverCatalog(store);
-        try self.openConfiguredIndex(store, cfg, false, false);
+        const jobs = try self.graphReplacementBuildsAlloc(store, self.alloc);
+        defer jobs.deinit();
+        const ordered_generation = for (jobs.value) |job| {
+            if (std.mem.eql(u8, job.name, cfg.name) and job.generation == cfg.coverage_generation) {
+                break job.contribution_ordering_version == 1;
+            }
+        } else false;
+        try self.openConfiguredIndexWithOptions(store, cfg, false, false, false, ordered_generation);
         errdefer self.removeInMemory(cfg.name);
         try self.refreshGeneratedEnrichmentTargetCache();
     }
@@ -21399,6 +21412,18 @@ pub const IndexManager = struct {
         read_only: bool,
         authorize_dense_native_candidate: bool,
     ) !void {
+        return self.openConfiguredIndexWithOptions(store, cfg, allow_backfill, read_only, authorize_dense_native_candidate, false);
+    }
+
+    fn openConfiguredIndexWithOptions(
+        self: *IndexManager,
+        store: anytype,
+        cfg: types.IndexConfig,
+        allow_backfill: bool,
+        read_only: bool,
+        authorize_dense_native_candidate: bool,
+        ordered_graph_generation: bool,
+    ) !void {
         try self.beginIndexLoadNoLock(cfg.name);
         defer self.completeIndexLoadNoLock(cfg.name);
         try self.ensureConfiguredIndexDir(cfg);
@@ -21408,6 +21433,7 @@ pub const IndexManager = struct {
             allow_backfill,
             read_only,
             authorize_dense_native_candidate,
+            ordered_graph_generation,
         );
         errdefer opened.deinit(self);
         try self.appendOpenedIndex(opened);
@@ -21430,6 +21456,7 @@ pub const IndexManager = struct {
         allow_backfill: bool,
         read_only: bool,
         authorize_dense_native_candidate: bool,
+        ordered_graph_generation: bool,
     ) !OpenedIndex {
         if (test_inject_index_open_error) |err| return err;
         var cfg = cfg_input;
@@ -22140,7 +22167,11 @@ pub const IndexManager = struct {
                 if (graphEntryHasContributors(&entry) and !try entry.index.contributionOrderingReady()) {
                     if (read_only) return error.GraphContributorMigrationRequired;
                     const ordering_started_ns = nowNs();
-                    try self.backfillGraphContributorOrdering(self.primary_store orelse return error.MissingPrimaryStore, &entry);
+                    if (ordered_graph_generation) {
+                        try entry.index.publishContributionOrderingReady();
+                    } else {
+                        try self.backfillGraphContributorOrdering(self.primary_store orelse return error.MissingPrimaryStore, &entry);
+                    }
                     backfill_ns += elapsedSince(ordering_started_ns);
                 }
 
@@ -26590,6 +26621,7 @@ pub const IndexManager = struct {
     /// scratch space. Interrupted opens repeat this idempotent scan; the
     /// completion marker never precedes durable contributor snapshots.
     fn backfillGraphContributorOrdering(self: *IndexManager, primary: *docstore_mod.DocStore, entry: *GraphIndex) !void {
+        if (builtin.is_test) _ = test_graph_contributor_migrations.fetchAdd(1, .monotonic);
         const State = struct {
             manager: *IndexManager,
             primary: *docstore_mod.DocStore,

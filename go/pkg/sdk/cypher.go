@@ -85,23 +85,80 @@ func (c *AntflyClient) GetGraph(ctx context.Context, name string) (*GraphCatalog
 	}
 	return decodeCypherResponse[GraphCatalogEntry](response)
 }
-func (c *AntflyClient) CreateGraph(ctx context.Context, name string, definition GraphDefinition) (*GraphCatalogEntry, error) {
+
+// GraphCatalogMutationResult distinguishes a visible catalog entry from a
+// durable mutation whose projection is still pending. Never replay a pending
+// mutation; inspect GetGraph to observe its eventual visibility.
+type GraphCatalogMutationResult struct {
+	Entry   *GraphCatalogEntry
+	Outcome *oapi.CommittedMutationOutcome
+}
+
+func decodeGraphCatalogMutation(response *http.Response) (*GraphCatalogMutationResult, error) {
+	if response.StatusCode == http.StatusAccepted {
+		outcome, err := decodeCypherResponse[oapi.CommittedMutationOutcome](response)
+		if err != nil {
+			return nil, err
+		}
+		if outcome.Status != oapi.CommittedMutationOutcomeStatusCommittedVisibilityPending {
+			return nil, fmt.Errorf("unexpected pending graph mutation status %q", outcome.Status)
+		}
+		return &GraphCatalogMutationResult{Outcome: outcome}, nil
+	}
+	entry, err := decodeCypherResponse[GraphCatalogEntry](response)
+	if err != nil {
+		return nil, err
+	}
+	if entry.GraphId == "" || entry.Name == "" || entry.Revision == "" {
+		return nil, fmt.Errorf("graph mutation returned an invalid catalog entry")
+	}
+	return &GraphCatalogMutationResult{Entry: entry}, nil
+}
+
+func (c *AntflyClient) CreateGraph(ctx context.Context, name string, definition GraphDefinition) (*GraphCatalogMutationResult, error) {
 	response, err := c.client.CreateGraph(ctx, name, definition)
 	if err != nil {
 		return nil, err
 	}
-	return decodeCypherResponse[GraphCatalogEntry](response)
+	return decodeGraphCatalogMutation(response)
 }
-func (c *AntflyClient) DropGraph(ctx context.Context, name string) error {
+
+// UpdateGraph conditionally replaces mappings without replaying a stale revision.
+func (c *AntflyClient) UpdateGraph(ctx context.Context, name, expectedRevision string, definition GraphDefinition) (*GraphCatalogMutationResult, error) {
+	if expectedRevision == "" || expectedRevision[0] == '0' {
+		return nil, fmt.Errorf("expected a positive decimal graph revision")
+	}
+	for _, digit := range expectedRevision {
+		if digit < '0' || digit > '9' {
+			return nil, fmt.Errorf("expected a positive decimal graph revision")
+		}
+	}
+	response, err := c.client.UpdateGraph(ctx, name, oapi.GraphDefinitionUpdate{ExpectedRevision: expectedRevision, Definition: definition})
+	if err != nil {
+		return nil, err
+	}
+	return decodeGraphCatalogMutation(response)
+}
+
+// DropGraph returns a non-nil outcome when deletion committed but catalog
+// visibility is pending. A nil outcome and nil error mean deletion is visible.
+func (c *AntflyClient) DropGraph(ctx context.Context, name string) (*oapi.CommittedMutationOutcome, error) {
 	response, err := c.client.DropGraph(ctx, name)
 	if err != nil {
-		return err
+		return nil, err
+	}
+	if response.StatusCode == http.StatusAccepted {
+		result, err := decodeGraphCatalogMutation(response)
+		if err != nil {
+			return nil, err
+		}
+		return result.Outcome, nil
 	}
 	defer response.Body.Close()
 	if response.StatusCode >= 300 {
-		return readErrorResponse(response)
+		return nil, readErrorResponse(response)
 	}
-	return nil
+	return nil, nil
 }
 
 // ExecuteGraphQuery never retries a write. Retain WriteRequestId and inspect

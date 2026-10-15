@@ -87,8 +87,12 @@ class GraphOperations:
         body = definition.to_dict() if isinstance(definition, GraphDefinition) else dict(definition)
         return self._catalog_result(self._client._request("POST", f"/db/v1/graphs/{quote(name, safe='')}", json=body))
 
-    def drop(self, name: str) -> None:
-        self._client._request("DELETE", f"/db/v1/graphs/{quote(name, safe='')}")
+    def drop(self, name: str) -> CommittedMutationOutcome | None:
+        """Return a pending outcome when deletion is durable but not yet visible."""
+        result = self._client._request("DELETE", f"/db/v1/graphs/{quote(name, safe='')}")
+        if result and result.get("status") == "committed_visibility_pending":
+            return CommittedMutationOutcome.from_dict(result)
+        return None
 
     def update(
         self,

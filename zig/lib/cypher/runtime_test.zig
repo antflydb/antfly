@@ -597,3 +597,67 @@ test "shortest selection groups independent patterns within a linear checkpoint 
         try std.testing.expectEqual(@as(i64, 2187), result.rows[0][0].integer);
     }
 }
+
+test "computed containers cannot exceed the transport depth before result traversal" {
+    for ([_][]const u8{
+        "RETURN reduce(acc = [], x IN range(1,10000) | [acc]) AS nested",
+        "RETURN reduce(acc = {}, x IN range(1,10000) | {nested:acc}) AS nested",
+        "RETURN size(reduce(acc = [], x IN range(1,10000) | [acc])) AS size",
+        "MATCH (n:Document) RETURN reduce(a=n,x IN range(1,64)|[a]) AS nested",
+        "MATCH p=(n:Document) RETURN reduce(a=p,x IN range(1,64)|[a]) AS nested",
+    }) |query| {
+        var diagnostic: c.Diagnostic = .{};
+        var compiled = try c.compile(std.testing.allocator, query, .{}, &diagnostic);
+        defer compiled.deinit();
+        var fixture: Fixture = .{};
+        try std.testing.expectError(error.CypherValueDepthExceeded, runtime.execute(std.testing.allocator, fixture.backend(), graph, &compiled, &.{}, .{}));
+    }
+}
+
+test "shared computed containers compare and hash without expanding their DAG" {
+    try check("WITH reduce(a=[1],x IN range(1,40)|[a,a]) AS a RETURN a=a, a<a, a<=a", "[[true,false,true]]");
+    try check("WITH reduce(a=[null],x IN range(1,40)|[a,a]) AS a RETURN a=a, a<a", "[[null,null]]");
+    try check("WITH reduce(a=[1],x IN range(1,40)|[a,a]) AS a UNWIND [a,a] AS x RETURN count(DISTINCT x)", "[[1]]");
+    try check("WITH reduce(a=[1],x IN range(1,40)|[a,a]) AS a UNWIND [a,a] AS x RETURN count(*) ORDER BY collect(x)", "[[2]]");
+}
+
+test "nonidentical shared values reserve bounded work before equality ordering or output" {
+    for ([_][]const u8{
+        "WITH reduce(a=[1],x IN range(1,40)|[a,a]) AS a, reduce(b=[1],x IN range(1,40)|[b,b]) AS b RETURN a=b",
+        "WITH reduce(a=[1],x IN range(1,40)|[a,a]) AS a, reduce(b=[1],x IN range(1,40)|[b,b]) AS b RETURN a<b",
+        "WITH reduce(a=[1],x IN range(1,40)|[a,a]) AS a RETURN a",
+    }) |query| {
+        var diagnostic: c.Diagnostic = .{};
+        var compiled = try c.compile(std.testing.allocator, query, .{}, &diagnostic);
+        defer compiled.deinit();
+        var fixture: Fixture = .{ .cancel_after = 20_000 };
+        try std.testing.expectError(error.CypherStateBudgetExceeded, runtime.execute(std.testing.allocator, fixture.backend(), graph, &compiled, &.{}, .{}));
+    }
+}
+
+test "hash aggregation and deduplication preserve numeric map NULL and collision semantics" {
+    try check("UNWIND [1,1.0,2,null,null] AS x RETURN x,count(*) ORDER BY x", "[[1,2],[2,1],[null,2]]");
+    try check("UNWIND [{a:1,b:null},{b:null,a:1.0}] AS x RETURN count(DISTINCT x)", "[[1]]");
+    try check("RETURN 1 AS x UNION RETURN 1.0 AS x UNION RETURN null AS x UNION RETURN null AS x", "[[1],[null]]");
+    // FLOAT equality must never merge a distinct, nonrepresentable INTEGER.
+    try check("UNWIND [9007199254740992,9007199254740993,9007199254740992.0] AS x RETURN count(DISTINCT x)", "[[2]]");
+    try check("UNWIND [0,0.0,-0.0] AS x RETURN count(DISTINCT x)", "[[1]]");
+}
+
+test "unique grouping DISTINCT aggregates projections and UNION use linear work" {
+    for ([_][]const u8{
+        "UNWIND range(1,4000) AS x RETURN x,count(*)",
+        "UNWIND range(9223372036854771800,9223372036854775799) AS x RETURN x,count(*)",
+        "UNWIND range(1,4000) AS x RETURN DISTINCT x",
+        "UNWIND range(1,4000) AS x RETURN count(DISTINCT x)",
+        "UNWIND range(1,4000) AS x RETURN x UNION RETURN 0 AS x",
+    }) |query| {
+        var diagnostic: c.Diagnostic = .{};
+        var compiled = try c.compile(std.testing.allocator, query, .{}, &diagnostic);
+        defer compiled.deinit();
+        var fixture: Fixture = .{ .cancel_after = 200_000 };
+        var result = try runtime.execute(std.testing.allocator, fixture.backend(), graph, &compiled, &.{}, .{ .intermediate_states = 100_000 });
+        defer result.deinit();
+        try std.testing.expect(result.stats.intermediate_states < 100_000);
+    }
+}

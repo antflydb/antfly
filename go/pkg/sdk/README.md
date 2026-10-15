@@ -72,3 +72,12 @@ func main() {
 
 See `examples/quickstart` for tables, indexes, hybrid search, reranking, and
 a retrieval agent end to end.
+
+## Graph catalog mutation outcomes
+
+`CreateGraph` and `UpdateGraph` return `GraphCatalogMutationResult`. Inspect
+`Entry` for a visible catalog definition or `Outcome` for a durable mutation
+whose catalog visibility is pending. `DropGraph` returns a non-nil outcome when
+deletion visibility is pending, and nil when deletion is visible. Do not replay
+pending mutations; use `GetGraph` to observe the catalog. `UpdateGraph` requires
+the revision returned by the last read.

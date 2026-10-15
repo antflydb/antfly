@@ -897,3 +897,40 @@ def test_fields_and_artifacts_from_one_producer_have_independent_postimages(requ
         with database.open_table("docs") as table:
             table.run_until_idle()
         assert database.sql(count)["rows"] == [["3"]]
+
+
+def test_computed_graph_values_are_bounded_before_delivery_and_commit(require_native, aflite_path):
+    with af.create_hosted(aflite_path) as database:
+        database.sql("CREATE TABLE docs (id TEXT)")
+        database.graph_catalog_json(
+            {"action": "put", "name": "g", "definition": {"labels": [{"name": "D", "table": "docs"}]}}
+        )
+        for query in (
+            "RETURN reduce(a=[],x IN range(1,10000)|[a]) AS nested",
+            "CREATE (n:D {id:'rollback'}) WITH n,reduce(a=[],x IN range(1,10000)|[a]) AS a RETURN a",
+        ):
+            with pytest.raises(af.GraphError) as failed:
+                database.cypher_json("g", {"query": query})
+            assert failed.value.graph_code == "CypherValueDepthExceeded"
+        assert database.cypher_json("g", {"query": "MATCH (n:D) RETURN count(n)"})["rows"][0][0]["value"] == "0"
+        response = database.cypher_json("g", {"query": "WITH reduce(a=[1],x IN range(1,40)|[a,a]) AS a RETURN a=a"})
+        assert response["rows"][0][0] == {"type": "boolean", "value": True}
+        assert response["stats"]["intermediate_states"] < 1000
+        for query in (
+            "UNWIND range(1,8000) AS x RETURN x,count(*)",
+            "UNWIND range(9223372036854771800,9223372036854775799) AS x RETURN x,count(*)",
+            "UNWIND range(1,8000) AS x RETURN x UNION RETURN 0 AS x",
+        ):
+            response = database.cypher_json("g", {"query": query})
+            assert response["complete"]
+            assert response["stats"]["intermediate_states"] < 200000
+        database.sql("INSERT INTO docs (id) VALUES ('a')")
+        from antfly_embedded._sql import SQLStateError
+
+        with pytest.raises(SQLStateError) as limited:
+            database.sql("SELECT g.x FROM GRAPH_TABLE(g MATCH (n IS D) COLUMNS(range(1,1000000) AS x)) g")
+        assert limited.value.sqlstate == "54000"
+        nested = database.sql("SELECT g.nodes FROM GRAPH_TABLE(g MATCH (n IS D) COLUMNS(collect(n) AS nodes)) g")[
+            "rows"
+        ][0][0]
+        assert isinstance(nested, list) and nested[0]["type"] == "node"

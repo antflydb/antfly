@@ -46,10 +46,10 @@ import type {
   EnrichmentConfig,
   GlobalQueryRequest,
   GraphCatalogEntry,
+  GraphDefinition,
   GraphQueryRequest,
   GraphQueryResult,
   GraphWriteStatus,
-  GraphDefinition,
   IndexMaintenanceRequest,
   IndexMaintenanceResponse,
   IndexStatus,
@@ -1906,11 +1906,16 @@ export class AntflyClient {
       if (data === undefined) throw new Error("Failed to create graph: empty response");
       return data;
     },
-    drop: async (graphName: string): Promise<void> => {
-      const { error } = await this.client.DELETE("/db/v1/graphs/{graphName}", {
+    drop: async (graphName: string): Promise<CommittedMutationOutcome | undefined> => {
+      const { data, error, response } = await this.client.DELETE("/db/v1/graphs/{graphName}", {
         params: { path: { graphName } },
       });
       if (error) throw new Error(`Failed to drop graph: ${apiErrorMessage(error)}`);
+      if (response.status === 202) {
+        if (!data) throw new Error("Failed to drop graph: empty pending response");
+        return data;
+      }
+      return undefined;
     },
     update: async (
       graphName: string,

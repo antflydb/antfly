@@ -22,6 +22,7 @@ const backend_mod = @import("backend.zig");
 const numbers = @import("numbers.zig");
 const unicode_string = @import("unicode_string.zig");
 const Budget = @import("budget.zig");
+const value_work = @import("value_work.zig");
 const A = std.mem.Allocator;
 pub const Row = []const v.Entry;
 pub const max_response_bytes: usize = 32 << 20;
@@ -90,6 +91,7 @@ fn executeBudget(budget: *Budget, backend: backend_mod.Backend, graph: catalog.G
     var arena = std.heap.ArenaAllocator.init(budget.allocator());
     errdefer arena.deinit();
     var engine: Engine = .{ .a = arena.allocator(), .backend = backend, .graph = graph, .source = compiled.query.source, .parameters = parameters, .limits = limits, .regex = .{ .a = arena.allocator(), .scratch = std.heap.ArenaAllocator.init(budget.allocator()) } };
+    engine.values = .{ .a = engine.a, .ptr = &engine, .charge = Engine.chargeWork };
     defer engine.regex.deinit();
     for (compiled.parameters) |name| {
         _ = lookup(parameters, name) orelse return error.MissingCypherParameter;
@@ -128,7 +130,11 @@ fn executeBudget(budget: *Budget, backend: backend_mod.Backend, graph: catalog.G
     const output = try engine.a.alloc([]const v.Value, combined.items.len);
     for (combined.items, output) |row, *out| {
         const cells = try engine.a.alloc(v.Value, engine.columns.len);
-        for (engine.columns, cells) |name, *cell| cell.* = try (try engine.readValue(lookup(row, name) orelse return error.UnboundCypherVariable)).clone(engine.a);
+        for (engine.columns, cells) |name, *cell| {
+            const value = try engine.readValue(lookup(row, name) orelse return error.UnboundCypherVariable);
+            try engine.values.output(value);
+            cell.* = try value.clone(engine.a);
+        }
         out.* = cells;
     }
     const columns = try engine.a.alloc([]const u8, engine.columns.len);
@@ -187,6 +193,13 @@ const Engine = struct {
     stages: std.ArrayList(Stage) = .empty,
     recursion: usize = 0,
     deleted: std.ArrayList(v.EntityIdentity) = .empty,
+    values: value_work.Work = undefined,
+    fn chargeWork(ptr: *anyopaque, amount: usize) !void {
+        const self: *Engine = @ptrCast(@alignCast(ptr));
+        try self.checkpoint();
+        if (amount > self.limits.intermediate_states -| self.stats.intermediate_states) return error.CypherStateBudgetExceeded;
+        self.stats.intermediate_states += amount;
+    }
     fn checkpoint(self: *Engine) !void {
         try self.backend.vtable.checkpoint(self.backend.ptr);
     }
@@ -201,7 +214,7 @@ const Engine = struct {
     }
     fn bind(self: *Engine, row: Row, name: ?[]const u8, value: v.Value) !?Row {
         const alias = name orelse return row;
-        if (lookup(row, alias)) |existing| return if (v.Value.eql(existing, value)) row else null;
+        if (lookup(row, alias)) |existing| return if ((try self.values.eql(existing, value))) row else null;
         const output = try self.a.alloc(v.Entry, row.len + 1);
         @memcpy(output[0..row.len], row);
         output[row.len] = .{ .name = alias, .value = value };
@@ -420,7 +433,7 @@ const Engine = struct {
                 candidate = try self.deferConstraint(candidate, actual, property.value);
                 continue;
             };
-            if (v.Value.equal(actual, expected) != true) return null;
+            if ((try self.values.equal(actual, expected)) != true) return null;
         }
         return candidate;
     }
@@ -439,7 +452,7 @@ const Engine = struct {
                 if (partial and err == error.UnboundCypherVariable) continue;
                 return err;
             };
-            if (v.Value.equal(constraint.actual, expected) != true) return false;
+            if ((try self.values.equal(constraint.actual, expected)) != true) return false;
         }
         return true;
     }
@@ -762,6 +775,12 @@ const Engine = struct {
         };
     }
     fn readValue(self: *Engine, value: v.Value) anyerror!v.Value {
+        if (!(try self.values.info(value)).entities) return value;
+        if (self.backend.vtable.project_node != null or self.backend.vtable.get_relationship != null or self.deleted.items.len != 0) try self.values.entityTraversal(value);
+        return self.readValueInner(value);
+    }
+    fn readValueInner(self: *Engine, value: v.Value) anyerror!v.Value {
+        if (!(try self.values.info(value)).entities) return value;
         const project_node = self.backend.vtable.project_node;
         if (self.isDeleted(value)) return switch (value) {
             .node => |retained| blk: {
@@ -803,13 +822,13 @@ const Engine = struct {
             .path => |path| blk: {
                 const nodes = try self.a.alloc(*const v.Node, path.nodes.len);
                 for (path.nodes, nodes) |node, *out| {
-                    const visible = try self.readValue(.{ .node = node });
+                    const visible = try self.readValueInner(.{ .node = node });
                     if (visible == .null) break :blk .null;
                     out.* = visible.node;
                 }
                 const relationships = try self.a.alloc(*const v.Relationship, path.relationships.len);
                 for (path.relationships, relationships) |relationship, *out| {
-                    const visible = try self.readValue(.{ .relationship = relationship });
+                    const visible = try self.readValueInner(.{ .relationship = relationship });
                     if (visible == .null) break :blk .null;
                     out.* = visible.relationship;
                 }
@@ -817,12 +836,12 @@ const Engine = struct {
             },
             .list => |items| blk: {
                 const visible = try self.a.alloc(v.Value, items.len);
-                for (items, visible) |item, *out| out.* = try self.readValue(item);
+                for (items, visible) |item, *out| out.* = try self.readValueInner(item);
                 break :blk .{ .list = visible };
             },
             .map => |map_entries| blk: {
                 const visible = try self.a.alloc(v.Entry, map_entries.len);
-                for (map_entries, visible) |entry, *out| out.* = .{ .name = entry.name, .value = try self.readValue(entry.value) };
+                for (map_entries, visible) |entry, *out| out.* = .{ .name = entry.name, .value = try self.readValueInner(entry.value) };
                 break :blk .{ .map = visible };
             },
             else => value,
@@ -836,6 +855,11 @@ const Engine = struct {
         return self.eval(expression, row, null);
     }
     fn eval(self: *Engine, expression: *const ast.Expr, row: Row, group: ?[]const Row) anyerror!v.Value {
+        const result = try self.evalInner(expression, row, group);
+        _ = try self.values.info(result);
+        return result;
+    }
+    fn evalInner(self: *Engine, expression: *const ast.Expr, row: Row, group: ?[]const Row) anyerror!v.Value {
         try self.checkpoint();
         return switch (expression.value) {
             .literal => |value| switch (value) {
@@ -1012,7 +1036,7 @@ const Engine = struct {
                 const operand = if (c.operand) |x| try self.eval(x, row, group) else null;
                 for (c.branches) |branch| {
                     const condition = try self.eval(branch.condition, row, group);
-                    const matched = if (operand) |x| v.Value.equal(x, condition) == true else (try condition.truth()) == true;
+                    const matched = if (operand) |x| (try self.values.equal(x, condition)) == true else (try condition.truth()) == true;
                     if (matched) break :blk try self.eval(branch.value, row, group);
                 }
                 break :blk if (c.otherwise) |other| try self.eval(other, row, group) else .null;
@@ -1044,16 +1068,16 @@ const Engine = struct {
             if (right != .list) return error.CypherTypeMismatch;
             var unknown = false;
             for (right.list) |item| {
-                if (v.Value.equal(left, item)) |same| {
+                if ((try self.values.equal(left, item))) |same| {
                     if (same) return .{ .boolean = true };
                 } else unknown = true;
             }
             return if (unknown) .null else .{ .boolean = false };
         }
         if (left == .null or right == .null) return .null;
-        if (op == .eq or op == .neq) return if (v.Value.equal(left, right)) |same| .{ .boolean = same == (op == .eq) } else .null;
+        if (op == .eq or op == .neq) return if ((try self.values.equal(left, right))) |same| .{ .boolean = same == (op == .eq) } else .null;
         if (op == .lt or op == .lte or op == .gt or op == .gte) {
-            const order_value = v.Value.compare(left, right) orelse return .null;
+            const order_value = (try self.values.compare(left, right)) orelse return .null;
             return .{ .boolean = switch (op) {
                 .lt => order_value == .lt,
                 .lte => order_value != .gt,
@@ -1285,16 +1309,24 @@ const Engine = struct {
     fn aggregate(self: *Engine, call_value: ast.Function, group: []const Row) !v.Value {
         if (call_value.args.len != (if (call_value.star) @as(usize, 0) else 1)) return error.CypherFunctionArity;
         var items: std.ArrayList(v.Value) = .empty;
+        var distinct_values: value_work.Index = .{};
         for (group) |row| {
             const value = if (call_value.star) v.Value{ .integer = 1 } else try self.eval(call_value.args[0], row, null);
             if (value == .null) continue;
             if (call_value.distinct) {
+                const hash = (try self.values.info(value)).hash;
+                var candidate = distinct_values.head(hash);
                 var duplicate = false;
-                for (items.items) |item| if (v.Value.eql(item, value)) {
-                    duplicate = true;
-                    break;
-                };
+                while (candidate) |position| {
+                    const link = distinct_values.links.items[position];
+                    if (try self.values.eql(items.items[link.index], value)) {
+                        duplicate = true;
+                        break;
+                    }
+                    candidate = link.next;
+                }
                 if (duplicate) continue;
+                try distinct_values.insert(self.a, hash, items.items.len);
             }
             try items.append(self.a, value);
         }
@@ -1304,7 +1336,7 @@ const Engine = struct {
         if (std.ascii.eqlIgnoreCase(call_value.name, "min") or std.ascii.eqlIgnoreCase(call_value.name, "max")) {
             var best = items.items[0];
             for (items.items[1..]) |item| {
-                const order_value = try v.Value.order(item, best);
+                const order_value = try self.values.order(item, best);
                 if ((order_value == .lt and std.ascii.eqlIgnoreCase(call_value.name, "min")) or (order_value == .gt and std.ascii.eqlIgnoreCase(call_value.name, "max"))) best = item;
             }
             return best;
@@ -1343,23 +1375,25 @@ const Engine = struct {
         var groups: std.ArrayList(std.ArrayList(Row)) = .empty;
         if (grouped) {
             var keys: std.ArrayList([]const v.Value) = .empty;
+            var group_index: value_work.Index = .{};
             for (rows) |row| {
                 var values: std.ArrayList(v.Value) = .empty;
                 for (projection.items) |item| if (!aggregates(item.expression)) try values.append(self.a, try self.eval(item.expression, row, null));
+                const key_values = try values.toOwnedSlice(self.a);
+                const hash = (try self.values.info(.{ .list = key_values })).hash;
                 var found: ?usize = null;
-                for (keys.items, 0..) |key, i| {
-                    var equal = key.len == values.items.len;
-                    if (equal) for (key, values.items) |x, y| if (!v.Value.eql(x, y)) {
-                        equal = false;
-                        break;
-                    };
-                    if (equal) {
-                        found = i;
+                var candidate = group_index.head(hash);
+                while (candidate) |position| {
+                    const link = group_index.links.items[position];
+                    if (try self.values.eql(.{ .list = keys.items[link.index] }, .{ .list = key_values })) {
+                        found = link.index;
                         break;
                     }
+                    candidate = link.next;
                 }
                 if (found) |i| try groups.items[i].append(self.a, row) else {
-                    try keys.append(self.a, try values.toOwnedSlice(self.a));
+                    try group_index.insert(self.a, hash, keys.items.len);
+                    try keys.append(self.a, key_values);
                     var group: std.ArrayList(Row) = .empty;
                     try group.append(self.a, row);
                     try groups.append(self.a, group);
@@ -1376,6 +1410,7 @@ const Engine = struct {
             try groups.append(self.a, group);
         }
         var projected: std.ArrayList(Projected) = .empty;
+        var projected_index: value_work.Index = .{};
         var columns: std.ArrayList([]const u8) = .empty;
         if (projection.wildcard and rows.len > 0) for (rows[0]) |entry| try columns.append(self.a, entry.name);
         for (projection.items) |item| try columns.append(self.a, item.alias orelse try self.expressionName(item.expression));
@@ -1391,12 +1426,19 @@ const Engine = struct {
             const order_keys = try self.a.alloc(v.Value, projection.order.len);
             for (projection.order, order_keys) |order_value, *key| key.* = try self.eval(order_value.expression, scope, if (grouped) group.items else null);
             if (projection.distinct) {
+                const hash = try self.rowHash(out_row);
+                var candidate = projected_index.head(hash);
                 var duplicate = false;
-                for (projected.items) |previous| if (rowEqual(previous.row, out_row)) {
-                    duplicate = true;
-                    break;
-                };
+                while (candidate) |position| {
+                    const link = projected_index.links.items[position];
+                    if (try self.rowEqual(projected.items[link.index].row, out_row)) {
+                        duplicate = true;
+                        break;
+                    }
+                    candidate = link.next;
+                }
                 if (duplicate) continue;
+                try projected_index.insert(self.a, hash, projected.items.len);
             }
             try projected.append(self.a, .{ .row = out_row, .source = source, .group = if (grouped) group.items else null, .keys = order_keys });
         }
@@ -1412,22 +1454,34 @@ const Engine = struct {
         if (final) self.columns = try columns.toOwnedSlice(self.a);
         return output;
     }
-    fn rowEqual(a: Row, b: Row) bool {
-        if (a.len != b.len) return false;
-        // Wildcards retain binding order internally; UNION arms may project
-        // the same named columns explicitly in a different physical order.
-        for (a) |x| if (!v.Value.eql(x.value, lookup(b, x.name) orelse return false)) return false;
-        return true;
+    fn rowHash(self: *Engine, row: Row) !u64 {
+        // Columns are named; wildcard and explicit UNION arms can retain a
+        // different physical binding order for the same logical row.
+        return (try self.values.info(.{ .map = row })).hash;
+    }
+    fn rowEqual(self: *Engine, a: Row, b: Row) !bool {
+        return self.values.eql(.{ .map = a }, .{ .map = b });
     }
     fn distinct(self: *Engine, rows: []const Row) !std.ArrayList(Row) {
         var output: std.ArrayList(Row) = .empty;
+        var index: value_work.Index = .{};
         for (rows) |row| {
+            try self.checkpoint();
+            const hash = try self.rowHash(row);
+            var candidate = index.head(hash);
             var duplicate = false;
-            for (output.items) |previous| if (rowEqual(previous, row)) {
-                duplicate = true;
-                break;
-            };
-            if (!duplicate) try output.append(self.a, row);
+            while (candidate) |position| {
+                const link = index.links.items[position];
+                if (try self.rowEqual(output.items[link.index], row)) {
+                    duplicate = true;
+                    break;
+                }
+                candidate = link.next;
+            }
+            if (!duplicate) {
+                try index.insert(self.a, hash, output.items.len);
+                try output.append(self.a, row);
+            }
         }
         return output;
     }
@@ -1454,7 +1508,7 @@ const Engine = struct {
                     if (l < middle and r < end) {
                         choose_left = true;
                         for (orders, 0..) |order_value, i| {
-                            const ordering = try v.Value.order(items[l].keys[i], items[r].keys[i]);
+                            const ordering = try self.values.order(items[l].keys[i], items[r].keys[i]);
                             if (ordering != .eq) {
                                 choose_left = (ordering == .lt) != order_value.descending;
                                 break;
@@ -1519,6 +1573,12 @@ const Engine = struct {
     fn mutate(self: *Engine, mutation: backend_mod.Mutation) !void {
         try self.checkpoint();
         const mutate_fn = self.backend.vtable.mutate orelse return error.CypherMutationsUnavailable;
+        switch (mutation) {
+            .create_node => |node| try self.values.properties(node.properties),
+            .create_relationship => |edge| try self.values.properties(edge.properties),
+            .set_properties => |update| try self.values.properties(update.properties),
+            else => {},
+        }
         try mutation.validateProperties();
         try mutate_fn(self.backend.ptr, self.a, mutation);
         const deletion: ?v.EntityIdentity = switch (mutation) {
@@ -1531,6 +1591,7 @@ const Engine = struct {
     }
     fn creationProperties(self: *Engine, items: []const ast.Entry, row: Row, merge: bool) ![]const v.Entry {
         const properties = try self.entries(items, row);
+        try self.values.traversal(.{ .map = properties });
         if (merge) for (properties) |property| {
             if (property.value == .null) return error.CypherInvalidPropertyValue;
         };
@@ -1627,10 +1688,15 @@ const Engine = struct {
     }
     fn refreshRow(self: *Engine, row: Row, target: v.EntityIdentity, updated: v.Value) !Row {
         const result = try self.a.dupe(v.Entry, row);
-        for (result) |*entry| entry.value = try self.refreshValue(entry.value, target, updated);
+        for (result) |*entry| {
+            if (!(try self.values.info(entry.value)).entities) continue;
+            try self.values.entityTraversal(entry.value);
+            entry.value = try self.refreshValue(entry.value, target, updated);
+        }
         return result;
     }
     fn refreshValue(self: *Engine, value: v.Value, target: v.EntityIdentity, updated: v.Value) anyerror!v.Value {
+        if (!(try self.values.info(value)).entities) return value;
         if (value == .node or value == .relationship) return if ((try v.EntityIdentity.fromValue(value)).eql(target)) updated else value;
         return switch (value) {
             .path => |path| blk: {
@@ -1645,7 +1711,11 @@ const Engine = struct {
                 for (items, out) |item, *cell| cell.* = try self.refreshValue(item, target, updated);
                 break :blk .{ .list = out };
             },
-            .map => |map_entries| .{ .map = try self.refreshRow(map_entries, target, updated) },
+            .map => |map_entries| blk: {
+                const refreshed = try self.a.dupe(v.Entry, map_entries);
+                for (refreshed) |*entry| entry.value = try self.refreshValue(entry.value, target, updated);
+                break :blk .{ .map = refreshed };
+            },
             else => value,
         };
     }

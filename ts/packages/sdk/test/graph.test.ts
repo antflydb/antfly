@@ -183,3 +183,38 @@ describe("graph query transport", () => {
     expect(fetch).toHaveBeenCalledTimes(2);
   });
 });
+
+describe("graph catalog mutation visibility", () => {
+  it.each([
+    "create",
+    "update",
+    "drop",
+  ])("preserves pending %s without replay", async (operation) => {
+    const fetch = vi.fn(
+      async () =>
+        new Response(JSON.stringify({ status: "committed_visibility_pending" }), {
+          status: 202,
+          headers: { "Content-Type": "application/json" },
+        })
+    );
+    vi.stubGlobal("fetch", fetch);
+    const client = new AntflyClient({ baseUrl: "https://antfly.test" });
+    const definition = { labels: [{ name: "Document", table: "docs" }] };
+    const outcome =
+      operation === "create"
+        ? await client.graphs.create("knowledge", definition)
+        : operation === "update"
+          ? await client.graphs.update("knowledge", "1", definition)
+          : await client.graphs.drop("knowledge");
+    expect(outcome).toEqual({ status: "committed_visibility_pending" });
+    expect(fetch).toHaveBeenCalledTimes(1);
+  });
+  it("returns no pending outcome when graph deletion is visible", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => new Response(null, { status: 204 }))
+    );
+    const client = new AntflyClient({ baseUrl: "https://antfly.test" });
+    expect(await client.graphs.drop("knowledge")).toBeUndefined();
+  });
+});

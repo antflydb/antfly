@@ -679,3 +679,42 @@ test "missing producers suppress every assertion with one bounded lookup" {
     try std.testing.expectEqual(@as(usize, 3), snapshot.overlay.captured.scanned_anchors);
     for (snapshot.overlay.relationships.items) |relationship| try std.testing.expect(relationship.deleted);
 }
+
+test "computed depth and expanded mutation work fail before commit and roll back writes" {
+    var fixture = Fixture.init();
+    defer fixture.arena.deinit();
+    try std.testing.expectError(error.CypherValueDepthExceeded, fixture.run("CREATE (n:Person) WITH n, reduce(a=[],x IN range(1,10000)|[a]) AS a SET n.nested=a RETURN n"));
+    try std.testing.expectEqual(@as(usize, 0), fixture.nodes.len);
+    try std.testing.expectEqual(@as(usize, 0), fixture.commits);
+    try std.testing.expectEqual(@as(usize, 1), fixture.rollbacks);
+    // Mutation property validation must reserve work before walking a DAG.
+    try std.testing.expectError(error.CypherStateBudgetExceeded, fixture.run("CREATE (n:Person) WITH n, reduce(a=[1],x IN range(1,40)|[a,a]) AS a SET n.x=a RETURN n"));
+    try std.testing.expectEqual(@as(usize, 0), fixture.nodes.len);
+    try std.testing.expectEqual(@as(usize, 0), fixture.commits);
+    try std.testing.expectEqual(@as(usize, 2), fixture.rollbacks);
+}
+
+test "refreshing entity aliases preserves shared entity-free data without expanding it" {
+    var fixture = Fixture.init();
+    defer fixture.arena.deinit();
+    var result = try fixture.run("CREATE (n:Person) WITH n, reduce(a=[1],x IN range(1,40)|[a,a]) AS a SET n.x=1 RETURN size(a)");
+    defer result.deinit();
+    try std.testing.expectEqual(@as(i64, 2), result.rows[0][0].integer);
+    try std.testing.expectEqual(@as(usize, 1), fixture.commits);
+}
+
+test "property writes include entity envelopes in the wire depth before committing" {
+    var fixture = Fixture.init();
+    defer fixture.arena.deinit();
+    try std.testing.expectError(error.CypherValueDepthExceeded, fixture.run("CREATE (n:Person) WITH n,reduce(a=[1],x IN range(1,62)|[a]) AS a SET n.payload=a"));
+    try std.testing.expectEqual(@as(usize, 0), fixture.commits);
+    try std.testing.expectEqual(@as(usize, 0), fixture.nodes.len);
+    var result = try fixture.run("CREATE (n:Person) WITH n,reduce(a=[1],x IN range(1,61)|[a]) AS a SET n.payload=a RETURN n");
+    defer result.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const json = try std.json.Stringify.valueAlloc(a, root.wire.Value{ .value = result.rows[0][0] }, .{});
+    const decoded = try root.wire.transport(a, try std.json.parseFromSliceLeaky(std.json.Value, a, json, .{}));
+    try std.testing.expect(v.Value.eql(.{ .map = result.rows[0][0].node.properties }, .{ .map = decoded.node.properties }));
+}

@@ -72,6 +72,17 @@ function hasEntity(value: GraphValue): boolean {
 }
 export function sqlGraphValues(result: SQLResponse): GraphValue[] {
   const values: GraphValue[] = [];
+  function collect(value: unknown, depth = 0) {
+    if (depth > 64) return;
+    if (graphValue(value)) {
+      if (hasEntity(value)) values.push(value);
+      return;
+    }
+    // SQL GRAPH_TABLE lowers data lists/maps to ordinary JSON while retaining
+    // envelopes around nested entities. Visit those ordinary containers too.
+    if (Array.isArray(value)) for (const item of value) collect(item, depth + 1);
+    else if (object(value)) for (const item of Object.values(value)) collect(item, depth + 1);
+  }
   for (const [ri, row] of result.rows.entries())
     for (const [ci, cell] of row.entries()) {
       if (result.sql_nulls?.[ri]?.[ci]) continue;
@@ -83,7 +94,7 @@ export function sqlGraphValues(result: SQLResponse): GraphValue[] {
           continue;
         }
       }
-      if (graphValue(value) && hasEntity(value)) values.push(value);
+      collect(value);
     }
   return values;
 }
@@ -189,7 +200,8 @@ export default function SQLGraphPreview({ values }: { values: GraphValue[] }) {
           );
         })}
         {visual.nodes.map(([id, node]) => {
-          const point = positions.get(id)!;
+          const point = positions.get(id);
+          if (!point) return null;
           return (
             <g
               key={id}
@@ -230,6 +242,7 @@ export default function SQLGraphPreview({ values }: { values: GraphValue[] }) {
       </svg>
       {selected && (
         <pre
+          role="region"
           aria-label="SQL graph entity"
           className="max-h-80 overflow-auto rounded border p-3 text-xs"
         >

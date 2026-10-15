@@ -4060,6 +4060,7 @@ pub const DB = struct {
             try db.initializeTableStorage(opts.table_storage);
             profile.table_storage_ns = elapsedSince(table_storage_started_ns);
             if (opts.physical_root_mode == .filesystem_managed) {
+                if (comptime builtin.os.tag == .freestanding) return error.UnsupportedPlatform;
                 // Read-only status needs the same receiver identity as the
                 // writer to validate completion. It may load an existing
                 // checkpoint, but must never create one on an older root.
@@ -137355,6 +137356,41 @@ test "capi resolver replacement resumes checkpoints while writes continue" {
         try db.waitGraphReplacement("new", generation, 0);
         try std.testing.expect(!db.hasPendingGraphReplacements());
     }
+}
+
+test "capi resolver replacement skips legacy scans only for ordered generation reservations" {
+    const a = std.testing.allocator;
+    var directory = try TestDirectory.init("replacement-contributor-format");
+    defer directory.cleanup();
+    var db = try DB.open(a, directory.path(), .{ .executor = .{ .backend = .manual }, .start_optional_runtimes = false });
+    defer db.close();
+    const config = "{\"edge_types\":[{\"name\":\"R\",\"field\":\"links\"}]}";
+    try db.addIndex(.{ .name = "old", .kind = .graph, .config_json = config });
+    _ = try db.replaceGraphIndex("old", .{ .name = "new", .kind = .graph, .config_json = config });
+    const jobs = try db.graphReplacementStatusAlloc(a);
+    defer jobs.deinit();
+    const cfg = jobs.value[0].config.?;
+    const migrations = index_manager_mod.test_graph_contributor_migrations.load(.monotonic);
+    {
+        var private = try index_manager_mod.IndexManager.initWithOptions(a, db.core.index_manager.base_path, db.index_backends);
+        defer private.deinit();
+        private.setIo(db.backend_runtime.io());
+        try private.registerReplacementIndex(db.core.store, cfg);
+        try std.testing.expect(try private.graphIndex("new").?.index.contributionOrderingReady());
+        try std.testing.expectEqual(migrations, index_manager_mod.test_graph_contributor_migrations.load(.monotonic));
+        // Simulate an interrupted legacy projection without its format marker.
+        try private.resetGraphIndexForArtifactRebuild("new");
+        try private.graphIndex("new").?.index.sync(true);
+    }
+    var legacy_job = jobs.value[0];
+    legacy_job.contribution_ordering_version = 0;
+    try db.core.index_manager.saveGraphReplacementBuild(db.core.store, legacy_job);
+    var reopened = try index_manager_mod.IndexManager.initWithOptions(a, db.core.index_manager.base_path, db.index_backends);
+    defer reopened.deinit();
+    reopened.setIo(db.backend_runtime.io());
+    try reopened.registerReplacementIndex(db.core.store, cfg);
+    try std.testing.expect(try reopened.graphIndex("new").?.index.contributionOrderingReady());
+    try std.testing.expectEqual(migrations + 1, index_manager_mod.test_graph_contributor_migrations.load(.monotonic));
 }
 
 test "capi resolver replacement fenced tail advances gaps over 1024" {
