@@ -110,10 +110,14 @@ coded-window limit applies to each MP4 dependency closure, independently of the
 object length. Sources that exceed index, dependency or read budgets fail with
 explicit incomplete coverage.
 
-Each coded window retains verified restart/preroll proofs. Forward, static AVC
+Each coded window retains verified restart/preroll proofs. Forward AVC
 selections retain a bounded decoder owner across windows on portable H.264 and
-Apple VideoToolbox. Backward selections, separate colour planes, dynamic parameter
-sets and other codec paths use verified replay; projections still remain reusable.
+Apple VideoToolbox. Portable H.264 reuse includes separate colour planes and
+parameter-set updates within compatible epochs; geometry/representation changes
+construct fresh owners. Portable VP8/VP9/AV1 WebM windows retain entropy/reference
+state. Backward selections and previously consumed outputs within a multi-output
+packet use verified replay; projections still remain reusable. Apple WebM keeps
+its native replay path.
 Failed owners are destroyed before retry. Native callbacks drain before borrowed
 window state retires, and Apple decoder surface reservations survive until owner
 release. Required dependency bytes are still materialized per window; retained
@@ -230,13 +234,15 @@ time rather than jumping a long VFR hold to the next picture.
 
 MP4 uses one index/configuration owner and bounded coded windows including verified
 preroll, reorder and picture-assembly dependencies. WebM shares a logical/header
-index across model windows and replays from verified codec restart points. WAV
+index across model windows and retains portable VP8/VP9/AV1 reference state for
+forward selections, using verified restart points for cold or backward requests. WAV
 range input reads/decode only the selected samples. Compressed MP3, FLAC, core AAC, ALAC and Opus/Vorbis paths deliver codec blocks
 through a two-block queue and retain only the current PCM window plus overlap.
 Container trim, gain, per-channel clipping, and supported WebM timeline gaps are
 preserved. Formats/profiles without an incremental visitor (including enhanced
-AAC, chained Ogg and WebM FLAC without declared sample totals) retain the bounded
-fallback. Compressed input and packet metadata remain bounded contiguous owners;
+AAC) retain the bounded fallback. AIFF/AIFC, AU and PCM/G.711 CAF stream bounded
+blocks. Chained Vorbis normalizes each logical stream with bounded resampling;
+WebM FLAC without declared sample totals uses a PCM-free counting pass. Compressed input and packet metadata remain bounded contiguous owners;
 this does not yet promise remote packet-range streaming for every audio codec.
 Contiguous image/PDF decoders also use a bounded source/decode allocation;
 unsupported sizes fail without claiming completion. Model calls reuse the

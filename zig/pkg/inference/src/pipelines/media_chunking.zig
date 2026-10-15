@@ -523,7 +523,9 @@ pub const Runner = struct {
             end = @max(end, @as(i128, origin) + @as(i128, @intFromFloat(duration * std.time.ns_per_s)));
         } else if (last_duration == null or last_duration.? <= 0) return error.UnknownVideoDuration;
         if (end <= origin) return error.UnknownVideoDuration;
-        try self.videoWindows(&.{}, null, end - origin, origin, 1_000_000_000, null, .{ .reader = reader, .index = &indexed });
+        var continuation = video.webm_pictures.Continuation{ .allocator = self.allocator, .reader = reader };
+        defer continuation.deinit();
+        try self.videoWindows(&.{}, null, end - origin, origin, 1_000_000_000, null, .{ .reader = reader, .index = &indexed, .continuation = &continuation });
     }
     fn videoWindows(self: *Runner, bytes: []const u8, reader: ?*const media.mp4.Reader, duration: i128, origin: i64, timescale: u32, owner: ?*@import("media_chunking_video.zig").Owner, webm: ?@import("embedding_gemma2_video.zig").WebmInput) !void {
         const end = std.math.cast(i64, duration) orelse return error.TimestampOverflow;

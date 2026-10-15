@@ -51,21 +51,13 @@ const Mono = struct {
 pub fn supported(a: std.mem.Allocator, bytes: []const u8) !bool {
     const format = audio.detectFormat(bytes) orelse return false;
     return switch (format) {
-        .mp3, .flac, .aac, .webm => true,
-        .caf => blk: {
-            var demuxed = audio.caf.demux(a, bytes) catch |err| {
-                if (err == error.UnsupportedAudioFormat) break :blk false;
-                return err;
-            };
-            defer demuxed.deinit();
-            break :blk true;
-        },
+        .mp3, .flac, .aac, .webm, .aiff, .au, .caf => true,
         .ogg, .opus => blk: {
             if (bytes.len < 4 or !std.mem.eql(u8, bytes[0..4], "OggS")) break :blk false;
-            _ = try audio.ogg.sniffCodec(a, bytes);
+            const codec = try audio.ogg.sniffCodec(a, bytes);
             var streams = try audio.ogg.parsePacketStreamsAlloc(a, bytes);
             defer streams.deinit();
-            break :blk streams.streams.len == 1;
+            break :blk codec == .vorbis or streams.streams.len == 1;
         },
         .mp4 => blk: {
             var demuxed = try audio.mp4.demux(a, bytes);
@@ -84,7 +76,13 @@ pub fn visit(a: std.mem.Allocator, bytes: []const u8, control: @import("work_con
     const format = audio.detectFormat(bytes) orelse return error.UnsupportedAudioFormat;
     switch (format) {
         .webm => try audio.webm.visitInterleaved(a, bytes, mono.consumer()),
+        .aiff => try audio.aiff.visitInterleaved(a, bytes, mono.consumer()),
+        .au => try audio.au.visitInterleaved(a, bytes, mono.consumer()),
         .caf => {
+            if (audio.caf.isPcm(bytes)) {
+                try audio.caf.visitInterleaved(a, bytes, mono.consumer());
+                return;
+            }
             var demuxed = try audio.caf.demux(a, bytes);
             defer demuxed.deinit();
             mono.skip = demuxed.priming_frames;

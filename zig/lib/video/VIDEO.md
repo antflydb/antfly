@@ -179,9 +179,13 @@ adds opt-in long-video retrieval windows through `/ai/v1/chunk`; `/embed` retain
 one vector per explicit group. Chunk windows preserve cadence, half-open source
 clocks, VFR holds and exact selected picture IDs. MP4 retains its index and verified
 preroll/assembly context; WebM reuses a logical index and verified restart points.
-Static AVC forward windows also retain bounded portable H.264 or VideoToolbox
-reference state. Backward selections, dynamic parameter sets, separate colour
-planes and other codecs retain verified replay. Dependency bytes remain bounded
+Forward AVC windows retain bounded portable H.264 or VideoToolbox reference
+state. Portable reuse includes separate colour planes and dynamic parameter-set
+updates within compatible configuration epochs; geometry/representation epochs
+construct fresh decoder owners. Portable VP8/VP9/AV1 WebM windows retain reference
+and entropy state across forward selections. Backward selections and outputs
+already consumed within a multi-output packet use verified independent replay.
+Apple WebM selections continue to use the native replay path. Dependency bytes remain bounded
 per window even when reconstruction reuses references. Native decoder callbacks
 drain before window release; retained Apple surfaces keep their admission until
 decoder destruction. Request-local projected reuse and bounded preparation overlap

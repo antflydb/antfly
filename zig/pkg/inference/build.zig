@@ -1610,7 +1610,9 @@ pub fn build(b: *std.Build) void {
     @import("antfly_media").support.attach(b, chunk_audio_root, b.path(b.fmt("{s}/lib/media", .{shared_lib_root})));
     chunk_audio_root.link_libc = link_libc;
     const chunk_audio_tests = b.addTest(.{ .root_module = chunk_audio_root, .filters = &.{ "bounded audio cancellation", "streaming audio" } });
-    media_chunk_step.dependOn(&b.addRunArtifact(chunk_audio_tests).step);
+    const run_chunk_audio_tests = b.addRunArtifact(chunk_audio_tests);
+    media_chunk_step.dependOn(&run_chunk_audio_tests.step);
+    b.step("test-audio-streaming", "Qualify bounded audio block visitors, clocks and cancellation").dependOn(&run_chunk_audio_tests.step);
     const chunk_planning_tests = b.addTest(.{ .root_module = b.createModule(.{ .root_source_file = b.path(b.fmt("{s}/lib/chunker/src/planning.zig", .{shared_lib_root})), .target = target, .optimize = optimize }) });
     media_chunk_step.dependOn(&b.addRunArtifact(chunk_planning_tests).step);
     const chunk_sampling_root = b.createModule(.{ .root_source_file = b.path(b.fmt("{s}/lib/video/src/sampling.zig", .{shared_lib_root})), .target = target, .optimize = optimize });
@@ -2175,7 +2177,9 @@ pub fn build(b: *std.Build) void {
     });
     @import("antfly_media").support.attach(b, audio_module_tests_all.root_module, b.path(b.fmt("{s}/lib/media", .{shared_lib_root})));
     audio_module_tests_all.root_module.link_libc = true;
-    audio_module_test_step.dependOn(&b.addRunArtifact(audio_module_tests_all).step);
+    const run_audio_codecs = b.addRunArtifact(audio_module_tests_all);
+    audio_module_test_step.dependOn(&run_audio_codecs.step);
+    b.step("test-audio-codecs", "Run the complete shared audio codec suite").dependOn(&run_audio_codecs.step);
 
     for (audio_module_test_filters, 0..) |filter, filter_index| {
         const audio_module_tests = b.addTest(.{

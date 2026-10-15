@@ -642,8 +642,19 @@ pub fn visitInterleaved(a: std.mem.Allocator, bytes: []const u8, sink: @import("
             try native.appendSlice(a, demuxed.codec_private);
             for (demuxed.access_units) |unit| try native.appendSlice(a, unit);
             const info = try flac.parseStreamInfo(native.items);
-            if (info.total_samples == 0) return error.UnsupportedStreamingAudioProfile;
-            const count = [_]usize{@intCast(info.total_samples)};
+            // STREAMINFO may omit total_samples in a live recording. Count a
+            // validation pass without retaining PCM before constructing the
+            // final-tail timeline; execution still uses bounded codec blocks.
+            const Counter = struct {
+                frames: usize = 0,
+                fn write(raw: *anyopaque, pcm: []const f32, _: u32, channels: u8) !void {
+                    const self: *@This() = @ptrCast(@alignCast(raw));
+                    self.frames = try std.math.add(usize, self.frames, pcm.len / channels);
+                }
+            };
+            var counter = Counter{};
+            if (info.total_samples == 0) try flac.visitInterleaved(a, native.items, .{ .context = &counter, .write = Counter.write });
+            const count = [_]usize{if (info.total_samples == 0) counter.frames else @intCast(info.total_samples)};
             var timeline = try TimelineSink.init(sink, demuxed.access_unit_times_ns[0..1], &count, info.sample_rate, info.channels, nsToFrames(demuxed.codec_delay_ns, info.sample_rate), count[0], demuxed.discard_padding_ns);
             try flac.visitInterleaved(a, native.items, timeline.consumer());
             try timeline.finish();
@@ -1603,4 +1614,38 @@ test "webm demux rejects a truncated file instead of crashing" {
 test "webm demux rejects non-EBML input" {
     const allocator = std.testing.allocator;
     try std.testing.expectError(error.UnsupportedAudioFormat, demux(allocator, "not a webm file"));
+}
+
+test "streaming audio webm FLAC with unknown sample total preserves full PCM" {
+    const a = std.testing.allocator;
+    const end = try flacMetadataEnd(tone_flac_bytes);
+    const private = try a.dupe(u8, tone_flac_bytes[0..end]);
+    defer a.free(private);
+    const info = std.mem.readInt(u64, private[18..26], .big);
+    std.mem.writeInt(u64, private[18..26], info & ~@as(u64, 0x0f_ffff_ffff), .big);
+    const block = try buildSimpleBlockNoLacing(a, 1, tone_flac_bytes[end..]);
+    defer a.free(block);
+    const entry = try buildAudioTrackEntry(a, 1, "A_FLAC", private, 2, null);
+    defer a.free(entry);
+    const tracks = try buildTracks(a, &.{entry});
+    defer a.free(tracks);
+    const cluster = try buildCluster(a, 0, &.{block});
+    defer a.free(cluster);
+    const file = try buildWebmFile(a, tracks, &.{cluster});
+    defer a.free(file);
+    var expected = try flac.decodeInterleaved(a, tone_flac_bytes);
+    defer expected.deinit();
+    const Capture = struct {
+        expected: []const f32,
+        offset: usize = 0,
+        fn write(raw: *anyopaque, pcm: []const f32, _: u32, _: u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try std.testing.expect(pcm.len <= self.expected.len - self.offset);
+            try std.testing.expectEqualSlices(f32, self.expected[self.offset..][0..pcm.len], pcm);
+            self.offset += pcm.len;
+        }
+    };
+    var capture = Capture{ .expected = expected.samples };
+    try visitInterleaved(a, file, .{ .context = &capture, .write = Capture.write });
+    try std.testing.expectEqual(expected.samples.len, capture.offset);
 }

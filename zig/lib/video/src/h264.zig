@@ -1354,7 +1354,10 @@ pub const Incremental = struct {
     /// Continue reconstruction for later selections. Earlier pictures require
     /// replay from a verified restart point; callers must not rewind this owner.
     pub fn decodeSelected(self: *Incremental, reader: *media.mp4.Reader, indexes: []const usize, callback_context: *anyopaque, callback: SelectionCallback) !Statistics {
-        if (!self.valid or self.cfg.?.separate_planes) return error.UnsupportedIncrementalConfiguration;
+        return self.decodeSelectedWithConfigurations(reader, indexes, callback_context, callback, null);
+    }
+    pub fn decodeSelectedWithConfigurations(self: *Incremental, reader: *media.mp4.Reader, indexes: []const usize, callback_context: *anyopaque, callback: SelectionCallback, configurations: ?@import("h264_dynamic.zig").Context) !Statistics {
+        if (!self.valid) return error.UnsupportedIncrementalConfiguration;
         if (indexes.len == 0) return error.InvalidPacketIndex;
         var first = reader.packets.len;
         var last: usize = 0;
@@ -1365,14 +1368,19 @@ pub const Incremental = struct {
         }
         errdefer self.valid = false;
         switch (self.lanes) {
-            inline else => |*lanes| for (&lanes[0].workspaces) |*slot| if (slot.*) |*workspace| {
+            inline else => |*lanes| for (lanes[0..if (self.cfg.?.separate_planes) @as(usize, 3) else 1]) |*lane| for (&lane.workspaces) |*slot| if (slot.*) |*workspace| {
                 workspace.selected = try self.budget.allocator().realloc(workspace.selected, indexes.len);
                 @memset(workspace.selected, false);
             },
         }
         var frame = switch (self.lanes) {
-            .eight => |*lanes| try decodeConfiguredState(u8, self.cfg.?, &self.config_reservation, &self.budget, reader, indexes, self.options, callback_context, callback, last, first, null, &lanes[0]),
-            .wide => |*lanes| try decodeConfiguredState(u16, self.cfg.?, &self.config_reservation, &self.budget, reader, indexes, self.options, callback_context, callback, last, first, null, &lanes[0]),
+            inline else => |*lanes, kind| frame: {
+                const Sample = if (kind == .eight) u8 else u16;
+                break :frame if (self.cfg.?.separate_planes)
+                    try decodeSeparatedState(Sample, self.cfg.?, &self.config_reservation, &self.budget, reader, indexes, self.options, callback_context, callback, last, first, configurations, lanes)
+                else
+                    try decodeConfiguredState(Sample, self.cfg.?, &self.config_reservation, &self.budget, reader, indexes, self.options, callback_context, callback, last, first, configurations, &lanes[0]);
+            },
         };
         const result = Statistics{ .decoded_packets = frame.decoded_packets, .payload_bytes = frame.payload_bytes, .decode_high_water = frame.decode_high_water };
         // This internal frame dies before the retained decoder budget.
@@ -1800,6 +1808,9 @@ fn decodeConfiguredState(comptime Sample: type, initial_cfg: Config, config_rese
 /// dependency span once; selected native planes are retained under one budget
 /// until all three have been reconstructed and can be published as 4:4:4.
 fn decodeSeparated(comptime Sample: type, cfg: Config, config_reservation: *media.admission.Token, budget: *@import("decode_budget.zig").Budget, reader: *media.mp4.Reader, indexes: []const usize, options: Options, callback_context: ?*anyopaque, callback: ?SelectionCallback, index: usize, first_index: usize, configurations: ?@import("h264_dynamic.zig").Context) !Frame {
+    return decodeSeparatedState(Sample, cfg, config_reservation, budget, reader, indexes, options, callback_context, callback, index, first_index, configurations, null);
+}
+fn decodeSeparatedState(comptime Sample: type, cfg: Config, config_reservation: *media.admission.Token, budget: *@import("decode_budget.zig").Budget, reader: *media.mp4.Reader, indexes: []const usize, options: Options, callback_context: ?*anyopaque, callback: ?SelectionCallback, index: usize, first_index: usize, configurations: ?@import("h264_dynamic.zig").Context, state: ?*[3]Continuation(Sample)) !Frame {
     const allocator = budget.allocator();
     const plane_bytes = try std.math.mul(usize, cfg.width * cfg.height, @sizeOf(Sample));
     const frame_bytes = try std.math.mul(usize, plane_bytes, 3);
@@ -1832,7 +1843,7 @@ fn decodeSeparated(comptime Sample: type, cfg: Config, config_reservation: *medi
     for (0..3) |plane| {
         capture.plane = plane;
         const lane_cfg = cfg.independent(@intCast(plane));
-        var lane = try decodeConfigured(Sample, lane_cfg, config_reservation, budget, reader, indexes, options, &capture, Capture.publish, index, first_index, configurations);
+        var lane = try decodeConfiguredState(Sample, lane_cfg, config_reservation, budget, reader, indexes, options, &capture, Capture.publish, index, first_index, configurations, if (state) |lanes| &lanes[plane] else null);
         packets += lane.decoded_packets;
         payload += lane.payload_bytes;
         // This internal frame dies before the budget; account its storage free.

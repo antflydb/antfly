@@ -42,7 +42,7 @@ pub const Encoded = struct {
 /// The FPS policy matches HF; timestamp selection remains a separate video API.
 pub const Sampling = union(enum) { reference, timestamps: video.sampling.TimestampPolicy, source_timestamps: video.sampling.TimestampPolicy };
 /// Decoder controls apply equally to CPU and Metal model execution.
-pub const WebmInput = struct { reader: *const media.webm.Reader, index: *const video.webm_pictures.Index };
+pub const WebmInput = struct { reader: *const media.webm.Reader, index: *const video.webm_pictures.Index, continuation: ?*video.webm_pictures.Continuation = null };
 pub const Configuration = struct {
     webm: ?WebmInput = null,
     sampling: Sampling = .reference,
@@ -57,6 +57,8 @@ pub const DecoderContinuation = struct {
     allocator: std.mem.Allocator,
     reader: *media.mp4.Reader,
     decoder: ?*video.h264.Incremental = null,
+    parameter_sets: ?*video.h264_dynamic.Session = null,
+    dynamic: ?video.h264_dynamic.Continuation = null,
     apple: ?*video.apple.Continuation = null,
     session: ?@import("../backends/session.zig").Session = null,
     surface_permit: ?@import("../backends/session.zig").RunPermit = null,
@@ -70,6 +72,8 @@ pub const DecoderContinuation = struct {
         self.surface_permit = null;
         if (self.decoder) |decoder| decoder.deinit();
         self.decoder = null;
+        if (self.dynamic) |*owner| owner.deinit();
+        self.dynamic = null;
     }
     fn decodeApple(self: *@This(), selected: []const usize, packet_base: usize, capture: *Capture) !bool {
         if (self.reader.track.codec != .avc or self.reader.track.inband_parameter_sets or !try compatibleApple(self.allocator, self.reader.track.avcc)) return false;
@@ -111,16 +115,23 @@ pub const DecoderContinuation = struct {
         return true;
     }
     fn decode(self: *@This(), selected: []const usize, packet_base: usize, context: *anyopaque, callback: video.h264.SelectionCallback) !bool {
-        if (self.reader.track.codec != .avc or self.reader.track.inband_parameter_sets) return false;
+        if (self.reader.track.codec != .avc) return false;
         var absolute: [32]usize = undefined;
         if (selected.len > absolute.len) return error.ResourceLimitExceeded;
         for (selected, absolute[0..selected.len]) |index, *target| target.* = try std.math.add(usize, index, packet_base);
+        if (self.parameter_sets) |registry| {
+            if (self.dynamic == null) self.dynamic = .{ .session = registry };
+            for (absolute[0..selected.len]) |index| if (index < self.dynamic.?.cursor()) return false;
+            const warm = self.dynamic.?.core != null;
+            const stats = try self.dynamic.?.decodeSelected(absolute[0..selected.len], context, callback);
+            self.decoded_packets += stats.decoded_packets;
+            self.reused_windows += @intFromBool(warm);
+            return true;
+        }
+        if (self.reader.track.inband_parameter_sets) return false;
         if (self.decoder) |decoder| {
             for (absolute[0..selected.len]) |index| if (index < decoder.cursor()) return false;
         } else {
-            const cfg = try video.h264.configParse(self.allocator, self.reader.track.avcc);
-            defer cfg.groups.deinit(self.allocator);
-            if (cfg.separate_planes) return false;
             self.decoder = try video.h264.Incremental.init(self.allocator, self.reader, .{ .max_dependency_packets = self.max_packets });
         }
         const was_warm = self.decoder.?.cursor() != 0;
@@ -831,7 +842,7 @@ pub const Prefetch = struct {
         if (missing == 0) return;
         capture.decode_slots = miss_slots[0..missing];
         if (webm) {
-            try decodeWebm(a, &webm_reader, webm_index.?, misses[0..missing], &capture);
+            try decodeWebm(a, &webm_reader, webm_index.?, misses[0..missing], &capture, if (self.webm_input) |input| input.continuation else null);
         } else try decodeSelection(a, &reader, misses[0..missing], configurations, &capture);
     }
 
@@ -1052,7 +1063,7 @@ fn encodeInput(a: std.mem.Allocator, cb: *const ComputeBackend, bytes: []const u
     }
     capture.decode_slots = miss_slots[0..missing];
     const decoded = if (missing == 0) {} else if (webm)
-        decodeWebm(a, &webm_reader, webm_index.?, misses[0..missing], &capture)
+        decodeWebm(a, &webm_reader, webm_index.?, misses[0..missing], &capture, if (webm_input) |input| input.continuation else null)
     else
         decodeSelection(a, &reader, misses[0..missing], configurations, &capture);
     const decode_error: ?anyerror = if (decoded) |_| null else |err| err;
@@ -1124,7 +1135,7 @@ fn decodeAppleH264(a: std.mem.Allocator, reader: *media.mp4.Reader, selected: []
     capture.decoder.record(if (batch.hardware) .apple_hardware else .apple_software);
     return true;
 }
-fn decodeWebm(a: std.mem.Allocator, reader: *media.webm.Reader, indexed: video.webm_pictures.Index, selected: []const usize, capture: *Capture) !void {
+fn decodeWebm(a: std.mem.Allocator, reader: *media.webm.Reader, indexed: video.webm_pictures.Index, selected: []const usize, capture: *Capture, continuation: ?*video.webm_pictures.Continuation) !void {
     const estimate = if (indexed.pictures.len != 0) try video.apple.surfaceAdmissionBytesForDepth(indexed.pictures[0].width, indexed.pictures[0].height, selected.len, indexed.pictures[0].bit_depth) else 0;
     if (capture.decoder.policy == .automatic and estimate > 512 * 1024 * 1024) capture.decoder.fallback();
     if (capture.decoder.policy != .portable and (capture.decoder.policy == .apple or estimate <= 512 * 1024 * 1024)) {
@@ -1138,7 +1149,15 @@ fn decodeWebm(a: std.mem.Allocator, reader: *media.webm.Reader, indexed: video.w
         }
     }
     capture.decoder.record(.portable);
-    try video.webm_pictures.walkIndexed(a, reader, webmDecodeOptions(reader.input.control, capture.pool), indexed, selected, capture, Capture.publishWebm);
+    const options = webmDecodeOptions(reader.input.control, capture.pool);
+    if (continuation) |owner| {
+        // Model preparation borrows a reader copy with per-window cancellation.
+        // Retained codec state stays bound to the request's immutable reader.
+        if (owner.reader.packets.ptr != reader.packets.ptr or !std.mem.eql(u8, owner.reader.input.identity, reader.input.identity)) return error.InvalidVideoIndex;
+        var bound_index = indexed;
+        bound_index.reader = owner.reader;
+        try owner.walk(bound_index, options, selected, capture, Capture.publishWebm);
+    } else try video.webm_pictures.walkIndexed(a, reader, options, indexed, selected, capture, Capture.publishWebm);
 }
 
 fn decodeSelection(a: std.mem.Allocator, reader: *media.mp4.Reader, selected: []const usize, configurations: ?*video.h264_dynamic.Session, capture: *Capture) !void {
@@ -1164,16 +1183,6 @@ fn decodeSelection(a: std.mem.Allocator, reader: *media.mp4.Reader, selected: []
             try capture.project(slot, patches, options);
         }
     } else {
-        // Keep the automatic Apple policy on the native device path. Portable
-        // execution retains reference state across forward chunk selections.
-        if (capture.decoder.policy == .portable or @import("builtin").os.tag != .macos) {
-            if (capture.reader_selection) |selection| if (selection.continuation) |continuation| {
-                if (try continuation.decode(selected, selection.packet_base, capture, Capture.publishDecoded)) {
-                    capture.decoder.record(.portable);
-                    return;
-                }
-            };
-        }
         if (capture.decoder.policy != .portable and appleAllowed(capture.decoder)) {
             if (capture.reader_selection) |selection| if (selection.continuation) |continuation| {
                 const used = continuation.decodeApple(selected, selection.packet_base, capture) catch |err| retry: {
@@ -1184,6 +1193,12 @@ fn decodeSelection(a: std.mem.Allocator, reader: *media.mp4.Reader, selected: []
             };
         }
         if (try decodeAppleH264(a, reader, selected, capture)) return;
+        if (capture.reader_selection) |selection| if (selection.continuation) |continuation| {
+            if (try continuation.decode(selected, selection.packet_base, capture, Capture.publishDecoded)) {
+                capture.decoder.record(.portable);
+                return;
+            }
+        };
         capture.decoder.record(.portable);
         // Decode references once for the whole selection, never once per frame.
         if (configurations) |session| _ = try session.decodeSelected(selected, capture, Capture.publishDecoded) else _ = try video.h264_sparse.decodeSelected(a, reader, selected, .{ .max_total_packets = 8192 }, capture, Capture.publishDecoded);
@@ -2683,4 +2698,36 @@ test "embeddinggemma2 video Apple continuation drains windows while preserving n
         try std.testing.expectEqualSlices(u8, &expected.hash, &actual.hash);
     }
     try std.testing.expectEqual(@min(reader.packets.len, 8), total);
+}
+
+test "embeddinggemma2 video retained WebM preparation matches independent windows" {
+    const a = std.testing.allocator;
+    inline for (.{ "vp8", "vp9", "av1" }) |name| {
+        var request_pool = media.admission.Pool{ .limits = .{ .host_bytes = 512 * 1024 * 1024 } };
+        defer std.debug.assert(std.meta.eql(request_pool.snapshot(), media.admission.Resources{}));
+        var source = media.source.Source{ .allocator = a, .storage = .{ .borrowed = @embedFile("../testdata/video/" ++ name ++ ".webm") }, .identity = name, .admission_pool = &request_pool };
+        var reader = try media.webm.Reader.init(a, &source, .{});
+        defer reader.deinit();
+        var indexed = try video.webm_pictures.index(a, &reader, webmDecodeOptions(.{}, &request_pool));
+        defer indexed.deinit();
+        var owner = video.webm_pictures.Continuation{ .allocator = a, .reader = &reader };
+        defer owner.deinit();
+        const count = @min(indexed.pictures.len, 4);
+        try std.testing.expect(count > 1);
+        for (indexed.pictures[0..count]) |picture| {
+            var window_pool = media.admission.Pool{ .limits = .{ .host_bytes = 512 * 1024 * 1024 } };
+            defer std.debug.assert(std.meta.eql(window_pool.snapshot(), media.admission.Resources{}));
+            const sampling = Sampling{ .source_timestamps = .{ .start_ns = picture.pts, .end_ns = picture.pts + 1, .max_frames = 1, .overflow = .truncate } };
+            const original = try Prefetch.startConfigured(a, std.testing.io, null, &.{}, null, .{}, .{ .pool = &window_pool, .sampling = sampling, .decoder = .{ .policy = .portable }, .webm = .{ .reader = &reader, .index = &indexed } });
+            const expected = preparedReaderHash(a, original) catch |err| {
+                original.deinit();
+                return err;
+            };
+            original.deinit();
+            const retained = try Prefetch.startConfigured(a, std.testing.io, null, &.{}, null, .{}, .{ .pool = &window_pool, .sampling = sampling, .decoder = .{ .policy = .portable }, .webm = .{ .reader = &reader, .index = &indexed, .continuation = &owner } });
+            defer retained.deinit();
+            try std.testing.expectEqual(expected, try preparedReaderHash(a, retained));
+        }
+        try std.testing.expect(owner.reused_windows > 0);
+    }
 }

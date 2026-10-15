@@ -1559,6 +1559,7 @@ pub fn validateGroup(group: Group, options: Options) !void {
             }
             if (part.sampled_video.webm) |input| {
                 if (part.sampled_video.reader != null or part.sampled_video.selection != null or part.sampled_video.bytes.len != 0 or input.index.reader != input.reader or input.index.pictures.len == 0) return error.InvalidEmbeddingGroup;
+                if (input.continuation) |owner| if (owner.reader != input.reader) return error.InvalidEmbeddingGroup;
             }
             if (part.sampled_video.reader) |reader| {
                 if (part.sampled_video.bytes.len != 0) return error.InvalidEmbeddingGroup;

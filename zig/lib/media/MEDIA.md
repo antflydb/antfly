@@ -10,7 +10,10 @@ introducing that dependency into portable container consumers.
 [Model-aware chunking](../../../docs/plans/model-aware-media-chunking.md) shares
 version-pinned source/index ownership across model windows and returns source
 coordinates with optional embeddings through `/ai/v1/chunk`. MP4 snapshots bounded
-coded windows; WebM retains its logical index; WAV ranges decode selected samples.
+coded windows; WebM retains its logical index and portable reference decoder
+across forward windows; WAV ranges decode selected samples. Retained decoder
+leases belong to the request pool and outlive individual preparation/model
+windows. Backward selections replay independently.
 HTTP/S3 references enforce immutable versions and exact range responses through
 configured scraping security/credentials. Media supplies leases, clocks and
 admission; model adapters supply token budgets. Container packets remain distinct

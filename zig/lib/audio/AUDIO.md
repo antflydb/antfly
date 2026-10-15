@@ -55,7 +55,7 @@ All public interleaved decode output is normalized to finite `[-1, 1]` PCM.
 | AIFF/AIFC | Common pure-Zig coverage | Decide how far to go beyond PCM/float/G.711 before falling back. |
 | CAF | `lpcm`/G.711 pure Zig, checked-in 16-bit/24-bit stereo ALAC pure Zig | Broaden ALAC compressed-frame coverage beyond the checked-in stereo fixtures. |
 | MP4/M4A demux | Pure-Zig demux for checked-in AAC/ALAC, including 16 kHz stereo, 44.1 kHz mono, and 44.1 kHz short-window AAC fixtures, `stsz`/`stz2` sample tables, stable single-description `stsc` chunk maps even when the selected description is not entry 1, version-0/1/2 audio sample entries, direct or `wave`-wrapped config atoms, order-insensitive audio `mdia` handler/minf parsing, order-insensitive `moov` `mvhd`/`trak` scanning, skipping earlier unsupported audio tracks when a later one is supported, contiguous-media-edit trim metadata | Widen ISO BMFF/QuickTime layouts beyond discontiguous edit-list timing and broader multi-track/container shapes. |
-| AAC Main/AAC-LC | Narrow pure-Zig decode lane | Broaden conformance before claiming general AAC. Narrow MP4/M4A `frame_length_960` access-unit decode is now covered, sync-extension SBR now has a narrow payload-aware enhancement lane, and explicit HE-AAC/PS object-type configs now have a narrow synthesized highband/stereo-widening lane, but remaining hard cases still include wider real stereo CPE/tool combinations beyond the checked-in PNS/TNS/gain/short-window fixtures plus general enhancement-payload SBR/PS reconstruction beyond the current synthetic/object-type boundary. The AAC-LC lane now matches ffmpeg sample for sample on the checked-in ADTS/M4A/MP4 corpus and on ffmpeg and Apple encodes at 16, 44.1 and 48 kHz (short windows, TNS, PNS, M/S, intensity, edit-list and iTunSMPB priming). Known gaps: the synthetic SBR/PS enhancement lanes, the fill-element detail-hint parser, and AAC Main prediction state have failing tests that are excluded from `test-audio-internals`; real HE-AAC streams decode their LC core only. |
+| AAC Main/AAC-LC | Narrow pure-Zig decode lane | Broaden conformance before claiming general AAC. Narrow MP4/M4A `frame_length_960` access-unit decode is now covered, sync-extension SBR now has a narrow payload-aware enhancement lane, and explicit HE-AAC/PS object-type configs now have a narrow synthesized highband/stereo-widening lane, but remaining hard cases still include wider real stereo CPE/tool combinations beyond the checked-in PNS/TNS/gain/short-window fixtures plus general enhancement-payload SBR/PS reconstruction beyond the current synthetic/object-type boundary. The AAC-LC lane now matches ffmpeg sample for sample on the checked-in ADTS/M4A/MP4 corpus and on ffmpeg and Apple encodes at 16, 44.1 and 48 kHz (short windows, TNS, PNS, M/S, intensity, edit-list and iTunSMPB priming). Known gaps: synthetic SBR/PS enhancement tests do not establish real HE-AAC conformance. General enhancement-payload reconstruction remains unqualified. `test-audio-codecs` runs the complete shared suite, including internal AAC tests, without the curated per-test repetitions. |
 | MP3 | Narrow pure-Zig decode lane | Broaden Huffman/requantization/oracle coverage before calling it general. Unsupported MP3 shapes now fail closed. |
 | FLAC | Narrow pure-Zig decode lane | Add malformed/real-world corpus coverage and more stream-shape coverage before calling it general. |
 | Ogg container | Narrow pure-Zig owned codec mappings | Pure-Zig Ogg dispatch now owns the checked-in Vorbis, Opus, and FLAC-in-Ogg lanes and fails closed on unsupported codec/container shapes. Broaden packet/page coverage only if we intend to own more Ogg shapes. |
@@ -293,9 +293,23 @@ model work, retaining only the current PCM window plus overlap. MP4/CAF priming
 and remainder trimming, Opus gain/pre-skip, channel clipping before downmixing and
 supported WebM timeline gaps preserve the ordinary decode contract. Unsupported
 incremental profiles use the existing bounded full-decode fallback (including
-enhanced AAC, chained Ogg and WebM FLAC without declared sample totals).
+enhanced AAC). AIFF/AIFC, AU and PCM/G.711 CAF deliver at most 1024 frames per
+block, including cancellation checks. Chained Vorbis streams reset codec state
+per logical stream and normalize to the batch path's maximum sample rate/channel
+count using a previous frame and one output block. WebM FLAC without declared
+sample totals uses a PCM-free counting pass before streaming execution.
 Compressed input and packet metadata are still contiguous bounded owners.
 Metadata without a trustworthy duration uses a bounded PCM-free validation pass;
 that trades additional decoding for stable final-tail and continuation semantics.
 See [model-aware chunking](../../../docs/plans/model-aware-media-chunking.md) for
 sample clocks, duration/token budgets, pause boundaries and coverage metadata.
+
+The streaming regressions compare block output with batch PCM for container
+trimming, gain, fractional chained-stream resampling and undeclared FLAC totals.
+Two-minute AU/CAF inputs execute with 16 KiB of visitor scratch; consumer
+cancellation propagates immediately. Run from the repository root:
+
+```sh
+zig build --build-file zig/pkg/inference/build.zig test-audio-streaming -Dmetal=false -Doptimize=ReleaseSafe
+zig build --build-file zig/pkg/inference/build.zig test-audio-codecs -Dmetal=false -Doptimize=ReleaseSafe
+```

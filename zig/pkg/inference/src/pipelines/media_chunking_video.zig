@@ -52,7 +52,7 @@ pub const Owner = struct {
             }
         }
         const registry = if (reader.track.inband_parameter_sets) try video.h264_dynamic.Session.init(a, reader, .{}) else null;
-        return .{ .continuation = .{ .allocator = a, .reader = reader, .max_packets = limits.max_dependency_packets }, .allocator = a, .reader = reader, .timed = timed, .logical = logical, .registry = registry, .origin = origin, .pool = pool, .limits = limits };
+        return .{ .continuation = .{ .allocator = a, .reader = reader, .parameter_sets = registry, .max_packets = limits.max_dependency_packets }, .allocator = a, .reader = reader, .timed = timed, .logical = logical, .registry = registry, .origin = origin, .pool = pool, .limits = limits };
     }
     pub fn deinit(self: *Owner) void {
         self.continuation.deinit();

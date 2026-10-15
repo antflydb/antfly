@@ -226,7 +226,7 @@ fn appendHeader(collector: *Collect, packet: media.webm.Packet, packet_id: usize
 /// The callback borrows the frame until it returns. Repeated selections publish
 /// once; the model reuses that projection in each requested presentation slot.
 pub fn walk(a: std.mem.Allocator, reader: *media.webm.Reader, options: Options, selected: ?[]const usize, context: *anyopaque, accept: *const fn (*anyopaque, usize, *const codecs.Frame) anyerror!void) !void {
-    return walkFrom(a, reader, options, .{}, selected, context, accept, null);
+    return walkFrom(a, reader, options, .{}, selected, context, accept, null, null);
 }
 /// Restarts only at parsed codec key pictures, retaining logical output IDs.
 /// AV1 reloads the most recent sequence OBU before replaying the key packet.
@@ -246,8 +246,72 @@ pub fn walkIndexed(a: std.mem.Allocator, reader: *media.webm.Reader, options: Op
             restart = point;
         }
     }
-    return walkFrom(a, reader, options, restart, selected, context, accept, null);
+    return walkFrom(a, reader, options, restart, selected, context, accept, null, null);
 }
+/// One request-owned reference decoder across forward logical selections.
+/// The immutable reader/index and admission pool outlive this owner. Calls are
+/// sequential; callbacks borrow each output. Backward/within-packet selections
+/// replay independently without disturbing the forward cursor. Any failure
+/// destroys retained entropy/reference state before retry.
+pub const Continuation = struct {
+    allocator: std.mem.Allocator,
+    reader: *media.webm.Reader,
+    packet: usize = 0,
+    logical: usize = 0,
+    vp8_session: ?*vp8.Session = null,
+    session: ?*codecs.Session = null,
+    configured: ?codecs.Options = null,
+    packets_decoded: usize = 0,
+    reused_windows: usize = 0,
+    pub fn deinit(self: *@This()) void {
+        if (self.vp8_session) |session| session.deinit();
+        if (self.session) |session| session.destroy();
+        self.vp8_session = null;
+        self.session = null;
+        self.configured = null;
+        self.packet = 0;
+        self.logical = 0;
+    }
+    pub fn walk(self: *@This(), indexed: Index, options: Options, selected: []const usize, context: *anyopaque, accept: *const fn (*anyopaque, usize, *const codecs.Frame) anyerror!void) !void {
+        if (indexed.reader != self.reader) return error.InvalidVideoIndex;
+        if (self.reader.track.codec == .av1 and (indexed.operating_point != options.decoder.av1_operating_point or indexed.all_layers != options.decoder.av1_all_layers)) return error.InvalidDecodeOptions;
+        if (selected.len == 0) return;
+        var first = selected[0];
+        for (selected) |id| {
+            if (id >= indexed.pictures.len) return error.InvalidPacketIndex;
+            first = @min(first, id);
+        }
+        var config = options.decoder;
+        // Reference reservations survive model invocations. Charge them to the
+        // reader's request-lived pool, never a per-window preprocessing pool.
+        config.admission_pool = self.reader.input.admission_pool;
+        config.control = .{};
+        if (self.configured) |previous| if (!std.meta.eql(previous, config)) return error.InvalidDecodeOptions;
+        if (first < self.logical) return walkIndexed(self.allocator, self.reader, options, indexed, selected, context, accept);
+        var restart = Restart{ .packet = self.packet, .logical = self.logical };
+        const warm = self.vp8_session != null or self.session != null;
+        if (!warm) {
+            for (indexed.restarts) |point| {
+                if (point.logical > first) break;
+                restart = point;
+            }
+            self.packet = restart.packet;
+            self.logical = restart.logical;
+        }
+        errdefer self.deinit();
+        var stats = ReplayStats{};
+        var measured = options;
+        measured.decoder.admission_pool = self.reader.input.admission_pool;
+        measured.replay_stats = &stats;
+        defer {
+            self.packets_decoded += stats.packets_decoded;
+            if (options.replay_stats) |out| out.* = stats;
+        }
+        try walkFrom(self.allocator, self.reader, measured, restart, selected, context, accept, null, self);
+        self.configured = config;
+        self.reused_windows += @intFromBool(warm);
+    }
+};
 pub const RecoveryOptions = struct {
     max_recoveries: usize = 8,
     max_skipped_packets: usize = 4096,
@@ -290,7 +354,7 @@ pub fn walkRecoveringIndexed(a: std.mem.Allocator, reader: *media.webm.Reader, o
     while (true) {
         try options.decoder.control.check();
         var failure: ?DecodeFailure = null;
-        walkFrom(a, reader, options, restart, selected, context, accept, &failure) catch |err| {
+        walkFrom(a, reader, options, restart, selected, context, accept, &failure, null) catch |err| {
             const failed = failure orelse return err;
             if (!corruptDecode(err)) return err;
             if (stats.recoveries >= recovery.max_recoveries) return error.RecoveryLimitExceeded;
@@ -316,7 +380,7 @@ pub fn walkRecoveringIndexed(a: std.mem.Allocator, reader: *media.webm.Reader, o
     }
 }
 const DecodeFailure = struct { packet: usize, logical: usize };
-fn walkFrom(a: std.mem.Allocator, reader: *media.webm.Reader, options: Options, restart: Restart, selected: ?[]const usize, context: *anyopaque, accept: *const fn (*anyopaque, usize, *const codecs.Frame) anyerror!void, failure: ?*?DecodeFailure) !void {
+fn walkFrom(a: std.mem.Allocator, reader: *media.webm.Reader, options: Options, restart: Restart, selected: ?[]const usize, context: *anyopaque, accept: *const fn (*anyopaque, usize, *const codecs.Frame) anyerror!void, failure: ?*?DecodeFailure, retained: ?*Continuation) !void {
     if (reader.packets.len > options.max_packets) return error.ResourceLimitExceeded;
     if (reader.track.codec == .av1 and options.decoder.av1_framing != .low_overhead) return error.InvalidDecodeOptions;
     const Watch = struct {
@@ -347,9 +411,16 @@ fn walkFrom(a: std.mem.Allocator, reader: *media.webm.Reader, options: Options, 
     if (restart.packet > reader.packets.len or restart.logical > options.max_pictures) return error.InvalidPacketIndex;
     if (options.replay_stats) |stats| stats.* = .{ .first_packet = restart.packet };
     var logical: usize = restart.logical;
+    defer if (retained) |owner| {
+        owner.logical = logical;
+    };
     if (reader.track.codec == .vp8) {
-        const session = try vp8.Session.init(a, reader, .{ .max_packet_bytes = options.decoder.max_packet_bytes, .max_pixels = options.decoder.max_pixels, .max_decode_bytes = options.decoder.max_decode_bytes, .admission_pool = options.decoder.admission_pool });
-        defer session.deinit();
+        const session = if (retained != null and retained.?.vp8_session != null) retained.?.vp8_session.? else try vp8.Session.init(a, reader, .{ .max_packet_bytes = options.decoder.max_packet_bytes, .max_pixels = options.decoder.max_pixels, .max_decode_bytes = options.decoder.max_decode_bytes, .admission_pool = options.decoder.admission_pool });
+        if (retained) |owner| owner.vp8_session = session;
+        defer if (retained == null) session.deinit();
+        defer if (retained) |owner| {
+            owner.packet = session.next_index;
+        };
         session.next_index = restart.packet;
         while (session.next_index < reader.packets.len) {
             try options.decoder.control.check();
@@ -380,14 +451,22 @@ fn walkFrom(a: std.mem.Allocator, reader: *media.webm.Reader, options: Options, 
             if (selected != null and logical > last) return;
         }
     } else {
-        const session = try codecs.Session.create(a, if (reader.track.codec == .vp9) .vp9 else .av1, decoder_options);
-        defer session.destroy();
+        const cold = retained == null or retained.?.session == null;
+        const session = if (!cold) retained.?.session.? else try codecs.Session.create(a, if (reader.track.codec == .vp9) .vp9 else .av1, decoder_options);
+        if (retained) |owner| owner.session = session;
+        defer if (retained == null) session.destroy();
+        session.options.control = control;
+        // The composite control borrows this call's stack; never retain it.
+        defer if (retained != null) {
+            session.options.control = .{};
+        };
+        const previous_stats = session.output_stats;
         defer if (options.replay_stats) |stats| {
-            stats.output_copy_bytes = session.output_stats.copied_bytes;
-            stats.outputs_skipped = session.output_stats.skipped_outputs;
+            stats.output_copy_bytes = session.output_stats.copied_bytes - previous_stats.copied_bytes;
+            stats.outputs_skipped = session.output_stats.skipped_outputs - previous_stats.skipped_outputs;
         };
         try session.initializeWebm(reader);
-        if (restart.sequence) |span| {
+        if (if (cold) restart.sequence else null) |span| {
             if (span.packet >= reader.packets.len) return error.InvalidPacketIndex;
             const packet = reader.packets[span.packet];
             if (span.offset > packet.size or span.size > packet.size - span.offset) return error.InvalidVideoData;
@@ -425,6 +504,7 @@ fn walkFrom(a: std.mem.Allocator, reader: *media.webm.Reader, options: Options, 
             };
             defer batch.deinit();
             try control.check();
+            if (retained) |owner| owner.packet = packet_id + 1;
             // Container-invisible packets still update codec references.
             if (packet.invisible) continue;
             // Skipped native pictures advance logical identity exactly as owned
@@ -1092,4 +1172,70 @@ test "WebM filtered replay preserves invisible preroll and superframe output ide
     try std.testing.expectEqual(actual.bytes, filtered_stats.output_copy_bytes);
     try std.testing.expectEqual(2 * actual.bytes, full_stats.output_copy_bytes);
     try std.testing.expectEqual(@as(usize, 1), filtered_stats.outputs_skipped);
+}
+
+test "WebM continuation retains VP8 VP9 AV1 references and preserves replay outputs" {
+    const a = std.testing.allocator;
+    const Capture = struct {
+        digest: [32]u8 = undefined,
+        pts: i64 = 0,
+        duration: ?u64 = null,
+        count: usize = 0,
+        fail: bool = false,
+        fn accept(raw: *anyopaque, _: usize, frame: *const codecs.Frame) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.fail) return error.Cancelled;
+            std.crypto.hash.sha2.Sha256.hash(frame.bytes, &self.digest, .{});
+            self.pts = frame.pts_ns;
+            self.duration = frame.duration_ns;
+            self.count += 1;
+        }
+    };
+    inline for (.{ "../testdata/vp8-inter.webm", "../testdata/vp8-altref.webm", "../testdata/vpx-av1/vp9-sintel.webm", "../testdata/vpx-av1/av1-sintel.webm" }) |path| {
+        var request_pool = media.admission.Pool{ .limits = .{ .host_bytes = 512 * 1024 * 1024 } };
+        var source = media.source.Source{ .allocator = a, .storage = .{ .borrowed = @embedFile(path) }, .identity = path, .admission_pool = &request_pool };
+        var reader = try media.webm.Reader.init(a, &source, .{});
+        defer reader.deinit();
+        var indexed = try index(a, &reader, .{});
+        defer indexed.deinit();
+        const indexed_usage = request_pool.snapshot();
+        var retained = Continuation{ .allocator = a, .reader = &reader };
+        defer retained.deinit();
+        var replay_packets: usize = 0;
+        const count = @min(indexed.pictures.len, 8);
+        try std.testing.expect(count > 2);
+        for (0..count) |id| {
+            var expected = Capture{};
+            var actual = Capture{};
+            var stats = ReplayStats{};
+            try walkIndexed(a, &reader, .{ .replay_stats = &stats }, indexed, &.{id}, &expected, Capture.accept);
+            replay_packets += stats.packets_decoded;
+            var window_pool = media.admission.Pool{ .limits = .{ .host_bytes = 0 } };
+            try retained.walk(indexed, .{ .decoder = .{ .admission_pool = &window_pool } }, &.{id}, &actual, Capture.accept);
+            try std.testing.expectEqual(media.admission.Resources{}, window_pool.snapshot());
+            try std.testing.expectEqual(expected.count, actual.count);
+            try std.testing.expectEqualSlices(u8, &expected.digest, &actual.digest);
+            try std.testing.expectEqual(expected.pts, actual.pts);
+            try std.testing.expectEqual(expected.duration, actual.duration);
+        }
+        try std.testing.expect(retained.reused_windows > 0);
+        try std.testing.expect(retained.packets_decoded < replay_packets);
+        // A backward request replays separately and leaves forward state intact.
+        const next_packet = retained.packet;
+        var backwards = Capture{};
+        try retained.walk(indexed, .{}, &.{0}, &backwards, Capture.accept);
+        try std.testing.expectEqual(@as(usize, 1), backwards.count);
+        try std.testing.expectEqual(next_packet, retained.packet);
+        // A consumer failure must not leave a partially advanced owner reusable.
+        if (count < indexed.pictures.len) {
+            var failed = Capture{ .fail = true };
+            try std.testing.expectError(error.Cancelled, retained.walk(indexed, .{}, &.{count}, &failed, Capture.accept));
+            try std.testing.expect(retained.session == null and retained.vp8_session == null);
+            var retried = Capture{};
+            try retained.walk(indexed, .{}, &.{count}, &retried, Capture.accept);
+            try std.testing.expectEqual(@as(usize, 1), retried.count);
+        }
+        retained.deinit();
+        try std.testing.expectEqual(indexed_usage, request_pool.snapshot());
+    }
 }

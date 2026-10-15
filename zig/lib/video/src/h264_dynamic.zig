@@ -25,6 +25,75 @@ const Parameter = struct { at: ?usize, kind: u8, id: usize, bytes: []u8, origina
 pub const Entry = struct { avcc: []u8, config: h264.Config, sps_hash: [32]u8 };
 pub const Epoch = struct { start: usize, end: usize, entry: usize, independent: bool = false, max_refs: usize };
 pub const Context = struct { session: *Session, base: usize, independent_start: bool = false, max_refs: usize };
+/// Forward selections retain DPB/assembly state within a compatible epoch.
+/// Crossing an SPS geometry/representation epoch constructs a fresh owner;
+/// parameter changes inside an epoch use the same validated registry as replay.
+/// The borrowed registry and immutable reader must outlive this owner.
+pub const Continuation = struct {
+    session: *Session,
+    core: ?*h264.Incremental = null,
+    epoch_start: ?usize = null,
+    pub fn deinit(self: *@This()) void {
+        if (self.core) |core| core.deinit();
+        self.core = null;
+        self.epoch_start = null;
+    }
+    pub fn cursor(self: *const @This()) usize {
+        return if (self.core) |core| self.epoch_start.? + core.cursor() else 0;
+    }
+    pub fn decodeSelected(self: *@This(), indexes: []const usize, context: *anyopaque, callback: h264.SelectionCallback) !h264.Statistics {
+        const registry = self.session;
+        if (indexes.len == 0 or indexes.len > registry.options.max_dependency_packets) return error.ResourceLimitExceeded;
+        for (indexes) |index| if (index >= registry.reader.packets.len or index < self.cursor()) return error.InvalidPacketIndex;
+        errdefer self.deinit();
+        const selected = try registry.backing.alloc(usize, indexes.len);
+        defer registry.backing.free(selected);
+        const slots = try registry.backing.alloc(usize, indexes.len);
+        defer registry.backing.free(slots);
+        var stats = h264.Statistics{ .decoded_packets = 0, .payload_bytes = 0, .decode_high_water = registry.budget.live };
+        for (registry.epochs.items) |epoch| {
+            var count: usize = 0;
+            for (indexes, 0..) |index, slot| if (index >= epoch.start and index < epoch.end) {
+                selected[count] = index - epoch.start;
+                slots[count] = slot;
+                count += 1;
+            };
+            if (count == 0) continue;
+            const entry = registry.entries.items[epoch.entry];
+            var view = registry.reader.*;
+            view.packets = registry.reader.packets[epoch.start..epoch.end];
+            view.track.avcc = entry.avcc;
+            view.track.width = @intCast(entry.config.width);
+            view.track.height = @intCast(entry.config.height);
+            if (self.epoch_start == null or self.epoch_start.? != epoch.start) {
+                if (self.core) |core| if (core.hasPending()) return error.UnfinishedVideoPictureAtReset;
+                self.deinit();
+                var initial = view;
+                initial.track.inband_parameter_sets = false;
+                var options = registry.options;
+                if (registry.budget.live >= options.max_decode_bytes) return error.ResourceLimitExceeded;
+                options.max_decode_bytes -= registry.budget.live;
+                self.core = try h264.Incremental.init(registry.backing, &initial, options);
+                self.epoch_start = epoch.start;
+            }
+            const Capture = struct {
+                slots: []const usize,
+                context: *anyopaque,
+                callback: h264.SelectionCallback,
+                fn publish(raw: *anyopaque, slot: usize, frame: *const h264.Frame) !void {
+                    const capture: *@This() = @ptrCast(@alignCast(raw));
+                    try capture.callback(capture.context, capture.slots[slot], frame);
+                }
+            };
+            var capture = Capture{ .slots = slots[0..count], .context = context, .callback = callback };
+            const result = try self.core.?.decodeSelectedWithConfigurations(&view, selected[0..count], &capture, Capture.publish, .{ .session = registry, .base = epoch.start, .independent_start = epoch.independent, .max_refs = epoch.max_refs });
+            stats.decoded_packets += result.decoded_packets;
+            stats.payload_bytes += result.payload_bytes;
+            stats.decode_high_water = @max(stats.decode_high_water, result.decode_high_water + registry.budget.live);
+        }
+        return stats;
+    }
+};
 pub const Session = struct {
     backing: std.mem.Allocator,
     budget: Budget,

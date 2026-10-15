@@ -3194,7 +3194,7 @@ test "streaming audio codec blocks preserve full decode sample clocks trim gain 
             try self.samples.appendSlice(std.testing.allocator, pcm);
         }
     };
-    inline for (.{ "../tone.mp3", "tone-stereo.flac", "tone-stereo-24bit.flac", "tone-mono-44k.aac", "transient-stereo-44k-short.aac", "tone-stereo.mp4", "tone-stereo-alac.m4a", "tone-stereo-opus.ogg", "tone-stereo.oga", "tone-stereo-flac.ogg", "tone-stereo.caf", "tone-stereo-alac-24bit.caf", "probe-silk-mono-16k-fec-60ms.ogg" }) |name| {
+    inline for (.{ "../tone.mp3", "tone-stereo.flac", "tone-stereo-24bit.flac", "tone-mono-44k.aac", "transient-stereo-44k-short.aac", "tone-stereo.mp4", "tone-stereo-alac.m4a", "tone-stereo-opus.ogg", "tone-stereo.oga", "tone-stereo-flac.ogg", "tone-stereo.caf", "tone-stereo-alac-24bit.caf", "tone-stereo.aiff", "probe-silk-mono-16k-fec-60ms.ogg" }) |name| {
         const bytes = @embedFile("../testdata/codec-corpus/" ++ name);
         var expected = try decode(std.testing.allocator, bytes, .{});
         defer expected.deinit();
@@ -3208,5 +3208,58 @@ test "streaming audio codec blocks preserve full decode sample clocks trim gain 
         const info = try streaming.inspect(std.testing.allocator, bytes, .{});
         try std.testing.expectEqual(expected.sample_rate, info.sample_rate);
         try std.testing.expectEqual(expected.samples.len, info.samples);
+    }
+}
+
+test "streaming audio PCM containers fit fixed scratch and propagate cancellation" {
+    const a = std.testing.allocator;
+    const Capture = struct {
+        expected: []const f32,
+        offset: usize = 0,
+        stop: bool = false,
+        fn write(raw: *anyopaque, pcm: []const f32, _: u32, channels: u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.stop) return error.Cancelled;
+            try std.testing.expectEqual(@as(u8, 1), channels);
+            try std.testing.expect(pcm.len <= 1024);
+            try std.testing.expect(pcm.len <= self.expected.len - self.offset);
+            try std.testing.expectEqualSlices(f32, self.expected[self.offset..][0..pcm.len], pcm);
+            self.offset += pcm.len;
+        }
+    };
+    // Two minutes of stereo PCM require megabytes if decoded in full. The
+    // visitor gets 16 KiB for its interleaved block plus the mono output block.
+    const frames = 120 * 16000;
+    const caf_header = [_]u8{
+        'c',  'a',  'f',  'f',  0,    1,    0,    0,
+        'd',  'e',  's',  'c',  0,    0,    0,    0,
+        0,    0,    0,    32,   0x40, 0xcf, 0x40, 0,
+        0,    0,    0,    0,    'l',  'p',  'c',  'm',
+        0,    0,    0,    12,   0,    0,    0,    4,
+        0,    0,    0,    1,    0,    0,    0,    2,
+        0,    0,    0,    16,   'd',  'a',  't',  'a',
+        0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+        0,    0,    0,    0,
+    };
+    const caf_bytes = try a.alloc(u8, caf_header.len + frames * 4);
+    defer a.free(caf_bytes);
+    @memcpy(caf_bytes[0..caf_header.len], &caf_header);
+    for (0..frames * 2) |i| std.mem.writeInt(i16, caf_bytes[caf_header.len + i * 2 ..][0..2], @intCast(@as(i32, @intCast(i % 65536)) - 32768), .little);
+    const au_bytes = try a.alloc(u8, 24 + frames * 4);
+    defer a.free(au_bytes);
+    @memcpy(au_bytes[0..24], &[_]u8{ '.', 's', 'n', 'd', 0, 0, 0, 24, 0xff, 0xff, 0xff, 0xff, 0, 0, 0, 3, 0, 0, 0x3e, 0x80, 0, 0, 0, 2 });
+    for (0..frames * 2) |i| std.mem.writeInt(i16, au_bytes[24 + i * 2 ..][0..2], @intCast(@as(i32, @intCast(i % 65536)) - 32768), .big);
+    for ([_][]const u8{ tone_aiff_bytes, au_bytes, caf_bytes }) |bytes| {
+        try std.testing.expect(try streaming.supported(a, bytes));
+        var expected = try decode(a, bytes, .{});
+        defer expected.deinit();
+        var scratch: [16 * 1024]u8 = undefined;
+        var fixed = std.heap.FixedBufferAllocator.init(&scratch);
+        var capture = Capture{ .expected = expected.samples };
+        try streaming.visit(fixed.allocator(), bytes, .{}, .{ .context = &capture, .write = Capture.write });
+        try std.testing.expectEqual(expected.samples.len, capture.offset);
+        capture.stop = true;
+        fixed.reset();
+        try std.testing.expectError(error.Cancelled, streaming.visit(fixed.allocator(), bytes, .{}, .{ .context = &capture, .write = Capture.write }));
     }
 }

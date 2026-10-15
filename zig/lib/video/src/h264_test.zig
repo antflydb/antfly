@@ -1741,3 +1741,46 @@ test "video H264 shared and copying reference paths preserve progressive output"
         }
     }
 }
+
+test "video H264 continuation preserves separate-plane and dynamic epoch selections" {
+    const Capture = struct {
+        expected: *const video.h264.Frame,
+        count: usize = 0,
+        fn accept(raw: *anyopaque, slot: usize, frame: *const video.h264.Frame) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try std.testing.expectEqual(@as(usize, 0), slot);
+            try std.testing.expectEqualSlices(u8, self.expected.nv12, frame.nv12);
+            try std.testing.expectEqual(self.expected.width, frame.width);
+            try std.testing.expectEqual(self.expected.height, frame.height);
+            try std.testing.expectEqual(self.expected.bit_depth, frame.bit_depth);
+            try std.testing.expectEqual(self.expected.chroma_format, frame.chroma_format);
+            try std.testing.expectEqual(self.expected.pts, frame.pts);
+            self.count += 1;
+        }
+    };
+    inline for (.{ "h264-jm-separate", "h264-jm-separate-10", "h264-jm-separate-14", "h264-dynamic-pps", "h264-dynamic-geometry" }) |name| {
+        var src = media.source.Source{ .allocator = a, .identity = name, .storage = .{ .borrowed = @embedFile("../testdata/" ++ name ++ ".mp4") } };
+        var reader = try media.mp4.Reader.init(a, &src, .{});
+        defer reader.deinit();
+        var pictures = try video.h264_pictures.index(a, &reader, .{});
+        defer pictures.deinit();
+        const registry = if (reader.track.inband_parameter_sets) try video.h264_dynamic.Session.init(a, &reader, .{}) else null;
+        defer if (registry) |owner| owner.deinit();
+        var dynamic: ?video.h264_dynamic.Continuation = if (registry) |owner| .{ .session = owner } else null;
+        defer if (dynamic) |*owner| owner.deinit();
+        const core = if (registry == null) try video.h264.Incremental.init(a, &reader, .{}) else null;
+        defer if (core) |owner| owner.deinit();
+        var compared: usize = 0;
+        for (pictures.pictures) |picture| {
+            const cursor = if (core) |owner| owner.cursor() else dynamic.?.cursor();
+            if (picture.first_packet < cursor) continue;
+            var expected = try video.h264.decodeFrame(a, &reader, picture.first_packet, .{});
+            defer expected.deinit();
+            var capture = Capture{ .expected = &expected };
+            _ = if (core) |owner| try owner.decodeSelected(&reader, &.{picture.first_packet}, &capture, Capture.accept) else try dynamic.?.decodeSelected(&.{picture.first_packet}, &capture, Capture.accept);
+            try std.testing.expectEqual(@as(usize, 1), capture.count);
+            compared += 1;
+        }
+        try std.testing.expect(compared >= 2);
+    }
+}
