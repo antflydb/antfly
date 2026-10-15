@@ -685,9 +685,27 @@ test "native index owner adapter executes fresh permission stages and recovers r
         try std.testing.expect(status.value.claims_retired);
         try std.testing.expect(status.value.claim_allocation != null);
         try std.testing.expectEqual(@as(usize, 1), metadata.admission_reads);
+        // Completion is tied to the host signing identity and applying lease.
+        const other_root: u128 = if (signing_root.root_incarnation == 1) 2 else 1;
+        try std.testing.expectError(error.PrivateIndexRootRecoveryRequired, owners.completeNativeIndexOwnerCancellationAtRoot(alloc, group, plan.before.name, owner_identity, other_root, .{}));
+        var completed = try owners.completeNativeIndexOwnerCancellationAtRoot(alloc, group, plan.before.name, owner_identity, signing_root.root_incarnation, .{});
+        defer completed.deinit();
+        try std.testing.expectEqual(root_generation, completed.root_generation);
+        try std.testing.expect(!completed.outcome.value.duplicate and completed.outcome.value.receipt != null);
+        try std.testing.expectEqual(.canceled, completed.outcome.value.receipt.?.action);
+        try std.testing.expectEqual(cleanup.position.sequence + 1, completed.outcome.value.position.sequence);
+        var completion_retry = try owners.completeNativeIndexOwnerCancellationAtRoot(alloc, group, plan.before.name, owner_identity, signing_root.root_incarnation, .{});
+        defer completion_retry.deinit();
+        try std.testing.expect(completion_retry.outcome.value.duplicate);
+        try std.testing.expectEqualDeep(completed.outcome.value.record, completion_retry.outcome.value.record);
+        var completed_state = try owners.nativeIndexOwnerCancellationState(alloc, group, plan.before.name, owner_identity, .{});
+        defer completed_state.deinit();
+        try completed_state.value.validate(owner_identity);
+        try std.testing.expectEqualDeep(completed.outcome.value.record, completed_state.value.completed);
         // A subsequent routing/root switch must not relabel the already
         // recovered receipt as belonging to the replacement physical root.
         root_generation += 1;
+        try std.testing.expectEqual(@as(u64, 7), completed.root_generation);
         try std.testing.expectEqual(@as(u64, 7), recovered.recovered.root_generation);
         try std.testing.expectEqual(@as(u64, 7), source_result.rootGeneration().?);
         try std.testing.expectEqual(@as(u64, 7), source_response.signed_source.?.root_generation);

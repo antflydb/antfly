@@ -1986,6 +1986,70 @@ test "storage owner native index raw admission and bounded controls preserve loc
     try std.testing.expect(status.value.claim_allocation != null);
     try std.testing.expectEqual(cancel_position.sequence + 1, status.value.cleanup.?.sequence);
     try std.testing.expectEqual(cancel_position, status.value.intent.?.position);
+    try std.testing.expect(status.value.completed == null);
+    const completion_native = local.storage_db_relational_index_owner_control;
+    const signer = try local.storage_db_root_signing_identity.loadOrCreate(a, std.testing.io, directory.path());
+    const completion_root: completion_native.AuditRoot = .{ .root_dir = directory.path(), .root_incarnation = signer.root_incarnation };
+    const completion_root_json = try std.json.Stringify.valueAlloc(a, completion_root, .{});
+    defer a.free(completion_root_json);
+    request.operation = .cancel_complete;
+    request.manifest = .fromSlice(completion_root_json);
+    request.control = .{ .has_execution_deadline = 1, .execution_deadline_ns = 0 };
+    try std.testing.expectEqual(kernel_owner_abi.Status.deadline_exceeded, server_api.storageOwnerNativeIndexControlJson(id, &request, &response));
+    try std.testing.expect(response.ptr == null);
+    request.control = .{ .version = kernel_owner_abi.abi_version - 1 };
+    try std.testing.expectEqual(kernel_owner_abi.Status.invalid_argument, server_api.storageOwnerNativeIndexControlJson(id, &request, &response));
+    request.control = .{};
+    request.manifest = .{ .ptr = @ptrFromInt(1), .len = completion_native.AuditRoot.max_wire_bytes + 1 };
+    try std.testing.expectEqual(kernel_owner_abi.Status.invalid_argument, server_api.storageOwnerNativeIndexControlJson(id, &request, &response));
+    request.manifest = .fromSlice(completion_root_json);
+    {
+        var completion_foreign = identity;
+        completion_foreign.owner_group_id += 1;
+        const encoded = try std.json.Stringify.valueAlloc(a, completion_foreign, .{});
+        defer a.free(encoded);
+        var rejected = request;
+        rejected.request_json = .fromSlice(encoded);
+        try std.testing.expectEqual(kernel_owner_abi.Status.invalid_argument, server_api.storageOwnerNativeIndexControlJson(id, &rejected, &response));
+        var different = completion_root;
+        different.root_incarnation = if (completion_root.root_incarnation == 1) 2 else 1;
+        const different_json = try std.json.Stringify.valueAlloc(a, different, .{});
+        defer a.free(different_json);
+        rejected = request;
+        rejected.manifest = .fromSlice(different_json);
+        try std.testing.expectEqual(kernel_owner_abi.Status.private_index_root_recovery_required, server_api.storageOwnerNativeIndexControlJson(id, &rejected, &response));
+        try std.testing.expect(response.ptr == null);
+    }
+    // The raw ABI cannot bypass the writer gate, even with genuine retired
+    // artifacts and a valid host signing-root scope.
+    try std.testing.expect(server_api.storageOwnerNativeIndexControlJson(id, &request, &response) != .ok);
+    try std.testing.expect(response.ptr == null);
+    const before_complete = try handle.db.nativeIndexOwnerCancellationState(identity);
+    try std.testing.expect(before_complete.completed == null);
+    try std.testing.expectEqual(cancel_position.sequence + 1, before_complete.source.sequence);
+    handle.db.local_execution.replication_write_gate = null;
+    var completed: ?local.storage_db_relational_index_owner_job.Canceled = null;
+    for (0..2) |attempt| {
+        try std.testing.expectEqual(kernel_owner_abi.Status.ok, server_api.storageOwnerNativeIndexControlJson(id, &request, &response));
+        const completion_response = response;
+        defer freeRawBuffer(completion_response.ptr, completion_response.len);
+        var outcome = try std.json.parseFromSlice(completion_native.CancellationCompletionOutcome, a, completion_response.slice(), .{ .ignore_unknown_fields = false });
+        defer outcome.deinit();
+        try outcome.value.validate();
+        try std.testing.expectEqual(attempt != 0, outcome.value.duplicate);
+        try std.testing.expectEqual(cancel_position.sequence + 2, outcome.value.position.sequence);
+        try std.testing.expectEqual(.canceled, outcome.value.receipt.?.action);
+        if (completed) |previous| try std.testing.expectEqualDeep(previous, outcome.value.record.?) else completed = outcome.value.record;
+    }
+    handle.db.close();
+    handle.db = try db_mod.DB.open(a, directory.path(), .{ .start_optional_runtimes = false, .primary_backend = .{ .lsm = .{} }, .online_source_authority = .native, .identity_namespace = header.fence.namespace });
+    const recovered_state = try handle.db.nativeIndexOwnerCancellationState(identity);
+    try recovered_state.validate(identity);
+    try std.testing.expectEqualDeep(completed, recovered_state.completed);
+    var completion_read = try handle.db.core.store.beginReadTxn();
+    defer completion_read.abort();
+    try std.testing.expect((try local.storage_db_relational_integrity_topology.current(&completion_read)).?.eql(header.fence));
+    try std.testing.expect(try local.storage_db_relational_integrity_topology.completed(&completion_read) == null);
 }
 
 test "storage owner open rejects prior ABI before reading expanded request fields" {

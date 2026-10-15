@@ -8214,3 +8214,33 @@ This is the durable native checkpoint, not complete public cancellation activati
 The leased receiving boundary, signed cleanup witness/metadata verification,
 bounded cancellation scheduling and final cohort fence release remain required.
 Original SQL accounting and performance claims are unchanged.
+
+### Leased cancellation-completion boundary
+
+The private kernel ABI now has an identity-only cleanup-completion operation
+(ABI 91). The receiver supplies a host-selected signing-root scope, checked
+against the actual persisted key before mutation; remote callers cannot supply
+a physical allocation, cleanup record, native cut or root directory through
+the source adapter. Controlled cancellation/deadlines and writer admission
+apply before the effect, and the response buffer is reserved before commit.
+
+The source adapter captures the returned root generation from the same applying
+lease that executes/retries completion. A subsequent routing switch cannot
+relabel the earlier result. The fixed cancellation inspection projects the
+durable completion record separately from physical retirement, validates its
+identity/cuts, and keeps the reserved job and source fence active.
+
+Debug qualification passes for raw ABI scope/size/version/deadline/root
+rejection, denied-writer no-effect checks, cold recovery, exact retries through
+the real compiled owner, and pinned-generation behavior. Signed cleanup
+witnesses, independent metadata verification, bounded cleanup scheduling and
+the final cohort fence-release barrier still require integration. No public
+activation or original-case credit is claimed by this boundary alone.
+
+The combined Debug gate passed 88/88 build steps in
+`/private/tmp/antfly-index-cancel-complete-leased-debug-4.log`: six ABI/runtime-status,
+three actual leased-adapter and 46 runtime-contract tests, with no failures or
+leaks. Formatting, diff, licensing, Apache boundary, control-catalog and original
+inventory integrity checks pass. Intermediate compile failures were the missing
+prepared-operation dispatcher branch and fixture/inspection syntax; no failing
+or empty-selection run is counted as qualification.

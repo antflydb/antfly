@@ -596,6 +596,20 @@ pub const Owner = struct {
         return response;
     }
 
+    /// Host-scoped cleanup completion. The body contains immutable identity,
+    /// not the physical binding or a caller-claimed cleanup cut.
+    pub fn nativeIndexOwnerCancellationCompletionScopedJson(self: *Owner, table_name: []const u8, identity_json: []const u8, root_scope_json: []const u8, options: QueryOptions) !Response {
+        var response: Response = .{};
+        try statusToError(abi.antfly_storage_owner_native_index_control_json(self.handle, &.{
+            .operation = .cancel_complete,
+            .table_name = .fromSlice(table_name),
+            .request_json = .fromSlice(identity_json),
+            .manifest = .fromSlice(root_scope_json),
+            .control = controlledRequest("", "", options.execution_deadline_ns, options.cancellation_ctx, options.cancellation_fn),
+        }, &response.buffer));
+        return response;
+    }
+
     /// Trusted server command after independent durable metadata acceptance.
     pub fn nativeIndexSourceConsumptionJson(self: *Owner, table_name: []const u8, command_json: []const u8, options: QueryOptions) !Response {
         var response: Response = .{};

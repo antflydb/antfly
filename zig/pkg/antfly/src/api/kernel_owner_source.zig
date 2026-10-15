@@ -95,6 +95,7 @@ test "native index owner adapter rejects cancellation deadline and foreign group
         try std.testing.expectError(expected, source.consumeNativeIndexSourceAtRoot(std.testing.allocator, 7, "rows", undefined, context));
         try std.testing.expectError(expected, source.stepNativeIndexOwnerInstallationAtRoot(std.testing.allocator, 7, "rows", undefined, 1, context));
         try std.testing.expectError(expected, source.applyNativeIndexOwnerReleaseAtRoot(std.testing.allocator, 7, "rows", undefined, 1, context));
+        try std.testing.expectError(expected, source.completeNativeIndexOwnerCancellationAtRoot(std.testing.allocator, 7, "rows", identity, 1, context));
         try std.testing.expectError(expected, source.cancelNativeIndexOwnerIntent(std.testing.allocator, 7, "rows", undefined, context));
         try std.testing.expectError(expected, source.cleanupNativeIndexOwner(std.testing.allocator, 7, "rows", identity, context));
         try std.testing.expectError(expected, source.collectNativeIndexOwnerGarbage(std.testing.allocator, 7, "rows", identity, context));
@@ -3739,6 +3740,43 @@ pub const ProvisionedKernelOwnerSource = struct {
         errdefer result.deinit();
         try result.value.validate();
         if (!std.meta.eql(result.value.intent, intent)) return error.InvalidPrivateIndexNativeReceipt;
+        return .{ .root_generation = lease.entry.generation, .outcome = result };
+    }
+
+    pub const RootedNativeIndexOwnerCancellationCompletion = struct {
+        root_generation: u64,
+        outcome: std.json.Parsed(native_index_control.CancellationCompletionOutcome),
+        pub fn deinit(self: *@This()) void {
+            self.outcome.deinit();
+            self.* = undefined;
+        }
+    };
+
+    /// The applying lease supplies the observed generation. No physical job,
+    /// cleanup certificate, native cut or root path enters the remote body.
+    pub fn completeNativeIndexOwnerCancellationAtRoot(self: *ProvisionedKernelOwnerSource, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, identity: native_index_control.Identity, signing_root_incarnation: u128, context: request_operation.RequestContext) !RootedNativeIndexOwnerCancellationCompletion {
+        try context.ensureActive();
+        var lease = try self.acquireNativeIndexOwner(group_id, table_name, identity, context);
+        defer lease.deinit();
+        const encoded = try std.json.Stringify.valueAlloc(alloc, identity, .{});
+        defer alloc.free(encoded);
+        const root: native_index_control.AuditRoot = .{ .root_dir = self.replica_root_dir, .root_incarnation = signing_root_incarnation };
+        try root.validate();
+        const scope = try std.json.Stringify.valueAlloc(alloc, root, .{});
+        defer alloc.free(scope);
+        const native_context = try platformDeadlineContext(context);
+        var cancellation = native_context.cancellation;
+        try context.ensureActive();
+        var response = try lease.owner().nativeIndexOwnerCancellationCompletionScopedJson(table_name, encoded, scope, .{ .execution_deadline_ns = native_context.deadline_ns, .cancellation_ctx = &cancellation, .cancellation_fn = cancellationTokenRequested });
+        defer response.deinit();
+        if (response.bytes().len == 0 or response.bytes().len > native_index_control.max_response_bytes) return error.InvalidPrivateIndexNativeReceipt;
+        var result = try std.json.parseFromSlice(native_index_control.CancellationCompletionOutcome, alloc, response.bytes(), .{ .allocate = .alloc_always, .ignore_unknown_fields = false });
+        errdefer result.deinit();
+        try result.value.validate();
+        const binding = result.value.binding;
+        if (!std.mem.eql(u8, &binding.id, &identity.id) or !std.mem.eql(u8, &binding.plan_digest, &identity.plan_digest) or
+            !std.mem.eql(u8, &binding.owner_digest, &identity.owner_digest) or binding.ordinal != identity.ordinal or
+            binding.fence.owner_group_id != identity.owner_group_id or !binding.fence.namespace.eql(identity.namespace)) return error.PrivateIndexOwnerJobChanged;
         return .{ .root_generation = lease.entry.generation, .outcome = result };
     }
 

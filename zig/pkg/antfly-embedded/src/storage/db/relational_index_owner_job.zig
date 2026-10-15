@@ -361,6 +361,7 @@ pub const CancellationState = struct {
     claim_allocation: ?u64 = null,
     artifacts_retired: bool = false,
     claims_retired: bool = false,
+    completed: ?Canceled = null,
 
     /// Validate a decoded inspection before dispatching another owner effect.
     /// Structural validity is not metadata permission or root attestation.
@@ -395,6 +396,13 @@ pub const CancellationState = struct {
         } else if (self.claim_allocation != null) return error.InvalidPrivateIndexCancellation;
         if (self.artifacts_retired and self.cleanup == null) return error.InvalidPrivateIndexCancellation;
         if (self.claims_retired and self.cleanup == null) return error.InvalidPrivateIndexCancellation;
+        if (self.completed) |record| {
+            try record.validate();
+            if (!self.artifacts_retired or !self.claims_retired or self.binding == null or self.intent == null or
+                !std.meta.eql(record.binding, self.binding.?) or !std.meta.eql(record.intent_position, self.intent.?.position) or
+                !std.meta.eql(record.cleanup.position, self.cleanup.?) or record.cleanup.claim_allocation != self.claim_allocation.? or
+                record.position.sequence > self.source.sequence) return error.InvalidPrivateIndexCancellation;
+        }
     }
 };
 
@@ -438,6 +446,11 @@ pub fn inspectCancellation(txn: anytype, expected: anytype) !CancellationState {
         } else |err| switch (err) {
             error.PrivateIndexCancellationPending => {},
             else => return err,
+        }
+    }
+    if (try Canceled.load(txn)) |record| {
+        if (binding) |current| {
+            if (std.meta.eql(record.binding, current)) result.completed = record;
         }
     }
     try result.validate(expected);

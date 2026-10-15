@@ -8623,6 +8623,15 @@ pub const DB = struct {
         return outcome;
     }
 
+    /// Inspect the actual leased job; a caller supplies immutable identity,
+    /// never a physical allocation, cleanup certificate or completion cut.
+    pub fn prepareNativeIndexOwnerCancellationCompletion(self: *DB, identity: native_index_control.Identity, context: @import("../../api/operation.zig").RequestContext) !native_index_control.PreparedCancellationCompletion {
+        try context.ensureActive();
+        const state = try self.nativeIndexOwnerCancellationState(identity);
+        if (!state.artifacts_retired or !state.claims_retired) return error.PrivateIndexCancellationPending;
+        return .{ .alloc = self.alloc, .binding = state.binding orelse return error.PrivateIndexJobRequired, .context = context };
+    }
+
     pub fn applyPreparedNativeIndexOwnerCancellationCompletion(self: *DB, prepared: *native_index_control.PreparedCancellationCompletion, replay: ?NativeIndexReplay) !native_index_control.CancellationCompletionOutcome {
         return self.applyPreparedNativeIndexEffect(prepared, replay);
     }
