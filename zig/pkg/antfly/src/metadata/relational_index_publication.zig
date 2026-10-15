@@ -54,6 +54,36 @@ pub const DecidePublish = struct {
 };
 pub const RootProof = @import("relational_index_root_attestation.zig").Proof;
 
+pub const CancelDecision = struct {
+    table_id: u64,
+    id: Id,
+    expected_revision: u64,
+    failure: progress.Failure,
+
+    pub fn validate(self: @This()) !void {
+        try (DecidePublish{ .table_id = self.table_id, .id = self.id, .expected_revision = self.expected_revision }).validate();
+        if (self.failure == .none) return error.InvalidGenerationPublication;
+    }
+};
+
+/// Cancellation admission is not cleanup completion or permission to lift a
+/// physical fence. An unmirrored decision is never reported as confirmed.
+pub const CancellationStatus = struct {
+    pub const max_wire_bytes = 2048;
+    head: progress.Head,
+    replication_pending: bool = false,
+
+    pub fn isCanceled(self: @This(), request: CancelDecision) !bool {
+        try request.validate();
+        try self.head.validate();
+        if (self.head.table_id != request.table_id or !std.mem.eql(u8, &self.head.plan_id, &request.id) or
+            self.head.revision < request.expected_revision) return error.GenerationPublicationChanged;
+        const canceled = self.head.phase == .canceling or self.head.phase == .cancel_releasing or self.head.phase == .canceled;
+        if (canceled and (self.head.failure != request.failure or self.head.revision <= request.expected_revision)) return error.GenerationPublicationChanged;
+        return canceled and !self.replication_pending;
+    }
+};
+
 /// Exact observation of an admitted job's irreversible decision. A metadata
 /// outbox obligation withholds completion even if the local head advanced.
 pub const DecisionStatus = struct {

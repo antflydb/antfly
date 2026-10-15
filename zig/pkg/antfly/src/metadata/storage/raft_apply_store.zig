@@ -4826,7 +4826,118 @@ pub const OwnerAckTestFixture = if (@import("builtin").is_test) struct {
         try testNativePublicationDecision(alloc, &reopened, group, recovered.value.head, signing_root);
     }
 
+    fn testNativeCancellationDecision(alloc: std.mem.Allocator, source: *RaftApplyStore, group: u64, head: index_progress.Head) !void {
+        const snapshot = try source.snapshotBuilder().buildSnapshot(alloc, group);
+        defer alloc.free(snapshot);
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/index-cancel-decision", .{tmp.sub_path});
+        defer alloc.free(path);
+        var clone = try RaftApplyStore.init(alloc, .{ .root_dir = path });
+        var opened = true;
+        defer if (opened) clone.deinit();
+        try std.testing.expect(try clone.snapshotBuilder().installSnapshot(alloc, group, 100, snapshot));
+        const request: index_publication.CancelDecision = .{ .table_id = head.table_id, .id = head.plan_id, .expected_revision = head.revision, .failure = .duplicate_key };
+        const command: TransitionCommand = .{ .cancel_relational_index_publication = request };
+        const encoded = try encodeTransitionCommand(alloc, command);
+        defer alloc.free(encoded);
+        var decoded = (try decodeTransitionCommand(alloc, encoded)).?;
+        defer decoded.deinit(alloc);
+        try std.testing.expectEqualDeep(request, decoded.cancel_relational_index_publication);
+        for (0..encoded.len) |len| {
+            const result = decodeTransitionCommand(alloc, encoded[0..len]);
+            if (result) |value| {
+                if (value) |partial| {
+                    var owned = partial;
+                    owned.deinit(alloc);
+                    return error.TestAcceptedTruncatedCancellation;
+                }
+            } else |_| {}
+        }
+        const trailing = try std.mem.concat(alloc, u8, &.{ encoded, "x" });
+        defer alloc.free(trailing);
+        try std.testing.expectError(error.InvalidMetadataTransitionEncoding, decodeTransitionCommand(alloc, trailing));
+        try clone.validateRelationalIndexCancellation(group, request);
+        var stale = request;
+        stale.expected_revision -= 1;
+        try std.testing.expectError(error.GenerationPublicationChanged, clone.validateRelationalIndexCancellation(group, stale));
+        stale = request;
+        stale.failure = .none;
+        try std.testing.expectError(error.InvalidGenerationPublication, clone.validateRelationalIndexCancellation(group, stale));
+        const Fault = struct {
+            txn: *docstore.DocStore.Txn,
+            after: bool,
+            pub fn get(self: *@This(), key: []const u8) ![]const u8 {
+                return self.txn.get(key);
+            }
+            pub fn put(self: *@This(), key: []const u8, value: []const u8) !void {
+                if (!self.after) return error.TestCancelDecisionWriteFailed;
+                try self.txn.put(key, value);
+                return error.TestCancelDecisionWriteFailed;
+            }
+        };
+        for ([_]bool{ false, true }) |after| {
+            var txn = try clone.store.beginWriteTxn();
+            defer txn.abort();
+            const prepared = (try clone.prepareRelationalIndexCancellationTxn(&txn, group, request)).?;
+            var fault: Fault = .{ .txn = &txn, .after = after };
+            try std.testing.expectError(error.TestCancelDecisionWriteFailed, prepared.stage(&fault, group));
+        }
+        {
+            const before = try clone.relationalIndexCancellationStatusJson(alloc, group, request);
+            defer alloc.free(before);
+            var status = try std.json.parseFromSlice(index_publication.CancellationStatus, alloc, before, .{});
+            defer status.deinit();
+            try std.testing.expect(!try status.value.isCanceled(request));
+            try std.testing.expectEqualDeep(head, status.value.head);
+        }
+        try clone.applyStandaloneCommand(group, command);
+        try clone.applyStandaloneCommand(group, command); // exact uncertain retry
+        try clone.validateRelationalIndexCancellation(group, request);
+        try std.testing.expectError(error.GenerationPublicationChanged, clone.validateRelationalIndexPublicationDecision(group, .{ .table_id = head.table_id, .id = head.plan_id, .expected_revision = head.revision + 1 }));
+        opened = false;
+        clone.deinit();
+        clone = try RaftApplyStore.init(alloc, .{ .root_dir = path });
+        opened = true;
+        try verifyRelationRecoveryForTest(&clone, alloc, group);
+        const observed = try clone.relationalIndexCancellationStatusJson(alloc, group, request);
+        defer alloc.free(observed);
+        var status = try std.json.parseFromSlice(index_publication.CancellationStatus, alloc, observed, .{});
+        defer status.deinit();
+        try std.testing.expect(try status.value.isCanceled(request));
+        try std.testing.expectEqual(index_progress.Phase.canceling, status.value.head.phase);
+        try std.testing.expectEqual(head.revision + 1, status.value.head.revision);
+        try std.testing.expectEqualDeep(head.counts, status.value.head.counts);
+        stale = request;
+        stale.failure = .requested;
+        try std.testing.expectError(error.GenerationPublicationChanged, clone.validateRelationalIndexCancellation(group, stale));
+        try std.testing.expectError(error.GenerationPublicationChanged, clone.relationalIndexCancellationStatusJson(alloc, group, stale));
+        {
+            const before = (try source.getTable(alloc, group, head.table_id)).?;
+            defer metadata_table_manager.freeTable(alloc, before);
+            const after = (try clone.getTable(alloc, group, head.table_id)).?;
+            defer metadata_table_manager.freeTable(alloc, after);
+            try std.testing.expect(metadata_table_manager.tableDefinitionsEqual(before, after));
+        }
+        {
+            var read = try clone.store.beginReadTxn();
+            defer read.abort();
+            try index_publication.requireActivePointer(&read, group, status.value.head);
+            const lock = (try @import("../table_lifecycle_lock.zig").read(&read, group, head.table_id)).?;
+            try std.testing.expectEqualDeep(head.plan_id, lock.id);
+        }
+        try clone.store.put(RaftApplyStore.metadata_hot_standby.outbox_key, "pending-cancel-decision");
+        defer clone.store.delete(RaftApplyStore.metadata_hot_standby.outbox_key) catch unreachable;
+        try std.testing.expectError(error.MetadataReplicationPending, clone.validateRelationalIndexCancellation(group, request));
+        const pending = try clone.relationalIndexCancellationStatusJson(alloc, group, request);
+        defer alloc.free(pending);
+        var pending_status = try std.json.parseFromSlice(index_publication.CancellationStatus, alloc, pending, .{});
+        defer pending_status.deinit();
+        try std.testing.expect(!try pending_status.value.isCanceled(request));
+    }
+
     fn testNativePublicationDecision(alloc: std.mem.Allocator, source: *RaftApplyStore, group: u64, head: index_progress.Head, signing_root: @import("antfly_local_sources").storage_db_root_signing_identity.State) !void {
+        try testNativeCancellationDecision(alloc, source, group, head);
         const snapshot = try source.snapshotBuilder().buildSnapshot(alloc, group);
         defer alloc.free(snapshot);
         var tmp = std.testing.tmpDir(.{});
@@ -9078,6 +9189,7 @@ pub const TransitionCommand = union(enum) {
     begin_relational_index_publication: []const u8,
     ack_relational_index_publication: []const u8,
     decide_relational_index_publication: index_publication.DecidePublish,
+    cancel_relational_index_publication: index_publication.CancelDecision,
     apply_relation_reconciliation: []const u8,
     apply_restore_staging: []const u8,
     /// Versioned system catalog request, applied atomically with any table topology.
@@ -9387,6 +9499,7 @@ pub fn validateTransitionCommandSchemaReaderRequirements(command: TransitionComm
 pub fn validateTransitionCommandDataGroupIds(command: TransitionCommand) !void {
     switch (command) {
         .decide_relational_index_publication => |decision| try decision.validate(),
+        .cancel_relational_index_publication => |decision| try decision.validate(),
         .apply_relation_reconciliation => |bytes| _ = try relation_control.Command.decode(bytes),
         .apply_restore_staging => |bytes| if (bytes.len == 0 or bytes.len > restore_staging.max_encoded_bytes) return error.InvalidRestoreStaging,
         .apply_fk_generation_publication => |bytes| if (bytes.len == 0 or bytes.len > fk_generation_publication.max_bytes) return error.InvalidGenerationPublication,
@@ -18166,6 +18279,70 @@ pub const RaftApplyStore = struct {
         return std.json.Stringify.valueAlloc(alloc, status, .{});
     }
 
+    const IndexPublicationCancellation = struct {
+        table_id: u64,
+        expected: [index_progress.Head.encoded_len]u8,
+        next: [index_progress.Head.encoded_len]u8,
+        id: index_publication.Id,
+
+        fn stage(self: *const @This(), txn: anytype, group: u64) !void {
+            var buf: [192]u8 = undefined;
+            const head_key = try index_publication.headKey(&buf, group, self.table_id);
+            if (!std.mem.eql(u8, try txn.get(head_key), &self.expected)) return error.GenerationPublicationChanged;
+            const previous = try index_progress.Head.decode(&self.expected);
+            try index_publication.requireActivePointer(txn, group, previous);
+            const lock = (try @import("../table_lifecycle_lock.zig").read(txn, group, self.table_id)) orelse return error.GenerationPublicationChanged;
+            if (lock.kind != .index_build or !std.mem.eql(u8, &lock.id, &self.id)) return error.GenerationPublicationChanged;
+            try txn.put(try index_publication.headKey(&buf, group, self.table_id), &self.next);
+        }
+    };
+
+    fn prepareRelationalIndexCancellationTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group: u64, request: index_publication.CancelDecision) !?IndexPublicationCancellation {
+        try request.validate();
+        _ = try self.standbyRelationActivationTxn(txn, group, topology_protocol.index_publication_head_version);
+        if (!try relationWriterEnabledTxn(txn, group)) return error.CatalogOccupancyNotReady;
+        if (try stagingGet(txn, metadata_hot_standby.outbox_key) != null) return error.MetadataReplicationPending;
+        var buf: [192]u8 = undefined;
+        const head = try index_progress.Head.decode(try txn.get(try index_publication.headKey(&buf, group, request.table_id)));
+        if (head.table_id != request.table_id or !std.mem.eql(u8, &head.plan_id, &request.id)) return error.GenerationPublicationChanged;
+        try index_publication.requireActivePointer(txn, group, head);
+        if (head.phase == .canceling or head.phase == .cancel_releasing or head.phase == .canceled) {
+            if (head.failure != request.failure or request.expected_revision >= head.revision) return error.GenerationPublicationChanged;
+            return null;
+        }
+        const next = try head.cancel(request.expected_revision, request.failure);
+        const lock = (try @import("../table_lifecycle_lock.zig").read(txn, group, request.table_id)) orelse return error.GenerationPublicationChanged;
+        if (lock.kind != .index_build or !std.mem.eql(u8, &lock.id, &request.id)) return error.GenerationPublicationChanged;
+        return .{ .table_id = request.table_id, .expected = try head.encode(), .next = try next.encode(), .id = request.id };
+    }
+
+    pub fn validateRelationalIndexCancellation(self: *RaftApplyStore, group: u64, request: index_publication.CancelDecision) !void {
+        var txn = try self.beginIndexedReportRead(group);
+        defer txn.abort();
+        _ = try self.prepareRelationalIndexCancellationTxn(&txn, group, request);
+    }
+
+    pub fn relationalIndexCancellationStatusJson(self: *RaftApplyStore, alloc: std.mem.Allocator, group: u64, request: index_publication.CancelDecision) ![]u8 {
+        try request.validate();
+        var txn = try self.store.beginReadTxn();
+        defer txn.abort();
+        _ = try self.standbyRelationActivationTxn(&txn, group, topology_protocol.index_publication_head_version);
+        var buf: [192]u8 = undefined;
+        const head = try index_progress.Head.decode(try txn.get(try index_publication.headKey(&buf, group, request.table_id)));
+        try index_publication.requireActivePointer(&txn, group, head);
+        const status: index_publication.CancellationStatus = .{ .head = head, .replication_pending = try stagingGet(&txn, metadata_hot_standby.outbox_key) != null };
+        _ = try status.isCanceled(request);
+        return std.json.Stringify.valueAlloc(alloc, status, .{});
+    }
+
+    fn cancelRelationalIndexPublicationTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group: u64, request: index_publication.CancelDecision) !void {
+        const prepared = self.prepareRelationalIndexCancellationTxn(txn, group, request) catch |err| switch (err) {
+            error.GenerationPublicationChanged => return,
+            else => return err,
+        };
+        if (prepared) |value| try value.stage(txn, group);
+    }
+
     const IndexPublicationDecision = struct {
         inputs: std.json.Parsed(index_publication.DecisionInputs),
         table: PreparedTableRecordWrite,
@@ -22266,6 +22443,7 @@ pub const RaftApplyStore = struct {
             .begin_relational_index_publication => metadataSnapshotProjectionBit(.index_publication_proof) | metadataSnapshotProjectionBit(.index_publication_inputs) | metadataSnapshotProjectionBit(.index_publication_dispatch) | metadataSnapshotProjectionBit(.index_publication_owner_group) | metadataSnapshotProjectionBit(.index_publication_plan) | metadataSnapshotProjectionBit(.index_publication_active) | metadataSnapshotProjectionBit(.index_publication_head) | metadataSnapshotProjectionBit(.index_publication_owner) | metadataSnapshotProjectionBit(.fk_generation_table_lock) | metadataSnapshotProjectionBit(.table),
             .ack_relational_index_publication => metadataSnapshotProjectionBit(.index_publication_head) | metadataSnapshotProjectionBit(.index_publication_owner) | metadataSnapshotProjectionBit(.index_publication_proof) | metadataSnapshotProjectionBit(.fk_generation_table_lock),
             .decide_relational_index_publication => metadataSnapshotProjectionBit(.index_publication_head) | metadataSnapshotProjectionBit(.index_publication_active) | metadataSnapshotProjectionBit(.table) | metadataSnapshotProjectionBit(.lake_index_lifecycle),
+            .cancel_relational_index_publication => metadataSnapshotProjectionBit(.index_publication_head),
             .apply_relation_reconciliation => metadataSnapshotProjectionBit(.relation_source) | metadataSnapshotProjectionBit(.relation_reconciliation) |
                 metadataSnapshotProjectionBit(.relation_retirements) | metadataSnapshotProjectionBit(.relation_candidates) | metadataSnapshotProjectionBit(.relation_root) | metadataSnapshotProjectionBit(.relation_live) |
                 metadataSnapshotProjectionBit(.relation_writer) | metadataSnapshotProjectionBit(.topology_activation) | metadataSnapshotProjectionBit(.metadata_incarnation),
@@ -24743,6 +24921,7 @@ pub const RaftApplyStore = struct {
             .begin_relational_index_publication => |bytes| try self.beginRelationalIndexPublicationTxn(txn, group_id, bytes),
             .ack_relational_index_publication => |bytes| try self.ackRelationalIndexPublicationTxn(txn, group_id, bytes),
             .decide_relational_index_publication => |decision| try self.decideRelationalIndexPublicationTxn(txn, group_id, decision),
+            .cancel_relational_index_publication => |decision| try self.cancelRelationalIndexPublicationTxn(txn, group_id, decision),
             .accept_relational_index_delivery => |bytes| try self.acceptRelationalIndexDeliveryTxn(txn, group_id, bytes),
             .complete_relational_index_source => |bytes| try self.completeRelationalIndexSourceTxn(txn, group_id, bytes),
             .apply_fk_initial_create => |bytes| try self.applyCommittedFkInitialCreateTxn(txn, group_id, bytes),
@@ -30127,6 +30306,7 @@ fn storeRuntimeStatusRecordVersion(record: metadata.StoreRecord) ?u16 {
 }
 
 const TransitionTag = enum(u8) {
+    cancel_relational_index_publication = 83,
     decide_relational_index_publication = 82,
     accept_relational_index_delivery = 80,
     complete_relational_index_source = 81,
@@ -30299,6 +30479,14 @@ pub fn encodeTransitionCommand(alloc: std.mem.Allocator, command: TransitionComm
             if (bytes.len > fk_generation_publication.max_bytes) return error.CatalogCommandTooLarge;
             try out.append(alloc, @backingInt(TransitionTag.apply_fk_generation_publication));
             try appendRequiredString(alloc, &out, bytes);
+        },
+        .cancel_relational_index_publication => |decision| {
+            try decision.validate();
+            try out.append(alloc, @backingInt(TransitionTag.cancel_relational_index_publication));
+            try appendInt(alloc, &out, u64, decision.table_id);
+            try out.appendSlice(alloc, &decision.id);
+            try appendInt(alloc, &out, u64, decision.expected_revision);
+            try out.append(alloc, @backingInt(decision.failure));
         },
         .decide_relational_index_publication => |decision| {
             try decision.validate();
@@ -30752,6 +30940,20 @@ pub fn decodeTransitionCommand(alloc: std.mem.Allocator, encoded: []const u8) !?
         .apply_fk_generation_publication => blk: {
             if (encoded.len > fk_generation_publication.max_bytes + 16) return error.CatalogCommandTooLarge;
             break :blk .{ .apply_fk_generation_publication = try readRequiredString(alloc, encoded, &pos) };
+        },
+        .cancel_relational_index_publication => blk: {
+            const table_id = try readInt(encoded, &pos, u64);
+            if (encoded.len - pos < 16) return error.InvalidMetadataTransitionEncoding;
+            const id: [16]u8 = encoded[pos..][0..16].*;
+            pos += 16;
+            const revision = try readInt(encoded, &pos, u64);
+            if (pos == encoded.len) return error.InvalidMetadataTransitionEncoding;
+            const failure = std.enums.fromInt(index_progress.Failure, encoded[pos]) orelse return error.InvalidMetadataTransitionEncoding;
+            pos += 1;
+            const request: index_publication.CancelDecision = .{ .table_id = table_id, .id = id, .expected_revision = revision, .failure = failure };
+            try request.validate();
+            if (pos != encoded.len) return error.InvalidMetadataTransitionEncoding;
+            break :blk .{ .cancel_relational_index_publication = request };
         },
         .decide_relational_index_publication => blk: {
             const table_id = try readInt(encoded, &pos, u64);

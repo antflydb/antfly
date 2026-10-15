@@ -3424,7 +3424,7 @@ test "relation mutation admission projects naming capability without materializi
 pub fn transitionRequiredCoordinatedDecoderVersion(command: metadata_storage.TransitionCommand) u16 {
     // AIPH v2 also applies to unmarked plans. Classify it before the older
     // table-definition profile can return a weaker decoder requirement.
-    if (command == .complete_relational_index_source or command == .accept_relational_index_delivery or command == .begin_relational_index_publication or command == .ack_relational_index_publication)
+    if (command == .complete_relational_index_source or command == .accept_relational_index_delivery or command == .begin_relational_index_publication or command == .ack_relational_index_publication or command == .cancel_relational_index_publication)
         return metadata_topology_protocol.index_publication_head_version;
     const has_reader_requirements = switch (command) {
         .upsert_table => |table| table.schema_reader_requirements != null,
@@ -3615,6 +3615,8 @@ test "catalog projection schema reader facts require their decoder profile at fi
 
 test "relational index publication admission requires its own coordinated decoder floor" {
     const command: metadata_storage.TransitionCommand = .{ .begin_relational_index_publication = "{}" };
+    const cancel: metadata_storage.TransitionCommand = .{ .cancel_relational_index_publication = .{ .table_id = 1, .id = @splat(2), .expected_revision = 1, .failure = .requested } };
+    try std.testing.expectEqual(metadata_topology_protocol.index_publication_head_version, transitionRequiredCoordinatedDecoderVersion(cancel));
     try std.testing.expectEqual(metadata_topology_protocol.index_publication_head_version, transitionRequiredCoordinatedDecoderVersion(command));
     try std.testing.expect(transitionRequiredCoordinatedDecoderVersion(command) > metadata_topology_protocol.checks_catalog_identity_version);
     const ack: metadata_storage.TransitionCommand = .{ .ack_relational_index_publication = "{}" };
