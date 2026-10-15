@@ -11974,7 +11974,7 @@ pub const IndexManager = struct {
         errdefer self.truncateResolvers(resolver_checkpoint);
         var stored = try indexConfigWithCoverageGeneration(self.alloc, self.io, cfg);
         errdefer stored.deinit(self.alloc);
-        try self.stageGraphReplacementResolvers(old, stored);
+        try self.stageGraphReplacementResolvers(old, stored, pending.value);
         try self.prepareStorageForFreshCatalogEntry(store, stored);
         try self.provisionConfiguredIndexDirDurable(stored);
         const key = try std.fmt.allocPrint(self.alloc, "{s}{s}", .{ graph_replacement_build_prefix, stored.name });
@@ -12013,7 +12013,7 @@ pub const IndexManager = struct {
 
     /// Stage a distinct execution stream, never mutate the serving contract.
     /// Both the reservation and these definitions are committed by the caller.
-    fn stageGraphReplacementResolvers(self: *IndexManager, old: []const u8, cfg: types.IndexConfig) !void {
+    fn stageGraphReplacementResolvers(self: *IndexManager, old: []const u8, cfg: types.IndexConfig, pending: []const GraphReplacementBuild) !void {
         var parsed = try std.json.parseFromSlice(std.json.Value, self.alloc, cfg.config_json, .{});
         defer parsed.deinit();
         if (parsed.value != .object) return error.InvalidIndexConfig;
@@ -12032,6 +12032,9 @@ pub const IndexManager = struct {
             next.namespace_generation = 0;
             next.replacement_index = "";
             next.replacement_resolver = "";
+            // An unchanged declaration can acquire another graph owner too.
+            // Fence it before taking the equality shortcut.
+            try self.requireResolverNotReplacing(next.name);
             if (self.getResolver(next.name)) |previous| {
                 next.merges = previous.merges;
                 next.merge_generation = previous.merge_generation;
@@ -12051,12 +12054,7 @@ pub const IndexManager = struct {
                 next.inline_managed = true;
                 if (previous.inline_managed != true or !try self.indexDeclaresResolver(self.get(old).?.config_json, next.name))
                     return error.ResolverReplacementOwnershipConflict;
-                for (self.graph_indexes.items) |graph| {
-                    if (!std.mem.eql(u8, graph.config.name, old) and try self.indexDeclaresResolver(graph.config.config_json, next.name))
-                        return error.ResolverReplacementOwnershipConflict;
-                }
-                for (self.resolvers.items) |entry| if (std.mem.eql(u8, entry.replacement_resolver, next.name))
-                    return error.IndexReplacementPending;
+                try self.requireExclusiveResolverOwner(next.name, old, cfg.name, pending);
                 // Separate source and output streams keep the serving graph's
                 // endpoint maps and label routing unchanged throughout build.
                 if (std.mem.eql(u8, previous.source_artifact, next.source_artifact) or
@@ -12091,6 +12089,18 @@ pub const IndexManager = struct {
     pub fn requireResolverNotReplacing(self: *const IndexManager, name: []const u8) !void {
         for (self.resolvers.items) |cfg| if (std.mem.eql(u8, cfg.replacement_resolver, name))
             return error.IndexReplacementPending;
+    }
+
+    fn requireExclusiveResolverOwner(self: *const IndexManager, name: []const u8, old: []const u8, replacement: []const u8, pending: []const GraphReplacementBuild) !void {
+        for (self.graph_indexes.items) |graph| {
+            if (!std.mem.eql(u8, graph.config.name, old) and try self.indexDeclaresResolver(graph.config.config_json, name))
+                return error.ResolverReplacementOwnershipConflict;
+        }
+        for (pending) |job| {
+            if (job.phase == .failed or std.mem.eql(u8, job.name, replacement)) continue;
+            if (job.config) |config| if (try self.indexDeclaresResolver(config.config_json, name))
+                return error.ResolverReplacementOwnershipConflict;
+        }
     }
 
     pub fn graphReplacementBuildsAlloc(self: *IndexManager, store: anytype, alloc: Allocator) !std.json.Parsed([]GraphReplacementBuild) {
@@ -12250,6 +12260,22 @@ pub const IndexManager = struct {
         if (replaces) |old| {
             const previous = self.get(old) orelse return error.NotFound;
             if (previous.kind != .graph or cfg.kind != .graph) return error.UnsupportedOperation;
+        }
+
+        if (cfg.kind == .graph) {
+            var pending_owners: ?std.json.Parsed([]GraphReplacementBuild) = null;
+            defer if (pending_owners) |jobs| jobs.deinit();
+            for (self.resolvers.items) |resolver| {
+                if (resolver.replacement_index.len == 0) continue;
+                if (prepared != null and std.mem.eql(u8, resolver.replacement_index, cfg.name)) {
+                    // Recheck at publication as well, including reservations
+                    // admitted by an older writer before ownership was fenced.
+                    if (pending_owners == null) pending_owners = try self.graphReplacementBuildsAlloc(store, self.alloc);
+                    try self.requireExclusiveResolverOwner(resolver.replacement_resolver, replaces orelse return error.InvalidIndexConfig, cfg.name, pending_owners.?.value);
+                } else if (try self.indexDeclaresResolver(cfg.config_json, resolver.replacement_resolver)) {
+                    return error.IndexReplacementPending;
+                }
+            }
         }
 
         var stored_cfg = try indexConfigWithCoverageGeneration(self.alloc, self.io, cfg);

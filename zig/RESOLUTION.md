@@ -1321,6 +1321,11 @@ graphs with absent or unchanged resolvers. A missing enrichment runtime is
 created on demand, including after reopen; manual owners retain synchronous
 execution without starting background workers. The old graph and public resolver
 remain authoritative during the build.
+Producer replay yields after at most 4096 physical records, a 4 MiB byte budget,
+or a 100 ms quantum (and honors an earlier caller deadline). Byte and time
+budgets are checked between records, so a single oversized record still makes
+progress. Its durable cursor includes artifact-only pages, rather than counting
+only primary documents toward the work budget.
 The successor takes the public name in the same transaction that activates the
 shadow graph; cancellation or terminal build failure retires only the staged
 execution contract. Pending replacement and resolution work resume after reopen.
@@ -1330,7 +1335,10 @@ inline aliases. Resolver mutations return `replacement_pending` during the build
 finish or cancel the replacement before making further identity changes. A
 resolver independently created through the resolver API, or declared by another
 serving graph, cannot be taken over. An unchanged resolver contract can be reused
-without creating a new execution stream.
+without creating a new execution stream. Pending graph reservations participate
+in ownership checks too. A graph cannot acquire a resolver while its handoff is
+pending, and publication revalidates exclusive ownership before retiring the
+serving execution contract.
 
 Changing a key template is supported when no aliases, merges, or explicit
 namespace fence exist. Curated namespaces still require an explicit

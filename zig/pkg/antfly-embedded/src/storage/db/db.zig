@@ -15132,6 +15132,7 @@ pub const DB = struct {
                 true,
                 entry.intent.source_replay_resume_key,
                 128,
+                .{},
             );
             defer page.deinit(alloc);
             try self.updateIndexRepairIntent(alloc, repair_id, .{
@@ -28167,6 +28168,7 @@ pub const DB = struct {
 
     fn advanceGraphReplacementUntil(self: *DB, deadline: ?u64) !bool {
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return false;
+        if (deadline) |end| if (self.graphReplacementWorkNow() >= end) return self.hasPendingGraphReplacements();
         if (!self.graph_replacement_mutex.tryLock()) return self.hasPendingGraphReplacements();
         defer self.graph_replacement_mutex.unlock(self.core.index_manager.checkpointIo());
         const jobs = try self.graphReplacementStatusAlloc(self.alloc);
@@ -28347,7 +28349,9 @@ pub const DB = struct {
                 GeneratedEnrichmentReplayPageResult{ .complete = true }
             else blk: {
                 try self.ensureGraphReplacementEnrichmentRuntime();
-                break :blk try self.appendGeneratedEnrichmentsFromStoredDocsPage(a, producers, true, producer_resume, 32);
+                break :blk try self.appendGeneratedEnrichmentsFromStoredDocsPage(a, producers, true, producer_resume, 32, .{
+                    .deadline_ns = @min(deadline orelse std.math.maxInt(u64), self.graphReplacementWorkNow() +| 100 * std.time.ns_per_ms),
+                });
             };
             defer page.deinit(a);
             job.producer_replay_complete = page.complete;
@@ -34477,6 +34481,7 @@ pub const DB = struct {
         writes: []types.BatchWrite = &.{},
         extracted: []mapper.ExtractedWrite = &.{},
         next_lower: ?[]u8 = null,
+        complete: bool = true,
 
         pub fn deinit(self: *@This(), alloc: Allocator) void {
             for (self.writes) |write| {
@@ -34491,20 +34496,33 @@ pub const DB = struct {
         }
     };
 
+    const GeneratedEnrichmentReplayScanOptions = struct {
+        max_records: usize = 4096,
+        max_bytes: usize = 4 * 1024 * 1024,
+        deadline_ns: ?u64 = null,
+    };
+
     fn collectStoredGeneratedReplayBatch(
         self: *DB,
         alloc: Allocator,
         lower: []const u8,
         lower_exclusive: bool,
         limit: usize,
+        options: GeneratedEnrichmentReplayScanOptions,
     ) !StoredGeneratedReplayBatch {
+        if (limit == 0 or options.max_records == 0 or options.max_bytes == 0) return error.InvalidArgument;
         const ScanState = struct {
             alloc: Allocator,
+            database: *DB,
             index_manager: *index_manager_mod.IndexManager,
             limit: usize,
+            options: GeneratedEnrichmentReplayScanOptions,
+            records: usize = 0,
+            bytes: usize = 0,
+            yielded: bool = false,
             writes: std.ArrayListUnmanaged(types.BatchWrite) = .empty,
             extracted: std.ArrayListUnmanaged(mapper.ExtractedWrite) = .empty,
-            last_store_key: ?[]u8 = null,
+            last_store_key: std.ArrayList(u8) = .empty,
 
             fn deinitPartial(state: *@This()) void {
                 for (state.writes.items) |write| {
@@ -34514,47 +34532,68 @@ pub const DB = struct {
                 state.writes.deinit(state.alloc);
                 for (state.extracted.items) |*item| item.deinit(state.alloc);
                 state.extracted.deinit(state.alloc);
-                if (state.last_store_key) |key| state.alloc.free(key);
             }
 
             fn scanEntry(ctx: ?*anyopaque, key: []const u8, value: []const u8) anyerror!docstore_mod.DocStore.ScanAction {
                 const state: *@This() = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
-                if (!isPrimaryDocumentStoreKey(key)) return .@"continue";
-                const raw_key = (try internal_keys.decodeStoredDocumentRowKeyAlloc(state.alloc, key)) orelse return .@"continue";
+                if (state.options.deadline_ns) |end| if (state.database.graphReplacementWorkNow() >= end) {
+                    state.yielded = true;
+                    return .stop;
+                };
+                state.records += 1;
+                state.bytes +|= key.len +| value.len;
+                if (isPrimaryDocumentStoreKey(key)) try state.appendDocument(key, value);
+                // The cursor covers every visited record, including artifact
+                // rows. Empty document pages still make durable progress.
+                state.last_store_key.clearRetainingCapacity();
+                try state.last_store_key.appendSlice(state.alloc, key);
+                if (state.writes.items.len >= state.limit or state.records >= state.options.max_records or state.bytes >= state.options.max_bytes) {
+                    state.yielded = true;
+                    return .stop;
+                }
+                return .@"continue";
+            }
+
+            fn appendDocument(state: *@This(), key: []const u8, value: []const u8) !void {
+                const raw_key = (try internal_keys.decodeStoredDocumentRowKeyAlloc(state.alloc, key)) orelse return;
                 errdefer state.alloc.free(raw_key);
                 const raw_value = try state.index_manager.materializeStoredValueAlloc(state.alloc, key, value);
                 errdefer state.alloc.free(raw_value);
-                try state.writes.append(state.alloc, .{
+                state.bytes +|= raw_value.len;
+                var extracted = try mapper.extractWrite(state.alloc, raw_key, raw_value);
+                errdefer extracted.deinit(state.alloc);
+                try state.writes.ensureUnusedCapacity(state.alloc, 1);
+                try state.extracted.ensureUnusedCapacity(state.alloc, 1);
+                state.writes.appendAssumeCapacity(.{
                     .key = raw_key,
                     .value = raw_value,
                 });
-                var extracted = try mapper.extractWrite(state.alloc, raw_key, raw_value);
-                errdefer extracted.deinit(state.alloc);
-                const next_last_store_key = try state.alloc.dupe(u8, key);
-                errdefer state.alloc.free(next_last_store_key);
-                try state.extracted.append(state.alloc, extracted);
-                if (state.last_store_key) |last| state.alloc.free(last);
-                state.last_store_key = next_last_store_key;
-                if (state.writes.items.len >= state.limit) return .stop;
-                return .@"continue";
+                state.extracted.appendAssumeCapacity(extracted);
             }
         };
 
-        var state = ScanState{ .alloc = alloc, .index_manager = self.core.index_manager, .limit = limit };
+        var state = ScanState{ .alloc = alloc, .database = self, .index_manager = self.core.index_manager, .limit = limit, .options = options };
+        defer state.last_store_key.deinit(alloc);
         errdefer state.deinitPartial();
         try self.core.store.scanWithContext(lower, "", .{ .lower_exclusive = lower_exclusive }, &state, ScanState.scanEntry);
 
         var next_lower: ?[]u8 = null;
-        if (state.last_store_key) |last| {
-            next_lower = try alloc.dupe(u8, last);
-            alloc.free(last);
-            state.last_store_key = null;
+        if (state.last_store_key.items.len > 0) next_lower = try state.last_store_key.toOwnedSlice(alloc);
+        errdefer if (next_lower) |key| alloc.free(key);
+        const writes = try state.writes.toOwnedSlice(alloc);
+        errdefer {
+            for (writes) |write| {
+                alloc.free(@constCast(write.key));
+                alloc.free(@constCast(write.value));
+            }
+            alloc.free(writes);
         }
 
         return .{
-            .writes = try state.writes.toOwnedSlice(alloc),
+            .writes = writes,
             .extracted = try state.extracted.toOwnedSlice(alloc),
             .next_lower = next_lower,
+            .complete = !state.yielded,
         };
     }
 
@@ -34583,6 +34622,7 @@ pub const DB = struct {
         skip_terminally_covered: bool,
         resume_key: ?[]const u8,
         limit: usize,
+        options: GeneratedEnrichmentReplayScanOptions,
     ) !GeneratedEnrichmentReplayPageResult {
         if (self.enrichment_runtime == null) return .{ .complete = true };
         if (limit == 0) return error.InvalidArgument;
@@ -34590,9 +34630,8 @@ pub const DB = struct {
         const initial_lower = if (resume_key == null) try self.core.documentRangeLowerAlloc("") else null;
         defer if (initial_lower) |key| self.core.alloc.free(key);
         const lower = resume_key orelse initial_lower.?;
-        var replay_batch = try self.collectStoredGeneratedReplayBatch(alloc, lower, resume_key != null, limit);
+        var replay_batch = try self.collectStoredGeneratedReplayBatch(alloc, lower, resume_key != null, limit, options);
         defer replay_batch.deinit(alloc);
-        if (replay_batch.writes.len == 0) return .{ .complete = true };
 
         var pending_batch = derived_types.DerivedBatch{};
         defer derived_types.deinitDerivedBatch(self.alloc, &pending_batch);
@@ -34608,11 +34647,11 @@ pub const DB = struct {
             self.notifyResolverReplayRuntimes(target_sequence);
         }
 
-        const complete = replay_batch.writes.len < limit;
+        const complete = replay_batch.complete;
         const next_resume_key = if (complete)
             null
         else blk: {
-            const key = replay_batch.next_lower orelse return error.InvalidDerivedReplayCursor;
+            const key = replay_batch.next_lower orelse break :blk if (resume_key) |previous| try alloc.dupe(u8, previous) else null;
             replay_batch.next_lower = null;
             break :blk key;
         };
@@ -34643,7 +34682,10 @@ pub const DB = struct {
         var generated_ref_count: usize = 0;
         var latest_sequence: u64 = 0;
         while (true) {
-            var replay_batch = try self.collectStoredGeneratedReplayBatch(alloc, lower, lower_exclusive, chunk_size);
+            var replay_batch = try self.collectStoredGeneratedReplayBatch(alloc, lower, lower_exclusive, chunk_size, .{
+                .max_records = std.math.maxInt(usize),
+                .max_bytes = std.math.maxInt(usize),
+            });
             defer replay_batch.deinit(alloc);
             if (replay_batch.writes.len == 0) break;
 
@@ -137596,7 +137638,12 @@ test "inline resolver replacement replays graph producers without staged resolve
             }
             // Reopen both during paging and after all source work has been
             // appended but before enrichment reaches its durable target.
-            for (0..mode + 1) |_| try std.testing.expect(try db.advanceGraphReplacement());
+            for (0..128) |_| {
+                try std.testing.expect(try db.advanceGraphReplacement());
+                const current = try db.graphReplacementStatusAlloc(a);
+                defer current.deinit();
+                if (mode == 0 or current.value[0].producer_replay_complete) break;
+            }
             const jobs = try db.graphReplacementStatusAlloc(a);
             defer jobs.deinit();
             try std.testing.expectEqual(mode != 0, jobs.value[0].producer_replay_complete);
@@ -137645,6 +137692,136 @@ test "inline resolver replacement creates a synchronous enrichment driver on an 
     try std.testing.expect(db.enrichment_runtime != null);
     try std.testing.expect(!db.enrichment_runtime.?.isStarted());
     try std.testing.expectEqualStrings("kg_v2", db.core.index_manager.getResolver("concepts").?.source_artifact);
+}
+
+test "inline resolver replacement fences ownership in both reservation orders and at publication" {
+    const a = std.testing.allocator;
+    for (0..3) |mode| {
+        var directory = try TestDirectory.init("replacement-pending-ownership");
+        defer directory.cleanup();
+        var runtime = try background_runtime_mod.BackendRuntimeHandle.init(a, .{ .backend = .manual, .borrowed_io = .{ .general = std.testing.io } });
+        defer runtime.deinit();
+        var db = try DB.open(a, directory.path(), .{ .backend_runtime = runtime.ptr(), .executor = .{ .backend = .manual }, .start_optional_runtimes = false, .start_independent_maintenance = false });
+        defer db.close();
+        try db.initResolutionRuntime();
+        try db.initPromotionRuntime();
+        const old = try inlineResolverReplacementConfigAlloc(a, "kg_v1", "resolved_v1", "entity/{{ uslug _entity.text }}");
+        defer a.free(old);
+        const next = try inlineResolverReplacementConfigAlloc(a, "kg_v2", "resolved_v2", "entity/{{ uslug _entity.text }}");
+        defer a.free(next);
+        const fields = "{\"edge_types\":[{\"name\":\"R\",\"field\":\"links\"}]}";
+        try db.addIndex(.{ .name = "old", .kind = .graph, .config_json = old });
+        try db.addIndex(.{ .name = "other", .kind = .graph, .config_json = fields });
+        _ = try db.upsertResolverWithResultOptions(.{ .name = "concepts", .table = "default", .source_artifact = "kg_v1", .resolution_artifact = "resolved_v1", .key_template = "entity/{{ uslug _entity.text }}", .promote = false, .inline_managed = true }, .{ .drain_backfill = false });
+        if (mode == 1) {
+            _ = try db.replaceGraphIndex("other", .{ .name = "z_sharing", .kind = .graph, .config_json = old });
+            try std.testing.expectError(error.ResolverReplacementOwnershipConflict, db.replaceGraphIndex("old", .{ .name = "a_changing", .kind = .graph, .config_json = next }));
+        } else {
+            _ = try db.replaceGraphIndex("old", .{ .name = "a_changing", .kind = .graph, .config_json = next });
+            try std.testing.expectError(error.IndexReplacementPending, db.replaceGraphIndex("other", .{ .name = "z_sharing", .kind = .graph, .config_json = old }));
+            try std.testing.expectError(error.IndexReplacementPending, db.addIndex(.{ .name = "ordinary", .kind = .graph, .config_json = old }));
+            if (mode == 0) {
+                try std.testing.expect(try db.cancelReplacement("a_changing"));
+                _ = try db.replaceGraphIndex("other", .{ .name = "z_sharing", .kind = .graph, .config_json = old });
+            } else {
+                // Simulate a conflicting reservation admitted by a prior
+                // writer. Publication must revalidate, rather than stealing
+                // the identity and silently disabling the other graph.
+                _ = try db.replaceGraphIndex("other", .{ .name = "z_sharing", .kind = .graph, .config_json = fields });
+                const jobs = try db.graphReplacementStatusAlloc(a);
+                defer jobs.deinit();
+                for (jobs.value) |saved| {
+                    if (!std.mem.eql(u8, saved.name, "z_sharing")) continue;
+                    var job = saved;
+                    var config = saved.config.?;
+                    config.config_json = old;
+                    job.config = config;
+                    try db.core.index_manager.saveGraphReplacementBuild(db.core.store, job);
+                }
+            }
+        }
+        try db.runUntilIdle();
+        try std.testing.expect(db.indexGeneration("old") != null);
+        try std.testing.expect(db.indexGeneration("z_sharing") != null);
+        try std.testing.expectEqualStrings("kg_v1", db.core.index_manager.getResolver("concepts").?.source_artifact);
+        if (mode == 2) {
+            const jobs = try db.graphReplacementStatusAlloc(a);
+            defer jobs.deinit();
+            try std.testing.expectEqual(.failed, jobs.value[0].phase);
+            try std.testing.expectEqualStrings("ResolverReplacementOwnershipConflict", jobs.value[0].last_error.?);
+        }
+        try db.batch(.{ .writes = &.{.{ .key = "after", .value = "{\"kg\":{\"entities\":[{\"id\":\"a\",\"text\":\"Grace\",\"label\":\"person\"}]}}" }} });
+        try db.runUntilIdle();
+        const edges = try db.getEdges(a, "z_sharing", "after", "mentions", .out);
+        defer graph_mod.GraphIndex.freeEdges(a, edges);
+        try std.testing.expectEqual(@as(usize, 1), edges.len);
+        try std.testing.expectEqualStrings("entity/grace", edges[0].target);
+    }
+}
+
+test "inline resolver replacement producer pages bound physical records bytes and deadlines" {
+    const a = std.testing.allocator;
+    var directory = try TestDirectory.init("replacement-bounded-producer-pages");
+    defer directory.cleanup();
+    var runtime = try background_runtime_mod.BackendRuntimeHandle.init(a, .{ .backend = .manual, .borrowed_io = .{ .general = std.testing.io } });
+    defer runtime.deinit();
+    var db = try DB.open(a, directory.path(), .{ .backend_runtime = runtime.ptr(), .executor = .{ .backend = .manual }, .start_optional_runtimes = false, .start_independent_maintenance = false });
+    defer db.close();
+    try db.addIndex(.{ .name = "old", .kind = .graph, .config_json = "{}" });
+    try db.batch(.{ .writes = &.{ .{ .key = "a", .value = "{\"relations\":[]}" }, .{ .key = "z", .value = "{\"relations\":[]}" } } });
+    // Artifact rows between primary documents must consume the scan budget.
+    for (0..8) |i| {
+        const name = try std.fmt.allocPrint(a, "padding:{d}", .{i});
+        defer a.free(name);
+        const key = try internal_keys.artifactNamedPrefixAlloc(a, "m", "asset", name);
+        defer a.free(key);
+        try db.core.store.put(key, "{}");
+    }
+    const config = "{\"source\":{\"artifact\":\"relations\",\"format\":\"extraction_relation\"},\"artifact\":{\"name\":\"relations\",\"kind\":\"asset\",\"source\":{\"type\":\"field\",\"value\":\"relations\"},\"content_type\":\"application/json\"}}";
+    _ = try db.replaceGraphIndex("old", .{ .name = "new", .kind = .graph, .config_json = config });
+    DB.test_graph_replacement_work_now_ns = 100;
+    defer DB.test_graph_replacement_work_now_ns = null;
+    const sequence = db.core.nextDerivedSequence();
+    try std.testing.expect(try db.advanceGraphReplacementUntil(100));
+    try std.testing.expectEqual(sequence, db.core.nextDerivedSequence());
+    try std.testing.expect(db.enrichment_runtime == null);
+    try db.ensureGraphReplacementEnrichmentRuntime();
+    var expired = try db.appendGeneratedEnrichmentsFromStoredDocsPage(a, &.{"relations"}, true, null, 32, .{ .deadline_ns = 100 });
+    defer expired.deinit(a);
+    try std.testing.expect(!expired.complete);
+    try std.testing.expectEqual(@as(usize, 0), expired.documents_scanned);
+    try std.testing.expect(expired.next_resume_key == null);
+    for ([_]DB.GeneratedEnrichmentReplayScanOptions{ .{ .max_records = 2 }, .{ .max_bytes = 1 } }) |budget| {
+        var page_resume: ?[]u8 = null;
+        defer if (page_resume) |key| a.free(key);
+        var documents: usize = 0;
+        var refs: usize = 0;
+        var empty_pages: usize = 0;
+        var completed = false;
+        for (0..256) |_| {
+            var page = try db.appendGeneratedEnrichmentsFromStoredDocsPage(a, &.{"relations"}, true, page_resume, 32, budget);
+            defer page.deinit(a);
+            documents += page.documents_scanned;
+            refs += page.generated_ref_count;
+            if (page.complete) {
+                completed = true;
+                break;
+            }
+            if (page.documents_scanned == 0) empty_pages += 1;
+            const next_key = page.next_resume_key orelse return error.TestUnexpectedResult;
+            if (page_resume) |previous| {
+                try std.testing.expect(std.mem.order(u8, previous, next_key) == .lt);
+                a.free(previous);
+            }
+            page_resume = next_key;
+            page.next_resume_key = null;
+        }
+        try std.testing.expect(completed);
+        try std.testing.expect(empty_pages > 0);
+        try std.testing.expectEqual(@as(usize, 2), documents);
+        try std.testing.expectEqual(@as(usize, 2), refs);
+    }
+    try std.testing.expect(try db.cancelReplacement("new"));
 }
 
 fn inlineResolverReplacementConfigAlloc(a: Allocator, artifact: []const u8, resolution: []const u8, key_template: []const u8) ![]u8 {
