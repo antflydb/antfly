@@ -7084,3 +7084,56 @@ repair, bounded parallel target fanout, actual data-Raft execution, terminal
 catalog publication and complete distributed faults. Public UNIQUE activation
 remains guarded. Original dispositions remain 483 implemented / 862 unresolved;
 no additional original SQL case or throughput improvement is claimed here.
+
+### Bidirectional claim-inventory coverage
+
+Inventory validation now runs both directions before reporting readiness. The
+generation-local inventory pass still checks every companion and accepted
+logical contribution. A second pass checks authoritative claim records against
+their exact inventory companions. A claim-only orphan fails durably even when
+the completed forward count/XOR still matches metadata. Both directional
+counts/XORs must match, and the strong chain includes the related physical
+claim and companion bytes. This remains physical progress, not a signed
+publication ACK.
+
+The established integrity key format on main is routing-first. Consequently,
+the reverse pass streams the claim namespace and filters generation identities;
+it does not claim generation-local I/O or introduce a legacy-format migration.
+Each turn visits at most 128 records and honors byte/time/cancellation limits.
+Foreign claim values are not decoded or hashed, and inverse-reference/job
+namespaces are excluded. One indivisible existing foreign record may exceed
+the requested byte quantum, but remains bounded by the existing record limit
+plus its key. The audit does not impose a smaller claim storage limit. Overall
+reverse work depends on the claim namespace, so
+this is not a throughput improvement or constant-time admission claim.
+
+Replay verifies the actual bounded cursor interval and related membership,
+not an exact count of unrelated records. Unrelated retired claims may have
+been deleted, including the interval endpoint. Additional current records
+cannot make replay exceed the original bounded visit allowance, and missing
+or changed related members fail verification. EOF is established from the
+actual namespace, never from a supplied completion flag. Ordinary private
+claim insertion remains frozen; exact duplicates remain permitted.
+
+AICV v2, native envelope 27 and coordinated decoder floor 45 cover the private
+progress change. The LSM fixture injects a claim-only orphan after forward
+completion, verifies durable failure across reopen, restores its controlled
+fixture, restarts during the reverse pass, deletes an unrelated claim between
+preparation and actual normalized replay, and qualifies idempotent transport
+application. These are explicit corruption/GC fixtures, not authorization for
+ordinary writes through the source fence.
+
+The focused gate in `/private/tmp/antfly-claim-reverse-debug-v2.log` passed
+72/72 Debug steps. The final-source aggregate gate in
+`/private/tmp/antfly-claim-reverse-full-debug.log` passed 159/159 Debug steps,
+including all nine native-page, 48 publication, four ACK, three leased-owner,
+six C-ABI, 46 runtime-contract and 104 standalone tests. Counts overlap and
+are not independent SQL coverage. Boundary, license, original inventory,
+control-catalog, formatting and diff checks passed.
+
+Still required are authenticated proof joining and native capability barriers,
+full scanned-prefix re-audit on restore/adoption, install/release, durable
+failure completion, missing-root repair, bounded parallel target fanout, actual
+data-Raft execution, terminal catalog publication and complete distributed
+fault coverage. Public UNIQUE activation stays guarded. Original dispositions
+remain 483 implemented / 862 unresolved; no original SQL completion is claimed.

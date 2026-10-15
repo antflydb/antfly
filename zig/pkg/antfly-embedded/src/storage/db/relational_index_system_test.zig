@@ -1352,7 +1352,21 @@ test "relational index build pages identity dispatch caches immutable candidates
             prior_rows = retained.fields.rows;
         }
         var validation_pages: usize = 1;
+        var prior_claim_rows: u64 = 0;
+        var restarted_claims = false;
+        var orphan_exercised = false;
+        const Integrity = @import("relational_integrity_contract.zig");
+        var foreign_generation = validation_request.target_expectation.?.generation;
+        foreign_generation[0] ^= 1;
+        if (std.mem.allEqual(u8, &foreign_generation, 0)) foreign_generation[1] = 1;
+        const foreign_address = try Integrity.Address.init(foreign_generation, "foreign-audit");
+        const foreign_key = foreign_address.claimKey();
+        const foreign_value = try (Integrity.Claim{ .tuple = "foreign-audit", .parent_table = "items", .parent_key = "row000", .schema_version = 1 }).encode(alloc, foreign_address);
+        defer alloc.free(foreign_value);
+        try db.core.store.putBatch(&.{.{ .key = &foreign_key, .value = foreign_value }}, &.{});
+        var foreign_deleted = false;
         while (true) {
+            var applied_override: ?native.BuildResponse = null;
             // Normalized replay must recompute the physical page rather than
             // accepting a supplied cursor or chain, even with a valid digest.
             {
@@ -1363,15 +1377,82 @@ test "relational index build pages identity dispatch caches immutable candidates
                 var forged = page.command;
                 forged.next.chain[0] ^= 1;
                 try std.testing.expectError(error.InvalidPrivateIndexClaimInventory, Validation.Prepared.replay(alloc, &read, forged));
+                if (page.command.from == .claims and !foreign_deleted) {
+                    const before_audit = (try Validation.load(alloc, &read, binding)).?;
+                    const lower = before_audit.fields.claim_cursor;
+                    const end = page.command.next.claim_cursor;
+                    if ((lower == null or std.mem.order(u8, &foreign_key, &lower.?) == .gt) and end != null and std.mem.order(u8, &foreign_key, &end.?) != .gt) {
+                        // Unrelated retired claims may disappear between
+                        // preparation and ordered replay. Verify the bounded
+                        // interval, not an exact foreign-record count.
+                        try db.core.store.putBatch(&.{}, &.{&foreign_key});
+                        foreign_deleted = true;
+                        var fresh = try db.core.store.beginReadTxn();
+                        const checked = Validation.Prepared.replay(alloc, &fresh, page.command) catch |err| {
+                            fresh.abort();
+                            return err;
+                        };
+                        const sequence = (try authority.load(&fresh)).?.sequence + 1;
+                        fresh.abort();
+                        var replay_effect: native.PreparedInventoryValidation = .{ .alloc = alloc, .batch = checked };
+                        defer replay_effect.deinit();
+                        try replay_effect.preparePayload();
+                        const position: @import("receipt_position.zig").Native = .{ .namespace = binding.fence.namespace, .sequence = sequence };
+                        const payload = try replay_effect.finalizePayload(position);
+                        const packet: @import("replication_record.zig").Record = .{ .kind = .batch_mutation, .payload_codec = .json, .cluster_id = 1, .timeline_id = 1, .epoch = 1, .lsn = 2, .previous_lsn = 1, .payload = payload };
+                        try replication_ingress.applyRecord(&db, packet);
+                        try replication_ingress.applyRecord(&db, packet);
+                        var observe_replay = try db.core.store.beginReadTxn();
+                        defer observe_replay.abort();
+                        const retained = (try Validation.load(alloc, &observe_replay, binding)).?;
+                        applied_override = .{ .inventory = .{ .binding = binding, .record = retained, .position = retained.position, .duplicate = false } };
+                    }
+                }
             }
-            const result = try db.stepNativeIndexOwnerBuild("items", validation_request, .{});
+            const result = applied_override orelse try db.stepNativeIndexOwnerBuild("items", validation_request, .{});
             try result.validateFor(validation_request);
             const fields = result.inventory.record.fields;
             validation_pages += 1;
-            try std.testing.expect(validation_pages <= 12);
+            try std.testing.expect(validation_pages <= 48);
             try std.testing.expect(fields.rows >= prior_rows and fields.rows - prior_rows <= 3);
+            try std.testing.expect(fields.claim_rows >= prior_claim_rows and fields.claim_rows - prior_claim_rows <= 3);
             prior_rows = fields.rows;
-            if (validation_pages == 2) {
+            prior_claim_rows = fields.claim_rows;
+            if (fields.phase == .claims and fields.claim_rows == 0 and !orphan_exercised) {
+                orphan_exercised = true;
+                const orphan_address = try Integrity.Address.init(validation_request.target_expectation.?.generation, late.command.claims[0].tuple);
+                const orphan_value = try late.command.claims[0].encode(alloc, orphan_address);
+                defer alloc.free(orphan_value);
+                const saved = try result.inventory.record.encode(alloc);
+                defer alloc.free(saved);
+                // Privileged corruption injection: the forward inventory
+                // still matches exactly, but an authoritative claim has no
+                // companion and must prevent readiness.
+                try db.core.store.putBatch(&.{.{ .key = &orphan_address.claimKey(), .value = orphan_value }}, &.{});
+                var turns: usize = 0;
+                while (true) {
+                    const detected = try db.stepNativeIndexOwnerBuild("items", validation_request, .{});
+                    try detected.validateFor(validation_request);
+                    turns += 1;
+                    try std.testing.expect(turns <= 48);
+                    if (detected.inventory.record.fields.phase == .failed) {
+                        try std.testing.expectEqual(Validation.Failure.claim_companion, detected.inventory.record.fields.failure);
+                        try std.testing.expectEqual(@as(u64, 32), detected.inventory.record.fields.rows);
+                        try std.testing.expectEqualSlices(u8, &expected_xor, &detected.inventory.record.fields.inventory_xor);
+                        db.close();
+                        db = try db_mod.DB.open(alloc, directory.path(), options);
+                        const retained = try db.stepNativeIndexOwnerBuild("items", validation_request, .{});
+                        try std.testing.expect(retained.inventory.duplicate);
+                        try std.testing.expectEqualDeep(detected.inventory.record, retained.inventory.record);
+                        break;
+                    }
+                    try std.testing.expect(detected.inventory.record.fields.phase != .ready);
+                }
+                try db.core.store.putBatch(&.{.{ .key = &Validation.key(binding), .value = saved }}, &.{&orphan_address.claimKey()});
+            }
+            const restart_claims = fields.phase == .claims and fields.claim_rows != 0 and !restarted_claims;
+            if (validation_pages == 2 or restart_claims) {
+                if (restart_claims) restarted_claims = true;
                 db.close();
                 db = try db_mod.DB.open(alloc, directory.path(), options);
                 var read = try db.core.store.beginReadTxn();
@@ -1382,10 +1463,14 @@ test "relational index build pages identity dispatch caches immutable candidates
             if (fields.phase == .ready) {
                 try std.testing.expectEqual(@as(u64, 32), fields.rows);
                 try std.testing.expectEqualSlices(u8, &expected_xor, &fields.inventory_xor);
+                try std.testing.expectEqual(@as(u64, 32), fields.claim_rows);
+                try std.testing.expectEqualSlices(u8, &expected_xor, &fields.claim_xor);
                 break;
             }
-            try std.testing.expectEqual(Validation.Phase.scanning, fields.phase);
+            try std.testing.expect(fields.phase == .scanning or fields.phase == .claims);
         }
+        try std.testing.expect(restarted_claims);
+        try std.testing.expect(orphan_exercised and foreign_deleted);
         // Inventory readiness alone cannot publish the candidate schema.
         try std.testing.expectEqual(@as(u32, 1), db.core.schema.?.version);
         const Verification = @import("relational_index_validation.zig");
@@ -1526,7 +1611,7 @@ test "relational index build pages identity dispatch caches immutable candidates
                 wire_command.next.cursor_digest = @import("relational_integrity_contract.zig").hash(raw_cursor);
                 const packet = try std.json.Stringify.valueAlloc(alloc, .{ .schema_version = native.envelope_version, .request = @as(struct {}, .{}), .index_owner_control = native.Frame{ .effect = .{ .generation_validation = wire_command }, .position = frozen.inventory.position } }, .{});
                 defer alloc.free(packet);
-                var parsed_packet = try @import("replication_effects.zig").decodeBatchMutationRequest(alloc, .{ .kind = .batch_mutation, .payload_codec = .json, .cluster_id = 1, .timeline_id = 1, .epoch = 1, .lsn = 2, .previous_lsn = 1, .payload = packet });
+                var parsed_packet = try @import("replication_effects.zig").decodeBatchMutationRequest(alloc, .{ .kind = .batch_mutation, .payload_codec = .json, .cluster_id = 1, .timeline_id = 1, .epoch = 1, .lsn = 3, .previous_lsn = 2, .payload = packet });
                 defer parsed_packet.deinit();
                 try std.testing.expectEqualStrings(b64, parsed_packet.value.index_owner_control.?.effect.generation_validation.cursor_b64);
                 // Codec coverage is not a continuation proof: the actual
@@ -1546,10 +1631,10 @@ test "relational index build pages identity dispatch caches immutable candidates
             };
             const position: @import("receipt_position.zig").Native = .{ .namespace = binding.fence.namespace, .sequence = sequence };
             const payload = try page.finalizePayload(position);
-            const record: @import("replication_record.zig").Record = .{ .kind = .batch_mutation, .payload_codec = .json, .cluster_id = 1, .timeline_id = 1, .epoch = 1, .lsn = 2, .previous_lsn = 1, .payload = payload };
+            const record: @import("replication_record.zig").Record = .{ .kind = .batch_mutation, .payload_codec = .json, .cluster_id = 1, .timeline_id = 1, .epoch = 1, .lsn = 3, .previous_lsn = 2, .payload = payload };
             try replication_ingress.applyRecord(&db, record);
             try replication_ingress.applyRecord(&db, record);
-            try std.testing.expectEqual(@as(u64, 2), try db.replicationAppliedSequence());
+            try std.testing.expectEqual(@as(u64, 3), try db.replicationAppliedSequence());
         }
         var turns: usize = 0;
         var prior_counts: [3]u64 = .{ 3, 0, 0 };

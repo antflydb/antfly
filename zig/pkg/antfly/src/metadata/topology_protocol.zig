@@ -91,9 +91,11 @@ const std = @import("std");
 /// AIDA v3's fixed EOF-header prefix. This is not native validation capability.
 /// Version 44 decodes bounded physical-generation progress. It does not enable
 /// the authenticated native validation/install/release publication protocol.
-pub const current_version: u16 = 44;
-pub const index_publication_head_version: u16 = 44;
-pub const index_delivery_version: u16 = 44;
+/// Version 45 decodes AICV v2's bidirectional claim-inventory audit. This is
+/// physical progress, not authenticated native publication capability.
+pub const current_version: u16 = 45;
+pub const index_publication_head_version: u16 = 45;
+pub const index_delivery_version: u16 = 45;
 pub const schema_reader_publication_version: u16 = 39;
 pub const schema_reader_floor_version: u16 = 38;
 pub const schema_reader_capability_version: u16 = 37;
