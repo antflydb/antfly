@@ -4953,6 +4953,47 @@ pub const OwnerAckTestFixture = if (@import("builtin").is_test) struct {
         const committed = try clone.snapshotBuilder().buildSnapshot(alloc, group);
         defer alloc.free(committed);
         {
+            const install_group = install_group: {
+                var read = try clone.store.beginReadTxn();
+                defer read.abort();
+                const first_owner = try index_progress.OwnerState.decode(try read.get(try index_publication.ownerKey(&buf, group, head.table_id, 0)));
+                break :install_group first_owner.owner.group_id;
+            };
+            const lookup: index_publication.OwnerRequest = .{ .table_id = head.table_id, .group_id = install_group, .id = head.plan_id, .operation = .install };
+            {
+                try clone.store.put(RaftApplyStore.metadata_hot_standby.outbox_key, "pending-index-decision");
+                defer clone.store.delete(RaftApplyStore.metadata_hot_standby.outbox_key) catch unreachable;
+                try std.testing.expectError(error.MetadataReplicationPending, clone.relationalIndexOwnerDecisionJson(alloc, group, lookup));
+            }
+            const InstallGrantAllocations = struct {
+                fn run(task_alloc: std.mem.Allocator, store_: *RaftApplyStore, metadata_group: u64, lookup_request: index_publication.OwnerRequest) !void {
+                    const response = try store_.relationalIndexOwnerDecisionJson(task_alloc, metadata_group, lookup_request);
+                    defer task_alloc.free(response);
+                }
+            };
+            try @import("antfly_platform").allocator.checkAllAllocationFailures(alloc, InstallGrantAllocations.run, .{ &clone, group, lookup });
+            const reply = try clone.relationalIndexOwnerDecisionJson(alloc, group, lookup);
+            defer alloc.free(reply);
+            var permission = try std.json.parseFromSlice(index_publication.OwnerDecision, alloc, reply, .{});
+            defer permission.deinit();
+            try permission.value.requireRequest(lookup);
+            const grant = permission.value.native_install orelse return error.TestMissingNativeInstallGrant;
+            try std.testing.expectEqual(index_progress.Phase.installing, permission.value.head.phase);
+            try std.testing.expectEqual(permission.value.head.completion_revision, grant.validation.command.expected.completion_revision);
+            var missing = permission.value;
+            missing.native_install = null;
+            try std.testing.expectError(error.InvalidCatalogRecord, missing.requireRequest(lookup));
+            var changed = permission.value;
+            changed.native_install.?.decision_digest[0] ^= 1;
+            try std.testing.expectError(error.InvalidCatalogRecord, changed.requireRequest(lookup));
+            changed = permission.value;
+            changed.native_install.?.validation.position.sequence += 1;
+            try std.testing.expectError(error.InvalidCatalogRecord, changed.requireRequest(lookup));
+            changed = permission.value;
+            changed.head.revision += 1;
+            try changed.requireRequest(lookup); // ACK revisions do not change the immutable decision identity.
+        }
+        {
             var txn = try clone.store.beginWriteTxn();
             errdefer txn.abort();
             var outcome = CommittedApplyOutcome{ .alloc = alloc, .collect_transition_deltas = false };
@@ -17671,6 +17712,17 @@ pub const RaftApplyStore = struct {
         if (owner.owner.authority == .native) decision.native_signing = try self.nativeIndexSigningViewTxn(&txn, group_id, incarnation);
         if (owner.owner.authority == .native and request.operation == .validate)
             decision.target_expectation = try index_delivery.targetExpectation(alloc, &txn, group_id, head, owner, incarnation);
+        if (owner.owner.authority == .native and request.operation == .install) {
+            _ = try self.standbyRelationActivationTxn(&txn, group_id, topology_protocol.index_publication_decision_version);
+            const accepted = try index_publication.storedProof(self.alloc, try txn.get(try index_publication.proofKey(&buf, group_id, request.table_id, ordinal, .validated)), head, owner, .validated);
+            const witness = accepted.validation orelse return error.InvalidCatalogRecord;
+            const frozen = try index_delivery.frozenTargetForRecovery(alloc, &txn, group_id, head, owner, incarnation);
+            if (!std.meta.eql(frozen.expected, witness.outcome.expected)) return error.InvalidCatalogRecord;
+            decision.native_install = .{
+                .validation = .{ .command = try witness.outcome.logicalCommand(), .position = accepted.signed.receipt.position.native },
+                .decision_digest = try index_publication.NativeInstallGrant.decisionDigest(group_id, incarnation, head),
+            };
+        }
         var route_arena = std.heap.ArenaAllocator.init(self.alloc);
         defer route_arena.deinit();
         if (request.claim_groups) |groups| {

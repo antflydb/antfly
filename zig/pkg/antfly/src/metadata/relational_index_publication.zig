@@ -519,6 +519,50 @@ pub const NativeSigningView = struct {
     }
 };
 
+/// Root-independent logical install input derived only from metadata's retained
+/// accepted validation proof. Not a physical audit, transport authentication or
+/// permission to adopt a replacement root. ACK revisions do not change its ID.
+pub const NativeInstallGrant = struct {
+    validation: local.storage_db_relational_index_validation.Seal,
+    decision_digest: Digest,
+
+    pub fn decisionDigest(group: u64, incarnation: local.metadata_incarnation.MetadataClusterIncarnation, head: progress.Head) !Digest {
+        try head.validate();
+        if (group == 0 or !local.metadata_incarnation.isValid(incarnation) or head.phase != .installing) return error.InvalidCatalogRecord;
+        var state = std.crypto.hash.Blake3.init(.{});
+        state.update("antfly/native-index-install-decision/v1");
+        state.update(&incarnation);
+        state.update(&head.plan_id);
+        state.update(&head.plan_digest);
+        state.update(&head.candidate_digest);
+        state.update(&head.reservation_digest);
+        var numbers: [24]u8 = undefined;
+        std.mem.writeInt(u64, numbers[0..8], group, .little);
+        std.mem.writeInt(u64, numbers[8..16], head.table_id, .little);
+        std.mem.writeInt(u64, numbers[16..24], head.completion_revision, .little);
+        state.update(&numbers);
+        var result: Digest = undefined;
+        state.final(&result);
+        return result;
+    }
+
+    pub fn validateFor(self: @This(), group: u64, incarnation: local.metadata_incarnation.MetadataClusterIncarnation, head: progress.Head, owner: progress.OwnerState) !void {
+        try owner.validate();
+        const receipt = try self.validation.command.receipt(self.validation.position);
+        const expected = self.validation.command.expected;
+        if (!std.mem.eql(u8, &self.decision_digest, &try decisionDigest(group, incarnation, head)) or
+            owner.owner.namespace.table_id != head.table_id or owner.owner.ordinal >= head.owner_count or
+            !std.mem.eql(u8, &owner.owner.plan_id, &head.plan_id) or !std.mem.eql(u8, &owner.owner.plan_digest, &head.plan_digest) or
+            head.completed_sources != head.owner_count or head.completion_revision == 0 or !owner.source_completed or
+            std.mem.allEqual(u8, &owner.receipts[@backingInt(progress.Action.validated)], 0) or !std.meta.eql(receipt.owner, owner.owner) or
+            !std.mem.eql(u8, &receipt.candidate_digest, &head.candidate_digest) or
+            !std.mem.eql(u8, &receipt.reservation_digest, &head.reservation_digest) or
+            !std.mem.eql(u8, &try receipt.digest(), &owner.receipts[@backingInt(progress.Action.validated)]) or
+            !std.mem.eql(u8, &expected.metadata_incarnation, &incarnation) or
+            expected.completion_revision != head.completion_revision) return error.InvalidCatalogRecord;
+    }
+};
+
 pub const OwnerDecision = struct {
     pub const Attestation = struct {
         table_name: []const u8,
@@ -535,6 +579,7 @@ pub const OwnerDecision = struct {
     native_signing: ?NativeSigningView = null,
     claim_routes: ?ClaimRoutes = null,
     target_expectation: ?local.storage_db_relational_index_owner_job.private_claims.TargetExpectation = null,
+    native_install: ?NativeInstallGrant = null,
     /// Read-only recovery of an already accepted latest stage. This is never
     /// execution permission, schema input, or an index allocation request.
     attestation: ?Attestation = null,
@@ -552,6 +597,10 @@ pub const OwnerDecision = struct {
                 expected.completion_revision != self.head.completion_revision or
                 !std.mem.eql(u8, &expected.metadata_incarnation, &self.metadata_incarnation)) return error.InvalidCatalogRecord;
         } else if (self.target_expectation != null) return error.InvalidCatalogRecord;
+        if (request.operation == .install and self.disposition == .execute and self.owner.owner.authority == .native) {
+            const grant = self.native_install orelse return error.InvalidCatalogRecord;
+            try grant.validateFor(self.metadata_group_id, self.metadata_incarnation, self.head, self.owner);
+        } else if (self.native_install != null) return error.InvalidCatalogRecord;
         if (request.claim_groups) |groups| {
             if (self.disposition == .execute) {
                 const routes = self.claim_routes orelse return error.InvalidCatalogRecord;

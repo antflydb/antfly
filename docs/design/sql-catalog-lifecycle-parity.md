@@ -7875,3 +7875,30 @@ tests and 46 runtime contracts. Production code is unchanged from the preceding
 fault coverage with synthetic metadata authority, not distributed metadata/root
 authorization, installed ACK/release qualification or public SQL activation.
 No original-case credit or throughput improvement is claimed.
+
+### Metadata-derived native install grants
+
+Native install permission responses now project the accepted logical validation
+seal from the retained paired validation proof in the same metadata read
+transaction. Projection requires the irreversible decision decoder floor, no
+pending metadata outbox, the current lifecycle lock/range/catalog claim, and
+matching frozen source-consumption and target-inventory provenance. It does not
+copy schema-sized admission inputs or obtain authority from an RPC body.
+
+The grant's domain-separated decision identity binds metadata group/incarnation,
+plan, table, candidate/reservation and the consumed-EOF completion barrier. It
+is stable across later ACK revisions, not a lease. Decoding rejoins the seal's
+owner, plan, namespace, validation receipt digest and frozen completion scope.
+Missing or substituted grants and altered validation cuts fail closed. Grants
+are absent from other operations and acknowledged responses. Historical logical
+acceptance is not a fresh physical audit or replacement-root adoption permission.
+
+`/private/tmp/antfly-index-install-grant-debug-v3.log` passed 60/60 Debug build
+steps, including all 50 publication tests. The real metadata-store fixture
+projects after committed publication and reopen, checks malformed/missing grants
+and revision stability, withholds projection behind an unmirrored metadata
+decision, and exhaustively checks allocation-failure cleanup. Boundary, license,
+inventory, formatting and diff checks passed. The authenticated native install
+receiver/C-ABI bridge, current-root audits, installed ACK delivery and release
+coordination remain unfinished; no public SQL activation or original-case credit
+is claimed.
