@@ -4884,6 +4884,7 @@ test "capi SQL background embedding releases the file gate and fences stale resu
             defer guard.leave();
             break :blk guard.connection.?.owner;
         };
+        var captured_runtime: std.meta.Child(@FieldType(db_mod.DB, "enrichment_runtime")) = undefined;
         {
             const guard = public.enterHandle(handle, .exclusive).?;
             defer guard.leave();
@@ -4896,6 +4897,7 @@ test "capi SQL background embedding releases the file gate and fences stale resu
                 .config_json = "{\"field\":\"embedding\",\"dims\":3,\"publication_policy\":\"progressive\",\"generator\":{\"kind\":\"dense_embedding\",\"source_field\":\"body\",\"embedding_name\":\"body_dense\"}}",
             });
             try guard.handle.db.reconfigureEnrichmentRuntimePaused(.{ .dense_embedder = gate.interface() });
+            captured_runtime = guard.handle.db.enrichment_runtime.?;
             try guard.handle.db.batch(.{ .writes = &.{.{ .key = "doc", .value = "{\"body\":\"original\"}" }}, .sync_level = .write });
             connection.maintenance_pending = true;
         }
@@ -4915,20 +4917,50 @@ test "capi SQL background embedding releases the file gate and fences stale resu
             handle: ?*anyopaque,
             source_changed: bool,
             done: std.Io.Event = .unset,
+            stop: std.atomic.Value(bool) = .init(false),
+            writes: std.atomic.Value(usize) = .init(0),
             status: capi.ErrorCode = .internal,
             fn run(self: *@This()) void {
                 var response: capi.Buffer = .{};
                 self.status = antfly_db_sql_json(self.handle, .fromSlice(if (self.source_changed) "{\"statement\":\"UPDATE \\\"default\\\" SET body='foreground' WHERE _id='doc'\"}" else "{\"statement\":\"INSERT INTO \\\"default\\\" (_id,body) VALUES ('new','foreground')\"}"), &response);
                 freeRawBuffer(response.ptr, response.len);
                 self.done.set(shared.handleLockIo());
+                while (!self.source_changed and !self.stop.load(.acquire) and self.status == .ok) {
+                    const n = self.writes.fetchAdd(1, .monotonic);
+                    const request = std.fmt.allocPrint(std.heap.c_allocator, "{{\"statement\":\"UPDATE \\\"default\\\" SET body='foreground{d}' WHERE _id='new'\"}}", .{n}) catch break;
+                    defer std.heap.c_allocator.free(request);
+                    var output: capi.Buffer = .{};
+                    self.status = antfly_db_sql_json(self.handle, .fromSlice(request), &output);
+                    freeRawBuffer(output.ptr, output.len);
+                }
             }
         };
         var foreground: Foreground = .{ .handle = handle, .source_changed = source_changed };
         const writer = try std.Thread.spawn(.{}, Foreground.run, .{&foreground});
+        var writer_joined = false;
+        defer if (!writer_joined) {
+            foreground.stop.store(true, .release);
+            gate.allowed.set(shared.handleLockIo());
+            writer.join();
+        };
         const completed_while_embedding = if (foreground.done.waitTimeout(shared.handleLockIo(), .{ .duration = .{ .raw = .fromSeconds(5), .clock = .awake } })) |_| true else |_| false;
+        if (completed_while_embedding) {
+            // The common staging boundary must preserve document identity as
+            // well as its bytes. Exercise it directly while inference is parked.
+            const port = captured_runtime.generated_publication.?;
+            const staging = try port.acquire_store(port.ptr, null, 0);
+            defer staging.release(staging.ptr);
+            const artifact = try @import("antfly_local_sources").storage_internal_keys.embeddingArtifactKeyForDocumentAlloc(alloc, "doc", "body_dense");
+            defer alloc.free(artifact);
+            if (source_changed) {
+                try std.testing.expectError(error.EnrichmentWaitCanceled, staging.guard_key(staging.ptr, artifact));
+            } else try staging.guard_key(staging.ptr, artifact);
+        }
         gate.allowed.set(shared.handleLockIo());
-        writer.join();
         background.join();
+        foreground.stop.store(true, .release);
+        writer.join();
+        writer_joined = true;
         background_joined = true;
         try std.testing.expect(completed_while_embedding);
         try std.testing.expectEqual(capi.ErrorCode.ok, foreground.status);
@@ -5291,23 +5323,142 @@ test "capi SQL batched conflict validation reclaims prior row scratch" {
     try std.testing.expectEqualStrings("320", result.value.object.get("rows").?.array.items[0].array.items[0].string);
 }
 
-test "capi SQL full text publication progresses after unrelated writes" {
+test "capi SQL index publication accepts unrelated primary commits and fences changed inputs" {
     if (builtin.single_threaded or builtin.os.tag == .freestanding) return error.SkipZigTest;
     const alloc = std.testing.allocator;
-    const Gate = struct {
-        entered: std.atomic.Value(bool) = .init(false),
-        started: std.Io.Event = .unset,
-        allowed: std.Io.Event = .unset,
-        fn notify(ptr: *anyopaque) !void {
-            const self: *@This() = @ptrCast(@alignCast(ptr));
-            if (self.entered.swap(true, .acq_rel)) return;
-            self.started.set(shared.handleLockIo());
-            try self.allowed.waitTimeout(shared.handleLockIo(), .{ .duration = .{ .raw = .fromSeconds(10), .clock = .awake } });
+    for ([_]bool{ false, true }) |index_changed| {
+        const Gate = struct {
+            entered: std.atomic.Value(bool) = .init(false),
+            started: std.Io.Event = .unset,
+            allowed: std.Io.Event = .unset,
+            publication_error: ?anyerror = null,
+            fn notify(ptr: *anyopaque, root: *shared.Handle) void {
+                const self: *@This() = @ptrCast(@alignCast(ptr));
+                if (self.entered.swap(true, .acq_rel)) return;
+                self.started.set(shared.handleLockIo());
+                self.allowed.waitTimeout(shared.handleLockIo(), .{ .duration = .{ .raw = .fromSeconds(10), .clock = .awake } }) catch |err| {
+                    self.publication_error = err;
+                    return;
+                };
+                // Deliver already prepared immutable bytes through the same
+                // storage port used by full-text segments, after foreground
+                // commits have moved the primary checkpoint.
+                root.db.core.index_manager.text_lsm_storage.?.writeFileAbsolute("__antfly_lite/indexes/body_text/prepared.bin", "prepared index bytes") catch |err| {
+                    self.publication_error = err;
+                };
+            }
+        };
+        var gate: Gate = .{};
+        defer gate.allowed.set(shared.handleLockIo());
+        var directory = try TestDirectory.init("capi-sql-text-publication-progress");
+        defer directory.cleanup();
+        const path = try tempTestAflitePath(alloc, directory.path(), "database");
+        defer alloc.free(path);
+        defer cleanupTestFile(path);
+        var options: capi.OpenOptions = .{};
+        try std.testing.expectEqual(capi.ErrorCode.ok, antfly_open_options_init(&options));
+        options.storage_kind = capi.storage_kind_lite;
+        options.profile = capi.profile_native;
+        var handle: ?*anyopaque = null;
+        try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_create_with_options(path, &options, &handle));
+        defer antfly_db_close(handle);
+        // Exercise production's independent capture runtime. Stop its automatic
+        // worker so the test controls the exact capture/publication interleaving.
+        const connection = blk: {
+            const guard = public.enterHandle(handle, .exclusive).?;
+            defer guard.leave();
+            break :blk guard.connection.?.owner;
+        };
+        connection.stopping.store(true, .release);
+        connection.wake.set(shared.handleLockIo());
+        connection.worker.?.join();
+        connection.worker = null;
+        connection.stopping.store(false, .release);
+        const owner = blk: {
+            const guard = public.enterHandle(handle, .exclusive).?;
+            defer guard.leave();
+            try guard.handle.db.setSchemaJson(alloc,
+                \\{"version":1,"default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"body":{"type":"string"}},"additionalProperties":true}}}}
+            );
+            try guard.handle.db.addIndex(.{ .name = "body_text", .kind = .full_text, .config_json = "{\"field\":\"body\"}" });
+            try guard.handle.db.batch(.{ .writes = &.{.{ .key = "original", .value = "{\"body\":\"original needle\"}" }}, .sync_level = .write });
+            const maintenance_owner = guard.connection.?.owner;
+            maintenance_owner.maintenance_pending = true;
+            maintenance_owner.test_after_capture = .{ .ptr = &gate, .notify = Gate.notify };
+            break :blk maintenance_owner;
+        };
+        const Background = struct {
+            fn run(o: @TypeOf(owner)) void {
+                _ = o.maintenanceTurnForTest() catch {};
+            }
+        };
+        const background = try std.Thread.spawn(.{}, Background.run, .{owner});
+        var joined = false;
+        defer if (!joined) {
+            gate.allowed.set(shared.handleLockIo());
+            background.join();
+        };
+        try gate.started.waitTimeout(shared.handleLockIo(), .{ .duration = .{ .raw = .fromSeconds(5), .clock = .awake } });
+        for (0..8) |i| {
+            if (index_changed) {
+                const statement = try std.fmt.allocPrint(alloc, "INSERT INTO \"default\" (_id,body) VALUES ('other{d}','unrelated')", .{i});
+                defer alloc.free(statement);
+                try sqlFkRecoveryStatement(handle, statement);
+            } else {
+                // A primary-only bookkeeping commit moves the header and allocator,
+                // while leaving every physical full-text input unchanged.
+                const guard = public.enterHandle(handle, .exclusive).?;
+                defer guard.leave();
+                var txn = try guard.handle.db.core.store.beginWriteTxn();
+                errdefer txn.abort();
+                var bytes: [32]u8 = undefined;
+                try txn.put("__antfly_test_bookkeeping", try std.fmt.bufPrint(&bytes, "{d}", .{i}));
+                try txn.commit();
+            }
         }
-    };
-    var gate: Gate = .{};
-    defer gate.allowed.set(shared.handleLockIo());
-    var directory = try TestDirectory.init("capi-sql-text-publication-progress");
+        gate.allowed.set(shared.handleLockIo());
+        background.join();
+        joined = true;
+        owner.test_after_capture = null;
+        if (index_changed) {
+            try std.testing.expectEqual(error.EnrichmentWaitCanceled, gate.publication_error orelse return error.TestExpectedCancellation);
+        } else if (gate.publication_error) |err| return err;
+
+        if (index_changed) {
+            // Foreground SQL also publishes this index. Its manifests, WALs and
+            // segment IDs changed; the captured build must yield and retry from
+            // that new state, never overwrite it with the old manifest.
+            try std.testing.expect(owner.maintenance_pending);
+        }
+        for (0..64) |_| {
+            if (!try owner.maintenanceTurnForTest()) break;
+        }
+        // Unrelated primary commits permit publication in the captured turn. After
+        // index conflicts, a fresh turn must index the original without losing the
+        // foreground rows or their searchable terms.
+        const guard = public.enterHandle(handle, .exclusive).?;
+        defer guard.leave();
+        if (!index_changed) {
+            const storage = guard.handle.db.core.index_manager.text_lsm_storage.?;
+            const published = try storage.readFileAlloc(alloc, "__antfly_lite/indexes/body_text/prepared.bin", 1024);
+            defer alloc.free(published);
+            try std.testing.expectEqualStrings("prepared index bytes", published);
+        }
+        var result = try guard.handle.db.search(alloc, .{ .index_name = "body_text", .full_text = .{ .term = .{ .field = "body", .term = "needle" } }, .limit = 10 });
+        defer result.deinit();
+        try std.testing.expect(result.hits.len != 0);
+        try std.testing.expectEqualStrings("original", result.hits[0].id);
+        if (index_changed) {
+            var unrelated = try guard.handle.db.search(alloc, .{ .index_name = "body_text", .full_text = .{ .term = .{ .field = "body", .term = "unrelated" } }, .limit = 10 });
+            defer unrelated.deinit();
+            try std.testing.expectEqual(@as(usize, 8), unrelated.hits.len);
+        }
+    }
+}
+
+test "capi SQL missing namespace forces coordinated catalog validation" {
+    const alloc = std.testing.allocator;
+    var directory = try TestDirectory.init("capi-sql-missing-namespace-validation");
     defer directory.cleanup();
     const path = try tempTestAflitePath(alloc, directory.path(), "database");
     defer alloc.free(path);
@@ -5319,44 +5470,11 @@ test "capi SQL full text publication progresses after unrelated writes" {
     var handle: ?*anyopaque = null;
     try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_create_with_options(path, &options, &handle));
     defer antfly_db_close(handle);
-    const owner = blk: {
-        const guard = public.enterHandle(handle, .exclusive).?;
-        defer guard.leave();
-        try guard.handle.db.setSchemaJson(alloc,
-            \\{"version":1,"default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"body":{"type":"string"}},"additionalProperties":true}}}}
-        );
-        try guard.handle.db.addIndex(.{ .name = "body_text", .kind = .full_text, .config_json = "{\"field\":\"body\"}" });
-        try guard.handle.db.batch(.{ .writes = &.{.{ .key = "original", .value = "{\"body\":\"original needle\"}" }}, .sync_level = .write });
-        guard.handle.owned_lite_backend.?.native_docstore.?.test_index_publication_hook = .{ .ptr = &gate, .notify = Gate.notify };
-        const maintenance_owner = guard.connection.?.owner;
-        maintenance_owner.maintenance_pending = true;
-        break :blk maintenance_owner;
-    };
-    const Background = struct {
-        fn run(o: @TypeOf(owner)) void {
-            _ = o.maintenanceTurnForTest() catch {};
-        }
-    };
-    const background = try std.Thread.spawn(.{}, Background.run, .{owner});
-    var joined = false;
-    defer if (!joined) {
-        gate.allowed.set(shared.handleLockIo());
-        background.join();
-    };
-    try gate.started.waitTimeout(shared.handleLockIo(), .{ .duration = .{ .raw = .fromSeconds(5), .clock = .awake } });
-    for (0..8) |i| {
-        const statement = try std.fmt.allocPrint(alloc, "INSERT INTO \"default\" (_id,body) VALUES ('other{d}','unrelated')", .{i});
-        defer alloc.free(statement);
-        try sqlFkRecoveryStatement(handle, statement);
-    }
-    gate.allowed.set(shared.handleLockIo());
-    background.join();
-    joined = true;
-    // The prepared segment must publish in this turn, before an idle rerun.
     const guard = public.enterHandle(handle, .exclusive).?;
     defer guard.leave();
-    var result = try guard.handle.db.search(alloc, .{ .full_text = .{ .term = .{ .field = "body", .term = "needle" } }, .limit = 10 });
-    defer result.deinit();
-    try std.testing.expect(result.hits.len != 0);
-    try std.testing.expectEqualStrings("original", result.hits[0].id);
+    var adapter = @import("antfly_local_sources").capi_sql.Adapter(antfly){ .handle = guard.handle, .db = &guard.handle.db, .table_name = "default" };
+    try std.testing.expect(!adapter.localRequiresCoordination());
+    try guard.handle.embedded_table_errors.put(guard.handle.alloc, "broken", "InvalidSchema");
+    try std.testing.expect(adapter.localRequiresCoordination());
+    try std.testing.expectError(error.IntegrityCatalogUnavailable, adapter.localCatalog(alloc, 1));
 }

@@ -69,6 +69,18 @@ test "lite detached writer admission fences documents and index catalogs" {
     try indexes.storage().writeFileAbsolute("/index", "segment");
     try std.testing.expectEqual(@as(usize, 0), admission.active);
     try std.testing.expectEqual(@as(usize, 3), admission.entered);
+    const PendingIndex = struct {
+        fn apply(_: *anyopaque, file: *native.NativeFile) !void {
+            try file.putIndexCatalogRecord("/pending-index", "published");
+        }
+    };
+    try store.submitIndexMutation(&admission, PendingIndex.apply, false);
+    try std.testing.expect(store.file.durable_header == null);
+    var next_owner = try native.NativeFile.openWithIo(a, std.testing.io, path, .{ .read_only = true, .internal_reader = true });
+    defer next_owner.close();
+    const visible = (try next_owner.getIndexCatalogRecordAlloc(a, "/pending-index")).?;
+    defer a.free(visible);
+    try std.testing.expectEqualStrings("published", visible);
     const checkpoint = store.file.activeCheckpoint();
     admission.denied = true;
     try std.testing.expectError(error.EnrichmentSourceChanged, store.beginWrite());
@@ -1351,7 +1363,6 @@ pub const Store = struct {
     maintenance_running: bool = false,
     generation_workspace_active: bool = false,
     maintenance_start_suppressed: bool = false,
-    test_index_publication_hook: if (@import("builtin").is_test) ?struct { ptr: *anyopaque, notify: *const fn (*anyopaque) anyerror!void } else void = if (@import("builtin").is_test) null else {},
     test_maintenance_hook: if (@import("builtin").is_test) ?MaintenanceTestHook else void = if (@import("builtin").is_test) null else {},
     test_maintenance_cycles: if (@import("builtin").is_test) std.atomic.Value(u64) else void = if (@import("builtin").is_test) .init(0) else {},
     admission_refresh_size: u64 = 0,
@@ -2672,7 +2683,6 @@ pub const Store = struct {
         var index_only = true;
         var member: ?*MutationRequest = head;
         while (member) |item| : (member = item.next) index_only = index_only and item.index_only;
-        if (@import("builtin").is_test) if (index_only) if (self.test_index_publication_hook) |hook| try hook.notify(hook.ptr);
         if (self.writer_admission) |admission| try admission.enter(admission.ptr, if (index_only) .index else .primary);
         defer if (self.writer_admission) |admission| admission.leave(admission.ptr);
         lockStore(self);
@@ -2685,7 +2695,10 @@ pub const Store = struct {
         try self.file.beginTransaction();
         errdefer self.file.abortTransaction();
         var current: ?*MutationRequest = head;
-        var durable = false;
+        // Detached writers release their kernel lease after this group. The
+        // next owner must see its allocator and index roots on disk; a volatile
+        // durable_header cannot safely survive that ownership handoff.
+        var durable = self.writer_admission != null;
         while (current) |item| {
             durable = durable or item.durable;
             try item.apply(item.context, &self.file);

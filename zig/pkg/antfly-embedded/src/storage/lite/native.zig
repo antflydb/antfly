@@ -34,6 +34,32 @@ const CompleteScoreSink = @import("../backend_types.zig").CompleteScoreSink;
 const ReadIdentity = struct { canonical: u64, namespace: []const u8 };
 const Allocator = std.mem.Allocator;
 
+test "lite index checkpoint adoption discards physical page caches" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "index-adoption-caches.aflite");
+    defer a.free(path);
+    var captured = try NativeFile.createWithIo(a, std.testing.io, path, .{ .indexed_reclamation = true });
+    defer captured.close();
+    try captured.putDocument("doc", "original");
+    const original = (try captured.getDocumentAlloc(a, "doc")).?;
+    a.free(original);
+    try std.testing.expect(captured.page_cache.pages.count() != 0);
+    var writer = try NativeFile.openWithIo(a, std.testing.io, path, .{ .externally_locked = true });
+    defer writer.close();
+    try writer.putDocument("doc", "updated");
+    captured.free_pages_verified = true;
+    try captured.adoptIndexPublicationHeader(writer.header);
+    try std.testing.expectEqual(@as(usize, 0), captured.page_cache.pages.count());
+    try std.testing.expect(!captured.free_pages_verified);
+    const updated = (try captured.getDocumentAlloc(a, "doc")).?;
+    defer a.free(updated);
+    try std.testing.expectEqualStrings("updated", updated);
+    try captured.putDocument("next", "after adoption");
+    try std.testing.expect((try captured.check()).valid);
+}
+
 test "lite allocator v4 small checkpoints bound counter and queue boundary growth" {
     const a = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -3434,6 +3460,7 @@ pub const NativeFile = struct {
             self.header.page_size != header.page_size or self.header.indexed_reclamation != header.indexed_reclamation) return error.EnrichmentWaitCanceled;
         self.invalidateLedger();
         self.page_cache.clear(self.allocator);
+        if (self.secondary_page_cache) |cache| cache.clear(self.allocator);
         self.free_pages_verified = false;
         self.namespace_directory_cache_root = std.math.maxInt(u64);
         self.namespace_directory_delta_depth = 0;

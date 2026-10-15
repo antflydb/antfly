@@ -23488,8 +23488,10 @@ fn processOrderedChunkVectorWithAllocator(runtime: *EnrichmentRuntime, alloc: Al
             defer prepared_checkpoint.deinit();
             if (runtime.coverage_apply_mutex) |mutex| mutex.lockShared();
             defer if (runtime.coverage_apply_mutex) |mutex| mutex.unlockShared();
+            var publication_store = try RuntimePublicationStore.init(runtime);
+            defer publication_store.deinit();
             const fence = try requiredRuntimeStoreWriteFence(runtime);
-            var write = try runtime.store.beginWrite();
+            var write = try publication_store.store(runtime).beginWrite();
             var open = true;
             defer if (open) write.abort();
             try validateRuntimeStoreWriteFenceTxn(runtime, &write, fence);
@@ -29750,7 +29752,7 @@ fn storePutBatchWithRetry(runtime: anytype, writes: []const KVPair, deletes: []c
             },
             else => return err,
         };
-        try runtime.store.sync(false);
+        if (runtime.generated_publication == null) try runtime.store.sync(false);
         return;
     }
 }
@@ -31252,6 +31254,7 @@ fn storePutBatch(runtime: *EnrichmentRuntime, writes: []const KVPair, deletes: [
     }
     try validateRuntimeStoreWriteFenceTxn(runtime, &batch, fence);
     try batch.commit();
+    if (publication_store.lease != null) try live_store.sync(false);
 }
 
 fn remoteRenderConfig(

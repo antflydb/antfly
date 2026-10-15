@@ -270,9 +270,12 @@ compatible connections reuses the live runtime. Streaming SQL cursors retain the
 runtime and immutable pages they originally pinned; retiring that runtime
 releases caches without flushing them over a newer generation. Read-only
 connections observe new commits at operation boundaries. Background enrichment and index builds capture one table at a time under the
-file gate, then compute outside it. Every resulting document or index publication
-reacquires the kernel writer lease and validates the captured inode and checkpoint;
-foreground publication cancels stale work. A bounded owner cache retains only
+file gate, then compute outside it. Generated artifacts, private staging, and progress writes reacquire the
+kernel writer lease and publish through the current namespace. Source digests,
+document incarnations, catalog identity, and lease tenure fence acceptance.
+Index file publications may adopt a newer primary checkpoint only while their
+immutable index inputs and inode remain unchanged; changes to those inputs
+cancel the prepared work. A bounded owner cache retains only
 pure embedding results with matching model revision, credentials, task, input and
 dimensions, allowing retries without publishing stale artifacts. Native capture
 runtimes use inode-fenced immutable inputs and release them before reclamation.
