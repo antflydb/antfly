@@ -5677,7 +5677,6 @@ pub fn executeEmbeddedSql(handle: *Handle, table_name: []const u8, request_json:
         if (value.failed) return error.SqlTransactionAborted;
         if (value.active and (compiled.statement == .create_table or compiled.statement == .drop_table or compiled.statement == .catalog_ddl or compiled.statement == .policy_ddl)) return error.UnsupportedSqlExecution;
     }
-    try @import("tables.zig").loadAvailable(handle);
     var adapter = sql.Adapter(antfly){ .transaction = session, .handle = handle, .db = handle.database(), .table_name = table_name, .read_only = !liteOpenModeCanWrite(handle.open_mode) or (if (session) |value| value.read_only else false) };
     var error_context: antfly.capi_dependencies.sql_errors.Context = .{};
     var result = sql.runtime.execute(handle.alloc, adapter.backend(), &compiled, parsed.value.parameters, .{ .result_rows = parsed.value.limit, .error_context = &error_context }) catch |err| {

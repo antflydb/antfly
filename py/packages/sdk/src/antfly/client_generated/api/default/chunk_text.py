@@ -83,23 +83,15 @@ def sync_detailed(
 ) -> Response[InferenceChunkResponse | InferenceError | InferenceTransientCapacityError]:
     r"""Chunk text into smaller segments
 
-     Splits text into smaller chunks using semantic or fixed-size chunking models.
+     Splits text into smaller chunks with the built-in fixed chunker.
 
     ## Models
 
-    ### Fixed Chunking (always available)
-    - Simple token-based splitting with overlap
-    - Use model=\"fixed\"
+    ### Fixed Chunking
+    - Token-count splitting with overlap for text; fixed time windows for audio
+    - Use model=\"fixed\" (aliases `fixed_bert`, `fixed_bpe`, and `fixed-bert-tokenizer` are accepted)
     - Fast and deterministic
-
-    ### ONNX Models
-    - Semantic chunking based on content similarity
-    - Models auto-discovered from `models_dir/chunkers/`
-    - Falls back to fixed chunking if model fails
-
-    ## Caching
-
-    Results are cached in memory for 2 minutes. Cache key includes both config and text content.
+    - Other model names are rejected as unsupported
 
     Args:
         body (InferenceChunkRequest):
@@ -130,23 +122,15 @@ def sync(
 ) -> InferenceChunkResponse | InferenceError | InferenceTransientCapacityError | None:
     r"""Chunk text into smaller segments
 
-     Splits text into smaller chunks using semantic or fixed-size chunking models.
+     Splits text into smaller chunks with the built-in fixed chunker.
 
     ## Models
 
-    ### Fixed Chunking (always available)
-    - Simple token-based splitting with overlap
-    - Use model=\"fixed\"
+    ### Fixed Chunking
+    - Token-count splitting with overlap for text; fixed time windows for audio
+    - Use model=\"fixed\" (aliases `fixed_bert`, `fixed_bpe`, and `fixed-bert-tokenizer` are accepted)
     - Fast and deterministic
-
-    ### ONNX Models
-    - Semantic chunking based on content similarity
-    - Models auto-discovered from `models_dir/chunkers/`
-    - Falls back to fixed chunking if model fails
-
-    ## Caching
-
-    Results are cached in memory for 2 minutes. Cache key includes both config and text content.
+    - Other model names are rejected as unsupported
 
     Args:
         body (InferenceChunkRequest):
@@ -172,23 +156,15 @@ async def asyncio_detailed(
 ) -> Response[InferenceChunkResponse | InferenceError | InferenceTransientCapacityError]:
     r"""Chunk text into smaller segments
 
-     Splits text into smaller chunks using semantic or fixed-size chunking models.
+     Splits text into smaller chunks with the built-in fixed chunker.
 
     ## Models
 
-    ### Fixed Chunking (always available)
-    - Simple token-based splitting with overlap
-    - Use model=\"fixed\"
+    ### Fixed Chunking
+    - Token-count splitting with overlap for text; fixed time windows for audio
+    - Use model=\"fixed\" (aliases `fixed_bert`, `fixed_bpe`, and `fixed-bert-tokenizer` are accepted)
     - Fast and deterministic
-
-    ### ONNX Models
-    - Semantic chunking based on content similarity
-    - Models auto-discovered from `models_dir/chunkers/`
-    - Falls back to fixed chunking if model fails
-
-    ## Caching
-
-    Results are cached in memory for 2 minutes. Cache key includes both config and text content.
+    - Other model names are rejected as unsupported
 
     Args:
         body (InferenceChunkRequest):
@@ -217,23 +193,15 @@ async def asyncio(
 ) -> InferenceChunkResponse | InferenceError | InferenceTransientCapacityError | None:
     r"""Chunk text into smaller segments
 
-     Splits text into smaller chunks using semantic or fixed-size chunking models.
+     Splits text into smaller chunks with the built-in fixed chunker.
 
     ## Models
 
-    ### Fixed Chunking (always available)
-    - Simple token-based splitting with overlap
-    - Use model=\"fixed\"
+    ### Fixed Chunking
+    - Token-count splitting with overlap for text; fixed time windows for audio
+    - Use model=\"fixed\" (aliases `fixed_bert`, `fixed_bpe`, and `fixed-bert-tokenizer` are accepted)
     - Fast and deterministic
-
-    ### ONNX Models
-    - Semantic chunking based on content similarity
-    - Models auto-discovered from `models_dir/chunkers/`
-    - Falls back to fixed chunking if model fails
-
-    ## Caching
-
-    Results are cached in memory for 2 minutes. Cache key includes both config and text content.
+    - Other model names are rejected as unsupported
 
     Args:
         body (InferenceChunkRequest):
