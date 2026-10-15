@@ -41,7 +41,7 @@ pub const MemberObserver = struct {
 
 /// Validate one value at the current position, leaving the scanner immediately
 /// after it. Each active object owns independently reclaimable duplicate-key
-/// storage. Completed siblings reuse at most 16 KiB per depth. This requires a
+/// storage. Completed siblings reuse bounded key and table storage. This requires a
 /// complete-input scanner; optional member observation adds no second scan.
 pub fn scanValue(alloc: std.mem.Allocator, scanner: *std.json.Scanner, max_len: usize, observer: ?MemberObserver) !void {
     var workspace: ValueScanner = .init(alloc);
@@ -50,7 +50,7 @@ pub fn scanValue(alloc: std.mem.Allocator, scanner: *std.json.Scanner, max_len: 
 }
 
 /// Parser-owned workspace. Small key arenas survive sibling values and rows;
-/// retained frames and arenas share a 256 KiB ceiling between calls. Active
+/// retained frames, tables and arenas share a 256 KiB ceiling between calls. Active
 /// ancestor key sets remain live for duplicate detection, regardless of depth.
 pub const ValueScanner = struct {
     const Frame = struct {
@@ -60,18 +60,82 @@ pub const ValueScanner = struct {
     };
     allocator: std.mem.Allocator,
     stack: std.ArrayListUnmanaged(Frame) = .empty,
+    table_bytes: usize = 0,
+    key_bytes: usize = 0,
+    const reuse_limit = 256 * 1024;
+
+    // Count actual backing bytes, including arena headers, without depending
+    // on private container layouts. Maps do not retain their allocator; arenas
+    // use this adapter only during synchronous operations and restore their
+    // backing allocator before returning. The workspace remains movable.
+    const ScratchAllocator = struct {
+        backing: std.mem.Allocator,
+        bytes: *usize,
+        fn allocator(self: *@This()) std.mem.Allocator {
+            return .{ .ptr = self, .vtable = &.{ .alloc = alloc, .resize = resize, .remap = remap, .free = free } };
+        }
+        fn alloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ra: usize) ?[*]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            const result = self.backing.rawAlloc(len, alignment, ra) orelse return null;
+            self.bytes.* += len;
+            return result;
+        }
+        fn resize(ctx: *anyopaque, buf: []u8, alignment: std.mem.Alignment, len: usize, ra: usize) bool {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            if (!self.backing.rawResize(buf, alignment, len, ra)) return false;
+            self.bytes.* = self.bytes.* - buf.len + len;
+            return true;
+        }
+        fn remap(ctx: *anyopaque, buf: []u8, alignment: std.mem.Alignment, len: usize, ra: usize) ?[*]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            const result = self.backing.rawRemap(buf, alignment, len, ra) orelse return null;
+            self.bytes.* = self.bytes.* - buf.len + len;
+            return result;
+        }
+        fn free(ctx: *anyopaque, buf: []u8, alignment: std.mem.Alignment, ra: usize) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.backing.rawFree(buf, alignment, ra);
+            self.bytes.* -= buf.len;
+        }
+    };
+
+    fn retainedBytes(self: *const @This()) usize {
+        return self.stack.capacity * @sizeOf(Frame) + self.table_bytes + self.key_bytes;
+    }
+
+    fn finishFrame(self: *@This(), frame: *Frame, table_allocator: std.mem.Allocator) !void {
+        // Clear borrowed names before retiring their decoded storage. Active
+        // ancestors keep their sets; only completed frames may shed capacity.
+        if (frame.seen.count() != 0) frame.seen.clearRetainingCapacity();
+        var key_allocator: ScratchAllocator = .{ .backing = self.allocator, .bytes = &self.key_bytes };
+        frame.keys.child_allocator = key_allocator.allocator();
+        defer frame.keys.child_allocator = self.allocator;
+        if (!frame.keys.reset(if (frame.keys.queryCapacity() > 16 * 1024) .free_all else .retain_capacity)) return error.OutOfMemory;
+        if (self.retainedBytes() > reuse_limit) {
+            frame.seen.deinit(table_allocator);
+            frame.seen = .empty;
+            _ = frame.keys.reset(.free_all);
+        }
+    }
 
     pub fn init(allocator: std.mem.Allocator) @This() {
         return .{ .allocator = allocator };
     }
     pub fn deinit(self: *@This()) void {
-        for (self.stack.items) |*frame| frame.keys.deinit();
+        for (self.stack.items) |*frame| {
+            frame.seen.deinit(self.allocator);
+            frame.keys.deinit();
+        }
         self.stack.deinit(self.allocator);
         self.stack = .empty;
+        self.table_bytes = 0;
+        self.key_bytes = 0;
     }
     pub fn scan(self: *@This(), scanner: *std.json.Scanner, max_len: usize, observer: ?MemberObserver) !void {
         errdefer self.deinit();
         const stack = &self.stack;
+        var table_allocator: ScratchAllocator = .{ .backing = self.allocator, .bytes = &self.table_bytes };
+        var key_allocator: ScratchAllocator = .{ .backing = self.allocator, .bytes = &self.key_bytes };
         var root_seen = false;
         var depth: usize = 0;
         var member_name: ?[]const u8 = null;
@@ -80,12 +144,15 @@ pub const ValueScanner = struct {
             if (depth != 0) {
                 const top = &stack.items[depth - 1];
                 if (top.object) {
-                    const token = try scanner.nextAllocMax(top.keys.allocator(), .alloc_if_needed, max_len);
+                    const token = token: {
+                        top.keys.child_allocator = key_allocator.allocator();
+                        defer top.keys.child_allocator = self.allocator;
+                        break :token try scanner.nextAllocMax(top.keys.allocator(), .alloc_if_needed, max_len);
+                    };
                     const name = switch (token) {
                         .string, .allocated_string => |name| name,
                         .object_end => {
-                            if (!top.keys.reset(if (top.keys.queryCapacity() > 16 * 1024) .free_all else .retain_capacity)) return error.OutOfMemory;
-                            top.seen = .empty;
+                            try self.finishFrame(top, table_allocator.allocator());
                             depth -= 1;
                             if (depth == 1 and member_name != null) {
                                 try observer.?.member_fn(observer.?.ctx, member_name.?, scanner.input[member_start..scanner.cursor]);
@@ -95,7 +162,7 @@ pub const ValueScanner = struct {
                         },
                         else => return error.UnexpectedToken,
                     };
-                    if ((try top.seen.getOrPut(top.keys.allocator(), name)).found_existing) return error.DuplicateField;
+                    if ((try top.seen.getOrPut(table_allocator.allocator(), name)).found_existing) return error.DuplicateField;
                     if (observer != null and depth == 1) {
                         member_name = name;
                         member_start = scanner.cursor;
@@ -103,8 +170,7 @@ pub const ValueScanner = struct {
                     }
                 } else if (try scanner.peekNextTokenType() == .array_end) {
                     _ = try scanner.next();
-                    if (!top.keys.reset(if (top.keys.queryCapacity() > 16 * 1024) .free_all else .retain_capacity)) return error.OutOfMemory;
-                    top.seen = .empty;
+                    try self.finishFrame(top, table_allocator.allocator());
                     depth -= 1;
                     if (depth == 1 and member_name != null) {
                         try observer.?.member_fn(observer.?.ctx, member_name.?, scanner.input[member_start..scanner.cursor]);
@@ -131,9 +197,7 @@ pub const ValueScanner = struct {
                 else => return error.UnexpectedToken,
             }
         }
-        var retained = stack.capacity * @sizeOf(Frame);
-        for (stack.items) |*frame| retained += frame.keys.queryCapacity();
-        if (retained > 256 * 1024) self.deinit();
+        if (self.retainedBytes() > reuse_limit) self.deinit();
     }
 };
 
@@ -346,4 +410,83 @@ test "value scanner reuses scratch across rows and resets after errors" {
     };
     try Fixture.run(std.testing.allocator);
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Fixture.run, .{});
+}
+
+test "value scanner retains wide sibling tables within the shared budget" {
+    const a = std.testing.allocator;
+    var input = std.Io.Writer.Allocating.init(a);
+    defer input.deinit();
+    try input.writer.writeByte('{');
+    for (0..1000) |i| {
+        if (i != 0) try input.writer.writeByte(',');
+        try input.writer.print("\"k{d}\":0", .{i});
+    }
+    try input.writer.writeByte('}');
+    const Fixture = struct {
+        fn run(backing: std.mem.Allocator, json: []const u8) !void {
+            var counted: std.testing.FailingAllocator = .init(backing, .{});
+            var workspace: ValueScanner = .init(counted.allocator());
+            defer workspace.deinit();
+            for (0..4) |iteration| {
+                var scanner = std.json.Scanner.initCompleteInput(backing, json);
+                defer scanner.deinit();
+                const calls = counted.allocations;
+                try workspace.scan(&scanner, json.len, null);
+                if (iteration != 0) try std.testing.expectEqual(calls, counted.allocations);
+                // Table and decoded-name storage both contribute to the
+                // budget; names without escapes borrow input instead.
+                try std.testing.expect(workspace.table_bytes > 16 * 1024);
+                if (std.mem.indexOfScalar(u8, json, '\\') == null) try std.testing.expectEqual(@as(usize, 0), workspace.key_bytes);
+                try std.testing.expectEqual(counted.allocated_bytes - counted.freed_bytes, workspace.retainedBytes());
+                try std.testing.expect(workspace.retainedBytes() <= ValueScanner.reuse_limit);
+            }
+        }
+    };
+    try Fixture.run(a, input.written());
+    try std.testing.checkAllAllocationFailures(a, Fixture.run, .{input.written()});
+    var escaped = std.Io.Writer.Allocating.init(a);
+    defer escaped.deinit();
+    try escaped.writer.writeByte('{');
+    for (0..1000) |i| {
+        if (i != 0) try escaped.writer.writeByte(',');
+        try escaped.writer.print("\"\\u006b{d}\":0", .{i});
+    }
+    try escaped.writer.writeByte('}');
+    try Fixture.run(a, escaped.written());
+    try std.testing.checkAllAllocationFailures(a, Fixture.run, .{escaped.written()});
+}
+
+test "value scanner retires oversized tables and recovers across depths" {
+    const a = std.testing.allocator;
+    var input = std.Io.Writer.Allocating.init(a);
+    defer input.deinit();
+    try input.writer.writeAll("[{\"\\u0061\":{");
+    for (0..12000) |i| {
+        if (i != 0) try input.writer.writeByte(',');
+        try input.writer.print("\"k{d}\":0", .{i});
+    }
+    // Retiring a child table must preserve its active ancestor set.
+    try input.writer.writeAll("},\"child\":0}]");
+    var counted: std.testing.FailingAllocator = .init(a, .{});
+    var workspace: ValueScanner = .init(counted.allocator());
+    defer workspace.deinit();
+    var scanner = std.json.Scanner.initCompleteInput(a, input.written());
+    defer scanner.deinit();
+    try workspace.scan(&scanner, input.written().len, null);
+    try std.testing.expect(workspace.retainedBytes() <= ValueScanner.reuse_limit);
+    try std.testing.expectEqual(counted.allocated_bytes - counted.freed_bytes, workspace.retainedBytes());
+    // Replace the final member name with the ancestor's decoded name.
+    const valid_len = input.written().len;
+    var duplicate = std.Io.Writer.Allocating.init(a);
+    defer duplicate.deinit();
+    try duplicate.writer.writeAll(input.written()[0 .. valid_len - "\"child\":0}]".len]);
+    try duplicate.writer.writeAll("\"a\":0}]");
+    const small = duplicate.written();
+    var invalid = std.json.Scanner.initCompleteInput(a, small);
+    defer invalid.deinit();
+    try std.testing.expectError(error.DuplicateField, workspace.scan(&invalid, small.len, null));
+    try std.testing.expectEqual(@as(usize, 0), workspace.retainedBytes());
+    var recovered = std.json.Scanner.initCompleteInput(a, "0");
+    defer recovered.deinit();
+    try workspace.scan(&recovered, 1, null);
 }
