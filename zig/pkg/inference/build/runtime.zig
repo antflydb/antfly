@@ -746,6 +746,14 @@ fn configureRuntimeLinks(
         configureSystemBlas(b, module, target, backend.blas_root);
     }
     configureMetal(b, module, target, backend.enable_metal, paths);
+    configureCudaVideo(b, module, target, backend.enable_cuda, paths);
+}
+
+pub fn configureCudaVideo(b: *std.Build, module: *std.Build.Module, target: std.Build.ResolvedTarget, enabled: bool, paths: Paths) void {
+    const media = b.createModule(.{ .root_source_file = b.path(pathJoin(b, paths.shared_lib_root, "lib/media/src/inference.zig")), .target = target });
+    module.addImport("antfly_video_media", media);
+    if (!enabled or target.result.os.tag != .linux) return;
+    module.addCSourceFile(.{ .file = b.path(pathJoin(b, paths.inference_root, "src/ops/cuda/video_decode.c")), .flags = &.{"-std=c11"} });
 }
 
 pub fn configureSystemBlas(

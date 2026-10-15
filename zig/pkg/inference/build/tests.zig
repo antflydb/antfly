@@ -104,6 +104,7 @@ pub fn create(ctx: Context) Suite {
         runtime_build.configureSystemBlas(b, tests.root_module, ctx.target, ctx.backend.blas_root);
     }
     runtime_build.configureMetal(b, tests.root_module, ctx.target, ctx.backend.enable_metal, ctx.paths);
+    runtime_build.configureCudaVideo(b, tests.root_module, ctx.target, ctx.backend.enable_cuda, ctx.paths);
     tests.root_module.link_libc = ctx.backend.link_libc;
 
     // Keep the standalone server's CLI and configuration parsing covered too.
@@ -169,6 +170,23 @@ pub fn addDefault(ctx: Context, suite: Suite, checks: Checks) *std.Build.Step {
     const run_quant_kernel_metal_runtime_check_tests = checks.metal_runtime;
     const run_bge_m3_e2e_bench_tests = checks.bge_benchmark;
     const test_step = ctx.step("test", "Run unit tests");
+    const media_tests = b.addTest(.{ .root_module = b.createModule(.{
+        .root_source_file = b.path(b.pathJoin(&.{ ctx.paths.shared_lib_root, "lib/media/src/inference.zig" })),
+        .target = ctx.target,
+        .optimize = ctx.optimize,
+    }) });
+    const media_step = ctx.step("test-video-media", "Run bounded media and NVDEC callback tests without a GPU");
+    media_step.dependOn(&ctx.addRunArtifact(media_tests).step);
+    if (ctx.target.result.os.tag == .linux) {
+        const callbacks = b.addExecutable(.{ .name = "video-decode-callback-tests", .root_module = b.createModule(.{
+            .target = ctx.target,
+            .optimize = ctx.optimize,
+            .link_libc = true,
+        }) });
+        callbacks.root_module.addCSourceFile(.{ .file = ctx.path("tests/video_decode_test.c"), .flags = &.{ "-std=c11", "-Wall", "-Wextra", "-Werror", "-UNDEBUG" } });
+        media_step.dependOn(&ctx.addRunArtifact(callbacks).step);
+    }
+    test_step.dependOn(media_step);
     const cancellation_e2e_step = ctx.step("test-cancellation-e2e", "Run HTTP inference cancellation and worker recovery E2E tests");
     if (ctx.target.result.os.tag == .linux or ctx.target.result.os.tag == .macos) {
         const fixture = b.addExecutable(.{

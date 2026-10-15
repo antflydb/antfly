@@ -198,6 +198,54 @@ tmp_sm89="$(mktemp "${TMPDIR:-/tmp}/inference_cuda_kernels.XXXXXX.sm89.cubin")"
 trap 'rm -f "$tmp_ptx" "$tmp_fatbin" "$tmp_sm89"' EXIT
 
 required_symbols=(
+  termite_embedding_gemma2_lookup_bf16
+  termite_embedding_gemma2_pillow_horizontal_rgb8
+  termite_embedding_gemma2_pillow_vertical_patches_f32
+  termite_gemma4_audio_local_attention_f32
+  termite_gemma4_audio_clamp_f32
+  termite_gemma4_audio_glu_rows_f32
+  termite_gemma4_audio_depthwise_causal_conv1d_f32
+  termite_embedding_gemma2_rms_norm_bf16
+  termite_embedding_gemma2_training_rms_norm_bf16
+  termite_embedding_gemma2_rms_norm_input_vjp_f32
+  termite_embedding_gemma2_training_rms_norm_input_vjp_f32
+  termite_embedding_gemma2_training_pack_bhsd_bf16
+  termite_embedding_gemma2_training_unpack_bhsd_bf16
+  termite_embedding_gemma2_rope_bf16
+  termite_embedding_gemma2_rope_vjp_f32
+  termite_embedding_gemma2_training_rope_bf16
+  termite_embedding_gemma2_training_rope_vjp_f32
+  termite_embedding_gemma2_attention_bf16
+  termite_embedding_gemma2_attention_local_flash_bf16
+  termite_embedding_gemma2_attention_softmax_bf16
+  termite_embedding_gemma2_matmul_bf16
+  termite_embedding_gemma2_gelu_mul_bf16
+  termite_embedding_gemma2_gelu_mul_vjp_f32
+  termite_embedding_gemma2_bf16_to_f32
+  termite_embedding_gemma2_f32_to_bf16
+  termite_embedding_gemma2_scale_bf16
+  termite_embedding_gemma2_scale_device_bf16
+  termite_embedding_gemma2_gelu_ple_bf16
+  termite_embedding_gemma2_residual_bf16
+  termite_embedding_gemma2_residual_vjp_f32
+  termite_embedding_gemma2_contrastive_prob_f32
+  termite_embedding_gemma2_contrastive_query_vjp_f32
+  termite_embedding_gemma2_contrastive_candidate_vjp_f32
+  termite_embedding_gemma2_training_contrastive_ce_f32
+  termite_embedding_gemma2_training_softmax_f32
+  termite_embedding_gemma2_training_softmax_vjp_f32
+  termite_embedding_gemma2_mean_l2_f32
+  termite_embedding_gemma2_training_mean_l2_f32
+  termite_embedding_gemma2_mean_l2_vjp_f32
+  termite_embedding_gemma2_mrl_normalize_f32
+  termite_embedding_gemma2_mrl_normalize_vjp_f32
+  termite_embedding_gemma2_pack_bshd_bf16_f32
+  termite_embedding_gemma2_pack_bshd_f32
+  termite_embedding_gemma2_unpack_bhsd_f32
+  termite_embedding_gemma2_unpack_bhsd_f32_bf16
+  termite_embedding_gemma2_scale_device_f32_bf16
+  termite_embedding_gemma2_accumulate_f32
+  termite_embedding_gemma2_accumulate_bf16_boundary_f32
   termite_gliner_encoder_attention_f32
   termite_gliner_qkv_rope_f32
   termite_gliner_encoder_attention_tc_f16

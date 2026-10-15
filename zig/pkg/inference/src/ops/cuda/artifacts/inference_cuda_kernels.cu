@@ -16,6 +16,7 @@
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <mma.h>
+#include "../kernels/embedding_gemma2.cuh"
 
 using namespace nvcuda;
 

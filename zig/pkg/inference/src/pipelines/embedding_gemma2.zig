@@ -22,7 +22,7 @@ const Session = @import("../backends/session.zig").Session;
 const Tokenizer = @import("inference_tokenizer").Tokenizer;
 const Control = @import("../execution_control.zig").InferenceExecutionControl;
 const scoring = @import("antfly_decisions").scoring;
-pub const Part = union(enum) { text: []const u8, image: []const u8, audio: []const u8, raster: @import("antfly_image").BorrowedRasterAttachment };
+pub const Part = union(enum) { text: []const u8, image: []const u8, audio: []const u8, video: []const u8, raster: @import("antfly_image").BorrowedRasterAttachment };
 
 fn partBytes(part: Part) []const u8 {
     return switch (part) {
@@ -54,6 +54,8 @@ pub const MediaTimings = struct {
 pub const Options = struct {
     task_type: []const u8 = "RETRIEVAL_DOCUMENT",
     dimensions: usize = 768,
+    /// Expanded input limit, including prompts, wrappers, and media tokens.
+    max_tokens: usize = encoder.max_tokens,
     resident_images: bool = true,
     resident_audio: bool = true,
     /// At most one admitted CPU preparation wave ahead of accelerator work.
@@ -92,7 +94,9 @@ pub fn embed(out: std.mem.Allocator, session: Session, tokenizer: Tokenizer, gro
 
 fn embedScoped(a: std.mem.Allocator, session: Session, tokenizer: Tokenizer, group: Group, options: Options, lock: ?*std.atomic.Mutex, control: ?Control) !Result {
     const cfg = factory.getEmbeddingGemma2Config(session) orelse return error.UnsupportedEmbeddingGemma2Backend;
-    try validateGroup(group, options);
+    try validateGroupContent(group, options, session.backend() == .cuda);
+    if (group.content.len == 1 and group.content[0] == .video) return embedVideo(a, session, tokenizer, group.content[0].video, options, lock, control);
+    if (session.backend() == .cuda and (!singleImageGroup(group) or !options.resident_images)) return embedCudaGroup(a, session, tokenizer, group, options, lock, control);
     var input_bytes: usize = 0;
     for (group.content) |part| {
         input_bytes = std.math.add(usize, input_bytes, partBytes(part).len) catch return error.ResourceLimitExceeded;
@@ -100,19 +104,49 @@ fn embedScoped(a: std.mem.Allocator, session: Session, tokenizer: Tokenizer, gro
             .text => {},
             .image, .raster => if (!cfg.vision) return error.NoVisionSession,
             .audio => if (!cfg.audio) return error.NoAudioSession,
+            .video => return error.InvalidEmbeddingGroup,
         }
     }
     const effective = control orelse Control{};
     try effective.check();
     // Reserve the maximum encoder sequence and a bounded media preprocessing
     // working set before decoding or allocating any projected soft tokens.
-    var permit = try session.admit(.{ .batch = 1, .sequence = 8192, .input_bytes = input_bytes, .host_preprocess_bytes = 512 * 1024 * 1024, .workspace_bytes = if (session.backend() == .metal) 768 * 1024 * 1024 else 512 * 1024 * 1024, .output_bytes = 8192 * 768 * @sizeOf(f32) });
+    const resident_image = singleImageGroup(group) and options.resident_images and (session.backend() == .metal or session.backend() == .cuda);
+    const encoder_workspace: usize = if (session.backend() == .metal) 768 * 1024 * 1024 else 512 * 1024 * 1024;
+    var permit = try session.admit(.{ .batch = 1, .sequence = if (resident_image) @min(raster_max_sequence, options.max_tokens) else options.max_tokens, .input_bytes = input_bytes, .host_preprocess_bytes = 512 * 1024 * 1024, .workspace_bytes = encoder_workspace + (if (resident_image) @as(usize, 768 * 1024 * 1024) else 0), .output_bytes = (if (resident_image) @as(usize, raster_max_sequence) else options.max_tokens) * 768 * @sizeOf(f32) });
     defer permit.deinit();
     if (lock) |mutex| try effective.lock(mutex);
     defer if (lock) |mutex| mutex.unlock();
     var managed = try factory.getManagedComputeBackend(session, a, null, control);
     defer managed.deinit();
     const cb = &managed.backend;
+    if (singleImageGroup(group) and residentImagesEnabled(cb, options)) {
+        const before = MediaTransferSnapshot.init(cb);
+        defer observeResidentTransfers(cb, before, options);
+        const image_scope = @import("antfly_image").work_control.Scope.enter(effective.imageWorkControl());
+        defer image_scope.deinit();
+        const preprocess_started = mediaNow();
+        var image = switch (group.content[0]) {
+            .image => |bytes| try projector.prepareEmbeddingGemma2ImageForBackend(a, bytes, session.backend()),
+            .raster => |raster| try projector.prepareEmbeddingGemma2RasterForBackend(a, raster, session.backend()),
+            else => unreachable,
+        };
+        defer image.deinit();
+        if (options.timings) |t| t.preprocess_ns += mediaNow() - preprocess_started;
+        const vision_started = mediaNow();
+        var projected = try projector.encodePreparedEmbeddingGemma2ImagesResident(cb, a, &.{image}, .{});
+        defer projected.deinit();
+        if (options.timings) |t| {
+            t.vision_ns += mediaNow() - vision_started;
+            t.resident_cohorts += 1;
+        }
+        var counts: [1]usize = undefined;
+        const vectors = try runResidentMediaBatch(a, cb, cfg, tokenizer, &projected, options, false, &counts);
+        defer a.free(vectors);
+        errdefer a.free(vectors[0]);
+        try effective.check();
+        return .{ .vector = vectors[0], .input_tokens = counts[0] };
+    }
     const prepared = try prepareGroup(a, cb, tokenizer, group, options, effective);
     defer prepared.deinit(a);
     const count = prepared.ids.len;
@@ -135,6 +169,124 @@ fn embedScoped(a: std.mem.Allocator, session: Session, tokenizer: Tokenizer, gro
     errdefer a.free(vectors[0]);
     try effective.check();
     return .{ .vector = vectors[0], .input_tokens = count };
+}
+
+/// One clip produces one pooled vector. All decoded pixels, projected frame rows,
+/// and encoder inputs remain on CUDA; only the final requested vector is read back.
+fn embedVideo(a: std.mem.Allocator, session: Session, tokenizer: Tokenizer, bytes: []const u8, options: Options, lock: ?*std.atomic.Mutex, control: ?Control) !Result {
+    if (comptime !@import("build_options").enable_cuda or @import("builtin").os.tag != .linux) return error.UnsupportedVideoBackend;
+    if (session.backend() != .cuda) return error.UnsupportedVideoBackend;
+    const cfg = factory.getEmbeddingGemma2Config(session) orelse return error.UnsupportedEmbeddingGemma2Backend;
+    if (!cfg.vision) return error.NoVisionSession;
+    const effective = control orelse Control{};
+    try effective.check();
+    var permit = try session.admit(.{ .batch = 1, .sequence = @min(options.max_tokens, 4546), .input_bytes = bytes.len, .host_preprocess_bytes = 128 * 1024 * 1024, .workspace_bytes = 1536 * 1024 * 1024, .output_bytes = options.dimensions * @sizeOf(f32) });
+    defer permit.deinit();
+    if (lock) |mutex| try effective.lock(mutex);
+    defer if (lock) |mutex| mutex.unlock();
+    var managed = try factory.getManagedComputeBackend(session, a, null, control);
+    defer managed.deinit();
+    const cb = &managed.backend;
+    const scope = @import("antfly_image").work_control.Scope.enter(effective.imageWorkControl());
+    defer scope.deinit();
+    const before = MediaTransferSnapshot.init(cb);
+    defer observeResidentTransfers(cb, before, options);
+    const started = mediaNow();
+    var projected = projector.encodeEmbeddingGemma2VideoResident(cb, a, bytes, options.max_tokens) catch |err| return videoInputError(err);
+    defer projected.deinit();
+    if (options.timings) |t| {
+        t.vision_ns += mediaNow() - started;
+        t.resident_cohorts += 1;
+    }
+    const pack_started = mediaNow();
+    var rendered = std.ArrayList(u8).empty;
+    defer rendered.deinit(a);
+    var total: usize = 0;
+    for (projected.images.tokens_per_image) |count| {
+        if (count == 0 or count > 140) return error.InvalidTensorShape;
+        try rendered.appendSlice(a, "<|image>");
+        for (0..count) |_| try rendered.appendSlice(a, "<|video|>");
+        try rendered.appendSlice(a, "<image|>");
+        total += count;
+    }
+    var encoded = try tokenizer.encodeForModel(a, rendered.items, options.max_tokens + 1);
+    defer encoded.deinit();
+    var length: usize = 0;
+    for (encoded.attention_mask) |m| length += @intFromBool(m != 0);
+    // BOS/EOS once for the whole clip; two wrapper tokens per frame.
+    if (length != total + projected.images.tokens_per_image.len * 2 + 2 or length > options.max_tokens) return error.EmbeddingInputTooLong;
+    const ids = try a.alloc(i64, length);
+    defer a.free(ids);
+    const mask = try a.alloc(i64, length);
+    defer a.free(mask);
+    for (ids, encoded.ids[0..length]) |*dest, id| dest.* = id;
+    for (mask, encoded.attention_mask[0..length]) |*dest, m| dest.* = m;
+    const row = PreparedGroup{ .ids = ids, .mask = mask, .embeddings = null };
+    const video_input = try packResidentMediaRows(a, cb, &.{row}, projected.images.embeddings, &.{total}, 258884, options.max_tokens);
+    defer video_input.deinit(a, cb);
+    if (options.timings) |t| t.pack_ns += mediaNow() - pack_started;
+    const encoder_started = mediaNow();
+    const compute: *@import("../ops/cuda/cuda_compute.zig").CudaCompute = @ptrCast(@alignCast(cb.ptr));
+    const vector = try compute.runEmbeddingGemma2(a, cfg.resident orelse return error.UnsupportedEmbeddingGemma2Backend, .{ .resident_embeddings = video_input.embeddings }, video_input.mask, 1, length, options.dimensions, cb.execution_control);
+    errdefer a.free(vector);
+    if (options.timings) |t| t.encoder_ns += mediaNow() - encoder_started;
+    try effective.check();
+    return .{ .vector = vector, .input_tokens = length };
+}
+
+fn videoInputError(err: anyerror) anyerror {
+    return switch (err) {
+        error.UnexpectedEndOfSource, error.EmptyVideo, error.EmptyVideoTrack, error.MalformedMedia, error.MissingMovieMetadata, error.UnsupportedContainer, error.UnsupportedDataReference, error.UnsupportedDisplayGeometry, error.UnsupportedEncryptedMedia, error.UnsupportedFragmentedMp4, error.UnsupportedHybridMp4, error.UnsupportedInterlacedVideo, error.UnsupportedSampleDescription, error.UnsupportedSampleSize, error.UnsupportedTimeline, error.UnsupportedVideoCodec, error.InvalidTimebase, error.TimestampOverflow, error.NoRandomAccessPoint, error.InvalidVideoTimestamp, error.NonMonotonicVideoPresentation, error.UnsupportedVideoFormat, error.UnsupportedVideoContainerColor, error.InvalidVideoGeometry, error.InvalidVideoConfiguration, error.InvalidVideoPacket, error.VideoDecodeFailed => error.InvalidVideoInput,
+        else => err,
+    };
+}
+
+fn singleImageGroup(group: Group) bool {
+    return group.content.len == 1 and (group.content[0] == .image or group.content[0] == .raster);
+}
+
+fn embedCudaGroup(a: std.mem.Allocator, session: Session, tokenizer: Tokenizer, group: Group, options: Options, lock: ?*std.atomic.Mutex, control: ?Control) !Result {
+    const embedding = @import("embedding.zig");
+    const parts = try a.alloc(embedding.EmbeddingContentPart, group.content.len);
+    defer a.free(parts);
+    for (group.content, parts) |part, *dest| dest.* = switch (part) {
+        .text => |text| .{ .text = text },
+        .image => |image| .{ .image = image },
+        .audio => |audio| .{ .audio = .{ .bytes = audio } },
+        .raster, .video => return error.UnsupportedInput,
+    };
+    const prefix = if (group.title) |title| try std.fmt.allocPrint(a, "title: {s} | text: ", .{title}) else try a.dupe(u8, try encoder.taskPrefix(options.task_type));
+    defer a.free(prefix);
+    var pipeline = embedding.EmbeddingPipeline.init(a, session, tokenizer, .{
+        .max_length = options.max_tokens,
+        .strict_max_length = true,
+        .reject_truncation = true,
+        .normalize = true,
+        .pooling = .mean,
+        .text_prefix = prefix,
+        .trim_padding_to_batch_max = true,
+        .resident_text_encoder = true,
+        .resident_embedding_gemma2 = true,
+        .resident_image_handoff = false,
+    });
+    pipeline.execution_lock = lock;
+    pipeline.execution_control = control;
+    const vectors = try pipeline.embedContent(&.{.{ .content = parts }});
+    defer a.free(vectors);
+    if (vectors.len != 1) {
+        for (vectors) |vector| a.free(vector);
+        return error.InvalidEmbeddingOutput;
+    }
+    defer a.free(vectors[0]);
+    if (options.dimensions > vectors[0].len) return error.InvalidEmbeddingDimensions;
+    const output = try a.dupe(f32, vectors[0][0..options.dimensions]);
+    errdefer a.free(output);
+    var norm: f32 = 0;
+    for (output) |value| norm += value * value;
+    if (norm <= 0 or !std.math.isFinite(norm)) return error.InvalidEmbeddingOutput;
+    const scale = 1 / @sqrt(norm);
+    for (output) |*value| value.* *= scale;
+    return .{ .vector = output, .input_tokens = pipeline.last_input_tokens };
 }
 
 const PreparedGroup = struct {
@@ -181,6 +333,7 @@ fn prepareGroupWithImage(a: std.mem.Allocator, cb: *const @import("../ops/ops.zi
         if (index > 0) try rendered.append(a, '\n');
         switch (part) {
             .text => |text| try rendered.appendSlice(a, text),
+            .video => return error.InvalidEmbeddingGroup,
             .image, .audio, .raster => {
                 const bytes = partBytes(part);
                 const is_image = part != .audio;
@@ -207,7 +360,7 @@ fn prepareGroupWithImage(a: std.mem.Allocator, cb: *const @import("../ops/ops.zi
                 errdefer a.free(projected.embeddings);
                 if (projected.tokens == 0 or projected.embeddings.len != projected.tokens * 512) return error.InvalidTensorShape;
                 media_tokens = std.math.add(usize, media_tokens, projected.tokens) catch return error.EmbeddingInputTooLong;
-                if (media_tokens > 8192) return error.EmbeddingInputTooLong;
+                if (media_tokens > options.max_tokens) return error.EmbeddingInputTooLong;
                 try rendered.appendSlice(a, if (is_image) "<|image>" else "<|audio>");
                 for (0..projected.tokens) |_| try rendered.appendSlice(a, if (is_image) "<|image|>" else "<|audio|>");
                 try rendered.appendSlice(a, if (is_image) "<image|>" else "<audio|>");
@@ -215,11 +368,11 @@ fn prepareGroupWithImage(a: std.mem.Allocator, cb: *const @import("../ops/ops.zi
             },
         }
     }
-    var tokens = try tokenizer.encodeForModel(a, rendered.items, 8193);
+    var tokens = try tokenizer.encodeForModel(a, rendered.items, options.max_tokens + 1);
     defer tokens.deinit();
     var count: usize = 0;
     for (tokens.attention_mask) |m| count += @intFromBool(m != 0);
-    if (count == 0 or count > 8192) return error.EmbeddingInputTooLong;
+    if (count == 0 or count > options.max_tokens) return error.EmbeddingInputTooLong;
     const ids = try a.alloc(i64, count);
     errdefer a.free(ids);
     const mask = try a.alloc(i64, count);
@@ -260,6 +413,13 @@ const raster_max_batch = 4;
 const raster_max_sequence = 512;
 const raster_max_padded_tokens = raster_max_batch * raster_max_sequence;
 
+pub fn imageCohortLimit(session: Session) usize {
+    // Larger CUDA GEMMs alter BF16 row arithmetic. Preserve qualified
+    // singleton outputs unless a caller explicitly opts into coalescing.
+    if (session.backend() == .cuda and !@import("antfly_platform").env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_EMBEDDING_GEMMA2_IMAGE_BATCH", false)) return 1;
+    return raster_max_batch;
+}
+
 /// Bound live rows and padding, preserving input order. Avoid singleton tails
 /// when neighboring sequence lengths permit another balanced cohort.
 fn rasterBatchCount(lengths: []const usize, remaining: usize) usize {
@@ -284,8 +444,9 @@ pub fn embedRasters(out: std.mem.Allocator, session: Session, tokenizer: Tokeniz
     const cfg = factory.getEmbeddingGemma2Config(session) orelse return error.UnsupportedEmbeddingGemma2Backend;
     if (!cfg.vision) return error.NoVisionSession;
     if (!encoder.validDimension(options.dimensions)) return error.InvalidEmbeddingDimensions;
+    if (options.max_tokens == 0 or options.max_tokens > encoder.max_tokens) return error.InvalidEmbeddingTokenLimit;
     _ = try encoder.taskPrefix(options.task_type);
-    if (options.prepare_ahead and (session.backend() == .metal or session.backend() == .cuda))
+    if (options.prepare_ahead and imageCohortLimit(session) > 1 and (session.backend() == .metal or session.backend() == .cuda))
         return embedPreparedMedia(out, session, tokenizer, cfg, .{ .rasters = rasters }, options, lock, effective, null);
     const vectors = try out.alloc([]f32, rasters.len);
     var initialized: usize = 0;
@@ -299,7 +460,7 @@ pub fn embedRasters(out: std.mem.Allocator, session: Session, tokenizer: Tokeniz
         var lengths: [raster_max_batch + 1]usize = undefined;
         const candidates = @min(rasters.len - initialized, lengths.len);
         for (rasters[initialized..][0..candidates], lengths[0..candidates]) |raster, *length| length.* = try projector.embeddingGemma2RasterSequenceLength(raster);
-        const count = rasterBatchCount(lengths[0..candidates], rasters.len - initialized);
+        const count = @min(imageCohortLimit(session), rasterBatchCount(lengths[0..candidates], rasters.len - initialized));
         var bounded = @import("../runtime/bounded_allocator.zig").BoundedAllocator{ .backing = workspaceBackingAllocator(session.backend()), .limit = 512 * 1024 * 1024 };
         defer std.debug.assert(bounded.live == 0);
         const temporary = embedRasterCohort(bounded.allocator(), session, tokenizer, cfg, rasters[initialized..][0..count], options, lock, effective) catch |err| return if (err == error.OutOfMemory and bounded.denied) error.MemoryBudgetExceeded else err;
@@ -330,7 +491,7 @@ pub fn embedImages(out: std.mem.Allocator, session: Session, tokenizer: Tokenize
         if (errors.len != images.len) return error.InvalidInputShape;
         @memset(errors, null);
     }
-    if (options.prepare_ahead and (session.backend() == .metal or session.backend() == .cuda))
+    if (options.prepare_ahead and imageCohortLimit(session) > 1 and (session.backend() == .metal or session.backend() == .cuda))
         return embedPreparedMedia(out, session, tokenizer, cfg, .{ .images = images }, options, lock, effective, item_errors);
     const vectors = try out.alloc([]f32, images.len);
     var initialized: usize = 0;
@@ -341,7 +502,7 @@ pub fn embedImages(out: std.mem.Allocator, session: Session, tokenizer: Tokenize
     var observation = BatchExecution.Observation{};
     while (initialized < images.len) {
         try effective.check();
-        const count = @min(raster_max_batch, images.len - initialized);
+        const count = @min(imageCohortLimit(session), images.len - initialized);
         var bounded = @import("../runtime/bounded_allocator.zig").BoundedAllocator{ .backing = workspaceBackingAllocator(session.backend()), .limit = 512 * 1024 * 1024 };
         defer std.debug.assert(bounded.live == 0);
         const errors = if (item_errors) |e| e[initialized..][0..count] else null;
@@ -477,7 +638,7 @@ fn consumePreparedAudios(out: std.mem.Allocator, slot: *@import("audio_preparati
     var managed = try factory.getManagedComputeBackend(slot.session, a, null, slot.control);
     defer managed.deinit();
     const cb = &managed.backend;
-    const before = cb.debugTimingSnapshot().provider;
+    const before = MediaTransferSnapshot.init(cb);
     defer observeResidentTransfers(cb, before, options);
     var order: [4]usize = undefined;
     for (order[0..slot.retained], 0..) |*index, n| index.* = n;
@@ -526,7 +687,7 @@ fn consumePreparedAudios(out: std.mem.Allocator, slot: *@import("audio_preparati
             t.resident_cohorts += 1;
         }
         var projected = projector.ResidentProjectedImages{ .allocator = a, .backend = cb, .embeddings = joined.?, .tokens_per_image = lengths, .hidden_size = 512, .batches_executed = count, .max_batch_executed = 1 };
-        const result = try runResidentMediaBatch(a, cb, cfg, tokenizer, &projected, options, true);
+        const result = try runResidentMediaBatch(a, cb, cfg, tokenizer, &projected, options, true, null);
         defer {
             for (result) |vector| a.free(vector);
             a.free(result);
@@ -650,8 +811,8 @@ const PreparationSlot = struct {
             try self.control.check();
             if (self.errors) |errors| if (errors[index] != null) continue;
             self.pixels[self.retained] = switch (self.source.part(index)) {
-                .image => |bytes| projector.prepareEmbeddingGemma2Image(self.allocator(), bytes),
-                .raster => |raster| projector.prepareEmbeddingGemma2Raster(self.allocator(), raster),
+                .image => |bytes| projector.prepareEmbeddingGemma2ImageForBackend(self.allocator(), bytes, self.session.backend()),
+                .raster => |raster| projector.prepareEmbeddingGemma2RasterForBackend(self.allocator(), raster, self.session.backend()),
                 else => unreachable,
             } catch |err| {
                 if (self.errors) |errors| {
@@ -665,7 +826,7 @@ const PreparationSlot = struct {
             self.retained += 1;
         }
         self.retained_bytes = self.input_bytes;
-        for (self.pixels[0..self.retained]) |image| self.retained_bytes = std.math.add(usize, self.retained_bytes, image.pixels.len * 4) catch return error.ResourceLimitExceeded;
+        for (self.pixels[0..self.retained]) |image| self.retained_bytes = std.math.add(usize, self.retained_bytes, image.retainedBytes()) catch return error.ResourceLimitExceeded;
         try self.permit.?.retainHostBytes(self.retained_bytes);
         self.prepare_ns = mediaNow() - started;
     }
@@ -788,7 +949,7 @@ fn consumePreparedMedia(slot: *PreparationSlot, tokenizer: Tokenizer, cfg: encod
     defer permit.deinit();
     var managed = try factory.getManagedComputeBackend(session, a, null, control);
     defer managed.deinit();
-    const transfer_before = managed.backend.debugTimingSnapshot().provider;
+    const transfer_before = MediaTransferSnapshot.init(&managed.backend);
     defer observeResidentTransfers(&managed.backend, transfer_before, options);
     const vision_started = mediaNow();
     if (residentImagesEnabled(&managed.backend, options)) {
@@ -851,7 +1012,7 @@ fn embedImageCohort(a: std.mem.Allocator, session: Session, tokenizer: Tokenizer
     for (images, 0..) |bytes, index| {
         try control.check();
         if (item_errors) |errors| if (errors[index] != null) continue;
-        pixels[retained] = projector.prepareEmbeddingGemma2Image(a, bytes) catch |err| {
+        pixels[retained] = projector.prepareEmbeddingGemma2ImageForBackend(a, bytes, session.backend()) catch |err| {
             if (item_errors) |errors| {
                 if (err == error.OutOfMemory or err == error.Cancelled or err == error.Canceled or err == error.Timeout or err == error.DeadlineExceeded or err == error.MemoryBudgetExceeded) return err;
                 errors[index] = err;
@@ -871,7 +1032,7 @@ fn embedImageCohort(a: std.mem.Allocator, session: Session, tokenizer: Tokenizer
     if (options.timings) |t| t.preprocess_ns += mediaNow() - preprocess_started;
     if (retained == 0) return vectors;
     var retained_bytes = input_bytes;
-    for (pixels[0..retained]) |item| retained_bytes = std.math.add(usize, retained_bytes, item.pixels.len * 4) catch return error.ResourceLimitExceeded;
+    for (pixels[0..retained]) |item| retained_bytes = std.math.add(usize, retained_bytes, item.retainedBytes()) catch return error.ResourceLimitExceeded;
     try host_permit.retainHostBytes(retained_bytes);
     if (lock) |mutex| try control.lock(mutex);
     defer if (lock) |mutex| mutex.unlock();
@@ -879,7 +1040,7 @@ fn embedImageCohort(a: std.mem.Allocator, session: Session, tokenizer: Tokenizer
     defer permit.deinit();
     var managed = try factory.getManagedComputeBackend(session, a, null, control);
     defer managed.deinit();
-    const transfer_before = managed.backend.debugTimingSnapshot().provider;
+    const transfer_before = MediaTransferSnapshot.init(&managed.backend);
     defer observeResidentTransfers(&managed.backend, transfer_before, options);
     if (residentImagesEnabled(&managed.backend, options)) {
         if (options.timings) |t| t.resident_cohorts += 1;
@@ -927,17 +1088,18 @@ fn embedRasterCohort(a: std.mem.Allocator, session: Session, tokenizer: Tokenize
     }
     // Image soft tokens are capped at 280. Reserve a conservative 512-token
     // row before projection; a cohort occupies at most 2048 padded slots.
+    const max_sequence = @min(raster_max_sequence, options.max_tokens);
     const vision_limit: usize = if (session.backend() == .metal or session.backend() == .cuda) 2 * 1024 * 1024 * 1024 else 512 * 1024 * 1024;
     const vision_scratch = try projector.embeddingGemma2RasterScratch(rasters, vision_limit);
     var host_permit = try session.admitHostPreprocess(input_bytes);
     defer host_permit.deinit();
     if (lock) |mutex| try control.lock(mutex);
     defer if (lock) |mutex| mutex.unlock();
-    var permit = try session.admit(.{ .batch = rasters.len, .sequence = raster_max_sequence, .input_bytes = input_bytes, .pre_admitted_host_bytes = input_bytes, .host_preprocess_bytes = 512 * 1024 * 1024, .workspace_bytes = vision_scratch + (if (session.backend() == .metal) @as(usize, 768 * 1024 * 1024) else @as(usize, 512 * 1024 * 1024)), .output_bytes = rasters.len * raster_max_sequence * 768 * @sizeOf(f32) });
+    var permit = try session.admit(.{ .batch = rasters.len, .sequence = max_sequence, .input_bytes = input_bytes, .pre_admitted_host_bytes = input_bytes, .host_preprocess_bytes = 512 * 1024 * 1024, .workspace_bytes = vision_scratch + (if (session.backend() == .metal) @as(usize, 768 * 1024 * 1024) else @as(usize, 512 * 1024 * 1024)), .output_bytes = rasters.len * max_sequence * 768 * @sizeOf(f32) });
     defer permit.deinit();
     var managed = try factory.getManagedComputeBackend(session, a, null, control);
     defer managed.deinit();
-    const transfer_before = managed.backend.debugTimingSnapshot().provider;
+    const transfer_before = MediaTransferSnapshot.init(&managed.backend);
     defer observeResidentTransfers(&managed.backend, transfer_before, options);
     const image_scope = @import("antfly_image").work_control.Scope.enter(control.imageWorkControl());
     defer image_scope.deinit();
@@ -947,7 +1109,7 @@ fn embedRasterCohort(a: std.mem.Allocator, session: Session, tokenizer: Tokenize
     defer for (pixels[0..pixel_count]) |item| item.deinit();
     for (rasters) |raster| {
         try control.check();
-        pixels[pixel_count] = try projector.prepareEmbeddingGemma2Raster(a, raster);
+        pixels[pixel_count] = try projector.prepareEmbeddingGemma2RasterForBackend(a, raster, session.backend());
         pixel_count += 1;
     }
     if (options.timings) |t| t.preprocess_ns += mediaNow() - preprocess_started;
@@ -994,16 +1156,29 @@ fn embedRasterCohort(a: std.mem.Allocator, session: Session, tokenizer: Tokenize
     return vectors;
 }
 
-fn observeResidentTransfers(cb: *const ComputeBackend, before: @import("../ops/ops.zig").NativeQuantTimingStats, options: Options) void {
+const MediaTransferSnapshot = struct {
+    metal: @import("../ops/ops.zig").NativeQuantTimingStats,
+    cuda: @import("../ops/ops.zig").TrainingRuntimeStats,
+
+    fn init(cb: *const ComputeBackend) MediaTransferSnapshot {
+        return .{ .metal = cb.debugTimingSnapshot().provider, .cuda = cb.trainingRuntimeStats() };
+    }
+};
+
+fn observeResidentTransfers(cb: *const ComputeBackend, before: MediaTransferSnapshot, options: Options) void {
     if (options.timings) |t| {
         const after = cb.debugTimingSnapshot().provider;
         if (cb.kind() == .metal) {
-            t.gpu_frame_ns += after.decoder_runtime_frame_gpu_nanos -| before.decoder_runtime_frame_gpu_nanos;
-            t.frame_submits += after.decoder_runtime_frame_submits -| before.decoder_runtime_frame_submits;
-            t.frame_wait_ns += after.decoder_runtime_frame_wait_nanos -| before.decoder_runtime_frame_wait_nanos;
-            t.download_bytes = (t.download_bytes orelse 0) + after.metal_tensor_host_mirror_download_bytes - before.metal_tensor_host_mirror_download_bytes;
-            t.readbacks = (t.readbacks orelse 0) + after.metal_tensor_to_host_device_calls - before.metal_tensor_to_host_device_calls;
+            t.gpu_frame_ns += after.decoder_runtime_frame_gpu_nanos -| before.metal.decoder_runtime_frame_gpu_nanos;
+            t.frame_submits += after.decoder_runtime_frame_submits -| before.metal.decoder_runtime_frame_submits;
+            t.frame_wait_ns += after.decoder_runtime_frame_wait_nanos -| before.metal.decoder_runtime_frame_wait_nanos;
+            t.download_bytes = (t.download_bytes orelse 0) + after.metal_tensor_host_mirror_download_bytes - before.metal.metal_tensor_host_mirror_download_bytes;
+            t.readbacks = (t.readbacks orelse 0) + after.metal_tensor_to_host_device_calls - before.metal.metal_tensor_to_host_device_calls;
             t.device_owned_peak_bytes = @max(t.device_owned_peak_bytes orelse 0, after.metal_tensor_device_owned_peak_live_bytes);
+        } else if (cb.kind() == .cuda) {
+            const runtime = cb.trainingRuntimeStats();
+            t.download_bytes = (t.download_bytes orelse 0) + runtime.d2h_bytes - before.cuda.d2h_bytes;
+            t.readbacks = (t.readbacks orelse 0) + runtime.download_events - before.cuda.download_events;
         }
     }
 }
@@ -1011,14 +1186,15 @@ fn observeResidentTransfers(cb: *const ComputeBackend, before: @import("../ops/o
 /// Tokenization stays on CPU; projected pixels and prompt embedding rows stay
 /// on their creating backend through the encoder. Padding never pools into a row.
 fn runResidentImageBatch(a: std.mem.Allocator, cb: *const ComputeBackend, cfg: encoder.Config, tokenizer: Tokenizer, projected: *const projector.ResidentProjectedImages, options: Options) ![][]f32 {
-    return runResidentMediaBatch(a, cb, cfg, tokenizer, projected, options, false);
+    return runResidentMediaBatch(a, cb, cfg, tokenizer, projected, options, false, null);
 }
-fn runResidentMediaBatch(a: std.mem.Allocator, cb: *const ComputeBackend, cfg: encoder.Config, tokenizer: Tokenizer, projected: *const projector.ResidentProjectedImages, options: Options, is_audio: bool) ![][]f32 {
-    const max_sequence: usize = if (is_audio) 1024 else raster_max_sequence;
+fn runResidentMediaBatch(a: std.mem.Allocator, cb: *const ComputeBackend, cfg: encoder.Config, tokenizer: Tokenizer, projected: *const projector.ResidentProjectedImages, options: Options, is_audio: bool, input_tokens: ?[]usize) ![][]f32 {
+    const max_sequence: usize = @min(options.max_tokens, if (is_audio) @as(usize, 1024) else raster_max_sequence);
     const marker: i64 = if (is_audio) 258881 else 258880;
     const started = mediaNow();
     const batch = projected.tokens_per_image.len;
     if (batch == 0 or batch > raster_max_batch or projected.hidden_size != 512) return error.InvalidInputShape;
+    if (input_tokens) |counts| if (counts.len != batch) return error.InvalidInputShape;
     var tokens: [raster_max_batch]PreparedGroup = undefined;
     var initialized: usize = 0;
     defer for (tokens[0..initialized]) |row| row.deinit(a);
@@ -1040,12 +1216,32 @@ fn runResidentMediaBatch(a: std.mem.Allocator, cb: *const ComputeBackend, cfg: e
         for (ids, encoded.ids[0..length]) |*dest, id| dest.* = id;
         for (mask, encoded.attention_mask[0..length]) |*dest, m| dest.* = m;
         tokens[initialized] = .{ .ids = ids, .mask = mask, .embeddings = null };
+        if (input_tokens) |counts| counts[initialized] = length;
         initialized += 1;
     }
     const batch_inputs = try packResidentMediaRows(a, cb, tokens[0..initialized], projected.embeddings, projected.tokens_per_image, marker, max_sequence);
     defer batch_inputs.deinit(a, cb);
     if (options.timings) |t| t.pack_ns += mediaNow() - started;
     const encoder_started = mediaNow();
+    if (comptime @import("build_options").enable_cuda) {
+        if (cb.kind() == .cuda) {
+            const compute: *@import("../ops/cuda/cuda_compute.zig").CudaCompute = @ptrCast(@alignCast(cb.ptr));
+            const flat = try compute.runEmbeddingGemma2(a, cfg.resident orelse return error.UnsupportedEmbeddingGemma2Backend, .{ .resident_embeddings = batch_inputs.embeddings }, batch_inputs.mask, batch, batch_inputs.sequence, options.dimensions, cb.execution_control);
+            defer a.free(flat);
+            const vectors = try a.alloc([]f32, batch);
+            var copied_vectors: usize = 0;
+            errdefer {
+                for (vectors[0..copied_vectors]) |vector| a.free(vector);
+                a.free(vectors);
+            }
+            for (vectors, 0..) |*vector, index| {
+                vector.* = try a.dupe(f32, flat[index * options.dimensions ..][0..options.dimensions]);
+                copied_vectors += 1;
+            }
+            if (options.timings) |t| t.encoder_ns += mediaNow() - encoder_started;
+            return vectors;
+        }
+    }
     const output = try encoder.forwardEmbeddingsCT(cb, a, cfg, batch_inputs.embeddings, batch_inputs.mask, batch, batch_inputs.sequence);
     defer cb.free(output);
     if (options.timings) |t| t.encoder_ns += mediaNow() - encoder_started;
@@ -1090,22 +1286,28 @@ fn packResidentMediaRows(a: std.mem.Allocator, cb: *const ComputeBackend, rows: 
     defer cb.free(weight);
     const raw = try cb.embeddingLookup(weight, ids, ids.len, 512);
     defer cb.free(raw);
-    const scaled = (try cb.multiplyScalar(raw, @sqrt(@as(f32, 512)))) orelse return error.ResidentImageOperationUnavailable;
+    const scaled = (try cb.multiplyScalar(raw, if (cb.kind() == .cuda) @as(f32, 22.625) else @sqrt(@as(f32, 512)))) orelse return error.ResidentImageOperationUnavailable;
     const input = try cb.ensureDeviceResidentOwned(scaled);
     errdefer cb.free(input);
     var source_offset: usize = 0;
     for (rows, lengths, 0..) |row, count, index| {
-        var first: ?usize = null;
         var found: usize = 0;
-        for (row.ids, 0..) |id, r| {
-            if (id == marker) {
-                if (first == null) first = r;
-                if (r != first.? + found or row.mask[r] == 0) return error.InvalidEmbeddingGroup;
-                found += 1;
+        var r: usize = 0;
+        while (r < row.ids.len) {
+            if (row.ids[r] != marker) {
+                r += 1;
+                continue;
             }
+            const first = r;
+            while (r < row.ids.len and row.ids[r] == marker) : (r += 1) {
+                if (row.mask[r] == 0) return error.InvalidEmbeddingGroup;
+            }
+            const run = r - first;
+            if (found + run > count) return error.InvalidEmbeddingGroup;
+            if (!try cb.copyRows2D(a, input, index * sequence + first, projected, source_offset + found, run, 512)) return error.ResidentImageOperationUnavailable;
+            found += run;
         }
         if (found != count or count == 0) return error.InvalidEmbeddingGroup;
-        if (!try cb.copyRows2D(a, input, index * sequence + first.?, projected, source_offset, count, 512)) return error.ResidentImageOperationUnavailable;
         source_offset += count;
     }
     return .{ .embeddings = input, .mask = mask, .sequence = sequence };
@@ -1137,7 +1339,12 @@ fn poolResidentBatch(a: std.mem.Allocator, cb: *const ComputeBackend, output: @i
             if (count == 0) return error.EmptyEmbeddingInput;
             const active = (try cb.takeRows(row, indexes[0..count], count, 768)) orelse return error.ResidentImageOperationUnavailable;
             defer cb.free(active);
-            break :blk try cb.primReduceMean(active, &.{0}, &.{ @intCast(count), 768 });
+            const mean = try cb.primReduceMean(active, &.{0}, &.{ @intCast(count), 768 });
+            if (dimensions == 768) break :blk mean;
+            defer cb.free(mean);
+            // Apply Matryoshka truncation before the download, matching the
+            // fused masked-mean path's final-vector-only transfer contract.
+            break :blk try cb.sliceLastDim(mean, 0, dimensions);
         };
         defer cb.free(pooled);
         const values = try cb.toFloat32(pooled, a);
@@ -1232,12 +1439,23 @@ fn poolBatch(a: std.mem.Allocator, values: []const f32, mask: []const i64, batch
 
 /// Validation independent of model loading, shared by HTTP and linked APIs.
 pub fn validateGroup(group: Group, options: Options) !void {
+    // Preflight validates the layout before a session is acquired. The
+    // execution path additionally checks the active backend's capabilities.
+    return validateGroupContent(group, options, true);
+}
+
+fn validateGroupContent(group: Group, options: Options, allow_manual_markers: bool) !void {
     _ = try encoder.taskPrefix(options.task_type);
     if (!encoder.validDimension(options.dimensions)) return error.InvalidEmbeddingDimensions;
+    if (options.max_tokens == 0 or options.max_tokens > encoder.max_tokens) return error.InvalidEmbeddingTokenLimit;
     if (group.content.len == 0 or group.content.len > 64) return error.InvalidEmbeddingGroup;
     var has_text = false;
     var bytes: usize = 0;
     var raster_bytes: usize = 0;
+    var images: usize = 0;
+    var audios: usize = 0;
+    var image_markers: usize = 0;
+    var audio_markers: usize = 0;
     for (group.content) |part| {
         const value = partBytes(part);
         if (part == .raster) {
@@ -1245,15 +1463,52 @@ pub fn validateGroup(group: Group, options: Options) !void {
             try @import("image.zig").DecodeLimits.inference_default.validate(part.raster.width, part.raster.height);
         }
         if (value.len == 0) return error.EmptyEmbeddingInput;
+        switch (part) {
+            .image, .raster => images += 1,
+            .audio => audios += 1,
+            .video => if (group.content.len != 1 or group.title != null) return error.InvalidEmbeddingGroup,
+            .text => {},
+        }
         if (part == .raster) raster_bytes = std.math.add(usize, raster_bytes, value.len) catch return error.ResourceLimitExceeded else bytes = std.math.add(usize, bytes, value.len) catch return error.ResourceLimitExceeded;
         if (part == .text) {
             has_text = true;
             if (!std.unicode.utf8ValidateSlice(value)) return error.InvalidUtf8;
-            for ([_][]const u8{ "<|image", "<image|>", "<|audio", "<audio|>", "<|video|>" }) |marker| if (std.mem.indexOf(u8, value, marker) != null) return error.InvalidEmbeddingGroup;
+            var remaining = value;
+            while (std.mem.indexOfScalar(u8, remaining, '<')) |at| {
+                const tail = remaining[at..];
+                if (allow_manual_markers and std.mem.startsWith(u8, tail, "<|image|>")) {
+                    image_markers += 1;
+                    remaining = tail["<|image|>".len..];
+                    continue;
+                }
+                if (allow_manual_markers and std.mem.startsWith(u8, tail, "<|audio|>")) {
+                    audio_markers += 1;
+                    remaining = tail["<|audio|>".len..];
+                    continue;
+                }
+                for ([_][]const u8{ "<|image", "<image|>", "<|audio", "<audio|>", "<|video|>" }) |marker| if (std.mem.startsWith(u8, tail, marker)) return error.InvalidEmbeddingGroup;
+                remaining = tail[1..];
+            }
         }
     }
-    if (bytes > 64 * 1024 * 1024 or raster_bytes > 512 * 1024 * 1024) return error.ResourceLimitExceeded;
+    // The resident CUDA frontend expands explicit placeholders itself. Once
+    // any is present, every supplied media item must be referenced exactly
+    // once; generated wrapper tokens remain forbidden in caller text.
+    if (image_markers + audio_markers > 0 and (image_markers != images or audio_markers != audios)) return error.MediaPlaceholderMismatch;
+    if (bytes > (if (group.content.len == 1 and group.content[0] == .video) @as(usize, 256 * 1024 * 1024) else 64 * 1024 * 1024) or raster_bytes > 512 * 1024 * 1024) return error.ResourceLimitExceeded;
     if (group.title) |title| if (!has_text or !std.mem.eql(u8, options.task_type, "RETRIEVAL_DOCUMENT") or !std.unicode.utf8ValidateSlice(title) or title.len > 8192 or std.mem.indexOf(u8, title, "<") != null) return error.InvalidEmbeddingTitle;
+}
+
+test "embeddinggemma2 CUDA groups admit complete manual media layouts and reject malformed ones" {
+    try validateGroupContent(.{ .content = &.{ .{ .text = "before <|image|> after" }, .{ .image = "image" } } }, .{}, true);
+    try validateGroupContent(.{ .content = &.{ .{ .text = "<|audio|> then <|image|>" }, .{ .image = "image" }, .{ .audio = "audio" } } }, .{}, true);
+    try std.testing.expectError(error.MediaPlaceholderMismatch, validateGroupContent(.{ .content = &.{.{ .text = "<|image|>" }} }, .{}, true));
+    try std.testing.expectError(error.MediaPlaceholderMismatch, validateGroupContent(.{ .content = &.{ .{ .text = "<|image|><|image|>" }, .{ .image = "image" } } }, .{}, true));
+    try std.testing.expectError(error.MediaPlaceholderMismatch, validateGroupContent(.{ .content = &.{ .{ .text = "<|image|>" }, .{ .image = "image" }, .{ .audio = "audio" } } }, .{}, true));
+    for ([_][]const u8{ "<|image>", "<image|>", "<|audio>", "<audio|>", "<|video|>" }) |marker|
+        try std.testing.expectError(error.InvalidEmbeddingGroup, validateGroupContent(.{ .content = &.{ .{ .text = marker }, .{ .image = "image" } } }, .{}, true));
+    try validateGroup(.{ .content = &.{ .{ .text = "<|image|>" }, .{ .image = "image" } } }, .{});
+    try std.testing.expectError(error.InvalidEmbeddingGroup, validateGroupContent(.{ .content = &.{ .{ .text = "<|image|>" }, .{ .image = "image" } } }, .{}, false));
 }
 
 /// Encoder benchmark and serving share this boundary: prepared IDs/mask through
@@ -1299,6 +1554,38 @@ pub fn preparedText(cb: *const @import("../ops/ops.zig").ComputeBackend, a: std.
         for (vector, values[row * 768 ..][0..dimensions]) |*dest, value| dest.* += value / @as(f32, @floatFromInt(count));
     }
     return scoring.centroid(a, &.{vector}, dimensions);
+}
+
+test "embeddinggemma2 grouped tokenization rejects overflow without truncating" {
+    const Mock = struct {
+        tokens: usize,
+        fn encode(ptr: *anyopaque, a: std.mem.Allocator, _: []const u8, max_length: usize) !@import("inference_tokenizer").EncodeResult {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            const count = @min(self.tokens, max_length);
+            const ids = try a.alloc(i32, count);
+            errdefer a.free(ids);
+            const mask = try a.alloc(i32, count);
+            @memset(ids, 3);
+            @memset(mask, 1);
+            return .{ .ids = ids, .attention_mask = mask, .allocator = a };
+        }
+    };
+    var mock = Mock{ .tokens = 512 };
+    var vtable: Tokenizer.VTable = undefined;
+    vtable.encodeForModel = Mock.encode;
+    const tokenizer = Tokenizer{ .ptr = &mock, .vtable = &vtable };
+    const cb: ComputeBackend = undefined; // Text-only preparation does not invoke compute.
+    const group = Group{ .content = &.{.{ .text = "document" }} };
+    const options = Options{ .max_tokens = 512 };
+    const prepared = try prepareGroup(std.testing.allocator, &cb, tokenizer, group, options, .{});
+    defer prepared.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 512), prepared.ids.len);
+    for ([_]usize{ 513, 8192, 16384 }) |count| {
+        mock.tokens = count;
+        try std.testing.expectError(error.EmbeddingInputTooLong, prepareGroup(std.testing.allocator, &cb, tokenizer, group, options, .{}));
+    }
+    try std.testing.expectError(error.InvalidEmbeddingTokenLimit, validateGroup(group, .{ .max_tokens = 0 }));
+    try std.testing.expectError(error.InvalidEmbeddingTokenLimit, validateGroup(group, .{ .max_tokens = encoder.max_tokens + 1 }));
 }
 
 test "embeddinggemma2 raster batches bound padding and avoid singleton tails" {
@@ -1397,7 +1684,20 @@ fn checkResidentImageRows(cb: ComputeBackend, _: ComputeBackend) !void {
     const actual = try cb.toFloat32(inputs.embeddings, a);
     defer a.free(actual);
     for ([_]usize{ 1, 2, 5 }, [_]f32{ 1, 2, 3 }) |r, value| for (actual[r * 512 ..][0..512]) |v| try std.testing.expectEqual(value, v);
-    try std.testing.expectApproxEqAbs(@as(f32, 0.25) * @sqrt(@as(f32, 512)), actual[0], 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.25) * (if (cb.kind() == .cuda) @as(f32, 22.625) else @sqrt(@as(f32, 512))), actual[0], 1e-6);
+    // A clip's marker runs are separated by per-frame image wrappers.
+    var video_ids = [_]i64{ 2, 255999, 258884, 258884, 258882, 255999, 258884, 258882, 1 };
+    var video_mask: [video_ids.len]i64 = @splat(1);
+    const video_rows = [_]PreparedGroup{.{ .ids = &video_ids, .mask = &video_mask, .embeddings = null }};
+    const video_inputs = try packResidentMediaRows(a, &guarded, &video_rows, source, &.{3}, 258884, 8192);
+    defer video_inputs.deinit(a, &cb);
+    const video_actual = try cb.toFloat32(video_inputs.embeddings, a);
+    defer a.free(video_actual);
+    for ([_]usize{ 2, 3, 6 }, [_]f32{ 1, 2, 3 }) |r, value| for (video_actual[r * 512 ..][0..512]) |v| try std.testing.expectEqual(value, v);
+    for ([_]usize{ 0, 1, 4, 5, 7, 8 }) |r| try std.testing.expectEqual(actual[0], video_actual[r * 512]);
+    try std.testing.expectError(error.EmbeddingInputTooLong, packResidentMediaRows(a, &guarded, &video_rows, source, &.{3}, 258884, 8));
+    video_mask[6] = 0;
+    try std.testing.expectError(error.InvalidEmbeddingGroup, packResidentMediaRows(a, &guarded, &video_rows, source, &.{3}, 258884, 8192));
     ids0[2] = 12;
     try std.testing.expectError(error.InvalidEmbeddingGroup, packResidentImageRows(a, &guarded, &rows, source, &.{ 2, 1 }));
 }
@@ -1426,6 +1726,7 @@ fn checkResidentPooling(cb: ComputeBackend, _: ComputeBackend) !void {
     }
     const after = @import("../ops/media_residency_test.zig").Transfers.snapshot(cb);
     if (cb.kind() == .metal) try std.testing.expectEqual(@as(u64, 2 * 128 * 4), after.downloads - before.downloads);
+    if (cb.kind() == .cuda) try std.testing.expectEqual(@as(u64, 2 * 128 * 4), after.cuda_bytes - before.cuda_bytes);
     try std.testing.expectApproxEqAbs(@as(f32, 0.6), vectors[0][0], 1e-6);
     try std.testing.expectApproxEqAbs(@as(f32, -0.6), vectors[1][0], 1e-6);
     try std.testing.expectApproxEqAbs(@as(f32, 0.8), vectors[1][1], 1e-6);
@@ -1528,7 +1829,7 @@ fn checkResidentAudioRows(cb: ComputeBackend, _: ComputeBackend) !void {
     const actual = try cb.toFloat32(inputs.embeddings, a);
     defer a.free(actual);
     for ([_]usize{ 1, 2, 5 }, [_]f32{ 1, 2, 3 }) |r, value| for (actual[r * 512 ..][0..512]) |v| try std.testing.expectEqual(value, v);
-    try std.testing.expectApproxEqAbs(@as(f32, 0.25) * @sqrt(@as(f32, 512)), actual[0], 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.25) * (if (cb.kind() == .cuda) @as(f32, 22.625) else @sqrt(@as(f32, 512))), actual[0], 1e-6);
     ids0[2] = 12;
     try std.testing.expectError(error.InvalidEmbeddingGroup, packResidentMediaRows(a, &guarded, &rows, source, &.{ 2, 1 }, 258881, 1024));
     // Audio can exceed the image sequence capacity without losing valid rows.
@@ -1550,4 +1851,27 @@ fn checkResidentAudioRows(cb: ComputeBackend, _: ComputeBackend) !void {
 
 test "embeddinggemma2 resident audio packing preserves clip isolation and rejects readbacks on Metal" {
     try @import("../ops/media_residency_test.zig").onMetal(populateResidentImageRows, checkResidentAudioRows);
+}
+
+test "embeddinggemma2 video rejects mixed groups and invalid limits before decoding" {
+    try validateGroup(.{ .content = &.{.{ .video = "clip" }} }, .{});
+    try std.testing.expectError(error.InvalidEmbeddingGroup, validateGroup(.{ .content = &.{ .{ .text = "caption" }, .{ .video = "clip" } } }, .{}));
+    try std.testing.expectError(error.InvalidEmbeddingGroup, validateGroup(.{ .title = "clip", .content = &.{.{ .video = "clip" }} }, .{}));
+    try std.testing.expectError(error.InvalidEmbeddingTokenLimit, validateGroup(.{ .content = &.{.{ .video = "clip" }} }, .{ .max_tokens = 0 }));
+}
+
+test "embeddinggemma2 truncated video headers are input errors without masking runtime failures" {
+    const media = @import("antfly_video_media");
+    const a = std.testing.allocator;
+    for ([_][]const u8{ &.{1}, @embedFile("../testdata/video/closed.mp4")[0..7], &.{ 0, 0, 0, 1, 'f', 'r', 'e', 'e' } }) |bytes| {
+        var source = media.source.Source{ .allocator = a, .storage = .{ .borrowed = bytes }, .identity = "truncated" };
+        if (media.mp4.Reader.init(a, &source, .{})) |parsed| {
+            var reader = parsed;
+            reader.deinit();
+            return error.TestUnexpectedResult;
+        } else |err| try std.testing.expectEqual(error.InvalidVideoInput, videoInputError(err));
+        try std.testing.expectEqual(@as(usize, 0), source.retained_bytes);
+    }
+    for ([_]anyerror{ error.Cancelled, error.Timeout, error.OutOfMemory, error.CudaDriverError, error.NvdecUnavailable }) |err|
+        try std.testing.expectEqual(err, videoInputError(err));
 }

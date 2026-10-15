@@ -18,8 +18,10 @@ T = TypeVar("T", bound="InferenceEmbeddingGroup")
 
 @_attrs_define
 class InferenceEmbeddingGroup:
-    """EmbeddingGemma 2 ordered text, image and audio parts producing one joint vector. Video is unsupported. The expanded
-    sequence including all media soft tokens must fit 8192 tokens.
+    """EmbeddingGemma 2 ordered text, image and audio parts producing one joint vector. On Linux CUDA, a group containing
+    one video/mp4 part produces one clip embedding using NVDEC; video groups cannot include a title or other parts.
+    Video requires progressive SDR H.264 MP4, at most 60 seconds and 256 MiB, subject to narrower request limits. The
+    expanded sequence including all media soft tokens must fit 8192 tokens.
 
         Attributes:
             content (list[ImageURLContentPart | MediaContentPart | TextContentPart]):

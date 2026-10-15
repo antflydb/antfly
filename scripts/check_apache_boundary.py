@@ -165,6 +165,7 @@ SOURCE_MODULES = {
     "antfly_google": ("zig/lib/google/src/root.zig",),
     "antfly_hash": ("zig/lib/hash/src/mod.zig",),
     "antfly_image": ("zig/lib/image/src/mod.zig",),
+    "antfly_video_media": ("zig/lib/media/src/inference.zig",),
     "antfly_indexes_openapi": (
         "zig/pkg/antfly-embedded/src/openapi/generated/antfly_indexes_openapi/root.zig",
     ),

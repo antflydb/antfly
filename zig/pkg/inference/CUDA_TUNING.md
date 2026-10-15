@@ -4,6 +4,32 @@ Gemma 4 QAT CUDA measurements must use the shared profile in
 `scripts/gemma4/gemma4_qat_cuda_tuning.sh`. The CLI benchmark and server wrapper both
 source it so production route settings stay aligned.
 
+## EmbeddingGemma 2 CUDA image residency
+
+Pure-image groups and the direct image embedding pipeline retain resized patches,
+vision activations, projected soft tokens, and packed encoder inputs on CUDA.
+Compressed image decoding and tokenization remain on CPU; decoded RGB uploads once
+per image. CUDA performs Pillow-compatible resizing and patch extraction. Only
+final vectors download (3,072 bytes per 768-dimensional FP32 vector). Grouped
+requests truncate to the requested dimensions on CUDA; the direct pipeline
+preserves its 768-dimensional return contract.
+Mixed text/media groups retain the ordered-content frontend.
+
+CUDA image cohorts default to one image to preserve the existing BF16 arithmetic.
+`ANTFLY_INFERENCE_CUDA_EMBEDDING_GEMMA2_IMAGE_BATCH=1` enables experimental cohorts
+of up to four compatible images with bounded preparation lookahead. Attention is
+isolated per image, but larger GEMMs can change final vectors; this option is not
+qualified for exact-output workloads. Metal cohort policy is unchanged. Broker
+keys include expanded token limits, so requests with different limits cannot share
+a cohort. CUDA audio coalescing remains disabled.
+
+The optional fused vision-attention path requires a discoverable
+`libcudnn.so.9` (module minimum: cuDNN 9.13). Add its directory to
+`LD_LIBRARY_PATH` when it is not installed system-wide. Plans that decline
+retain the existing fallback. For diagnostics, set
+`ANTFLY_INFERENCE_CUDA_EMBEDDING_GEMMA2_STATS=1` and inspect
+`embedding_gemma2_cudnn_stats` for `vision_executes` and `unavailable`.
+
 ## Production Defaults
 
 The tuned profile currently uses these conservative defaults:
@@ -122,10 +148,21 @@ single-row E2B GGML-Q8_1 FFN route. Its default is `off`, and qualification is
 scoped to SM89. Likewise,
 `ANTFLY_INFERENCE_CUDA_CUBLASLT_BF16_TUNING_PROFILE=sm89-prefill` is an
 experimental SM89-only BF16 prefill profile. That typed profile is fixed at 8
-algorithm candidates, 1 warmup, 3 timed iterations, and a minimum of 128 rows;
-these are part of the profile contract rather than free tuning knobs. Its
-default is `off` so normal inference never performs synchronous first-use
-algorithm timing.
+algorithm candidates, 3 warmups, 10 timed iterations, and a minimum of 32
+rows; these are part of the profile contract rather than free tuning knobs.
+Its default is `off` so normal inference uses cuBLASLt's first admissible
+heuristic and never performs synchronous first-use algorithm timing. This is
+also the repeatable retrieval path: timed selection is owned by each model
+session and can otherwise choose numerically different algorithms for models
+with identical shapes.
+
+EmbeddingGemma 2 global text attention uses the resident SM89 BF16 flash
+kernel for its exact 512-token, four-query-head, one-KV-head, 512-dimension
+geometry. This route is independent of the optional cuDNN
+policy. Other global shapes use the generic attention kernel. Sliding text
+attention may use cuDNN for supported shapes; setting
+`ANTFLY_INFERENCE_CUDA_EMBEDDING_GEMMA2_CUDNN=0`, unavailable plans, and
+workspace-budget limits retain its existing SM89 or generic fallback.
 
 Continuous batching and request-scoped graph replay are mutually exclusive.
 Set both server controls explicitly when running the batching profile:
@@ -1097,3 +1134,60 @@ Because continuous batching remains default-off, scheduled and release CI
 use an explicit `0.40` C2 speedup floor as a correctness and catastrophic-
 regression check. The benchmark's `1.5` default remains the manual promotion
 gate before enabling batching by default.
+
+
+### EmbeddingGemma2 video embeddings
+
+Linux CUDA accepts one H.264 MP4 clip per embedding input, through `inference
+embed <model-dir> --backend cuda --video <clip.mp4>` or a `video/mp4` media part:
+
+```json
+{"model":"embeddinggemma-2","input":[{"content":[{"type":"media","mime_type":"video/mp4","data":"<base64 MP4>"}]}]}
+```
+
+The checkpoint's video processor samples at 1 FPS and uniformly caps the sampled
+sequence at 32 frames. Each frame contributes up to 140 visual tokens. Image
+wrappers surround each frame's video markers, with BOS/EOS once around the clip;
+the encoder pools this complete sequence into one normalized embedding. This
+preserves temporal order and does not average independently embedded frames.
+Expanded inputs exceeding the configured token limit fail without truncation.
+
+NVDEC surfaces, RGB8 conversion, torchvision-compatible antialiased bicubic
+resize, patch projection, frame packing, and encoder activations stay on CUDA.
+The NV12 conversion uses nearest chroma, round-to-nearest RGB8, and BT.601
+(default/unspecified) or BT.709 with the declared full/limited range. This is
+an explicit decoder policy; FFmpeg/PyAV RGB24 may use different chroma filtering
+and integer rounding. The CPU handles compressed MP4 packets, timestamps,
+resize coefficients, and token IDs. Only the final embedding vector is downloaded. Selected surfaces are
+synchronized before NVDEC unmaps them. Decoder errors discard cached surfaces;
+successful clips reuse the decoder.
+
+The supported envelope is progressive 8-bit SDR H.264 MP4, at most 60 seconds,
+256 MiB, 4096 pixels per side, and 18,000 packets. HTTP/CLI request budgets can
+be narrower. Rotation, non-square pixels, HDR, interlacing, other codecs, and
+mixed text/image/audio/video groups are rejected. The existing Gemma4 generation
+sampler and still-image preprocessing are unchanged. NVDEC's `libnvcuvid.so.1`
+is required at runtime; no FFmpeg process or runtime CUDA compiler is needed.
+
+HTTP reports corrupt or truncated clips as `400 INVALID_VIDEO`, unsupported
+backends as `400 UNSUPPORTED_VIDEO_BACKEND`, and a missing NVDEC library as
+`503 VIDEO_BACKEND_UNAVAILABLE`. With `error_policy: "per_item"`, failures retain
+their input indexes and valid sibling inputs can still complete.
+
+For HTTP serving, set `ANTFLY_INFERENCE_REQUIRED_BACKEND=cuda` so ordinary
+requests use CUDA. A CUDA-specific preload alone does not force that selection.
+Configure backend and scratch budgets for the model plus video workspace.
+
+The checked-in six-second fixture at `src/testdata/video/closed.mp4` and its
+provenance record cover decoder, sampling, cancellation, and resident preprocessing
+regressions. CUDA tests also compare RGB conversion and resized patches against the
+CPU reference. Preserve those small fixtures when changing the decoder or sampler.
+
+Both Gemma4 and EmbeddingGemma2 video projectors compact into an owned device
+allocation before releasing their accumulation buffer. CUDA row slices borrow
+their source, so returning a slice here would allow subsequent token lookup to
+overwrite projected video features. A CUDA regression test overwrites the
+accumulator and checks the returned rows remain intact.
+
+Production changes to video decoding, sampling, color conversion, or token
+packing require renewed endpoint parity and recovery checks on the target GPU.

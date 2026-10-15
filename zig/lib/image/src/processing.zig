@@ -642,7 +642,7 @@ fn sampleBicubic(
     return std.math.clamp(accum, 0.0, 255.0);
 }
 
-const BicubicAxis = struct {
+pub const BicubicAxis = struct {
     allocator: std.mem.Allocator,
     starts: []usize,
     offsets: []usize,
@@ -659,7 +659,7 @@ const BicubicAxis = struct {
 /// Build Pillow-compatible antialiased bicubic coefficients. Downsampling
 /// widens the cubic support by the reduction factor and renormalizes the
 /// surviving in-bounds taps instead of clamping out-of-bounds samples.
-fn buildPillowBicubicAxis(
+pub fn buildPillowBicubicAxis(
     allocator: std.mem.Allocator,
     source_size: usize,
     target_size: usize,
@@ -679,6 +679,7 @@ fn buildPillowBicubicAxis(
     const filter_scale = @max(scale, 1.0);
     const support = 2.0 * filter_scale;
     for (0..target_size) |target| {
+        if (target & 63 == 0) try @import("work_control.zig").check();
         const center = (@as(f64, @floatFromInt(target)) + 0.5) * scale;
         var first: isize = @intFromFloat(center - support + 0.5);
         var last: isize = @intFromFloat(center + support + 0.5);
@@ -773,22 +774,57 @@ fn preprocessDecodedRectPillowBicubic(
         }
     }
 
+    const row_bytes = target_width * 3;
+    const Vec = @Vector(8, i32);
     for (0..target_height) |target_y| {
         try @import("work_control.zig").check();
         const start = vertical_axis.starts[target_y];
         const begin = vertical_axis.offsets[target_y];
         const end = vertical_axis.offsets[target_y + 1];
-        for (0..target_width) |target_x| {
-            for (0..3) |channel| {
-                var value: i64 = @as(i64, 1) << (vertical_axis.precision_bits - 1);
-                for (vertical_axis.weights[begin..end], 0..) |weight, offset| {
-                    const source_y = start + offset;
-                    value += @as(i64, horizontal[(source_y * target_width + target_x) * 3 + channel]) * weight;
+        const weights = vertical_axis.weights[begin..end];
+        // Bound every partial accumulator before narrowing to SIMD i32.
+        // The wider scalar path preserves the existing behavior when a
+        // coefficient set cannot safely use the faster representation.
+        var magnitude: u64 = @as(u64, 1) << (vertical_axis.precision_bits - 1);
+        var vector_safe = vertical_axis.precision_bits < 32;
+        for (weights) |weight| {
+            const term = @as(u64, @intCast(@abs(@as(i64, weight)))) * 255;
+            magnitude = std.math.add(u64, magnitude, term) catch {
+                vector_safe = false;
+                break;
+            };
+        }
+        var byte_x: usize = 0;
+        if (vector_safe and magnitude <= std.math.maxInt(i32)) {
+            while (byte_x + 8 <= row_bytes) : (byte_x += 8) {
+                var accum: Vec = @splat(@as(i32, 1) << @intCast(vertical_axis.precision_bits - 1));
+                for (weights, 0..) |weight, offset| {
+                    const source = (start + offset) * row_bytes + byte_x;
+                    const bytes: @Vector(8, u8) = horizontal[source..][0..8].*;
+                    const values: Vec = @intCast(bytes);
+                    accum += values * @as(Vec, @splat(weight));
                 }
-                const sample: f32 = @floatFromInt(clipPillowAccumulator(value, vertical_axis.precision_bits));
-                result[channel * target_height * target_width + target_y * target_width + target_x] =
-                    normalizeSample(sample, mean[channel], std_dev[channel], rescale_factor);
+                const clipped = @min(
+                    @max(accum >> @as(@Vector(8, u5), @splat(@intCast(vertical_axis.precision_bits))), @as(Vec, @splat(0))),
+                    @as(Vec, @splat(255)),
+                );
+                inline for (0..8) |lane| {
+                    const channel = (byte_x + lane) % 3;
+                    const x = (byte_x + lane) / 3;
+                    const sample: f32 = @floatFromInt(clipped[lane]);
+                    result[channel * target_height * target_width + target_y * target_width + x] =
+                        normalizeSample(sample, mean[channel], std_dev[channel], rescale_factor);
+                }
             }
+        }
+        while (byte_x < row_bytes) : (byte_x += 1) {
+            var value: i64 = @as(i64, 1) << (vertical_axis.precision_bits - 1);
+            for (weights, 0..) |weight, offset| value += @as(i64, horizontal[(start + offset) * row_bytes + byte_x]) * weight;
+            const channel = byte_x % 3;
+            const x = byte_x / 3;
+            const sample: f32 = @floatFromInt(clipPillowAccumulator(value, vertical_axis.precision_bits));
+            result[channel * target_height * target_width + target_y * target_width + x] =
+                normalizeSample(sample, mean[channel], std_dev[channel], rescale_factor);
         }
     }
 }

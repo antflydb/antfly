@@ -54,7 +54,7 @@ pub fn validateProcessor(a: std.mem.Allocator, bytes: []const u8) !void {
     const reference = try std.json.parseFromSlice(std.json.Value, a, @embedFile("embedding_gemma2_processor.json"), .{});
     defer reference.deinit();
     if (parsed.value != .object) return error.InvalidEmbeddingGemma2Processor;
-    for ([_][]const u8{ "processor_class", "audio_ms_per_token", "audio_seq_length", "image_seq_length", "feature_extractor", "image_processor" }) |key| {
+    for ([_][]const u8{ "processor_class", "audio_ms_per_token", "audio_seq_length", "image_seq_length", "feature_extractor", "image_processor", "video_processor" }) |key| {
         if (!same(parsed.value.object.get(key) orelse return error.InvalidEmbeddingGemma2Processor, reference.value.object.get(key).?)) return error.InvalidEmbeddingGemma2Processor;
     }
 }
@@ -76,6 +76,7 @@ pub fn validateTokenizer(a: std.mem.Allocator, bytes: []const u8) !void {
         .{ .id = 0, .token = "<pad>" },          .{ .id = 1, .token = "<eos>" },         .{ .id = 2, .token = "<bos>" },
         .{ .id = 255999, .token = "<|image>" },  .{ .id = 256000, .token = "<|audio>" }, .{ .id = 258880, .token = "<|image|>" },
         .{ .id = 258881, .token = "<|audio|>" }, .{ .id = 258882, .token = "<image|>" }, .{ .id = 258883, .token = "<audio|>" },
+        .{ .id = 258884, .token = "<|video|>" },
     };
     for (required) |want| {
         var found = false;
@@ -160,4 +161,20 @@ test "embeddinggemma2 processor changes fail closed" {
     const index = std.mem.indexOf(u8, changed, "\"fft_length\": 512").?;
     changed[index + "\"fft_length\": ".len] = '6';
     try std.testing.expectError(error.InvalidEmbeddingGemma2Processor, validateProcessor(a, changed));
+}
+
+test "embeddinggemma2 video processor sampling and token budgets fail closed" {
+    const a = std.testing.allocator;
+    var parsed = try std.json.parseFromSlice(std.json.Value, a, @embedFile("embedding_gemma2_processor.json"), .{});
+    defer parsed.deinit();
+    const processor = parsed.value.object.getPtr("video_processor").?;
+    for ([_][]const u8{ "fps", "max_frames", "max_soft_tokens" }) |key| {
+        const value = processor.object.getPtr(key).?;
+        const original = value.*;
+        value.* = .{ .integer = 0 };
+        const changed = try std.json.Stringify.valueAlloc(a, parsed.value, .{});
+        defer a.free(changed);
+        try std.testing.expectError(error.InvalidEmbeddingGemma2Processor, validateProcessor(a, changed));
+        value.* = original;
+    }
 }

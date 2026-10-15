@@ -86,6 +86,10 @@ pub const CudaContext = struct {
     ctx: CUcontext,
     stream: CUstream,
     info: DeviceInfo,
+    // Lazy NVDEC session shares this context. Its parser is request-scoped;
+    // the decoder survives successful clips with compatible geometry.
+    video_decoder_cache: ?*anyopaque = null,
+    video_decoder_release: ?*const fn (*anyopaque) callconv(.c) void = null,
     stats: RuntimeStats = .{},
     device_allocations: @import("allocation_budget.zig").Budget = .{},
     debug_graph_capture_active: bool = false,
@@ -136,6 +140,10 @@ pub const CudaContext = struct {
     pub fn deinit(self: *CudaContext) void {
         if (self.ctx != null) {
             _ = self.driver.fns.cuCtxSetCurrent(self.ctx);
+        }
+        if (self.video_decoder_cache) |decoder| {
+            self.video_decoder_release.?(decoder);
+            self.video_decoder_cache = null;
         }
         if (self.stream != null) {
             _ = self.driver.fns.cuStreamDestroy(self.stream);

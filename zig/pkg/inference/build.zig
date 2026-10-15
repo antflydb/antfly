@@ -298,6 +298,9 @@ pub fn build(b: *std.Build) void {
     const inference_internal_mod = runtime_graph.inference_internal_mod;
 
     const exe = @import("build/commands.zig").addCommands(workflow_ctx, true);
+    const compile_check = b.addExecutable(.{ .name = "antfly-inference-check", .root_module = exe.root_module });
+    b.step("check", "Type-check the inference executable without emitting a binary").dependOn(&compile_check.step);
+
     exe.root_module.strip = strip;
     const kernel_jit_package_exe = b.addExecutable(.{
         .name = "antfly-kernel-jit-package",
@@ -2171,6 +2174,32 @@ pub fn build(b: *std.Build) void {
     const onnx_graph_test_step = b.step("test-onnx-graph", "Run ONNX data and graph converter tests");
     onnx_graph_test_step.dependOn(&onnx_tests.data.step);
     onnx_graph_test_step.dependOn(&onnx_tests.graph.step);
+
+    // Grouped serving is reached through lazy pipeline imports. Give its
+    // admission and packing regressions an explicit owner so filtered and
+    // default test runs cannot silently omit them.
+    const grouped_embedding_tests = b.addTest(.{
+        .max_rss = 7 * 1024 * 1024 * 1024,
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/test_embedding_gemma2_groups.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+        .test_runner = .{ .path = b.path("src/test_runner_filter.zig"), .mode = .simple },
+    });
+    var grouped_imports = tests.root_module.import_table.iterator();
+    while (grouped_imports.next()) |entry| {
+        grouped_embedding_tests.root_module.addImport(entry.key_ptr.*, if (std.mem.eql(u8, entry.key_ptr.*, "inference_internal")) grouped_embedding_tests.root_module else entry.value_ptr.*);
+    }
+    grouped_embedding_tests.root_module.link_libc = true;
+    grouped_embedding_tests.root_module.strip = strip;
+    if (enable_cuda and target.result.os.tag == .linux) grouped_embedding_tests.root_module.addCSourceFile(.{ .file = b.path("src/ops/cuda/video_decode.c"), .flags = &.{"-std=c11"} });
+    if (enable_system_blas) configureSystemBlas(b, grouped_embedding_tests.root_module, target, blas_root);
+    configureMetal(b, grouped_embedding_tests.root_module, target, enable_metal);
+    const run_grouped_embedding_tests = b.addRunArtifact(grouped_embedding_tests);
+    run_grouped_embedding_tests.addArgs(&.{ "--test-filter", "embeddinggemma2" });
+    b.step("test-embeddinggemma2-groups", "Run grouped EmbeddingGemma 2 admission and packing regressions").dependOn(&run_grouped_embedding_tests.step);
+    if (suite.selected_test_filters.len == 0) default_test_step.dependOn(&run_grouped_embedding_tests.step);
 
     if (enable_wasm) {
         const wasm_target = workflows_wasm.resolveTarget(workflow_ctx);

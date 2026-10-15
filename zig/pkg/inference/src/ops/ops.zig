@@ -36,6 +36,15 @@ const ml = @import("ml");
 /// (native CPU uses f32 slices, device backends use opaque handles). Tensors are always
 /// freed via the ComputeBackend that created them.
 pub const CT = backend_contracts.CT;
+
+/// Result of an optional backend lookup for immutable scalar model metadata.
+/// `unsupported` lets callers retain their existing weight-loading path;
+/// `missing` is a supported, cached negative lookup.
+pub const ImmutableScalarF32Lookup = union(enum) {
+    unsupported,
+    missing,
+    value: f32,
+};
 pub const gliner_boundary_device = @import("gliner_boundary_device_ops.zig");
 pub const resident_training = @import("resident_training_ops.zig");
 pub const rope_table = @import("rope_table.zig");
@@ -1634,6 +1643,11 @@ pub const ComputeBackend = struct {
         return self.vtable.backendKind(self.ptr);
     }
 
+    pub fn immutableResidentScalarF32(self: *const ComputeBackend, name: []const u8) !ImmutableScalarF32Lookup {
+        const op = self.vtable.immutableResidentScalarF32 orelse return .unsupported;
+        return op(self.ptr, name);
+    }
+
     /// Install a backend-provided device-write hook on `storage` if this
     /// backend supports one. When the backend can't accelerate device writes
     /// for the storage's dtype or geometry, the call is a no-op and the
@@ -1768,6 +1782,10 @@ pub const ComputeBackend = struct {
         /// fast paths; backends without a device KV implementation leave it
         /// null.
         provisionKvDeviceWriteHook: ?*const fn (ctx: *anyopaque, storage: *runtime.kv.storage_runtime.KvStorageRuntime) anyerror!void = null,
+
+        /// Read immutable scalar inference metadata from resident model
+        /// storage. Implementations may cache both values and missing names.
+        immutableResidentScalarF32: ?*const fn (ctx: *anyopaque, name: []const u8) anyerror!ImmutableScalarF32Lookup = null,
 
         /// Optional request boundary for shared backend implementations.
         beginRequest: ?*const fn (ctx: *anyopaque) anyerror!void = null,
@@ -2359,6 +2377,14 @@ pub const ComputeBackend = struct {
         /// unrelated vision encoders that happen to share a tensor shape.
         scaledDotProductAttentionGemma4Vision: ?*const fn (ctx: *anyopaque, Q: CT, K: CT, V: CT, batch: usize, seq_len: usize, num_heads: usize, head_dim: usize) anyerror!CT = null,
         scaledDotProductAttentionQwen3VlVision: ?*const fn (ctx: *anyopaque, Q: CT, K: CT, V: CT, batch: usize, seq_len: usize, num_heads: usize, head_dim: usize) anyerror!CT = null,
+        scaledDotProductAttentionEmbeddingGemma2Vision: ?*const fn (ctx: *anyopaque, Q: CT, K: CT, V: CT, batch: usize, seq_len: usize, num_heads: usize, head_dim: usize) anyerror!?CT = null,
+        /// Complete official EmbeddingGemma2 HF vision encoder. The input and
+        /// output are token-major F32 `[sequence, 768]`. A backend may decline
+        /// before queueing work; errors after submission must propagate.
+        runEmbeddingGemma2VisionTower: ?*const fn (ctx: *anyopaque, input: CT, sequence: usize, grid_x: usize, grid_y: usize, batch: usize, control: ?InferenceExecutionControl) anyerror!?CT = null,
+        /// Exact Pillow RGB8 resize and official 16x16 patch packing. Returns
+        /// F32 `[patch_count, 768]` scaled pixels; decline before queueing work.
+        preprocessEmbeddingGemma2ImagePatches: ?*const fn (ctx: *anyopaque, rgb: []const u8, width: u32, height: u32, stride: usize, target_width: u32, target_height: u32) anyerror!?CT = null,
 
         /// Optional bidirectional attention with no mask. This is equivalent
         /// to scaledDotProductAttention with an all-ones mask, but lets
@@ -4248,6 +4274,23 @@ pub const ComputeBackend = struct {
             return f(self.ptr, Q, K, V, batch, seq_len, num_heads, head_dim);
         }
         return self.scaledDotProductAttention(Q, K, V, &.{}, null, batch, seq_len, num_heads, head_dim);
+    }
+
+    pub fn scaledDotProductAttentionEmbeddingGemma2Vision(self: *const ComputeBackend, Q: CT, K: CT, V: CT, batch: usize, seq_len: usize, num_heads: usize, head_dim: usize) !?CT {
+        if (self.vtable.scaledDotProductAttentionEmbeddingGemma2Vision) |f| {
+            return f(self.ptr, Q, K, V, batch, seq_len, num_heads, head_dim);
+        }
+        return null;
+    }
+
+    pub fn runEmbeddingGemma2VisionTower(self: *const ComputeBackend, input: CT, sequence: usize, grid_x: usize, grid_y: usize, batch: usize) !?CT {
+        const op = self.vtable.runEmbeddingGemma2VisionTower orelse return null;
+        return op(self.ptr, input, sequence, grid_x, grid_y, batch, self.execution_control);
+    }
+
+    pub fn preprocessEmbeddingGemma2ImagePatches(self: *const ComputeBackend, rgb: []const u8, width: u32, height: u32, stride: usize, target_width: u32, target_height: u32) !?CT {
+        const op = self.vtable.preprocessEmbeddingGemma2ImagePatches orelse return null;
+        return op(self.ptr, rgb, width, height, stride, target_width, target_height);
     }
 
     /// Token-major `Q [queries, heads*head_dim]` attending to `K`/`V`
