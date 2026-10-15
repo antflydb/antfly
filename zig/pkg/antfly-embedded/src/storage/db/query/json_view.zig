@@ -31,10 +31,14 @@ pub const View = struct {
     root_sources: []const RootSource = &.{},
     pub const RootSource = struct {
         name: []const u8,
-        value: Value,
+        value: Value = .null,
+        embeddings: ?*const @import("embedding_fields.zig").EmbeddingFields = null,
+        pub fn outputSource(self: *const @This()) @import("projection_output.zig").Source {
+            return if (self.embeddings) |fields| .{ .embeddings = fields } else .{ .logical = &self.value };
+        }
         fn include(self: @This(), alloc: Allocator, dst: *std.json.ObjectMap, path: []const []const u8) !void {
             var source = std.json.ObjectMap.empty;
-            try source.put(alloc, self.name, self.value);
+            try source.put(alloc, self.name, if (self.embeddings) |fields| try fields.materialize(alloc) else self.value);
             try @import("../document_query.zig").applyIncludeBorrowedPath(alloc, source, dst, path);
         }
     };
@@ -341,17 +345,36 @@ pub const View = struct {
         root_excluded: []const []const u8 = &.{},
     };
     pub fn prepareProjectionWithOptions(view: *View, selector: *const Selector, policy: DuplicatePolicy, root_mode: RootMode, options: PreparationOptions) !void {
+        const raw = view.root.raw;
+        errdefer {
+            view.root.raw = raw;
+            view.invalidatePreparation();
+        }
+        var scanner = std.json.Scanner.initCompleteInput(@import("antfly_platform").allocator.reclaimingScratch(view.alloc), raw);
+        defer scanner.deinit();
+        try view.prepareProjectionValue(selector, policy, root_mode, options, &scanner, raw, @import("antfly_platform").allocator.reclaimingScratch(view.alloc));
+        if (try scanner.next() != .end_of_document) return error.SyntaxError;
+    }
+
+    fn invalidatePreparation(view: *View) void {
+        view.root.children = null;
+        view.root.object_index = .empty;
+        view.root.array_index.clearRetainingCapacity();
+        view.root.state = .{};
+    }
+
+    /// Consume one value from a scanner over `raw`, leaving its enclosing
+    /// container positioned at the next separator. Captured spans use the same
+    /// immutable backing bytes; navigation belongs only to this view's arena.
+    pub fn prepareProjectionValue(view: *View, selector: *const Selector, policy: DuplicatePolicy, root_mode: RootMode, options: PreparationOptions, scanner: *std.json.Scanner, raw: []const u8, work: Allocator) !void {
         errdefer {
             // A failed preparation cannot publish half-built caches to a
             // later predicate or projection using this same source view.
-            view.root.children = null;
-            view.root.object_index = .empty;
-            view.root.array_index.clearRetainingCapacity();
-            view.root.markObjectComplete(false);
+            view.invalidatePreparation();
         }
         const alloc = view.alloc;
-        const raw = view.root.raw;
-        const scratch = @import("antfly_platform").allocator.reclaimingScratch(alloc);
+        const root_start = scanner.cursor;
+        const scratch = work;
         const Frame = struct {
             object: bool = false,
             key: bool = true,
@@ -472,8 +495,6 @@ pub const View = struct {
             }
             frames.deinit(scratch);
         }
-        var scanner = std.json.Scanner.initCompleteInput(scratch, raw);
-        defer scanner.deinit();
         var depth: usize = 0;
         var root_seen = false;
         while (!root_seen or depth != 0) {
@@ -530,7 +551,7 @@ pub const View = struct {
                 if (depth != 0) try frames.items[depth - 1].finishValue(alloc, raw, scanner.cursor);
             }
         }
-        if (try scanner.next() != .end_of_document) return error.SyntaxError;
+        view.root.raw = raw[root_start..scanner.cursor];
     }
 
     pub fn materialize(self: *View, node: *Node) !Value {

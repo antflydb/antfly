@@ -101,7 +101,7 @@ pub const SpanProjectionPlan = struct {
 
 /// Per-row spans and projection containers use scratch; selector plans can be
 /// shared across the request and remain immutable during row preparation.
-pub const ProjectionSource = struct { name: []const u8, value: std.json.Value };
+pub const ProjectionSource = @import("query/json_view.zig").View.RootSource;
 pub fn lookupJsonWithPlan(alloc: Allocator, output: Allocator, raw: []const u8, plan: *const SpanProjectionPlan) !types.LookupResult {
     return lookupJsonWithSources(alloc, output, raw, plan, &.{});
 }
@@ -118,7 +118,7 @@ pub fn lookupJsonWithSources(alloc: Allocator, output: Allocator, raw: []const u
     view.parse_numbers = true;
     try view.prepareProjectionWithOptions(plan.selector, .all, .object_only, .{ .defer_fanout = true, .retain_root_fields = plan.include_all or plan.passthrough, .root_excluded = plan.excluded });
     const overlays = try a.alloc(JsonView.RootSource, sources.len);
-    for (sources, overlays) |source, *overlay| overlay.* = .{ .name = source.name, .value = source.value };
+    for (sources, overlays) |source, *overlay| overlay.* = source;
     view.root_sources = overlays;
     const Projection = @import("query/projection_output.zig").Output;
     var projected: Projection.Object = .empty;
@@ -142,7 +142,7 @@ pub fn lookupJsonWithOutput(alloc: Allocator, output: Allocator, raw: []const u8
     return .{ .json = try serializeWithOutput(alloc, output, projected) };
 }
 
-fn spanProjectionSupported(fields: []const []const u8) bool {
+pub fn spanProjectionSupported(fields: []const []const u8) bool {
     var positives: usize = 0;
     var all = false;
     for (fields) |field| {

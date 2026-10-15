@@ -18610,6 +18610,7 @@ pub const DB = struct {
                 .ctx = self,
                 .load_chunks = loadChunkFieldValueCallback,
                 .load_embeddings = loadEmbeddingFieldValueCallback,
+                .load_embeddings_compact = loadEmbeddingFieldsCallback,
                 .load_artifacts = loadArtifactFieldValueCallback,
             }, if (prepared) |plans| try plans.getPlain() else null);
         };
@@ -45109,6 +45110,7 @@ fn projectLookupStoredBytes(self: *DB, alloc: Allocator, doc_key: []const u8, ra
         .ctx = self,
         .load_chunks = loadChunkFieldValueCallback,
         .load_embeddings = loadEmbeddingFieldValueCallback,
+        .load_embeddings_compact = loadEmbeddingFieldsCallback,
         .load_artifacts = loadArtifactFieldValueCallback,
     });
 }
@@ -45121,6 +45123,7 @@ fn projectStoredBytesForSearch(self: *DB, alloc: Allocator, req: types.SearchReq
         .ctx = self,
         .load_chunks = loadChunkFieldValueCallback,
         .load_embeddings = loadEmbeddingFieldValueCallback,
+        .load_embeddings_compact = loadEmbeddingFieldsCallback,
         .load_artifacts = loadArtifactFieldValueCallback,
     });
 }
@@ -45133,6 +45136,7 @@ fn projectOwnedStoredBytesForSearch(self: *DB, alloc: Allocator, req: types.Sear
         .ctx = self,
         .load_chunks = loadChunkFieldValueCallback,
         .load_embeddings = loadEmbeddingFieldValueCallback,
+        .load_embeddings_compact = loadEmbeddingFieldsCallback,
         .load_artifacts = loadArtifactFieldValueCallback,
     });
 }
@@ -45413,6 +45417,11 @@ fn loadChunkFieldValueCallback(
 ) anyerror!?std.json.Value {
     const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
     return try loadChunkFieldValue(self, alloc, doc_key);
+}
+
+fn loadEmbeddingFieldsCallback(ctx: ?*anyopaque, alloc: Allocator, doc_key: []const u8) anyerror!?db_query_projection.EmbeddingFields {
+    const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+    return read_projection.loadEmbeddingFieldsTxn(.{ .core = self.core }, alloc, doc_key, null);
 }
 
 fn loadEmbeddingFieldValueCallback(
@@ -137704,4 +137713,41 @@ test "public graph metric borrowed wire hydration projection cache reuses and bo
         try std.testing.expect(value.plan.base.schema_version != 1);
     };
     try std.testing.expectEqual(@as(usize, 4), resident);
+}
+
+test "public graph metric borrowed wire compact embedding physical loader matches legacy and pins transactions" {
+    const a = std.testing.allocator;
+    var directory = try TestDirectory.init("compact-embedding-loader");
+    defer directory.cleanup();
+    var db = try DB.open(a, directory.path(), .{ .start_index_workers = false, .start_optional_runtimes = false, .start_independent_maintenance = false });
+    defer db.close();
+    const key = try internal_keys.embeddingArtifactKeyForDocumentAlloc(a, "doc", "dense");
+    defer a.free(key);
+    const bad_key = try internal_keys.embeddingArtifactKeyForDocumentAlloc(a, "doc", "invalid");
+    defer a.free(bad_key);
+    const payload = try enrichment_artifact_codec.encodeDenseEmbeddingAlloc(a, null, &.{ 0.1, -0.0, 1.25 });
+    defer a.free(payload);
+    try db.core.store.put(key, payload);
+    try db.core.store.put(bad_key, "invalid artifact");
+    for ([_]bool{ false, true }) |pinned| {
+        var read = try db.core.store.beginReadTxn();
+        defer read.abort();
+        const txn: ?*docstore_mod.DocStore.Txn = if (pinned) &read else null;
+        var compact = (try read_projection.loadEmbeddingFieldsTxn(.{ .core = db.core }, a, "doc", txn)).?;
+        defer compact.deinit(a);
+        var logical = (try read_projection.loadEmbeddingFieldValueTxn(.{ .core = db.core }, a, "doc", txn)).?;
+        defer db_query_projection.freeJsonValue(a, &logical);
+        var scratch = std.heap.ArenaAllocator.init(a);
+        defer scratch.deinit();
+        const sources = [_]@import("document_query.zig").ProjectionSource{.{ .name = "_embeddings", .embeddings = &compact }};
+        var plan = (try @import("document_query.zig").SpanProjectionPlan.init(a, .{ .fields = &.{"_embeddings.*"}, .include_all_fields = false })).?;
+        defer plan.deinit();
+        var actual = try @import("document_query.zig").lookupJsonWithSources(scratch.allocator(), a, "{}", &plan, &sources);
+        defer actual.deinit(a);
+        const expected_source = [_]@import("document_query.zig").ProjectionSource{.{ .name = "_embeddings", .value = logical }};
+        var expected = try @import("document_query.zig").lookupJsonWithSources(scratch.allocator(), a, "{}", &plan, &expected_source);
+        defer expected.deinit(a);
+        try std.testing.expectEqualStrings(expected.json, actual.json);
+        try std.testing.expectEqual(@as(usize, 1), compact.values.count());
+    }
 }

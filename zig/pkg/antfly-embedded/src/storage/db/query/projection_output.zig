@@ -16,6 +16,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Value = std.json.Value;
+const EmbeddingFields = @import("embedding_fields.zig").EmbeddingFields;
 const View = @import("json_view.zig").View;
 
 /// Row-owned projection structure. Terminal values borrow immutable sources;
@@ -24,9 +25,15 @@ const View = @import("json_view.zig").View;
 pub const Source = union(enum) {
     span: struct { view: *View, node: *View.Node },
     logical: *const Value,
+    embeddings: *const EmbeddingFields,
+    vector: []const f32,
+    component: f32,
 
     fn kind(self: Source) u8 {
         return switch (self) {
+            .embeddings => '{',
+            .vector => '[',
+            .component => 0,
             .span => |s| s.node.kind(),
             .logical => |v| switch (v.*) {
                 .object => '{',
@@ -37,12 +44,16 @@ pub const Source = union(enum) {
     }
     fn field(self: Source, name: []const u8) !?Source {
         return switch (self) {
+            .embeddings => |fields| if (fields.values.get(name)) |v| .{ .vector = v } else null,
+            .vector, .component => null,
             .span => |s| if (try s.view.fieldSparse(s.node, name)) |node| .{ .span = .{ .view = s.view, .node = node } } else null,
             .logical => |v| if (v.* == .object) (if (v.object.getPtr(name)) |value| .{ .logical = value } else null) else null,
         };
     }
     fn element(self: Source, index: usize) !?Source {
         return switch (self) {
+            .vector => |v| if (index < v.len) .{ .component = v[index] } else null,
+            .embeddings, .component => null,
             .span => |s| if (try s.view.element(s.node, index)) |node| .{ .span = .{ .view = s.view, .node = node } } else null,
             .logical => |v| if (v.* == .array and index < v.array.items.len) .{ .logical = &v.array.items[index] } else null,
         };
@@ -55,7 +66,7 @@ pub const Output = union(enum) {
     overlay: *Overlay,
     array: std.ArrayListUnmanaged(Output),
     fanout: *const Fanout,
-    const Fanout = struct { source: Source, path: []const []const u8 };
+    const Fanout = struct { source: Source, path: []const []const u8, selector: ?*const @import("json_projection_plan.zig").Selector = null };
     pub const Object = std.StringArrayHashMapUnmanaged(Output);
     // Keep this behind a pointer: ordinary fanout entries must not pay for a
     // base source plus an override map when no copy-on-write is needed.
@@ -85,6 +96,8 @@ pub const Output = union(enum) {
 
     fn copyObject(a: Allocator, dst: *Object, source: Source) !void {
         switch (source) {
+            .embeddings => |fields| for (fields.values.keys(), fields.values.values()) |name, vector| try put(a, dst, name, .{ .borrowed = .{ .vector = vector } }),
+            .vector, .component => unreachable,
             .logical => |v| for (v.object.keys(), v.object.values()) |name, *value| {
                 try put(a, dst, name, .{ .borrowed = .{ .logical = value } });
             },
@@ -142,7 +155,7 @@ pub const Output = union(enum) {
                     // array, then retain only its immutable source and path.
                     // A selector with no surviving items must leave it alone.
                     const fanout = try a.create(Fanout);
-                    fanout.* = .{ .source = source, .path = path };
+                    fanout.* = .{ .source = source, .path = path, .selector = if (source == .span and path.len > 1) try @import("json_projection_plan.zig").compile(a, &.{.{ .parts = path }}) else null };
                     var rows = FanoutRows.init(a, fanout.*);
                     defer rows.deinit();
                     if (try rows.next() != null) {
@@ -166,7 +179,7 @@ pub const Output = union(enum) {
     pub fn includeRoot(a: Allocator, dst: *Object, view: *View, path: []const []const u8) !void {
         if (path.len == 0) return;
         for (view.root_sources) |*source| if (std.mem.eql(u8, source.name, path[0])) {
-            return include(a, dst, source.name, .{ .logical = &source.value }, path[1..]);
+            return include(a, dst, source.name, source.outputSource(), path[1..]);
         };
         if (try view.field(&view.root, path[0])) |node| try include(a, dst, path[0], .{ .span = .{ .view = view, .node = node } }, path[1..]);
     }
@@ -182,7 +195,7 @@ pub const Output = union(enum) {
         for (names) |name| if (!omitted(excluded, name)) try includeRoot(a, dst, view, &.{name});
         for (view.root_sources) |*source| {
             if (omitted(excluded, source.name) or dst.contains(source.name)) continue;
-            try put(a, dst, source.name, .{ .borrowed = .{ .logical = &source.value } });
+            try put(a, dst, source.name, .{ .borrowed = source.outputSource() });
         }
     }
     fn omitted(excluded: []const []const u8, name: []const u8) bool {
@@ -191,21 +204,43 @@ pub const Output = union(enum) {
     }
 
     pub fn serialize(self: Output, scratch: Allocator, output: Allocator) ![]u8 {
-        var writer = std.Io.Writer.Allocating.init(@import("antfly_platform").allocator.reclaimingScratch(scratch));
+        const reclaimable = @import("antfly_platform").allocator.reclaimingScratch(output);
+        // An arena cannot reclaim superseded growing buffers. Preserve one
+        // exact allocation there; ordinary owners can take the writer buffer.
+        const arena_output = reclaimable.ptr != output.ptr or reclaimable.vtable != output.vtable;
+        var writer = std.Io.Writer.Allocating.init(if (arena_output) @import("antfly_platform").allocator.reclaimingScratch(scratch) else output);
         defer writer.deinit();
-        var context = StreamContext.init(scratch);
-        defer context.deinit();
-        self.write(&context, &writer.writer) catch |err| switch (err) {
+        self.writeTo(scratch, &writer.writer) catch |err| switch (err) {
             error.WriteFailed => return error.OutOfMemory,
             else => return err,
         };
-        return output.dupe(u8, writer.written());
+        return if (arena_output) output.dupe(u8, writer.written()) else writer.toOwnedSlice();
+    }
+
+    /// A transport with its own writer can stream the body without allocating
+    /// an intermediate response. The source remains borrowed until completion.
+    pub fn writeTo(self: Output, scratch: Allocator, writer: *std.Io.Writer) !void {
+        var context = StreamContext.init(scratch);
+        defer context.deinit();
+        try self.write(&context, writer);
     }
     fn write(self: Output, context: *StreamContext, writer: *std.Io.Writer) anyerror!void {
         switch (self) {
             .borrowed => |source| switch (source) {
                 .span => |s| try context.writeSpan(writer, s.node.raw, s.view.parse_numbers),
                 .logical => |v| try std.json.Stringify.value(v.*, .{}, writer),
+                .component => |v| try std.json.Stringify.value(@as(f64, v), .{}, writer),
+                .vector => |v| try writeVector(writer, v),
+                .embeddings => |fields| {
+                    try writer.writeByte('{');
+                    for (fields.values.keys(), fields.values.values(), 0..) |name, vector, i| {
+                        if (i != 0) try writer.writeByte(',');
+                        try std.json.Stringify.value(name, .{}, writer);
+                        try writer.writeByte(':');
+                        try writeVector(writer, vector);
+                    }
+                    try writer.writeByte('}');
+                },
             },
             .overlay => |overlay| try writeOverlay(context, writer, overlay),
             .object => |object| {
@@ -241,6 +276,14 @@ pub const Output = union(enum) {
         }
     }
 
+    fn writeVector(writer: *std.Io.Writer, vector: []const f32) !void {
+        try writer.writeByte('[');
+        for (vector, 0..) |component, i| {
+            if (i != 0) try writer.writeByte(',');
+            try std.json.Stringify.value(@as(f64, component), .{}, writer);
+        }
+        try writer.writeByte(']');
+    }
     fn writeMember(context: *StreamContext, writer: *std.Io.Writer, count: *usize, name: []const u8, value: Output) !void {
         if (count.* != 0) try writer.writeByte(',');
         try std.json.Stringify.value(name, .{}, writer);
@@ -262,6 +305,8 @@ pub const Output = union(enum) {
         var count: usize = 0;
         try writer.writeByte('{');
         switch (overlay.base) {
+            .vector, .component => unreachable,
+            .embeddings => |fields| for (fields.values.keys(), fields.values.values()) |name, vector| try writeBaseMember(context, writer, overlay, emitted, &count, name, .{ .vector = vector }),
             .logical => |value| for (value.object.keys(), value.object.values()) |name, *child| {
                 try writeBaseMember(context, writer, overlay, emitted, &count, name, .{ .logical = child });
             },
@@ -417,6 +462,7 @@ const StreamContext = struct {
 const FanoutRows = struct {
     source: Source,
     path: []const []const u8,
+    selector: ?*const @import("json_projection_plan.zig").Selector,
     arena: std.heap.ArenaAllocator,
     scanner: ?std.json.Scanner = null,
     started: bool = false,
@@ -424,9 +470,9 @@ const FanoutRows = struct {
     view: View = undefined,
     fn init(a: Allocator, fanout: Output.Fanout) FanoutRows {
         const work = @import("antfly_platform").allocator.reclaimingScratch(a);
-        return .{ .source = fanout.source, .path = fanout.path, .arena = .init(work), .scanner = switch (fanout.source) {
+        return .{ .source = fanout.source, .path = fanout.path, .selector = fanout.selector, .arena = .init(work), .scanner = switch (fanout.source) {
             .span => |span| std.json.Scanner.initCompleteInput(work, span.node.raw),
-            .logical => null,
+            .logical, .embeddings, .vector, .component => null,
         } };
     }
     fn deinit(self: *FanoutRows) void {
@@ -438,6 +484,8 @@ const FanoutRows = struct {
             try resetScratch(&self.arena);
             const a = self.arena.allocator();
             const item: Source = switch (self.source) {
+                .vector => return null,
+                .embeddings, .component => unreachable,
                 .logical => |value| blk: {
                     if (self.index == value.array.items.len) return null;
                     const item = &value.array.items[self.index];
@@ -458,7 +506,13 @@ const FanoutRows = struct {
                     }
                     if (token == .object_end or token == .end_of_document) return error.SyntaxError;
                     const start = scanner.cursor;
-                    if (token == .object_begin and !std.mem.eql(u8, self.path[0], "*")) {
+                    if (token == .object_begin and self.selector != null) {
+                        // Bound navigation to this item. Preparing the complete
+                        // selected path once avoids rescanning every ancestor's
+                        // remaining subtree for a deep field selection.
+                        self.view = .init(a, span.node.raw[start..]);
+                        try self.view.prepareProjectionValue(self.selector.?, .visited, .object_only, .{ .defer_fanout = true }, scanner, span.node.raw, a);
+                    } else if (token == .object_begin and !std.mem.eql(u8, self.path[0], "*")) {
                         // Discover the selected root member while advancing
                         // the array scanner, avoiding a second scan per item.
                         _ = try scanner.next();
@@ -794,4 +848,80 @@ test "public graph metric borrowed wire streaming fanout validates unprepared si
     var object: Output.Object = .empty;
     try Output.include(arena.allocator(), &object, "items", .{ .span = .{ .view = &view, .node = &view.root } }, &.{"x"});
     try std.testing.expectError(error.DuplicateField, (Output{ .object = object }).serialize(arena.allocator(), a));
+}
+
+test "public graph metric borrowed wire deep streaming fanout retains only one prepared item" {
+    const a = std.testing.allocator;
+    const query = @import("../document_query.zig");
+    var input = std.Io.Writer.Allocating.init(a);
+    defer input.deinit();
+    var field = std.Io.Writer.Allocating.init(a);
+    defer field.deinit();
+    try input.writer.writeAll("{\"items\":[");
+    try field.writer.writeAll("items");
+    for (0..32) |_| {
+        try input.writer.writeAll("{\"x\":");
+        try field.writer.writeAll(".x");
+    }
+    try input.writer.writeByte('[');
+    for (0..100000) |i| {
+        if (i != 0) try input.writer.writeByte(',');
+        try input.writer.writeAll("123456789");
+    }
+    try input.writer.writeByte(']');
+    for (0..32) |_| try input.writer.writeByte('}');
+    try input.writer.writeAll("]}");
+    var plan = (try query.SpanProjectionPlan.init(a, .{ .fields = &.{field.written()}, .include_all_fields = false })).?;
+    defer plan.deinit();
+    const Counter = @import("../../lite/test_allocator.zig").BudgetAllocator;
+    var budget: Counter = .{ .backing = a, .limit = 512 * 1024 };
+    var result = try query.lookupJsonWithPlan(budget.allocator(), a, input.written(), &plan);
+    defer result.deinit(a);
+    try std.testing.expectEqualStrings(input.written(), result.json);
+    try std.testing.expectEqual(@as(usize, 0), budget.live);
+    std.debug.print("DEEP_FANOUT depth=32 output_bytes={d} scratch_peak={d}\n", .{ result.json.len, budget.peak });
+}
+
+test "public graph metric borrowed wire direct writer streams compact vectors with no scratch allocation" {
+    const a = std.testing.allocator;
+    const vector = [_]f32{ 0.1, -0.0, 1.25 };
+    const value: Output = .{ .borrowed = .{ .vector = &vector } };
+    var expected = std.Io.Writer.Allocating.init(a);
+    defer expected.deinit();
+    var logical = [_]Value{ .{ .float = @as(f64, vector[0]) }, .{ .float = @as(f64, vector[1]) }, .{ .float = @as(f64, vector[2]) } };
+    const array: Value = .{ .array = .fromOwnedSlice(a, &logical) };
+    try std.json.Stringify.value(array, .{}, &expected.writer);
+    var buffer: [256]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&buffer);
+    const Counter = @import("../../lite/test_allocator.zig").BudgetAllocator;
+    var budget: Counter = .{ .backing = a, .limit = 0 };
+    try value.writeTo(budget.allocator(), &writer);
+    try std.testing.expectEqualStrings(expected.written(), writer.buffered());
+    try std.testing.expectEqual(@as(usize, 0), budget.alloc_attempts);
+}
+
+test "public graph metric borrowed wire multi component fanout reuses item preparation scratch" {
+    const a = std.testing.allocator;
+    const query = @import("../document_query.zig");
+    var input = std.Io.Writer.Allocating.init(a);
+    defer input.deinit();
+    try input.writer.writeAll("{\"items\":[");
+    for (0..8000) |i| {
+        if (i != 0) try input.writer.writeByte(',');
+        try input.writer.writeAll("{\"x\":{\"m\":1,\"n\":2}}");
+    }
+    try input.writer.writeAll("]}");
+    var plan = (try query.SpanProjectionPlan.init(a, .{ .fields = &.{"items.x.m"}, .include_all_fields = false })).?;
+    defer plan.deinit();
+    const counters = @import("../../lite/test_allocator.zig");
+    var no_resize: counters.NoResizeAllocator = .{ .backing = a };
+    var budget: counters.BudgetAllocator = .{ .backing = no_resize.allocator(), .limit = 1024 * 1024 };
+    var result = try query.lookupJsonWithPlan(budget.allocator(), a, input.written(), &plan);
+    defer result.deinit(a);
+    var expected = try query.lookupJson(a, input.written(), .{ .fields = &.{"items.x.m"}, .include_all_fields = false });
+    defer expected.deinit(a);
+    try std.testing.expectEqualStrings(expected.json, result.json);
+    try std.testing.expect(budget.alloc_calls < 128);
+    try std.testing.expectEqual(@as(usize, 0), budget.live);
+    std.debug.print("PREPARED_FANOUT count=8000 allocations={d} peak={d}\n", .{ budget.alloc_calls, budget.peak });
 }

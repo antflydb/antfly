@@ -31,7 +31,9 @@ pub const FieldSelectionPlan = struct {
     special: SpecialFieldSelection,
 };
 
+pub const EmbeddingFields = @import("embedding_fields.zig").EmbeddingFields;
 pub const SpecialFieldLoader = struct {
+    load_embeddings_compact: ?*const fn (?*anyopaque, Allocator, []const u8) anyerror!?EmbeddingFields = null,
     ctx: ?*anyopaque,
     load_chunks: *const fn (
         ctx: ?*anyopaque,
@@ -237,7 +239,14 @@ fn projectWithSelectionAndOutput(alloc: Allocator, output: Allocator, doc_key: [
     const names = [_][]const u8{ "_artifacts", "_chunks", "_embeddings" };
     if (selection.special.all_artifacts) values[0] = try loader.load_artifacts(loader.ctx, alloc, doc_key);
     if (selection.special.all_chunks) values[1] = try loader.load_chunks(loader.ctx, alloc, doc_key);
-    if (selection.special.all_embeddings) values[2] = try loader.load_embeddings(loader.ctx, alloc, doc_key);
+    var compact: ?EmbeddingFields = null;
+    defer if (compact) |*fields| fields.deinit(alloc);
+    // Unsupported legacy selectors keep the established DOM contract.
+    if (selection.special.all_embeddings) {
+        if (loader.load_embeddings_compact != null and document_query.spanProjectionSupported(selection.projection.fields)) {
+            compact = try loader.load_embeddings_compact.?(loader.ctx, alloc, doc_key);
+        } else values[2] = try loader.load_embeddings(loader.ctx, alloc, doc_key);
+    }
     for (&values) |*value| if (value.*) |*logical| try normalizeLoadedNumbers(alloc, logical);
     var sources: [3]document_query.ProjectionSource = undefined;
     var count: usize = 0;
@@ -245,6 +254,10 @@ fn projectWithSelectionAndOutput(alloc: Allocator, output: Allocator, doc_key: [
         sources[count] = .{ .name = name, .value = logical };
         count += 1;
     };
+    if (compact) |*fields| {
+        sources[count] = .{ .name = "_embeddings", .embeddings = fields };
+        count += 1;
+    }
     if (prepared) |plan| return (try document_query.lookupJsonWithSources(alloc, output, raw, plan, sources[0..count])).json;
     if (try document_query.SpanProjectionPlan.init(alloc, selection.projection)) |owned| {
         var plan = owned;
@@ -454,7 +467,7 @@ test "public graph metric borrowed wire decoded embedding projection fits bounde
     for (0..64) |i| {
         var array = std.json.Array.init(s);
         try array.ensureTotalCapacity(1536);
-        for (0..1536) |j| try array.append(.{ .float = @as(f64, @floatFromInt(j)) / 1536 });
+        for (0..1536) |j| try array.append(.{ .float = @as(f64, @as(f32, @floatFromInt(j)) / 1536) });
         try vectors.put(s, try std.fmt.allocPrint(s, "v{d}", .{i}), .{ .array = array });
     }
     var logical: std.json.Value = .{ .object = vectors };
@@ -472,4 +485,77 @@ test "public graph metric borrowed wire decoded embedding projection fits bounde
     try std.testing.expectEqual(@as(usize, 64), parsed.value.object.get("_embeddings").?.object.count());
     try std.testing.expectEqual(@as(usize, 1536), parsed.value.object.get("_embeddings").?.object.get("v63").?.array.items.len);
     std.debug.print("DECODED_EMBEDDINGS output_bytes={d} scratch_peak={d}\n", .{ result.len, budget.peak });
+}
+
+test "public graph metric borrowed wire compact embeddings preserve float spelling wildcard order and legacy fallback" {
+    const Fixture = struct {
+        fn none(_: ?*anyopaque, _: Allocator, _: []const u8) !?std.json.Value {
+            return null;
+        }
+        fn compact(_: ?*anyopaque, a: Allocator, _: []const u8) !?EmbeddingFields {
+            var fields: EmbeddingFields = .{};
+            errdefer fields.deinit(a);
+            const vector = try a.dupe(f32, &.{ 0.1, -0.0, 1.25, 1e30 });
+            errdefer a.free(vector);
+            try fields.putOwned(a, "dense", vector);
+            return fields;
+        }
+        fn logical(ctx: ?*anyopaque, a: Allocator, key: []const u8) !?std.json.Value {
+            var fields = (try compact(ctx, a, key)).?;
+            defer fields.deinit(a);
+            return try fields.materialize(a);
+        }
+        fn run(a: Allocator) !void {
+            const old: SpecialFieldLoader = .{ .ctx = null, .load_embeddings = logical, .load_chunks = none, .load_artifacts = none };
+            var new = old;
+            new.load_embeddings_compact = compact;
+            for ([_][]const []const u8{
+                &.{"_embeddings"},            &.{"_embeddings.*"},                 &.{ "_embeddings", "_embeddings.dense.2" },
+                &.{ "_embeddings", "title" }, &.{ "_embeddings", "-_embeddings" }, &.{ "_embeddings", "-title.nested" },
+            }) |fields| {
+                const opts: types.LookupOptions = .{ .fields = fields, .include_all_fields = false };
+                const expected = try projectLookupStoredBytesWithOutput(a, a, "doc", "{\"title\":{\"nested\":1},\"_embeddings\":{\"old\":[]}}", opts, old);
+                defer a.free(expected);
+                const actual = try projectLookupStoredBytesWithOutput(a, a, "doc", "{\"title\":{\"nested\":1},\"_embeddings\":{\"old\":[]}}", opts, new);
+                defer a.free(actual);
+                try std.testing.expectEqualStrings(expected, actual);
+            }
+        }
+    };
+    try Fixture.run(std.testing.allocator);
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Fixture.run, .{});
+}
+
+test "public graph metric borrowed wire compact embeddings bound numeric scratch" {
+    const Loader = struct {
+        fn none(_: ?*anyopaque, _: Allocator, _: []const u8) !?std.json.Value {
+            return null;
+        }
+        fn compact(_: ?*anyopaque, a: Allocator, _: []const u8) !?EmbeddingFields {
+            var fields: EmbeddingFields = .{};
+            errdefer fields.deinit(a);
+            for (0..64) |i| {
+                const vector = try a.alloc(f32, 1536);
+                errdefer a.free(vector);
+                for (vector, 0..) |*v, j| v.* = @as(f32, @floatFromInt(j)) / 1536;
+                const name = try std.fmt.allocPrint(a, "v{d}", .{i});
+                defer a.free(name);
+                try fields.putOwned(a, name, vector);
+            }
+            return fields;
+        }
+    };
+    const a = std.testing.allocator;
+    const Counter = @import("../../lite/test_allocator.zig").BudgetAllocator;
+    var budget: Counter = .{ .backing = a, .limit = 1024 * 1024 };
+    const result = try projectLookupStoredBytesWithOutput(budget.allocator(), a, "doc", "{}", .{ .fields = &.{"_embeddings"}, .include_all_fields = false }, .{
+        .ctx = null,
+        .load_embeddings = Loader.none,
+        .load_embeddings_compact = Loader.compact,
+        .load_chunks = Loader.none,
+        .load_artifacts = Loader.none,
+    });
+    defer a.free(result);
+    try std.testing.expectEqual(@as(usize, 0), budget.live);
+    std.debug.print("COMPACT_EMBEDDINGS output_bytes={d} scratch_peak={d}\n", .{ result.len, budget.peak });
 }

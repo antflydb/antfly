@@ -102,6 +102,45 @@ pub fn loadChunkFieldValueTxn(self: Source, alloc: Allocator, doc_key: []const u
     return .{ .object = chunks_obj };
 }
 
+/// Compact ownership for response projection. Scan results are retired before
+/// returning; only dense f32 slabs and field names survive the read scope.
+pub fn loadEmbeddingFieldsTxn(self: Source, alloc: Allocator, doc_key: []const u8, read_txn: ?*docstore_mod.DocStore.Txn) !?db_query_projection.EmbeddingFields {
+    if (read_txn == null) {
+        var read = try self.core.store.beginReadTxnWithBlockCacheAdmission(.transient);
+        defer read.abort();
+        return loadEmbeddingFieldsFromTxn(alloc, doc_key, &read);
+    }
+    return loadEmbeddingFieldsFromTxn(alloc, doc_key, read_txn.?);
+}
+
+fn loadEmbeddingFieldsFromTxn(alloc: Allocator, doc_key: []const u8, read_txn: *docstore_mod.DocStore.Txn) !?db_query_projection.EmbeddingFields {
+    const prefix = try internal_keys.artifactTypePrefixAlloc(alloc, doc_key, "embedding");
+    defer alloc.free(prefix);
+    var cursor = try read_txn.openCursor();
+    defer cursor.close();
+    var next = try cursor.seekAtOrAfter(prefix);
+    var fields: db_query_projection.EmbeddingFields = .{};
+    errdefer fields.deinit(alloc);
+    while (next) |entry| : (next = try cursor.next()) {
+        if (!std.mem.startsWith(u8, entry.key, prefix)) break;
+        if (!internal_keys.isInternalUserKey(entry.key)) continue;
+        var identity = (try decodeArtifactRefIfKnownAlloc(alloc, entry.key)) orelse continue;
+        defer identity.deinit(alloc);
+        if (identity.kind != .embedding or identity.source != null) continue;
+        const vector = enrichment_artifact_codec.decodeDenseEmbeddingAlloc(alloc, entry.value) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => continue,
+        };
+        errdefer alloc.free(vector);
+        try fields.putOwned(alloc, identity.name, vector);
+    }
+    if (fields.values.count() == 0) {
+        fields.deinit(alloc);
+        return null;
+    }
+    return fields;
+}
+
 pub fn loadEmbeddingFieldValueTxn(self: Source, alloc: Allocator, doc_key: []const u8, read_txn: ?*docstore_mod.DocStore.Txn) !?std.json.Value {
     const prefix = try internal_keys.artifactTypePrefixAlloc(alloc, doc_key, "embedding");
     defer alloc.free(prefix);
@@ -394,6 +433,11 @@ pub fn loadChunkFieldValueTxnCallback(
     return try loadChunkFieldValueTxn(projection.source, alloc, doc_key, projection.read_txn);
 }
 
+pub fn loadEmbeddingFieldsTxnCallback(ctx: ?*anyopaque, alloc: Allocator, doc_key: []const u8) anyerror!?db_query_projection.EmbeddingFields {
+    const projection: *TransactionProjectionContext = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+    return loadEmbeddingFieldsTxn(projection.source, alloc, doc_key, projection.read_txn);
+}
+
 pub fn loadEmbeddingFieldValueTxnCallback(
     ctx: ?*anyopaque,
     alloc: Allocator,
@@ -445,6 +489,7 @@ pub fn projectLookupStoredBytesTxn(
         .ctx = context,
         .load_chunks = loadChunkFieldValueTxnCallback,
         .load_embeddings = loadEmbeddingFieldValueTxnCallback,
+        .load_embeddings_compact = loadEmbeddingFieldsTxnCallback,
         .load_artifacts = loadArtifactFieldValueTxnCallback,
     });
 }
@@ -506,4 +551,48 @@ test "artifact projection grouping transfers nested values only on success" {
         }
     };
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Check.run, .{});
+}
+
+test "public graph metric borrowed wire compact embedding cursor owns values beyond transaction lifetime" {
+    const a = std.testing.allocator;
+    const Lite = @import("../lite/docstore.zig");
+    var directory = std.testing.tmpDir(.{});
+    defer directory.cleanup();
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/compact-embeddings.aflite", .{directory.sub_path});
+    defer a.free(path);
+    var lite = try Lite.Store.createWithOptions(a, path, .{ .io = std.testing.io, .no_sync = true });
+    defer lite.close();
+    var store = try docstore_mod.DocStore.openRuntime(a, try lite.runtimeStore(a));
+    defer store.close();
+    const key = try internal_keys.embeddingArtifactKeyForDocumentAlloc(a, "doc", "dense");
+    defer a.free(key);
+    const bad = try internal_keys.embeddingArtifactKeyForDocumentAlloc(a, "doc", "invalid");
+    defer a.free(bad);
+    const other = try internal_keys.embeddingArtifactKeyForDocumentAlloc(a, "other", "dense");
+    defer a.free(other);
+    const vector = [_]f32{ 0.1, -0.0, 1.25 };
+    const payload = try enrichment_artifact_codec.encodeDenseEmbeddingAlloc(a, null, &vector);
+    defer a.free(payload);
+    try store.put(key, payload);
+    try store.put(bad, "invalid artifact");
+    try store.put(other, payload);
+    var read = try store.beginReadTxn();
+    var fields = loadEmbeddingFieldsFromTxn(a, "doc", &read) catch |err| {
+        read.abort();
+        return err;
+    };
+    read.abort();
+    defer if (fields) |*value| value.deinit(a);
+    try std.testing.expect(fields != null);
+    try std.testing.expectEqual(@as(usize, 1), fields.?.values.count());
+    try std.testing.expectEqualSlices(f32, &vector, fields.?.values.get("dense").?);
+    const Fixture = struct {
+        fn run(failing: Allocator, txn: *docstore_mod.DocStore.Txn) !void {
+            var result = try loadEmbeddingFieldsFromTxn(failing, "doc", txn);
+            defer if (result) |*value| value.deinit(failing);
+        }
+    };
+    var pinned = try store.beginReadTxn();
+    defer pinned.abort();
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(a, Fixture.run, .{&pinned});
 }
