@@ -92,6 +92,7 @@ pub const PreparedSchemaMetadata = struct {
     legacy_public_binding: bool = false,
     generated_semantics_match: bool = true,
     reserved_index: ?@import("relational_index_owner_job.zig").Binding = null,
+    reserved_activation: ?@import("relational_integrity_activation.zig").PreparedIndexPublication = null,
     combined_writes: []docstore_mod.KVPair,
 
     fn init(
@@ -131,6 +132,7 @@ pub const PreparedSchemaMetadata = struct {
     }
 
     pub fn deinit(self: *PreparedSchemaMetadata) void {
+        if (self.reserved_activation) |*activation| activation.deinit();
         if (self.integrity_catalog) |*catalog| catalog.deinit();
         if (self.relational_indexes) |*indexes| indexes.deinit();
         if (self.base_relational_indexes) |*indexes| indexes.deinit();
@@ -1530,6 +1532,14 @@ pub const DBCore = struct {
                 }
             }
         }
+        if (reserved_index) |reserved| {
+            var read = try self.store.beginReadTxn();
+            defer read.abort();
+            if (try @import("relational_index_validation.zig").Seal.load(self.alloc, &read, reserved.binding) != null) {
+                const inputs = reserved_inputs.?;
+                prepared.reserved_activation = try @import("relational_integrity_activation.zig").PreparedIndexPublication.init(self.alloc, &read, reserved.binding, inputs.predecessor, &prepared.integrity_catalog.?, inputs.name);
+            }
+        }
         return prepared;
     }
 
@@ -1728,7 +1738,10 @@ pub const DBCore = struct {
                         try doc_identity.writeNamespaceTxn(txn, participants.namespace);
                     }
                     try catalog.stage(txn);
-                    try @import("relational_integrity_activation.zig").stageSchema(participants.prepared.alloc, txn, catalog.catalog, participants.row_count);
+                    if (participants.prepared.reserved_index != null) {
+                        const activation = if (participants.prepared.reserved_activation) |*value| value else return error.PrivateIndexTargetValidationRequired;
+                        try activation.stage(txn);
+                    } else try @import("relational_integrity_activation.zig").stageSchema(participants.prepared.alloc, txn, catalog.catalog, participants.row_count);
                 }
             }
         };

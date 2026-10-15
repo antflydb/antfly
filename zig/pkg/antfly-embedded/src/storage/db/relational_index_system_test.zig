@@ -372,6 +372,7 @@ test "relational index build pages native owner control preserves committed cuts
         const writes = [_]docstore.KVPair{.{ .key = "\x00\x00__metadata__:schema_json", .value = after }};
         var prepared_schema = try primary.core.prepareSchemaMetadataReservedIndex(runtime, &writes, .{ .binding = reserved, .candidate = &candidate });
         defer prepared_schema.deinit();
+        try std.testing.expect(prepared_schema.reserved_activation == null);
         const indexes = prepared_schema.relational_indexes.?;
         try std.testing.expect(indexes.metadata.head.eql(binding.physical_candidate));
         try std.testing.expect(indexes.metadata.expected.?.eql(binding.physical_reserved));
@@ -950,6 +951,21 @@ test "relational index build pages native owner control preserves committed cuts
         try std.testing.expectEqual(@as(u64, 5), (try authority.require(&read, .native, @import("online_source_contract.zig").namespaceBytes(binding.fence.namespace))).sequence);
         try std.testing.expect(try @import("relational_integrity_topology.zig").completed(&read) == null);
     }
+}
+
+fn testNativeIndexActivationAllocations(allocator: std.mem.Allocator, txn: *docstore.DocStore.Txn, binding: @import("relational_index_owner_job.zig").Binding, candidate: *const @import("relational_index_candidate.zig").Candidate) !void {
+    const activation = @import("relational_integrity_activation.zig");
+    var publication = try @import("relational_integrity_catalog.zig").prepareIndexPublication(allocator, candidate.reservation.expected.?, candidate.reservation.value, candidate.next.value, "email_idx");
+    defer publication.deinit();
+    var prepared = try activation.PreparedIndexPublication.init(allocator, txn, binding, candidate.reservation.expected.?, &publication, "email_idx");
+    defer prepared.deinit();
+    try prepared.validateBefore(txn);
+    const progress = try activation.Progress.decode(prepared.value);
+    try std.testing.expectEqual(activation.State.enforced, progress.state);
+    try std.testing.expectEqual(@as(u32, 2), progress.schema_version);
+    try std.testing.expect(progress.matches(publication.catalog, try activation.ownership(txn)));
+    // Even a real seal cannot stage activation against the reserved catalog.
+    try std.testing.expectError(error.IntegrityCatalogChanged, prepared.stage(txn));
 }
 
 test "relational index build pages identity dispatch caches immutable candidates and keeps completion receipt free" {
@@ -2121,6 +2137,97 @@ test "relational index build pages identity dispatch caches immutable candidates
             db = try db_mod.DB.open(alloc, directory.path(), options);
             const reopened = try db.sealNativeIndexOwnerValidation(validation_request, .{});
             try std.testing.expectEqualDeep(observed, reopened);
+            {
+                var read = try db.core.store.beginReadTxn();
+                defer read.abort();
+                try testNativeIndexActivationAllocations(alloc, &read, binding, &candidate);
+                try @import("antfly_platform").allocator.checkAllAllocationFailures(alloc, testNativeIndexActivationAllocations, .{ &read, binding, &candidate });
+            }
+            {
+                const api = @import("../../schema/mod.zig");
+                const activation = @import("relational_integrity_activation.zig");
+                var parsed_after = try api.parseValidatedTableSchema(alloc, after);
+                defer parsed_after.deinit(alloc);
+                const runtime = try api.deriveRuntimeTableSchema(alloc, parsed_after);
+                defer @import("../schema.zig").freeSchema(alloc, runtime);
+                const metadata = [_]docstore.KVPair{.{ .key = "\x00\x00__metadata__:schema_json", .value = after }};
+                var schema_prepared = try db.core.prepareSchemaMetadataReservedIndex(runtime, &metadata, .{ .binding = binding, .candidate = &candidate });
+                defer schema_prepared.deinit();
+                const activated = &schema_prepared.reserved_activation.?;
+                try std.testing.expectEqual(activation.State.enforced, (try activation.Progress.decode(activated.value)).state);
+                try std.testing.expectError(error.PrivateIndexPublicationRequired, db.core.commitPreparedSchemaMetadata(&schema_prepared, &metadata, &.{}, null));
+                {
+                    var txn = try db.core.store.beginWriteTxn();
+                    defer txn.abort();
+                    try txn.delete(Verification.Seal.key);
+                    try std.testing.expectError(error.PrivateIndexTargetValidationRequired, activated.validateBefore(&txn));
+                }
+                {
+                    var txn = try db.core.store.beginWriteTxn();
+                    defer txn.abort();
+                    const stale: activation.Progress = .{ .generation_set = activation.generationSet(candidate.reservation.catalog), .owner = try activation.ownership(&txn), .schema_version = 1 };
+                    const bytes = try stale.encode(alloc);
+                    defer alloc.free(bytes);
+                    try txn.put(activation.key, bytes);
+                    try std.testing.expectError(error.ConstraintActivationChanged, activated.validateBefore(&txn));
+                }
+                {
+                    // Component staging only: no metadata decision, installed
+                    // job/cut or outbox is invented, and the transaction aborts.
+                    var txn = try db.core.store.beginWriteTxn();
+                    defer txn.abort();
+                    try activated.validateBefore(&txn);
+                    try txn.put(@import("../schema.zig").schema_key, schema_prepared.encoded);
+                    _ = try schema_prepared.relational_indexes.?.metadata.stage(&txn);
+                    try schema_prepared.integrity_catalog.?.stage(&txn);
+                    try activated.stage(&txn);
+                    try activation.requireReady(&txn, schema_prepared.integrity_catalog.?.catalog);
+                    const fence = (try @import("relational_integrity_topology.zig").current(&txn)).?;
+                    try std.testing.expect(fence.eql(binding.fence));
+                }
+                const ActivationFault = struct {
+                    txn: *docstore.DocStore.Txn,
+                    after_put: bool,
+                    pub fn get(self: *@This(), key: []const u8) ![]const u8 {
+                        return self.txn.get(key);
+                    }
+                    pub fn put(self: *@This(), key: []const u8, value: []const u8) !void {
+                        if (self.after_put) try self.txn.put(key, value);
+                        return error.TestActivationWriteFailed;
+                    }
+                };
+                for ([_]bool{ false, true }) |after_put| {
+                    var txn = try db.core.store.beginWriteTxn();
+                    defer txn.abort();
+                    try activated.validateBefore(&txn);
+                    try txn.put(@import("../schema.zig").schema_key, schema_prepared.encoded);
+                    _ = try schema_prepared.relational_indexes.?.metadata.stage(&txn);
+                    try schema_prepared.integrity_catalog.?.stage(&txn);
+                    var activation_fault: ActivationFault = .{ .txn = &txn, .after_put = after_put };
+                    try std.testing.expectError(error.TestActivationWriteFailed, activated.stage(&activation_fault));
+                    if (after_put) {
+                        try std.testing.expectEqual(activation.State.enforced, (try activation.Progress.decode(try txn.get(activation.key))).state);
+                    } else try std.testing.expectError(error.NotFound, txn.get(activation.key));
+                }
+                {
+                    var txn = try db.core.store.beginWriteTxn();
+                    defer txn.abort();
+                    try activated.validateBefore(&txn);
+                    try txn.put(@import("../schema.zig").schema_key, schema_prepared.encoded);
+                    _ = try schema_prepared.relational_indexes.?.metadata.stage(&txn);
+                    try schema_prepared.integrity_catalog.?.stage(&txn);
+                    const range = @import("range_state.zig");
+                    const moved = try range.encodeRangeAlloc(alloc, .{ .start = "row001", .end = "" });
+                    defer alloc.free(moved);
+                    try txn.put(range.range_key, moved);
+                    try std.testing.expectError(error.ConstraintActivationOwnerChanged, activated.stage(&txn));
+                }
+                var read = try db.core.store.beginReadTxn();
+                defer read.abort();
+                try @import("relational_index_owner_job.zig").requireReserved(&read, binding);
+                try std.testing.expectEqual(sequence + 1, (try authority.load(&read)).?.sequence);
+                try std.testing.expectEqual(@as(u32, 1), db.core.schema.?.version);
+            }
             {
                 var read = try db.core.store.beginReadTxn();
                 defer read.abort();

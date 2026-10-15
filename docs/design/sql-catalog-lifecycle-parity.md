@@ -7701,3 +7701,55 @@ run's three TLS failures were sandbox-denied loopback binds; the final run had
 loopback permission and passed without skips. Boundary, license, inventory,
 generated control-catalog, formatting and diff checks passed. No original SQL
 case credit or complete native/public activation is claimed.
+
+### Seal-bound incremental constraint activation preparation
+
+The reserved schema preparation now owns an activation delta only after the
+native validation seal exists and matches complete canonical inventory and
+generation evidence. The seal's generation must be the exact UNIQUE addition;
+the predecessor, reservation and candidate catalog identities are independently
+checked. This does not authorize native installation or physical-root adoption.
+
+The delta preserves older constraints' exact activation state, phase, cursor,
+row count and diagnostics when their generation set and owner still match.
+Enforced FK/CHECK/UNIQUE coverage is not reset for an unrelated index addition,
+avoiding a full-table revalidation after a successful build. Invalid or partial
+older coverage is never promoted by the new index's proof. Missing/mismatched
+older coverage remains validating; only a predecessor with no active
+constraints needs no older proof. Ownership and schema/generation identities
+are rebound to the candidate while existing semantic bindings remain unchanged.
+
+All activation bytes and CAS ownership are prepared off-lock. The native
+installer must call the predecessor check inside its schema transaction before
+catalog puts, stage the exact candidate catalogs and activation, then commit
+the installed job/cut, replay marker and outbox in the same transaction without
+releasing the fence. Activation staging checks the exact seal, active job,
+candidate catalog, prior activation bytes and current owned range. Ordinary
+schema publication still rejects reserved preparations, including sealed ones;
+an unsealed preparation owns no candidate activation.
+
+The authenticated native install participant, installed-state recovery and
+wire/replay effect, install/release receiver/scheduler, full capability/adoption
+barriers and public SQL qualification remain unfinished. This is the
+seal-bound activation component, not a committed native installation or new
+original-case credit. Dispositions remain 483 implemented / 862 unresolved.
+
+Qualification: `/private/tmp/antfly-index-activation-final-debug-v2.log` passed
+159/159 macOS Debug build steps, including 11 native page/lifecycle, 50
+publication, four ACK, six C-ABI, three leased-owner, 46 runtime-contract and
+104 standalone tests. The new data-policy regression preserves enforced,
+invalid and partial older FK/CHECK/UNIQUE coverage, with conservative reset for
+missing/mismatched ownership. The LSM fixture uses its real canonical native
+seal after replay and reopen, checks off-lock activation/schema preparation,
+and exhaustively exercises allocation-failure/leak cleanup. It rejects missing
+seals, stale activation CAS, the wrong catalog and a moved owned range.
+
+Component transaction tests stage schema, both catalogs and activation with
+the fence still held, inject failures before/after the activation write, and
+abort. The original reserved catalogs/schema, runtime epoch and native clock
+remain unchanged. They deliberately commit no installed job/receipt, outbox or
+release and are not a distributed installation qualification. A sealed reserved
+preparation still cannot use ordinary schema commit; an unsealed one owns no
+activation delta. Boundary, license, inventory, generated control-catalog,
+formatting and diff checks passed. No throughput measurement, full native
+activation or original SQL case credit is claimed.

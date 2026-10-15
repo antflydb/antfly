@@ -106,6 +106,107 @@ pub fn requireReady(txn: anytype, catalog: catalog_mod.Catalog) !void {
     }
 }
 
+/// Used only after the exact catalog addition and native seal agree.
+fn carriedIndexProgress(before: catalog_mod.Catalog, after: catalog_mod.Catalog, owner: integrity.Digest, previous: ?[]const u8) !Progress {
+    var progress: Progress = .{ .generation_set = generationSet(before), .owner = owner, .schema_version = before.schema_version, .phase = firstPhase(before) };
+    if (previous) |bytes| {
+        const current = try Progress.decode(bytes);
+        if (current.matches(before, owner)) progress = current;
+    }
+    if (!hasActive(before)) {
+        progress.state = .enforced;
+        progress.phase = firstPhase(after);
+        progress.cursor = "";
+        progress.failure = "";
+    }
+    progress.generation_set = generationSet(after);
+    progress.owner = owner;
+    progress.schema_version = after.schema_version;
+    return progress;
+}
+
+/// Owned activation delta for one independently validated UNIQUE addition.
+/// This is not metadata installation authority. The native installer must
+/// validateBefore in its schema transaction, stage both catalogs, stage this
+/// delta, and commit its installed cut/outbox without releasing the fence.
+/// Existing invalid/partial coverage is preserved, never promoted by the new
+/// index's seal. Already enforced generations need no primary-row rescan.
+pub const PreparedIndexPublication = struct {
+    alloc: Allocator,
+    binding: @import("relational_index_owner_job.zig").Binding,
+    seal: @import("relational_index_validation.zig").Seal,
+    owner: integrity.Digest,
+    catalog_digest: integrity.Digest,
+    expected: ?[]u8,
+    value: []u8,
+
+    pub fn deinit(self: *@This()) void {
+        if (self.expected) |bytes| self.alloc.free(bytes);
+        self.alloc.free(self.value);
+        self.* = undefined;
+    }
+
+    pub fn init(alloc: Allocator, txn: anytype, binding: @import("relational_index_owner_job.zig").Binding, predecessor: []const u8, publication: *const catalog_mod.Update, name: []const u8) !@This() {
+        const jobs = @import("relational_index_owner_job.zig");
+        const validation = @import("relational_index_validation.zig");
+        try jobs.requireReserved(txn, binding);
+        var before = try catalog_mod.decode(alloc, predecessor);
+        defer before.deinit();
+        const added = try catalog_mod.indexAddition(before, publication.catalog, name);
+        if (added.retired or !std.mem.eql(u8, &digest(predecessor), &binding.integrity_before) or
+            !std.mem.eql(u8, &digest(publication.expected orelse return error.IntegrityCatalogChanged), &binding.integrity_reserved) or
+            !std.mem.eql(u8, &digest(publication.value), &binding.integrity_candidate)) return error.IntegrityCatalogChanged;
+        const sealed = (try validation.Seal.load(alloc, txn, binding)) orelse return error.PrivateIndexTargetValidationRequired;
+        const actual = try validation.SealCommand.prepare(alloc, txn, binding, sealed.command.expected);
+        if (!std.meta.eql(actual, sealed.command) or !std.mem.eql(u8, &added.generation, &sealed.command.expected.generation)) return error.InvalidRelationalIndexValidation;
+        const owner = try ownership(txn);
+        const raw = try optional(txn, key);
+        const expected = if (raw) |bytes| try alloc.dupe(u8, bytes) else null;
+        errdefer if (expected) |bytes| alloc.free(bytes);
+        const progress = try carriedIndexProgress(before, publication.catalog, owner, expected);
+        const value = try progress.encode(alloc);
+        return .{ .alloc = alloc, .binding = binding, .seal = sealed, .owner = owner, .catalog_digest = binding.integrity_candidate, .expected = expected, .value = value };
+    }
+
+    /// Called before schema/catalog puts in the same write transaction. No
+    /// preparation-time observation substitutes for this predecessor check.
+    pub fn validateBefore(self: *const @This(), txn: anytype) !void {
+        try @import("relational_index_owner_job.zig").requireReserved(txn, self.binding);
+        const validation = @import("relational_index_validation.zig");
+        const command = try validation.SealCommand.prepare(self.alloc, txn, self.binding, self.seal.command.expected);
+        if (!std.meta.eql(command, self.seal.command)) return error.InvalidRelationalIndexValidation;
+        try self.requireSeal(txn);
+        try self.requireActivation(txn);
+    }
+
+    fn requireSeal(self: *const @This(), txn: anytype) !void {
+        const current = (try @import("relational_index_validation.zig").Seal.load(self.alloc, txn, self.binding)) orelse return error.PrivateIndexTargetValidationRequired;
+        if (!std.meta.eql(current, self.seal)) return error.InvalidRelationalIndexValidation;
+    }
+
+    fn requireActivation(self: *const @This(), txn: anytype) !void {
+        const current = try optional(txn, key);
+        if (self.expected) |expected| {
+            if (!std.mem.eql(u8, current orelse return error.ConstraintActivationChanged, expected)) return error.ConstraintActivationChanged;
+        } else if (current != null) return error.ConstraintActivationChanged;
+        if (!std.mem.eql(u8, &try ownership(txn), &self.owner)) return error.ConstraintActivationOwnerChanged;
+    }
+
+    /// Stages only after the exact candidate catalog, with the source still
+    /// fenced. The installed job/cut and outbox are the installer's effects.
+    pub fn stage(self: *const @This(), txn: anytype) !void {
+        const jobs = @import("relational_index_owner_job.zig");
+        const current = (try jobs.load(txn)) orelse return error.PrivateIndexJobRequired;
+        if (!std.meta.eql(current, self.binding)) return error.PrivateIndexOwnerJobChanged;
+        try jobs.requireActive(txn, self.binding.fence);
+        const candidate = try txn.get(catalog_mod.key);
+        if (!std.mem.eql(u8, &digest(candidate), &self.catalog_digest)) return error.IntegrityCatalogChanged;
+        try self.requireSeal(txn);
+        try self.requireActivation(txn);
+        try txn.put(key, self.value);
+    }
+};
+
 /// Repairs retain an exact-value read guard on failed or diagnosed activation.
 /// MATCH PARTIAL missing-parent diagnostics cannot be terminal (there is no
 /// negative witness lock), but must still admit constraint-checked repairs.
@@ -289,4 +390,48 @@ test "relational integrity activation coverage binds generation owner phase and 
     try std.testing.expect(!decoded.matches(catalog.catalog, @splat(6)));
     bytes[bytes.len - 1] ^= 1;
     try std.testing.expectError(error.InvalidConstraintActivation, Progress.decode(bytes));
+}
+
+test "relational index build pages activation preserves older enforced invalid and partial coverage" {
+    const alloc = std.testing.allocator;
+    const definitions = [_]catalog_mod.Definition{
+        .{ .kind = .unique, .name = "id", .fingerprint = @splat(3) },
+        .{ .kind = .foreign_key, .name = "parent", .fingerprint = @splat(4) },
+        .{ .kind = .unique, .name = "new_index", .fingerprint = @splat(5) },
+    };
+    var before = try catalog_mod.prepareWithChecks(alloc, null, @splat(1), 1, @splat(2), definitions[0..2], @splat(9));
+    defer before.deinit();
+    var after = try catalog_mod.prepareWithChecks(alloc, before.value, @splat(1), 2, @splat(6), &definitions, @splat(9));
+    defer after.deinit();
+    _ = try catalog_mod.indexAddition(before.catalog, after.catalog, "new_index");
+    const owner: integrity.Digest = @splat(7);
+    for ([_]State{ .enforced, .invalid, .validating }) |state| {
+        const previous: Progress = .{ .generation_set = generationSet(before.catalog), .owner = owner, .schema_version = 1, .state = state, .phase = .foreign_key, .rows_scanned = 11, .cursor = if (state == .enforced) "" else "row11", .failure = if (state == .invalid) "ForeignKeyParentMissing" else "" };
+        const bytes = try previous.encode(alloc);
+        defer alloc.free(bytes);
+        const next = try carriedIndexProgress(before.catalog, after.catalog, owner, bytes);
+        try std.testing.expect(next.matches(after.catalog, owner));
+        try std.testing.expectEqual(@as(u32, 2), next.schema_version);
+        try std.testing.expectEqual(state, next.state);
+        try std.testing.expectEqual(previous.phase, next.phase);
+        try std.testing.expectEqual(previous.rows_scanned, next.rows_scanned);
+        try std.testing.expectEqualStrings(previous.cursor, next.cursor);
+        try std.testing.expectEqualStrings(previous.failure, next.failure);
+        const different_owner = try carriedIndexProgress(before.catalog, after.catalog, @splat(8), bytes);
+        try std.testing.expectEqual(State.validating, different_owner.state);
+        try std.testing.expectEqual(@as(u64, 0), different_owner.rows_scanned);
+        try std.testing.expectEqualStrings("", different_owner.cursor);
+    }
+    const missing = try carriedIndexProgress(before.catalog, after.catalog, owner, null);
+    try std.testing.expectEqual(State.validating, missing.state);
+    try std.testing.expectEqual(firstPhase(before.catalog), missing.phase);
+    var empty = try catalog_mod.prepare(alloc, null, @splat(1), 1, @splat(2), &.{});
+    defer empty.deinit();
+    var only_index = try catalog_mod.prepare(alloc, empty.value, @splat(1), 2, @splat(6), definitions[2..]);
+    defer only_index.deinit();
+    _ = try catalog_mod.indexAddition(empty.catalog, only_index.catalog, "new_index");
+    const ready = try carriedIndexProgress(empty.catalog, only_index.catalog, owner, null);
+    try std.testing.expectEqual(State.enforced, ready.state);
+    try std.testing.expectEqual(Phase.unique, ready.phase);
+    try std.testing.expect(ready.matches(only_index.catalog, owner));
 }
