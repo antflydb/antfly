@@ -583,6 +583,19 @@ pub const Owner = struct {
         return response;
     }
 
+    /// Private terminal effect after metadata accepts the installed cohort.
+    pub fn nativeIndexOwnerReleaseScopedJson(self: *Owner, table_name: []const u8, intent_json: []const u8, root_scope_json: []const u8, options: QueryOptions) !Response {
+        var response: Response = .{};
+        try statusToError(abi.antfly_storage_owner_native_index_control_json(self.handle, &.{
+            .operation = .release,
+            .table_name = .fromSlice(table_name),
+            .request_json = .fromSlice(intent_json),
+            .manifest = .fromSlice(root_scope_json),
+            .control = controlledRequest("", "", options.execution_deadline_ns, options.cancellation_ctx, options.cancellation_fn),
+        }, &response.buffer));
+        return response;
+    }
+
     /// Trusted server command after independent durable metadata acceptance.
     pub fn nativeIndexSourceConsumptionJson(self: *Owner, table_name: []const u8, command_json: []const u8, options: QueryOptions) !Response {
         var response: Response = .{};

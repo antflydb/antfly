@@ -4161,6 +4161,34 @@ pub fn storageOwnerNativeIndexControlJson(
         const result = handle.db.stepNativeIndexOwnerInstallation(request.table_name.slice(), parsed.value, root_scope.value.root_dir, root_scope.value.root_incarnation, context) catch |err| return nativeIndexValidationStatus(err);
         return response.finish(result, out_response);
     }
+    if (request.operation == .release) {
+        const native = @import("antfly_local_sources").storage_db_relational_index_owner_control;
+        if (request.manifest.len == 0 or request.manifest.len > native.AuditRoot.max_wire_bytes or request.manifest.ptr == null or
+            request.control.version != kernel_owner_abi.abi_version or request.control.has_execution_deadline > 1 or
+            request.control.table_name.len != 0 or request.control.request_json.len != 0) return .invalid_argument;
+        const context: @import("antfly_local_sources").api_operation.RequestContext = .{
+            .deadline_ns = if (request.control.has_execution_deadline != 0) request.control.execution_deadline_ns else null,
+            .cancellation = ownerQueryCancellation(&request.control),
+        };
+        context.ensureActive() catch |err| return storageOwnerStatusFromError(err);
+        var parsed = std.json.parseFromSlice(@FieldType(native.ReleaseOutcome, "intent"), handle.alloc, request.request_json.slice(), .{ .ignore_unknown_fields = false, .allocate = .alloc_always }) catch |err| return switch (err) {
+            error.OutOfMemory => .out_of_memory,
+            else => .invalid_argument,
+        };
+        defer parsed.deinit();
+        if (parsed.value.installed.command.validation.command.binding.fence.owner_group_id != handle.storage_owner_group_id) return .invalid_argument;
+        var root_scope = std.json.parseFromSlice(native.AuditRoot, handle.alloc, request.manifest.slice(), .{ .ignore_unknown_fields = false, .allocate = .alloc_always, .max_value_len = native.AuditRoot.max_wire_bytes }) catch |err| return switch (err) {
+            error.OutOfMemory => .out_of_memory,
+            else => .invalid_argument,
+        };
+        defer root_scope.deinit();
+        root_scope.value.validate() catch return .invalid_argument;
+        const root = @import("antfly_local_sources").storage_db_root_signing_identity.load(handle.alloc, handle.db.backend_runtime.io() orelse std.Options.debug_io, root_scope.value.root_dir) catch |err| return nativeIndexValidationStatus(err);
+        if (root.root_incarnation != root_scope.value.root_incarnation) return nativeIndexValidationStatus(error.PrivateIndexRootRecoveryRequired);
+        var prepared = handle.db.prepareNativeIndexOwnerRelease(parsed.value, context) catch |err| return storageOwnerStatusFromError(err);
+        defer prepared.deinit();
+        return applyNativeIndexPreparedResponse(handle, &prepared, out_response);
+    }
     if (request.operation == .receipt) {
         if (request.manifest.len != 0) return .invalid_argument;
         var parsed = std.json.parseFromSlice(db_mod.DB.NativeIndexOwnerReceiptRequest, handle.alloc, request.request_json.slice(), .{}) catch |err|
@@ -4339,6 +4367,8 @@ fn applyNativeIndexPreparedResponse(handle: anytype, prepared: anytype, out_resp
         handle.db.applyPreparedNativeIndexOwnerClaims(prepared, null)
     else if (comptime @TypeOf(prepared.*) == db_mod.DB.PreparedNativeIndexSourceConsumption)
         handle.db.applyPreparedNativeIndexSourceConsumption(prepared, null)
+    else if (comptime @TypeOf(prepared.*) == @import("antfly_local_sources").storage_db_relational_index_owner_control.PreparedRelease)
+        handle.db.applyPreparedNativeIndexOwnerRelease(prepared, null)
     else
         handle.db.applyPreparedNativeIndexOwnerControl(prepared, null)) catch |err|
         return storageOwnerStatusFromError(err);

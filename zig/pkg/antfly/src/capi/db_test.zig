@@ -1112,7 +1112,7 @@ test "capi system write cursor sees pending catalog rows and preserves abort" {
 }
 
 test "storage owner native index rejects prior ABI before dereferencing request fields" {
-    for ([_]u32{ 0, kernel_owner_abi.abi_version - 1 }) |version| for ([_]kernel_owner_abi.NativeIndexOwnerOperation{ .build, .install }) |operation| {
+    for ([_]u32{ 0, kernel_owner_abi.abi_version - 1 }) |version| for ([_]kernel_owner_abi.NativeIndexOwnerOperation{ .build, .install, .release }) |operation| {
         var response: kernel_owner_abi.OwnedBytes = .{ .ptr = @ptrFromInt(1), .len = 1 };
         try std.testing.expectEqual(kernel_owner_abi.Status.invalid_abi, server_api.storageOwnerNativeIndexControlJson(null, &.{
             .version = version,
@@ -1225,6 +1225,63 @@ fn testNativeIndexInstallationInterface(source: *db_mod.DB, intent: @import("ant
         try std.testing.expect(result.value.installed.logical.duplicate);
         try std.testing.expectEqualDeep(committed.?.receipt.?, result.value.installed.logical.receipt.?);
         try std.testing.expectEqual(committed.?.position, result.value.installed.logical.position);
+    }
+    // Kernel-interface qualification only: metadata authorization and signing
+    // are independently qualified by the server receiver and ACK tests.
+    const release_intent: @FieldType(native.ReleaseOutcome, "intent") = .{ .installed = .{ .command = committed.?.command, .position = committed.?.position }, .metadata_decision = @splat(88) };
+    const release_json = try std.json.Stringify.valueAlloc(a, release_intent, .{});
+    defer a.free(release_json);
+    request.operation = .release;
+    request.request_json = .fromSlice(release_json);
+    request.control = .{ .has_execution_deadline = 1, .execution_deadline_ns = 0 };
+    try std.testing.expectEqual(kernel_owner_abi.Status.deadline_exceeded, server_api.storageOwnerNativeIndexControlJson(id, &request, &response));
+    try std.testing.expect(response.ptr == null);
+    request.control = .{};
+    request.manifest = .{};
+    try std.testing.expectEqual(kernel_owner_abi.Status.invalid_argument, server_api.storageOwnerNativeIndexControlJson(id, &request, &response));
+    request.manifest = .{ .ptr = @ptrFromInt(1), .len = native.AuditRoot.max_wire_bytes + 1 };
+    try std.testing.expectEqual(kernel_owner_abi.Status.invalid_argument, server_api.storageOwnerNativeIndexControlJson(id, &request, &response));
+    request.manifest = .fromSlice(root_json);
+    handle.storage_owner_group_id = 99;
+    try std.testing.expectEqual(kernel_owner_abi.Status.invalid_argument, server_api.storageOwnerNativeIndexControlJson(id, &request, &response));
+    handle.storage_owner_group_id = 11;
+    {
+        var wrong_root = root;
+        wrong_root.root_incarnation ^= 1;
+        const wrong_json = try std.json.Stringify.valueAlloc(a, wrong_root, .{});
+        defer a.free(wrong_json);
+        var rejected = request;
+        rejected.manifest = .fromSlice(wrong_json);
+        try std.testing.expectEqual(kernel_owner_abi.Status.private_index_root_recovery_required, server_api.storageOwnerNativeIndexControlJson(id, &rejected, &response));
+        try std.testing.expect(response.ptr == null);
+        var read = try handle.db.core.store.beginReadTxn();
+        defer read.abort();
+        try std.testing.expect(try local.storage_db_relational_integrity_topology.current(&read) != null);
+    }
+    var released: ?native.ReleaseOutcome = null;
+    for (0..3) |attempt| {
+        try std.testing.expectEqual(kernel_owner_abi.Status.ok, server_api.storageOwnerNativeIndexControlJson(id, &request, &response));
+        {
+            const output = response;
+            defer freeRawBuffer(output.ptr, output.len);
+            var result = try std.json.parseFromSlice(native.ReleaseOutcome, a, output.slice(), .{ .ignore_unknown_fields = false });
+            defer result.deinit();
+            try result.value.validate();
+            try std.testing.expectEqualDeep(release_intent, result.value.intent);
+            try std.testing.expectEqual(attempt != 0, result.value.duplicate);
+            try std.testing.expect(!result.value.replication_pending);
+            try std.testing.expectEqual(committed.?.position.sequence + 1, result.value.position.sequence);
+            if (released) |prior| try std.testing.expectEqualDeep(prior.receipt.?, result.value.receipt.?) else released = result.value;
+        }
+        handle.db.close();
+        opened = false;
+        handle.db = try db_mod.DB.open(a, directory.path(), options);
+        opened = true;
+        var read = try handle.db.core.store.beginReadTxn();
+        defer read.abort();
+        try std.testing.expect(try local.storage_db_relational_integrity_topology.current(&read) == null);
+        try std.testing.expect(try local.storage_db_relational_index_owner_job.load(&read) == null);
+        try std.testing.expectEqual(@as(u32, 2), handle.db.core.schema.?.version);
     }
 }
 

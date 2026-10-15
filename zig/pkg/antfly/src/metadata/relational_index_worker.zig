@@ -39,7 +39,7 @@ const idle_lifetime_ns = 60 * std.time.ns_per_s;
 const max_job_quanta = 4096;
 
 pub const Authority = struct { metadata_incarnation: [32]u8, binding_digest: [32]u8, writer_generation: u64 };
-const Stage = enum { refresh, control, acknowledge, resolve_ack, decide, resolve_decision, build, deliver, inventory, install };
+const Stage = enum { refresh, control, acknowledge, resolve_ack, decide, resolve_decision, build, deliver, inventory, install, release };
 const Owner = struct {
     ordinal: u16,
     stage: Stage = .refresh,
@@ -203,9 +203,10 @@ const Job = struct {
                     .fencing, .reserving => .control,
                     .building => .build,
                     .installing => .install,
+                    .releasing => .release,
                     else => {
-                        // Release needs its own real native
-                        // evidence, never a synthesized "ready" response.
+                        // Terminal and cancellation work have no forward
+                        // publication effect to dispatch here.
                         self.retireOwner(index);
                         self.retry_at_ns = now_ns +| std.time.ns_per_s;
                         return;
@@ -348,6 +349,30 @@ const Job = struct {
                 if (result == .pending) {
                     if (owner.stream.?.phase == prior) owner.retry_at_ns = now_ns +| retry_ns;
                 } else self.retireOwner(index);
+            },
+            .release => {
+                const request: execution.Request = .{ .table_id = self.identity.table_id, .group_id = identity.group_id, .id = self.identity.id, .operation = .release };
+                var response = transport.control(alloc, self.table_name.?, request, context_) catch |err| switch (@as(anyerror, err)) {
+                    error.MetadataReplicationPending => {
+                        owner.retry_at_ns = now_ns +| retry_ns;
+                        return;
+                    },
+                    else => return err,
+                };
+                defer response.deinit();
+                try response.value.validate(request);
+                if (response.value == .acknowledged) {
+                    self.retireOwner(index);
+                    return;
+                }
+                if (response.value != .releasing) return error.InvalidPrivateIndexNativeReceipt;
+                const ack = (try response.value.releaseAck(request)) orelse {
+                    owner.retry_at_ns = now_ns +| retry_ns;
+                    return;
+                };
+                if (!std.meta.eql(ack.signed.receipt.owner, identity)) return error.InvalidIndexOwnerReceipt;
+                owner.ack = ack;
+                owner.stage = .acknowledge;
             },
             .install => {
                 const request: execution.Request = .{ .table_id = self.identity.table_id, .group_id = identity.group_id, .id = self.identity.id, .operation = .install, .build_budget = .{ .records = 128, .bytes = 16 * 1024 * 1024 } };
