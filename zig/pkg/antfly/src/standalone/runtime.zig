@@ -2580,7 +2580,7 @@ const LocalStandaloneMetadata = struct {
         try context.ensureActive();
         if (call.isRelationalIndexOwnerCall() and !context.index_publication_authority) return error.Forbidden;
         if (call == .relational_index_begin) return self.beginRelationalIndexPublication(alloc, context, call.relational_index_begin);
-        if (call == .relational_index_prepare and !context.setting_admin) return error.Forbidden;
+        if ((call == .relational_index_status or call == .relational_index_prepare) and !context.setting_admin) return error.Forbidden;
         if ((call == .store_root_enroll or call == .store_root_enrollment_status) and !context.setting_admin) return error.Forbidden;
         if (call == .lake_index_lifecycle_read) return getLakeIndexLifecycle(ptr, alloc, call.lake_index_lifecycle_read, context);
         if (call == .lake_index_lifecycle_work) {
@@ -2622,6 +2622,10 @@ const LocalStandaloneMetadata = struct {
         }
         switch (call) {
             .lake_index_lifecycle_read, .lake_index_lifecycle_work, .lake_index_lifecycle_mutate, .relational_index_begin => unreachable,
+            .relational_index_status => |request| {
+                const store = self.lifecycle_store orelse return error.UnsupportedOperation;
+                return store.relationalIndexStatusJson(alloc, group_ids.main_metadata_group_id, request);
+            },
             .relational_index_prepare => |request| {
                 const store = self.lifecycle_store orelse return error.UnsupportedOperation;
                 return store.relationalIndexPrepareCutJson(alloc, group_ids.main_metadata_group_id, request);

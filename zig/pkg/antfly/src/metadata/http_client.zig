@@ -1192,6 +1192,19 @@ pub const MetadataHttpClient = struct {
         return parsed.value;
     }
 
+    pub fn relationalIndexStatus(self: *MetadataHttpClient, base_uri: []const u8, request: @import("relational_index_publication.zig").StatusRequest, remaining_ms: u32, cancellation: ?*const http_common.RequestCancellation) !@import("relational_index_publication.zig").AdmissionStatus {
+        const publication = @import("relational_index_publication.zig");
+        try request.validate();
+        const observed = try self.readSystemCatalog(base_uri, .{ .relational_index_status = request }, remaining_ms, cancellation);
+        defer observed.deinit(self.alloc);
+        if (!std.mem.eql(u8, &observed.metadata_incarnation, &request.admission.metadata_incarnation)) return error.MetadataIncarnationMismatch;
+        if (observed.body.len == 0 or observed.body.len > publication.AdmissionStatus.max_wire_bytes) return error.InvalidCatalogRecord;
+        var parsed = try std.json.parseFromSlice(publication.AdmissionStatus, self.alloc, observed.body, .{});
+        defer parsed.deinit();
+        _ = try parsed.value.isAdmitted(request.admission);
+        return parsed.value;
+    }
+
     pub fn relationalIndexAdmissionStatus(self: *MetadataHttpClient, base_uri: []const u8, request: @import("relational_index_publication.zig").AdmissionRequest, remaining_ms: u32, cancellation: ?*const http_common.RequestCancellation) !@import("relational_index_publication.zig").AdmissionStatus {
         const publication = @import("relational_index_publication.zig");
         try request.validate();
@@ -4669,7 +4682,7 @@ fn catalogResponseLimit(input: @import("../system_catalog/server_call.zig").Call
     const publication = @import("relational_index_publication.zig");
     return switch (input) {
         .relational_index_prepare => publication.PrepareCut.max_wire_bytes,
-        .relational_index_begin, .relational_index_admission_status => publication.AdmissionStatus.max_wire_bytes,
+        .relational_index_status, .relational_index_begin, .relational_index_admission_status => publication.AdmissionStatus.max_wire_bytes,
         .relational_index_publish_decide, .relational_index_publish_status => publication.DecisionStatus.max_wire_bytes,
         .relational_index_cancel, .relational_index_cancel_status => publication.CancellationStatus.max_wire_bytes,
         .relational_index_source_accept, .relational_index_source_accept_status, .relational_index_source_complete => 16 * 1024,
@@ -4697,7 +4710,7 @@ test "relational index publication ACK client binds read grants and never retrie
             const mutation = call.value.isMutation();
             try std.testing.expect(call.value.isRelationalIndexOwnerCall());
             if (call.value == .relational_index_prepare) try std.testing.expectEqual(@as(?usize, publication.PrepareCut.max_wire_bytes), request.max_response_bytes);
-            if (call.value == .relational_index_begin or call.value == .relational_index_admission_status) try std.testing.expectEqual(@as(?usize, publication.AdmissionStatus.max_wire_bytes), request.max_response_bytes);
+            if (call.value == .relational_index_status or call.value == .relational_index_begin or call.value == .relational_index_admission_status) try std.testing.expectEqual(@as(?usize, publication.AdmissionStatus.max_wire_bytes), request.max_response_bytes);
             if (call.value == .relational_index_source_accept_status or call.value == .relational_index_source_accept or call.value == .relational_index_source_complete) try std.testing.expectEqual(@as(?usize, 16 * 1024), request.max_response_bytes);
             if (call.value == .relational_index_publish_status or call.value == .relational_index_publish_decide) try std.testing.expectEqual(@as(?usize, publication.DecisionStatus.max_wire_bytes), request.max_response_bytes);
             if (call.value == .relational_index_cancel_status or call.value == .relational_index_cancel) try std.testing.expectEqual(@as(?usize, publication.CancellationStatus.max_wire_bytes), request.max_response_bytes);
@@ -4814,6 +4827,12 @@ test "relational index publication ACK client binds read grants and never retrie
     defer alloc.free(begin_reply);
     const prepare_reply = try client.readSystemCatalog("http://metadata.invalid", .{ .relational_index_prepare = .{ .guard = beginning.begin.plan.table_guard, .index_name = beginning.begin.plan.index_name } }, 25, null);
     defer prepare_reply.deinit(alloc);
+    const scoped: publication.StatusRequest = .{ .guard = beginning.begin.plan.table_guard, .index_name = beginning.begin.plan.index_name, .admission = admission };
+    executor.body = admission_bytes;
+    try std.testing.expect(!try (try client.relationalIndexStatus("http://metadata.invalid", scoped, 25, null)).isAdmitted(admission));
+    executor.wrong_cluster = true;
+    try std.testing.expectError(error.MetadataIncarnationMismatch, client.relationalIndexStatus("http://metadata.invalid", scoped, 25, null));
+    executor.wrong_cluster = false;
     executor.status = 409;
     executor.body = "MetadataReplicationPending";
     executor.outcome = routes.Routes.raft_mutation_outcome_not_proposed;

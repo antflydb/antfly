@@ -3630,6 +3630,7 @@ test "opaque metadata relational index controls cross compiled projection withou
         try std.testing.expectError(error.CatalogOccupancyNotReady, store.validateRelationalIndexCancellation(group, cancel));
         try std.testing.expectError(error.CatalogOccupancyNotReady, store.validateRelationalIndexBegin(group, begin, &prepared));
         try std.testing.expectError(error.CatalogOccupancyNotReady, store.relationalIndexPrepareCutJson(alloc, group, .{ .guard = plan.table_guard, .index_name = plan.index_name }));
+        try std.testing.expectError(error.CatalogOccupancyNotReady, store.relationalIndexStatusJson(alloc, group, .{ .guard = plan.table_guard, .index_name = plan.index_name, .admission = observation }));
         var foreign = begin;
         foreign.metadata_incarnation[0] = '2';
         try std.testing.expectError(error.MetadataIncarnationMismatch, store.validateRelationalIndexBegin(group, foreign, &prepared));

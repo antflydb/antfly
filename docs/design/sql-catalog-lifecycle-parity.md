@@ -8626,3 +8626,31 @@ No latency benchmark or complete public execution is claimed. Static checks pass
 the new file's initial license-header formatting mismatch was corrected. Public
 SQL/REST recovery receipts and activation, replacement-root adoption and hosted
 execution remain unfinished. Original inventory is still 483 / 862.
+
+### Table-authorized, name-bound publication recovery reads
+
+The private scoped status read now requires the current logical table guard as
+well as the exact admission identity and index name. Reads and writes share one
+indexed ownership/incarnation boundary. Polling reads no table/schema JSON and
+no owner cohort: it consumes the fixed head and one validated owner dispatch.
+Dispatch v3 includes an index-name commitment, independently joined to native
+inputs during admission and to the retained plan during recovery. Wrong names,
+substituted table identities, stale guards and foreign transport incarnations
+are rejected. Absence remains an observation, never permission to replay begin.
+The shared metadata, standalone, compiled projection and authenticated client
+paths all carry this read; it is not yet the public SQL/REST recovery endpoint.
+
+The final frozen-source Debug gate passed 142/142 steps in
+`/private/tmp/antfly-index-scoped-recovery-final-debug.log`: 62 metadata/index,
+50 relation-store, four transport, four standalone, one decoder-barrier, one
+compiled metadata-owner and three real owner-adapter tests, without failures or
+leaks. The first compile caught an incorrect decoder helper name. The next run
+exposed a Debug stack overflow in the deeply nested lifecycle fixture: the fault
+was a function-prologue stack save, not a JSON buffer access. LLDB launch was
+blocked by local debugger permissions; disassembly established the unchanged
+16 MiB executable stack and the oversized fixture frame. Replacing its inline
+authority loop with runtime iteration retains both Raft/native cases and reduces
+that frame from 7,934,592 to 5,179,024 bytes. No stack-budget increase or optimized
+build was used to make the final gate pass. Public recovery receipts, activation,
+replacement-root adoption and hosted execution remain unfinished. Inventory
+remains 483 implemented / 862 unresolved.

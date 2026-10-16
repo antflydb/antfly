@@ -5927,7 +5927,10 @@ pub const OwnerAckTestFixture = if (@import("builtin").is_test) struct {
         const root: @import("antfly_local_sources").storage_db_root_signing_identity.State = .{ .seed = seed, .root_incarnation = 7, .public_key = pair.public_key.toBytes() };
         const identity: store_root_enrollment.Identity = .{ .metadata_incarnation = incarnation, .node_id = 2, .store_id = 3, .root_incarnation = 7, .public_key = root.public_key };
         const native_binding: standalone_native_owner.Binding = .{ .metadata_incarnation = incarnation, .node_id = 2, .store_id = 3, .root_incarnation = 7 };
-        inline for (.{ index_progress.Authority.raft, index_progress.Authority.native }) |authority| {
+        // Both modes exercise the same fixture. Inline duplication retains
+        // both large Debug frames across nested native lifecycle checks and
+        // can exhaust the runner stack; runtime iteration preserves coverage.
+        for ([_]index_progress.Authority{ .raft, .native }) |authority| {
             var tmp = std.testing.tmpDir(.{});
             defer tmp.cleanup();
             const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/index-ack", .{tmp.sub_path});
@@ -6769,6 +6772,14 @@ test "relational index publication admission reserves names atomically and survi
         var prepared_admission = try plan.prepare(a);
         defer prepared_admission.deinit();
         const admission: index_publication.AdmissionRequest = .{ .table_id = plan.before.table_id, .id = plan.id, .plan_digest = prepared_admission.head.plan_digest, .metadata_incarnation = identity };
+        const scoped: index_publication.StatusRequest = .{ .guard = plan.table_guard, .index_name = plan.index_name, .admission = admission };
+        {
+            const bytes = try store.relationalIndexStatusJson(a, group, scoped);
+            defer a.free(bytes);
+            var status = try std.json.parseFromSlice(index_publication.AdmissionStatus, a, bytes, .{});
+            defer status.deinit();
+            try std.testing.expect(!try status.value.isAdmitted(admission));
+        }
         {
             const bytes = try store.relationalIndexAdmissionStatusJson(a, group, admission);
             defer a.free(bytes);
@@ -6786,6 +6797,20 @@ test "relational index publication admission reserves names atomically and survi
             try std.testing.expect(try status.value.isAdmitted(admission));
             try std.testing.expectEqual(@as(u64, 1), status.value.head.?.revision);
             try std.testing.expect(bytes.len <= index_publication.AdmissionStatus.max_wire_bytes);
+            const scoped_bytes = try store.relationalIndexStatusJson(a, group, scoped);
+            defer a.free(scoped_bytes);
+            var scoped_status = try std.json.parseFromSlice(index_publication.AdmissionStatus, a, scoped_bytes, .{});
+            defer scoped_status.deinit();
+            try std.testing.expect(try scoped_status.value.isAdmitted(admission));
+            var wrong_scope = scoped;
+            wrong_scope.index_name = "other_index";
+            try std.testing.expectError(error.GenerationPublicationChanged, store.relationalIndexStatusJson(a, group, wrong_scope));
+            wrong_scope = scoped;
+            wrong_scope.guard.owner.schema_digest[0] ^= 1;
+            try std.testing.expectError(error.CatalogGenerationChanged, store.relationalIndexStatusJson(a, group, wrong_scope));
+            wrong_scope = scoped;
+            wrong_scope.admission.table_id += 1;
+            try std.testing.expectError(error.InvalidGenerationPublication, store.relationalIndexStatusJson(a, group, wrong_scope));
             var substituted = admission;
             substituted.plan_digest[0] ^= 1;
             try std.testing.expectError(error.GenerationPublicationChanged, store.relationalIndexAdmissionStatusJson(a, group, substituted));
@@ -6829,6 +6854,11 @@ test "relational index publication admission reserves names atomically and survi
             const admission: index_publication.AdmissionRequest = .{ .table_id = head.table_id, .id = head.plan_id, .plan_digest = head.plan_digest, .metadata_incarnation = identity };
             const observed = try store.relationalIndexAdmissionStatusJson(a, group, admission);
             defer a.free(observed);
+            const scoped_bytes = try store.relationalIndexStatusJson(a, group, .{ .guard = plan.table_guard, .index_name = plan.index_name, .admission = admission });
+            defer a.free(scoped_bytes);
+            var scoped_status = try std.json.parseFromSlice(index_publication.AdmissionStatus, a, scoped_bytes, .{});
+            defer scoped_status.deinit();
+            try std.testing.expect(try scoped_status.value.isAdmitted(admission));
             var status = try std.json.parseFromSlice(index_publication.AdmissionStatus, a, observed, .{});
             defer status.deinit();
             try std.testing.expect(try status.value.isAdmitted(admission));
@@ -18751,24 +18781,55 @@ pub const RaftApplyStore = struct {
         defer if (prepared) |*value| value.deinit(self.alloc);
     }
 
+    fn relationalIndexAdmissionStatusTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group_id: u64, request: index_publication.AdmissionRequest) !index_publication.AdmissionStatus {
+        try request.validate();
+        _ = try self.standbyRelationActivationTxn(txn, group_id, topology_protocol.index_publication_head_version);
+        var buf: [192]u8 = undefined;
+        const incarnation = (try decodeMetadataIncarnationRecord(try txn.get(try metadataIncarnationKeyForGroup(&buf, group_id)))).incarnation;
+        const raw = try stagingGet(txn, try index_publication.headKey(&buf, group_id, request.table_id));
+        const head: ?index_progress.Head = if (raw) |bytes| index_progress.Head.decode(bytes) catch return error.InvalidCatalogRecord else null;
+        if (head) |value| {
+            try index_publication.requireActivePointer(txn, group_id, value);
+        } else {
+            // A partially retained job is corruption, not evidence of absence.
+            if (try stagingGet(txn, try index_publication.activeKey(&buf, group_id, request.table_id)) != null or
+                try stagingGet(txn, try index_publication.planKey(&buf, group_id, request.table_id)) != null) return error.InvalidCatalogRecord;
+        }
+        const status: index_publication.AdmissionStatus = .{ .metadata_incarnation = incarnation, .head = head, .replication_pending = try stagingGet(txn, metadata_hot_standby.outbox_key) != null };
+        _ = try status.isAdmitted(request);
+        return status;
+    }
+
     pub fn relationalIndexAdmissionStatusJson(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, request: index_publication.AdmissionRequest) ![]u8 {
+        var txn = try self.store.beginReadTxn();
+        defer txn.abort();
+        const status = try self.relationalIndexAdmissionStatusTxn(&txn, group_id, request);
+        return std.json.Stringify.valueAlloc(alloc, status, .{});
+    }
+
+    pub fn relationalIndexStatusJson(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, request: index_publication.StatusRequest) ![]u8 {
         try request.validate();
         var txn = try self.store.beginReadTxn();
         defer txn.abort();
         _ = try self.standbyRelationActivationTxn(&txn, group_id, topology_protocol.index_publication_head_version);
+        if (!try relationWriterEnabledTxn(&txn, group_id)) return error.CatalogOccupancyNotReady;
         var buf: [192]u8 = undefined;
-        const incarnation = (try decodeMetadataIncarnationRecord(try txn.get(try metadataIncarnationKeyForGroup(&buf, group_id)))).incarnation;
-        const raw = try stagingGet(&txn, try index_publication.headKey(&buf, group_id, request.table_id));
-        const head: ?index_progress.Head = if (raw) |bytes| index_progress.Head.decode(bytes) catch return error.InvalidCatalogRecord else null;
-        if (head) |value| {
-            try index_publication.requireActivePointer(&txn, group_id, value);
-        } else {
-            // A partially retained job is corruption, not evidence of absence.
-            if (try stagingGet(&txn, try index_publication.activeKey(&buf, group_id, request.table_id)) != null or
-                try stagingGet(&txn, try index_publication.planKey(&buf, group_id, request.table_id)) != null) return error.InvalidCatalogRecord;
+        // Authorization follows the current logical table, not a retained
+        // token. Keep ownership validation and job observation in one snapshot.
+        var scope = try self.guardedRelationOwnerTxn(&txn, group_id, request.guard);
+        defer scope.deinit();
+        const status = try self.relationalIndexAdmissionStatusTxn(&txn, group_id, request.admission);
+        if (status.head) |head| {
+            const owner = try index_progress.OwnerState.decode(try txn.get(try index_publication.ownerKey(&buf, group_id, head.table_id, 0)));
+            if (owner.owner.ordinal != 0 or owner.owner.namespace.table_id != head.table_id or
+                !std.mem.eql(u8, &owner.owner.plan_id, &head.plan_id) or !std.mem.eql(u8, &owner.owner.plan_digest, &head.plan_digest)) return error.InvalidCatalogRecord;
+            var dispatch = try index_publication.readDispatch(self.alloc, &txn, group_id, owner.owner);
+            defer dispatch.deinit();
+            var name_digest: index_publication.Digest = undefined;
+            std.crypto.hash.Blake3.hash(request.index_name, &name_digest, .{});
+            if (!std.mem.eql(u8, &name_digest, &dispatch.value.index_name_digest) or
+                !std.mem.eql(u8, scope.physicalName(request.guard), dispatch.value.table_name)) return error.GenerationPublicationChanged;
         }
-        const status: index_publication.AdmissionStatus = .{ .metadata_incarnation = incarnation, .head = head, .replication_pending = try stagingGet(&txn, metadata_hot_standby.outbox_key) != null };
-        _ = try status.isAdmitted(request);
         return std.json.Stringify.valueAlloc(alloc, status, .{});
     }
 
@@ -27944,16 +28005,27 @@ pub const RaftApplyStore = struct {
     /// Validate name authorization in the same transaction that replaces the
     /// table. A current root is required, but unrelated source revisions do
     /// not invalidate an unchanged owner or logical binding.
-    fn validateRelationMutationTxn(
+    const GuardedRelationOwner = struct {
+        namespace_id: u64,
+        binding: ?std.json.Parsed(system_catalog.Resource),
+
+        fn deinit(self: *@This()) void {
+            if (self.binding) |*value| value.deinit();
+        }
+        fn physicalName(self: *const @This(), guard: system_catalog.RelationMutationGuard) []const u8 {
+            return if (self.binding) |value| value.value.storage_name else guard.logical_table;
+        }
+    };
+
+    /// The common indexed ownership boundary for reads and writes. It never
+    /// decodes table/schema JSON, scans schemas or grants a mutation lease.
+    fn guardedRelationOwnerTxn(
         self: *RaftApplyStore,
         txn: *docstore.DocStore.Txn,
         group_id: u64,
         guard: system_catalog.RelationMutationGuard,
-        expected: metadata.TableRecord,
-        replacement: metadata.TableRecord,
-    ) !void {
+    ) !GuardedRelationOwner {
         try guard.validate();
-        if (guard.owner.table_id != expected.table_id) return error.InvalidCatalogMutation;
         const required = if (guard.constraint_name_admission != null) topology_protocol.constraint_occupancy_version else topology_protocol.relation_mutation_version;
         const activation = try self.standbyRelationActivationTxn(txn, group_id, required);
         if (activation.version < required) return error.TableTopologyProtocolUpgradeRequired;
@@ -27965,14 +28037,29 @@ pub const RaftApplyStore = struct {
         const namespace_id = (try resolveSystemCatalogNamespaceTxn(self.alloc, txn, group_id, guard.target.database, guard.target.namespace)) orelse return error.CatalogGenerationChanged;
         const owner = (try live.getClaim(.{ .namespace_id = namespace_id, .name = guard.target.name })) orelse return error.CatalogGenerationChanged;
         if (!owner.eql(guard.owner)) return error.CatalogGenerationChanged;
-        if (guard.constraint_name_admission) |admission|
-            try self.validateConstraintNameOccupancyTxn(self.alloc, txn, group_id, admission, namespace_id, replacement.schema_json);
         var binding = try system_catalog_storage.getById(self.alloc, txn, group_id, .table, owner.table_id);
-        defer if (binding) |*value| value.deinit();
+        errdefer if (binding) |*value| value.deinit();
         if (binding) |value| {
             if (value.value.parent_id != namespace_id or !std.mem.eql(u8, value.value.name, guard.logical_table) or
-                !std.mem.eql(u8, value.value.storage_name, expected.name)) return error.CatalogGenerationChanged;
-        } else if (namespace_id != system_catalog.default_namespace_id or !std.mem.eql(u8, expected.name, guard.logical_table)) return error.CatalogGenerationChanged;
+                value.value.storage_name.len == 0) return error.CatalogGenerationChanged;
+        } else if (namespace_id != system_catalog.default_namespace_id) return error.CatalogGenerationChanged;
+        return .{ .namespace_id = namespace_id, .binding = binding };
+    }
+
+    fn validateRelationMutationTxn(
+        self: *RaftApplyStore,
+        txn: *docstore.DocStore.Txn,
+        group_id: u64,
+        guard: system_catalog.RelationMutationGuard,
+        expected: metadata.TableRecord,
+        replacement: metadata.TableRecord,
+    ) !void {
+        if (guard.owner.table_id != expected.table_id) return error.InvalidCatalogMutation;
+        var scope = try self.guardedRelationOwnerTxn(txn, group_id, guard);
+        defer scope.deinit();
+        if (!std.mem.eql(u8, scope.physicalName(guard), expected.name)) return error.CatalogGenerationChanged;
+        if (guard.constraint_name_admission) |admission|
+            try self.validateConstraintNameOccupancyTxn(self.alloc, txn, group_id, admission, scope.namespace_id, replacement.schema_json);
         // Extension ownership is independently mutable. Recheck its exact
         // table-local index in this write transaction, not a preflight snapshot.
         var prefix_buf: [catalog_name_key_buffer_bytes]u8 = undefined;

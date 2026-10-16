@@ -78,6 +78,22 @@ pub const AdmissionStatus = struct {
     }
 };
 
+/// Public recovery is lowered to this body-bound private read only after
+/// authorizing the current logical table. A handle is not read authority.
+pub const StatusRequest = struct {
+    guard: domain.RelationMutationGuard,
+    index_name: []const u8,
+    admission: AdmissionRequest,
+
+    pub fn validate(self: @This()) !void {
+        try self.guard.validate();
+        try self.admission.validate();
+        if (self.guard.owner.kind != .table or self.guard.constraint_name_admission != null or
+            self.guard.owner.table_id != self.admission.table_id) return error.InvalidGenerationPublication;
+        try (names.Key{ .namespace_id = 1, .name = self.index_name }).validate();
+    }
+};
+
 test "relational index publication admission status binds the immutable plan and incarnation" {
     const request: AdmissionRequest = .{ .table_id = 17, .id = @splat(1), .plan_digest = @splat(2), .metadata_incarnation = @splat(3) };
     var status: AdmissionStatus = .{ .metadata_incarnation = request.metadata_incarnation };
@@ -1153,6 +1169,7 @@ pub const OwnerDecision = struct {
         const inputs = self.inputs orelse return error.InvalidGenerationPublication;
         try inputs.requireHead(self.head);
         if (inputs.namespace_id != dispatch.namespace_id or
+            !std.mem.eql(u8, &digest(inputs.index_name), &dispatch.index_name_digest) or
             !std.mem.eql(u8, inputs.before.name, dispatch.table_name) or
             !std.mem.eql(u8, &digest(inputs.before.schema_json), &dispatch.table_guard.owner.schema_digest) or
             !std.mem.eql(u8, &digest(inputs.after.schema_json), &dispatch.successor_schema_digest)) return error.InvalidCatalogRecord;
@@ -1600,11 +1617,12 @@ pub const Inputs = struct {
 /// The table guard and successor identity support indexed live-catalog checks;
 /// the complete owner descriptor is independently bound by fence_digest.
 pub const Dispatch = struct {
-    format_version: u16 = 2,
+    format_version: u16 = 3,
     id: Id,
     plan_digest: Digest,
     ordinal: u16,
     namespace_id: u64,
+    index_name_digest: Digest,
     table_guard: domain.RelationMutationGuard,
     table_name: []const u8,
     successor_schema_version: u32,
@@ -1631,7 +1649,7 @@ pub const Dispatch = struct {
 
     fn requireOwner(d: Dispatch, expected: progress.Owner) !void {
         try (progress.OwnerState{ .owner = expected }).validate();
-        if (d.format_version != 2 or d.native_claim_allocation == 0 or std.mem.allEqual(u8, &d.native_schema_digest, 0) or std.mem.allEqual(u8, &d.native_inputs_digest, 0) or !std.mem.eql(u8, &d.id, &expected.plan_id) or
+        if (d.format_version != 3 or std.mem.allEqual(u8, &d.index_name_digest, 0) or d.native_claim_allocation == 0 or std.mem.allEqual(u8, &d.native_schema_digest, 0) or std.mem.allEqual(u8, &d.native_inputs_digest, 0) or !std.mem.eql(u8, &d.id, &expected.plan_id) or
             !std.mem.eql(u8, &d.plan_digest, &expected.plan_digest) or d.ordinal != expected.ordinal or
             d.namespace_id == 0 or d.table_name.len == 0 or d.successor_schema_version == 0 or
             d.owner.range.group_id != expected.group_id or !d.owner.namespace.eql(expected.namespace) or
@@ -1835,6 +1853,7 @@ pub const Plan = struct {
             .namespace_id = self.namespace_id,
             .table_guard = self.table_guard,
             .table_name = self.before.name,
+            .index_name_digest = digest(self.index_name),
             .successor_schema_version = successor_version,
             .successor_schema_digest = successor_digest,
             .native_inputs_digest = native_inputs_digest,
