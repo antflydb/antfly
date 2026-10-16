@@ -13,8 +13,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Conservative statement-wide property liveness. Unknown entity uses retain
-//! complete values; only statically named scalar reads admit column pruning.
+//! Scoped entity lineage and statement-wide property liveness. Forwarding an
+//! entity does not consume its properties; unknown consumers retain full values.
 const std = @import("std");
 const ast = @import("ast.zig");
 const catalog = @import("catalog.zig");
@@ -24,6 +24,47 @@ const Plan = struct {
     entities: std.StringHashMapUnmanaged(void) = .empty,
     fields: std.StringHashMapUnmanaged(void) = .empty,
     full: bool = false,
+    fn clauses(self: *Plan, items: []const ast.Clause) anyerror!void {
+        for (items) |clause| switch (clause.operation) {
+            .project => |p| {
+                var next = if (p.value.wildcard) try self.entities.clone(self.a) else std.StringHashMapUnmanaged(void).empty;
+                for (p.value.items) |item| {
+                    const forwarded = item.expression.value == .variable and self.entities.contains(item.expression.value.variable);
+                    if (forwarded and !p.final) {
+                        try next.put(self.a, item.alias orelse item.expression.value.variable, {});
+                    } else try self.walk(item.expression.*);
+                }
+                // ORDER BY can see input bindings as well as projection aliases.
+                // Keep both scopes while collecting requirements, then retire
+                // hidden bindings before the next clause.
+                var visible = try self.entities.clone(self.a);
+                var names_iter = next.keyIterator();
+                while (names_iter.next()) |key| try visible.put(self.a, key.*, {});
+                self.entities = visible;
+                try self.walk(p.value.predicate);
+                try self.walk(p.value.order);
+                try self.walk(p.value.skip);
+                try self.walk(p.value.limit);
+                if (p.final and p.value.wildcard and next.count() != 0) self.full = true;
+                self.entities = next;
+            },
+            .subquery => |inner| {
+                const outer = try self.entities.clone(self.a);
+                try self.clauses(inner);
+                // Returning entities across a CALL boundary already requires
+                // complete values. Preserve outer bindings for later clauses.
+                self.entities = outer;
+            },
+            .unwind => |u| {
+                try self.walk(u.expression.*);
+                _ = self.entities.remove(u.alias);
+            },
+            else => {
+                try self.names(clause.operation);
+                try self.walk(clause.operation);
+            },
+        };
+    }
     fn names(self: *Plan, value: anytype) anyerror!void {
         const T = @TypeOf(value);
         if (T == ast.Node or T == ast.Edge or T == ast.Path) {
@@ -46,8 +87,23 @@ const Plan = struct {
     }
     fn walk(self: *Plan, value: anytype) anyerror!void {
         const T = @TypeOf(value);
+        if (T == ast.Query) {
+            const initial = try self.entities.clone(self.a);
+            try self.clauses(value.clauses);
+            for (value.unions) |arm| {
+                self.entities = try initial.clone(self.a);
+                try self.clauses(arm.clauses);
+            }
+            return;
+        }
         if (T == ast.Expr) {
             switch (value.value) {
+                .exists => |inner| {
+                    const outer = try self.entities.clone(self.a);
+                    try self.clauses(inner);
+                    self.entities = outer;
+                    return;
+                },
                 .variable => |name| {
                     if (self.entities.contains(name)) self.full = true;
                     return;
@@ -70,9 +126,6 @@ const Plan = struct {
             }
         }
         if (T == ast.Node or T == ast.Edge) for (value.properties) |entry| try self.fields.put(self.a, entry.name, {});
-        if (T == ast.Projection) if (value.wildcard) {
-            self.full = true;
-        };
         // Procedure yields may contain entities with implementation-defined
         // aliases. Preserve complete results across this extension boundary.
         if (T == ast.Procedure) self.full = true;
@@ -94,7 +147,6 @@ const Plan = struct {
 };
 pub fn required(a: A, query: ast.Query, graph: catalog.Graph) !?[]const []const u8 {
     var plan: Plan = .{ .a = a };
-    try plan.names(query);
     try plan.walk(query);
     if (plan.full) return null;
     for (graph.labels) |label| for (label.predicate) |entry| try plan.fields.put(a, entry.name, {});

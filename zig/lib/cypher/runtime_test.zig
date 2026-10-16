@@ -920,6 +920,14 @@ test "lower bound operators agree with exact cyclic route selection" {
     }
 }
 
+test "lazy lower bound probes preserve cyclic trail history and multiplicity" {
+    try check("MATCH (a:Document {id:'a'}),(c:Document {id:'c'}) MATCH p=allShortestPaths((a)-[:CITES*3..8]->(c)) RETURN length(p)", "[[4],[4]]");
+    try check("MATCH (a:Document {id:'a'}),(c:Document {id:'c'}) MATCH p=allShortestPaths((a)-[:CITES*6..8]->(c)) RETURN count(*)", "[[0]]");
+    try check("MATCH (a:Document {id:'a'}),(c:Document {id:'c'}) MATCH REPEATABLE ELEMENTS p=allShortestPaths((a)-[:CITES*6..8]->(c)) RETURN count(*)", "[[8]]");
+    try check("MATCH (a:Document {id:'a'}) MATCH p=allShortestPaths((a)-[:CITES*2..8]->(a)) RETURN count(*)", "[[2]]");
+    try check("MATCH (a:Document {id:'a'}) MATCH p=allShortestPaths((a)-[:CITES*3..8]->(a)) RETURN count(*)", "[[0]]");
+}
+
 test "property liveness retains complete entities at unknown consumers" {
     const Case = struct { query: []const u8, fields: ?[]const []const u8 };
     for ([_]Case{
@@ -928,7 +936,15 @@ test "property liveness retains complete entities at unknown consumers" {
         .{ .query = "MATCH (n:Document) WHERE n.rank>1 RETURN labels(n),antfly.documentKey(n)", .fields = &.{"rank"} },
         .{ .query = "MATCH (n:Document) RETURN n", .fields = null },
         .{ .query = "MATCH (n:Document) RETURN properties(n)", .fields = null },
-        .{ .query = "MATCH (n:Document) WITH n AS m RETURN m.title", .fields = null },
+        .{ .query = "MATCH (n:Document) WITH n AS m RETURN m.title", .fields = &.{"title"} },
+        .{ .query = "MATCH (n:Document) WITH n AS m WITH m AS k WHERE k.rank>1 RETURN k.title", .fields = &.{ "rank", "title" } },
+        .{ .query = "MATCH (n:Document) WITH * RETURN n.title", .fields = &.{"title"} },
+        .{ .query = "MATCH (n:Document) WITH n AS m RETURN m", .fields = null },
+        .{ .query = "MATCH (n:Document) WITH n AS m RETURN properties(m)", .fields = null },
+        .{ .query = "MATCH (n:Document) WITH n AS m RETURN m[$field]", .fields = null },
+        .{ .query = "MATCH (n:Document) WITH n AS m RETURN *", .fields = null },
+        .{ .query = "MATCH (n:Document) WITH n.title AS n RETURN n", .fields = &.{"title"} },
+        .{ .query = "MATCH (n:Document) WITH n AS m RETURN m.title UNION ALL MATCH (m:Document) RETURN m.rank", .fields = &.{ "rank", "title" } },
         .{ .query = "MATCH p=(n:Document)-[:CITES]->(m) RETURN nodes(p)", .fields = null },
         .{ .query = "MATCH (n:Document) RETURN n[$field]", .fields = null },
     }) |case| {
@@ -944,6 +960,14 @@ test "property liveness retains complete entities at unknown consumers" {
             for (fields, actual.?) |expected, field| try std.testing.expectEqualStrings(expected, field);
         }
     }
+}
+
+test "interior anchors preserve routes aliases uniqueness and deferred constraints" {
+    try check("MATCH p=(a:Document)-[l:CITES]->(m:Document {id:'b'})-[r:CITES]->(z:Document) RETURN a.id,z.id,[n IN nodes(p)|n.id],l.weight ORDER BY a.id,z.id,l.weight", "[[\"a\",\"a\",[\"a\",\"b\",\"a\"],1],[\"a\",\"a\",[\"a\",\"b\",\"a\"],2],[\"a\",\"c\",[\"a\",\"b\",\"c\"],1],[\"a\",\"c\",[\"a\",\"b\",\"c\"],2]]");
+    try check("MATCH p=(a:Document)-[l:CITES*1..2]->(m:Document {id:'b'})-[r:CITES]->(z:Document {id:'c'}) RETURN [n IN nodes(p)|n.id],[e IN l|e.weight] ORDER BY length(p),l[0].weight,l[1].weight", "[[[\"a\",\"b\",\"c\"],[1]],[[\"a\",\"b\",\"c\"],[2]],[[\"b\",\"a\",\"b\",\"c\"],[null,1]],[[\"b\",\"a\",\"b\",\"c\"],[null,2]]]");
+    try check("MATCH (a)-[:CITES]-(m:Document {id:'c'})-[:CITES]-(b) RETURN count(*)", "[[0]]");
+    try check("MATCH REPEATABLE ELEMENTS (a)-[:CITES]-(m:Document {id:'c'})-[:CITES]-(b) RETURN count(*)", "[[1]]");
+    try check("MATCH p=(a {id:z.id})-[:CITES]->(m:Document {id:'b'})-[:CITES]->(z) RETURN [n IN nodes(p)|n.id]", "[[[\"a\",\"b\",\"a\"]],[[\"a\",\"b\",\"a\"]]]");
 }
 
 test "document key seeks outrank arbitrarily many candidate predicates" {

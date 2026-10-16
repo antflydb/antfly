@@ -1184,10 +1184,13 @@ records. Page/evaluation arenas are reclaimed between batches; retained heap
 entries and min/max values have independent lifetimes. DISTINCT, collect, grouped
 aggregation and correlated pattern expressions retain the general operator.
 
-Path planning compares both endpoints before opening an anchor scan. Existing
+Path planning compares every vertex before opening an anchor scan. Existing
 bindings and document-key seeks take precedence over constant property filters
 and label-only scans. Reverse execution restores the original order of named
-paths and variable-length relationship lists. `EXISTS` supplies one-row demand
+paths and variable-length relationship lists. Interior anchors traverse the
+reversed prefix and feed each match directly into the suffix, retaining shared
+relationship uniqueness and restoring the complete path's source order.
+`EXISTS` supplies one-row demand
 to ordinary terminal projections (and implicit projections on MATCH/WITH bodies),
 preserving SKIP, LIMIT 0, DISTINCT and global-aggregation semantics.
 
@@ -1197,6 +1200,10 @@ Relational readers project only the required columns, including every catalog
 label-predicate field; row policies still inspect the complete typed row before
 projection. Returning an entity, dynamic property access, unknown procedures,
 writes and staged reconciliation retain complete documents.
+Entity aliases forwarded by `WITH`, including renames and wildcard forwarding,
+retain their lineage without demanding complete properties. Only subsequent
+consumers determine which fields must be hydrated; returning the full entity
+still retains its complete document.
 
 Eligible single-pattern shortest paths use breadth-first traversal and cached
 endpoint hydration. Bound destinations stop after the winning frontier layer.
@@ -1207,11 +1214,15 @@ constraints and prebound route aliases use the exhaustive selector. Owners
 accept bounded, aligned endpoint batches; the coordinator partitions these
 by table/owner, preserves missing/hidden values,
 and checks overlapping-owner results. Runtime caches deduplicate hydration
-without changing parallel-edge multiplicity. Positive lower bounds capture the
-authorized reachable adjacency once. Acyclic graphs and repeatable walks use
-vertex/lower-bound distance states and share tied predecessors; bound-target
-backward reachability removes dead branches. Cyclic relationship/node-simple
-queries retain exact route histories and reuse captured adjacency. Mapping ranges
+without changing parallel-edge multiplicity. Positive lower bounds fetch and
+cache authorized adjacency only as the frontier demands it. Repeatable walks
+use vertex/lower-bound distance states directly. Uniqueness modes first probe
+those states without emitting speculative results, stopping at the winning
+bound-target layer (or the first eligible layer for an unfiltered LIMIT 1).
+Acyclic captured prefixes admit compressed distance states and shared tied
+predecessors. Cyclic prefixes use exact breadth-first route histories, extending
+the same adjacency cache only when needed. An unsuccessful walk probe proves
+there can be no qualifying unique trail. Mapping ranges
 are sought directly during replay, which consumes logical execution work without
 charging physical reads again. Their route
 enumeration remains combinatorial when uniqueness requires it; neither vertex

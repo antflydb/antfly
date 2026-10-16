@@ -531,10 +531,98 @@ def test_unused_wide_relational_columns_are_not_hydrated(graph_db):
             "definition": {"labels": [{"name": "W", "table": "wide"}], "relationships": []},
         }
     )
-    result = db.cypher_json(
-        "wide", {"query": "MATCH (n:W) RETURN count(*),sum(n.score)", "limits": {"memory_bytes": 2 << 20}}
-    )
-    assert [cell["value"] for cell in result["rows"][0]] == ["1000", "499500"]
-    assert result["stats"]["memory_bytes"] < 2 << 20
+    for forwarding in ("", "WITH n ", "WITH n AS m WITH m AS n ", "WITH * "):
+        result = db.cypher_json(
+            "wide",
+            {"query": f"MATCH (n:W) {forwarding}RETURN count(*),sum(n.score)", "limits": {"memory_bytes": 2 << 20}},
+        )
+        assert [cell["value"] for cell in result["rows"][0]] == ["1000", "499500"]
+        assert result["stats"]["memory_bytes"] < 2 << 20
     entity = db.cypher_json("wide", {"query": "MATCH (n:W) WHERE antfly.documentKey(n)='n0' RETURN n"})
     assert entity["rows"][0][0]["value"]["properties"]["value"]["payload"]["value"] == "x" * 8192
+    forwarded = db.cypher_json("wide", {"query": "MATCH (n:W) WHERE antfly.documentKey(n)='n0' WITH n AS m RETURN m"})
+    assert forwarded["rows"][0][0] == entity["rows"][0][0]
+
+
+def test_lower_bound_shortest_reads_only_the_winning_frontier(graph_db):
+    db = graph_db
+    count = 151
+    patterns = [f"(n{i}:D {{id:'n{i}'}})" for i in range(count)]
+    patterns += [f"(n{i})-[:R]->(n{i + 1})" for i in range(count - 1)]
+    keys = db.cypher_json(
+        "g", {"query": "CREATE " + ",".join(patterns) + " RETURN antfly.documentKey(n0),antfly.documentKey(n2)"}
+    )["rows"][0]
+    parameters = {"s": keys[0]["value"], "t": keys[1]["value"]}
+    for mode in ("", "REPEATABLE ELEMENTS "):
+        for selector in ("shortestPath", "allShortestPaths"):
+            result = db.cypher_json(
+                "g",
+                {
+                    "query": "MATCH (s:D) WHERE antfly.documentKey(s)=$s "
+                    "MATCH (t:D) WHERE antfly.documentKey(t)=$t "
+                    f"MATCH {mode}p={selector}((s)-[:R*2..200]->(t)) RETURN length(p)",
+                    "parameters": parameters,
+                    "limits": {"scanned_anchors": 2, "explored_edges": 2, "memory_bytes": 256 << 10},
+                },
+            )
+            assert result["rows"] == [[{"type": "integer", "value": "2"}]]
+            assert result["stats"]["explored_edges"] == 2
+    limited = db.cypher_json(
+        "g",
+        {
+            "query": "MATCH (s:D) WHERE antfly.documentKey(s)=$s "
+            "MATCH p=shortestPath((s)-[:R*2..200]->(t:D)) RETURN length(p) LIMIT 1",
+            "parameters": parameters,
+            "limits": {"scanned_anchors": 1, "explored_edges": 2},
+        },
+    )
+    assert limited["rows"] == [[{"type": "integer", "value": "2"}]]
+
+
+def test_interior_document_key_is_the_physical_anchor(graph_db):
+    db = graph_db
+    count = 151
+    patterns = [f"(n{i}:D {{id:'n{i}'}})" for i in range(count)]
+    patterns += [f"(n{i})-[:R]->(n{i + 1})" for i in range(count - 1)]
+    key = db.cypher_json("g", {"query": "CREATE " + ",".join(patterns) + " RETURN antfly.documentKey(n75)"})["rows"][0][
+        0
+    ]["value"]
+    for left, right in (("", ""), ("*1..1", "*1..1")):
+        result = db.cypher_json(
+            "g",
+            {
+                "query": f"MATCH p=(a:D)-[left:R{left}]->(m:D)-[right:R{right}]->(b:D) "
+                "WHERE antfly.documentKey(m)=$key RETURN [n IN nodes(p)|n.id],a.id,b.id",
+                "parameters": {"key": key},
+                "limits": {"scanned_anchors": 1, "explored_edges": 2, "memory_bytes": 256 << 10},
+            },
+        )
+        assert [[cell["value"] for cell in row] for row in result["rows"]] == [
+            [[{"type": "string", "value": f"n{i}"} for i in (74, 75, 76)], "n74", "n76"]
+        ]
+        assert result["stats"]["scanned_anchors"] == 1
+        assert result["stats"]["explored_edges"] == 2
+
+
+def test_cyclic_lower_bound_routes_reuse_reads_without_merging_histories(graph_db):
+    db = graph_db
+    keys = db.cypher_json(
+        "g",
+        {
+            "query": "CREATE (s:D),(u:D),(t:D),(s)-[:R]->(u),(s)-[:R]->(u),"
+            "(u)-[:R]->(s),(u)-[:R]->(t) RETURN antfly.documentKey(s),antfly.documentKey(t)"
+        },
+    )["rows"][0]
+    for mode, lower, expected in (("", 2, 2), ("", 3, 2), ("", 6, 0), ("REPEATABLE ELEMENTS ", 6, 8)):
+        result = db.cypher_json(
+            "g",
+            {
+                "query": "MATCH (s:D) WHERE antfly.documentKey(s)=$s "
+                "MATCH (t:D) WHERE antfly.documentKey(t)=$t "
+                f"MATCH {mode}p=allShortestPaths((s)-[:R*{lower}..8]->(t)) RETURN count(*)",
+                "parameters": {"s": keys[0]["value"], "t": keys[1]["value"]},
+                "limits": {"explored_edges": 4, "intermediate_states": 2000, "memory_bytes": 1 << 20},
+            },
+        )
+        assert result["rows"] == [[{"type": "integer", "value": str(expected)}]]
+        assert result["stats"]["explored_edges"] == 4
