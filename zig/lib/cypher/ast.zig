@@ -63,7 +63,7 @@ pub const Edge = struct {
     max_hops: ?u32 = 1,
     variable_length: bool = false,
 };
-pub const Path = struct { span: Span, alias: ?[]const u8, nodes: []const Node, edges: []const Edge, selector: enum { all, shortest, all_shortest } = .all };
+pub const Path = struct { span: Span, alias: ?[]const u8, nodes: []const Node, edges: []const Edge, selector: enum { all, shortest, all_shortest } = .all, execution_reversed: bool = false };
 pub const Match = struct { paths: []const Path, optional: bool = false, predicate: ?*const Expr = null, mode: PathMode = .relationship_simple };
 pub const Item = struct { expression: *const Expr, alias: ?[]const u8 = null };
 pub const Order = struct { expression: *const Expr, descending: bool = false };

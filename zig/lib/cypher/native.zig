@@ -55,9 +55,28 @@ pub fn Adapter(comptime DB: type, comptime GraphIndex: type, comptime EdgeScanCu
         partitioned: bool = false,
         work: ?b.Work = null,
         membership_units: usize = 0,
+        read_fields: ?[]const []const u8 = null,
 
         pub fn backend(self: *Self) b.Backend {
-            return .{ .ptr = self, .vtable = &.{ .bind = bind, .checkpoint = checkpoint, .scan = scan, .scan_where = scanWhere, .get = get, .expand = expand, .search = search, .set_work = setWork } };
+            return .{ .ptr = self, .vtable = &.{ .bind = bind, .checkpoint = checkpoint, .scan = scan, .scan_where = scanWhere, .get = get, .expand = expand, .search = search, .set_work = setWork, .set_read_fields = setReadFields } };
+        }
+        fn setReadFields(ptr: *anyopaque, fields: ?[]const []const u8) void {
+            cast(ptr).read_fields = fields;
+        }
+        const ScanOptions = if (@hasDecl(DB, "cypherDocumentScanOptions")) @typeInfo(@typeInfo(@TypeOf(DB.cypherDocumentScanOptions)).@"fn".return_type.?).error_union.payload else void;
+        fn scanOptions(self: *Self, a: A, db: *DB, input: ScanOptions) !ScanOptions {
+            var opts = try db.cypherDocumentScanOptions(a, input);
+            if (self.read_fields) |required| if (opts.relational_query) |*query| {
+                var fields: std.ArrayList([]const u8) = .empty;
+                for (query.fields) |field| for (required) |name| {
+                    if (std.mem.eql(u8, field, name)) {
+                        try fields.append(a, field);
+                        break;
+                    }
+                };
+                query.fields = fields.items;
+            };
+            return opts;
         }
         fn setWork(ptr: *anyopaque, work: ?b.Work) void {
             cast(ptr).work = work;
@@ -155,7 +174,7 @@ pub fn Adapter(comptime DB: type, comptime GraphIndex: type, comptime EdgeScanCu
             const db = try self.selected(table);
             const authorization = try self.readAuthorization(temporary, table);
             var found = if (comptime @hasDecl(DB, "cypherDocumentScanOptions"))
-                try db.scan(temporary, cursor orelse "", "", try db.cypherDocumentScanOptions(temporary, .{ .execution_deadline_ns = authorization.deadline_ns, .row_policy_principal_proof = authorization.proof, .row_policy_database = authorization.database, .inclusive_from = cursor == null, .include_documents = true, .limit = std.math.cast(u32, limit) orelse return error.InvalidArgument }))
+                try db.scan(temporary, cursor orelse "", "", try self.scanOptions(temporary, db, .{ .execution_deadline_ns = authorization.deadline_ns, .row_policy_principal_proof = authorization.proof, .row_policy_database = authorization.database, .inclusive_from = cursor == null, .include_documents = true, .limit = std.math.cast(u32, limit) orelse return error.InvalidArgument }))
             else
                 try db.scan(temporary, cursor orelse "", "", .{ .execution_deadline_ns = authorization.deadline_ns, .row_policy_principal_proof = authorization.proof, .row_policy_database = authorization.database, .inclusive_from = cursor == null, .include_documents = true, .limit = std.math.cast(u32, limit) orelse return error.InvalidArgument });
             defer found.deinit(temporary);
@@ -191,7 +210,7 @@ pub fn Adapter(comptime DB: type, comptime GraphIndex: type, comptime EdgeScanCu
             const cursor = if (encoded) |json| try std.json.parseFromSliceLeaky(PropertyCursor, temporary, json, .{}) else PropertyCursor{};
             if (cursor.primary) return propertyFallback(ptr, a, table, cursor, limit);
             const authorization = try self.readAuthorization(temporary, table);
-            var opts = try db.cypherDocumentScanOptions(temporary, .{ .execution_deadline_ns = authorization.deadline_ns, .row_policy_principal_proof = authorization.proof, .row_policy_database = authorization.database, .include_documents = true, .limit = @intCast(limit) });
+            var opts = try self.scanOptions(temporary, db, .{ .execution_deadline_ns = authorization.deadline_ns, .row_policy_principal_proof = authorization.proof, .row_policy_database = authorization.database, .include_documents = true, .limit = @intCast(limit) });
             if (opts.relational_query == null) return propertyFallback(ptr, a, table, cursor, limit);
             var schema = db.core.acquireSchemaView() orelse return propertyFallback(ptr, a, table, cursor, limit);
             defer schema.release();
@@ -306,11 +325,23 @@ pub fn Adapter(comptime DB: type, comptime GraphIndex: type, comptime EdgeScanCu
             try checkpoint(ptr);
             const db = try self.selected(identity.table);
             const authorization = try self.readAuthorization(temporary, identity.table);
-            var document = (try db.getDocument(temporary, identity.key, .{ .row_policy_principal_proof = authorization.proof, .row_policy_database = authorization.database, .execution_deadline_ns = authorization.deadline_ns })) orelse return null;
-            defer document.deinit(temporary);
-            const result = try self.node(a, identity.table, identity.key, document.json);
+            const result = if (comptime @hasDecl(DB, "cypherDocumentScanOptions")) projected: {
+                if (self.read_fields != null) {
+                    const opts = try self.scanOptions(temporary, db, .{ .inclusive_from = true, .include_documents = true, .limit = 1, .row_policy_principal_proof = authorization.proof, .row_policy_database = authorization.database, .execution_deadline_ns = authorization.deadline_ns });
+                    if (opts.relational_query == null) break :projected try self.getFull(a, temporary, db, identity, authorization);
+                    var page = try db.scan(temporary, identity.key, identity.key, opts);
+                    defer page.deinit(temporary);
+                    break :projected if (page.documents.len == 0) null else try self.node(a, identity.table, identity.key, page.documents[0].json);
+                }
+                break :projected try self.getFull(a, temporary, db, identity, authorization);
+            } else try self.getFull(a, temporary, db, identity, authorization);
             try checkpoint(ptr);
             return result;
+        }
+        fn getFull(self: *Self, a: A, temporary: A, db: *DB, identity: v.Identity, authorization: ReadAuthorization) !?*const v.Node {
+            var document = (try db.getDocument(temporary, identity.key, .{ .row_policy_principal_proof = authorization.proof, .row_policy_database = authorization.database, .execution_deadline_ns = authorization.deadline_ns })) orelse return null;
+            defer document.deinit(temporary);
+            return self.node(a, identity.table, identity.key, document.json);
         }
         const Resume = struct { incoming: bool = false, cursor: ?EdgeScanCursor = null };
         fn readAuthorization(self: *Self, a: A, table: []const u8) !ReadAuthorization {

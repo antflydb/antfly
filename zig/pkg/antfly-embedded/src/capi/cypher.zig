@@ -147,11 +147,15 @@ pub const Read = struct {
         self.pin_arena = null;
     }
     pub fn pinnedBackend(self: *Read) cypher.backend.Backend {
-        return .{ .ptr = self, .vtable = &.{ .bind = pinnedBind, .checkpoint = checkpoint, .scan = pinnedScan, .scan_where = pinnedScanWhere, .get = pinnedGet, .expand = pinnedExpand, .set_work = pinnedWork, .normalize_node = normalize, .document_relationships = documentRelationships } };
+        return .{ .ptr = self, .vtable = &.{ .bind = pinnedBind, .checkpoint = checkpoint, .scan = pinnedScan, .scan_where = pinnedScanWhere, .get = pinnedGet, .expand = pinnedExpand, .set_work = pinnedWork, .set_read_fields = pinnedReadFields, .normalize_node = normalize, .document_relationships = documentRelationships } };
     }
     fn pinnedBind(ptr: *anyopaque, a: A, graph: cypher.catalog.Graph) !void {
         const backend = cast(ptr).pinned_adapter.backend();
         try backend.vtable.bind(backend.ptr, a, graph);
+    }
+    fn pinnedReadFields(ptr: *anyopaque, fields: ?[]const []const u8) void {
+        const backend = cast(ptr).pinned_adapter.backend();
+        backend.vtable.set_read_fields.?(backend.ptr, fields);
     }
     fn pinnedWork(ptr: *anyopaque, work: ?cypher.backend.Work) void {
         const backend = cast(ptr).pinned_adapter.backend();

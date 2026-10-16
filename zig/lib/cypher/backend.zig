@@ -116,6 +116,9 @@ pub const Backend = struct {
     ptr: *anyopaque,
     vtable: *const VTable,
     pub const VTable = struct {
+        /// Borrowed until reset. Null retains complete entities, an empty set
+        /// requests identities only. Authorization always sees the full row.
+        set_read_fields: ?*const fn (*anyopaque, ?[]const []const u8) void = null,
         bind: *const fn (*anyopaque, std.mem.Allocator, catalog.Graph) anyerror!void,
         checkpoint: *const fn (*anyopaque) anyerror!void,
         scan: *const fn (*anyopaque, std.mem.Allocator, []const u8, ?[]const u8, usize) anyerror!Page(*const v.Node),

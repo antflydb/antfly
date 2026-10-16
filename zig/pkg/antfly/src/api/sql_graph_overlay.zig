@@ -46,7 +46,7 @@ pub const View = struct {
         };
     };
     pub fn backend(self: *View) cypher.backend.Backend {
-        return .{ .ptr = self, .vtable = &.{ .bind = bind, .checkpoint = checkpoint, .scan = scan, .scan_where = scanWhere, .get = get, .expand = expand, .search = search, .startup_work = startupWork, .set_work = setWork } };
+        return .{ .ptr = self, .vtable = &.{ .bind = bind, .checkpoint = checkpoint, .scan = scan, .scan_where = scanWhere, .get = get, .expand = expand, .search = search, .startup_work = startupWork, .set_work = setWork, .set_read_fields = setReadFields } };
     }
     fn cast(ptr: *anyopaque) *View {
         return @ptrCast(@alignCast(ptr));
@@ -218,6 +218,11 @@ pub const View = struct {
         const self = cast(ptr);
         var work = self.inner.valueWork(self.inner.alloc.?);
         try work.output(value);
+    }
+    fn setReadFields(ptr: *anyopaque, fields: ?[]const []const u8) void {
+        const self = cast(ptr);
+        const base = self.client.backend();
+        if (base.vtable.set_read_fields) |configure| configure(base.ptr, if (self.rows.len != 0 or self.effects.len != 0) null else fields);
     }
     fn setWork(ptr: *anyopaque, work: ?cypher.backend.Work) void {
         cast(ptr).inner.setExecutionWork(work);

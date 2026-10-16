@@ -1179,6 +1179,20 @@ records. Page/evaluation arenas are reclaimed between batches; retained heap
 entries and min/max values have independent lifetimes. DISTINCT, collect, grouped
 aggregation and correlated pattern expressions retain the general operator.
 
+Path planning compares both endpoints before opening an anchor scan. Existing
+bindings and document-key seeks take precedence over constant property filters
+and label-only scans. Reverse execution restores the original order of named
+paths and variable-length relationship lists. `EXISTS` supplies one-row demand
+to ordinary terminal projections (and implicit projections on bare MATCH),
+preserving SKIP, LIMIT 0, DISTINCT and global-aggregation semantics.
+
+Read-only statements derive conservative property requirements and carry them
+through pinned native reads, distributed endpoint batches and owner RPCs.
+Relational readers project only the required columns, including every catalog
+label-predicate field; row policies still inspect the complete typed row before
+projection. Returning an entity, dynamic property access, unknown procedures,
+writes and staged reconciliation retain complete documents.
+
 Eligible single-pattern shortest paths use breadth-first traversal and cached
 endpoint hydration. Bound destinations stop after the winning frontier layer.
 All-shortest ties are preserved; undirected positive cycles retain first-edge
@@ -1188,7 +1202,13 @@ constraints and prebound route aliases use the exhaustive selector. Owners
 accept bounded, aligned endpoint batches; the coordinator partitions these
 by table/owner, preserves missing/hidden values,
 and checks overlapping-owner results. Runtime caches deduplicate hydration
-without changing parallel-edge multiplicity.
+without changing parallel-edge multiplicity. Positive lower bounds capture the
+authorized reachable adjacency once. Acyclic graphs and repeatable walks use
+vertex/lower-bound distance states and share tied predecessors; bound-target
+backward reachability removes dead branches. Cyclic relationship/node-simple
+queries retain exact route histories and reuse captured adjacency. Their route
+enumeration remains combinatorial when uniqueness requires it; neither vertex
+compression nor early deduplication may discard valid qualifying trails.
 
 `antfly.search` no longer scans the table to enumerate allowed IDs. Unrestricted
 table labels without row policies use native indexed search directly. Restricted

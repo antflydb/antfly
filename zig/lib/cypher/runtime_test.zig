@@ -882,3 +882,65 @@ test "DAG count agrees with materialized selectors for directed and undirected c
         }
     }
 }
+
+test "endpoint planning preserves ordered path and relationship bindings" {
+    try check("MATCH p=(a:Document)-[r:CITES*2..2]->(b:Document {id:'c'}) RETURN a.id,[n IN nodes(p)|n.id],[e IN r|e.weight] ORDER BY a.id,r[0].weight", "[[\"a\",[\"a\",\"b\",\"c\"],[1,null]],[\"a\",[\"a\",\"b\",\"c\"],[2,null]]]");
+    try check("MATCH (b:Document {id:'c'}) MATCH p=(a)-[r:CITES*2..2]->(b) RETURN a.id,[n IN nodes(p)|n.id] ORDER BY r[0].weight", "[[\"a\",[\"a\",\"b\",\"c\"]],[\"a\",[\"a\",\"b\",\"c\"]]]");
+}
+
+test "EXISTS demand preserves pagination and global aggregation" {
+    try check("RETURN EXISTS { MATCH (a:Document {id:'a'})-[:CITES]->(b) RETURN b SKIP 1 }, EXISTS { MATCH (a:Document {id:'a'})-[:CITES]->(b) RETURN b SKIP 2 }, EXISTS { MATCH (a:Document) RETURN a LIMIT 0 }", "[[true,false,false]]");
+    try check("RETURN EXISTS { MATCH (a:Document {id:'missing'}) RETURN count(*) }, EXISTS { MATCH (a:Document {id:'missing'}) RETURN count(*) LIMIT 0 }, EXISTS { MATCH (a:Document {id:'missing'}) RETURN a }", "[[true,false,false]]");
+    try check("RETURN EXISTS { MATCH (a:Document {id:'a'})-[:CITES]->(b) RETURN DISTINCT b SKIP 1 }", "[[false]]");
+}
+
+test "lower bound operators agree with exact cyclic route selection" {
+    for ([_][]const u8{ "", "REPEATABLE ELEMENTS ", "DIFFERENT RELATIONSHIPS " }) |mode| {
+        for ([_][]const u8{ "shortestPath", "allShortestPaths" }) |selector| {
+            for ([_][]const u8{ "->", "-" }) |direction| {
+                const fast = try std.fmt.allocPrint(std.testing.allocator, "MATCH {s}p={s}((a:Document {{id:'a'}})-[:CITES*2..4]{s}(b)) RETURN count(*)", .{ mode, selector, direction });
+                defer std.testing.allocator.free(fast);
+                // The later pattern forces the history-preserving selector.
+                const exact = try std.fmt.allocPrint(std.testing.allocator, "MATCH {s}p={s}((a:Document {{id:'a'}})-[:CITES*2..4]{s}(b)),(:Person) RETURN count(*)", .{ mode, selector, direction });
+                defer std.testing.allocator.free(exact);
+                var diagnostic: c.Diagnostic = .{};
+                var compiled = try c.compile(std.testing.allocator, fast, .{}, &diagnostic);
+                defer compiled.deinit();
+                var reference = try c.compile(std.testing.allocator, exact, .{}, &diagnostic);
+                defer reference.deinit();
+                var fixture: Fixture = .{};
+                var actual = try runtime.execute(std.testing.allocator, fixture.backend(), graph, &compiled, &.{}, .{});
+                defer actual.deinit();
+                var expected = try runtime.execute(std.testing.allocator, fixture.backend(), graph, &reference, &.{}, .{});
+                defer expected.deinit();
+                try std.testing.expectEqual(expected.rows[0][0].integer, actual.rows[0][0].integer);
+            }
+        }
+    }
+}
+
+test "property liveness retains complete entities at unknown consumers" {
+    const Case = struct { query: []const u8, fields: ?[]const []const u8 };
+    for ([_]Case{
+        .{ .query = "MATCH (n:Document) RETURN count(*)", .fields = &.{} },
+        .{ .query = "MATCH (n:Document {id:'a'}) RETURN n.rank", .fields = &.{ "id", "rank" } },
+        .{ .query = "MATCH (n:Document) WHERE n.rank>1 RETURN labels(n),antfly.documentKey(n)", .fields = &.{"rank"} },
+        .{ .query = "MATCH (n:Document) RETURN n", .fields = null },
+        .{ .query = "MATCH (n:Document) RETURN properties(n)", .fields = null },
+        .{ .query = "MATCH (n:Document) WITH n AS m RETURN m.title", .fields = null },
+        .{ .query = "MATCH p=(n:Document)-[:CITES]->(m) RETURN nodes(p)", .fields = null },
+        .{ .query = "MATCH (n:Document) RETURN n[$field]", .fields = null },
+    }) |case| {
+        var diagnostic: c.Diagnostic = .{};
+        var compiled = try c.compile(std.testing.allocator, case.query, .{}, &diagnostic);
+        defer compiled.deinit();
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        const actual = try @import("read_fields.zig").required(arena.allocator(), compiled.query, graph);
+        try std.testing.expectEqual(case.fields == null, actual == null);
+        if (case.fields) |fields| {
+            try std.testing.expectEqual(fields.len, actual.?.len);
+            for (fields, actual.?) |expected, field| try std.testing.expectEqualStrings(expected, field);
+        }
+    }
+}

@@ -357,7 +357,8 @@ def test_traversals_stream_demand_top_k_and_reductions(graph_db):
         assert [[cell["value"] for cell in row] for row in result["rows"]] == expected
 
 
-def test_shortest_operator_uses_bound_comma_inputs_and_counts_the_dag(graph_db):
+@pytest.mark.parametrize("min_hops", [1, 2, 6])
+def test_shortest_operator_uses_bound_comma_inputs_and_counts_the_dag(graph_db, min_hops):
     db = graph_db
     layers = 16
     patterns = ["(s:D)", "(z:D)"] + [f"(v{i}_{j}:D)" for i in range(layers) for j in range(2)]
@@ -379,7 +380,7 @@ def test_shortest_operator_uses_bound_comma_inputs_and_counts_the_dag(graph_db):
         result = db.cypher_json(
             "g",
             {
-                "query": "MATCH (s:D) WHERE antfly.documentKey(s)=$s MATCH (z:D) WHERE antfly.documentKey(z)=$z MATCH p=allShortestPaths((s)-[:R*1..32]->(z)) RETURN count(*)",
+                "query": f"MATCH (s:D) WHERE antfly.documentKey(s)=$s MATCH (z:D) WHERE antfly.documentKey(z)=$z MATCH p=allShortestPaths((s)-[:R*{min_hops}..32]->(z)) RETURN count(*)",
                 "parameters": {"s": keys[0], "z": target},
                 "limits": {"explored_edges": edges, "memory_bytes": 2 << 20, "intermediate_states": 2000},
             },
@@ -388,7 +389,7 @@ def test_shortest_operator_uses_bound_comma_inputs_and_counts_the_dag(graph_db):
     limited = db.cypher_json(
         "g",
         {
-            "query": "MATCH (s:D) WHERE antfly.documentKey(s)=$s MATCH (z:D) WHERE antfly.documentKey(z)=$z MATCH p=allShortestPaths((s)-[:R*1..32]->(z)) RETURN length(p) LIMIT 1",
+            "query": f"MATCH (s:D) WHERE antfly.documentKey(s)=$s MATCH (z:D) WHERE antfly.documentKey(z)=$z MATCH p=allShortestPaths((s)-[:R*{min_hops}..32]->(z)) RETURN length(p) LIMIT 1",
             "parameters": {"s": keys[0], "z": keys[2]},
             "limits": {"explored_edges": edges, "memory_bytes": 2 << 20, "intermediate_states": 2000},
         },
@@ -397,7 +398,7 @@ def test_shortest_operator_uses_bound_comma_inputs_and_counts_the_dag(graph_db):
     result = db.cypher_json(
         "g",
         {
-            "query": "MATCH (s:D),(z:D),p=shortestPath((s)-[:R*1..32]->(z)) WHERE antfly.documentKey(s)=$s AND antfly.documentKey(z)=$z RETURN count(*)",
+            "query": f"MATCH (s:D),(z:D),p=shortestPath((s)-[:R*{min_hops}..32]->(z)) WHERE antfly.documentKey(s)=$s AND antfly.documentKey(z)=$z RETURN count(*)",
             "parameters": {"s": keys[0], "z": keys[1]},
             "limits": {"explored_edges": edges, "memory_bytes": 2 << 20},
         },
@@ -447,3 +448,86 @@ def test_dag_count_reports_overflow_only_for_qualifying_endpoints(graph_db):
     with pytest.raises(af.GraphError) as overflow:
         db.cypher_json("g", request)
     assert overflow.value.graph_code == "CypherNumericOverflow"
+
+
+def test_selective_right_endpoint_drives_traversal(graph_db):
+    db = graph_db
+    populate(db, 201)
+    db.sql("CREATE INDEX docs_id ON docs(id)")
+    db.cypher_json("g", {"query": "MATCH (a:D),(b:D) WHERE b.score=a.score+1 CREATE (a)-[:R]->(b)"})
+    for predicate in ("{id:'n200'}", ""):
+        where = "" if predicate else " WHERE antfly.documentKey(b)='n200'"
+        result = db.cypher_json(
+            "g",
+            {
+                "query": f"MATCH p=(a:D)-[:R]->(b:D {predicate}){where} RETURN a.id,b.id,[n IN nodes(p)|n.id]",
+                "limits": {"scanned_anchors": 1, "explored_edges": 1},
+            },
+        )
+        assert [cell["value"] for cell in result["rows"][0][:2]] == ["n199", "n200"]
+        assert [cell["value"] for cell in result["rows"][0][2]["value"]] == ["n199", "n200"]
+        assert result["stats"]["scanned_anchors"] == 1
+        assert result["stats"]["explored_edges"] == 1
+
+
+def test_exists_propagates_edge_demand(graph_db):
+    db = graph_db
+    patterns = ["(a:D)"] + [f"(n{i}:D)" for i in range(200)]
+    patterns += [f"(a)-[:R]->(n{i})" for i in range(200)]
+    key = db.cypher_json("g", {"query": "CREATE " + ",".join(patterns) + " RETURN antfly.documentKey(a)"})["rows"][0][
+        0
+    ]["value"]
+    for body in ("MATCH (a)-[:R]->(b)", "MATCH (a)-[:R]->(b) RETURN b"):
+        result = db.cypher_json(
+            "g",
+            {
+                "query": f"MATCH (a:D) WHERE antfly.documentKey(a)=$key RETURN EXISTS {{ {body} }}",
+                "parameters": {"key": key},
+                "limits": {"explored_edges": 1},
+            },
+        )
+        assert result["rows"] == [[{"type": "boolean", "value": True}]]
+        assert result["stats"]["explored_edges"] == 1
+
+
+def test_lower_bound_shortest_keeps_longer_qualifying_dag_routes(graph_db):
+    db = graph_db
+    db.cypher_json(
+        "g",
+        {
+            "query": "CREATE (a:D {id:'a'}),(b:D),(c:D {id:'c'}),(d:D),(e:D),(a)-[:R]->(b),(a)-[:R]->(d),(d)-[:R]->(b),(b)-[:R]->(e),(e)-[:R]->(c)"
+        },
+    )
+    for lower, expected in ((2, 3), (4, 4)):
+        result = db.cypher_json(
+            "g",
+            {
+                "query": f"MATCH p=allShortestPaths((a:D {{id:'a'}})-[:R*{lower}..8]->(c:D {{id:'c'}})) RETURN length(p)",
+                "limits": {"explored_edges": 5},
+            },
+        )
+        assert result["rows"] == [[{"type": "integer", "value": str(expected)}]]
+
+
+def test_unused_wide_relational_columns_are_not_hydrated(graph_db):
+    db = graph_db
+    db.sql("CREATE TABLE wide (score BIGINT,payload TEXT)")
+    for start in range(0, 1000, 100):
+        db.sql(
+            "INSERT INTO wide (_id,score,payload) VALUES "
+            + ",".join(f"('n{i}',{i},'{('x' * 8192)}')" for i in range(start, start + 100))
+        )
+    db.graph_catalog_json(
+        {
+            "action": "put",
+            "name": "wide",
+            "definition": {"labels": [{"name": "W", "table": "wide"}], "relationships": []},
+        }
+    )
+    result = db.cypher_json(
+        "wide", {"query": "MATCH (n:W) RETURN count(*),sum(n.score)", "limits": {"memory_bytes": 2 << 20}}
+    )
+    assert [cell["value"] for cell in result["rows"][0]] == ["1000", "499500"]
+    assert result["stats"]["memory_bytes"] < 2 << 20
+    entity = db.cypher_json("wide", {"query": "MATCH (n:W) WHERE antfly.documentKey(n)='n0' RETURN n"})
+    assert entity["rows"][0][0]["value"]["properties"]["payload"]["value"] == "x" * 8192

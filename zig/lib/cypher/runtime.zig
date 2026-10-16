@@ -104,6 +104,8 @@ fn executeBudget(budget: *Budget, backend: backend_mod.Backend, graph: catalog.G
     if (backend.vtable.set_work) |configure| configure(backend.ptr, .{ .ptr = &engine, .charge = Engine.chargeWork, .value = Engine.chargeValue, .remaining = Engine.remainingWork });
     defer if (backend.vtable.set_work) |configure| configure(backend.ptr, null);
     const writes = queryHasWrites(compiled.query);
+    if (backend.vtable.set_read_fields) |configure| configure(backend.ptr, if (writes) null else try @import("read_fields.zig").required(engine.a, compiled.query, graph));
+    defer if (backend.vtable.set_read_fields) |configure| configure(backend.ptr, null);
     engine.cache_reads = !writes;
     var transaction = false;
     defer if (transaction) backend.vtable.rollback.?(backend.ptr);
@@ -208,6 +210,7 @@ const Engine = struct {
     stream_fold: ?*StreamFold = null,
     stream_predicate: ?*const ast.Expr = null,
     shortest_count: ?*u64 = null,
+    lower_graph: ?*LowerGraph = null,
     cache_reads: bool = false,
     aggregate_overrides: ?[]const AggregateValue = null,
     read_nodes: std.HashMapUnmanaged(v.Identity, ?*const v.Node, v.Identity.Context, std.hash_map.default_max_load_percentage) = .empty,
@@ -465,7 +468,7 @@ const Engine = struct {
         } else if (projection.limit == null or (projection.order.len == 0 and projection.predicate != null)) return null;
         const selected_path = path.selector != .all;
         if (selected_path) {
-            if (path.edges.len != 1 or path.edges[0].min_hops > 1) return null;
+            if (path.edges.len != 1) return null;
             for (input) |row| {
                 if (path.alias) |alias| if (lookup(row, alias) != null) return null;
                 if (path.edges[0].alias) |alias| if (lookup(row, alias) != null) return null;
@@ -562,7 +565,33 @@ const Engine = struct {
         try self.stages.append(self.a, .{ .operation = "project", .span = projection_span, .input_rows = matched, .output_rows = rows.len });
         return rows;
     }
+    // EXISTS consumes one result row. Keep aggregation, DISTINCT, ordering and
+    // pagination barriers intact; ordinary terminal projections can carry the
+    // demand into MATCH without evaluating or retaining the remaining routes.
+    fn existsRows(self: *Engine, clauses: []const ast.Clause, row: Row) ![]const Row {
+        const one: ast.Expr = .{ .span = .{}, .value = .{ .literal = .{ .integer = 1 } } };
+        var plan = try self.a.dupe(ast.Clause, clauses);
+        if (plan[plan.len - 1].operation == .project) {
+            const projection = &plan[plan.len - 1].operation.project.value;
+            var has_aggregate = false;
+            for (projection.items) |item| has_aggregate = has_aggregate or aggregates(item.expression);
+            if (!has_aggregate and !projection.distinct and projection.order.len == 0 and projection.predicate == null) {
+                if (projection.limit == null) projection.limit = &one else if (self.constant(projection.limit.?, row)) |limit| {
+                    if (limit == .integer and limit.integer > 1) projection.limit = &one;
+                }
+            }
+        } else {
+            const extended = try self.a.alloc(ast.Clause, plan.len + 1);
+            @memcpy(extended[0..plan.len], plan);
+            extended[plan.len] = .{ .span = .{}, .operation = .{ .project = .{ .final = true, .value = .{ .items = &.{.{ .expression = &one }}, .limit = &one } } } };
+            plan = extended;
+        }
+        return self.run(plan, &.{row}, false, true);
+    }
     fn run(self: *Engine, clauses: []const ast.Clause, input: []const Row, explain: bool, preserve_rows: bool) anyerror![]const Row {
+        const prior_lower_graph = self.lower_graph;
+        self.lower_graph = null;
+        defer self.lower_graph = prior_lower_graph;
         self.recursion += 1;
         defer self.recursion -= 1;
         if (self.recursion > self.limits.recursion_depth) return error.CypherRecursionBudgetExceeded;
@@ -689,6 +718,7 @@ const Engine = struct {
 
     fn getNode(self: *Engine, identity: v.Identity) anyerror!?*const v.Node {
         try self.checkpoint();
+        if (self.lower_graph) |graph| if (graph.positions.get(identity)) |position| return graph.nodes.items[position].node;
         if (!self.cache_reads) return self.backend.vtable.get(self.backend.ptr, self.a, identity);
         if (self.read_nodes.get(identity)) |cached| return cached;
         const node = try self.backend.vtable.get(self.backend.ptr, self.a, identity);
@@ -706,6 +736,7 @@ const Engine = struct {
         var seen: v.IdentitySet = .empty;
         for (relationships) |relationship| {
             const target = if (outgoing and relationship.source.eql(identity)) relationship.target else if (incoming and relationship.target.eql(identity)) relationship.source else continue;
+            if (self.lower_graph) |graph| if (graph.positions.contains(target)) continue;
             if (self.read_nodes.contains(target)) continue;
             if ((try seen.getOrPut(temporary, target)).found_existing) continue;
             try pending.append(temporary, target);
@@ -1070,7 +1101,32 @@ const Engine = struct {
         if (keyCall(operands[1], name)) return self.constant(operands[0], row);
         return null;
     }
-    fn matchPath(self: *Engine, input: MatchState, path: ast.Path, mode: ast.PathMode, predicate: ?*const ast.Expr, output: *std.ArrayList(MatchState)) anyerror!void {
+    fn anchorScore(self: *Engine, node: ast.Node, predicate: ?*const ast.Expr, row: Row) !usize {
+        if (node.alias) |alias| if (lookup(row, alias) != null) return 1_000_000;
+        if (self.anchorKey(predicate, node.alias, row) != null) return 100_000;
+        var filters: std.ArrayList(backend_mod.PropertyFilter) = .empty;
+        for (node.properties) |property| if (self.constant(property.value, row)) |value| try filters.append(self.a, .{ .property = property.name, .value = value });
+        if (predicate) |expression| if (node.alias) |alias| try self.predicateFilters(expression, alias, row, &filters);
+        return (if (self.backend.vtable.scan_where != null) @as(usize, 100) * filters.items.len else 0) + @intFromBool(node.labels.len > 0);
+    }
+    fn matchPath(self: *Engine, input: MatchState, original: ast.Path, mode: ast.PathMode, predicate: ?*const ast.Expr, output: *std.ArrayList(MatchState)) anyerror!void {
+        var path = original;
+        if (!path.execution_reversed and path.edges.len != 0 and
+            try self.anchorScore(path.nodes[path.nodes.len - 1], predicate, input.row) > try self.anchorScore(path.nodes[0], predicate, input.row))
+        {
+            const nodes = try self.a.dupe(ast.Node, path.nodes);
+            const edges = try self.a.dupe(ast.Edge, path.edges);
+            std.mem.reverse(ast.Node, nodes);
+            std.mem.reverse(ast.Edge, edges);
+            for (edges) |*edge| edge.direction = switch (edge.direction) {
+                .out => .in,
+                .in => .out,
+                .both => .both,
+            };
+            path.nodes = nodes;
+            path.edges = edges;
+            path.execution_reversed = true;
+        }
         const first = path.nodes[0];
         if (first.alias) |alias| if (lookup(input.row, alias)) |retained| {
             const bound = try self.readValue(retained);
@@ -1140,7 +1196,7 @@ const Engine = struct {
     const BreadthParent = struct { previous: usize, relationship: *const v.Relationship };
     const BreadthState = struct { node: *const v.Node, parent: ?usize = null, relationship: ?*const v.Relationship = null, alternatives: std.ArrayList(BreadthParent) = .empty, depth: usize = 0, branch: usize = 0, ways: u64 = 1 };
     fn startPath(self: *Engine, input: MatchState, path: ast.Path, mode: ast.PathMode, node: *const v.Node, output: *std.ArrayList(MatchState)) anyerror!void {
-        if (!self.shortest_fast or path.selector == .all or path.edges.len != 1 or input.used.len != 0 or input.constraints.len != 0 or path.edges[0].min_hops > 1) {
+        if (!self.shortest_fast or path.selector == .all or path.edges.len != 1 or input.used.len != 0 or input.constraints.len != 0) {
             return self.pathStep(input, path, mode, 0, &.{node}, &.{}, output);
         }
         // Rebound relationship/path variables constrain the complete route,
@@ -1156,17 +1212,191 @@ const Engine = struct {
             return self.pathStep(input, path, mode, 0, &.{node}, &.{}, output);
         for (path.nodes[1].properties) |property| if (self.constant(property.value, input.row) == null)
             return self.pathStep(input, path, mode, 0, &.{node}, &.{}, output);
+        if (path.edges[0].min_hops > 1) return self.lowerPath(input, path, mode, node, output);
         try self.breadthPath(input, path, mode, node, output);
+    }
+    // A statement-owned adjacency capture shares physical reads between route
+    // prefixes. DAGs and repeatable walks admit distance states indexed by the
+    // unsatisfied lower bound; cyclic trails retain exact route histories.
+    const LowerArc = struct { target: usize, relationship: *const v.Relationship, mapping: usize };
+    const LowerNode = struct { node: *const v.Node, depth: usize, arcs: std.ArrayList(LowerArc) = .empty, loaded: bool = false };
+    const LowerGraph = struct {
+        nodes: std.ArrayList(LowerNode) = .empty,
+        positions: std.HashMapUnmanaged(v.Identity, usize, v.Identity.Context, std.hash_map.default_max_load_percentage) = .empty,
+        acyclic: bool = false,
+        complete: bool = true,
+    };
+    fn accountEdges(self: *Engine, page: backend_mod.Page(*const v.Relationship)) !void {
+        const examined = page.examined orelse page.items.len;
+        if (examined < page.items.len) return error.CypherInvalidBackendPage;
+        if (examined > self.limits.explored_edges -| self.stats.explored_edges) return error.CypherEdgeBudgetExceeded;
+        self.stats.explored_edges += examined;
+    }
+    fn expandEdges(self: *Engine, mapping: catalog.Relationship, identity: v.Identity, direction: ast.Direction, cursor: ?[]const u8, demand: usize) !backend_mod.Page(*const v.Relationship) {
+        if (self.lower_graph) |graph| if (graph.positions.get(identity)) |position| {
+            const node = graph.nodes.items[position];
+            if (node.loaded) {
+                // Captured adjacency is already authorized and charged. Replay
+                // never crosses the backend boundary or consumes edge budget.
+                if (cursor != null) return error.CypherInvalidBackendCursor;
+                var items: std.ArrayList(*const v.Relationship) = .empty;
+                for (node.arcs.items) |arc| if (std.mem.eql(u8, self.graph.relationships[arc.mapping].name, mapping.name)) try items.append(self.a, arc.relationship);
+                return .{ .items = items.items };
+            }
+        };
+        const page = try self.backend.vtable.expand(self.backend.ptr, self.a, mapping, identity, direction, cursor, demand);
+        try self.accountEdges(page);
+        return page;
+    }
+    fn captureLowerGraph(self: *Engine, input: MatchState, path: ast.Path, start: *const v.Node) !LowerGraph {
+        const edge = path.edges[0];
+        var graph: LowerGraph = .{};
+        try graph.positions.put(self.a, start.identity, 0);
+        try graph.nodes.append(self.a, .{ .node = start, .depth = 0 });
+        const maximum = @min(edge.max_hops orelse self.limits.path_depth, self.limits.path_depth);
+        var head: usize = 0;
+        while (head < graph.nodes.items.len) : (head += 1) {
+            try self.state();
+            const current = graph.nodes.items[head];
+            if (current.depth >= maximum) {
+                if (maximum < (edge.max_hops orelse std.math.maxInt(u32))) graph.complete = false;
+                continue;
+            }
+            graph.nodes.items[head].loaded = true;
+            for (self.graph.relationships, 0..) |mapping, mapping_index| {
+                var selected = edge.types.len == 0;
+                for (edge.types) |name| if (std.mem.eql(u8, name, mapping.name)) {
+                    selected = true;
+                };
+                if (!selected) continue;
+                const outgoing = edge.direction != .in and try self.graph.admits(current.node, mapping.source_label, &self.values);
+                const incoming = edge.direction != .out and try self.graph.admits(current.node, mapping.target_label, &self.values);
+                if (!outgoing and !incoming) continue;
+                var cursor: ?[]const u8 = null;
+                while (true) {
+                    const page = try self.backend.vtable.expand(self.backend.ptr, self.a, mapping, current.node.identity, edge.direction, cursor, 128);
+                    try self.accountEdges(page);
+                    try self.prefetchEndpoints(page.items, current.node.identity, outgoing, incoming);
+                    for (page.items) |relationship| {
+                        try self.state();
+                        if (!std.mem.eql(u8, relationship.index, mapping.index) or !std.mem.eql(u8, relationship.type, mapping.name)) return error.CypherInvalidBackendRelationship;
+                        const traversing_out = outgoing and relationship.source.eql(current.node.identity);
+                        const target = if (traversing_out) relationship.target else if (incoming and relationship.target.eql(current.node.identity)) relationship.source else continue;
+                        const reached = (try self.getNode(target)) orelse continue;
+                        if (!try self.graph.admits(reached, if (traversing_out) mapping.target_label else mapping.source_label, &self.values)) continue;
+                        const eligible = (try self.constrain(input, .{ .relationship = relationship }, edge.properties)) orelse continue;
+                        if (!try self.constraintsMatch(eligible.constraints, input.row, false)) continue;
+                        const entry = try graph.positions.getOrPut(self.a, reached.identity);
+                        if (!entry.found_existing) {
+                            entry.value_ptr.* = graph.nodes.items.len;
+                            try graph.nodes.append(self.a, .{ .node = reached, .depth = current.depth + 1 });
+                        }
+                        const target_index = entry.value_ptr.*;
+                        try graph.nodes.items[head].arcs.append(self.a, .{ .target = target_index, .relationship = relationship, .mapping = mapping_index });
+                    }
+                    if (page.next == null) break;
+                    if (cursor) |old| if (std.mem.eql(u8, old, page.next.?)) return error.CypherInvalidBackendCursor;
+                    cursor = page.next;
+                }
+            }
+        }
+        // Bound-target reachability is a necessary condition even when route
+        // uniqueness prevents state compression. Remove dead branches before
+        // either the distance operator or exact trail enumeration consumes them.
+        if (graph.complete) if (path.nodes[1].alias) |alias| if (lookup(input.row, alias)) |target| {
+            if (target == .node) if (graph.positions.get(target.node.identity)) |goal| {
+                const incoming = try self.a.alloc(std.ArrayList(usize), graph.nodes.items.len);
+                @memset(incoming, .empty);
+                for (graph.nodes.items, 0..) |source, index| for (source.arcs.items) |arc| try incoming[arc.target].append(self.a, index);
+                const reaches = try self.a.alloc(bool, graph.nodes.items.len);
+                @memset(reaches, false);
+                reaches[goal] = true;
+                var pending: std.ArrayList(usize) = .empty;
+                try pending.append(self.a, goal);
+                var position: usize = 0;
+                while (position < pending.items.len) : (position += 1) {
+                    try self.state();
+                    for (incoming[pending.items[position]].items) |source| if (!reaches[source]) {
+                        reaches[source] = true;
+                        try pending.append(self.a, source);
+                    };
+                }
+                for (graph.nodes.items) |*source| {
+                    var retained: usize = 0;
+                    for (source.arcs.items) |arc| if (reaches[arc.target]) {
+                        source.arcs.items[retained] = arc;
+                        retained += 1;
+                    };
+                    source.arcs.items.len = retained;
+                }
+            };
+        };
+        const indegree = try self.a.alloc(usize, graph.nodes.items.len);
+        @memset(indegree, 0);
+        for (graph.nodes.items) |node| for (node.arcs.items) |arc| {
+            indegree[arc.target] += 1;
+        };
+        var queue: std.ArrayList(usize) = .empty;
+        for (indegree, 0..) |degree, index| if (degree == 0) {
+            try queue.append(self.a, index);
+        };
+        head = 0;
+        while (head < queue.items.len) : (head += 1) {
+            try self.state();
+            for (graph.nodes.items[queue.items[head]].arcs.items) |arc| {
+                indegree[arc.target] -= 1;
+                if (indegree[arc.target] == 0) try queue.append(self.a, arc.target);
+            }
+        }
+        graph.acyclic = queue.items.len == graph.nodes.items.len;
+        return graph;
+    }
+    fn lowerPath(self: *Engine, input: MatchState, path: ast.Path, mode: ast.PathMode, node: *const v.Node, output: *std.ArrayList(MatchState)) !void {
+        var graph = try self.captureLowerGraph(input, path, node);
+        const previous = self.lower_graph;
+        self.lower_graph = &graph;
+        defer self.lower_graph = previous;
+        if (path.nodes[1].alias) |alias| if (lookup(input.row, alias)) |target| {
+            if (graph.complete and target == .node and !graph.positions.contains(target.node.identity)) return;
+        };
+        if (graph.acyclic or mode == .repeatable) return self.breadthPath(input, path, mode, node, output);
+        // Relationship/node uniqueness in a cyclic graph depends on route
+        // history. Reuse the captured reads, but select exact trails before
+        // feeding a streaming consumer or multiplicity accumulator.
+        const fold = self.stream_fold;
+        const count_paths = self.shortest_count;
+        if (fold == null and count_paths == null) return self.pathStep(input, path, mode, 0, &.{node}, &.{}, output);
+        const collect = self.collect_match_paths;
+        self.stream_fold = null;
+        self.shortest_count = null;
+        self.collect_match_paths = true;
+        defer {
+            self.stream_fold = fold;
+            self.shortest_count = count_paths;
+            self.collect_match_paths = collect;
+        }
+        var candidates: std.ArrayList(MatchState) = .empty;
+        try self.pathStep(input, path, mode, 0, &.{node}, &.{}, &candidates);
+        for (try self.selectPaths(candidates.items, &.{path})) |candidate| {
+            if (count_paths) |value| {
+                value.* = std.math.add(u64, value.*, 1) catch return error.CypherNumericOverflow;
+            }
+            if (fold) |consumer| {
+                if (self.stream_predicate) |predicate| if ((try (try self.eval(predicate, candidate.row, null)).truth()) != true) continue;
+                try consumer.add(self, candidate.row);
+            }
+        }
     }
     const BreadthKey = struct {
         identity: v.Identity,
         branch: usize,
+        phase: usize = 0,
         const Context = struct {
             pub fn hash(_: @This(), key: BreadthKey) u64 {
-                return std.hash.Wyhash.hash((v.Identity.Context{}).hash(key.identity), std.mem.asBytes(&key.branch));
+                return std.hash.Wyhash.hash(std.hash.Wyhash.hash((v.Identity.Context{}).hash(key.identity), std.mem.asBytes(&key.branch)), std.mem.asBytes(&key.phase));
             }
             pub fn eql(_: @This(), left: BreadthKey, right: BreadthKey) bool {
-                return left.branch == right.branch and left.identity.eql(right.identity);
+                return left.phase == right.phase and left.branch == right.branch and left.identity.eql(right.identity);
             }
         };
     };
@@ -1220,7 +1450,7 @@ const Engine = struct {
             // The whole winning layer is already queued when a bound target
             // is discovered. Preserve all ties without expanding deeper layers.
             if (target_depth) |depth| if (current.depth >= depth) continue;
-            if (current.depth != 0 and current.node.identity.eql(start.identity)) continue;
+            if (edge.min_hops <= 1 and current.depth != 0 and current.node.identity.eql(start.identity)) continue;
             const maximum = edge.max_hops orelse std.math.maxInt(u32);
             if (current.depth >= maximum) continue;
             for (self.graph.relationships) |mapping| {
@@ -1234,11 +1464,7 @@ const Engine = struct {
                 if (!outgoing and !incoming) continue;
                 var cursor: ?[]const u8 = null;
                 while (true) {
-                    const page = try self.backend.vtable.expand(self.backend.ptr, self.a, mapping, current.node.identity, edge.direction, cursor, 128);
-                    const examined = page.examined orelse page.items.len;
-                    if (examined < page.items.len) return error.CypherInvalidBackendPage;
-                    if (examined > self.limits.explored_edges -| self.stats.explored_edges) return error.CypherEdgeBudgetExceeded;
-                    self.stats.explored_edges += examined;
+                    const page = try self.expandEdges(mapping, current.node.identity, edge.direction, cursor, 128);
                     try self.prefetchEndpoints(page.items, current.node.identity, outgoing, incoming);
                     for (page.items) |relationship| {
                         try self.checkpoint();
@@ -1250,7 +1476,7 @@ const Engine = struct {
                         // first edge from the shortest route to its penultimate
                         // node. Keep one BFS distance per first-edge branch.
                         const branch = if (edge.direction == .both and edge.min_hops == 1 and mode == .relationship_simple and current.depth == 0) queue.items.len + 1 else current.branch;
-                        const distance_key: BreadthKey = .{ .identity = target, .branch = branch };
+                        const distance_key: BreadthKey = .{ .identity = target, .branch = branch, .phase = if (edge.min_hops > 1) @min(next_depth, edge.min_hops) else 0 };
                         if (distances.get(distance_key)) |index| if (queue.items[index].depth < next_depth or (queue.items[index].depth == next_depth and path.selector == .shortest)) continue;
                         if (mode != .repeatable and target.eql(start.identity)) {
                             var ancestor: ?usize = head;
@@ -1279,7 +1505,7 @@ const Engine = struct {
                             continue;
                         }
                         try distances.put(self.a, distance_key, queue.items.len);
-                        if (bound_target) |goal| if (target_depth == null and goal.eql(target)) {
+                        if (bound_target) |goal| if (target_depth == null and next_depth >= edge.min_hops and goal.eql(target)) {
                             target_depth = next_depth;
                         };
                         try queue.append(self.a, .{ .node = reached, .parent = head, .relationship = relationship, .depth = next_depth, .branch = branch, .ways = current.ways });
@@ -1311,7 +1537,7 @@ const Engine = struct {
         const values = try self.a.alloc(v.Value, relationships.len);
         for (relationships, values) |relationship, *value| value.* = .{ .relationship = relationship };
         const edge = path.edges[0];
-        const edge_value: v.Value = if (edge.variable_length) .{ .list = values } else if (relationships.len == 1) .{ .relationship = relationships[0] } else .null;
+        const edge_value = try self.routeEdgeValue(path, edge, values, relationships);
         if (try self.bind(input.row, edge.alias, edge_value)) |bound| {
             var completed = input;
             completed.row = bound;
@@ -1325,6 +1551,10 @@ const Engine = struct {
                 .{ .nodes = try self.a.dupe(*const v.Node, nodes), .relationships = try self.a.dupe(*const v.Relationship, relationships) }
             else
                 .{ .nodes = &.{}, .relationships = &.{} };
+            if (path.execution_reversed) {
+                std.mem.reverse(*const v.Node, @constCast(matched_path.nodes));
+                std.mem.reverse(*const v.Relationship, @constCast(matched_path.relationships));
+            }
             const row = (try self.bind(input.row, path.alias, .{ .path = matched_path })) orelse return;
             if (!try self.constraintsMatch(input.constraints, row, true)) return;
             var paths = input.paths;
@@ -1345,12 +1575,19 @@ const Engine = struct {
         try self.expandPath(input, path, mode, edge_index, nodes, relationships, 0, &.{}, output);
     }
 
+    fn routeEdgeValue(self: *Engine, path: ast.Path, edge: ast.Edge, values: []const v.Value, relationships: []const *const v.Relationship) !v.Value {
+        if (!edge.variable_length) return .{ .relationship = relationships[relationships.len - 1] };
+        if (!path.execution_reversed) return .{ .list = values };
+        const reversed = try self.a.dupe(v.Value, values);
+        std.mem.reverse(v.Value, reversed);
+        return .{ .list = reversed };
+    }
     fn expandPath(self: *Engine, input: MatchState, path: ast.Path, mode: ast.PathMode, edge_index: usize, nodes: []const *const v.Node, relationships: []const *const v.Relationship, hops: u32, edge_values: []const v.Value, output: *std.ArrayList(MatchState)) anyerror!void {
         const edge = path.edges[edge_index];
         const current = nodes[nodes.len - 1];
         if (hops >= edge.min_hops and try self.nodeMatches(current, path.nodes[edge_index + 1])) {
             if (try self.bind(input.row, path.nodes[edge_index + 1].alias, .{ .node = current })) |node_row| {
-                const edge_value: v.Value = if (edge.variable_length) .{ .list = edge_values } else .{ .relationship = relationships[relationships.len - 1] };
+                const edge_value = try self.routeEdgeValue(path, edge, edge_values, relationships);
                 if (try self.bind(node_row, edge.alias, edge_value)) |edge_row| {
                     if (try self.constrain(.{ .row = edge_row, .used = input.used, .paths = input.paths, .constraints = input.constraints }, .{ .node = current }, path.nodes[edge_index + 1].properties)) |candidate|
                         try self.pathStep(candidate, path, mode, edge_index + 1, nodes, relationships, output);
@@ -1378,11 +1615,7 @@ const Engine = struct {
                 if (page_scope != null) self.cache_reads = true;
                 defer if (page_scope) |scope| scope.leave(self);
                 try self.checkpoint();
-                const page = try self.backend.vtable.expand(self.backend.ptr, self.a, mapping, current.identity, edge.direction, cursor, if (self.stream_fold) |fold| fold.demand() else 128);
-                const examined = page.examined orelse page.items.len;
-                if (examined < page.items.len) return error.CypherInvalidBackendPage;
-                if (examined > self.limits.explored_edges -| self.stats.explored_edges) return error.CypherEdgeBudgetExceeded;
-                self.stats.explored_edges += examined;
+                const page = try self.expandEdges(mapping, current.identity, edge.direction, cursor, if (self.stream_fold) |fold| fold.demand() else 128);
                 try self.prefetchEndpoints(page.items, current.identity, outgoing, incoming);
                 for (page.items) |relationship| {
                     var used = false;
@@ -1746,7 +1979,7 @@ const Engine = struct {
             .exists => |clauses| blk: {
                 const columns = self.columns;
                 defer self.columns = columns;
-                const candidates = try self.run(clauses, &.{row}, false, true);
+                const candidates = try self.existsRows(clauses, row);
                 break :blk .{ .boolean = candidates.len > 0 };
             },
         };

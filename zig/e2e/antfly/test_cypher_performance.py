@@ -156,6 +156,36 @@ def test_authenticated_cypher_property_plans_and_sql_overlays(monkeypatch):
             ["1", "5000"],
         ], result
         assert result["stats"]["memory_bytes"] <= first_memory + (1 << 20), result
+        # Column requirements must survive the coordinator/owner RPC boundary.
+        wide = table + "_wide"
+        call("/sql", {"statement": f"CREATE TABLE {wide} (score BIGINT,payload TEXT)"})
+        call(
+            f"/tables/{wide}/batch",
+            {
+                "inserts": {
+                    f"n{i}": {"score": i, "payload": "x" * 8192} for i in range(400)
+                },
+                "sync_level": "full_index",
+            },
+        )
+        call(
+            f"/graphs/{wide}",
+            {"labels": [{"name": "W", "table": wide}], "relationships": []},
+        )
+        pruned = call(
+            f"/graphs/{wide}/query",
+            {
+                "query": "MATCH (n:W) RETURN count(*),sum(n.score)",
+                "limits": {"memory_bytes": 2 << 20},
+            },
+        )
+        assert [cell["value"] for cell in pruned["rows"][0]] == ["400", "79800"], pruned
+        complete = call(
+            f"/graphs/{wide}/query",
+            {"query": "MATCH (n:W) WHERE antfly.documentKey(n)='n0' RETURN n.payload"},
+        )
+        assert complete["rows"] == [[{"type": "string", "value": "x" * 8192}]], complete
+
         script = (
             Path(__file__).resolve().parents[2]
             / "scripts"

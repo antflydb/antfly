@@ -38,6 +38,7 @@ pub const Request = struct {
     prepared_search_json: []const u8 = "",
     max_examined: usize = 1_000_000,
     max_work: usize = 1_000_000,
+    read_fields: ?[]const []const u8 = null,
     document: ?std.json.Value = null,
     apply_defaults: bool = false,
     json_null_fields: []const []const u8 = &.{},
@@ -53,8 +54,12 @@ pub const Client = struct {
     revision: u64,
     allowed_versions: []const Version = &.{},
     work: ?b.Work = null,
+    read_fields: ?[]const []const u8 = null,
     pub fn backend(self: *Client) b.Backend {
-        return .{ .ptr = self, .vtable = &.{ .bind = bind, .checkpoint = checkpoint, .scan = scan, .scan_where = scanWhere, .get = get, .get_many = getMany, .expand = expand, .search = search, .normalize_node = normalizeNode, .project_postimage = projectPostimage, .document_relationships = documentRelationships, .set_work = setWork } };
+        return .{ .ptr = self, .vtable = &.{ .bind = bind, .checkpoint = checkpoint, .scan = scan, .scan_where = scanWhere, .get = get, .get_many = getMany, .expand = expand, .search = search, .normalize_node = normalizeNode, .project_postimage = projectPostimage, .document_relationships = documentRelationships, .set_work = setWork, .set_read_fields = setReadFields } };
+    }
+    fn setReadFields(ptr: *anyopaque, fields: ?[]const []const u8) void {
+        cast(ptr).read_fields = fields;
     }
     fn setWork(ptr: *anyopaque, work: ?b.Work) void {
         cast(ptr).work = work;
@@ -64,6 +69,7 @@ pub const Client = struct {
     }
     fn invoke(self: *Client, a: A, request: Request) !Reply {
         var bounded = request;
+        bounded.read_fields = self.read_fields;
         if (self.work) |work| if (work.remaining) |remaining| {
             bounded.max_work = remaining(work.ptr);
         };
@@ -223,6 +229,8 @@ pub const Owner = struct {
         defer arena.deinit();
         const scratch = arena.allocator();
         const request = try std.json.parseFromSliceLeaky(Request, scratch, body, .{});
+        if (self.backend.vtable.set_read_fields) |configure| configure(self.backend.ptr, request.read_fields);
+        defer if (self.backend.vtable.set_read_fields) |configure| configure(self.backend.ptr, null);
         if (request.graph_incarnation != self.graph.incarnation or request.graph_revision != self.graph.revision) return error.CatalogGenerationChanged;
         if (request.limit == 0 or request.limit > 1024) return error.CypherOwnerBudgetExceeded;
         try self.backend.vtable.checkpoint(self.backend.ptr);
