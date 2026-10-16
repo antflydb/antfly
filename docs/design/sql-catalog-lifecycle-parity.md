@@ -9,7 +9,7 @@ a completion claim. PostgreSQL is the SQL standard and independent test oracle.
 ## Baseline and priorities
 
 The [original inventory](sql/parity-inventory.md) remains authoritative:
-505 implemented / 136 rejected / 113 superseded / 832 unresolved. Counts below
+505 implemented / 132 rejected / 113 superseded / 836 unresolved. Counts below
 are unresolved family pools, not promises that one implementation closes them.
 
 | Priority | Pool | Cases | Shared delivery boundary |
@@ -9075,3 +9075,87 @@ UNNEST originals still need their actual mapping/catalog and indexed producer
 paths proven end to end; typed relational inputs are not a substitute for that
 contract. Persisted document SQL views, index-proof pushdown, ROWS FROM/other
 table functions, and broader distributed activation remain unfinished.
+
+### Replay ownership and prefix demand across expansion boundaries
+
+A new negative workload reproduced a real gap: wrapping UNNEST in a lateral
+derived SELECT caused invariant expanded rows to be eagerly materialized before
+LIMIT 1. The 10,001-element prepared-array case failed its one-row expansion
+quota in `/private/tmp/antfly-sql-unnest-derived-baseline.log`.
+
+Bound relational nodes now carry a conservative replay policy: captured,
+restartable, or streaming. This is an ownership/effect property, not an estimated
+row count or a claim that every operator can stream. Binding computes it once
+from child owners and bound expression volatility, including hash keys and
+late-attached Apply demand masks. Pure expansion projections/filters preserve
+the streaming property. Physical cursors, explicit materialization, recursive
+state, volatile programs, and unclassified blocking operators retain their
+existing replay owner. Thus a derived expansion may restart from its pinned
+values, but an exhausted native storage cursor may never be reopened as a
+shortcut to replay.
+
+Apply passes consumer demand to its right iterator. Residual filtering also
+preserves demand when its input is restartable expansion, without reducing
+physical-storage prefetch to one-row I/O. Demand remains advisory: rejected
+rows keep pulling until a match, exhaustion or a real quota/error boundary.
+Tests prove that division by zero beyond a delivered LIMIT prefix is deferred,
+but occurs when that row is requested. Classification tests explicitly retain
+captured ownership for physical reads and volatile AI programs. No executor
+limits were raised or input validation skipped. The wider audit below returns
+four stale parser-negative dispositions to unresolved; current accounting is
+505 implemented / 132 rejected / 113 superseded / 836 unresolved.
+
+The generic long-term follow-up is resumable, bounded prefix replay for
+captured/volatile producers, with independently owned readers, spill admission
+and fault coverage. This checkpoint preserves those owners; it does not replace
+them with unsafe rescanning or claim that every enclosing plan is prefix-lazy.
+
+The full SQL gate also exposed stale compile-only rejection evidence for
+`sql-0834`, `sql-0835`, `sql-0879` and `sql-0880`: UNNEST grammar now admits
+these complete statements. Those four entries return to unresolved, not
+implemented or superseded, until their actual document/index producer contract
+is qualified. The immutable source inventory and source rejection expectations
+remain unchanged. A dedicated grammar-only test records admission without
+granting parity credit. The rejection harness now releases unexpectedly
+successful compiled owners and still fails its gate, rather than leaking them
+while reporting only the first stale expectation.
+
+Validation: `/private/tmp/antfly-sql-expansion-replay-full-debug-recovered.log`
+passed 21/21 build steps, with 834 core tests and 227 extracted SQL contracts,
+zero failures/leaks and three opt-in benchmark skips. Mounted HTTP expansion
+and the 22-original join cohort passed 80/80 Debug build steps in
+`/private/tmp/antfly-sql-expansion-replay-public-debug-recovered.log`.
+`/private/tmp/antfly-sql-replay-deterministic-witness-debug.log` checks the final
+focused fixtures, and `/private/tmp/antfly-sql-expansion-demand-postgres-final.log`
+independently confirms PostgreSQL's filtered prefix and SQLSTATE 22012 when the
+zero-divisor row is requested. That error witness uses one parent so unordered
+join orientation cannot duplicate safe rows and hide the requested error;
+multi-parent 10,001-element demand/quota tests remain separate.
+
+### Document SQL-view integration: catalog boundary still required
+
+The current catalog has no persisted view resource. The mega branch discovers
+mapped view names by scanning a full table snapshot and reading mappings from
+index JSON. That resolver must not be ported as the production architecture.
+The desired shape is an indexed, namespace-owned view definition, resolved in
+the same catalog epoch as stable source identities, schema layouts and any
+index-generation proofs. Its definition and source bindings belong in the
+durable catalog, not an implicit index side channel or a global table scan.
+
+SQL binding should expand the pinned view as an authorized derived relation,
+retaining dependency identities, RLS/security mode, projected paths and typed
+output descriptors. PostgreSQL view-owner versus security-invoker access needs
+an explicit owner contract; it must not be approximated by a mutable adapter's last table or
+by granting the caller arbitrary physical-source access. Rename/drop/recreate
+and source-layout changes must fence stale bindings before opening data cursors.
+Public resource/type additions should come from OpenAPI and shared catalog
+machinery when that owner contract is implemented. View access and RLS follow
+the [PostgreSQL CREATE VIEW rules](https://www.postgresql.org/docs/18/sql-createview.html),
+not the superficially similar SECURITY DEFINER function model.
+
+Document JSON arrays remain JSON on ordinary table reads. A mapped SQL-array
+output needs an explicit schema-bound conversion and item type, never inference
+from sampled payloads. Index-backed originals need real native candidate/proof
+paths plus residual evaluation against the captured cut; ordinary relational
+scans over a similarly named fixture are not their evidence. These catalog,
+authorization, conversion and producer paths remain unfinished.

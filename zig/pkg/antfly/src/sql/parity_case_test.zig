@@ -213,6 +213,22 @@ test "SQL exact corpus lookup owns parameters and rejects malformed identities" 
         try std.testing.expectError(error.UnknownParityCase, corpus.get(id));
 }
 
+test "SQL newly admitted historical UNNEST rejections remain unqualified" {
+    var corpus = try fixtures.Corpus.init(std.testing.allocator);
+    defer corpus.deinit();
+    for ([_][]const u8{ "sql-0834", "sql-0835", "sql-0879", "sql-0880" }) |id| {
+        const case = try corpus.get(id);
+        // Preserve the immutable source expectation. Grammar admission does
+        // not prove document mappings, native indexes, or execution parity.
+        try std.testing.expectEqualStrings("rejection", case.source_expectation);
+        var compiled = try compiler.compile(std.testing.allocator, case.sql, .{});
+        defer compiled.deinit();
+        try std.testing.expect(compiled.statement == .select);
+        try std.testing.expect(compiled.statement.select.source.?.* == .join);
+        try std.testing.expect(compiled.statement.select.source.?.join.right.* == .unnest);
+    }
+}
+
 test "SQL exact original rejection contracts fail before backend access" {
     var corpus = try fixtures.Corpus.init(std.testing.allocator);
     defer corpus.deinit();
@@ -245,8 +261,6 @@ test "SQL exact original rejection contracts fail before backend access" {
         .{ .id = "sql-0794", .expected = error.InvalidSqlSyntax },
         .{ .id = "sql-0795", .expected = error.UnsupportedSqlShape },
         .{ .id = "sql-0796", .expected = error.UnsupportedSqlShape },
-        .{ .id = "sql-0834", .expected = error.UnsupportedSqlShape },
-        .{ .id = "sql-0835", .expected = error.UnsupportedSqlShape },
         .{ .id = "sql-0839", .expected = error.UnsupportedSqlShape },
         .{ .id = "sql-0840", .expected = error.UnsupportedSqlShape },
         .{ .id = "sql-0841", .expected = error.UnsupportedSqlShape },
@@ -254,8 +268,6 @@ test "SQL exact original rejection contracts fail before backend access" {
         .{ .id = "sql-0843", .expected = error.UnsupportedSqlShape },
         .{ .id = "sql-0844", .expected = error.UnsupportedSqlShape },
         .{ .id = "sql-0845", .expected = error.UnsupportedSqlShape },
-        .{ .id = "sql-0879", .expected = error.InvalidSqlSyntax },
-        .{ .id = "sql-0880", .expected = error.InvalidSqlSyntax },
         .{ .id = "sql-0892", .expected = error.UnsupportedSqlShape },
         .{ .id = "sql-0904", .expected = error.UnsupportedSqlShape },
         .{ .id = "sql-0905", .expected = error.UnsupportedSqlShape },
@@ -295,16 +307,21 @@ test "SQL exact original rejection contracts fail before backend access" {
         .{ .id = "sql-1585", .expected = error.UnsupportedSqlShape },
         .{ .id = "sql-1586", .expected = error.UnsupportedSqlShape },
     };
+    var admitted: usize = 0;
     for (cases) |expected| {
         const case = try corpus.get(expected.id);
         try std.testing.expectEqualStrings("rejection", case.source_expectation);
         var diagnostic: compiler.Diagnostic = .{};
-        std.testing.expectError(expected.expected, compiler.compileDiagnostic(std.testing.allocator, case.sql, .{}, &diagnostic)) catch |err| {
-            std.debug.print("rejection contract {s}: {s}\n", .{ case.id, diagnostic.message });
-            return err;
-        };
+        if (compiler.compileDiagnostic(std.testing.allocator, case.sql, .{}, &diagnostic)) |value_| {
+            var value = value_;
+            defer value.deinit();
+            std.debug.print("rejection contract unexpectedly admitted {s}\n", .{case.id});
+            admitted += 1;
+            continue;
+        } else |err| try std.testing.expectEqual(expected.expected, err);
         try std.testing.expect(diagnostic.message.len > 0);
         try std.testing.expect(diagnostic.start <= diagnostic.end);
         try std.testing.expect(diagnostic.end <= case.sql.len);
     }
+    try std.testing.expectEqual(@as(usize, 0), admitted);
 }

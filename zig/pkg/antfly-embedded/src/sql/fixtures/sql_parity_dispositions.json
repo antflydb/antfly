@@ -7988,27 +7988,13 @@
     },
     {
       "id": "sql-0834",
-      "status": "rejected",
-      "reason": "Exact pinned original rejection is preserved by UnsupportedSqlShape at the complete-statement compiler boundary, with a nonempty source-bounded diagnostic and no backend acquisition. No SQL prefix is executed.",
-      "evidence": [
-        {
-          "path": "zig/pkg/antfly/src/sql/parity_case_test.zig",
-          "test": "SQL exact original rejection contracts fail before backend access",
-          "gate": "sql-exact-rejection-contracts"
-        }
-      ]
+      "status": "unresolved",
+      "reason": "The native UNNEST grammar now admits this exact source, so its former compile-rejection proof no longer holds. The original indexed document/mapped-view execution contract and any PostgreSQL supersession remain unqualified; grammar admission receives no parity credit."
     },
     {
       "id": "sql-0835",
-      "status": "rejected",
-      "reason": "Exact pinned original rejection is preserved by UnsupportedSqlShape at the complete-statement compiler boundary, with a nonempty source-bounded diagnostic and no backend acquisition. No SQL prefix is executed.",
-      "evidence": [
-        {
-          "path": "zig/pkg/antfly/src/sql/parity_case_test.zig",
-          "test": "SQL exact original rejection contracts fail before backend access",
-          "gate": "sql-exact-rejection-contracts"
-        }
-      ]
+      "status": "unresolved",
+      "reason": "The native UNNEST grammar now admits this exact source, so its former compile-rejection proof no longer holds. The original indexed document/mapped-view execution contract and any PostgreSQL supersession remain unqualified; grammar admission receives no parity credit."
     },
     {
       "id": "sql-0836",
@@ -8276,27 +8262,13 @@
     },
     {
       "id": "sql-0879",
-      "status": "rejected",
-      "reason": "Exact pinned original rejection is preserved by InvalidSqlSyntax at the complete-statement compiler boundary, with a nonempty source-bounded diagnostic and no backend acquisition. No SQL prefix is executed.",
-      "evidence": [
-        {
-          "path": "zig/pkg/antfly/src/sql/parity_case_test.zig",
-          "test": "SQL exact original rejection contracts fail before backend access",
-          "gate": "sql-exact-rejection-contracts"
-        }
-      ]
+      "status": "unresolved",
+      "reason": "The native UNNEST grammar now admits this exact source, so its former compile-rejection proof no longer holds. The original indexed document/mapped-view execution contract and any PostgreSQL supersession remain unqualified; grammar admission receives no parity credit."
     },
     {
       "id": "sql-0880",
-      "status": "rejected",
-      "reason": "Exact pinned original rejection is preserved by InvalidSqlSyntax at the complete-statement compiler boundary, with a nonempty source-bounded diagnostic and no backend acquisition. No SQL prefix is executed.",
-      "evidence": [
-        {
-          "path": "zig/pkg/antfly/src/sql/parity_case_test.zig",
-          "test": "SQL exact original rejection contracts fail before backend access",
-          "gate": "sql-exact-rejection-contracts"
-        }
-      ]
+      "status": "unresolved",
+      "reason": "The native UNNEST grammar now admits this exact source, so its former compile-rejection proof no longer holds. The original indexed document/mapped-view execution contract and any PostgreSQL supersession remain unqualified; grammar admission receives no parity credit."
     },
     {
       "id": "sql-0881",

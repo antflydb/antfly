@@ -108,7 +108,20 @@ fn physicalScope(table: catalog.Table, name: ast.Name, aliased: bool) ?catalog.T
 
 pub const Node = struct {
     pub const ConstantRef = struct { frame: usize, ordinal: usize };
+    /// A bound ownership property, not a row estimate. Captured producers may
+    /// never be restarted against an exhausted native statement cursor.
+    pub const ReplayPolicy = enum {
+        captured,
+        restartable,
+        streaming,
+
+        fn combine(left: @This(), right: @This()) @This() {
+            if (left == .captured or right == .captured) return .captured;
+            return if (left == .streaming or right == .streaming) .streaming else .restartable;
+        }
+    };
     columns: []const Column,
+    replay_policy: ReplayPolicy = .captured,
     operation: union(enum) {
         singleton,
         recursive_ref: usize,
@@ -752,8 +765,42 @@ const Builder = struct {
         self.nodes += 1;
         if (self.nodes > self.node_limit) return error.SqlProgramLimitExceeded;
         const result = try self.alloc.create(Node);
-        result.* = .{ .columns = columns, .operation = operation };
+        result.* = .{ .columns = columns, .operation = operation, .replay_policy = replayPolicy(operation) };
         return result;
+    }
+    fn repeatable(program: scalar.Program) bool {
+        for (program.instructions) |instruction| if (instruction.operation == .call and instruction.operation.call.function.volatility() == .@"volatile") return false;
+        return true;
+    }
+    fn replayPolicy(operation: @FieldType(Node, "operation")) Node.ReplayPolicy {
+        return switch (operation) {
+            .singleton, .literal_rows, .outer_ref => .restartable,
+            .unnest => |function| blk: {
+                if (function.source.replay_policy == .captured) break :blk .captured;
+                for (function.arrays) |program| if (!repeatable(program)) break :blk .captured;
+                break :blk .streaming;
+            },
+            .query => |query| blk: {
+                if (query.binding.aggregate != null or query.binding.window != null or query.binding.order_keys.len != 0) break :blk .captured;
+                if (query.binding.scalars.predicate) |program| if (!repeatable(program)) break :blk .captured;
+                for (query.binding.scalars.projections) |optional| if (optional) |program| if (!repeatable(program)) break :blk .captured;
+                break :blk query.source.replay_policy;
+            },
+            .join => |join| blk: {
+                if (join.condition) |program| if (!repeatable(program)) break :blk .captured;
+                for (join.left_keys) |program| if (!repeatable(program)) break :blk .captured;
+                for (join.right_keys) |program| if (!repeatable(program)) break :blk .captured;
+                break :blk join.left.replay_policy.combine(join.right.replay_policy);
+            },
+            .apply => |apply| blk: {
+                if (apply.condition) |program| if (!repeatable(program)) break :blk .captured;
+                if (apply.demand) |program| if (!repeatable(program)) break :blk .captured;
+                break :blk apply.left.replay_policy.combine(apply.right.replay_policy);
+            },
+            // Explicit MATERIALIZED, recursive state and physical cursors
+            // retain their existing replay owner. No storage is reopened.
+            else => .captured,
+        };
     }
     fn internal(self: *Builder) ![]const u8 {
         defer self.next_column += 1;
@@ -1601,7 +1648,11 @@ const Builder = struct {
                     if (!lateral or join.kind != .left or apply_id == null or join.condition != null or join.membership != null) return error.InvalidSqlBackendResponse;
                     if (!self.shape_only) @constCast(result).operation.apply.single_row = true;
                 }
-                if (!self.shape_only and demand != null) @constCast(result).operation.apply.demand = demand;
+                if (!self.shape_only and demand != null) {
+                    const mutable = @constCast(result);
+                    mutable.operation.apply.demand = demand;
+                    mutable.replay_policy = replayPolicy(mutable.operation);
+                }
                 break :blk result;
             },
         };

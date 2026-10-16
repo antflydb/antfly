@@ -3381,6 +3381,8 @@ test "SQL UNNEST demand admission and allocation failures never materialize expa
     for ([_][]const u8{
         "SELECT v FROM unnest($1::text[]) t(v) LIMIT 1",
         "SELECT v FROM things d CROSS JOIN unnest($1::text[]) t(v) LIMIT 1",
+        "SELECT q.v FROM things d CROSS JOIN LATERAL (SELECT v FROM unnest($1::text[]) t(v)) q LIMIT 1",
+        "SELECT q.v FROM things d CROSS JOIN LATERAL (SELECT v FROM unnest($1::text[]) t(v) WHERE v = 'x') q LIMIT 1",
     }) |sql| {
         var backend: TestBackend = .{ .row_count = 3 };
         var compiled = try compiler.compile(std.testing.allocator, sql, .{});
@@ -3408,6 +3410,51 @@ test "SQL UNNEST demand admission and allocation failures never materialize expa
     var compiled = try compiler.compile(std.testing.allocator, "SELECT d._id, t.v, t.n FROM things d LEFT JOIN unnest(ARRAY[d._id, NULL]) WITH ORDINALITY t(v,n) ON true ORDER BY d._id, t.n LIMIT 3", .{});
     defer compiled.deinit();
     try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Check.run, .{&compiled});
+}
+
+test "SQL expansion replay policy distinguishes restartable wrappers from capture and volatility" {
+    for ([_]struct { sql: []const u8, expected: @import("relation_binding.zig").Node.ReplayPolicy }{
+        .{ .sql = "SELECT q.v FROM things d CROSS JOIN LATERAL (SELECT v FROM unnest(ARRAY[1,2]) t(v)) q", .expected = .streaming },
+        .{ .sql = "SELECT q.v FROM things d CROSS JOIN LATERAL (SELECT v FROM things s CROSS JOIN unnest(ARRAY[1,2]) t(v)) q", .expected = .captured },
+        .{ .sql = "SELECT q.v FROM things d CROSS JOIN LATERAL (SELECT ai_probability(v, 'Refund?', 'local') AS v FROM unnest(ARRAY['input']) t(v)) q", .expected = .captured },
+        .{ .sql = "SELECT q.v FROM things d CROSS JOIN LATERAL unnest(ARRAY[ai_probability('input', 'Refund?', 'local')]) q(v)", .expected = .captured },
+    }) |case| {
+        var backend: TestBackend = .{};
+        var compiled = try compiler.compile(std.testing.allocator, case.sql, .{});
+        defer compiled.deinit();
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        var parameters: [0]?ast.ColumnType = .{};
+        const bound = try @import("relation_binding.zig").bind(arena.allocator(), backend.coordinated(), compiled.statement.select, &parameters);
+        try std.testing.expect(bound.root.operation == .apply);
+        try std.testing.expectEqual(case.expected, bound.root.operation.apply.right.replay_policy);
+        try std.testing.expectEqual(@import("relation_binding.zig").Node.ReplayPolicy.captured, bound.root.operation.apply.left.replay_policy);
+        try std.testing.expectEqual(@as(usize, 0), backend.statement_opens);
+    }
+}
+
+test "SQL expansion demand preserves residual filtering and errors beyond delivered prefixes" {
+    for ([_]struct { sql: []const u8, expected: []const u8, rows: usize, native_rows: usize }{
+        .{ .sql = "SELECT q.v FROM things d CROSS JOIN LATERAL (SELECT 10 / v AS v FROM unnest(ARRAY[2,0]) t(v)) q LIMIT 1", .expected = "5", .rows = 1, .native_rows = 1 },
+        .{ .sql = "SELECT q.v FROM things d CROSS JOIN LATERAL (SELECT v FROM unnest(ARRAY[0,1]) t(v) WHERE v = 1) q LIMIT 1", .expected = "1", .rows = 2, .native_rows = 3 },
+    }) |case| {
+        var backend: TestBackend = .{ .row_count = case.native_rows };
+        var compiled = try compiler.compile(std.testing.allocator, case.sql, .{});
+        defer compiled.deinit();
+        var result = try execute(std.testing.allocator, backend.coordinated(), &compiled, &.{}, .{ .scan_rows = case.rows, .page_rows = 64 });
+        defer result.deinit();
+        try std.testing.expectEqual(@as(usize, 1), result.output.rows.len);
+        try std.testing.expectEqualStrings(case.expected, result.output.rows[0][0].string);
+        try std.testing.expectEqual(@as(usize, 1), backend.statement_opens);
+        try std.testing.expectEqual(@as(usize, 1), backend.statement_closes);
+    }
+    // One parent makes requesting the zero-divisor row deterministic even
+    // when PostgreSQL changes join orientation for an unordered LIMIT.
+    var backend: TestBackend = .{ .row_count = 1 };
+    var compiled = try compiler.compile(std.testing.allocator, "SELECT q.v FROM things d CROSS JOIN LATERAL (SELECT 10 / v AS v FROM unnest(ARRAY[2,0]) t(v)) q LIMIT 2", .{});
+    defer compiled.deinit();
+    try std.testing.expectError(error.SqlDivisionByZero, execute(std.testing.allocator, backend.coordinated(), &compiled, &.{}, .{ .page_rows = 64 }));
+    try std.testing.expectEqual(backend.statement_opens, backend.statement_closes);
 }
 
 test "SQL USING retains composite hash extraction and bounded fanout allocations" {

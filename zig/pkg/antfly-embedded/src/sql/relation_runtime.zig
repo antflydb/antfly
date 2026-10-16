@@ -949,14 +949,14 @@ fn Engine(comptime Context: type) type {
                 const self = try alloc.create(Iterator);
                 self.* = .{ .engine = engine, .node = node, .arena = .init(alloc), .scratch = .init(alloc), .probe_arena = .init(alloc), .recursive_id = recursive_id, .apply_mode = apply_mode };
                 errdefer self.deinit();
-                if (recursive_id) |id| if (node.operation != .unnest and !dependsOn(node, id)) {
+                if (recursive_id) |id| if (node.replay_policy != .streaming and !dependsOn(node, id)) {
                     self.cached_reader = try (try engine.staticRows(node)).openReader();
                     return self;
                 };
-                // UNNEST reuses prepared array inputs, not an eager replay of
-                // all expanded rows. Even an invariant invocation must remain
-                // demand-driven for LIMIT, cancellation and row admission.
-                if (apply_mode and node.operation != .unnest and outerMask(node) == 0 and (recursive_id == null or !dependsOn(node, recursive_id.?))) {
+                // Repeatable expansion plans preserve demand through derived
+                // boundaries. Captured and volatile producers retain replay;
+                // restarting those could lose rows or repeat external effects.
+                if (apply_mode and node.replay_policy != .streaming and outerMask(node) == 0 and (recursive_id == null or !dependsOn(node, recursive_id.?))) {
                     self.cached_reader = try (try engine.staticRows(node)).openReader();
                     return self;
                 }
@@ -1333,7 +1333,7 @@ fn Engine(comptime Context: type) type {
                         self.right = try createContext(self.engine, apply.right, self.recursive_id, true);
                     }
                     _ = self.scratch.reset(.free_all);
-                    if (try self.right.?.next(self.scratch.allocator())) |right| {
+                    if (try self.right.?.nextDemand(self.scratch.allocator(), self.batch_demand orelse std.math.maxInt(usize))) |right| {
                         // A second pull may retire borrowed cursor/cache pages.
                         // Own the first row before checking the cardinality
                         // witness, and never expose a prefix of an invalid row.
@@ -1531,7 +1531,10 @@ fn Engine(comptime Context: type) type {
                     // Each nested stage leaves room for upstream pages, bindings and spill operators.
                     const wanted = @min(self.batch_demand orelse std.math.maxInt(usize), @min(@min(context.limits.page_rows, @max(@as(usize, 1), context.limits.retained_bytes / (16 * 1024 + query.source.columns.len * @sizeOf(Datum) * 16))), self.query_remaining +| self.query_skip));
                     while (rows.items.len < wanted) {
-                        const input = (if (context.binding.scalars.predicate == null)
+                        // Pure expansion has no physical I/O to amortize.
+                        // Keep evaluation prefix-bounded even under residual
+                        // filtering; rejected rows continue pulling normally.
+                        const input = (if (context.binding.scalars.predicate == null or query.source.replay_policy == .streaming)
                             try self.left.?.nextDemand(scratch, wanted - rows.items.len)
                         else
                             try self.left.?.next(scratch)) orelse break;
