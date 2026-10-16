@@ -31,7 +31,7 @@ pub const Request = struct {
     identities: []const v.Identity = &.{},
     relationship: []const u8 = "",
     direction: ast.Direction = .out,
-    filters: []const struct { property: []const u8, value: std.json.Value } = &.{},
+    filters: []const struct { property: []const u8, value: std.json.Value, op: b.FilterOp = .eq } = &.{},
     after: ?[]const u8 = null,
     limit: usize = 128,
     search: ?std.json.Value = null,
@@ -250,7 +250,7 @@ pub const Owner = struct {
             .scan => {
                 if (!self.permitsTable(request.table)) return error.Forbidden;
                 const filters = try scratch.alloc(b.PropertyFilter, request.filters.len);
-                for (request.filters, filters) |input, *filter| filter.* = .{ .property = input.property, .value = try v.Value.fromJson(scratch, input.value) };
+                for (request.filters, filters) |input, *filter| filter.* = .{ .property = input.property, .value = try v.Value.fromJson(scratch, input.value), .op = input.op };
                 const page = if (self.backend.vtable.scan_where) |filtered| try filtered(self.backend.ptr, scratch, request.table, filters, request.after, request.limit) else try self.backend.vtable.scan(self.backend.ptr, scratch, request.table, request.after, request.limit);
                 for (page.items) |node| try values.append(scratch, .{ .value = .{ .node = node } });
                 next = page.next;

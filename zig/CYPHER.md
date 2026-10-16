@@ -16,12 +16,14 @@ system catalog and exposed through generated HTTP catalog routes and SDK types.
 The existing JSON pattern engine now follows Cypher relationship uniqueness in
 each MATCH scope and accepts explicit zero-hop bounds.
 
-Execution uses bounded native pages rather than capturing the graph. Equality
-constraints on mapped relational properties are candidate restrictions for the
+Execution uses bounded native pages rather than capturing the graph. Equality,
+range, and bounded sparse IN constraints on mapped relational properties restrict the
 native READY-index planner; authorization, graph membership, and full Cypher
 predicates remain residual checks. Index continuations retain their schema and
-index identity and reapply the original predicate bounds. Without a usable
-index, execution keeps a budgeted primary scan.
+index identity and reapply the original predicate bounds. Sparse IN sets use
+deduplicated equality seeks, with the selected branch retained in the cursor.
+Mixed or rounding-sensitive operands stay residual. Without a usable index,
+execution keeps a budgeted primary scan.
 
 Retained results and temporary pages share one quota, backed by a reclaiming
 allocator even when the host supplies a request arena. Releasing a page frees
@@ -29,22 +31,31 @@ its physical buffers instead of merely decrementing a counter while the host
 retains the allocation. RPC bodies and decoded reply metadata use temporary
 arenas; only returned entities and continuation bytes survive each call.
 
-Single-vertex MATCH pipelines stream through ordinary WITH projections into
+Single-pattern node and traversal MATCH pipelines, including bound inputs from
+earlier clauses, stream through ordinary WITH projections into
 bounded top-k or hash aggregation. Grouped count/sum/avg/min/max retain one
 accumulator set per group, and aggregate expressions are evaluated after the
-fold. Intermediate reductions can feed subsequent clauses. DISTINCT, collect,
-and general traversal/join pipelines still use the budgeted materializing path.
+fold. Intermediate reductions can feed subsequent clauses. Unordered LIMIT
+propagates demand to adjacency pages; completed routes release their temporary
+buffers after feeding the consumer. DISTINCT, collect, OPTIONAL and general
+multi-pattern joins retain the budgeted materializing path.
 
 Shortest-path frontiers share equal-distance predecessors in a DAG. Each
 vertex/branch expands once; qualifying paths are reconstructed lazily with all
 ties preserved. Undirected positive relationship-simple cycles retain separate
-first-edge branches. The number of returned shortest paths can still be
-exponential and remains subject to the normal output/work/memory limits.
+first-edge branches. A final shortest pattern can use earlier comma-separated
+bindings when no unresolved constraints or used relationships require exhaustive
+selection. Eligible global count(*) expressions fold endpoint multiplicities
+directly over the DAG, including shortest-cycle branches. Materialized path
+outputs can still be exponential and remain subject to output/work/memory limits.
 
 Distributed point and endpoint-batch reads use the immutable key ranges captured
 with the owner cohort. Keys are partitioned by owning shard; temporary routing
 and reply-decode buffers are reclaimed after retaining positive results.
-Incoming adjacency still follows source-owner routing. SQL overlays reconcile
+Statement-covered owner validations are classified once when acquiring the
+cohort, so expression checkpoints perform one statement check. Independent
+owner validators remain on every checkpoint; each owner call still checks its
+retained authority. Incoming adjacency still follows source-owner routing. SQL overlays reconcile
 staged postimages and exact relationship tombstones when pages are read, so a
 node-only GRAPH_TABLE query does not enumerate a staged source's adjacency.
 

@@ -165,10 +165,19 @@ pub fn Adapter(comptime DB: type, comptime GraphIndex: type, comptime EdgeScanCu
             try checkpoint(ptr);
             return .{ .items = try nodes.toOwnedSlice(a), .next = next, .examined = found.documents.len };
         }
-        const PropertyCursor = struct { index: ?[]const u8 = null, after: ?[]const u8 = null, key: ?[]const u8 = null, schema_version: ?u32 = null, primary: bool = false };
+        const PropertyCursor = struct { branch: usize = 0, index: ?[]const u8 = null, after: ?[]const u8 = null, key: ?[]const u8 = null, schema_version: ?u32 = null, primary: bool = false };
         fn propertyFallback(ptr: *anyopaque, a: A, table: []const u8, cursor: PropertyCursor, limit: usize) !b.Page(*const v.Node) {
             const page = try scan(ptr, a, table, cursor.key, limit);
             return .{ .items = page.items, .examined = page.examined, .next = if (page.next) |key| try std.json.Stringify.valueAlloc(a, PropertyCursor{ .key = key, .primary = true }, .{}) else null };
+        }
+        fn filterCompatible(column_type: anytype, value: v.Value) bool {
+            return switch (column_type) {
+                .string => value == .string,
+                .integer => value == .integer,
+                .number => value == .number or value == .integer,
+                .boolean => value == .boolean,
+                else => false,
+            };
         }
         fn scanWhere(ptr: *anyopaque, a: A, table: []const u8, filters: []const b.PropertyFilter, encoded: ?[]const u8, limit: usize) !b.Page(*const v.Node) {
             if (comptime !@hasDecl(DB, "openRelationalReadSession") or !@hasDecl(DB, "cypherDocumentScanOptions")) return scan(ptr, a, table, encoded, limit);
@@ -188,29 +197,72 @@ pub fn Adapter(comptime DB: type, comptime GraphIndex: type, comptime EdgeScanCu
             defer schema.release();
             const Query = @TypeOf(opts.relational_query.?);
             var conditions: std.ArrayList(Query.Condition) = .empty;
+            var alternatives: []const v.Value = &.{};
             for (filters) |filter| {
+                if (conditions.items.len >= 256) break;
                 var known = false;
                 for (opts.relational_query.?.fields) |field| if (std.mem.eql(u8, field, filter.property)) {
                     known = true;
                     break;
                 };
                 if (!known) continue;
-                // Only push types whose JSON projection preserves equality.
-                // In particular NUMERIC may round when exposed as a Cypher
-                // float; an exact decimal index would then exclude true rows.
-                const compatible = for (schema.tableSchema().relational_columns) |column| {
-                    if (!std.mem.eql(u8, column.name, filter.property)) continue;
-                    break switch (column.column_type) {
-                        .string => filter.value == .string,
-                        .integer => filter.value == .integer,
-                        .number => filter.value == .number or filter.value == .integer,
-                        .boolean => filter.value == .boolean,
-                        else => false,
-                    };
-                } else false;
-                if (!compatible) continue;
-                const value = try std.json.parseFromSliceLeaky(std.json.Value, temporary, try std.json.Stringify.valueAlloc(temporary, filter.value, .{}), .{ .parse_numbers = false });
-                if (conditions.items.len < 256) try conditions.append(temporary, .{ .column = filter.property, .op = .eq, .value = value });
+                const column_type = for (schema.tableSchema().relational_columns) |column| {
+                    if (std.mem.eql(u8, column.name, filter.property)) break column.column_type;
+                } else continue;
+                var operand = filter.value;
+                if (filter.op == .in) {
+                    // One union of equality seeks; other IN predicates remain
+                    // residuals. Never replace a sparse set by its broad hull.
+                    if (alternatives.len != 0 or operand != .list or operand.list.len > 256) continue;
+                    var unique: std.ArrayList(v.Value) = .empty;
+                    var distinct: @import("value_work.zig").Index = .{};
+                    var work = self.valueWork(temporary);
+                    var compatible = true;
+                    for (operand.list) |item| {
+                        if (item == .null) continue;
+                        if (!filterCompatible(column_type, item) or (column_type == .number and item == .integer and
+                            (item.integer < -9007199254740992 or item.integer > 9007199254740992)))
+                        {
+                            compatible = false;
+                            break;
+                        }
+                        const hash = (try work.info(item)).hash;
+                        var duplicate = false;
+                        var candidate = distinct.head(hash);
+                        while (candidate) |position| {
+                            const link = distinct.links.items[position];
+                            if (try work.eql(unique.items[link.index], item)) {
+                                duplicate = true;
+                                break;
+                            }
+                            candidate = link.next;
+                        }
+                        if (!duplicate) {
+                            try distinct.insert(temporary, hash, unique.items.len);
+                            try unique.append(temporary, item);
+                        }
+                    }
+                    if (!compatible) continue;
+                    if (unique.items.len == 0) return .{ .items = &.{} };
+                    alternatives = unique.items;
+                    if (cursor.branch >= alternatives.len) return error.CypherInvalidBackendCursor;
+                    operand = alternatives[cursor.branch];
+                }
+                // NUMERIC can round in the Cypher projection; its exact index
+                // bounds are unsafe. Unsupported/mixed operands stay residual.
+                if (!filterCompatible(column_type, operand)) continue;
+                // Open bounds cannot round a large integer to the neighboring
+                // double: that would exclude a true Cypher comparison.
+                if (column_type == .number and operand == .integer and filter.op != .eq and filter.op != .in and
+                    (operand.integer < -9007199254740992 or operand.integer > 9007199254740992)) continue;
+                const value = try std.json.parseFromSliceLeaky(std.json.Value, temporary, try std.json.Stringify.valueAlloc(temporary, operand, .{}), .{ .parse_numbers = false });
+                if (conditions.items.len < 256) try conditions.append(temporary, .{ .column = filter.property, .op = switch (filter.op) {
+                    .eq, .in => .eq,
+                    .lt => .lt,
+                    .lte => .lte,
+                    .gt => .gt,
+                    .gte => .gte,
+                }, .value = value });
             }
             if (conditions.items.len == 0) return propertyFallback(ptr, a, table, cursor, limit);
             opts.relational_query.?.conditions = conditions.items;
@@ -235,7 +287,10 @@ pub fn Adapter(comptime DB: type, comptime GraphIndex: type, comptime EdgeScanCu
             defer page.deinit();
             var nodes: std.ArrayList(*const v.Node) = .empty;
             for (page.rows) |row| if (try self.node(a, table, row.key, row.json)) |node_value| if (node_value.labels.len != 0) try nodes.append(a, node_value);
-            const next = if (page.more) try std.json.Stringify.valueAlloc(a, PropertyCursor{ .schema_version = session.reader.active.version(), .index = session.reader.index.?.name, .after = page.next_cursor orelse return error.CypherInvalidBackendCursor }, .{}) else null;
+            const next = if (page.more) try std.json.Stringify.valueAlloc(a, PropertyCursor{ .branch = cursor.branch, .schema_version = session.reader.active.version(), .index = session.reader.index.?.name, .after = page.next_cursor orelse return error.CypherInvalidBackendCursor }, .{}) else if (cursor.branch + 1 < alternatives.len)
+                try std.json.Stringify.valueAlloc(a, PropertyCursor{ .branch = cursor.branch + 1, .schema_version = session.reader.active.version(), .index = session.reader.index.?.name }, .{})
+            else
+                null;
             try checkpoint(ptr);
             return .{ .items = try nodes.toOwnedSlice(a), .next = next, .examined = page.records_examined };
         }

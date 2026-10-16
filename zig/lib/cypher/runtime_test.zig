@@ -845,3 +845,34 @@ test "nested owner RPC scans keep grouped pipeline memory independent of input s
         previous_physical = physical.peak;
     }
 }
+
+test "streamed traversal reductions preserve bags, scopes, ordering and limits" {
+    try check("MATCH (a:Document {id:'a'}) MATCH (a)-[:CITES]->(b) RETURN count(*),sum(b.rank)", "[[2,4]]");
+    try check("MATCH (a:Document {id:'a'}) MATCH (a)-[:CITES]->(b) WITH b.rank AS rank RETURN rank,count(*)", "[[2,2]]");
+    try check("MATCH p=(a:Document {id:'a'})-[:CITES*1..2]->(b) RETURN b.id,length(p) ORDER BY b.id,length(p) DESC LIMIT 3", "[[\"a\",2],[\"a\",2],[\"b\",1]]");
+    try check("MATCH (a:Document {id:'a'}) MATCH (a)-[:CITES]->(b) RETURN * LIMIT 1", "[[{\"$type\":\"node\",\"identity\":{\"table\":\"docs\",\"key\":\"a\"},\"labels\":[\"Document\"],\"properties\":{\"id\":\"a\",\"title\":\"Alpha\",\"rank\":1}},{\"$type\":\"node\",\"identity\":{\"table\":\"docs\",\"key\":\"b\"},\"labels\":[\"Document\"],\"properties\":{\"id\":\"b\",\"title\":\"Beta\",\"rank\":2}}]]");
+    try check("UNWIND [1,1] AS x MATCH (a:Document {id:'a'})-[:CITES]->(b) RETURN x,count(*)", "[[1,4]]");
+    try check("MATCH (a:Document {id:'c'})-[:CITES]->(b) RETURN count(*),sum(b.rank)", "[[0,0]]");
+}
+
+test "DAG count agrees with materialized selectors for directed and undirected cycles" {
+    for ([_][]const u8{ "shortestPath", "allShortestPaths" }) |selector| {
+        for ([_][]const u8{ "->", "-" }) |direction| {
+            const fast = try std.fmt.allocPrint(std.testing.allocator, "MATCH p={s}((a:Document {{id:'a'}})-[:CITES*1..4]{s}(b)) RETURN count(*)", .{ selector, direction });
+            defer std.testing.allocator.free(fast);
+            const slow = try std.fmt.allocPrint(std.testing.allocator, "MATCH p={s}((a:Document {{id:'a'}})-[:CITES*1..4]{s}(b)) WITH p RETURN count(*)", .{ selector, direction });
+            defer std.testing.allocator.free(slow);
+            var d: c.Diagnostic = .{};
+            var fast_compiled = try c.compile(std.testing.allocator, fast, .{}, &d);
+            defer fast_compiled.deinit();
+            var slow_compiled = try c.compile(std.testing.allocator, slow, .{}, &d);
+            defer slow_compiled.deinit();
+            var fixture: Fixture = .{};
+            var actual = try runtime.execute(std.testing.allocator, fixture.backend(), graph, &fast_compiled, &.{}, .{});
+            defer actual.deinit();
+            var expected = try runtime.execute(std.testing.allocator, fixture.backend(), graph, &slow_compiled, &.{}, .{});
+            defer expected.deinit();
+            try std.testing.expectEqual(expected.rows[0][0].integer, actual.rows[0][0].integer);
+        }
+    }
+}

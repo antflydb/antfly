@@ -276,3 +276,139 @@ def test_index_candidates_preserve_cypher_numeric_and_type_semantics(graph_db):
     assert db.cypher_json("g", {"query": "MATCH (n:D {score:2.0}) RETURN n.id"})["rows"] == [
         [{"type": "string", "value": "n2"}]
     ]
+
+
+def test_indexed_ranges_and_sparse_sets_keep_exact_cypher_residuals(graph_db):
+    db = graph_db
+    populate(db, 2000)
+    db.sql("CREATE INDEX docs_score ON docs(score)")
+    for predicate, anchors, expected in (
+        ("n.score>=1999", 1, [1999]),
+        ("1999<=n.score", 1, [1999]),
+        ("n.score>1998 AND n.score<2000", 1, [1999]),
+        ("1998<n.score<2000", 1, [1999]),
+        ("n.score IN [1999,1,1999,null]", 2, [1, 1999]),
+        ("n.score IN []", 0, []),
+        ("n.score IN [null]", 0, []),
+        ("n.score IN [1999,'incompatible']", 2000, [1999]),
+        ("n.score>=1999.0", 2000, [1999]),
+    ):
+        result = db.cypher_json(
+            "g",
+            {
+                "query": f"MATCH (n:D) WHERE {predicate} RETURN n.score ORDER BY n.score",
+                "limits": {"scanned_anchors": anchors},
+            },
+        )
+        assert [int(row[0]["value"]) for row in result["rows"]] == expected
+        assert result["stats"]["scanned_anchors"] == anchors
+    result = db.cypher_json(
+        "g",
+        {
+            "query": "MATCH (n:D) WHERE n.score>=100 AND n.score<1500 RETURN count(*)",
+            "limits": {"scanned_anchors": 1400, "memory_bytes": 2 << 20},
+        },
+    )
+    assert result["rows"] == [[{"type": "integer", "value": "1400"}]]
+    assert result["stats"]["scanned_anchors"] == 1400
+    with closing(db.sql_session()) as session:
+        session.execute("BEGIN")
+        session.execute("UPDATE docs SET score=5000 WHERE _id='n0'")
+        session.execute("UPDATE docs SET score=-1 WHERE _id='n1999'")
+        result = session.execute(
+            "SELECT g.id FROM GRAPH_TABLE(g MATCH (n IS D) WHERE n.score>=1999 COLUMNS(n.id AS id)) g"
+        )
+        assert result["rows"] == [["n0"]]
+        session.execute("ROLLBACK")
+
+
+def test_traversals_stream_demand_top_k_and_reductions(graph_db):
+    db = graph_db
+    count = 400
+    patterns = ["(a:D)"] + [f"(n{i}:D {{score:{i}}})" for i in range(count)]
+    patterns += [f"(a)-[:R]->(n{i})" for i in range(count)]
+    key = db.cypher_json("g", {"query": "CREATE " + ",".join(patterns) + " RETURN antfly.documentKey(a)"})["rows"][0][
+        0
+    ]["value"]
+    prefix = "MATCH (a:D) WHERE antfly.documentKey(a)=$key MATCH (a)-[:R]->(b) "
+    limited = db.cypher_json(
+        "g",
+        {
+            "query": prefix + "RETURN b.score LIMIT 1",
+            "parameters": {"key": key},
+            "limits": {"explored_edges": 1},
+        },
+    )
+    assert len(limited["rows"]) == 1
+    assert limited["stats"]["explored_edges"] == 1
+    for tail, expected in (
+        ("RETURN count(*),sum(b.score)", [["400", "79800"]]),
+        ("WITH b.score%2 AS parity RETURN parity,count(*) ORDER BY parity", [["0", "200"], ["1", "200"]]),
+        ("RETURN b.score ORDER BY b.score DESC LIMIT 3", [["399"], ["398"], ["397"]]),
+    ):
+        result = db.cypher_json(
+            "g",
+            {
+                "query": prefix + tail,
+                "parameters": {"key": key},
+                "limits": {"memory_bytes": 2 << 20, "explored_edges": count},
+            },
+        )
+        assert [[cell["value"] for cell in row] for row in result["rows"]] == expected
+
+
+def test_shortest_operator_uses_bound_comma_inputs_and_counts_the_dag(graph_db):
+    db = graph_db
+    layers = 16
+    patterns = ["(s:D)", "(z:D)"] + [f"(v{i}_{j}:D)" for i in range(layers) for j in range(2)]
+    patterns += [f"(s)-[:R]->(v0_{j})" for j in range(2)]
+    patterns += [f"(v{i}_{j})-[:R]->(v{i + 1}_{k})" for i in range(layers - 1) for j in range(2) for k in range(2)]
+    keys = [
+        cell["value"]
+        for cell in db.cypher_json(
+            "g",
+            {
+                "query": "CREATE "
+                + ",".join(patterns)
+                + f" RETURN antfly.documentKey(s),antfly.documentKey(z),antfly.documentKey(v{layers - 1}_0)"
+            },
+        )["rows"][0]
+    ]
+    edges = 2 + 4 * (layers - 1)
+    for target, expected in ((keys[1], 0), (keys[2], 1 << (layers - 1))):
+        result = db.cypher_json(
+            "g",
+            {
+                "query": "MATCH (s:D) WHERE antfly.documentKey(s)=$s MATCH (z:D) WHERE antfly.documentKey(z)=$z MATCH p=allShortestPaths((s)-[:R*1..32]->(z)) RETURN count(*)",
+                "parameters": {"s": keys[0], "z": target},
+                "limits": {"explored_edges": edges, "memory_bytes": 2 << 20, "intermediate_states": 2000},
+            },
+        )
+        assert result["rows"] == [[{"type": "integer", "value": str(expected)}]]
+    result = db.cypher_json(
+        "g",
+        {
+            "query": "MATCH (s:D),(z:D),p=shortestPath((s)-[:R*1..32]->(z)) WHERE antfly.documentKey(s)=$s AND antfly.documentKey(z)=$z RETURN count(*)",
+            "parameters": {"s": keys[0], "z": keys[1]},
+            "limits": {"explored_edges": edges, "memory_bytes": 2 << 20},
+        },
+    )
+    assert result["rows"] == [[{"type": "integer", "value": "0"}]]
+    assert result["stats"]["explored_edges"] == edges
+
+
+def test_range_seeks_do_not_round_integer_bounds_on_float_columns(graph_db):
+    db = graph_db
+    db.sql("CREATE TABLE doubles (n DOUBLE PRECISION)")
+    with db.open_table("doubles") as table:
+        table.batch_json({"inserts": {"one": {"n": 9007199254740992.0}}})
+    db.sql("CREATE INDEX doubles_n ON doubles(n)")
+    db.graph_catalog_json(
+        {
+            "action": "put",
+            "name": "float_graph",
+            "definition": {"labels": [{"name": "F", "table": "doubles"}], "relationships": []},
+        }
+    )
+    result = db.cypher_json("float_graph", {"query": "MATCH (n:F) WHERE n.n<9007199254740993 RETURN count(*)"})
+    assert result["rows"] == [[{"type": "integer", "value": "1"}]]

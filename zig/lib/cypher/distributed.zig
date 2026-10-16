@@ -40,7 +40,15 @@ pub const Target = struct {
         return false;
     }
 };
-pub const Snapshot = struct { backend: b.Backend, ptr: *anyopaque, validate: *const fn (*anyopaque) anyerror!void, close: *const fn (*anyopaque) void };
+pub const Snapshot = struct {
+    /// Set only when source.checkpoint already performs exactly this snapshot's
+    /// validation. Independent authority checks remain mandatory by default.
+    validation_covered_by_source: bool = false,
+    backend: b.Backend,
+    ptr: *anyopaque,
+    validate: *const fn (*anyopaque) anyerror!void,
+    close: *const fn (*anyopaque) void,
+};
 pub const Fence = struct { ptr: *anyopaque, validate: *const fn (*anyopaque) anyerror!void, fork: *const fn (*anyopaque, A) anyerror!Snapshot, release: *const fn (*anyopaque) void };
 pub const Source = struct {
     ptr: *anyopaque,
@@ -52,6 +60,7 @@ pub const ReadSet = struct {
     a: A,
     targets: []const Target,
     snapshots: []const Snapshot,
+    independent_validations: []const Snapshot,
     source: Source,
     graph: ?catalog.Graph = null,
     pub fn acquire(a: A, source: Source, targets: []const Target) !ReadSet {
@@ -119,7 +128,10 @@ pub const ReadSet = struct {
             out.ranges = ranges;
             copied += 1;
         }
-        return .{ .a = a, .source = source, .targets = owned, .snapshots = snapshots };
+        var validations: std.ArrayList(Snapshot) = .empty;
+        errdefer validations.deinit(a);
+        for (snapshots) |snapshot| if (!snapshot.validation_covered_by_source) try validations.append(a, snapshot);
+        return .{ .a = a, .source = source, .targets = owned, .snapshots = snapshots, .independent_validations = try validations.toOwnedSlice(a) };
     }
     fn freeTarget(a: A, target: Target) void {
         a.free(target.table);
@@ -134,6 +146,7 @@ pub const ReadSet = struct {
         for (self.targets) |target| freeTarget(self.a, target);
         self.a.free(self.targets);
         self.a.free(self.snapshots);
+        self.a.free(self.independent_validations);
         self.* = undefined;
     }
     pub fn backend(self: *ReadSet) b.Backend {
@@ -148,7 +161,7 @@ pub const ReadSet = struct {
     fn checkpoint(ptr: *anyopaque) !void {
         const self = cast(ptr);
         try self.source.checkpoint(self.source.ptr);
-        for (self.snapshots) |snapshot| try snapshot.validate(snapshot.ptr);
+        for (self.independent_validations) |snapshot| try snapshot.validate(snapshot.ptr);
     }
     fn bind(ptr: *anyopaque, a: A, graph: catalog.Graph) !void {
         const self = cast(ptr);
@@ -309,6 +322,8 @@ test "distributed graph captures the whole cohort and pages immutable owners" {
         closed: usize = 0,
         busy_once: bool = true,
         revoked: bool = false,
+        validations: usize = 0,
+        covered: bool = false,
         owners: [2]Owner = undefined,
         const Owner = struct {
             fixture: *Self,
@@ -320,6 +335,8 @@ test "distributed graph captures the whole cohort and pages immutable owners" {
                 if (self.fixture.revoked) return error.Forbidden;
             }
             fn validate(ptr: *anyopaque) !void {
+                const self: *@This() = @ptrCast(@alignCast(ptr));
+                self.fixture.validations += 1;
                 try Owner.checkpoint(ptr);
             }
             fn release(ptr: *anyopaque) void {
@@ -330,7 +347,7 @@ test "distributed graph captures the whole cohort and pages immutable owners" {
                 const self: *@This() = @ptrCast(@alignCast(ptr));
                 try std.testing.expectEqual(@as(usize, 2), self.fixture.held);
                 self.fixture.forks += 1;
-                return .{ .ptr = self, .validate = validate, .close = close, .backend = .{ .ptr = self, .vtable = &.{ .bind = bind, .checkpoint = Owner.checkpoint, .scan = scan, .get = get, .expand = expand, .search = search } } };
+                return .{ .ptr = self, .validate = validate, .close = close, .validation_covered_by_source = self.fixture.covered, .backend = .{ .ptr = self, .vtable = &.{ .bind = bind, .checkpoint = Owner.checkpoint, .scan = scan, .get = get, .expand = expand, .search = search } } };
             }
             fn close(ptr: *anyopaque) void {
                 const self: *@This() = @ptrCast(@alignCast(ptr));
@@ -416,6 +433,21 @@ test "distributed graph captures the whole cohort and pages immutable owners" {
     try std.testing.expectEqual(@as(f64, 2), seeds.seeds[0].score);
     try std.testing.expect(seeds.approximate);
     try std.testing.expectError(error.CypherInvalidSearchLimit, backend.vtable.search.?(backend.ptr, arena.allocator(), "docs", .{ .parameters = .{ .map = &.{.{ .name = "limit", .value = .{ .integer = 1025 } }} } }));
+    const independent_before = fixture.validations;
+    try backend.vtable.checkpoint(backend.ptr);
+    try std.testing.expectEqual(independent_before + 2, fixture.validations);
+    // Coverage is fixed when acquiring the immutable cohort. No owner loop
+    // remains on the runtime path when all checks belong to the statement.
+    var covered_fixture: Fixture = .{ .covered = true };
+    for (&covered_fixture.owners, 0..) |*owner, index| owner.* = .{ .fixture = &covered_fixture, .index = index, .node = fixture.owners[index].node };
+    var covered_set = try ReadSet.acquire(std.testing.allocator, .{ .ptr = &covered_fixture, .checkpoint = Fixture.checkpoint, .admit = Fixture.admit, .capture = Fixture.capture }, set.targets);
+    defer covered_set.deinit();
+    try std.testing.expectEqual(@as(usize, 0), covered_set.independent_validations.len);
+    const covered_before = covered_fixture.validations;
+    for (0..1000) |_| try covered_set.backend().vtable.checkpoint(&covered_set);
+    try std.testing.expectEqual(covered_before, covered_fixture.validations);
+    covered_fixture.revoked = true;
+    try std.testing.expectError(error.Forbidden, covered_set.backend().vtable.checkpoint(&covered_set));
     fixture.revoked = true;
     try std.testing.expectError(error.Forbidden, set.backend().vtable.checkpoint(&set));
 }

@@ -146,7 +146,7 @@ pub const Statement = struct {
             const snapshot = try a.create(Owner);
             snapshot.* = .{ .a = a, .statement = statement, .read = read, .client = undefined };
             snapshot.client = .{ .channel = .{ .ptr = snapshot, .call = Owner.call }, .incarnation = statement.graph.incarnation, .revision = statement.graph.revision, .allowed_versions = statement.versions };
-            return .{ .backend = snapshot.client.backend(), .ptr = snapshot, .validate = Owner.validate, .close = Owner.close };
+            return .{ .backend = snapshot.client.backend(), .ptr = snapshot, .validate = Owner.validate, .close = Owner.close, .validation_covered_by_source = true };
         }
     };
     const Owner = struct {

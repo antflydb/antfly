@@ -87,6 +87,7 @@ def test_authenticated_cypher_property_plans_and_sql_overlays(monkeypatch):
 
         call("/sql", {"statement": f"CREATE TABLE {table} (id TEXT, score BIGINT)"})
         call("/sql", {"statement": f"CREATE INDEX {table}_id ON {table}(id)"})
+        call("/sql", {"statement": f"CREATE INDEX {table}_score ON {table}(score)"})
         call(
             f"/tables/{table}/batch",
             {
@@ -119,6 +120,21 @@ def test_authenticated_cypher_property_plans_and_sql_overlays(monkeypatch):
             ["1", "1000"],
         ], result
         first_memory = result["stats"]["memory_bytes"]
+        for predicate, anchors, values in (
+            ("n.score>=1999", 1, ["1999"]),
+            ("n.score IN [1999,1,1999,null]", 2, ["1", "1999"]),
+        ):
+            indexed = call(
+                f"/graphs/{graph}/query",
+                {
+                    "query": f"MATCH (n:D) WHERE {predicate} RETURN n.score ORDER BY n.score",
+                    "limits": {"scanned_anchors": anchors},
+                },
+                wait_for_index=True,
+            )
+            assert [row[0]["value"] for row in indexed["rows"]] == values, indexed
+            assert indexed["stats"]["scanned_anchors"] == anchors, indexed
+
         call(
             f"/tables/{table}/batch",
             {
