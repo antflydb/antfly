@@ -104,6 +104,20 @@ multiplicity and all-shortest ties. UNION deduplication compares bound column na
 wildcard binding order. Core and native regression cases cover these boundaries,
 including SQL GRAPH_TABLE scalar types and durable mutation postimages.
 
+MATCH equality joins use the same bounded lookup planner for fused reductions
+and materialized consumers such as UNWIND and collect. Materialized consumers
+retain matching rows rather than Cartesian candidate states. Streaming DISTINCT
+aggregates retain per-group unique arguments with Cypher value equality and SQL
+NULL exclusion; min/max remain constant-state reducers because duplicates cannot
+change their result.
+SQL GRAPH_TABLE pushes row-local predicates through inner/cross joins and the
+preserved side of outer joins using bound column identity. Derived queries,
+nullable join inputs, and observable graph source ordinals retain their semantic
+boundaries. Bound duplicate predicates are removed without cross-domain coercion.
+Pushdown quotas leave remaining predicates in SQL residual evaluation;
+they do not reject otherwise valid statements. A NULL operand in an ordinary SQL
+comparison proves the graph scan empty before its producer is opened.
+
 Native Cypher CREATE defaults, generated-column SET through aliases, and REMOVE
 SQL NULL postimages are qualified against durable SQL rows. Cypher entity properties
 omit SQL NULL and document JSON null fields; `keys(n)` and `properties(n)` do

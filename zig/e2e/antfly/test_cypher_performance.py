@@ -138,6 +138,18 @@ def test_authenticated_cypher_property_plans_and_sql_overlays(monkeypatch):
         )
         assert joined["rows"] == [[{"type": "integer", "value": "150"}]], joined
         assert joined["stats"]["scanned_anchors"] <= 400, joined
+        joined_unwind = call(
+            f"/graphs/{graph}/query",
+            {
+                "query": "MATCH (a:D),(b:D) WHERE a.score<150 AND a.score=b.score UNWIND [1] AS x RETURN count(*)",
+                "limits": {"scanned_anchors": 400, "memory_bytes": 8 << 20},
+            },
+            wait_for_index=True,
+        )
+        assert joined_unwind["rows"] == [[{"type": "integer", "value": "150"}]], (
+            joined_unwind
+        )
+        assert joined_unwind["stats"]["scanned_anchors"] <= 400, joined_unwind
         for predicate, anchors, values in (
             ("n.score>=1999", 1, ["1999"]),
             ("n.score IN [1999,1,1999,null]", 2, ["1", "1999"]),
@@ -174,6 +186,17 @@ def test_authenticated_cypher_property_plans_and_sql_overlays(monkeypatch):
             ["1", "5000"],
         ], result
         assert result["stats"]["memory_bytes"] <= first_memory + (1 << 20), result
+        distinct_aggregate = call(
+            f"/graphs/{graph}/query",
+            {
+                "query": "MATCH (n:D) RETURN count(DISTINCT n.score%2),sum(DISTINCT n.score%2)",
+                "limits": {"memory_bytes": 8 << 20},
+            },
+        )
+        assert [cell["value"] for cell in distinct_aggregate["rows"][0]] == [
+            "2",
+            "1",
+        ], distinct_aggregate
         # Column requirements must survive the coordinator/owner RPC boundary.
         wide = table + "_wide"
         call("/sql", {"statement": f"CREATE TABLE {wide} (score BIGINT,payload TEXT)"})

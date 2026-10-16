@@ -1066,3 +1066,14 @@ test "oversized unindexed join cache declines without failing the query" {
     try std.testing.expectEqual(@as(i64, 3), result.rows[0][0].integer);
     try std.testing.expect(result.stats.scanned_anchors > 9);
 }
+
+test "streaming distinct aggregates preserve nulls numeric equality groups and min max lifetime" {
+    try check("MATCH (n:Document) RETURN count(DISTINCT n.rank%2),sum(DISTINCT n.rank%2),avg(DISTINCT n.rank%2),min(DISTINCT n.rank%2),max(DISTINCT n.rank%2)", "[[2,1,0.5,0,1]]");
+    try check("MATCH (n:Document) RETURN count(DISTINCT n.rank),count(DISTINCT n.rank%2),sum(DISTINCT n.rank)", "[[3,2,6]]");
+    try check("MATCH (n:Document) RETURN count(DISTINCT n.missing),sum(DISTINCT n.missing),avg(DISTINCT n.missing)", "[[0,0,null]]");
+    try check("MATCH (n:Document) WHERE n.rank<0 RETURN count(DISTINCT n.rank)", "[[0]]");
+    try check("MATCH (n:Document) RETURN n.rank%2 AS bucket,count(DISTINCT n.rank%2) ORDER BY bucket", "[[0,1],[1,1]]");
+    // Duplicate integer/float keys and nested structures share GROUP BY equality.
+    try check("UNWIND [1,1.0,2,null,[1],[1.0],{x:1},{x:1.0}] AS x MATCH (n:Document) RETURN count(DISTINCT x)", "[[4]]");
+    try check("MATCH (n:Document) WITH n.rank%2 AS x RETURN min(DISTINCT toString(x)),max(DISTINCT toString(x))", "[[\"0\",\"1\"]]");
+}

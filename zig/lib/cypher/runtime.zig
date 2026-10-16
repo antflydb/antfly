@@ -409,6 +409,9 @@ const Engine = struct {
     const StreamingAggregate = struct {
         function: ast.Function,
         arena: std.heap.ArenaAllocator,
+        distinct_arena: std.heap.ArenaAllocator,
+        distinct_values: std.ArrayList(v.Value) = .empty,
+        distinct_index: value_work.Index = .{},
         count: u64 = 0,
         sum: v.Value = .{ .integer = 0 },
         mean: f64 = 0,
@@ -416,6 +419,22 @@ const Engine = struct {
         fn add(self: *StreamingAggregate, engine: *Engine, row: Row) !void {
             const value = if (self.function.star) v.Value{ .integer = 1 } else try engine.eval(self.function.args[0], row, null);
             if (value == .null) return;
+            // MIN/MAX are duplicate insensitive and need no distinct set.
+            // Other DISTINCT reducers retain only unique arguments, using the
+            // same equality and hashing as GROUP BY.
+            if (self.function.distinct and !std.ascii.eqlIgnoreCase(self.function.name, "min") and !std.ascii.eqlIgnoreCase(self.function.name, "max")) {
+                const hash = (try engine.values.info(value)).hash;
+                var candidate = self.distinct_index.head(hash);
+                while (candidate) |position| {
+                    const link = self.distinct_index.links.items[position];
+                    if (try engine.values.eql(self.distinct_values.items[link.index], value)) return;
+                    candidate = link.next;
+                }
+                const retained = self.distinct_arena.allocator();
+                const owned = try value.clone(retained);
+                try self.distinct_index.insert(retained, hash, self.distinct_values.items.len);
+                try self.distinct_values.append(retained, owned);
+            }
             self.count += 1;
             if (std.ascii.eqlIgnoreCase(self.function.name, "count")) return;
             if (std.ascii.eqlIgnoreCase(self.function.name, "sum")) {
@@ -450,7 +469,7 @@ const Engine = struct {
     fn collectStreamingAggregates(self: *Engine, expression: *const ast.Expr, calls: *std.ArrayList(*const ast.Expr)) !bool {
         if (expression.value == .call and aggregateName(expression.value.call.name)) {
             const call_value = expression.value.call;
-            if (call_value.distinct or std.ascii.eqlIgnoreCase(call_value.name, "collect")) return false;
+            if (std.ascii.eqlIgnoreCase(call_value.name, "collect")) return false;
             for (call_value.args) |arg| if (aggregates(arg)) return false;
             if (call_value.args.len != (if (call_value.star) @as(usize, 0) else 1)) return error.CypherFunctionArity;
             for (calls.items) |prior| if (prior == expression) return true;
@@ -483,7 +502,7 @@ const Engine = struct {
     const StreamGroup = struct { key: []const v.Value, source: Row, states: []StreamingAggregate };
     fn newStreamGroup(self: *Engine, a: A, key: []const v.Value, source: Row, calls: []const *const ast.Expr) !StreamGroup {
         const states = try a.alloc(StreamingAggregate, calls.len);
-        for (states, calls) |*state_value, call_value| state_value.* = .{ .function = call_value.value.call, .arena = std.heap.ArenaAllocator.init(self.scratch_allocator) };
+        for (states, calls) |*state_value, call_value| state_value.* = .{ .function = call_value.value.call, .arena = std.heap.ArenaAllocator.init(self.scratch_allocator), .distinct_arena = std.heap.ArenaAllocator.init(self.scratch_allocator) };
         const copied = try (v.Value{ .list = key }).clone(a);
         return .{ .key = copied.list, .source = (try (v.Value{ .map = source }).clone(a)).map, .states = states };
     }
@@ -645,7 +664,7 @@ const Engine = struct {
         }
         const count_shortest = selected_path and grouped and middle.len == 0 and operation.predicate == null and blk: {
             for (projection.items) |item| if (!aggregates(item.expression)) break :blk false;
-            for (calls.items) |expression| if (!expression.value.call.star or !std.ascii.eqlIgnoreCase(expression.value.call.name, "count")) break :blk false;
+            for (calls.items) |expression| if (expression.value.call.distinct or !expression.value.call.star or !std.ascii.eqlIgnoreCase(expression.value.call.name, "count")) break :blk false;
             break :blk true;
         };
         var shape: std.ArrayList(v.Entry) = .empty;
@@ -671,7 +690,10 @@ const Engine = struct {
         const retained = self.a;
         var groups: std.ArrayList(StreamGroup) = .empty;
         var group_index: value_work.Index = .{};
-        defer for (groups.items) |group| for (group.states) |*state_value| state_value.arena.deinit();
+        defer for (groups.items) |group| for (group.states) |*state_value| {
+            state_value.arena.deinit();
+            state_value.distinct_arena.deinit();
+        };
         var has_keys = false;
         for (projection.items) |item| has_keys = has_keys or !aggregates(item.expression);
         if (grouped and !has_keys) try groups.append(retained, try self.newStreamGroup(retained, &.{}, &.{}, calls.items));
@@ -1130,6 +1152,16 @@ const Engine = struct {
         return try output.toOwnedSlice(self.a);
     }
     fn match(self: *Engine, rows: []const Row, operation: ast.Match) anyerror![]const Row {
+        // Reuse the route producer with a row collector when downstream
+        // operators require materialization. Join planning and early predicate
+        // evaluation must not depend on projection/aggregate fusion.
+        if (!operation.optional and operation.paths.len > 1) {
+            const previous_columns = self.columns;
+            const stage_count = self.stages.items.len;
+            defer self.columns = previous_columns;
+            defer self.stages.shrinkRetainingCapacity(stage_count);
+            if (try self.streamMatchProjection(rows, operation, .{ .items = &.{}, .wildcard = true }, &.{}, .{}, .{})) |matched| return matched;
+        }
         const previous_fold = self.stream_fold;
         const previous_count = self.shortest_count;
         self.stream_fold = null;

@@ -644,6 +644,20 @@ def test_pattern_equality_joins_use_indexes_or_bounded_hash_lookups(graph_db):
         )
         assert result["rows"] == [[{"type": "integer", "value": "153"}]]
         assert result["stats"]["scanned_anchors"] <= 500
+        # Join execution is independent of downstream fusion eligibility.
+        for tail in (
+            "UNWIND [1] AS x RETURN count(*)",
+            "WITH collect(a.score) AS scores RETURN size(scores)",
+        ):
+            materialized = db.cypher_json(
+                "g",
+                {
+                    "query": "MATCH (a:D),(b:D) WHERE a.score=b.score " + tail,
+                    "limits": {"scanned_anchors": 500, "memory_bytes": 4 << 20},
+                },
+            )
+            assert materialized["rows"] == [[{"type": "integer", "value": "153"}]]
+            assert materialized["stats"]["scanned_anchors"] <= 500
         projected = db.cypher_json(
             "g",
             {
@@ -660,6 +674,9 @@ def test_distinct_streams_unique_keys_and_propagates_limit_demand(graph_db):
     db = graph_db
     populate(db, 2000)
     for query, expected in (
+        ("MATCH (n:D) RETURN count(DISTINCT n.score%2)", [["2"]]),
+        ("MATCH (n:D) RETURN min(DISTINCT n.score),max(DISTINCT n.score)", [["0", "1999"]]),
+        ("MATCH (n:D) RETURN sum(DISTINCT n.score%2),avg(DISTINCT n.score%2)", [["1", 0.5]]),
         ("MATCH (n:D) RETURN DISTINCT n.score%2 AS bucket ORDER BY bucket", [["0"], ["1"]]),
         ("MATCH (n:D) WITH DISTINCT n.score%2 AS bucket RETURN count(*)", [["2"]]),
         ("MATCH (n:D) WITH DISTINCT n.score%2 AS bucket RETURN bucket ORDER BY bucket", [["0"], ["1"]]),
@@ -714,3 +731,80 @@ def test_sql_graph_table_prunes_columns_pushes_filters_and_pulls_rows(graph_db):
         )["rows"]
         == []
     )
+
+
+def test_sql_graph_predicates_cross_safe_joins_and_short_circuit_null(graph_db):
+    db = graph_db
+    db.sql("CREATE TABLE wide (score BIGINT,payload TEXT)")
+    payload = "x" * 32768
+    for start in range(0, 1000, 50):
+        db.sql(
+            "INSERT INTO wide (_id,score,payload) VALUES "
+            + ",".join(f"('n{i}',{i},'{payload}')" for i in range(start, start + 50))
+        )
+    db.sql("CREATE INDEX wide_score ON wide(score)")
+    db.graph_catalog_json(
+        {
+            "action": "put",
+            "name": "wide",
+            "definition": {"labels": [{"name": "W", "table": "wide"}], "relationships": []},
+        }
+    )
+    graph = "GRAPH_TABLE(wide MATCH (n IS W) COLUMNS(n.score AS score,n.payload AS payload)) g"
+    for source in (
+        f"{graph} CROSS JOIN (SELECT 1 AS x) v",
+        f"(SELECT 1 AS x) v CROSS JOIN {graph}",
+        f"{graph} JOIN (SELECT 1 AS x) v ON TRUE",
+        f"{graph} LEFT JOIN (SELECT 1 AS x) v ON FALSE",
+        f"(SELECT 1 AS x) v RIGHT JOIN {graph} ON FALSE",
+    ):
+        assert db.sql(f"SELECT g.payload FROM {source} WHERE g.score=$1", [999])["rows"] == [[payload]]
+        # Exercise the binding-time path through an inner query as well.
+        assert db.sql(f"SELECT x.payload FROM (SELECT g.payload FROM {source} WHERE g.score=$1) x", [999])["rows"] == [
+            [payload]
+        ]
+    for op in ("=", "<>", "<", "<=", ">", ">="):
+        assert db.sql(f"SELECT g.payload FROM {graph} WHERE g.score{op}$1", [None])["rows"] == []
+    # Mutation captures use the same predicate routing before their read cut.
+    db.sql("CREATE TABLE picked (score BIGINT,payload TEXT)")
+    db.sql(
+        f"INSERT INTO picked (score,payload) SELECT g.score,g.payload FROM {graph} CROSS JOIN (SELECT 1 AS x) v WHERE g.score=999"
+    )
+    assert db.sql("SELECT score FROM picked")["rows"] == [["999"]]
+    # Repeated executions must not contaminate subsequent parameter bindings.
+    assert db.sql(f"SELECT g.payload FROM {graph} WHERE g.score=$1", [999])["rows"] == [[payload]]
+
+
+def test_sql_graph_pushdown_quota_preserves_residual_predicates(graph_db):
+    db = graph_db
+    populate(db, 2000)
+
+    def balanced(terms):
+        if len(terms) == 1:
+            return terms[0]
+        middle = len(terms) // 2
+        return f"({balanced(terms[:middle])} AND {balanced(terms[middle:])})"
+
+    graph = "GRAPH_TABLE(g MATCH (n IS D) COLUMNS(n.score AS score)) g"
+    for last, count in (("g.score>=0", "2000"), ("g.score<0", "0")):
+        predicate = balanced(["g.score>=0"] * 256 + [last])
+        assert db.sql(f"SELECT count(*) FROM {graph} WHERE {predicate}")["rows"] == [[count]]
+
+
+def test_sql_graph_pushdown_preserves_null_extension_and_query_barriers(graph_db):
+    db = graph_db
+    populate(db, 3)
+    graph = "GRAPH_TABLE(g MATCH (n IS D) COLUMNS(n.score AS score)) g"
+    # Pushing the WHERE into the nullable side can manufacture unmatched rows.
+    assert db.sql(
+        f"SELECT count(*) FROM (SELECT 1 AS x) v LEFT JOIN {graph} ON TRUE WHERE g.score=999 OR g.score IS NULL"
+    )["rows"] == [["0"]]
+    assert db.sql(
+        f"SELECT count(*) FROM {graph} RIGHT JOIN (SELECT 1 AS x) v ON TRUE WHERE g.score=999 OR g.score IS NULL"
+    )["rows"] == [["0"]]
+    assert db.sql(
+        f"SELECT count(*) FROM {graph} FULL JOIN (SELECT 1 AS x) v ON TRUE WHERE g.score=999 OR g.score IS NULL"
+    )["rows"] == [["0"]]
+    assert db.sql(
+        f"SELECT count(*) FROM (SELECT g.score FROM {graph} LIMIT 1) q CROSS JOIN (SELECT 1 AS x) v WHERE q.score=2"
+    )["rows"] == [["0"]]

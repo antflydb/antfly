@@ -28,7 +28,7 @@ pub fn bindSearchScans(a: Allocator, input_scans: []const catalog.StatementScan,
             if (scan.request.graph_conditions.len != 0) {
                 var conditions: std.ArrayList(catalog.Condition) = .empty;
                 try conditions.appendSlice(a, scan.request.conditions);
-                for (scan.request.graph_conditions) |condition| {
+                condition_loop: for (scan.request.graph_conditions) |condition| {
                     const operand = condition.operand.evaluateInstruction(a, condition.operand.root, parameters) catch |err| {
                         // Speculation is not an evaluation demand: a residual
                         // may short-circuit or see no rows. Defer data errors
@@ -36,6 +36,12 @@ pub fn bindSearchScans(a: Allocator, input_scans: []const catalog.StatementScan,
                         if (err == error.SqlProgramLimitExceeded or std.mem.startsWith(u8, @import("errors.zig").describe(err).code, "22")) continue;
                         return err;
                     };
+                    // Binding may discover duplicates across separate SQL
+                    // conjuncts or inner/outer pushdown passes. Do not inflate
+                    // graph expression depth and execution work with them.
+                    for (conditions.items) |existing| {
+                        if (existing.op == condition.op and std.mem.eql(u8, existing.column, condition.column) and sameGraphOperand(existing.datum(), operand)) continue :condition_loop;
+                    }
                     try conditions.append(a, .{ .column = condition.column, .op = condition.op, .value = operand.value, .operand = operand });
                 }
                 scan.request.conditions = try conditions.toOwnedSlice(a);
@@ -61,21 +67,43 @@ pub fn bindSearchScans(a: Allocator, input_scans: []const catalog.StatementScan,
     } else input_scans;
 }
 
+// Deduplication is deliberately representation preserving: cross-domain SQL
+// promotions can be non-transitive. Exact NUMERIC/array payloads and structured
+// JSON stay in residual evaluation rather than acquiring an approximate key.
+fn sameGraphOperand(left: scalar.Datum, right: scalar.Datum) bool {
+    if (left.sql_null or right.sql_null) return left.sql_null and right.sql_null;
+    if (left.numeric != null or right.numeric != null or left.array != null or right.array != null or left.patterns != null or right.patterns != null) return false;
+    if (std.meta.activeTag(left.value) != std.meta.activeTag(right.value)) return false;
+    return switch (left.value) {
+        .integer => |value| value == right.value.integer,
+        .bool => |value| value == right.value.bool,
+        .float => |value| @as(u64, @bitCast(value)) == @as(u64, @bitCast(right.value.float)),
+        .string => |value| std.mem.eql(u8, value, right.value.string),
+        .number_string => |value| std.mem.eql(u8, value, right.value.number_string),
+        else => false,
+    };
+}
+
+test "graph condition deduplication preserves exact operand domains and NULL semantics" {
+    try std.testing.expect(sameGraphOperand(scalar.Datum.fromJson(.{ .integer = 1 }), scalar.Datum.fromJson(.{ .integer = 1 })));
+    try std.testing.expect(!sameGraphOperand(scalar.Datum.fromJson(.{ .integer = 1 }), scalar.Datum.fromJson(.{ .float = 1 })));
+    try std.testing.expect(!sameGraphOperand(scalar.Datum.fromJson(.{ .float = 0.0 }), scalar.Datum.fromJson(.{ .float = -0.0 })));
+    try std.testing.expect(sameGraphOperand(scalar.Datum.fromJson(.null), scalar.Datum.fromJson(.null)));
+    try std.testing.expect(!sameGraphOperand(scalar.Datum.fromJson(.null), scalar.Datum.json(.null)));
+    try std.testing.expect(!sameGraphOperand(scalar.Datum.fromJson(.{ .string = "1" }), scalar.Datum.fromJson(.{ .number_string = "1" })));
+}
+
 /// The enclosing SELECT owns a predicate outside the relation's source tree.
 /// Attach that predicate at the same execution-local boundary as inner WHEREs.
 /// Mutation captures use this helper before their shared read cut is opened.
 pub fn outerGraphScans(a: Allocator, relation: *const binding.Bound, predicate: ?scalar.Program) ![]const catalog.StatementScan {
     const program = predicate orelse return relation.scans;
-    if (relation.root.operation != .scan) return relation.scans;
-    const index = relation.root.operation.scan.index;
-    const source = relation.scans[index];
-    if (source.table.graph == null or source.request.graph_source_ordinals) return relation.scans;
-    var conditions: std.ArrayList(catalog.Scan.GraphCondition) = .empty;
-    try conditions.appendSlice(a, source.request.graph_conditions);
-    try binding.graphScanConditions(a, relation.root, program, program.root, &conditions, 0);
-    if (conditions.items.len == source.request.graph_conditions.len) return relation.scans;
+    const has_graph = for (relation.scans) |scan| {
+        if (scan.table.graph != null and !scan.request.graph_source_ordinals) break true;
+    } else false;
+    if (!has_graph) return relation.scans;
     const scans = try a.dupe(catalog.StatementScan, relation.scans);
-    scans[index].request.graph_conditions = try conditions.toOwnedSlice(a);
+    try binding.attachGraphConditions(a, relation.root, program, scans);
     return scans;
 }
 

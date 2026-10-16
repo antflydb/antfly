@@ -237,6 +237,7 @@ pub const Cursor = struct {
     position: usize = 0,
     resume_position: usize = 0,
     optimized: bool = true,
+    empty: bool = false,
     pub fn open(a: A, binding: Binding, backend: cypher.backend.Backend, parameters: []const cypher.value.Entry, request: catalog.Scan, limits: cypher.runtime.Limits) !catalog.Cursor {
         const self = try a.create(Cursor);
         errdefer a.destroy(self);
@@ -255,18 +256,23 @@ pub const Cursor = struct {
         if (optimized) query_request.after = null;
         var compiled: cypher.compiler.Compiled = .{ .arena = std.heap.ArenaAllocator.init(a), .query = try scanQuery(owned, binding, query_request), .parameters = binding.definition.parameters };
         defer compiled.deinit();
-        const stream = try cypher.runtime.NodeCursor.open(a, backend, binding.graph, compiled.query, parameters, limits);
+        // Every ordinary comparison with SQL NULL is UNKNOWN. A conjunction
+        // containing one can emit no rows, even across graph semantic barriers.
+        const empty = for (conditions) |condition| {
+            if (condition.op != .is_null and condition.op != .is_not_null and condition.datum().sql_null) break true;
+        } else false;
+        const stream = if (empty) null else try cypher.runtime.NodeCursor.open(a, backend, binding.graph, compiled.query, parameters, limits);
         errdefer if (stream) |cursor| cursor.close();
-        var result: ?cypher.runtime.Result = if (stream == null) try cypher.runtime.execute(a, backend, binding.graph, &compiled, parameters, limits) else null;
+        var result: ?cypher.runtime.Result = if (!empty and stream == null) try cypher.runtime.execute(a, backend, binding.graph, &compiled, parameters, limits) else null;
         errdefer if (result) |*value| value.deinit();
         var copied = request;
         copied.fields = fields;
         copied.conditions = conditions;
         copied.after = null;
         copied.primary_key = if (request.primary_key) |key| try owned.dupe(u8, key) else null;
-        if (result != null and resume_position > result.?.rows.len) return error.InvalidSqlBackendResponse;
-        self.* = .{ .a = a, .arena = arena, .result = result, .stream = stream, .request = copied, .position = if (stream != null) 0 else resume_position, .resume_position = resume_position, .optimized = optimized };
-        return .{ .ptr = self, .next = next, .close = close, .estimated_rows = if (result) |value| value.rows.len else null };
+        if ((empty and resume_position != 0) or (result != null and resume_position > result.?.rows.len)) return error.InvalidSqlBackendResponse;
+        self.* = .{ .a = a, .arena = arena, .result = result, .stream = stream, .request = copied, .position = if (stream != null) 0 else resume_position, .resume_position = resume_position, .optimized = optimized, .empty = empty };
+        return .{ .ptr = self, .next = next, .close = close, .estimated_rows = if (empty) 0 else if (result) |value| value.rows.len else null };
     }
     fn next(ptr: *anyopaque, a: A, limit: u32) !catalog.Page {
         const self: *Cursor = @ptrCast(@alignCast(ptr));
@@ -280,7 +286,7 @@ pub const Cursor = struct {
         const names = try owned.alloc([]const u8, self.request.fields.len);
         for (self.request.fields, names) |name, *out| out.* = try owned.dupe(u8, name);
         const layout = try catalog.Row.TypedLayout.init(owned, names);
-        while (output.items.len < page_limit) {
+        while (!self.empty and output.items.len < page_limit) {
             var scratch = std.heap.ArenaAllocator.init(cypher.backend.reclaimingAllocator(a));
             defer scratch.deinit();
             const temporary = scratch.allocator();
@@ -343,7 +349,7 @@ pub const Cursor = struct {
                 try output.append(owned, try catalog.Row.fromDatums(owned, try owned.dupe(u8, row_id), layout, cells));
             }
         }
-        const more = if (self.stream) |stream| !stream.done else self.position < self.result.?.rows.len;
+        const more = if (self.empty) false else if (self.stream) |stream| !stream.done else self.position < self.result.?.rows.len;
         return .{ .rows = try output.toOwnedSlice(owned), .owned_arena = arena, .after = if (more) try std.fmt.allocPrint(owned, "{s}{d}", .{ if (self.optimized) "g:" else "", self.position }) else null };
     }
 
@@ -361,7 +367,9 @@ test "SQL GRAPH_TABLE derives columns and exposes typed rows from shared graph I
         const node: cypher.value.Node = .{ .identity = .{ .table = "docs", .key = "a" }, .labels = &.{"Document"}, .properties = &.{ .{ .name = "id", .value = .{ .string = "a" } }, .{ .name = "large", .value = .{ .integer = std.math.maxInt(i64) } } } };
         fn bind(_: *anyopaque, _: A, _: cypher.catalog.Graph) !void {}
         fn checkpoint(_: *anyopaque) !void {}
-        fn scan(_: *anyopaque, a: A, _: []const u8, after: ?[]const u8, _: usize) !cypher.backend.Page(*const cypher.value.Node) {
+        fn scan(ptr: *anyopaque, a: A, _: []const u8, after: ?[]const u8, _: usize) !cypher.backend.Page(*const cypher.value.Node) {
+            const scanned: *u8 = @ptrCast(@alignCast(ptr));
+            scanned.* += 1;
             return .{ .items = if (after == null) try a.dupe(*const cypher.value.Node, &.{&node}) else &.{} };
         }
         fn get(_: *anyopaque, _: A, _: cypher.value.Identity) !?*const cypher.value.Node {
@@ -394,6 +402,17 @@ test "SQL GRAPH_TABLE derives columns and exposes typed rows from shared graph I
     try std.testing.expectEqualStrings("node", entity.object.get("type").?.string);
     const large = entity.object.get("value").?.object.get("properties").?.object.get("value").?.object.get("large").?;
     try std.testing.expectEqualStrings("9223372036854775807", large.object.get("value").?.string);
+    marker = 0;
+    const empty = try Cursor.open(std.testing.allocator, binding, backend, &.{}, .{ .fields = &.{"id"}, .limit = 1, .conditions = &.{.{ .column = "id", .op = .eq, .value = .null }} }, .{ .scanned_anchors = 0 });
+    defer empty.close(empty.ptr);
+    try std.testing.expectEqual(@as(?u64, 0), empty.estimated_rows);
+    for (0..2) |_| {
+        const empty_page = try empty.next(empty.ptr, std.testing.allocator, 1);
+        defer empty_page.deinit();
+        try std.testing.expectEqual(@as(usize, 0), empty_page.rows.len);
+        try std.testing.expectEqual(@as(?[]const u8, null), empty_page.after);
+    }
+    try std.testing.expectEqual(@as(u8, 0), marker);
 }
 
 test "graph scan pushdown respects typed comparisons and cardinality barriers" {
