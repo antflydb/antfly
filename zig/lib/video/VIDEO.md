@@ -398,3 +398,14 @@ alternates header and reconstruction indexing on the same advanced AVC fixtures,
 checks complete picture metadata equality, and reports aggregate elapsed time for
 eight runs per case. This isolates indexing cost; full-pipeline throughput still
 requires the pretrained/load qualification tools.
+
+Model execution uses named, model-owned packed vision QKV snapshots and fused
+normalization/2-D RoPE. Frame/window batches can cross the former 512-row
+backbone cutoff: packed per-layer input storage has a 64 MiB ceiling and larger
+backbones drain bounded layer groups, retiring activation views between groups.
+Independent masks, positions and pooling remain per window. Shared admission,
+producer ownership and cancellation boundaries are unchanged. Cache admission
+failure retains bounded preparation; cache reclamation cannot invalidate active
+CPU borrowers or Metal commands. These mechanisms establish reuse and bounded
+lifetimes; speed comparisons require the pinned per-case performance gate in
+[the model guide](../../../docs/guides/embeddinggemma2.md#per-case-performance-gate).

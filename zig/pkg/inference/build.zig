@@ -1594,6 +1594,7 @@ pub fn build(b: *std.Build) void {
     const suite = workflows_tests.create(workflow_ctx);
     const tests = suite.tests;
     b.step("test-embeddinggemma2", "Run the filtered inference suite for EmbeddingGemma 2 qualification").dependOn(&suite.run_tests.step);
+    b.step("install-embeddinggemma2-tests", "Install the filtered EmbeddingGemma2 suite for execution on another host").dependOn(&b.addInstallArtifact(tests, .{ .dest_sub_path = "embeddinggemma2-tests" }).step);
     const video_model_root = b.createModule(.{ .root_source_file = b.path("src/inference_internal.zig"), .target = target, .optimize = optimize });
     var video_imports = inference_internal_mod.import_table.iterator();
     while (video_imports.next()) |entry| video_model_root.addImport(entry.key_ptr.*, entry.value_ptr.*);

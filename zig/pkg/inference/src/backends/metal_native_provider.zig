@@ -100,6 +100,7 @@ pub const MetalNativeProvider = if (build_options.enable_metal) struct {
     embeddinggemma2_linear_cache: std.StringHashMapUnmanaged(EmbeddingGemma2LinearCacheEntry) = .empty,
     embeddinggemma2_linear_cache_bytes: usize = 0,
     embeddinggemma2_vision_linear_cache_bytes: usize = 0,
+    embeddinggemma2_audio_linear_cache_bytes: usize = 0,
     embeddinggemma2_cache_admission: ?*tier_cache_mod.SharedCache = null,
     jit_mode: kernel_jit.Mode = .off,
     jit_scope: metal_runtime.MetalJitRouteScope = metal_runtime.MetalJitRouteScope.none(),
@@ -218,6 +219,7 @@ pub const MetalNativeProvider = if (build_options.enable_metal) struct {
             metal_runtime.clearRawLinearSlot(self, removed.value.slot);
             self.embeddinggemma2_linear_cache_bytes -= removed.value.bytes;
             if (cache_class == .vision) self.embeddinggemma2_vision_linear_cache_bytes -= removed.value.bytes;
+            if (cache_class == .audio) self.embeddinggemma2_audio_linear_cache_bytes -= removed.value.bytes;
             cache.noteRelease(.backend, removed.value.bytes);
             reclaimed += removed.value.bytes;
             std.heap.c_allocator.free(removed.key);
@@ -316,6 +318,7 @@ pub const MetalNativeProvider = if (build_options.enable_metal) struct {
         self.embeddinggemma2_linear_cache = .empty;
         self.embeddinggemma2_linear_cache_bytes = 0;
         self.embeddinggemma2_vision_linear_cache_bytes = 0;
+        self.embeddinggemma2_audio_linear_cache_bytes = 0;
         for (0..decoder_runtime_layer_norm_slot_capacity) |slot| metal_runtime.releaseRawLayerNormSlot(self, slot);
         for (0..decoder_runtime_rms_norm_slot_capacity) |slot| metal_runtime.releaseRawRmsNormSlot(self, slot);
         metal_runtime.termite_metal_provider_destroy(self.raw_provider);

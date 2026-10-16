@@ -715,6 +715,16 @@ pub const DecoderRuntimeActivationKind = backend_contracts.DecoderRuntimeActivat
 /// query is scaled per head dim (`q_dim_scales`, `[head_dim]`) and keys by
 /// `k_scale`, logits are tanh-capped and masked keys take `invalid_value`.
 /// `valid` is a `[rows]` 0/1 float mask.
+pub const VisionNormRopeParams = extern struct {
+    rows: u32,
+    hidden: u32,
+    head_dim: u32,
+    grid_x: u32,
+    grid_y: u32,
+    eps: f32,
+    theta: f32,
+    scale: f32,
+};
 pub const Gemma4AudioLocalAttentionParams = struct {
     rows: usize,
     hidden: usize,
@@ -2073,6 +2083,8 @@ pub const ComputeBackend = struct {
         /// This is the Q/K/V fast path for encoders with separate projection
         /// weights. Backends may fuse quantized kernels and bias application;
         /// otherwise the wrapper falls back to three independent `linear` calls.
+        linearTripleNoBiasNamed: ?*const fn (ctx: *anyopaque, input: CT, names: [3][]const u8, rows: usize, in_dim: usize, out_dim: usize) anyerror!LinearTripleResult = null,
+        linearTripleNoBias: ?*const fn (ctx: *anyopaque, input: CT, a: CT, b: CT, c: CT, rows: usize, in_dim: usize, out_dim: usize) anyerror!LinearTripleResult = null,
         linearTriple: ?*const fn (ctx: *anyopaque, input: CT, weight_a: CT, bias_a: CT, weight_b: CT, bias_b: CT, weight_c: CT, bias_c: CT, rows: usize, in_dim: usize, out_dim: usize) anyerror!LinearTripleResult = null,
 
         /// Y = X @ (W_base + LoRA_delta)^T + bias
@@ -2542,6 +2554,7 @@ pub const ComputeBackend = struct {
 
         /// Qwen3-VL vision RoPE. `positions` is axis-major [height][width].
         /// Each axis owns half of the rotary frequencies in every head.
+        visionNormRope: ?*const fn (ctx: *anyopaque, input: CT, weight: CT, params: VisionNormRopeParams) anyerror!?CT = null,
         visionRope: ?*const fn (ctx: *anyopaque, input: CT, token_count: usize, head_dim: usize, theta: f32, positions: []const u32) anyerror!?CT = null,
 
         /// Apply scalar multiply and RoPE in one backend op. Used by Gemma
@@ -3567,6 +3580,27 @@ pub const ComputeBackend = struct {
         errdefer self.free(first);
         const second = try self.linear(input_b, weight_b, bias_b, rows, in_dim, out_dim);
         return .{ .first = first, .second = second };
+    }
+
+    pub fn linearTripleNoBiasNamed(self: *const ComputeBackend, input: CT, names: [3][]const u8, rows: usize, in_dim: usize, out_dim: usize) !LinearTripleResult {
+        if (self.vtable.linearTripleNoBiasNamed) |op| return op(self.ptr, input, names, rows, in_dim, out_dim);
+        const a = try self.getWeight(names[0]);
+        defer self.free(a);
+        const b = try self.getWeight(names[1]);
+        defer self.free(b);
+        const c = try self.getWeight(names[2]);
+        defer self.free(c);
+        return self.linearTripleNoBias(input, a, b, c, rows, in_dim, out_dim);
+    }
+
+    pub fn linearTripleNoBias(self: *const ComputeBackend, input: CT, a: CT, b: CT, c: CT, rows: usize, in_dim: usize, out_dim: usize) !LinearTripleResult {
+        if (self.vtable.linearTripleNoBias) |op| return op(self.ptr, input, a, b, c, rows, in_dim, out_dim);
+        const first = try self.linearNoBias(input, a, rows, in_dim, out_dim);
+        errdefer self.free(first);
+        const second = try self.linearNoBias(input, b, rows, in_dim, out_dim);
+        errdefer self.free(second);
+        const third = try self.linearNoBias(input, c, rows, in_dim, out_dim);
+        return .{ .first = first, .second = second, .third = third };
     }
 
     pub fn linearTriple(
@@ -4613,6 +4647,11 @@ pub const ComputeBackend = struct {
     pub fn mrope(self: *const ComputeBackend, input: CT, token_count: usize, head_dim: usize, theta: f32, freq_scale: f32, positions: []const u32, sections: [3]u32) !?CT {
         const op = self.vtable.mrope orelse return null;
         return op(self.ptr, input, token_count, head_dim, theta, freq_scale, positions, sections);
+    }
+
+    pub fn visionNormRope(self: *const ComputeBackend, input: CT, weight: CT, params: VisionNormRopeParams) !?CT {
+        const op = self.vtable.visionNormRope orelse return null;
+        return op(self.ptr, input, weight, params);
     }
 
     pub fn visionRope(self: *const ComputeBackend, input: CT, token_count: usize, head_dim: usize, theta: f32, positions: []const u32) !?CT {

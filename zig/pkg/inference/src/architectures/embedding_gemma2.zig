@@ -523,7 +523,7 @@ const LayerFrameBatch = struct {
     }
 };
 
-fn encoderLayer(cb: *const ComputeBackend, allocator: std.mem.Allocator, cfg: Config, input: CT, embeddings: CT, pw: CT, vis: Visibility, batch: usize, seq: usize, layer: usize, frame_batch: ?*LayerFrameBatch, packed_ple: ?CT) !CT {
+fn encoderLayer(cb: *const ComputeBackend, allocator: std.mem.Allocator, cfg: Config, input: CT, embeddings: CT, pw: CT, vis: Visibility, batch: usize, seq: usize, layer: usize, frame_batch: ?*LayerFrameBatch, packed_ple: ?CT, packed_first: usize) !CT {
     if (cb.kind() == .metal and cb.decoderRuntimeHasActiveFrame() and frame_batch == null) return error.EmbeddingGemma2ExternalFrame;
     const rows = batch * seq;
     const h = cfg.hidden_size;
@@ -567,14 +567,13 @@ fn encoderLayer(cb: *const ComputeBackend, allocator: std.mem.Allocator, cfg: Co
     defer cb.free(fnorm);
     var down: ?CT = blk: {
         const product = product: {
-            const activated = activated: {
-                var gate: ?CT = try linear(cb, layer, "mlp.gate_proj.weight", fnorm, rows, h, cfg.intermediate_size);
-                defer if (gate) |value| cb.free(value);
-                break :activated try geluLastUse(cb, &gate);
-            };
-            defer cb.free(activated);
+            var gate: ?CT = try linear(cb, layer, "mlp.gate_proj.weight", fnorm, rows, h, cfg.intermediate_size);
+            defer if (gate) |value| cb.free(value);
             const up = try linear(cb, layer, "mlp.up_proj.weight", fnorm, rows, h, cfg.intermediate_size);
             defer cb.free(up);
+            if (try cb.activationMultiply(gate.?, up, .gelu)) |fused| break :product fused;
+            const activated = try geluLastUse(cb, &gate);
+            defer cb.free(activated);
             break :product try cb.multiply(activated, up);
         };
         defer cb.free(product);
@@ -589,7 +588,7 @@ fn encoderLayer(cb: *const ComputeBackend, allocator: std.mem.Allocator, cfg: Co
     var ple_region = if (profile) try cb.decoderRuntimePushComputeRegion(.ple) else ops.DecoderRuntimeComputeRegionScope{};
     defer ple_region.deinit();
     const ple = if (packed_ple) |packed_input|
-        try cb.sliceLastDim(packed_input, layer * cfg.per_layer_input_dim, (layer + 1) * cfg.per_layer_input_dim)
+        try cb.sliceLastDim(packed_input, (layer - packed_first) * cfg.per_layer_input_dim, (layer - packed_first + 1) * cfg.per_layer_input_dim)
     else blk: {
         const projected = try cb.linearNoBias(embeddings, slice.?, rows, h, cfg.per_layer_input_dim);
         defer cb.free(projected);
@@ -645,8 +644,8 @@ fn encoderLayer(cb: *const ComputeBackend, allocator: std.mem.Allocator, cfg: Co
 
 /// Match the upstream packed projection and norm for bounded row counts. The
 /// last dimension is [layer, per-layer width]; each layer later slices its
-/// columns without downloading the device result. Long contexts deliberately
-/// keep the layer-at-a-time path to avoid a 24-fold activation workspace.
+/// columns without downloading the device result. Long contexts pack only their current
+/// owned layer group to avoid a 24-fold activation workspace.
 fn packedPerLayerInputs(cb: *const ComputeBackend, cfg: Config, embeddings: CT, pw: CT, rows: usize, shared_frame: bool) !CT {
     var frame = false;
     if (cb.kind() == .metal and !shared_frame) {
@@ -695,24 +694,34 @@ pub fn forwardCT(cb: *const ComputeBackend, allocator: std.mem.Allocator, cfg: C
 fn metalFrameRows() usize {
     return if (@import("antfly_platform").env.getenvBool("ANTFLY_EMBEDDINGGEMMA2_DISABLE_MEDIUM_METAL_FRAME")) 128 else 512;
 }
-/// Preserve a singleton's fused frame/PLE regime when forming independent rows.
-/// Longer rows already use bounded per-layer execution and can batch normally.
+/// Independent rows use segmented frames and packed PLE while their admitted
+/// workspace permits it; total rows no longer force a singleton-only regime.
 pub fn metalBatchCapacity(sequence: usize, maximum: usize) usize {
-    return metalBatchCapacityWithFrame(sequence, maximum, metalFrameRows());
-}
-fn metalBatchCapacityWithFrame(sequence: usize, maximum: usize, frame_rows: usize) usize {
     if (sequence == 0) return 0;
-    const boundary: usize = if (sequence <= frame_rows) frame_rows else if (sequence <= 512) 512 else return maximum;
-    return @min(maximum, boundary / sequence);
+    return @min(maximum, 8192 / sequence);
+}
+fn metalLayerGroup(cfg: Config, rows: usize) usize {
+    if (rows <= metalFrameRows()) return cfg.num_hidden_layers;
+    // The existing run envelope supplies 192 KiB/row. Reserve one third for
+    // packed inputs, attention and outputs; group only fitting live layers.
+    const per_row = (12 * cfg.hidden_size + 3 * cfg.intermediate_size + 4 * cfg.per_layer_input_dim) * @sizeOf(f32);
+    return @max(@as(usize, 1), @min(@as(usize, 8), (128 * 1024) / @max(per_row, 1)));
+}
+fn packPerLayerInputs(cfg: Config, rows: usize) bool {
+    const elements = std.math.mul(usize, rows, cfg.num_hidden_layers * cfg.per_layer_input_dim) catch return false;
+    return elements <= 64 * 1024 * 1024 / @sizeOf(f32);
 }
 
-test "embeddinggemma2 video cohorts preserve Metal frame and PLE fusion boundaries" {
-    try std.testing.expectEqual(@as(usize, 2), metalBatchCapacityWithFrame(256, 4, 512));
-    try std.testing.expectEqual(@as(usize, 1), metalBatchCapacityWithFrame(257, 4, 512));
-    try std.testing.expectEqual(@as(usize, 1), metalBatchCapacityWithFrame(386, 4, 512));
-    try std.testing.expectEqual(@as(usize, 4), metalBatchCapacityWithFrame(513, 4, 512));
-    try std.testing.expectEqual(@as(usize, 1), metalBatchCapacityWithFrame(128, 4, 128));
-    try std.testing.expectEqual(@as(usize, 3), metalBatchCapacityWithFrame(129, 4, 128));
+test "embeddinggemma2 video cohorts cross former frame boundaries without singleton fallback" {
+    try std.testing.expectEqual(@as(usize, 4), metalBatchCapacity(386, 4));
+    try std.testing.expectEqual(@as(usize, 4), metalBatchCapacity(513, 4));
+    try std.testing.expectEqual(@as(usize, 2), metalBatchCapacity(4096, 4));
+    try std.testing.expectEqual(@as(usize, 0), metalBatchCapacity(0, 4));
+    const cfg = Config{};
+    try std.testing.expect(metalLayerGroup(cfg, 772) > 0);
+    try std.testing.expect(metalLayerGroup(cfg, 772) <= 8);
+    try std.testing.expect(packPerLayerInputs(cfg, 772));
+    try std.testing.expect(!packPerLayerInputs(cfg, 8192));
 }
 
 pub fn forwardEmbeddingsCT(cb: *const ComputeBackend, allocator: std.mem.Allocator, cfg: Config, embeddings: CT, mask: []const i64, batch: usize, seq: usize) !CT {
@@ -735,15 +744,17 @@ pub fn forwardEmbeddingsCT(cb: *const ComputeBackend, allocator: std.mem.Allocat
     var frame_batch: LayerFrameBatch = .{};
     defer frame_batch.deinit(cb);
     var shared_frame = false;
-    const frame_max_rows = metalFrameRows();
-    if (cb.kind() == .metal and rows <= frame_max_rows and cfg.num_hidden_layers <= frame_batch.slices.len) {
+    const group_layers = metalLayerGroup(cfg, rows);
+    if (cb.kind() == .metal and cfg.num_hidden_layers <= frame_batch.slices.len) {
         shared_frame = try cb.decoderRuntimeBeginFrame();
         if (!shared_frame) return error.EmbeddingGemma2OperationUnavailable;
         if (@import("antfly_platform").env.getenvBool("ANTFLY_EMBEDDINGGEMMA2_PROFILE_ENCODER")) try cb.decoderRuntimeSetActiveFrameRegime(.prefill);
     }
     // Registered after slice cleanup so cancellation happens before release.
     defer if (shared_frame) cb.decoderRuntimeCancelFrame() catch {};
-    const packed_ple: ?CT = if (cb.kind() == .metal and rows <= 512 and cfg.num_hidden_layers <= frame_batch.slices.len)
+    const whole_packed = cb.kind() == .metal and packPerLayerInputs(cfg, rows);
+    var packed_first: usize = 0;
+    var packed_ple: ?CT = if (whole_packed and cfg.num_hidden_layers <= frame_batch.slices.len)
         try packedPerLayerInputs(cb, cfg, embeddings, pw, rows, shared_frame)
     else
         null;
@@ -753,10 +764,35 @@ pub fn forwardEmbeddingsCT(cb: *const ComputeBackend, allocator: std.mem.Allocat
     defer if (owns_hidden) cb.free(hidden);
     for (0..cfg.num_hidden_layers) |layer| {
         try cb.checkExecutionControl();
-        const next = try encoderLayer(cb, allocator, cfg, hidden, embeddings, pw, vis, batch, seq, layer, if (shared_frame) &frame_batch else null, packed_ple);
+        if (shared_frame and !whole_packed and packed_ple == null) {
+            var group_cfg = cfg;
+            group_cfg.num_hidden_layers = @min(group_layers, cfg.num_hidden_layers - layer);
+            // Keep the projected group and its source slice alive through the
+            // owned frame. No all-layer activation allocation at long context.
+            const slice = try cb.sliceRows2D(allocator, pw, layer * cfg.per_layer_input_dim, group_cfg.num_hidden_layers * cfg.per_layer_input_dim, cfg.hidden_size);
+            frame_batch.slices[frame_batch.count] = slice;
+            frame_batch.count += 1;
+            packed_ple = try packedPerLayerInputs(cb, group_cfg, embeddings, slice, rows, true);
+            packed_first = layer;
+        }
+        const next = try encoderLayer(cb, allocator, cfg, hidden, embeddings, pw, vis, batch, seq, layer, if (shared_frame) &frame_batch else null, packed_ple, packed_first);
         if (owns_hidden) cb.free(hidden);
         hidden = next;
         owns_hidden = true;
+        if (shared_frame and (layer + 1) % group_layers == 0 and layer + 1 < cfg.num_hidden_layers) {
+            try cb.decoderRuntimeSubmitAndWaitFrame();
+            shared_frame = false;
+            if (!whole_packed) {
+                if (packed_ple) |tensor| cb.free(tensor);
+                packed_ple = null;
+            }
+            try @import("../ops/metal_compute.zig").MetalCompute.releaseEmbeddingGemma2ActivationViews(cb);
+            frame_batch.deinit(cb);
+            frame_batch.count = 0;
+            try cb.checkExecutionControl();
+            shared_frame = try cb.decoderRuntimeBeginFrame();
+            if (!shared_frame) return error.EmbeddingGemma2OperationUnavailable;
+        }
     }
     const nw = try cb.getWeight("language_model.norm.weight");
     defer cb.free(nw);
@@ -855,11 +891,11 @@ test "embeddinggemma2 native Metal layer parity" {
     // A cancelled layer must unwind its frame and transient PLE slot before
     // the same backend executes again. A foreign frame remains caller-owned.
     gpu.execution_control = .{ .check_fn = Cancel.check };
-    try std.testing.expectError(error.Cancelled, encoderLayer(&gpu, a, cfg, gs, gs, gpw, vis, 1, ids.len, 0, null, null));
+    try std.testing.expectError(error.Cancelled, encoderLayer(&gpu, a, cfg, gs, gs, gpw, vis, 1, ids.len, 0, null, null, 0));
     gpu.execution_control = null;
     try std.testing.expect(!gpu.decoderRuntimeHasActiveFrame());
     try std.testing.expect(try gpu.decoderRuntimeBeginFrame());
-    try std.testing.expectError(error.EmbeddingGemma2ExternalFrame, encoderLayer(&gpu, a, cfg, gs, gs, gpw, vis, 1, ids.len, 0, null, null));
+    try std.testing.expectError(error.EmbeddingGemma2ExternalFrame, encoderLayer(&gpu, a, cfg, gs, gs, gpw, vis, 1, ids.len, 0, null, null, 0));
     try std.testing.expect(gpu.decoderRuntimeHasActiveFrame());
     try gpu.decoderRuntimeCancelFrame();
     var ch = cs;
@@ -870,8 +906,8 @@ test "embeddinggemma2 native Metal layer parity" {
         gpu.free(gh);
     };
     for (0..24) |layer| {
-        const next_cpu = try encoderLayer(&cpu, a, cfg, ch, cs, cpw, vis, 1, ids.len, layer, null, null);
-        const next_gpu = try encoderLayer(&gpu, a, cfg, gh, gs, gpw, vis, 1, ids.len, layer, null, null);
+        const next_cpu = try encoderLayer(&cpu, a, cfg, ch, cs, cpw, vis, 1, ids.len, layer, null, null, 0);
+        const next_gpu = try encoderLayer(&gpu, a, cfg, gh, gs, gpw, vis, 1, ids.len, layer, null, null, 0);
         if (owns) {
             cpu.free(ch);
             gpu.free(gh);

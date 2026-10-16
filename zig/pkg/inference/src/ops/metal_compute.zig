@@ -5694,9 +5694,8 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         const bytes = std.math.mul(usize, payload, @sizeOf(f32)) catch return null;
         const class_bytes = if (cache_class == .vision)
             provider.embeddinggemma2_vision_linear_cache_bytes
-        else
-            provider.embeddinggemma2_linear_cache_bytes - provider.embeddinggemma2_vision_linear_cache_bytes;
-        const class_limit = if (cache_class == .vision) policy.metal_vision_max_bytes else policy.max_bytes;
+        else if (cache_class == .audio) provider.embeddinggemma2_audio_linear_cache_bytes else provider.embeddinggemma2_linear_cache_bytes - provider.embeddinggemma2_vision_linear_cache_bytes - provider.embeddinggemma2_audio_linear_cache_bytes;
+        const class_limit = policy.classLimit(cache_class);
         if (bytes == 0 or class_bytes > class_limit or bytes > class_limit - class_bytes or
             provider.embeddinggemma2_linear_cache.count() >= policy.max_entries) return null;
         const slot = self.nextFreeDynamicLinearSlot() orelse return null;
@@ -5730,6 +5729,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         });
         provider.embeddinggemma2_linear_cache_bytes += bytes;
         if (cache_class == .vision) provider.embeddinggemma2_vision_linear_cache_bytes += bytes;
+        if (cache_class == .audio) provider.embeddinggemma2_audio_linear_cache_bytes += bytes;
         committed = true;
         return slot;
     }
@@ -16868,6 +16868,112 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         return null;
     }
 
+    fn linearTripleNoBiasNamedOp(ctx: *anyopaque, input: CT, names: [3][]const u8, rows: usize, in_dim: usize, out_dim: usize) anyerror!ops.LinearTripleResult {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        if (self.require_f32_linears and self.shared_provider_lease_io != null) {
+            const key = try std.fmt.allocPrint(self.allocator, "{s}|{s}|{s}.linear.weight", .{ names[0], names[1], names[2] });
+            defer self.allocator.free(key);
+            if (self.provider_impl.embeddinggemma2_linear_cache.get(key)) |entry| {
+                if (entry.in_dim != in_dim or entry.out_dim != 3 * out_dim) return error.InvalidTensorShape;
+                const combined = (try decoderRuntimeApplyLinearOp(ctx, &.{ .slot = entry.slot, .input = input, .in_dim = in_dim, .out_dim = 3 * out_dim })) orelse return error.UnsupportedPrimitiveOp;
+                defer freeOp(ctx, combined);
+                const result = try splitLastDim3Op(ctx, combined, rows, out_dim);
+                return .{ .first = result.first, .second = result.second, .third = result.third };
+            }
+        }
+        var weights: [3]CT = undefined;
+        var count: usize = 0;
+        defer for (weights[0..count]) |weight| freeOp(ctx, weight);
+        for (names, &weights) |name, *weight| {
+            weight.* = try getWeightOp(ctx, name);
+            count += 1;
+        }
+        return linearTripleNoBiasOp(ctx, input, weights[0], weights[1], weights[2], rows, in_dim, out_dim);
+    }
+
+    fn packedMediaQkvSlot(self: *MetalCompute, weights: [3]CT, in_dim: usize, out_dim: usize) !?usize {
+        if (!self.require_f32_linears or self.shared_provider_lease_io == null) return null;
+        const policy = @import("../models/embedding_gemma2_weight_cache.zig");
+        var names: [3][]const u8 = undefined;
+        for (weights, &names) |weight, *name| {
+            const buf = toBuf(weight);
+            const entry = buf.lazy_entry orelse return null;
+            if (buf.mutable_state or entry.pin_count == 0 or hasHostView(buf) or buf.metal_tensor != null or bufHasAnyQuantizedStorage(buf) or buf.lazy_multiply != null) return null;
+            const source = if (entry.host_loaded) |*loaded| &loaded.tensor else return null;
+            if ((source.dtype != .bf16 and source.dtype != .f32) or source.shape.len != 2 or source.shape[0] != out_dim or source.shape[1] != in_dim) return null;
+            name.* = entry.tensor_ref.name;
+            if (policy.metalClass(name.*) != .vision) return null;
+        }
+        const name = try std.fmt.allocPrint(self.allocator, "{s}|{s}|{s}.linear.weight", .{ names[0], names[1], names[2] });
+        defer self.allocator.free(name);
+        const provider = self.provider_impl;
+        const cache = if (self.data.tier_cache) |*cache| cache else return null;
+        if (provider.embeddinggemma2_cache_admission) |bound| {
+            if (bound != cache) return null;
+        } else provider.embeddinggemma2_cache_admission = cache;
+        if (provider.embeddinggemma2_linear_cache.get(name)) |entry| {
+            if (entry.in_dim != in_dim or entry.out_dim != 3 * out_dim) return error.InvalidTensorShape;
+            return entry.slot;
+        }
+        const bytes = (3 * out_dim * in_dim + 3 * out_dim) * @sizeOf(f32);
+        const used = provider.embeddinggemma2_vision_linear_cache_bytes;
+        if (used > policy.metal_vision_max_bytes or bytes > policy.metal_vision_max_bytes - used or provider.embeddinggemma2_linear_cache.count() >= policy.max_entries) return null;
+        const slot = self.nextFreeDynamicLinearSlot() orelse return null;
+        self.data.prefetch.lock();
+        cache.reserve(.backend, bytes) catch {
+            cache.noteDenied(.backend, bytes);
+            self.data.prefetch.unlock();
+            return null;
+        };
+        self.data.prefetch.unlock();
+        var committed = false;
+        defer if (!committed) {
+            self.data.prefetch.lock();
+            cache.noteRelease(.backend, bytes);
+            self.data.prefetch.unlock();
+        };
+        const owner = std.heap.c_allocator;
+        const owned_name = try owner.dupe(u8, name);
+        defer if (!committed) owner.free(owned_name);
+        try provider.embeddinggemma2_linear_cache.ensureUnusedCapacity(owner, 1);
+        const data = try self.allocator.alloc(f32, 3 * out_dim * in_dim);
+        defer self.allocator.free(data);
+        for (weights, 0..) |weight, i| {
+            const values = try toFloat32Op(self, weight, self.allocator);
+            defer self.allocator.free(values);
+            if (values.len != in_dim * out_dim) return error.InvalidTensorShape;
+            @memcpy(data[i * in_dim * out_dim ..][0 .. in_dim * out_dim], values);
+        }
+        const combined_weight = try fromFloat32ShapeOp(self, data, &.{ @intCast(3 * out_dim), @intCast(in_dim) });
+        defer freeOp(self, combined_weight);
+        const bias = try self.cachedZeroBiasBuf(3 * out_dim);
+        defer freeOp(self, bias);
+        defer if (!committed) metal_runtime.clearRawLinearSlot(provider, slot);
+        if (!(try self.prepareLinearWithF32Storage(&.{ .slot = slot, .weight = combined_weight, .bias = bias, .in_dim = in_dim, .out_dim = 3 * out_dim, .prefer_f32_mps_fallback = true }, .owned_shared_if_unified))) return null;
+        provider.embeddinggemma2_linear_cache.putAssumeCapacityNoClobber(owned_name, .{ .slot = slot, .in_dim = in_dim, .out_dim = 3 * out_dim, .bytes = bytes });
+        provider.embeddinggemma2_linear_cache_bytes += bytes;
+        provider.embeddinggemma2_vision_linear_cache_bytes += bytes;
+        committed = true;
+        return slot;
+    }
+
+    fn linearTripleNoBiasOp(ctx: *anyopaque, input: CT, a: CT, b: CT, c: CT, rows: usize, in_dim: usize, out_dim: usize) anyerror!ops.LinearTripleResult {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        const slot = self.packedMediaQkvSlot(.{ a, b, c }, in_dim, out_dim) catch |err| switch (err) {
+            error.OutOfMemory => null,
+            else => return err,
+        };
+        if (slot) |combined_weight| {
+            const combined = (try decoderRuntimeApplyLinearOp(ctx, &.{ .slot = combined_weight, .input = input, .in_dim = in_dim, .out_dim = 3 * out_dim })) orelse return error.UnsupportedPrimitiveOp;
+            defer freeOp(ctx, combined);
+            const result = try splitLastDim3Op(ctx, combined, rows, out_dim);
+            return .{ .first = result.first, .second = result.second, .third = result.third };
+        }
+        const bias = try self.cachedZeroBiasBuf(out_dim);
+        defer freeOp(ctx, bias);
+        return linearTripleOp(ctx, input, a, bias, b, bias, c, bias, rows, in_dim, out_dim);
+    }
+
     fn linearTripleOp(
         ctx: *anyopaque,
         input: CT,
@@ -17005,6 +17111,16 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             .sections = sections,
         })) orelse return null;
         return self.ctFromOwnedMetalTensor(result);
+    }
+
+    fn visionNormRopeOp(ctx: *anyopaque, input: CT, weight: CT, params: ops.VisionNormRopeParams) anyerror!?CT {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        var x = try self.ownedDeviceMetalTensorFromCt(input);
+        defer x.deinit();
+        var w = try self.ownedDeviceMetalTensorFromCt(weight);
+        defer w.deinit();
+        const output = (try metal_runtime.decoderRuntimeVisionNormRope(self.provider_impl, x, w, params)) orelse return null;
+        return self.ctFromOwnedMetalTensor(output);
     }
 
     fn visionRopeOp(
@@ -32951,10 +33067,13 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         vt.splitLastDim3 = splitLastDim3Op;
         vt.linearPair = linearPairOp;
         vt.linearTriple = linearTripleOp;
+        vt.linearTripleNoBias = linearTripleNoBiasOp;
+        vt.linearTripleNoBiasNamed = linearTripleNoBiasNamedOp;
         vt.rmsNormHeadsRope = rmsNormHeadsRopeOp;
         vt.rope = ropeOp;
         vt.mrope = mropeOp;
         vt.visionRope = visionRopeOp;
+        vt.visionNormRope = visionNormRopeOp;
         vt.ropePerItem = ropePerItemOp;
         vt.gqaCausalAttention = gqaCausalAttentionOp;
         vt.runAttention = runAttentionOp;

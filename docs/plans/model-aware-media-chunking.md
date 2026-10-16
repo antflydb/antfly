@@ -401,3 +401,24 @@ Run `python3 -m unittest discover -s zig/pkg/inference/scripts -p
 test_qualify_chunk_load.py` for fault-injected retry qualification: partial
 acknowledgement, initial admission rejection, bounded exhaustion and refusal to
 mix generations or retry non-admission errors.
+
+## Model execution performance qualification
+
+Language, vision and audio immutable preparation reuse belongs to the loaded
+model generation with independent admitted cache ceilings. Named vision QKV
+projections avoid reopening/widening individual weights on warm execution.
+Packed snapshots replace individual copies. Native audio attention and gated
+GELU use portable SIMD and bounded parallel work. Metal retains independent
+window batching across 512 total rows through bounded layer groups and a capped
+packed per-layer projection; it drains GPU work before releasing transient views.
+
+Qualification compares each case against pinned PyTorch CPU/MPS, separately for
+prepared text encoder and completed requests. The maintained
+`embeddinggemma2/performance_gate.py` rejects mismatched artifacts and insufficient
+samples, checks vectors and per-case median latency, and preserves failed
+outcomes. Image tiles/PDF pages/GIF frames share vision execution, while their
+source extraction and chunk delivery remain complete-request measurements.
+Throughput and p95 under concurrent load, cold setup, sampled/process memory and
+cancellation/retry are separate gates. CPU-versus-CPU and Metal-versus-MPS claims
+must name their timing boundary and measured binary; historical reports do not
+qualify a subsequent implementation.

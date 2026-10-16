@@ -448,6 +448,8 @@ def native(args, suite, result):
                 "18432",
                 "--scratch-budget-mb",
                 "8192",
+                "--process-memory-budget-mb",
+                str(getattr(args, "process_memory_budget_mb", 8192)),
             ],
             env=env,
             stdout=log,
@@ -485,6 +487,8 @@ def native(args, suite, result):
                 for i in range(
                     warmups + iterations(case, args.iterations, args.long_iterations)
                 ):
+                    if i == warmups:
+                        vm_before = vm_counters()
                     started = time.perf_counter()
                     response = post(url + "/ai/v1", "/embed", body)
                     elapsed = time.perf_counter() - started
@@ -502,6 +506,8 @@ def native(args, suite, result):
                     "tokens": len(case["token_ids"]),
                     "timing": timing(samples),
                     "vector": vector,
+                    "vm_measured_before": vm_before,
+                    "vm_measured_after": vm_counters(),
                 }
                 print(
                     args.backend,
@@ -686,7 +692,7 @@ def torch_run(args, suite, result):
                 warmups + iterations(case, args.iterations, args.long_iterations)
             ):
                 sync()
-                if args.timing_mode == "encoder" and i == warmups:
+                if i == warmups:
                     vm_before = vm_counters()
                 full_started = time.perf_counter()
                 encoded = prepared if prepared is not None else inputs(case)
@@ -705,10 +711,9 @@ def torch_run(args, suite, result):
                 "preprocessing_and_inference_timing": timing(full_samples),
                 "vector": vector,
             }
-            if args.timing_mode == "encoder":
-                result["cases"][case["name"]].update(
-                    vm_measured_before=vm_before, vm_measured_after=vm_counters()
-                )
+            result["cases"][case["name"]].update(
+                vm_measured_before=vm_before, vm_measured_after=vm_counters()
+            )
             print(
                 args.backend, case["name"], timing(samples)["p50_seconds"], flush=True
             )
@@ -800,9 +805,11 @@ def main():
         "--timing-mode", choices=["default", "encoder"], default="default"
     )
     parser.add_argument("--max-vector-error", type=float, default=1e-4)
+    parser.add_argument("--process-memory-budget-mb", type=int, default=8192)
     args = parser.parse_args()
     if (
-        not 1 <= args.iterations <= 100
+        not 0 <= args.process_memory_budget_mb <= 65536
+        or not 1 <= args.iterations <= 100
         or not 1 <= args.long_iterations <= 100
         or (args.warmups is not None and not 0 <= args.warmups <= 100)
         or not 0 < args.max_vector_error <= 1e-4

@@ -4461,6 +4461,12 @@ pub const Node = struct {
         self.model_manager.detachPromptCacheResourceUsageObserver();
     }
 
+    /// Clone warm generation metadata without reparsing the model directory.
+    fn embeddingManifest(self: *Node, allocator: std.mem.Allocator, path: []const u8) !manifest_mod.ModelManifest {
+        if (try self.model_manager.copyCachedEmbeddingGemma2Manifest(allocator, path)) |manifest| return manifest;
+        return manifest_mod.loadFromDir(allocator, path);
+    }
+
     /// Resize linked results with the HTTP recipe; leave ownership unchanged on failure.
     pub fn applyDenseEmbeddingDimensions(self: *Node, allocator: std.mem.Allocator, io: std.Io, model_name: []const u8, vectors: [][]f32, requested: ?u32) !void {
         const dimensions = requested orelse return;
@@ -4470,7 +4476,7 @@ pub const Node = struct {
         } else return;
         const path = try self.resolveModelPath(io, model_name, "embedders");
         defer self.allocator.free(path);
-        var manifest = try manifest_mod.loadFromDir(allocator, path);
+        var manifest = try self.embeddingManifest(allocator, path);
         defer manifest.deinit();
         if (manifest.embedding_style == .embedding_gemma2 and !@import("../architectures/embedding_gemma2.zig").validDimension(dimensions)) return error.InvalidEmbeddingDimensions;
         try resizeDenseEmbeddingBatch(allocator, vectors, dimensions, manifest.normalize);
@@ -4609,7 +4615,7 @@ pub const Node = struct {
         defer self.metrics.decActive();
 
         try control.update(.loading_model, 0, 1);
-        var admission_manifest = try manifest_mod.loadFromDir(allocator, model_path);
+        var admission_manifest = try self.embeddingManifest(allocator, model_path);
         defer admission_manifest.deinit();
         if (admission_manifest.hasCapability("sparse")) return error.UnsupportedEmbeddingProvider;
         const executor_contract = try resolvedInferenceExecutorContract(self, "embed", &admission_manifest);
@@ -6064,7 +6070,7 @@ pub const Node = struct {
         const io = self.inferenceIo(allocator, null, &owned_io);
         const model_path = try self.resolveModelPath(io, model.name, warmModelTaskDir(model.kind));
         defer self.allocator.free(model_path);
-        var manifest = try manifest_mod.loadFromDir(allocator, model_path);
+        var manifest = try self.embeddingManifest(allocator, model_path);
         defer manifest.deinit();
         const gguf_path = manifest.gguf_path orelse return error.A4bPrefetchRequiresGguf;
         const workers = model.load_workers orelse ops.A4bInferenceConfig.default_load_workers;
@@ -6328,7 +6334,7 @@ pub const Node = struct {
         const model_path = try self.resolveModelPath(io, if (model_name.len > 0) model_name else null, "embedders");
         defer self.allocator.free(model_path);
         try ensureDirectEmbeddingDeadline(deadline_ns);
-        var admission_manifest = try manifest_mod.loadFromDir(allocator, model_path);
+        var admission_manifest = try self.embeddingManifest(allocator, model_path);
         defer admission_manifest.deinit();
         if (admission_manifest.hasCapability("sparse")) return error.UnsupportedEmbeddingProvider;
         const executor_contract = try resolvedInferenceExecutorContract(self, "embed", &admission_manifest);
@@ -6473,7 +6479,7 @@ pub const Node = struct {
         const model_path = try self.resolveModelPath(io, if (model_name.len > 0) model_name else null, "embedders");
         defer self.allocator.free(model_path);
         try control.update(.loading_model, 0, 1);
-        var admission_manifest = try manifest_mod.loadFromDir(allocator, model_path);
+        var admission_manifest = try self.embeddingManifest(allocator, model_path);
         defer admission_manifest.deinit();
         if (admission_manifest.hasCapability("sparse")) return error.UnsupportedEmbeddingProvider;
         const executor_contract = try resolvedInferenceExecutorContract(self, "embed", &admission_manifest);
@@ -6556,7 +6562,7 @@ pub const Node = struct {
 
         const model_path = try self.resolveModelPath(io, if (model_name.len > 0) model_name else null, "embedders");
         defer self.allocator.free(model_path);
-        var manifest = try manifest_mod.loadFromDir(allocator, model_path);
+        var manifest = try self.embeddingManifest(allocator, model_path);
         defer manifest.deinit();
         if (manifest.hasCapability("sparse")) return error.UnsupportedEmbeddingProvider;
         const executor_contract = try resolvedInferenceExecutorContract(self, "embed", &manifest);
@@ -11154,7 +11160,7 @@ pub const Node = struct {
         else
             null;
         var admission_manifest = cached_manifest orelse
-            manifest_mod.loadFromDir(ctx.allocator, model_path) catch |err|
+            self.embeddingManifest(ctx.allocator, model_path) catch |err|
             return modelLoadFailureResponse(ctx, err);
         defer admission_manifest.deinit();
         validateQwen3EmbeddingDimensions(&admission_manifest, requested_dimensions) catch |err| {

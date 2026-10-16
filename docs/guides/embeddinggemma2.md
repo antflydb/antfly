@@ -462,8 +462,9 @@ checks numerical agreement; it does not estimate application retrieval quality.
 
 Sliding layers restrict their actual attention ranges while preserving original
 positions, padding holes and batch isolation. Metal groups the encoder into one
-owned frame for at most 512 total rows, including padding and batch. Longer
-inputs complete one frame per layer to bound retained intermediates. Frames
+owned frame for at most 512 total rows, including padding and batch. Larger
+inputs use workspace-bounded layer groups, releasing completed activation views
+between groups; independent rows can batch across the former 512-row cutoff. Frames
 complete or cancel before their transient projection slots are released. Cached
 MPS activation views are released at frame completion and request teardown;
 only admitted model weights and multiplication plans persist across requests.
@@ -483,11 +484,12 @@ three sorted key ranges in contiguous spans; generic finite-window callers
 retain their per-key position checks. Rotary
 frequencies are computed once per operation and trigonometric values reused
 across heads at the same position. The shared per-layer projection is acquired
-once per encoder pass. On Metal, at up to 512 total rows, one packed projection
-and RMSNorm produce all layers' per-layer inputs, matching the upstream
-implementation. Individual layers slice their columns on the device. CPU and
-larger Metal inputs compute one layer's projection at a time to retain the
-host-workspace bound.
+once per encoder pass. On Metal, one packed projection and RMSNorm produce
+all layers' per-layer inputs when the packed output fits a 64 MiB ceiling.
+Individual layers slice their columns on the device. Longer Metal contexts
+pack only the current owned layer group rather than allocating the complete
+all-layer output. CPU retains layer-at-a-time projection. Packed outputs and
+live layer groups remain inside the existing admitted execution workspace.
 CPU execution reuses uniquely owned RMSNorm and GELU inputs at their last use
 and retires replaced projection/reshape handles. Aliased inputs and unsupported
 consume operations retain independent output storage. Errors preserve source
@@ -495,14 +497,61 @@ ownership for cleanup or retry. Independent activation references, alias
 preservation, allocation failures and retry behavior have focused coverage.
 BF16 widening uses lossless vector operations, and Metal
 linear preparation uses owned shared snapshots on unified-memory devices.
-Immutable language weights also have model-owned reuse: CPU retains losslessly
-widened BF16 mirrors, and Metal retains prepared F32 projection slots across
-requests. Each cache has at most 512 entries and 640 MiB of payload, charged to
-its resident host or backend tier before allocation. Vocabulary and media
-weights, mutable tensors and transient views are excluded. Admission denial
-keeps the request-scoped preparation path. Unloading a drained model releases
-both payloads and their admission ownership; the request workspace stays bounded
-independently.
+Immutable language, vision and audio weights have independent model-owned
+payload ceilings: 640 MiB each for language/vision and 1536 MiB for the larger
+audio tower. All payloads require resident host or backend admission before
+allocation, with at most 1536 entries across the classes. CPU retains lossless
+BF16 mirrors; Metal retains prepared F32 projection slots. Packed vision QKV
+snapshots replace the three individual projection snapshots. Warm named QKV
+execution acquires the packed snapshot before loading any original weights.
+Vocabulary, mutable tensors and transient views are excluded. Cache denial
+keeps bounded request-scoped preparation. Admission pressure can reclaim idle
+classes; native compute contexts pin borrowed mirrors until teardown, and Metal
+reclamation refuses active/submitted command groups. Unloading releases payloads
+and their admission ownership; request workspace remains bounded independently.
+
+Vision normalization and two-axis RoPE execute together without intermediate
+transposes. Native vision attention uses the existing BLAS-aware F32 segment
+tiles when system BLAS is available, without packing complete head-major Q/K/V
+copies or nesting head workers around threaded BLAS. No-BLAS targets and legacy
+layouts retain portable tiled attention. Compatible FFNs use fused GELU/product execution; CPU streams through
+SIMD tiles and parallelizes large independent output ranges. Native audio local
+attention intersects legal key ranges once per query and uses SIMD reductions
+with at most four workers, retaining relative-position terms and logit capping.
+Cancellation drains all workers before borrowed inputs or scratch are released.
+
+Warm embedding admission clones the loaded generation's validated manifest,
+including processor and capability policy, while briefly holding a model pin.
+Identity verification remains in place. Retirement/reload publishes a new
+snapshot; cold loads retain ordinary filesystem validation.
+
+### Per-case performance gate
+
+Use `performance_gate.py` with completed `compare.py` or `video_compare.py`
+receipts. It rejects mismatched weights, precision, suite/corpus, backend pairs,
+missing binary identities and mixed timing boundaries, and recomputes latency
+from raw samples. Every case must preserve F32 vector parity and meet the median
+ratio independently; the default ceiling is 1.10 and minimum sample count is 10.
+Insufficient samples, unobserved paging counters, new pageouts/swap traffic
+and slow modalities fail rather than disappearing into an aggregate. Prepared
+and request measurements record warm-sample VM counters outside their timers;
+older reports fall back conservatively to whole-process paging observations. A gate failure is retained in the output file with a nonzero exit.
+
+```sh
+python3 zig/pkg/inference/scripts/embeddinggemma2/performance_gate.py \
+  --candidate native.json --reference pytorch-cpu.json --output cpu-gate.json
+python3 zig/pkg/inference/scripts/embeddinggemma2/performance_gate.py \
+  --candidate metal-encoder.json --reference pytorch-mps-encoder.json \
+  --boundary encoder --output metal-encoder-gate.json
+```
+
+Prepared text encoder timing excludes HTTP and tokenization on both runtimes.
+Request comparison includes Antfly HTTP versus reference preprocessing and
+inference without HTTP. Cold setup, p95, memory, concurrency and cancellation
+remain separately reported boundaries. Images, PDF pages and GIF frames share
+the vision path, but source decoding/extraction must also be measured for each
+complete service workload. Passing isolated model cases does not certify those
+wrapper costs or universal PyTorch performance parity.
 
 
 ### Earlier local measurements

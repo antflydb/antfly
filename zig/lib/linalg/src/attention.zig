@@ -724,7 +724,7 @@ pub fn segmentAttentionHostWithGemm(
     num_heads: usize,
     head_dim: usize,
 ) ![]f32 {
-    return segmentAttentionHostWithGemmImpl(Gemm, allocator, null, Q, K, V, ranges, query_positions, key_positions, window, queries, keys, num_heads, head_dim);
+    return segmentAttentionHostWithGemmImpl(Gemm, allocator, null, false, Q, K, V, ranges, query_positions, key_positions, window, queries, keys, num_heads, head_dim);
 }
 
 /// Independent heads share immutable inputs and use caller-preallocated scratch.
@@ -745,13 +745,20 @@ pub fn segmentAttentionHostWithGemmParallelIo(
     num_heads: usize,
     head_dim: usize,
 ) ![]f32 {
-    return segmentAttentionHostWithGemmImpl(Gemm, allocator, io, Q, K, V, ranges, query_positions, key_positions, window, queries, keys, num_heads, head_dim);
+    return segmentAttentionHostWithGemmImpl(Gemm, allocator, io, true, Q, K, V, ranges, query_positions, key_positions, window, queries, keys, num_heads, head_dim);
+}
+
+/// Serial heads with cancellation between bounded GEMM tiles. A threaded
+/// system BLAS owns parallelism; scratch remains independent of head count.
+pub fn segmentAttentionHostWithGemmSerialIo(comptime Gemm: type, allocator: std.mem.Allocator, io: ?std.Io, Q: []const f32, K: []const f32, V: []const f32, ranges: []const u32, query_positions: []const i32, key_positions: []const i32, window: u32, queries: usize, keys: usize, num_heads: usize, head_dim: usize) ![]f32 {
+    return segmentAttentionHostWithGemmImpl(Gemm, allocator, io, false, Q, K, V, ranges, query_positions, key_positions, window, queries, keys, num_heads, head_dim);
 }
 
 fn segmentAttentionHostWithGemmImpl(
     comptime Gemm: type,
     allocator: std.mem.Allocator,
     io: ?std.Io,
+    parallel: bool,
     Q: []const f32,
     K: []const f32,
     V: []const f32,
@@ -771,7 +778,7 @@ fn segmentAttentionHostWithGemmImpl(
     const q_count = std.math.mul(usize, queries, H) catch return error.InvalidAttentionShape;
     const k_count = std.math.mul(usize, keys, H) catch return error.InvalidAttentionShape;
     const range_count = std.math.mul(usize, queries, 6) catch return error.InvalidAttentionShape;
-    const lanes = if (io != null) num_heads else 1;
+    const lanes = if (parallel and io != null) num_heads else 1;
     const tile_count = std.math.mul(usize, block_q, block_kv) catch return error.InvalidAttentionShape;
     const score_count = std.math.mul(usize, tile_count, lanes) catch return error.InvalidAttentionShape;
     if (block_q == 0 or block_kv == 0 or Q.len != q_count or K.len != k_count or V.len != k_count or ranges.len != range_count or
@@ -792,21 +799,24 @@ fn segmentAttentionHostWithGemmImpl(
     const scores = try allocator.alloc(f32, score_count);
     defer allocator.free(scores);
     const Head = SegmentHeadWork(Gemm);
-    if (io) |handle| {
+    if (parallel and io != null) {
+        const handle = io.?;
         const heads = try allocator.alloc(Head, num_heads);
         defer allocator.free(heads);
         const jobs = try allocator.alloc(pool.Job, num_heads);
         defer allocator.free(jobs);
         for (heads, jobs, 0..) |*ctx, *job, h| {
-            ctx.* = .{ .Q = Q, .K = K, .V = V, .ranges = ranges, .query_positions = query_positions, .key_positions = key_positions, .window = window, .queries = queries, .keys = keys, .head_dim = head_dim, .H = H, .h = h, .scale = scale, .output = output, .qh = qhs[h * queries * head_dim ..][0 .. queries * head_dim], .kh = khs[h * keys * head_dim ..][0 .. keys * head_dim], .vh = vhs[h * keys * head_dim ..][0 .. keys * head_dim], .oh = ohs[h * queries * head_dim ..][0 .. queries * head_dim], .score_tile = scores[h * block_q * block_kv ..][0 .. block_q * block_kv] };
+            ctx.* = .{ .io = io, .Q = Q, .K = K, .V = V, .ranges = ranges, .query_positions = query_positions, .key_positions = key_positions, .window = window, .queries = queries, .keys = keys, .head_dim = head_dim, .H = H, .h = h, .scale = scale, .output = output, .qh = qhs[h * queries * head_dim ..][0 .. queries * head_dim], .kh = khs[h * keys * head_dim ..][0 .. keys * head_dim], .vh = vhs[h * keys * head_dim ..][0 .. keys * head_dim], .oh = ohs[h * queries * head_dim ..][0 .. queries * head_dim], .score_tile = scores[h * block_q * block_kv ..][0 .. block_q * block_kv] };
             job.* = .{ .fn_ptr = Head.run, .ctx = ctx };
         }
         try pool.dispatchJobsIo(handle, jobs);
+        for (heads) |head| if (head.failure) |err| return err;
         try handle.checkCancel();
     } else {
         for (0..num_heads) |h| {
-            var ctx = Head{ .Q = Q, .K = K, .V = V, .ranges = ranges, .query_positions = query_positions, .key_positions = key_positions, .window = window, .queries = queries, .keys = keys, .head_dim = head_dim, .H = H, .h = h, .scale = scale, .output = output, .qh = qhs, .kh = khs, .vh = vhs, .oh = ohs, .score_tile = scores };
+            var ctx = Head{ .io = io, .Q = Q, .K = K, .V = V, .ranges = ranges, .query_positions = query_positions, .key_positions = key_positions, .window = window, .queries = queries, .keys = keys, .head_dim = head_dim, .H = H, .h = h, .scale = scale, .output = output, .qh = qhs, .kh = khs, .vh = vhs, .oh = ohs, .score_tile = scores };
             Head.run(&ctx);
+            if (ctx.failure) |err| return err;
         }
     }
     return output;
@@ -816,6 +826,8 @@ fn SegmentHeadWork(comptime Gemm: type) type {
     const block_q = if (@hasDecl(Gemm, "query_block")) Gemm.query_block else BLOCK_Q;
     const block_kv = if (@hasDecl(Gemm, "key_block")) Gemm.key_block else BLOCK_KV;
     return struct {
+        io: ?std.Io = null,
+        failure: ?anyerror = null,
         Q: []const f32,
         K: []const f32,
         V: []const f32,
@@ -837,6 +849,11 @@ fn SegmentHeadWork(comptime Gemm: type) type {
         score_tile: []f32,
         fn run(raw: *anyopaque) void {
             const self: *@This() = @ptrCast(@alignCast(raw));
+            self.execute() catch |err| {
+                self.failure = err;
+            };
+        }
+        fn execute(self: *@This()) !void {
             const Q = self.Q;
             const K = self.K;
             const V = self.V;
@@ -867,6 +884,7 @@ fn SegmentHeadWork(comptime Gemm: type) type {
             @memset(oh, 0);
             var q_start: usize = 0;
             while (q_start < queries) : (q_start += block_q) {
+                if (self.io) |io| try io.checkCancel();
                 const cur_bq = @min(block_q, queries - q_start);
                 for (0..cur_bq) |r| {
                     row_max[r] = -std.math.inf(f32);
@@ -901,6 +919,7 @@ fn SegmentHeadWork(comptime Gemm: type) type {
                 for (intervals[0..merged]) |interval| {
                     var kv_start: usize = interval[0];
                     while (kv_start < interval[1]) {
+                        if (self.io) |io| try io.checkCancel();
                         const kv_end = @min(kv_start + block_kv, interval[1]);
                         const cur_bkv = kv_end - kv_start;
                         const tile = score_tile[0 .. cur_bq * cur_bkv];
@@ -2980,4 +2999,33 @@ test "flash attention unmasked tiles match explicit all-valid masks" {
     defer a.free(actual);
     try std.testing.expectEqualSlices(f32, expected, actual);
     try std.testing.expectError(error.InvalidAttentionShape, flashAttentionHostWithIo(a, std.testing.io, input, input, input, null, mask[0..seq], batch, seq, heads, dim));
+}
+
+test "segmentAttentionHost serial Io bounds scratch and cancels between BLAS tiles before exact retry" {
+    const Case = struct {
+        fn run(a: std.mem.Allocator, io: std.Io) !void {
+            const q: [12]f32 = @splat(0.25);
+            const k: [18]f32 = @splat(-0.5);
+            const v: [18]f32 = @splat(0.75);
+            const output = try segmentAttentionHostWithGemmSerialIo(SegmentParallelTestGemm, a, io, &q, &k, &v, &.{ 0, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 }, &.{ 0, 1 }, &.{ 0, 1, 2 }, std.math.maxInt(u32), 2, 3, 2, 3);
+            defer a.free(output);
+            for (output[0..6]) |value| try std.testing.expectApproxEqAbs(@as(f32, 0.75), value, 1e-6);
+            for (output[6..]) |value| try std.testing.expectEqual(@as(f32, 0), value);
+        }
+        var calls: u32 = 0;
+        fn check(_: ?*anyopaque) std.Io.Cancelable!void {
+            calls += 1;
+            if (calls >= 3) return error.Canceled;
+        }
+    };
+    try Case.run(std.testing.allocator, std.testing.io);
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Case.run, .{std.testing.io});
+    var table = std.testing.io.vtable.*;
+    table.checkCancel = Case.check;
+    var io = std.testing.io;
+    io.vtable = &table;
+    Case.calls = 0;
+    try std.testing.expectError(error.Canceled, Case.run(std.testing.allocator, io));
+    try std.testing.expectEqual(@as(u32, 3), Case.calls);
+    try Case.run(std.testing.allocator, std.testing.io);
 }

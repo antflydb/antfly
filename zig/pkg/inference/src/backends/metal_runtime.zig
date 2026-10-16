@@ -3139,6 +3139,18 @@ pub fn decoderRuntimeApplyMrope(self: anytype, request: anytype) !?MetalTensor {
 /// Applies Qwen3-VL vision RoPE with axis-major height/width positions.
 /// This is intentionally device-only: the projector must not silently copy
 /// Q/K through host memory on the production Metal route.
+pub fn decoderRuntimeVisionNormRope(self: anytype, input: MetalTensor, weight: MetalTensor, p: anytype) !?MetalTensor {
+    const runtime = self.raw_decode_runtime orelse return null;
+    if (!input.isDevice() or !weight.isDevice() or input.dtype != .f32 or weight.dtype != .f32) return null;
+    if (p.rows == 0 or p.head_dim == 0 or p.head_dim % 4 != 0 or p.hidden % p.head_dim != 0 or p.grid_x == 0 or p.grid_y == 0 or p.theta <= 0 or input.elemCount() != @as(usize, p.rows) * p.hidden or weight.elemCount() != p.head_dim) return error.InvalidTensorShape;
+    var output = try MetalTensor.deviceAllocate(runtime, input.elemCount() * @sizeOf(f32), .private, input.shape());
+    errdefer output.deinit();
+    const rc = termite_metal_decode_runtime_vision_norm_rope(runtime, input.deviceHandle(), input.deviceByteOffset(), weight.deviceHandle(), weight.deviceByteOffset(), output.deviceHandle(), output.deviceByteOffset(), &p);
+    if (rc != 0) return error.UnsupportedPrimitiveOp;
+    return output;
+}
+extern fn termite_metal_decode_runtime_vision_norm_rope(runtime: ?*anyopaque, input: ?*anyopaque, input_offset: usize, weight: ?*anyopaque, weight_offset: usize, output: ?*anyopaque, output_offset: usize, params: *const @import("../ops/ops.zig").VisionNormRopeParams) c_int;
+
 pub fn decoderRuntimeApplyVisionRope(self: anytype, request: anytype) !?MetalTensor {
     const runtime = self.raw_decode_runtime orelse return null;
     if (termite_metal_decode_runtime_ready(runtime) == 0) return null;

@@ -33,8 +33,13 @@ fn visionCacheCanRelieve(pressure: @import("../runtime/tier/memory.zig").Admissi
     };
 }
 
+fn reclaimMediaWeights(session: Session, control: Control) !usize {
+    const vision = try factory.reclaimEmbeddingGemma2VisionWeights(session, control);
+    return vision + try factory.reclaimEmbeddingGemma2AudioWeights(session, control);
+}
+
 fn admitWithVisionCacheReclaim(session: Session, request: @import("../backends/session.zig").RunRequest, control: Control) !@import("../backends/session.zig").RunPermit {
-    return admitReclaimingVisionCache(session, request, control, session, factory.reclaimEmbeddingGemma2VisionWeights, factory.reclaimEmbeddingGemma2LanguageWeights);
+    return admitReclaimingVisionCache(session, request, control, session, reclaimMediaWeights, factory.reclaimEmbeddingGemma2LanguageWeights);
 }
 
 /// Optional caches cannot starve an unchanged request reservation. Prefer
@@ -47,7 +52,12 @@ fn admitReclaimingVisionCache(session: Session, request: @import("../backends/se
         var denied: anyerror = err;
         inline for (.{ reclaim_vision, reclaim_language }) |reclaim| {
             const reason = pressure orelse return denied;
-            if (!visionCacheCanRelieve(reason)) return denied;
+            const native_pressure = session.backend() == .native and switch (reason) {
+                .shared_host => true,
+                .domain_host, .domain_combined => |backend| backend == .cpu,
+                else => false,
+            };
+            if (!visionCacheCanRelieve(reason) and !native_pressure) return denied;
             try control.check();
             const bytes = try reclaim(context, control);
             try control.check();

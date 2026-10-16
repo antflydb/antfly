@@ -225,6 +225,14 @@ stay in stable slots until completed execution and worker join. Independent
 window identity, sample selection, output ordering and continuation semantics
 remain unchanged by batching.
 
+Model-owned language, vision and audio preparation caches have separate payload
+ceilings under shared process admission. Cache capacity grants no extra memory.
+Idle class reclamation happens before retrying an unchanged run reservation;
+CPU compute owners pin borrowed immutable mirrors until request teardown, and
+Metal refuses reclamation while a command group is active or submitted. Warm
+model admission reuses the loaded generation's validated metadata; source
+version, content policy and execution identity validation still apply.
+
 ## Verification
 
 From the repository root, with its pinned Zig toolchain:

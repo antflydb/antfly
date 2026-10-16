@@ -8460,15 +8460,22 @@ pub fn reclaimEmbeddingGemma2VisionWeights(session: Session, control: InferenceE
     return reclaimEmbeddingGemma2Weights(session, control, .vision);
 }
 
+pub fn reclaimEmbeddingGemma2AudioWeights(session: Session, control: InferenceExecutionControl) !usize {
+    return reclaimEmbeddingGemma2Weights(session, control, .audio);
+}
+
 pub fn reclaimEmbeddingGemma2LanguageWeights(session: Session, control: InferenceExecutionControl) !usize {
     return reclaimEmbeddingGemma2Weights(session, control, .language);
 }
 
 fn reclaimEmbeddingGemma2Weights(session: Session, control: InferenceExecutionControl, cache_class: @import("../models/embedding_gemma2_weight_cache.zig").MetalClass) !usize {
-    if (comptime !build_options.enable_metal) return 0;
     if (session.vtable != &arch_vtable) return 0;
     const self: *ArchSession = @ptrCast(@alignCast(session.ptr));
-    if (self.backend_type != .metal or self.arch_config != .embedding_gemma2) return 0;
+    if (self.arch_config != .embedding_gemma2) return 0;
+    try control.check();
+    if (self.backend_type == .native) return native_mod.reclaimEmbeddingGemma2Weights(&self.backend_data.native, cache_class);
+    if (comptime !build_options.enable_metal) return 0;
+    if (self.backend_type != .metal) return 0;
     try control.check();
     var guard = try control.enterUninterruptible(session.interruption());
     defer guard.deinit();

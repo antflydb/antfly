@@ -6233,6 +6233,18 @@ pub const ModelManager = struct {
         return try model.manifest.clone(allocator);
     }
 
+    /// Admission metadata belongs to the loaded immutable generation. A clone
+    /// outlives the cache pin; execution independently pins and verifies its
+    /// generation before consuming input. Explicit retirement/reload publishes
+    /// a different manifest instead of reparsing the tokenizer per request.
+    pub fn copyCachedEmbeddingGemma2Manifest(self: *ModelManager, allocator: std.mem.Allocator, model_dir: []const u8) !?manifest_mod.ModelManifest {
+        var handle = (try self.acquireCachedFromDir(model_dir)) orelse return null;
+        defer handle.release();
+        const model = handle.get();
+        if (model.manifest.embedding_style != .embedding_gemma2) return null;
+        return try model.manifest.clone(allocator);
+    }
+
     /// Pin one handle for every currently published model. Callers may release
     /// load_lock before taking per-model locks without racing model eviction or
     /// retirement destruction. Metrics/listing observation does not renew TTL;
@@ -13870,4 +13882,29 @@ test "capi resolver model identity uses receipt digests before load and survives
     try second.dir.writeFile(io, .{ .sub_path = managed_receipt.complete_filename, .data = receipt });
     try second.dir.writeFile(io, .{ .sub_path = "model.safetensors", .data = "different fake model weights" });
     try std.testing.expectError(error.ChecksumMismatch, modelIdentity(a, io, second_path, manifest));
+}
+
+test "embeddinggemma2 generation metadata clones survive retirement and release pins on OOM" {
+    const a = std.testing.allocator;
+    var manager = ModelManager.init(a, .{ .allocator = a, .preferred_backends = &.{.metal} });
+    defer manager.deinit();
+    try manager.ensureResourceOwnerReady();
+    var probe = TeardownTestProbe{};
+    const model = try teardownTestModel(&manager, &probe);
+    model.manifest.embedding_style = .embedding_gemma2;
+    model.manifest.hidden_size = 512;
+    model.manifest.embedding_profile.query.prefix = try a.dupe(u8, "task: search result | query: ");
+    var inference = try manager.publishLoadedModel(model, true, null, null);
+    defer inference.release();
+    var failing = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
+    try std.testing.expectError(error.OutOfMemory, manager.copyCachedEmbeddingGemma2Manifest(failing.allocator(), "teardown-fixture"));
+    try std.testing.expectEqual(@as(usize, 1), model.active_handles);
+    var copy = (try manager.copyCachedEmbeddingGemma2Manifest(a, "teardown-fixture")).?;
+    defer copy.deinit();
+    try std.testing.expectEqual(@as(usize, 1), model.active_handles);
+    inference.retire();
+    try std.testing.expect(probe.closed);
+    try std.testing.expectEqual(@as(u32, 512), copy.hidden_size);
+    try std.testing.expectEqualStrings("task: search result | query: ", copy.queryPrefix());
+    try std.testing.expect((try manager.copyCachedEmbeddingGemma2Manifest(a, "teardown-fixture")) == null);
 }

@@ -61,6 +61,52 @@ pub fn gelu(data: []f32) void {
     }
 }
 
+/// GELU and gate multiplication stream through cache-sized tiles. Workers
+/// own disjoint output ranges and retain the exact existing SIMD arithmetic.
+pub fn geluMultiplyIo(io: ?std.Io, gate: []const f32, up: []const f32, out: []f32) !void {
+    if (gate.len != up.len or gate.len != out.len) return error.InvalidTensorShape;
+    const Job = struct {
+        io: ?std.Io,
+        gate: []const f32,
+        up: []const f32,
+        out: []f32,
+        failure: ?anyerror = null,
+        fn run(self: *@This()) void {
+            self.execute() catch |err| {
+                self.failure = err;
+            };
+        }
+        fn execute(self: *@This()) !void {
+            var offset: usize = 0;
+            while (offset < self.out.len) {
+                if (self.io) |runtime| try runtime.checkCancel();
+                const stop = @min(self.out.len, offset + 4096);
+                const tile = self.out[offset..stop];
+                @memcpy(tile, self.gate[offset..stop]);
+                gelu(tile);
+                var lane: usize = 0;
+                while (lane + VEC_LEN <= tile.len) : (lane += VEC_LEN) tile[lane..][0..VEC_LEN].* = @as(F32xN, tile[lane..][0..VEC_LEN].*) * @as(F32xN, self.up[offset + lane ..][0..VEC_LEN].*);
+                while (lane < tile.len) : (lane += 1) tile[lane] *= self.up[offset + lane];
+                offset = stop;
+            }
+        }
+    };
+    const workers: usize = if (io != null and gate.len >= 262144) 4 else 1;
+    var jobs: [4]Job = undefined;
+    for (jobs[0..workers], 0..) |*job, index| {
+        const first = (gate.len / VEC_LEN * index / workers) * VEC_LEN;
+        const last = if (index + 1 == workers) gate.len else (gate.len / VEC_LEN * (index + 1) / workers) * VEC_LEN;
+        job.* = .{ .io = io, .gate = gate[first..last], .up = up[first..last], .out = out[first..last] };
+    }
+    if (workers == 1) jobs[0].run() else {
+        var group: std.Io.Group = .init;
+        defer group.cancel(io.?);
+        for (jobs[0..workers]) |*job| group.async(io.?, Job.run, .{job});
+        try group.await(io.?);
+    }
+    for (jobs[0..workers]) |job| if (job.failure) |err| return err;
+}
+
 /// Split independent GELU lanes without changing SIMD groups or the scalar
 /// tail. Jobs borrow disjoint slices; every job is drained before return.
 pub fn geluParallelIo(io: std.Io, data: []f32) std.Io.Cancelable!void {
@@ -1262,4 +1308,29 @@ test "sampleFromProbs distribution" {
     const probs = [_]f32{ 0.0, 0.0, 1.0, 0.0 };
     const idx = sampleFromProbs(&probs);
     try std.testing.expectEqual(@as(usize, 2), idx);
+}
+
+test "embeddinggemma2 fused GELU product preserves SIMD tails and parallel partitions" {
+    const a = std.testing.allocator;
+    for ([_]usize{ 0, 7, 4099, 262147 }) |count| {
+        const gate = try a.alloc(f32, count);
+        defer a.free(gate);
+        const up = try a.alloc(f32, count);
+        defer a.free(up);
+        const expected = try a.alloc(f32, count);
+        defer a.free(expected);
+        const actual = try a.alloc(f32, count);
+        defer a.free(actual);
+        for (gate, up, 0..) |*x, *y, i| {
+            x.* = @sin(@as(f32, @floatFromInt(i)) * 0.17) * 5;
+            y.* = @cos(@as(f32, @floatFromInt(i)) * 0.11);
+        }
+        @memcpy(expected, gate);
+        gelu(expected);
+        for (expected, up) |*x, y| x.* *= y;
+        for ([_]?std.Io{ null, std.testing.io }) |io| {
+            try geluMultiplyIo(io, gate, up, actual);
+            try std.testing.expectEqualSlices(f32, expected, actual);
+        }
+    }
 }

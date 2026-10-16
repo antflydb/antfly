@@ -425,6 +425,7 @@ pub const flashAttentionHostWithIo = attention.flashAttentionHostWithIo;
 pub const segmentAttentionHost = attention.segmentAttentionHost;
 pub const segmentAttentionHostWithGemm = attention.segmentAttentionHostWithGemm;
 pub const segmentAttentionHostWithGemmParallelIo = attention.segmentAttentionHostWithGemmParallelIo;
+pub const segmentAttentionHostWithGemmSerialIo = attention.segmentAttentionHostWithGemmSerialIo;
 pub const segmentTrainingAttentionForwardHost = attention.segmentTrainingAttentionForwardHost;
 pub const segmentTrainingAttentionBackwardHost = attention.segmentTrainingAttentionBackwardHost;
 pub const SegmentTrainingAttentionForward = attention.SegmentTrainingAttentionForward;

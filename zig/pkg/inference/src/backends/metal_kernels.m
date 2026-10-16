@@ -1038,6 +1038,7 @@ typedef struct termite_metal_decode_runtime {
     id<MTLComputePipelineState> q8_1_cpy_f32_to_q_pipeline;
     id<MTLComputePipelineState> rope_pipeline;
     id<MTLComputePipelineState> mrope_pipeline;
+    id<MTLComputePipelineState> vision_norm_rope_pipeline;
     id<MTLComputePipelineState> rope_pair_pipeline;
     id<MTLComputePipelineState> head_rms_rope_pipeline;
     id<MTLComputePipelineState> head_rms_rope_hd128_sg_pipeline;
@@ -13323,6 +13324,22 @@ static NSString *termite_metal_shader_source(void) {
            "    if (d == idx0) output[gid] = x0 * cos_val - x1 * sin_val;\n"
            "    else if (d == idx1) output[gid] = x0 * sin_val + x1 * cos_val;\n"
            "    else output[gid] = input[gid];\n"
+           "}\n"
+           "struct termite_vision_norm_rope_params { uint rows, hidden, head_dim, grid_x, grid_y; float eps, theta, scale; };\n"
+           "kernel void termite_vision_norm_rope(device const float *input [[buffer(0)]], device const float *weight [[buffer(1)]], device float *output [[buffer(2)]], constant termite_vision_norm_rope_params &p [[buffer(3)]], uint head [[threadgroup_position_in_grid]], uint lane [[thread_index_in_simdgroup]]) {\n"
+           "    uint heads = p.hidden / p.head_dim; uint row = head / heads; uint base = head * p.head_dim;\n"
+           "    float sum = 0.0f;\n"
+           "    for (uint d = lane; d < p.head_dim; d += 32u) { float x = input[base + d]; sum += x*x; }\n"
+           "    float inv = rsqrt(simd_sum(sum) / float(p.head_dim) + p.eps);\n"
+           "    uint quarter = p.head_dim / 4u;\n"
+           "    for (uint pair = lane; pair < p.head_dim / 2u; pair += 32u) {\n"
+           "        uint axis = pair / quarter; uint j = pair % quarter; uint a = axis * 2u * quarter + j; uint b = a + quarter;\n"
+           "        float position = axis == 0u ? float(row % p.grid_x) : float((row / p.grid_x) % p.grid_y);\n"
+           "        float angle = position / pow(p.theta, float(2u*j)/float(p.head_dim/2u));\n"
+           "        float x = input[base+a] * inv * weight[a]; float y = input[base+b] * inv * weight[b];\n"
+           "        output[base+a] = (x*cos(angle)-y*sin(angle))*p.scale;\n"
+           "        output[base+b] = (y*cos(angle)+x*sin(angle))*p.scale;\n"
+           "    }\n"
            "}\n"
            "kernel void termite_apply_mrope(device const float *input [[buffer(0)]], device const uint *positions [[buffer(1)]], device float *output [[buffer(2)]], constant termite_metal_mrope_params &p [[buffer(3)]], uint gid [[thread_position_in_grid]]) {\n"
            "    uint total = p.total_chunks * p.head_dim;\n"
@@ -28181,6 +28198,7 @@ termite_metal_decode_runtime *termite_metal_decode_runtime_create(void) {
         runtime->q8_1_cpy_f32_to_q_pipeline = termite_metal_make_pipeline(device, library, @"termite_q8_1_cpy_f32_to_q");
         runtime->rope_pipeline = termite_metal_make_pipeline(device, precise_library, @"termite_apply_rope");
         runtime->mrope_pipeline = termite_metal_make_pipeline(device, precise_library, @"termite_apply_mrope");
+        runtime->vision_norm_rope_pipeline = termite_metal_make_pipeline(device, precise_library, @"termite_vision_norm_rope");
         runtime->rope_pair_pipeline = termite_metal_make_pipeline(device, precise_library, @"termite_apply_rope_pair");
         runtime->head_rms_rope_pipeline = termite_metal_make_pipeline(device, precise_library, @"termite_apply_head_rms_rope");
         const bool enable_qwen_head_norm_sg = termite_metal_qualified_m4_feature_enabled("TERMITE_METAL_ENABLE_QWEN3_HEAD_NORM_SG");
@@ -29234,6 +29252,7 @@ void termite_metal_decode_runtime_destroy(termite_metal_decode_runtime *runtime)
     runtime->q8_1_cpy_f32_to_q_pipeline = nil;
     runtime->rope_pipeline = nil;
     runtime->mrope_pipeline = nil;
+    runtime->vision_norm_rope_pipeline = nil;
     runtime->rope_pair_pipeline = nil;
     runtime->head_rms_rope_pipeline = nil;
     runtime->head_rms_rope_hd128_sg_pipeline = nil;
@@ -32113,6 +32132,39 @@ int termite_metal_decode_runtime_apply_mrope_device(
               threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(runtime->mrope_pipeline, total_values), 1, 1)];
         termite_metal_end_scoped_compute_encoder(encoder, encoder_owned);
         return termite_metal_decode_runtime_finish_command_buffer(command_buffer, frame_owned, -12);
+    }
+}
+
+typedef struct { uint32_t rows, hidden, head_dim, grid_x, grid_y; float eps, theta, scale; } termite_vision_norm_rope_params;
+int termite_metal_decode_runtime_vision_norm_rope(termite_metal_decode_runtime *runtime,
+    void *input, size_t input_offset, void *weight, size_t weight_offset,
+    void *output, size_t output_offset, const termite_vision_norm_rope_params *p) {
+    if (!runtime || !input || !weight || !output || !p || !runtime->vision_norm_rope_pipeline) return -1;
+    if (!p->rows || !p->head_dim || p->head_dim % 4u || p->hidden % p->head_dim || !p->grid_x || !p->grid_y || !(p->theta > 0)) return -2;
+    size_t count, bytes, weight_bytes;
+    if (!termite_metal_size_mul(p->rows, p->hidden, &count) || count > UINT32_MAX ||
+        !termite_metal_size_mul(count, sizeof(float), &bytes) || !termite_metal_size_mul(p->head_dim, sizeof(float), &weight_bytes)) return -3;
+    @autoreleasepool {
+        id<MTLBuffer> x = (__bridge id<MTLBuffer>)input;
+        id<MTLBuffer> w = (__bridge id<MTLBuffer>)weight;
+        id<MTLBuffer> y = (__bridge id<MTLBuffer>)output;
+        if (!termite_metal_buffer_range_valid(x, input_offset, bytes) || !termite_metal_buffer_range_valid(w, weight_offset, weight_bytes) || !termite_metal_buffer_range_valid(y, output_offset, bytes)) return -4;
+        bool owned = runtime->active_frame_cb == nil;
+        id<MTLCommandBuffer> cb = termite_metal_decode_runtime_command_buffer(runtime, __func__, &owned);
+        if (!cb) return -5;
+        BOOL encoder_owned = YES;
+        id<MTLComputeCommandEncoder> encoder = termite_metal_scoped_compute_encoder_for(runtime, cb, TERMITE_METAL_COMPUTE_SOURCE_HEAD_ROPE, &encoder_owned);
+        if (!encoder) return -6;
+        int rc = termite_metal_decode_runtime_prepare_planned_compute_binary_accesses(runtime, x, input_offset, bytes, w, weight_offset, weight_bytes, y, output_offset, bytes, -7);
+        if (rc) { termite_metal_end_scoped_compute_encoder(encoder, encoder_owned); return rc; }
+        [encoder setComputePipelineState:runtime->vision_norm_rope_pipeline];
+        [encoder setBuffer:x offset:input_offset atIndex:0];
+        [encoder setBuffer:w offset:weight_offset atIndex:1];
+        [encoder setBuffer:y offset:output_offset atIndex:2];
+        [encoder setBytes:p length:sizeof(*p) atIndex:3];
+        [encoder dispatchThreadgroups:MTLSizeMake(count / p->head_dim, 1, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+        termite_metal_end_scoped_compute_encoder(encoder, encoder_owned);
+        return termite_metal_decode_runtime_finish_command_buffer(cb, owned, -8);
     }
 }
 

@@ -3667,7 +3667,21 @@ fn selfAttentionBatch(
     const total = batch * sequence;
     const head_dim = cfg.vision_hidden / cfg.head_count;
 
-    var q = try linearNoBiasMaybeClipped(cb, allocator, store, input, try fmt(buf, "v.blk.{d}.attn_q", .{layer}), total, cfg.vision_hidden, cfg.vision_hidden);
+    // EmbeddingGemma2 vision linears have no clipping or biases. The backend
+    // may cache one admitted packed QKV projection for this immutable model.
+    var packed_qkv: ?@import("../ops/ops.zig").LinearTripleResult = null;
+    if (cfg.embedding_gemma2_f32_attention and store.gguf == null) {
+        var names: [3][128]u8 = undefined;
+        const q_name = try std.fmt.bufPrint(&names[0], "vision_tower.encoder.layers.{d}.self_attn.q_proj.linear.weight", .{layer});
+        const k_name = try std.fmt.bufPrint(&names[1], "vision_tower.encoder.layers.{d}.self_attn.k_proj.linear.weight", .{layer});
+        const v_name = try std.fmt.bufPrint(&names[2], "vision_tower.encoder.layers.{d}.self_attn.v_proj.linear.weight", .{layer});
+        packed_qkv = try cb.linearTripleNoBiasNamed(input, .{ q_name, k_name, v_name }, total, cfg.vision_hidden, cfg.vision_hidden);
+    }
+    var remaining_k = if (packed_qkv) |triple| @as(?CT, triple.second) else null;
+    defer if (remaining_k) |tensor| cb.free(tensor);
+    var remaining_v = if (packed_qkv) |triple| @as(?CT, triple.third) else null;
+    defer if (remaining_v) |tensor| cb.free(tensor);
+    var q = if (packed_qkv) |triple| triple.first else try linearNoBiasMaybeClipped(cb, allocator, store, input, try fmt(buf, "v.blk.{d}.attn_q", .{layer}), total, cfg.vision_hidden, cfg.vision_hidden);
     defer cb.free(q);
     {
         const q_norm_w = try store.weightCt(try fmt(buf, "v.blk.{d}.attn_q_norm.weight", .{layer}));
@@ -3678,7 +3692,8 @@ fn selfAttentionBatch(
     }
 
     try profile.phase(cb, "q_projection_norm_rope");
-    var k = try linearNoBiasMaybeClipped(cb, allocator, store, input, try fmt(buf, "v.blk.{d}.attn_k", .{layer}), total, cfg.vision_hidden, cfg.vision_hidden);
+    var k = remaining_k orelse try linearNoBiasMaybeClipped(cb, allocator, store, input, try fmt(buf, "v.blk.{d}.attn_k", .{layer}), total, cfg.vision_hidden, cfg.vision_hidden);
+    remaining_k = null;
     defer cb.free(k);
     {
         const k_norm_w = try store.weightCt(try fmt(buf, "v.blk.{d}.attn_k_norm.weight", .{layer}));
@@ -3689,7 +3704,8 @@ fn selfAttentionBatch(
     }
 
     try profile.phase(cb, "k_projection_norm_rope");
-    var v = try linearNoBiasMaybeClipped(cb, allocator, store, input, try fmt(buf, "v.blk.{d}.attn_v", .{layer}), total, cfg.vision_hidden, cfg.vision_hidden);
+    var v = remaining_v orelse try linearNoBiasMaybeClipped(cb, allocator, store, input, try fmt(buf, "v.blk.{d}.attn_v", .{layer}), total, cfg.vision_hidden, cfg.vision_hidden);
+    remaining_v = null;
     defer cb.free(v);
     {
         const normed = try rmsNormHeadChunksNoScale(cb, allocator, v, total, cfg.vision_hidden, head_dim, cfg.layer_norm_eps);
@@ -3710,6 +3726,11 @@ fn selfAttentionBatch(
     return linearNoBiasMaybeClipped(cb, allocator, store, attn, try fmt(buf, "v.blk.{d}.attn_out", .{layer}), total, cfg.vision_hidden, cfg.vision_hidden);
 }
 
+fn visionNormRopeParams(rows: usize, hidden: usize, head_dim: usize, geometry: Geometry, eps: f32, theta: f32, compensate: bool) ?@import("../ops/ops.zig").VisionNormRopeParams {
+    if (head_dim == 0 or head_dim % 4 != 0 or hidden % head_dim != 0) return null;
+    return .{ .rows = std.math.cast(u32, rows) orelse return null, .hidden = std.math.cast(u32, hidden) orelse return null, .head_dim = std.math.cast(u32, head_dim) orelse return null, .grid_x = std.math.cast(u32, geometry.grid_x) orelse return null, .grid_y = std.math.cast(u32, geometry.grid_y) orelse return null, .eps = eps, .theta = theta, .scale = if (compensate) @sqrt(@as(f32, @floatFromInt(head_dim))) else 1 };
+}
+
 fn rmsNormHeadChunksAnd2dRope(
     cb: *const ComputeBackend,
     allocator: std.mem.Allocator,
@@ -3723,6 +3744,9 @@ fn rmsNormHeadChunksAnd2dRope(
     rope_theta: f32,
     compensate_sdpa_scale: bool,
 ) !CT {
+    if (visionNormRopeParams(rows, hidden, head_dim, geometry, eps, rope_theta, compensate_sdpa_scale)) |params| {
+        if (try cb.visionNormRope(input, weight, params)) |output| return output;
+    }
     if (head_dim % 4 == 0 and cb.vtable.visionRope != null and cb.vtable.reshapeOp != null and cb.vtable.transposeOp != null and cb.vtable.multiplyScalar != null) {
         const chunks = try cb.primReshape(input, &.{ @intCast(rows * (hidden / head_dim)), @intCast(head_dim) });
         defer cb.free(chunks);
@@ -3859,9 +3883,11 @@ fn feedForward(
     const up = try linearNoBiasMaybeClipped(cb, allocator, store, input, try fmt(buf, "v.blk.{d}.ffn_up", .{layer}), total, cfg.vision_hidden, cfg.intermediate_size);
     defer cb.free(up);
 
-    const activated = try cb.gelu(gate);
-    defer cb.free(activated);
-    const gated = try cb.multiply(activated, up);
+    const gated = (try cb.activationMultiply(gate, up, .gelu)) orelse blk: {
+        const activated = try cb.gelu(gate);
+        defer cb.free(activated);
+        break :blk try cb.multiply(activated, up);
+    };
     defer cb.free(gated);
 
     return linearNoBiasMaybeClipped(cb, allocator, store, gated, try fmt(buf, "v.blk.{d}.ffn_down", .{layer}), total, cfg.intermediate_size, cfg.vision_hidden);
@@ -5286,4 +5312,113 @@ test "model aware media audio preflight matches independently prepared feature m
         }
     }
     try std.testing.expectError(error.AudioTooLong, embeddingGemma2PcmSequenceLength(480001, 16000));
+}
+
+test "embeddinggemma2 native SIMD audio local attention matches scalar masks tails chunks and parallel rows" {
+    const a = std.testing.allocator;
+    for ([_]usize{ 1, 31, 65 }) |rows| for ([_]usize{ 7, 16 }) |dim| for ([_]bool{ false, true }) |exclude| {
+        const heads = 2;
+        const hidden = heads * dim;
+        const params = @import("../ops/ops.zig").Gemma4AudioLocalAttentionParams{ .rows = rows, .hidden = hidden, .heads = heads, .head_dim = dim, .chunk = 12, .context_left = 13, .context = 24, .k_scale = audioKeyScale(), .logit_cap = 50, .invalid_value = -1e9, .exclude_farthest_key = exclude };
+        const values = try a.alloc(f32, rows * hidden * 3 + 13 * hidden + dim);
+        defer a.free(values);
+        for (values, 0..) |*x, i| x.* = @sin(@as(f32, @floatFromInt(i)) * 0.173) * 0.4;
+        const q = values[0 .. rows * hidden];
+        const k = values[rows * hidden ..][0 .. rows * hidden];
+        const v = values[2 * rows * hidden ..][0 .. rows * hidden];
+        const rel = values[3 * rows * hidden ..][0 .. 13 * hidden];
+        const scales = values[3 * rows * hidden + 13 * hidden ..];
+        const valid = try a.alloc(bool, rows);
+        defer a.free(valid);
+        const mask = try a.alloc(f32, rows);
+        defer a.free(mask);
+        for (valid, mask, 0..) |*b, *m, i| {
+            b.* = i % 7 != 0;
+            m.* = if (b.*) 1 else 0;
+        }
+        const expected = try audioLocalAttentionReference(a, params, q, k, v, rel, scales, valid);
+        defer a.free(expected);
+        for ([_]?std.Io{ null, std.testing.io }) |io| {
+            const actual = try @import("../ops/native_audio_attention.zig").forward(a, io, params, q, k, v, rel, scales, mask);
+            defer a.free(actual);
+            for (expected, actual) |x, y| try std.testing.expectApproxEqAbs(x, y, 1e-6);
+        }
+    };
+}
+
+test "embeddinggemma2 fused vision normalization rotation preserves original axis layout" {
+    const a = std.testing.allocator;
+    var store = @import("../ops/native_compute.zig").WeightStore{ .allocator = a, .resident_weights = .empty, .lazy_weights = .empty };
+    var compute = @import("../ops/native_compute.zig").NativeCompute.init(a, &store, null);
+    defer compute.deinit();
+    const cb = compute.computeBackend();
+    const rows = 12;
+    const dim = 64;
+    var values: [rows * 2 * dim]f32 = undefined;
+    var weights: [dim]f32 = undefined;
+    for (&values, 0..) |*x, i| x.* = @sin(@as(f32, @floatFromInt(i)) * 0.137);
+    for (&weights, 0..) |*w, i| w.* = 0.5 + @as(f32, @floatFromInt(i)) / 64;
+    const input = try cb.fromFloat32Shape(&values, &.{ rows, 2 * dim });
+    defer cb.free(input);
+    const weight = try cb.fromFloat32Shape(&weights, &.{dim});
+    defer cb.free(weight);
+    const geometry = Geometry{ .width = 48, .height = 32, .grid_x = 3, .grid_y = 2, .pooled_x = 3, .pooled_y = 2 };
+    for ([_]bool{ false, true }) |compensate| {
+        var expected = values;
+        activations.rmsNorm(&expected, &weights, dim, 1e-6);
+        apply2dRope(&expected, rows, 2 * dim, dim, geometry, 10000, compensate);
+        const result = (try cb.visionNormRope(input, weight, visionNormRopeParams(rows, 2 * dim, dim, geometry, 1e-6, 10000, compensate).?)).?;
+        defer cb.free(result);
+        const actual = try cb.toFloat32(result, a);
+        defer a.free(actual);
+        for (expected, actual) |x, y| try std.testing.expectApproxEqAbs(x, y, 5e-6);
+    }
+}
+
+fn checkFusedVisionKernels(cb: ComputeBackend, reference: ComputeBackend) !void {
+    const a = std.testing.allocator;
+    var values: [12 * 128]f32 = undefined;
+    var weights: [64]f32 = undefined;
+    for (&values, 0..) |*x, i| x.* = @sin(@as(f32, @floatFromInt(i)) * 0.173);
+    for (&weights, 0..) |*x, i| x.* = 0.75 + @as(f32, @floatFromInt(i)) / 64;
+    const input = try cb.ensureDeviceResidentOwned(try cb.fromFloat32Shape(&values, &.{ 12, 128 }));
+    defer cb.free(input);
+    const weight = try cb.ensureDeviceResidentOwned(try cb.fromFloat32Shape(&weights, &.{64}));
+    defer cb.free(weight);
+    const cpu_input = try reference.fromFloat32Shape(&values, &.{ 12, 128 });
+    defer reference.free(cpu_input);
+    const cpu_weight = try reference.fromFloat32Shape(&weights, &.{64});
+    defer reference.free(cpu_weight);
+    for ([_]bool{ false, true }) |frame| for ([_]f32{ 1, 8 }) |scale| {
+        if (frame) try std.testing.expect(try cb.decoderRuntimeBeginFrame());
+        var active = frame;
+        defer if (active) cb.decoderRuntimeCancelFrame() catch {};
+        const p = @import("../ops/ops.zig").VisionNormRopeParams{ .rows = 12, .hidden = 128, .head_dim = 64, .grid_x = 3, .grid_y = 2, .eps = 1e-6, .theta = 10000, .scale = scale };
+        const before = @import("../ops/media_residency_test.zig").Transfers.snapshot(cb);
+        const result = (try cb.visionNormRope(input, weight, p)).?;
+        defer cb.free(result);
+        const gated = (try cb.activationMultiply(result, input, .gelu)).?;
+        defer cb.free(gated);
+        if (active) {
+            try cb.decoderRuntimeSubmitAndWaitFrame();
+            active = false;
+        }
+        try before.expectUnchanged(cb);
+        const cpu_result = (try reference.visionNormRope(cpu_input, cpu_weight, p)).?;
+        defer reference.free(cpu_result);
+        const cpu_gated = try reference.gelu(cpu_result);
+        defer reference.free(cpu_gated);
+        const cpu_product = try reference.multiply(cpu_gated, cpu_input);
+        defer reference.free(cpu_product);
+        const expected = try reference.toFloat32(cpu_product, a);
+        defer a.free(expected);
+        const actual = try cb.toFloat32(gated, a);
+        defer a.free(actual);
+        for (expected, actual) |x, y| try std.testing.expectApproxEqAbs(x, y, 2e-5);
+    };
+}
+
+test "embeddinggemma2 Metal fused vision RoPE and gated GELU retain frames without downloads" {
+    const fixture = @import("../ops/media_residency_test.zig");
+    try fixture.onMetal(fixture.noWeights, checkFusedVisionKernels);
 }
