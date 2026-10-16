@@ -28114,6 +28114,23 @@ pub const DB = struct {
         return self.core.index_manager.graphReplacementBuildsAlloc(self.core.store, alloc);
     }
 
+    /// Caller owns the returned names and slice. Include upstream artifact
+    /// producers so diagnostics and source replay describe the same dependency.
+    pub fn graphReplacementProducerNamesAlloc(self: *DB, a: Allocator, job: index_manager_mod.GraphReplacementBuild) ![][]u8 {
+        const cfg = job.config orelse return a.alloc([]u8, 0);
+        self.core.index_manager.catalog_mutex.lockShared();
+        defer self.core.index_manager.catalog_mutex.unlockShared();
+        var names: std.ArrayList([]const u8) = .empty;
+        defer names.deinit(a);
+        var graph = try index_manager_mod.parseGraphConfig(a, cfg.config_json);
+        defer graph.deinit(a);
+        for (graph.artifact_sources) |source| try names.append(a, source.artifact_name);
+        for (self.core.index_manager.resolvers.items) |resolver| {
+            if (std.mem.eql(u8, resolver.replacement_index, cfg.name)) try names.append(a, resolver.source_artifact);
+        }
+        return self.core.index_manager.artifactProducerNamesForArtifactsAlloc(a, names.items);
+    }
+
     fn catchUpGraphReplacement(self: *DB, private: *index_manager_mod.IndexManager, name: []const u8, from: u64, target: u64, limit: usize, deadline: ?u64) !u64 {
         if (target <= from) return from;
         var arena = std.heap.ArenaAllocator.init(self.alloc);
@@ -28499,18 +28516,7 @@ pub const DB = struct {
                 try std.base64.standard.Decoder.decode(bytes, encoded);
                 break :blk bytes;
             } else null;
-            const producers = blk: {
-                self.core.index_manager.catalog_mutex.lockShared();
-                defer self.core.index_manager.catalog_mutex.unlockShared();
-                var names: std.ArrayList([]const u8) = .empty;
-                var graph = try index_manager_mod.parseGraphConfig(a, cfg.config_json);
-                defer graph.deinit(a);
-                for (graph.artifact_sources) |source| try names.append(a, source.artifact_name);
-                for (self.core.index_manager.resolvers.items) |resolver| {
-                    if (std.mem.eql(u8, resolver.replacement_index, cfg.name)) try names.append(a, resolver.source_artifact);
-                }
-                break :blk try self.core.index_manager.artifactProducerNamesForArtifactsAlloc(a, names.items);
-            };
+            const producers = try self.graphReplacementProducerNamesAlloc(a, job);
             var page = if (producers.len == 0)
                 GeneratedEnrichmentReplayPageResult{ .complete = true }
             else blk: {

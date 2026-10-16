@@ -308,7 +308,7 @@ fn parseArgs(allocator: std.mem.Allocator, args: []const []const u8) !Options {
 
 fn embedGemma2(a: std.mem.Allocator, io: std.Io, writer: *std.Io.Writer, model: *model_manager_mod.LoadedModel, opts: Options) !void {
     const grouped = @import("pipelines/embedding_gemma2.zig");
-    const watchdog = if (model.session.interruption() == .process_required) try @import("hard_cancellation_watchdog.zig").HardCancellationWatchdog.create(a) else null;
+    const watchdog = if (model.session.interruption() == .uninterruptible) try @import("hard_cancellation_watchdog.zig").HardCancellationWatchdog.create(a) else null;
     defer if (watchdog) |owned| owned.destroy();
     if (watchdog) |owned| try owned.start(io);
     const control = @import("execution_control.zig").InferenceExecutionControl{ .io = io, .hard_cancellation = if (watchdog) |owned| owned.boundary() else null };

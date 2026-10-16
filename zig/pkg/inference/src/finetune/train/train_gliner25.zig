@@ -108,7 +108,7 @@ fn workerMain(init: std.process.Init, config_path: []const u8, stop: ?u64, grace
     const watchdog = try internal.HardCancellationWatchdog.create(init.gpa);
     defer watchdog.destroy();
     try watchdog.start(init.io);
-    var guard = try (internal.InferenceExecutionControl{ .io = init.io, .ptr = worker, .check_fn = process.Worker.checkHard, .hard_cancellation = watchdog.boundary() }).enterUninterruptible(.process_required);
+    var guard = try (internal.InferenceExecutionControl{ .io = init.io, .ptr = worker, .check_fn = process.Worker.checkHard, .hard_cancellation = watchdog.boundary() }).enterUninterruptible(.uninterruptible);
     defer guard.deinit();
     var config = try job.loadConfigSnapshot(init.gpa, init.io, config_path);
     defer config.deinit();

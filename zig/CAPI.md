@@ -159,19 +159,38 @@ handle rather than opening several.
 
 libantfly runs every inference backend, including Metal, CUDA, and ONNX, in
 the calling process. This applies to `antfly_inference` handles and to Lite
-handles opened with local inference.
+handles opened with local inference. A dylib-only build needs neither a
+separate worker executable nor an `ANTFLY_INFERENCE_WORKER` setting.
 
-The `antfly` server runs those backends in a worker process instead, because
-a GPU driver call or an ONNX model load has no per-call abort: the server
-stops a stuck call by killing the worker and starting a new one. A library
-cannot do that to its host program, so libantfly accepts the trade SQLite
-makes and runs them in-process:
+The `antfly` server can supervise inference in a worker to enforce hard
+deadlines around uninterruptible driver and native runtime calls. It can stop
+a stuck call by replacing that worker. Embedded handles keep the application
+in control of its process lifetime:
 
 - Once a call reaches the device or driver it runs to completion.
   `call_timeout_ms`, and closing a handle, take effect when it returns.
   Calls on CPU backends still stop cooperatively.
 - A GPU driver fault terminates the process.
 - A session wedged in the driver blocks close instead of being abandoned.
+
+Compatible native database connections retain one local inference service across
+foreground and maintenance snapshots. Refreshing a checkpoint does not reload
+models or reset admission accounting; the service drains and closes after its
+last retained database snapshot is released. Standalone `antfly_inference`
+handles continue to own independent runtimes.
+
+`antfly_db_status_json` includes `inference.memory_admission` for a local runtime.
+It records the last denied admission's pressure category, requested/admitted
+bytes, configured limits, denial count, and monotonic timestamp. These are
+historical diagnostic values, not a claim that a current request is blocked.
+The limits describe the first request in the denied group; requested bytes are
+the group's totals. An unavailable memory sample is reported as zero.
+
+Graph replacement rows in `antfly_db_pending_work_stats_json` expose
+`blocked_reason`, `producer_artifacts` (including upstream producers),
+`producer_replay_target`, `producer_applied_sequence`, and
+upstream retry/error details. Waiting for producer enrichment preserves the
+graph's own `last_error` and does not spend its failure retry budget.
 
 ## Read-Only Modes
 

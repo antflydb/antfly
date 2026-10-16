@@ -488,7 +488,7 @@ pub const Owner = struct {
         }
         var options = self.options;
         options.externally_locked = true;
-        const replacement = try api.openLiteHandleAllocWithRuntime(alloc, self.path, options, false, h.handleLockIo(), null);
+        const replacement = try api.openLiteHandleAllocWithSharedInference(alloc, self.path, options, false, h.handleLockIo(), null, self.current);
         errdefer h.closeHandle(replacement);
         if (self.current) |previous| {
             if (known_maintenance) |snapshot| {
@@ -675,7 +675,7 @@ pub const Owner = struct {
         options.externally_locked = true;
         options.artifact_reader_fence = true;
         const snapshot = if (need_database) blk: {
-            const opened = try api.openLiteHandleAllocWithRuntime(alloc, self.path, options, false, h.handleLockIo(), null);
+            const opened = try api.openLiteHandleAllocWithSharedInference(alloc, self.path, options, false, h.handleLockIo(), null, foreground);
             if (comptime h.builtin.is_test) self.test_runtime_snapshot_opens += 1;
             break :blk opened;
         } else blk: {

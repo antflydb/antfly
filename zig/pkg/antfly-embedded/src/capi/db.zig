@@ -134,10 +134,16 @@ pub fn startLiteEmbeddedInference(
     const models_dir = if (budget_options.models_dir) |directory| try alloc.dupe(u8, directory) else null;
     errdefer if (models_dir) |directory| alloc.free(directory);
     owned_options.models_dir = models_dir;
+    const service = try alloc.create(handles.SharedLiteInference);
+    errdefer alloc.destroy(service);
     const created = try inference_provider.createEmbeddedInferenceNode(data_dir, io_impl.io(), owned_options);
-    handle.lite_inference_models_dir = models_dir;
-    handle.lite_inference_io = io_impl;
-    handle.lite_inference_lifetime = .{ .handle = created.handle, .resource_owner = created.resource_owner };
+    service.* = .{
+        .alloc = alloc,
+        .io = io_impl,
+        .models_dir = models_dir,
+        .lifetime = .{ .handle = created.handle, .resource_owner = created.resource_owner },
+    };
+    handle.lite_inference = service;
     // Report the policy the node actually resolved (host-detected by
     // default, or the caller's explicit override) rather than leaving
     // `lite_inference_status` at the pre-open placeholder values.
@@ -2607,6 +2613,18 @@ pub fn openLiteHandleAllocWithRuntime(
     borrowed_io: ?std.Io,
     backend_runtime: ?*db_mod.background_runtime.BackendRuntime,
 ) !*Handle {
+    return openLiteHandleAllocWithSharedInference(alloc, path, resolved, create, borrowed_io, backend_runtime, null);
+}
+
+pub fn openLiteHandleAllocWithSharedInference(
+    alloc: Allocator,
+    path: []const u8,
+    resolved: LiteResolvedOpenOptions,
+    create: bool,
+    borrowed_io: ?std.Io,
+    backend_runtime: ?*db_mod.background_runtime.BackendRuntime,
+    inference_source: ?*Handle,
+) !*Handle {
     if (create and !liteOpenModeCanWrite(resolved.open_mode)) return error.InvalidArgument;
     // Each cached generation owns its storage pool. Retired cursors may keep
     // an older generation alive while the same index roots reopen in this one.
@@ -2699,12 +2717,9 @@ pub fn openLiteHandleAllocWithRuntime(
         .lite_inference_status = lite_backend.inferenceStatusForProfileWithOptions(resolved.profile, resolved.inference),
         .lite_generated_enrichment_replay = resolved.generated_enrichment_replay,
     };
-    // Only the native profile runs background enrichment automatically;
-    // only builds that both advertise (lite-local-inference-runtime) and
-    // actually link (capi_build_options.inference_enabled) the local
-    // inference runtime may construct one. Every other combination -- flag
-    // unset, default build, hosted profile -- leaves the handle exactly as
-    // it was before this feature existed.
+    // Native builds link local inference. The native profile starts a service
+    // only when the caller requests it and the target advertises support;
+    // hosted/freestanding surfaces retain caller-supplied inference.
     if (resolved.profile == .native and
         resolved.inference.local_runtime_configured and
         capi_build_options.inference_enabled and
@@ -2714,7 +2729,11 @@ pub fn openLiteHandleAllocWithRuntime(
         // already registered as `errdefer`s above (in that unwind order);
         // adding any of that cleanup here too would run it twice on this
         // error path. Only unwind the state this function itself owns.
-        try startLiteEmbeddedInference(handle, alloc, path, .{
+        if (if (inference_source) |source| source.lite_inference else null) |service| {
+            service.retain();
+            handle.lite_inference = service;
+            handle.lite_inference_status = inference_source.?.lite_inference_status;
+        } else try startLiteEmbeddedInference(handle, alloc, path, .{
             .models_dir = resolved.inference.models_dir,
             .host_budget_mb = resolved.inference.host_budget_mb,
             .backend_budget_mb = resolved.inference.backend_budget_mb,
@@ -3013,8 +3032,18 @@ pub fn antfly_db_status_json(handle_ptr: ?*anyopaque, out_buf: ?*capi.Buffer) ca
         .capabilities = capabilities,
     };
 
-    const bytes = std.fmt.allocPrint(handle.alloc, "{f}", .{std.json.fmt(status, .{})}) catch |err| return capi.mapErrorContext(err, @src().fn_name);
-    out.* = .{ .ptr = bytes.ptr, .len = bytes.len };
+    var arena = std.heap.ArenaAllocator.init(handle.alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const status_json = std.json.Stringify.valueAlloc(a, status, .{}) catch |err| return capi.mapError(err);
+    var value = std.json.parseFromSliceLeaky(std.json.Value, a, status_json, .{}) catch |err| return capi.mapError(err);
+    if (comptime capi_build_options.inference_enabled) if (handle.lite_inference) |service| {
+        const admission = inference_provider.embeddedMemoryAdmissionStats(service.lifetime.handle) catch |err| return capi.mapError(err);
+        const bytes = std.json.Stringify.valueAlloc(a, admission, .{}) catch |err| return capi.mapError(err);
+        const admission_value = std.json.parseFromSliceLeaky(std.json.Value, a, bytes, .{}) catch |err| return capi.mapError(err);
+        value.object.getPtr("inference").?.object.put(a, "memory_admission", admission_value) catch |err| return capi.mapError(err);
+    };
+    out.* = stringifyJson(value) catch |err| return capi.mapErrorContext(err, @src().fn_name);
     return .ok;
 }
 
@@ -4714,6 +4743,16 @@ fn pendingNamespaceStatsValue(a: Allocator, database: *db_mod.DB) !std.json.Valu
     defer jobs.deinit();
     var rows: std.ArrayList(std.json.Value) = .empty;
     for (jobs.value) |job| {
+        const upstream = if (database.enrichment_runtime) |runtime| runtime.stats() else db_mod.types.EnrichmentStats{};
+        const replaying = job.phase != .failed and !job.producer_replay_complete;
+        const waiting = job.phase != .failed and job.producer_replay_target > upstream.applied_sequence;
+        const producer_pending = replaying or waiting;
+        const blocked_reason: ?[]const u8 = if (replaying) "replaying_producer_sources" else if (waiting) "waiting_for_producer_enrichment" else null;
+        // A malformed failed declaration must not hide its retry/error status.
+        const producers = database.graphReplacementProducerNamesAlloc(a, job) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => try a.alloc([]u8, 0),
+        };
         const status = try std.json.Stringify.valueAlloc(a, .{
             .name = job.name,
             .replaces = job.old,
@@ -4722,6 +4761,13 @@ fn pendingNamespaceStatsValue(a: Allocator, database: *db_mod.DB) !std.json.Valu
             .applied_sequence = job.applied_sequence,
             .target_sequence = database.core.nextDerivedSequence(),
             .last_error = job.last_error,
+            .blocked_reason = blocked_reason,
+            .producer_artifacts = producers,
+            .producer_replay_target = job.producer_replay_target,
+            .producer_applied_sequence = upstream.applied_sequence,
+            .upstream_last_error = if (producer_pending and upstream.last_error_code.len > 0) upstream.last_error_code.slice() else @as(?[]const u8, null),
+            .upstream_retrying = producer_pending and upstream.retrying,
+            .upstream_next_retry_at_ms = if (producer_pending) upstream.next_retry_at_ms else 0,
             .retry_count = job.retry_count,
             .total_retry_count = job.total_retry_count,
             .max_total_retries = db_mod.DB.replacement_total_retry_limit,

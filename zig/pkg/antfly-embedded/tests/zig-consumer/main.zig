@@ -20,7 +20,7 @@ const inference = @import("antfly-inference");
 test "fetched public SQL and native inference modules" {
     var compiled = try embedded.lake.sql_compiler.compile(std.testing.allocator, "SELECT amount FROM events", .{});
     defer compiled.deinit();
-    try std.testing.expect(!(inference.backends.BackendRuntime{ .backend = .native }).requiresProcessIsolation());
+    try std.testing.expect(!(inference.backends.BackendRuntime{ .backend = .native }).hasUninterruptibleCalls());
 }
 test "fetched native inference executes matrix multiplication" {
     var output: [4]f32 = @splat(0);

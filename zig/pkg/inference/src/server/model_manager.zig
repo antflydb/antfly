@@ -3491,6 +3491,7 @@ const LoadFlight = struct {
     completed: std.Io.Event = .unset,
     io: std.Io,
     hard_cancellation: ?execution_control_mod.HardCancellationBoundary = null,
+    native_call_policy: execution_control_mod.NativeCallPolicy = .require_supervision,
     model: ?*LoadedModel = null,
     err: ?anyerror = null,
     /// Protected by ModelManager.load_lock. The manager-owned task holds one
@@ -3555,6 +3556,7 @@ const LoadFlightControl = struct {
             .ptr = self,
             .check_fn = check,
             .hard_cancellation = self.flight.hard_cancellation,
+            .native_call_policy = self.flight.native_call_policy,
         };
     }
 };
@@ -4059,6 +4061,23 @@ const TeardownTicket = struct {
     }
 };
 pub const ModelManager = struct {
+    pub const MemoryAdmissionDiagnostic = struct {
+        pressure: []const u8 = "none",
+        denied_count: u64 = 0,
+        last_denied_ns: u64 = 0,
+        request_count: u64 = 0,
+        requested_host_bytes: u64 = 0,
+        requested_backend_bytes: u64 = 0,
+        requested_kv_bytes: u64 = 0,
+        requested_scratch_bytes: u64 = 0,
+        admitted_host_bytes: u64 = 0,
+        admitted_backend_bytes: u64 = 0,
+        host_limit_bytes: u64 = 0,
+        backend_limit_bytes: u64 = 0,
+        combined_limit_bytes: u64 = 0,
+        available_memory_bytes: u64 = 0,
+    };
+
     const LoadedModelMap = std.StringHashMapUnmanaged(*LoadedModel);
     const tokenizer_cache_budget_shard_count = 16;
     const tokenizer_cache_admission_quantum_bytes = 1024 * 1024;
@@ -4266,6 +4285,8 @@ pub const ModelManager = struct {
     session_manager: backends.SessionManager,
     /// Null for diagnostic/offline CLIs. Serving Nodes set this before any model load.
     serving_policy: ?model_compatibility.Policy = null,
+    admission_diagnostic_mutex: std.atomic.Mutex = .unlocked,
+    admission_diagnostic: MemoryAdmissionDiagnostic = .{},
     admission_enabled: bool = false,
     admission_limit_overrides: runtime.tier.memory.Limits = .{},
     process_memory_limit_bytes: usize = 0,
@@ -5379,8 +5400,33 @@ pub const ModelManager = struct {
         pressure: ?runtime.tier.memory.AdmissionPressure,
         requests: []const runtime.tier.memory.AdmissionRequest,
     ) void {
-        if (builtin.is_test) return;
         const admitted = self.admissionController().snapshot();
+        var diagnostic: MemoryAdmissionDiagnostic = .{
+            .pressure = if (pressure) |value| @tagName(std.meta.activeTag(value)) else "unknown",
+            .last_denied_ns = platform.time.monotonicNs(),
+            .request_count = requests.len,
+            .admitted_host_bytes = admitted.hostTotalBytes(),
+            .admitted_backend_bytes = admitted.backendTotalBytes(),
+        };
+        for (requests) |request| {
+            diagnostic.requested_host_bytes +|= request.amounts.hostTotalBytes();
+            diagnostic.requested_backend_bytes +|= request.amounts.backendTotalBytes();
+            diagnostic.requested_kv_bytes +|= request.amounts.kvTotalBytes();
+            diagnostic.requested_scratch_bytes +|= request.amounts.scratchTotalBytes();
+        }
+        if (requests.len > 0) {
+            diagnostic.host_limit_bytes = requests[0].limits.host_limit_bytes;
+            diagnostic.backend_limit_bytes = requests[0].limits.backend_limit_bytes;
+            diagnostic.combined_limit_bytes = requests[0].limits.combined_limit_bytes;
+        }
+        if (!builtin.is_test) if (runtime.tier.memory.currentSystemMemoryInfoForLimit(self.process_memory_limit_bytes, self.process_memory_limit_provenance)) |info| {
+            diagnostic.available_memory_bytes = info.available_bytes orelse 0;
+        };
+        spinLock(&self.admission_diagnostic_mutex);
+        diagnostic.denied_count = self.admission_diagnostic.denied_count +| 1;
+        self.admission_diagnostic = diagnostic;
+        self.admission_diagnostic_mutex.unlock();
+        if (builtin.is_test) return;
         std.log.warn(
             "inference run admission denied pressure={s} request_count={d} admitted_host_bytes={d} admitted_backend_bytes={d} admitted_kv_bytes={d} admitted_scratch_bytes={d}",
             .{
@@ -5410,6 +5456,12 @@ pub const ModelManager = struct {
                 },
             );
         }
+    }
+
+    pub fn memoryAdmissionDiagnostic(self: *ModelManager) MemoryAdmissionDiagnostic {
+        spinLock(&self.admission_diagnostic_mutex);
+        defer self.admission_diagnostic_mutex.unlock();
+        return self.admission_diagnostic;
     }
 
     fn evictExpired(self: *ModelManager) void {
@@ -6808,6 +6860,7 @@ pub const ModelManager = struct {
             .load_state = .{
                 .io = coordination_io,
                 .hard_cancellation = if (control) |active| active.hard_cancellation else null,
+                .native_call_policy = self.session_manager.native_call_policy,
             },
         };
         const task = CompositeLoadTask.create(self, flight, asset_generation, model_dir, component_paths, kind) catch |err| {
@@ -7275,17 +7328,17 @@ pub const ModelManager = struct {
         return io;
     }
 
-    /// Establish a lifetime ticket before entering a process-required backend.
-    /// Embedded/nonisolated callers fail here; cooperative fallback can still
-    /// proceed. Nothing allocates or arms a monitor when eventual close starts.
+    /// Establish a lifetime ticket before entering an uninterruptible backend.
+    /// Embedded runtimes accept waiting for native close; supervised runtimes
+    /// retain a watchdog ticket. Nothing arms a monitor when close starts.
     fn prepareSessionClose(self: *ModelManager, backend_runtime: backends.BackendRuntime) !?backends.Session.CloseProtection {
-        if (!backend_runtime.requiresProcessIsolation()) return null;
+        if (!backend_runtime.hasUninterruptibleCalls()) return null;
         self.lockLoadedModels();
         defer self.unlockLoadedModels();
-        if (!self.session_manager.process_isolation_available) {
+        if (!self.session_manager.process_termination_available) {
             // In-process hosts accept that a wedged close blocks rather than
             // being ended by killing the worker.
-            if (execution_control_mod.uninterruptibleInProcessAllowed()) return null;
+            if (self.session_manager.native_call_policy == .in_process) return null;
             return error.ProcessIsolationRequired;
         }
         if (self.teardown_domain == null) {
@@ -7298,7 +7351,7 @@ pub const ModelManager = struct {
     }
 
     fn offlineLoadBoundaryLocked(self: *ModelManager, io: std.Io) !?execution_control_mod.HardCancellationBoundary {
-        if (!self.session_manager.process_isolation_available) return null;
+        if (!self.session_manager.process_termination_available) return null;
         if (self.owned_load_watchdog == null) {
             const watchdog = try HardCancellationWatchdog.create(self.allocator);
             errdefer watchdog.destroy();
@@ -7374,6 +7427,7 @@ pub const ModelManager = struct {
         flight.* = .{
             .io = coordination_io,
             .hard_cancellation = hard_cancellation,
+            .native_call_policy = self.session_manager.native_call_policy,
         };
         const owned_flight_key = self.allocator.dupe(u8, flight_key) catch |err| {
             self.allocator.destroy(flight);
@@ -8917,19 +8971,22 @@ fn sessionManagerForPreferredBackends(
         .gliner_cuda_precision = source.gliner_cuda_precision,
         .test_allow_unqualified_gliner_cuda_precision = source.test_allow_unqualified_gliner_cuda_precision,
         .io = source.io,
-        .process_isolation_available = source.process_isolation_available,
+        .process_termination_available = source.process_termination_available,
+        .native_call_policy = source.native_call_policy,
     };
 }
 
 test "session manager load clones preserve process isolation policy" {
     var source = backends.SessionManager.init(std.testing.allocator);
-    source.process_isolation_available = false;
+    source.process_termination_available = false;
+    source.native_call_policy = .in_process;
     const clone = sessionManagerForPreferredBackends(
         std.testing.allocator,
         &.{.native},
         &source,
     );
-    try std.testing.expect(!clone.process_isolation_available);
+    try std.testing.expect(!clone.process_termination_available);
+    try std.testing.expectEqual(execution_control_mod.NativeCallPolicy.in_process, clone.native_call_policy);
 }
 
 test "GLiNER CUDA load clones retain per-manager qualification policy" {
@@ -10230,7 +10287,7 @@ test "managed constructors retain cooperative fallback without a process boundar
     var manager = ModelManager.init(allocator, .{
         .allocator = allocator,
         .preferred_backends = &.{ .metal, .native },
-        .process_isolation_available = false,
+        .process_termination_available = false,
     });
     defer manager.deinit();
     manager.configureServingPolicy(.{ .allow_unknown = true });
@@ -13069,16 +13126,16 @@ test "gliner boundary cache pinned small Metal handle retention eviction and rel
 
 test "offline load runtime supplies a real hard cancellation boundary only for disposable processes" {
     const alloc = std.testing.allocator;
-    var manager = ModelManager.init(alloc, .{ .allocator = alloc, .preferred_backends = &.{.metal}, .process_isolation_available = false });
+    var manager = ModelManager.init(alloc, .{ .allocator = alloc, .preferred_backends = &.{.metal}, .process_termination_available = false });
     defer manager.deinit();
     try std.testing.expect(try manager.offlineLoadBoundaryLocked(std.testing.io) == null);
     try std.testing.expect(manager.owned_load_watchdog == null);
-    manager.session_manager.process_isolation_available = true;
+    manager.session_manager.process_termination_available = true;
     const boundary = (try manager.offlineLoadBoundaryLocked(std.testing.io)).?;
     const again = (try manager.offlineLoadBoundaryLocked(std.testing.io)).?;
     try std.testing.expectEqual(boundary.ptr, again.ptr);
     const control = InferenceExecutionControl{ .hard_cancellation = boundary };
-    var guard = try control.enterUninterruptible(.process_required);
+    var guard = try control.enterUninterruptible(.uninterruptible);
     guard.deinit();
     try std.testing.expectEqual(@as(usize, 0), manager.owned_load_watchdog.?.entries.items.len);
 }
@@ -13358,13 +13415,13 @@ test "model manager teardown raw session retains monitor and offline driver IO a
 
 test "model manager teardown rejects missing isolation and failed ticket before backend entry" {
     const allocator = std.testing.allocator;
-    var manager = ModelManager.init(allocator, .{ .allocator = allocator, .preferred_backends = &.{.native}, .process_isolation_available = false });
+    var manager = ModelManager.init(allocator, .{ .allocator = allocator, .preferred_backends = &.{.native}, .process_termination_available = false });
     defer manager.deinit();
     try std.testing.expectError(error.ProcessIsolationRequired, manager.prepareSessionClose(.{ .backend = .metal }));
     try std.testing.expect(manager.teardown_domain == null and manager.owned_load_runtime == null);
     try std.testing.expect(try manager.prepareSessionClose(.{ .backend = .native }) == null);
 
-    manager.session_manager.process_isolation_available = true;
+    manager.session_manager.process_termination_available = true;
     _ = try manager.loadCoordinationIoLocked();
     const domain = try TeardownDomain.create(allocator, manager.owned_load_io_owner);
     manager.teardown_domain = domain;
@@ -13654,4 +13711,27 @@ test "capi resolver model identity uses receipt digests before load and survives
     try second.dir.writeFile(io, .{ .sub_path = managed_receipt.complete_filename, .data = receipt });
     try second.dir.writeFile(io, .{ .sub_path = "model.safetensors", .data = "different fake model weights" });
     try std.testing.expectError(error.ChecksumMismatch, modelIdentity(a, io, second_path, manifest));
+}
+
+test "memory admission diagnostics retain pressure and recover after release" {
+    const memory = runtime.tier.memory;
+    var manager = ModelManager.init(std.testing.allocator, backends.SessionManager.init(std.testing.allocator));
+    defer manager.deinit();
+    const limits = memory.Limits{ .host_limit_bytes = 100 };
+    var held = try manager.acquireAmountsWithEviction(.cpu, limits, .{ .host_scratch_bytes = 80 });
+    defer held.release();
+    try std.testing.expectError(error.ResourceTemporarilyUnavailable, manager.acquireAmountsWithEviction(.cpu, limits, .{ .host_scratch_bytes = 30 }));
+    const denied = manager.memoryAdmissionDiagnostic();
+    try std.testing.expectEqualStrings("domain_host", denied.pressure);
+    try std.testing.expectEqual(@as(u64, 1), denied.denied_count);
+    try std.testing.expectEqual(@as(u64, 30), denied.requested_host_bytes);
+    try std.testing.expectEqual(@as(u64, 80), denied.admitted_host_bytes);
+    try std.testing.expectEqual(@as(u64, 100), denied.host_limit_bytes);
+    held.release();
+    var recovered = try manager.acquireAmountsWithEviction(.cpu, limits, .{ .host_scratch_bytes = 30 });
+    recovered.release();
+    try std.testing.expectEqual(@as(usize, 0), manager.admissionController().snapshot().hostTotalBytes());
+    // The last denial remains observable after recovery; its timestamp/count
+    // distinguish it from the current request and survive DB snapshot refresh.
+    try std.testing.expectEqual(denied.denied_count, manager.memoryAdmissionDiagnostic().denied_count);
 }

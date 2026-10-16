@@ -4318,11 +4318,11 @@ test "capi lite local-runtime-configured flag reports local_embedded only when t
         try std.testing.expect(std.mem.indexOf(u8, status_json, "\"inference_mode\":\"local_embedded\"") != null);
         try std.testing.expect(std.mem.indexOf(u8, status_json, "\"local_inference_runtime\":true") != null);
         const owned_handle = asHandle(handle).?;
-        try std.testing.expect(owned_handle.lite_inference_lifetime != null);
+        try std.testing.expect(owned_handle.lite_inference != null);
     } else {
         try std.testing.expect(std.mem.indexOf(u8, status_json, "\"inference_mode\":\"caller_supplied_or_disabled\"") != null);
         const owned_handle = asHandle(handle).?;
-        try std.testing.expect(owned_handle.lite_inference_lifetime == null);
+        try std.testing.expect(owned_handle.lite_inference == null);
     }
 }
 
@@ -4382,7 +4382,7 @@ test "capi lite explicit resource budget overrides are reported in status" {
         try std.testing.expect(std.mem.indexOf(u8, status_json, "\"process_memory_limit_bytes\":536870912") != null);
         try std.testing.expect(std.mem.indexOf(u8, status_json, "\"process_memory_limit_source\":\"explicit\"") != null);
         const owned_handle = asHandle(handle).?;
-        try std.testing.expect(owned_handle.lite_inference_lifetime != null);
+        try std.testing.expect(owned_handle.lite_inference != null);
     } else {
         // No local runtime started, so the resolution never ran; status
         // still echoes the caller's requested override values (asserted
@@ -4469,7 +4469,7 @@ test "capi lite drains an antfly embedder with no api_url through the embedded i
     try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_create_with_options(path, &options, &handle));
     defer antfly_db_close(handle);
     const owned_handle = asHandle(handle).?;
-    try std.testing.expect(owned_handle.lite_inference_lifetime != null);
+    try std.testing.expect(owned_handle.lite_inference != null);
 
     const index_json =
         \\{"name":"body_embedding","kind":"dense_vector","config_json":"{\"type\":\"embeddings\",\"embedder\":{\"provider\":\"antfly\",\"model\":\"Qwen/Qwen3-Embedding-0.6B-GGUF\"}}"}
@@ -6052,4 +6052,125 @@ test "capi SQL idle native maintenance avoids runtime construction and resumes w
     defer result.deinit();
     try std.testing.expectEqual(@as(usize, 1), result.hits.len);
     try std.testing.expectEqualStrings("doc", result.hits[0].id);
+}
+
+test "capi lite inference service survives foreground and maintenance snapshots" {
+    if (builtin.single_threaded or builtin.os.tag == .freestanding) return error.SkipZigTest;
+    if (!capi_build_options.inference_enabled or !lite_backend.capabilitiesForProfile(.native).local_inference_runtime) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var directory = try TestDirectory.init("capi-shared-inference");
+    defer directory.cleanup();
+    const path = try tempTestAflitePath(a, directory.path(), "database");
+    defer a.free(path);
+    defer cleanupTestFile(path);
+    var options: capi.OpenOptions = .{};
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_open_options_init(&options));
+    options.storage_kind = capi.storage_kind_lite;
+    options.profile = capi.profile_native;
+    options.flags |= capi.open_flag_local_runtime_configured;
+    var handle: ?*anyopaque = null;
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_create_with_options(path, &options, &handle));
+    defer antfly_db_close(handle);
+    const owner = blk: {
+        const guard = public.enterHandle(handle, .exclusive).?;
+        defer guard.leave();
+        break :blk guard.connection.?.owner;
+    };
+    owner.stopping.store(true, .release);
+    owner.wake.set(shared.handleLockIo());
+    owner.worker.?.join();
+    owner.worker = null;
+    owner.stopping.store(false, .release);
+    try sqlFkRecoveryStatement(handle, "CREATE TABLE docs(id TEXT PRIMARY KEY, body TEXT)");
+    const service = owner.current.?.lite_inference.?;
+    // Retiring a storage generation must not quiesce another generation's
+    // provider calls. Hold one admitted borrower across every refresh/close.
+    var provider_borrow = try service.lifetime.acquire();
+    defer provider_borrow.deinit();
+    for (0..4) |i| {
+        const statement = try std.fmt.allocPrint(a, "INSERT INTO docs(id,body) VALUES ('{d}','body')", .{i});
+        defer a.free(statement);
+        try sqlFkRecoveryStatement(handle, statement);
+        {
+            const guard = public.enterHandle(handle, .exclusive).?;
+            defer guard.leave();
+            const previous = guard.handle;
+            previous.maintenance_references += 1;
+            defer previous.maintenance_references -= 1;
+            guard.connection.?.detach();
+            const refreshed = try owner.refresh();
+            try std.testing.expect(refreshed != previous);
+            try std.testing.expectEqual(service, refreshed.lite_inference.?);
+        }
+        owner.collectRetired();
+        owner.maintenance_pending = true;
+        _ = try owner.maintenanceTurnForTest();
+        try std.testing.expectEqual(service, owner.maintenance_snapshot.?.lite_inference.?);
+        try std.testing.expectEqual(service, owner.current.?.lite_inference.?);
+        try std.testing.expectEqual(@as(usize, 2), service.references.load(.acquire));
+    }
+    var status: capi.Buffer = .{};
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_status_json(handle, &status));
+    defer freeRawBuffer(status.ptr, status.len);
+    try std.testing.expect(std.mem.indexOf(u8, status.ptr.?[0..status.len], "\"memory_admission\"") != null);
+}
+
+test "capi lite inference producer retry is visible in graph replacement status" {
+    const a = std.testing.allocator;
+    var directory = try TestDirectory.init("capi-producer-retry-status");
+    defer directory.cleanup();
+    const path = try tempTestAflitePath(a, directory.path(), "database");
+    defer a.free(path);
+    defer cleanupTestFile(path);
+    var options: capi.OpenOptions = .{};
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_open_options_init(&options));
+    options.storage_kind = capi.storage_kind_lite;
+    options.profile = capi.profile_hosted;
+    var handle: ?*anyopaque = null;
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_create_with_options(path, &options, &handle));
+    defer antfly_db_close(handle);
+    const guard = public.enterHandle(handle, .exclusive).?;
+    defer guard.leave();
+    const database = guard.handle.database();
+    try database.reconfigureEnrichmentRuntimePaused(.{ .enable_without_producers = true });
+    const runtime = database.enrichment_runtime.?;
+    runtime.applied_sequence = 1;
+    runtime.last_error_code = db_mod.types.RuntimeErrorName.init("ResourceTemporarilyUnavailable");
+    runtime.retrying = true;
+    runtime.next_retry_at_ms = 12345;
+    for ([_]bool{ true, false }) |complete| {
+        try database.core.index_manager.saveGraphReplacementBuild(database.core.store, .{
+            .name = "replacement",
+            .generation = 1,
+            .old = "old",
+            .producer_replay_complete = complete,
+            .producer_replay_target = 10,
+        });
+        const json = try public.pendingWorkStatsJson(guard.handle);
+        defer freeRawBuffer(json.ptr, json.len);
+        const parsed = try std.json.parseFromSlice(std.json.Value, a, json.ptr.?[0..json.len], .{});
+        defer parsed.deinit();
+        const row = parsed.value.object.get("replacements").?.array.items[0].object;
+        try std.testing.expectEqualStrings(if (complete) "waiting_for_producer_enrichment" else "replaying_producer_sources", row.get("blocked_reason").?.string);
+        try std.testing.expectEqualStrings("ResourceTemporarilyUnavailable", row.get("upstream_last_error").?.string);
+        try std.testing.expect(row.get("upstream_retrying").?.bool);
+        try std.testing.expectEqual(@as(i64, 12345), row.get("upstream_next_retry_at_ms").?.integer);
+        try std.testing.expect(row.get("last_error").? == .null);
+        try std.testing.expectEqual(@as(i64, 0), row.get("retry_count").?.integer);
+    }
+    try database.core.index_manager.saveGraphReplacementBuild(database.core.store, .{
+        .name = "replacement",
+        .generation = 1,
+        .old = "old",
+        .producer_replay_complete = true,
+        .producer_replay_target = 10,
+    });
+    runtime.applied_sequence = 10;
+    const json = try public.pendingWorkStatsJson(guard.handle);
+    defer freeRawBuffer(json.ptr, json.len);
+    const parsed = try std.json.parseFromSlice(std.json.Value, a, json.ptr.?[0..json.len], .{});
+    defer parsed.deinit();
+    const row = parsed.value.object.get("replacements").?.array.items[0].object;
+    try std.testing.expect(row.get("blocked_reason").? == .null);
+    try std.testing.expect(row.get("upstream_last_error").? == .null);
 }
