@@ -615,7 +615,7 @@ pub const rules: []const @import("unit_test_ownership.zig").Rule = &.{
     },
     .{
         .source = "pkg/antfly/src/root.zig",
-        .artifact = "test",
+        .artifact = "raft-unit-tests",
         .selection = "raft.",
         .skip = &.{
             // The explicit transport owner includes its reachability contracts.

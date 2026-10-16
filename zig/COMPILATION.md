@@ -1516,6 +1516,9 @@ The API auth and derived-coverage roots measured 13,895,155,712 and
 the same guards; they retain their existing focused targets and now use
 explicit artifact names. Aggregate ownership exclusions follow the renamed
 artifacts, preserving test selection and coverage.
+The broad Raft fixture root also measured 14,420,606,976 bytes against its
+former 12 GiB claim. Its `raft-unit-tests` artifact uses a 17 GiB native Darwin
+Debug floor, retaining the existing `antfly-raft-test` target and ownership selection.
 
 The production smoke reproduces Lite table creation returning HTTP 202 with
 committed repair debt. Erased storage read/probe/batch and namespace handles

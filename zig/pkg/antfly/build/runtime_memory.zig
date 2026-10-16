@@ -182,12 +182,13 @@ pub fn testCompileMaxRss(name: []const u8, host: std.Target, target: std.Target,
     // Native Apple Silicon CPU Debug qualification (SDK 26.3.1, Zig 0.17):
     // public-api-parity/api-docid-tests/api-auth-tests/api-derived-coverage-tests
     // peaked at 18,029,035,520/14,373,978,112/13,895,155,712/14,097,039,360
-    // bytes respectively. Reserve >25% headroom
+    // bytes respectively; raft-unit-tests peaked at 14,420,606,976 bytes.
+    // Reserve >25% headroom
     // without changing cross-host, release or other test-object reservations.
     if (host.os.tag == .macos and host.cpu.arch == .aarch64 and
         target.os.tag == .macos and target.cpu.arch == .aarch64 and optimize == .debug)
     {
-        const gib: usize = if (std.mem.eql(u8, name, "public-api-parity")) 22 else if (std.mem.eql(u8, name, "api-docid-tests")) 18 else if (std.mem.eql(u8, name, "api-auth-tests") or std.mem.eql(u8, name, "api-derived-coverage-tests")) 17 else return authored;
+        const gib: usize = if (std.mem.eql(u8, name, "public-api-parity")) 22 else if (std.mem.eql(u8, name, "api-docid-tests")) 18 else if (std.mem.eql(u8, name, "api-auth-tests") or std.mem.eql(u8, name, "api-derived-coverage-tests") or std.mem.eql(u8, name, "raft-unit-tests")) 17 else return authored;
         return @max(authored, gib * 1024 * 1024 * 1024);
     }
     if (host.os.tag != .linux or host.cpu.arch != .x86_64 or
@@ -410,8 +411,8 @@ test "native Darwin Debug API reservations cover measured peaks without unsafe o
     try std.testing.expectEqual(12 * gib, testCompileMaxRss("api-docid-tests", macos, linux, .debug, 12 * gib));
     try std.testing.expectEqual(12 * gib, testCompileMaxRss("api-docid-tests", linux, macos, .debug, 12 * gib));
     try std.testing.expectEqual(7 * gib, testCompileMaxRss("api-docid-tests", linux, linux, .debug, 7 * gib));
-    const names = [_][]const u8{ "api-auth-tests", "api-derived-coverage-tests" };
-    const peaks = [_]usize{ 13_895_155_712, 14_097_039_360 };
+    const names = [_][]const u8{ "api-auth-tests", "api-derived-coverage-tests", "raft-unit-tests" };
+    const peaks = [_]usize{ 13_895_155_712, 14_097_039_360, 14_420_606_976 };
     for (names, peaks) |name, measured| {
         const floor = testCompileMaxRss(name, macos, macos, .debug, 12 * gib);
         try std.testing.expect(floor >= measured + measured / 4);
