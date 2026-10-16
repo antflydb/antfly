@@ -8790,3 +8790,47 @@ Generation, formatting, license, Apache, inventory, control-catalog and whitespa
 checks pass. Two obsolete owned cached HTTP test binaries were reclaimed; source
 and test data were preserved. No whole-request RSS or latency benchmark is
 claimed. Original inventory remains 483 implemented / 862 unresolved.
+
+### Request-shaped durable index cancellation
+
+Pgwire cancellation and statement deadlines now enter a bounded, separately
+budgeted recovery lane for the exact admitted index job. The lane preserves
+request authority, clears only the expired client cancellation/deadline, and
+uses a two-second cleanup budget. HTTP bounded observation never cancels an
+asynchronous build. Transport/executor failures without a client cancellation
+or expired statement deadline do not manufacture cancellation intent.
+
+Each cancel CAS binds table/job/revision plus the observed metadata incarnation
+and immutable plan digest. Metadata checks that guard in the same transaction
+as cancellation, including apply/replay, not only in a preceding read. Protocol
+floor 54 adds an explicit guard-presence encoding; older private cancellation
+bytes are rejected and all index-publication stages use the coordinated floor.
+Current owner-failure workers retain their current-authority cancellation form.
+
+After a lost cancel reply, the lane observes only the exact job. It never repeats
+the same revision-CAS. A strictly newer committed pre-publication head can admit
+a new CAS because the old expected revision can no longer match. Cancellation
+admission is not rollback: definitive cancellation is returned only after the
+terminal canceled head proves cleanup and fence release. Irreversible publication,
+unmirrored/foreign observations, or exhausted cleanup budget preserve a pending
+receipt and token rather than claiming abort. Unknown admission remains unknown
+unless an exact confirmed observation establishes the job.
+
+This connects request cancellation to the durable job, not complete real-owner
+wire/distributed cancellation qualification. Hosted/Raft execution, replacement
+root adoption and client-preowned recovery for an entirely lost public response
+remain open. Original SQL dispositions are unchanged.
+
+Final Debug qualification passed 98/98 build steps in
+`/private/tmp/antfly-index-sql-cancel-atomic-debug.log`: 69 metadata/publication,
+four authenticated transport, four standalone DDL and one decoder-barrier tests,
+without failures or leaks. The interruption fixture covers successful cleanup,
+lost and unresolved cancel ACKs, strictly newer CAS cuts, irreversible/published
+jobs, foreign/unmirrored/absent observations, statement deadlines, and HTTP
+observation that performs no cancellation IO. The real metadata snapshot/restart
+fixture round-trips guarded commands, rejects every truncation/trailing bytes,
+rejects wrong incarnation/digest during both preflight and status, and verifies
+the apply transaction leaves the job head unchanged for either stale guard.
+Formatting, license, Apache, inventory, control-catalog and whitespace checks pass.
+No new original-case credit or complete wire/distributed rollback claim is made;
+the original inventory remains 483 implemented / 862 unresolved.

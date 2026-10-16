@@ -61,26 +61,74 @@ fn terminal(input: catalog.DdlReceipt, head: Head) !?catalog.DdlOutcome {
     }
 }
 
+fn interrupted(source: anytype, alloc: std.mem.Allocator, io: std.Io, original: operation.RequestContext, identity: publication.AdmissionRequest, receipt: catalog.DdlReceipt, completion: catalog.DdlAllocators.Completion, known: bool) !catalog.DdlOutcome {
+    const unresolved = if (known) pending(receipt) else unknown(receipt);
+    if (completion != .until_deadline) return unresolved;
+    // Executor/transport errors alone are not a client cancellation request.
+    if (original.ensureActive()) |_| {
+        return unresolved;
+    } else |err| {
+        if (err != error.Canceled and err != error.DeadlineExceeded) return unresolved;
+    }
+    var context = original;
+    context.cancellation = .none;
+    context.deadline_io = null;
+    context.deadline_ns = @import("antfly_platform").time.monotonicNs() +| 2 * std.time.ns_per_s;
+    var attempted_revision: ?u64 = null;
+    var admitted = known;
+    while (true) {
+        context.ensureActive() catch return if (admitted) pending(receipt) else unknown(receipt);
+        const bytes = source.systemCatalog(alloc, context, .{ .relational_index_admission_status = identity }) catch return if (admitted) pending(receipt) else unknown(receipt);
+        const observed = observation(alloc, bytes, identity);
+        alloc.free(bytes);
+        const head = (observed catch return if (admitted) pending(receipt) else unknown(receipt)) orelse return if (admitted) pending(receipt) else unknown(receipt);
+        admitted = true;
+        if (try terminal(receipt, head)) |done| return done;
+        switch (head.phase) {
+            .installing, .releasing => {
+                var outcome = pending(receipt);
+                outcome.receipt.?.diagnostic = "Cancellation raced irreversible index publication. Retain the publication token and reconcile completion; rollback is not confirmed.";
+                return outcome;
+            },
+            .fencing, .reserving, .building => {
+                // A strictly newer committed PRE-publication head proves an
+                // old revision-CAS cannot have canceled this job or do so later.
+                // At the same revision a missing ACK never permits replay.
+                if (attempted_revision == null or head.revision > attempted_revision.?) {
+                    attempted_revision = head.revision;
+                    const reply = source.systemCatalog(alloc, context, .{ .relational_index_cancel = .{ .table_id = identity.table_id, .id = identity.id, .expected_revision = head.revision, .failure = .requested, .expected = .{ .metadata_incarnation = identity.metadata_incarnation, .plan_digest = identity.plan_digest } } }) catch null;
+                    if (reply) |value| alloc.free(value);
+                    // Exact admission observations, not the cancel ACK, prove
+                    // metadata incarnation, plan commitment and cleanup state.
+                }
+            },
+            .canceling, .cancel_releasing => {},
+            .published, .canceled => unreachable,
+        }
+        io.sleep(.fromMilliseconds(20), .awake) catch return pending(receipt);
+    }
+}
+
 fn awaitCompletion(source: anytype, alloc: std.mem.Allocator, io: std.Io, original: operation.RequestContext, identity: publication.AdmissionRequest, receipt: catalog.DdlReceipt, completion: catalog.DdlAllocators.Completion, initial: Head) !catalog.DdlOutcome {
     if (try terminal(receipt, initial)) |done| return done;
     // Admission is already known. A later unavailable/unmirrored observation
     // cannot revoke that fact, but cannot prove successful completion either.
-    var context = original.platformDeadline() catch return pending(receipt);
+    var context = original.platformDeadline() catch return interrupted(source, alloc, io, original, identity, receipt, completion, true);
     if (completion == .bounded) context.deadline_ns = @min(context.deadline_ns orelse std.math.maxInt(u64), @import("antfly_platform").time.monotonicNs() +| 2 * std.time.ns_per_s);
     while (true) {
-        context.ensureActive() catch return pending(receipt);
-        io.sleep(.fromMilliseconds(20), .awake) catch return pending(receipt);
-        context.ensureActive() catch return pending(receipt);
-        const bytes = source.systemCatalog(alloc, context, .{ .relational_index_admission_status = identity }) catch return pending(receipt);
+        context.ensureActive() catch return interrupted(source, alloc, io, original, identity, receipt, completion, true);
+        io.sleep(.fromMilliseconds(20), .awake) catch return interrupted(source, alloc, io, original, identity, receipt, completion, true);
+        context.ensureActive() catch return interrupted(source, alloc, io, original, identity, receipt, completion, true);
+        const bytes = source.systemCatalog(alloc, context, .{ .relational_index_admission_status = identity }) catch return interrupted(source, alloc, io, original, identity, receipt, completion, true);
         defer alloc.free(bytes);
-        const head = (observation(alloc, bytes, identity) catch return pending(receipt)) orelse return pending(receipt);
+        const head = (observation(alloc, bytes, identity) catch return interrupted(source, alloc, io, original, identity, receipt, completion, true)) orelse return interrupted(source, alloc, io, original, identity, receipt, completion, true);
         if (try terminal(receipt, head)) |done| return done;
     }
 }
 
 fn recover(source: anytype, alloc: std.mem.Allocator, io: std.Io, context: operation.RequestContext, identity: publication.AdmissionRequest, receipt: catalog.DdlReceipt, completion: catalog.DdlAllocators.Completion) !catalog.DdlOutcome {
-    context.ensureActive() catch return unknown(receipt);
-    const bytes = source.systemCatalog(alloc, context, .{ .relational_index_admission_status = identity }) catch return unknown(receipt);
+    context.ensureActive() catch return interrupted(source, alloc, io, context, identity, receipt, completion, false);
+    const bytes = source.systemCatalog(alloc, context, .{ .relational_index_admission_status = identity }) catch return interrupted(source, alloc, io, context, identity, receipt, completion, false);
     defer alloc.free(bytes);
     const head = (observation(alloc, bytes, identity) catch return unknown(receipt)) orelse return unknown(receipt);
     return awaitCompletion(source, alloc, io, context, identity, receipt, completion, head);
@@ -203,7 +251,7 @@ test "relational index publication SQL admission preserves preowned handles and 
         const receipt: catalog.DdlReceipt = .{ .database = "default", .namespace = "public", .table = "items", .table_id = "101", .schema_version = 2, .state = .pending, .index_publication_token = &token };
         var source: Testing.Source = .{ .identity = owned.observation, .head = owned.prepared.head, .memory = &memory, .mode = mode };
         const context: operation.RequestContext = .{ .setting_admin = true, .index_publication_authority = true, .cancellation = .{ .ptr = &source, .is_cancelled_fn = Testing.Source.isCanceled } };
-        const result = submitOwned(&source, scratch, threaded.io(), context, &owned, receipt, .until_deadline);
+        const result = submitOwned(&source, scratch, threaded.io(), context, &owned, receipt, if (mode == .canceled_request) .bounded else .until_deadline);
         try std.testing.expectEqual(memory.allocated_bytes, memory.freed_bytes);
         if (mode == .duplicate or mode == .cleanup) {
             try std.testing.expectError(error.UniqueConstraintViolation, result);
@@ -229,6 +277,95 @@ test "relational index publication SQL admission preserves preowned handles and 
         }
         try std.testing.expectEqual(@as(usize, 1), source.begins);
     }
+}
+
+test "relational index publication SQL interruption cancels only exact prepublication jobs and waits for cleanup" {
+    const Source = struct {
+        identity: publication.AdmissionRequest,
+        base: Head,
+        mode: enum { cleanup, lost_ack, stale_cas, unknown_ack, irreversible, published, unmirrored, foreign, absent },
+        reads: usize = 0,
+        cancels: usize = 0,
+        fn canceled(_: *const anyopaque) bool {
+            return true;
+        }
+        pub fn systemCatalog(self: *@This(), a: std.mem.Allocator, context: operation.RequestContext, call: @import("../system_catalog/server_call.zig").Call) ![]u8 {
+            try std.testing.expect(context.setting_admin and context.index_publication_authority);
+            try std.testing.expect(!context.cancellation.isCancelled());
+            try context.ensureActive();
+            try std.testing.expect(context.deadline_io == null and context.deadline_ns != null);
+            if (call == .relational_index_cancel) {
+                self.cancels += 1;
+                const request = call.relational_index_cancel;
+                try std.testing.expectEqualDeep(self.identity.metadata_incarnation, request.expected.?.metadata_incarnation);
+                try std.testing.expectEqualDeep(self.identity.plan_digest, request.expected.?.plan_digest);
+                try std.testing.expectEqualDeep(self.identity.id, request.id);
+                try std.testing.expectEqual(self.identity.table_id, request.table_id);
+                try std.testing.expectEqual(local.storage_db_relational_index_publication_progress.Failure.requested, request.failure);
+                try std.testing.expectEqual(@as(u64, if (self.mode == .stale_cas and self.cancels == 2) 2 else 1), request.expected_revision);
+                if (self.mode == .stale_cas and self.cancels == 1) return error.GenerationPublicationChanged;
+                if (self.mode == .lost_ack or self.mode == .unknown_ack) return error.MetadataMutationOutcomeUnknown;
+                // A cancel reply alone never establishes cleanup. Deliberately
+                // leave its body unusable; only exact status proves completion.
+                return a.dupe(u8, "{}");
+            }
+            try std.testing.expect(call == .relational_index_admission_status);
+            try std.testing.expectEqualDeep(self.identity, call.relational_index_admission_status);
+            self.reads += 1;
+            if (self.mode == .unknown_ack and self.reads == 3) return error.ResourceTemporarilyUnavailable;
+            var head = self.base;
+            if (self.mode == .stale_cas and self.reads >= 2) head.revision = 2;
+            if (self.mode == .irreversible or self.mode == .published) {
+                head.phase = if (self.mode == .published) .published else .installing;
+                head.revision = 10;
+                head.counts = .{ 1, 1, 1, if (self.mode == .published) 1 else 0, if (self.mode == .published) 1 else 0, 0, 0 };
+            } else if (self.cancels != 0 and self.mode != .unknown_ack and !(self.mode == .lost_ack and self.reads == 2) and !(self.mode == .stale_cas and self.cancels == 1)) {
+                const complete = self.reads >= (if (self.mode == .lost_ack) @as(usize, 4) else 3);
+                head.phase = if (complete) .canceled else .cancel_releasing;
+                head.revision = 10;
+                head.failure = .requested;
+                head.cancellation_revision = 8;
+                head.counts = .{ 1, 1, 0, 0, 0, 1, if (complete) 1 else 0 };
+            }
+            var incarnation = self.identity.metadata_incarnation;
+            if (self.mode == .foreign) incarnation[0] = '2';
+            return std.json.Stringify.valueAlloc(a, publication.AdmissionStatus{ .metadata_incarnation = incarnation, .head = if (self.mode == .absent) null else head, .replication_pending = self.mode == .unmirrored }, .{});
+        }
+    };
+    const a = std.testing.allocator;
+    var owned = try Testing.owned(a);
+    const identity = owned.observation;
+    const base = owned.prepared.head;
+    const token = owned.recovery_token;
+    owned.deinit();
+    const receipt: catalog.DdlReceipt = .{ .database = "default", .namespace = "public", .table = "items", .table_id = "101", .schema_version = 2, .state = .pending, .index_publication_token = &token };
+    var threaded = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer threaded.deinit();
+    for ([_]@FieldType(Source, "mode"){ .cleanup, .lost_ack, .stale_cas, .unknown_ack, .irreversible, .published, .unmirrored, .foreign, .absent }) |mode| {
+        var source: Source = .{ .identity = identity, .base = base, .mode = mode };
+        const context: operation.RequestContext = .{ .setting_admin = true, .index_publication_authority = true, .cancellation = .{ .ptr = &source, .is_cancelled_fn = Source.canceled } };
+        const known = mode != .absent;
+        const result = interrupted(&source, a, threaded.io(), context, identity, receipt, .until_deadline, known);
+        if (mode == .cleanup or mode == .lost_ack or mode == .stale_cas) {
+            try std.testing.expectError(error.Canceled, result);
+            try std.testing.expectEqual(@as(usize, if (mode == .stale_cas) 2 else 1), source.cancels);
+            try std.testing.expectEqual(@as(usize, if (mode == .lost_ack) 4 else 3), source.reads);
+        } else {
+            const outcome = try result;
+            try std.testing.expectEqual(if (mode == .published) catalog.DdlReceipt.State.ready else if (mode == .absent) catalog.DdlReceipt.State.admission_unknown else catalog.DdlReceipt.State.pending, outcome.receipt.?.state);
+            try std.testing.expectEqualStrings(&token, outcome.receipt.?.index_publication_token.?);
+            try std.testing.expectEqual(@as(usize, if (mode == .unknown_ack) 1 else 0), source.cancels);
+        }
+    }
+    var http: Source = .{ .identity = identity, .base = base, .mode = .cleanup };
+    const expired: operation.RequestContext = .{ .setting_admin = true, .index_publication_authority = true, .deadline_ns = 0 };
+    try std.testing.expectEqual(catalog.DdlReceipt.State.pending, (try interrupted(&http, a, threaded.io(), expired, identity, receipt, .bounded, true)).receipt.?.state);
+    try std.testing.expectEqual(@as(usize, 0), http.reads + http.cancels);
+    _ = interrupted(&http, a, threaded.io(), expired, identity, receipt, .until_deadline, true) catch |err| {
+        try std.testing.expectEqual(error.Canceled, err);
+        return;
+    };
+    return error.TestExpectedError;
 }
 
 test "relational index publication SQL admission consumes rejected plans before any IO" {

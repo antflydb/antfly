@@ -134,15 +134,21 @@ pub const DecidePublish = struct {
 };
 pub const RootProof = @import("relational_index_root_attestation.zig").Proof;
 
+pub const CancelIdentity = struct { metadata_incarnation: [32]u8, plan_digest: Digest };
+
 pub const CancelDecision = struct {
     table_id: u64,
     id: Id,
     expected_revision: u64,
     failure: progress.Failure,
+    /// SQL cancellation binds the exact observed incarnation/commitment.
+    /// Owner-failure cancellation already carries its current worker authority.
+    expected: ?CancelIdentity = null,
 
     pub fn validate(self: @This()) !void {
         try (DecidePublish{ .table_id = self.table_id, .id = self.id, .expected_revision = self.expected_revision }).validate();
         if (self.failure == .none) return error.InvalidGenerationPublication;
+        if (self.expected) |identity| if (!local.metadata_incarnation.isValid(identity.metadata_incarnation) or std.mem.allEqual(u8, &identity.plan_digest, 0)) return error.InvalidGenerationPublication;
     }
 };
 
@@ -156,6 +162,7 @@ pub const CancellationStatus = struct {
     pub fn isCanceled(self: @This(), request: CancelDecision) !bool {
         try request.validate();
         try self.head.validate();
+        if (request.expected) |identity| if (!std.mem.eql(u8, &identity.plan_digest, &self.head.plan_digest)) return error.GenerationPublicationChanged;
         if (self.head.table_id != request.table_id or !std.mem.eql(u8, &self.head.plan_id, &request.id) or
             self.head.revision < request.expected_revision) return error.GenerationPublicationChanged;
         const canceled = self.head.phase == .canceling or self.head.phase == .cancel_releasing or self.head.phase == .canceled;

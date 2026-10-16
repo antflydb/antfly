@@ -111,14 +111,16 @@ const std = @import("std");
 /// Version 53 derives native release permission from the complete installed
 /// owner cohort and exact retained cut. This does not enable public DDL or
 /// authorize adoption of a different physical root.
-pub const current_version: u16 = 53;
-pub const index_publication_release_version: u16 = 53;
+/// Version 54 adds incarnation/plan-bound SQL cancellation and its explicit
+/// command guard encoding. Earlier private cancellation bytes are not accepted.
+pub const current_version: u16 = 54;
+pub const index_publication_release_version: u16 = 54;
 // One coordinated floor for this unreleased protocol. A cohort capable only
 // of an earlier partial stage must not admit work that it cannot finish.
-pub const index_publication_installation_version: u16 = 53;
-pub const index_publication_decision_version: u16 = 53;
-pub const index_publication_head_version: u16 = 53;
-pub const index_delivery_version: u16 = 53;
+pub const index_publication_installation_version: u16 = 54;
+pub const index_publication_decision_version: u16 = 54;
+pub const index_publication_head_version: u16 = 54;
+pub const index_delivery_version: u16 = 54;
 pub const schema_reader_publication_version: u16 = 39;
 pub const schema_reader_floor_version: u16 = 38;
 pub const schema_reader_capability_version: u16 = 37;
