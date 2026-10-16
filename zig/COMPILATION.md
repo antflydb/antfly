@@ -1506,6 +1506,16 @@ is now 22 GiB, retaining more than 25% headroom. The floor never lowers an
 authored claim and does not apply to cross-host builds, release modes or
 other test objects. A 30 GiB local compiler budget can still overlap it
 with smaller work, but cannot admit another 15 GiB API compile alongside it.
+The same qualification measured the API document identity/restore root at
+14,373,978,112 bytes against its former 12 GiB claim. Its native Darwin Debug
+floor is 18 GiB with the same profile guards and headroom. The object now has
+the explicit name `api-docid-tests` for attribution and can be qualified via
+`zig build antfly-api-docid-test` without rebuilding unrelated unit roots.
+The API auth and derived-coverage roots measured 13,895,155,712 and
+14,097,039,360 bytes. Both receive a 17 GiB native Darwin Debug floor under
+the same guards; they retain their existing focused targets and now use
+explicit artifact names. Aggregate ownership exclusions follow the renamed
+artifacts, preserving test selection and coverage.
 
 The production smoke reproduces Lite table creation returning HTTP 202 with
 committed repair debt. Erased storage read/probe/batch and namespace handles

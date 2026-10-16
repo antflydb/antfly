@@ -117,7 +117,7 @@ pub const rules: []const @import("unit_test_ownership.zig").Rule = &.{
     },
     .{
         .source = "pkg/antfly/src/api_derived_coverage_test_root.zig",
-        .artifact = "test",
+        .artifact = "api-derived-coverage-tests",
         .selection = "live repair admission supersedes cached vector serviceability",
         .skip = &.{
             "api.http_client.consumerTests.Suite.test.",
@@ -423,7 +423,7 @@ pub const rules: []const @import("unit_test_ownership.zig").Rule = &.{
     },
     .{
         .source = "pkg/antfly/src/root.zig",
-        .artifact = "test",
+        .artifact = "api-docid-tests",
         .selection = "api table reads reject stale doc identity before multigroup fanout",
         .skip = &.{
             "api.distributed_graph.test.distributed graph edge reader routes outgoing and fans out incoming adjacency",

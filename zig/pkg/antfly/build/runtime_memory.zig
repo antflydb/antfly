@@ -176,16 +176,20 @@ pub fn runtimeCompileMaxRss(unit: RuntimeLibraryUnit, profile: CompileMemoryProf
     };
 }
 
-/// Native linked test objects have different working sets from runtime
-/// archives. Keep measured floors at the linked-test compilation boundary.
-pub fn linkedTestCompileMaxRss(name: []const u8, host: std.Target, target: std.Target, optimize: ?std.lang.Optimize, authored: usize) usize {
+/// Test objects have different working sets from runtime archives. Keep
+/// measured floors at their compilation boundary.
+pub fn testCompileMaxRss(name: []const u8, host: std.Target, target: std.Target, optimize: ?std.lang.Optimize, authored: usize) usize {
     // Native Apple Silicon CPU Debug qualification (SDK 26.3.1, Zig 0.17):
-    // public-api-parity peaked at 18,029,035,520 bytes. Reserve >25% headroom
+    // public-api-parity/api-docid-tests/api-auth-tests/api-derived-coverage-tests
+    // peaked at 18,029,035,520/14,373,978,112/13,895,155,712/14,097,039,360
+    // bytes respectively. Reserve >25% headroom
     // without changing cross-host, release or other test-object reservations.
     if (host.os.tag == .macos and host.cpu.arch == .aarch64 and
-        target.os.tag == .macos and target.cpu.arch == .aarch64 and optimize == .debug and
-        std.mem.eql(u8, name, "public-api-parity"))
-        return @max(authored, 22 * 1024 * 1024 * 1024);
+        target.os.tag == .macos and target.cpu.arch == .aarch64 and optimize == .debug)
+    {
+        const gib: usize = if (std.mem.eql(u8, name, "public-api-parity")) 22 else if (std.mem.eql(u8, name, "api-docid-tests")) 18 else if (std.mem.eql(u8, name, "api-auth-tests") or std.mem.eql(u8, name, "api-derived-coverage-tests")) 17 else return authored;
+        return @max(authored, gib * 1024 * 1024 * 1024);
+    }
     if (host.os.tag != .linux or host.cpu.arch != .x86_64 or
         target.os.tag != .linux or target.cpu.arch != .x86_64 or target.abi != .gnu or optimize != .debug)
         return authored;
@@ -369,32 +373,53 @@ test "linked LLVM Debug test reservations cover native peaks without lowering au
     const names = [_][]const u8{ "public-api-parity", "data-runtime-tests" };
     const peaks = [_]usize{ 16_964_825_088, 11_133_898_752 };
     for (names, peaks) |name, peak| {
-        const claim = linkedTestCompileMaxRss(name, linux, linux, .debug, 7 * gib);
+        const claim = testCompileMaxRss(name, linux, linux, .debug, 7 * gib);
         try std.testing.expect(claim >= peak + peak / 4);
         try std.testing.expect(claim <= 22 * gib);
-        try std.testing.expectEqual(24 * gib, linkedTestCompileMaxRss(name, linux, linux, .debug, 24 * gib));
-        try std.testing.expectEqual(7 * gib, linkedTestCompileMaxRss(name, macos, linux, .debug, 7 * gib));
-        try std.testing.expectEqual(7 * gib, linkedTestCompileMaxRss(name, linux, macos, .debug, 7 * gib));
-        try std.testing.expectEqual(7 * gib, linkedTestCompileMaxRss(name, linux, linux, .safe, 7 * gib));
+        try std.testing.expectEqual(24 * gib, testCompileMaxRss(name, linux, linux, .debug, 24 * gib));
+        try std.testing.expectEqual(7 * gib, testCompileMaxRss(name, macos, linux, .debug, 7 * gib));
+        try std.testing.expectEqual(7 * gib, testCompileMaxRss(name, linux, macos, .debug, 7 * gib));
+        try std.testing.expectEqual(7 * gib, testCompileMaxRss(name, linux, linux, .safe, 7 * gib));
     }
-    try std.testing.expectEqual(7 * gib, linkedTestCompileMaxRss("unmeasured", linux, linux, .debug, 7 * gib));
+    try std.testing.expectEqual(7 * gib, testCompileMaxRss("unmeasured", linux, linux, .debug, 7 * gib));
 }
 
-test "native Darwin Debug public API reservation covers measured peak without unsafe overlap" {
+test "native Darwin Debug API reservations cover measured peaks without unsafe overlap" {
     const macos = try std.zig.system.resolveTargetQuery(std.testing.io, .{ .cpu_arch = .aarch64, .os_tag = .macos });
     const linux = try std.zig.system.resolveTargetQuery(std.testing.io, .{ .cpu_arch = .x86_64, .os_tag = .linux, .abi = .gnu });
     const gib = 1024 * 1024 * 1024;
     const peak: usize = 18_029_035_520;
-    const claim = linkedTestCompileMaxRss("public-api-parity", macos, macos, .debug, 15 * gib);
+    const claim = testCompileMaxRss("public-api-parity", macos, macos, .debug, 15 * gib);
     try std.testing.expect(claim >= peak + peak / 4);
     // A 30 GiB local compiler budget cannot overlap this object with another
     // 15 GiB API compile. Smaller work can still use the remaining capacity.
     try std.testing.expect(claim + 15 * gib > 30 * gib);
     try std.testing.expect(claim + 4 * gib <= 30 * gib);
-    try std.testing.expectEqual(24 * gib, linkedTestCompileMaxRss("public-api-parity", macos, macos, .debug, 24 * gib));
-    try std.testing.expectEqual(15 * gib, linkedTestCompileMaxRss("public-api-parity", macos, macos, .safe, 15 * gib));
-    try std.testing.expectEqual(15 * gib, linkedTestCompileMaxRss("public-api-parity", macos, linux, .debug, 15 * gib));
-    try std.testing.expectEqual(15 * gib, linkedTestCompileMaxRss("public-api-parity", linux, macos, .debug, 15 * gib));
-    try std.testing.expectEqual(7 * gib, linkedTestCompileMaxRss("data-runtime-tests", macos, macos, .debug, 7 * gib));
-    try std.testing.expectEqual(7 * gib, linkedTestCompileMaxRss("unmeasured", macos, macos, .debug, 7 * gib));
+    try std.testing.expectEqual(24 * gib, testCompileMaxRss("public-api-parity", macos, macos, .debug, 24 * gib));
+    try std.testing.expectEqual(15 * gib, testCompileMaxRss("public-api-parity", macos, macos, .safe, 15 * gib));
+    try std.testing.expectEqual(15 * gib, testCompileMaxRss("public-api-parity", macos, linux, .debug, 15 * gib));
+    try std.testing.expectEqual(15 * gib, testCompileMaxRss("public-api-parity", linux, macos, .debug, 15 * gib));
+    try std.testing.expectEqual(7 * gib, testCompileMaxRss("data-runtime-tests", macos, macos, .debug, 7 * gib));
+    try std.testing.expectEqual(7 * gib, testCompileMaxRss("unmeasured", macos, macos, .debug, 7 * gib));
+    const identity_peak: usize = 14_373_978_112;
+    const identity_claim = testCompileMaxRss("api-docid-tests", macos, macos, .debug, 12 * gib);
+    try std.testing.expect(identity_claim >= identity_peak + identity_peak / 4);
+    try std.testing.expect(identity_claim + claim > 30 * gib);
+    try std.testing.expectEqual(24 * gib, testCompileMaxRss("api-docid-tests", macos, macos, .debug, 24 * gib));
+    try std.testing.expectEqual(12 * gib, testCompileMaxRss("api-docid-tests", macos, macos, .safe, 12 * gib));
+    try std.testing.expectEqual(12 * gib, testCompileMaxRss("api-docid-tests", macos, linux, .debug, 12 * gib));
+    try std.testing.expectEqual(12 * gib, testCompileMaxRss("api-docid-tests", linux, macos, .debug, 12 * gib));
+    try std.testing.expectEqual(7 * gib, testCompileMaxRss("api-docid-tests", linux, linux, .debug, 7 * gib));
+    const names = [_][]const u8{ "api-auth-tests", "api-derived-coverage-tests" };
+    const peaks = [_]usize{ 13_895_155_712, 14_097_039_360 };
+    for (names, peaks) |name, measured| {
+        const floor = testCompileMaxRss(name, macos, macos, .debug, 12 * gib);
+        try std.testing.expect(floor >= measured + measured / 4);
+        try std.testing.expect(floor + identity_claim > 30 * gib);
+        try std.testing.expectEqual(24 * gib, testCompileMaxRss(name, macos, macos, .debug, 24 * gib));
+        try std.testing.expectEqual(12 * gib, testCompileMaxRss(name, macos, macos, .safe, 12 * gib));
+        try std.testing.expectEqual(12 * gib, testCompileMaxRss(name, macos, linux, .debug, 12 * gib));
+        try std.testing.expectEqual(12 * gib, testCompileMaxRss(name, linux, macos, .debug, 12 * gib));
+        try std.testing.expectEqual(7 * gib, testCompileMaxRss(name, linux, linux, .debug, 7 * gib));
+    }
 }

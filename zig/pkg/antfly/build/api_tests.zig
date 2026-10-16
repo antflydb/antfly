@@ -313,7 +313,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .filters = compileFiltersWithAnchors(b, &.{"api module compiles"}, public_api_parity_runtime_filters),
         // The macOS debug root includes the complete public transport,
         // generated-contract, and native-index surface. Debug test
-        // compilation has a measured native floor in linkedTestCompileMaxRss;
+        // compilation has a measured native floor in testCompileMaxRss;
         // retain this authored fallback for unmeasured host profiles.
         .max_rss = @as(usize, if (target.result.os.tag == .macos) 15 else 7) * 1024 * 1024 * 1024,
         .test_runner = .{
@@ -404,8 +404,8 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         &lib_api_auth_default_filters,
     );
     const lib_api_auth_tests = b.addTest(.{
-        // macOS Debug measured 11.43 GB for the linked auth surface.
-        .max_rss = if (target.result.os.tag == .macos) 12 * 1024 * 1024 * 1024 else 0,
+        .name = "api-auth-tests",
+        .max_rss = @import("runtime_memory.zig").testCompileMaxRss("api-auth-tests", b.graph.host.result, target.result, optimize, if (target.result.os.tag == .macos) 12 * 1024 * 1024 * 1024 else 0),
         .root_module = antfly_test_mod,
         .filters = lib_api_auth_runtime_filters,
         .test_runner = .{
@@ -707,8 +707,8 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     lib_api_session_maintenance_test_step.dependOn(&run_lib_api_session_maintenance_tests.step);
 
     const lib_api_docid_tests = b.addTest(.{
-        // macOS Debug measured 10.1 GiB for this broad identity/restore root.
-        .max_rss = if (target.result.os.tag == .macos) 12 * 1024 * 1024 * 1024 else 0,
+        .name = "api-docid-tests",
+        .max_rss = @import("runtime_memory.zig").testCompileMaxRss("api-docid-tests", b.graph.host.result, target.result, optimize, if (target.result.os.tag == .macos) 12 * 1024 * 1024 * 1024 else 0),
         .root_module = antfly_test_mod,
         .filters = &.{
             "api table reads reject stale doc identity before multigroup fanout",
@@ -1305,6 +1305,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         },
     });
     const run_lib_api_docid_tests = addFilteredTestRunArtifact(b, lib_api_docid_tests);
+    b.step("antfly-api-docid-test", "Run public API document identity and restore contracts").dependOn(&run_lib_api_docid_tests.step);
     const lib_api_graph_snapshot_tests = b.addTest(.{
         .root_module = antfly_test_mod,
         .filters = compileFiltersWithAnchors(b, &.{"api module compiles"}, &.{
@@ -1433,8 +1434,9 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     test_imports.configure(b, api_derived_coverage_test_mod, true, true);
     api_derived_coverage_test_mod.addImport("antfly_openapi_specs", antfly_imports.embedded_openapi);
     const lib_api_derived_coverage_tests = b.addTest(.{
+        .name = "api-derived-coverage-tests",
         .root_module = api_derived_coverage_test_mod,
-        .max_rss = @as(usize, if (target.result.os.tag == .macos) 13 else 7) * 1024 * 1024 * 1024,
+        .max_rss = @import("runtime_memory.zig").testCompileMaxRss("api-derived-coverage-tests", b.graph.host.result, target.result, optimize, @as(usize, if (target.result.os.tag == .macos) 13 else 7) * 1024 * 1024 * 1024),
         .filters = &.{
             "live repair admission supersedes cached vector serviceability",
             // Own the complete status contract suite; table-write integration
