@@ -895,6 +895,7 @@ test "EXISTS demand preserves pagination and global aggregation" {
 }
 
 test "lower bound operators agree with exact cyclic route selection" {
+    try check("MATCH p=allShortestPaths((a:Document {id:'a'})-[*2..3]->(b)) RETURN count(*)", "[[8]]");
     for ([_][]const u8{ "", "REPEATABLE ELEMENTS ", "DIFFERENT RELATIONSHIPS " }) |mode| {
         for ([_][]const u8{ "shortestPath", "allShortestPaths" }) |selector| {
             for ([_][]const u8{ "->", "-" }) |direction| {
@@ -943,4 +944,32 @@ test "property liveness retains complete entities at unknown consumers" {
             for (fields, actual.?) |expected, field| try std.testing.expectEqualStrings(expected, field);
         }
     }
+}
+
+test "document key seeks outrank arbitrarily many candidate predicates" {
+    const Filtered = struct {
+        fn scan(ptr: *anyopaque, a: std.mem.Allocator, table: []const u8, _: []const b.PropertyFilter, after: ?[]const u8, limit: usize) !b.Page(*const v.Node) {
+            return Fixture.scan(ptr, a, table, after, limit);
+        }
+    };
+    var source: std.ArrayList(u8) = .empty;
+    defer source.deinit(std.testing.allocator);
+    try source.appendSlice(std.testing.allocator, "MATCH (a:Document)-[:CITES]->(b:Document {");
+    for (0..1001) |i| {
+        const field = try std.fmt.allocPrint(std.testing.allocator, "{s}f{d}:0", .{ if (i == 0) "" else ",", i });
+        defer std.testing.allocator.free(field);
+        try source.appendSlice(std.testing.allocator, field);
+    }
+    try source.appendSlice(std.testing.allocator, "}) WHERE antfly.documentKey(a)='a' RETURN count(*)");
+    var diagnostic: c.Diagnostic = .{};
+    var compiled = try c.compile(std.testing.allocator, source.items, .{}, &diagnostic);
+    defer compiled.deinit();
+    var fixture: Fixture = .{};
+    const base = fixture.backend();
+    var vtable = base.vtable.*;
+    vtable.scan_where = Filtered.scan;
+    var result = try runtime.execute(std.testing.allocator, .{ .ptr = base.ptr, .vtable = &vtable }, graph, &compiled, &.{}, .{ .scanned_anchors = 1 });
+    defer result.deinit();
+    try std.testing.expectEqual(@as(i64, 0), result.rows[0][0].integer);
+    try std.testing.expectEqual(@as(usize, 1), result.stats.scanned_anchors);
 }

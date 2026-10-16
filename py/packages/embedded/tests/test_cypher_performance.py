@@ -475,12 +475,16 @@ def test_selective_right_endpoint_drives_traversal(graph_db):
 
 def test_exists_propagates_edge_demand(graph_db):
     db = graph_db
-    patterns = ["(a:D)"] + [f"(n{i}:D)" for i in range(200)]
+    patterns = ["(a:D)"] + [f"(n{i}:D {{score:{i}}})" for i in range(200)]
     patterns += [f"(a)-[:R]->(n{i})" for i in range(200)]
     key = db.cypher_json("g", {"query": "CREATE " + ",".join(patterns) + " RETURN antfly.documentKey(a)"})["rows"][0][
         0
     ]["value"]
-    for body in ("MATCH (a)-[:R]->(b)", "MATCH (a)-[:R]->(b) RETURN b"):
+    for body in (
+        "MATCH (a)-[:R]->(b)",
+        "MATCH (a)-[:R]->(b) RETURN b",
+        "MATCH (a)-[:R]->(b) WITH b WHERE b.score>=0",
+    ):
         result = db.cypher_json(
             "g",
             {

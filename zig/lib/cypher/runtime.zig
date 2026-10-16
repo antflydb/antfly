@@ -571,7 +571,7 @@ const Engine = struct {
     fn existsRows(self: *Engine, clauses: []const ast.Clause, row: Row) ![]const Row {
         const one: ast.Expr = .{ .span = .{}, .value = .{ .literal = .{ .integer = 1 } } };
         var plan = try self.a.dupe(ast.Clause, clauses);
-        if (plan[plan.len - 1].operation == .project) {
+        if (plan[plan.len - 1].operation == .project and plan[plan.len - 1].operation.project.final) {
             const projection = &plan[plan.len - 1].operation.project.value;
             var has_aggregate = false;
             for (projection.items) |item| has_aggregate = has_aggregate or aggregates(item.expression);
@@ -1107,7 +1107,7 @@ const Engine = struct {
         var filters: std.ArrayList(backend_mod.PropertyFilter) = .empty;
         for (node.properties) |property| if (self.constant(property.value, row)) |value| try filters.append(self.a, .{ .property = property.name, .value = value });
         if (predicate) |expression| if (node.alias) |alias| try self.predicateFilters(expression, alias, row, &filters);
-        return (if (self.backend.vtable.scan_where != null) @as(usize, 100) * filters.items.len else 0) + @intFromBool(node.labels.len > 0);
+        return (if (self.backend.vtable.scan_where != null) @as(usize, 100) * @min(filters.items.len, 999) else 0) + @intFromBool(node.labels.len > 0);
     }
     fn matchPath(self: *Engine, input: MatchState, original: ast.Path, mode: ast.PathMode, predicate: ?*const ast.Expr, output: *std.ArrayList(MatchState)) anyerror!void {
         var path = original;
@@ -1232,16 +1232,32 @@ const Engine = struct {
         if (examined > self.limits.explored_edges -| self.stats.explored_edges) return error.CypherEdgeBudgetExceeded;
         self.stats.explored_edges += examined;
     }
-    fn expandEdges(self: *Engine, mapping: catalog.Relationship, identity: v.Identity, direction: ast.Direction, cursor: ?[]const u8, demand: usize) !backend_mod.Page(*const v.Relationship) {
+    fn arcBound(arcs: []const LowerArc, mapping: usize, upper: bool) usize {
+        var low: usize = 0;
+        var high = arcs.len;
+        while (low < high) {
+            const middle = low + (high - low) / 2;
+            if (arcs[middle].mapping < mapping or (upper and arcs[middle].mapping == mapping)) low = middle + 1 else high = middle;
+        }
+        return low;
+    }
+    fn expandEdges(self: *Engine, mapping_index: usize, mapping: catalog.Relationship, identity: v.Identity, direction: ast.Direction, cursor: ?[]const u8, demand: usize) !backend_mod.Page(*const v.Relationship) {
         if (self.lower_graph) |graph| if (graph.positions.get(identity)) |position| {
             const node = graph.nodes.items[position];
             if (node.loaded) {
-                // Captured adjacency is already authorized and charged. Replay
-                // never crosses the backend boundary or consumes edge budget.
+                // Capture appends mappings in catalog order; reachability
+                // pruning preserves that order. Seek the matching range rather
+                // than scanning every mapping's arcs for each replay.
                 if (cursor != null) return error.CypherInvalidBackendCursor;
-                var items: std.ArrayList(*const v.Relationship) = .empty;
-                for (node.arcs.items) |arc| if (std.mem.eql(u8, self.graph.relationships[arc.mapping].name, mapping.name)) try items.append(self.a, arc.relationship);
-                return .{ .items = items.items };
+                const first = arcBound(node.arcs.items, mapping_index, false);
+                const last = arcBound(node.arcs.items, mapping_index, true);
+                // Physical reads were already charged, but replay still does
+                // route work. Keep cyclic enumeration and product-state walks
+                // within the statement's work/cancellation budget.
+                try chargeWork(self, 1 + last - first);
+                const items = try self.a.alloc(*const v.Relationship, last - first);
+                for (node.arcs.items[first..last], items) |arc, *item| item.* = arc.relationship;
+                return .{ .items = items };
             }
         };
         const page = try self.backend.vtable.expand(self.backend.ptr, self.a, mapping, identity, direction, cursor, demand);
@@ -1453,7 +1469,7 @@ const Engine = struct {
             if (edge.min_hops <= 1 and current.depth != 0 and current.node.identity.eql(start.identity)) continue;
             const maximum = edge.max_hops orelse std.math.maxInt(u32);
             if (current.depth >= maximum) continue;
-            for (self.graph.relationships) |mapping| {
+            for (self.graph.relationships, 0..) |mapping, mapping_index| {
                 var selected = edge.types.len == 0;
                 for (edge.types) |name| if (std.mem.eql(u8, mapping.name, name)) {
                     selected = true;
@@ -1464,7 +1480,7 @@ const Engine = struct {
                 if (!outgoing and !incoming) continue;
                 var cursor: ?[]const u8 = null;
                 while (true) {
-                    const page = try self.expandEdges(mapping, current.node.identity, edge.direction, cursor, 128);
+                    const page = try self.expandEdges(mapping_index, mapping, current.node.identity, edge.direction, cursor, 128);
                     try self.prefetchEndpoints(page.items, current.node.identity, outgoing, incoming);
                     for (page.items) |relationship| {
                         try self.checkpoint();
@@ -1595,7 +1611,7 @@ const Engine = struct {
             }
         }
         if (edge.max_hops) |maximum| if (hops >= maximum) return;
-        for (self.graph.relationships) |mapping| {
+        for (self.graph.relationships, 0..) |mapping, mapping_index| {
             var selected = edge.types.len == 0;
             for (edge.types) |type_name| {
                 if (self.graph.relationship(type_name) == null) return error.UnknownGraphRelationship;
@@ -1615,7 +1631,7 @@ const Engine = struct {
                 if (page_scope != null) self.cache_reads = true;
                 defer if (page_scope) |scope| scope.leave(self);
                 try self.checkpoint();
-                const page = try self.expandEdges(mapping, current.identity, edge.direction, cursor, if (self.stream_fold) |fold| fold.demand() else 128);
+                const page = try self.expandEdges(mapping_index, mapping, current.identity, edge.direction, cursor, if (self.stream_fold) |fold| fold.demand() else 128);
                 try self.prefetchEndpoints(page.items, current.identity, outgoing, incoming);
                 for (page.items) |relationship| {
                     var used = false;

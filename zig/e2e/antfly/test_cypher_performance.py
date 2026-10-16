@@ -172,11 +172,13 @@ def test_authenticated_cypher_property_plans_and_sql_overlays(monkeypatch):
             f"/graphs/{wide}",
             {"labels": [{"name": "W", "table": wide}], "relationships": []},
         )
+        # Retained owner/RPC cuts have a larger fixed cost than embedded
+        # reads; hydrating the unused payload still exceeds this ceiling.
         pruned = call(
             f"/graphs/{wide}/query",
             {
                 "query": "MATCH (n:W) RETURN count(*),sum(n.score)",
-                "limits": {"memory_bytes": 2 << 20},
+                "limits": {"memory_bytes": 8 << 20},
             },
         )
         assert [cell["value"] for cell in pruned["rows"][0]] == ["400", "79800"], pruned
