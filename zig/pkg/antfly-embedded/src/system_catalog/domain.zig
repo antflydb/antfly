@@ -1184,6 +1184,7 @@ pub fn httpStatus(err: anyerror) u16 {
         error.CatalogCommandTooLarge, error.CreateTableRequestTooLarge, error.RowPolicyLimitExceeded => 413,
         error.TableTopologyProtocolUpgradeRequired, error.TableTopologyUpgradeRequired, error.RowPolicyUnsupported => 426,
         error.ExtensionOwnedObject => 405,
+        error.UnsupportedNativeIndexOwner => 501,
         error.CatalogPublicationProofPending => 503,
         error.Forbidden => 403,
         error.InvalidInitialFkRetirementSignature, error.InitialFkRetirementSigningKeyUnavailable => 403,

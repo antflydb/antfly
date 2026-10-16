@@ -4678,6 +4678,37 @@ test "store-root enrollment status is a body-bound admin read and preserves abse
     try std.testing.expectError(error.StoreRootEnrollmentChanged, client.readSystemCatalog("http://metadata.invalid", .{ .store_root_enrollment_status = identity }, 25, null));
 }
 
+test "system catalog index prepare unsupported owner returns after one request" {
+    const a = std.testing.allocator;
+    const Executor = struct {
+        calls: usize = 0,
+        status: u16 = 501,
+        body: []const u8 = "UnsupportedNativeIndexOwner",
+        fn execute(raw: *anyopaque, alloc: std.mem.Allocator, _: http_common.HttpRequest) !http_common.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            return .{ .status = self.status, .body = try alloc.dupe(u8, self.body) };
+        }
+    };
+    var executor: Executor = .{};
+    var client = MetadataHttpClient.init(a, .{ .ptr = &executor, .vtable = &.{ .execute = Executor.execute } });
+    _ = client.withSettingAuthority("index-authority-test-secret", "index-authority-test");
+    const call: @import("../system_catalog/server_call.zig").Call = .{ .relational_index_prepare = .{
+        .guard = .{ .target = .{ .name = "usage_records" }, .logical_table = "usage_records", .owner = .{ .table_id = 7, .schema_version = 1, .schema_digest = @splat(1), .kind = .table }, .incarnation = @splat(1) },
+        .index_name = "expression_unique",
+    } };
+    try std.testing.expectError(error.UnsupportedNativeIndexOwner, client.readSystemCatalog("http://metadata.invalid", call, 25, null));
+    try std.testing.expectEqual(@as(usize, 1), executor.calls);
+    executor.body = "UnsupportedNativeIndexOwner suffix";
+    try std.testing.expectError(error.RemoteUnavailable, client.readSystemCatalog("http://metadata.invalid", call, 25, null));
+    executor.body = "UnsupportedNativeIndexOwner";
+    executor.status = 503;
+    try std.testing.expectError(error.NotLeader, client.readSystemCatalog("http://metadata.invalid", call, 25, null));
+    executor.status = 501;
+    try std.testing.expectError(error.RemoteUnavailable, client.readSystemCatalog("http://metadata.invalid", .snapshot, 25, null));
+    try std.testing.expectEqual(@as(usize, 4), executor.calls);
+}
+
 fn catalogResponseLimit(input: @import("../system_catalog/server_call.zig").Call) ?usize {
     const publication = @import("relational_index_publication.zig");
     return switch (input) {

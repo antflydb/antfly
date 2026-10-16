@@ -258,6 +258,7 @@ test "SQL diagnostics retain definite constraints conflicts and unknown outcomes
         .{ .err = error.SqlConstraintOwnedIndex, .code = "2BP01", .retryable = false },
         .{ .err = error.QueryCanceled, .code = "57014", .retryable = null },
         .{ .err = error.RowPolicyUnsupported, .code = "0A000", .retryable = false },
+        .{ .err = error.UnsupportedNativeIndexOwner, .code = "0A000", .retryable = false },
         .{ .err = error.SqlFeatureNotSupported, .code = "0A000", .retryable = false },
         .{ .err = error.SqlWrongAggregateKind, .code = "42809", .retryable = false },
         .{ .err = error.UndefinedSqlFunction, .code = "42883", .retryable = false },

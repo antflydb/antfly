@@ -28,11 +28,13 @@ pub const lsm_backend = @import("antfly_local_sources").storage_lsm_backend;
 test {
     _ = sql_primary_key_rewrite_integration_test;
     _ = @import("api/sql_index_lifecycle_integration_test.zig");
+    _ = @import("api/sql_expression_index_lifecycle_integration_test.zig");
     _ = @import("api/sql_default_lifecycle_integration_test.zig");
     _ = @import("api/sql_table_creation_integration_test.zig");
     _ = @import("metadata/schema_migration_finalization.zig");
     _ = @import("metadata/relation_publication_fence.zig");
     _ = @import("metadata/relation_reconciliation_worker.zig");
+    _ = @import("metadata/http_client.zig");
     _ = @import("metadata/storage/raft_apply_store.zig");
     _ = @import("data/raft_batch.zig").consumer_tests;
 }

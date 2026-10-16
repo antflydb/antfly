@@ -63,7 +63,7 @@ fn command(ctx: *fixture.Context, namespace: []const u8, statement: []const u8) 
     }
 }
 
-fn relationOwner(ctx: *fixture.Context, namespace: []const u8) !?u64 {
+pub fn relationOwner(ctx: *fixture.Context, namespace: []const u8) !?u64 {
     const domain = sources.system_catalog_domain;
     const source = server.StatusSource.fromMetadataHttpService(ctx.metadata.server.svc);
     const lookup: domain.ResolveMany = .{ .relations = &.{.{ .database = "default", .namespace = namespace, .name = "usage_records" }}, .include_query_definitions = true };
@@ -100,7 +100,7 @@ fn relationOwner(ctx: *fixture.Context, namespace: []const u8) !?u64 {
     return error.SqlIndexCampaignPublicationTimeout;
 }
 
-fn owner(ctx: *fixture.Context, namespace: []const u8) !u64 {
+pub fn owner(ctx: *fixture.Context, namespace: []const u8) !u64 {
     return (try relationOwner(ctx, namespace)) orelse error.SqlIndexCampaignMissingTable;
 }
 
@@ -130,7 +130,7 @@ fn waitTerminalActivation(ctx: *fixture.Context, namespace: []const u8) !Constra
     return error.SqlIndexCampaignActivationTimeout;
 }
 
-fn waitEnforced(ctx: *fixture.Context, namespace: []const u8) !void {
+pub fn waitEnforced(ctx: *fixture.Context, namespace: []const u8) !void {
     try std.testing.expectEqual(ConstraintState.enforced, try waitTerminalActivation(ctx, namespace));
 }
 
@@ -146,7 +146,7 @@ fn snapshotRows(ctx: *fixture.Context, namespace: []const u8) ![]u8 {
     }, .{});
 }
 
-fn snapshotDefinition(ctx: *fixture.Context, namespace: []const u8) ![]u8 {
+pub fn snapshotDefinition(ctx: *fixture.Context, namespace: []const u8) ![]u8 {
     const domain = sources.system_catalog_domain;
     const source = server.StatusSource.fromMetadataHttpService(ctx.metadata.server.svc);
     const lookup: domain.ResolveMany = .{ .relations = &.{.{ .database = "default", .namespace = namespace, .name = "usage_records" }}, .include_query_definitions = true };

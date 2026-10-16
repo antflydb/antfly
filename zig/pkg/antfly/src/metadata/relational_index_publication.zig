@@ -553,6 +553,7 @@ pub fn ownerAckHttpFailure(status: u16, body: []const u8) ?anyerror {
         409 => &.{ error.IndexOwnerReceiptChanged, error.GenerationPublicationChanged, error.GenerationPublicationNotFound, error.MetadataReplicationPending },
         503 => &.{error.MetadataReplicationPending},
         500 => &.{error.InvalidCatalogRecord},
+        501 => &.{error.UnsupportedNativeIndexOwner},
         else => return null,
     };
     for (failures) |err| if (std.mem.eql(u8, body, @errorName(err))) return err;
@@ -2322,6 +2323,14 @@ test "relational index publication ACK status binds exact committed digest not r
     try std.testing.expectEqual(error.IndexOwnerReceiptChanged, ownerAckHttpFailure(409, "IndexOwnerReceiptChanged").?);
     try std.testing.expect(ownerAckHttpFailure(503, "IndexOwnerReceiptChanged") == null);
     try std.testing.expect(ownerAckHttpFailure(409, "unrecognized") == null);
+}
+
+test "relational index publication unsupported owner has definite transport identity" {
+    try std.testing.expectEqual(@as(u16, 501), domain.httpStatus(error.UnsupportedNativeIndexOwner));
+    try std.testing.expectEqual(error.UnsupportedNativeIndexOwner, ownerAckHttpFailure(501, "UnsupportedNativeIndexOwner").?);
+    try std.testing.expect(ownerAckHttpFailure(500, "UnsupportedNativeIndexOwner") == null);
+    try std.testing.expect(ownerAckHttpFailure(503, "UnsupportedNativeIndexOwner") == null);
+    try std.testing.expect(ownerAckHttpFailure(501, "UnsupportedNativeIndexOwner suffix") == null);
 }
 
 test "relational index publication signatures bind owner authority position and root generation" {

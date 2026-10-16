@@ -2161,6 +2161,11 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .filters = &.{
             "mounted SQL ADD PRIMARY KEY publishes only validated fresh generation",
             "mounted SQL original unique indexes enforce exact postimages across owner restart",
+            "mounted SQL original expression indexes build maintain partial keys and recover owners",
+            "mounted SQL unsupported atomic index owner preserves definite nonadmission across restart",
+            "SQL schema cache",
+            "system catalog index prepare unsupported owner returns after one request",
+            "relational index publication unsupported owner has definite transport identity",
             "mounted SQL regular unique index build failure is atomic",
             "mounted SQL original column defaults preserve old rows and recover future mutation semantics",
             "schema publication acknowledgement accepts only exact deterministic finalization",
@@ -2187,6 +2192,18 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     sql_index_lifecycle_run.addArg("--require-no-skips");
     b.step("antfly-api-sql-index-lifecycle-test", "Run exact original index DDL, data-owner enforcement and restart qualification")
         .dependOn(&sql_index_lifecycle_run.step);
+    const sql_expression_index_run = addFilteredTestRunArtifactWithRuntimeFilters(b, sql_owner_lifecycle_tests, &.{"mounted SQL original expression indexes build maintain partial keys and recover owners"});
+    sql_expression_index_run.addArg("--require-no-skips");
+    b.step("antfly-api-sql-expression-index-lifecycle-test", "Run original expression/covering/partial indexes through owner builds mutations and cold restart")
+        .dependOn(&sql_expression_index_run.step);
+    const sql_index_unsupported_owner_run = addFilteredTestRunArtifactWithRuntimeFilters(b, sql_owner_lifecycle_tests, &.{ "mounted SQL unsupported atomic index owner preserves definite nonadmission across restart", "system catalog index prepare unsupported owner returns after one request", "relational index publication unsupported owner has definite transport identity" });
+    sql_index_unsupported_owner_run.addArg("--require-no-skips");
+    b.step("antfly-api-sql-index-owner-admission-test", "Run definite unsupported-owner nonadmission across the real compiled metadata boundary and restart")
+        .dependOn(&sql_index_unsupported_owner_run.step);
+    const sql_index_access_layout_run = addFilteredTestRunArtifactWithRuntimeFilters(b, sql_owner_lifecycle_tests, &.{"SQL schema cache"});
+    sql_index_access_layout_run.addArg("--require-no-skips");
+    b.step("antfly-api-sql-index-access-layout-test", "Run immutable SQL index access layout admission ownership and cache fallback contracts")
+        .dependOn(&sql_index_access_layout_run.step);
     const sql_index_atomicity_run = addFilteredTestRunArtifactWithRuntimeFilters(b, sql_owner_lifecycle_tests, &.{"mounted SQL regular unique index build failure is atomic"});
     sql_index_atomicity_run.addArg("--require-no-skips");
     b.step("antfly-api-sql-index-build-atomicity-test", "Run regular unique-index build rejection and repaired resubmission qualification")

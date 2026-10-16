@@ -9806,3 +9806,124 @@ The final PostgreSQL oracle rerun passes both tests against 18.6 in
 unit tests, staged license headers, scoped Python checks, Zig formatting,
 whitespace and the 2,062-file Apache-boundary audit pass. Unrelated edits remain
 unstaged; the checkpoint is local and unpushed.
+
+### Expression-index qualification and remaining owner/access architecture
+
+The next original cohort contains sql-0017, sql-0712 through sql-0718, and
+sql-0722/sql-0723. The independent PostgreSQL 18.6 oracle
+`scripts/test_sql_expression_index_lifecycle.py` passes all ten subcases,
+including complete mutation postimages, normalized UNIQUE collisions, inactive
+partial-index rows, predicate transitions and delete/reinsert behavior.
+PostgreSQL rejects concat/concat_ws index keys with 42P17 because those functions
+are stable, even with text arguments. They must not be silently accepted as
+immutable text-only overloads. Native immutable-expression lowering already
+preserves that distinction.
+
+The mounted positive gate
+`antfly-api-sql-expression-index-lifecycle-test` remains deliberately strict:
+it requires real owner builds, preserved generations across cold restart,
+complete postimages and EXPLAIN-selected index reads after mutations. Its first
+run failed before sql-0017 admission. The distributed fixture has no standalone
+native-owner binding, and metadata correctly rejects borrowing native ordered
+authority for a Raft owner. That semantic rejection was absent from the compiled
+failure registry, producing repeated undeclared-error warnings and finally a
+deadline diagnostic. The failure is retained in
+`/private/tmp/antfly-sql-expression-index-original-debug.log`.
+
+UnsupportedNativeIndexOwner now has an append-only runtime status (802) and
+shared failure ABI version 65. It round-trips without becoming generic internal
+failure. The mounted nonadmission regression independently requires 0A000,
+nonretryable completion, unchanged schema/owner and no durable index-publication
+head, then verifies the table remains writable after owner restart. This is a
+diagnostic/authority fix, not qualification of the positive original. No
+standalone reporter registration, generation switching or retirement is enabled.
+
+Two shared architectural requirements remain before this cohort is complete:
+
+1. **Raft-owned index lifecycle.** Mount the existing lifecycle phases on
+   data-Raft commands with exact owner/namespace/schema/term guards and durable
+   idempotent receipts at committed term/index positions. Preparation, bounded
+   source pages and artifact transfer stay outside serialized apply; local
+   progress, UNIQUE claims, installation and writer fencing commit atomically
+   through the authoritative group. Metadata must select the actual supported
+   authority and dispatch through an explicit authority adapter, never label
+   Raft execution native. Publication requires complete current-owner coverage;
+   cancellation and recovery must retain authentic positions and provenance.
+   Decoder/support admission must be in place before activation. The independent
+   native reporter-namespace activation restriction remains unchanged.
+2. **Shared expression/partial read access plans.** The schema cache currently
+   exposes only direct, nonpartial tuple keys to SQL access planning. Retain
+   immutable typed expression/comparison identities and compiled partial
+   predicates in the schema layout; match bound SQL programs in that same
+   domain. Prepare row-independent typed probe operands once per statement,
+   retaining the full residual filter. Reuse the native bounded implication
+   machinery rather than inventing SQL-only predicate equivalence. Carry an
+   explicit schema/generation-bound index span through coordinated snapshot and
+   range-proof capture, and use the same access plan for EXPLAIN and execution.
+   Simple scans and relation-graph scans must share that planner. An unproven
+   implication or incompatible comparison domain must not narrow a scan.
+
+NOT VALID/VALIDATE is a separate catalog gap: declared validity must remain
+distinct from future-write enforcement and disposable local scan coverage.
+Ordinary validated additions need an atomic publication barrier; NOT VALID
+must preserve existing rows and enforce future writes without pretending a
+background scan makes the declaration validated. Explicit validation needs a
+named, owner-fenced cohort and durable completion before catalog validity flips.
+
+No original dispositions change for this unfinished cohort: 531 implemented /
+132 rejected / 113 superseded / 810 unresolved. A green PostgreSQL oracle,
+kernel error round-trip, or unsupported-owner regression is not a substitute
+for successful native execution of the valid original indexes.
+
+Review also found a separate direct-index planning bug: SQL DDL serializes a
+total index's predicate as an empty array, but the schema cache treated any
+present predicate field as partial and discarded the candidate. It now checks
+nonempty predicate content. The regression runs actual SQL DDL lowering for a
+total, partial and expression index and verifies both cached and budget-fallback
+layouts retain only the proven direct total index. This restores candidate
+eligibility for existing indexed-probe consumers without claiming expression
+matching, partial implication or READY owner coverage. No latency/throughput
+speedup is asserted without an execution benchmark.
+
+Validation checkpoint: all six failure-identity tests, both released-status ABI
+tests and all five SQL diagnostic tests pass. The combined Debug run in
+`/private/tmp/antfly-sql-index-authority-layout-final-debug.log` passes ten schema
+cache tests, 27 publication/recovery tests, four acknowledgement tests and the
+mounted default lifecycle. Its unsupported-owner case still returns 57014,
+revealing a second gap: metadata HTTP did not preserve the now-correct compiled
+error. The HTTP status/body contract now uses an exact 501 identity for this
+index-owner operation, and the routed read stops on that permanent rejection.
+Wrong status, suffixed body and unrelated catalog calls remain untrusted.
+The new client regression requires one request and preserves those negative
+transport cases. Mutation outcome-header precedence is unchanged.
+
+The worktree cache disappeared during that run (the build also reports a
+missing cache output path); this was separate from the semantic test failure.
+Final current-source verification of both transport layers and the cache fix
+is running cold in
+`/private/tmp/antfly-sql-index-authority-http-final-debug.log`. Do not treat the
+mounted nonadmission path as verified until that gate finishes successfully.
+No source files or fixtures were removed. Earlier, three exact obsolete owned
+executables were verified unused and removed (about 1.3 GiB); those are
+rebuildable, and retained logs preserve the earlier evidence.
+
+Final transport verification now passes in
+`/private/tmp/antfly-sql-index-authority-http-contract-final-debug.log`:
+45 selected Debug tests, zero skips/failures/leaks and 92/92 build steps.
+The preceding HTTP run already returned the correct public HTTP 501 / SQLSTATE
+0A000 / nonretryable diagnostic; the remaining assertion expected 400 and was
+corrected to the existing SQL unsupported-feature contract without changing
+server behavior. Three further fresh-owner restart soaks pass in
+`/private/tmp/antfly-sql-index-unsupported-soak-{1,2,3}.log`.
+The mounted regression verifies unchanged owner/definition, no publication head
+through the compiled metadata work API and successful subsequent writes after
+restart. Original DDL is submitted once, with no retry.
+
+The formatted ten-subcase PostgreSQL oracle passes in
+`/private/tmp/antfly-sql-expression-index-postgres-final.log`; pure failure
+identity (six), released ABI identity (two) and SQL diagnostics (five) tests pass
+in `/private/tmp/antfly-sql-index-unsupported-{identity,abi,errors}-debug.log`.
+Formatting, licensing, Apache-boundary and original-inventory audits pass.
+The positive expression-index lifecycle gate remains unfinished and must not be
+represented as green. No original dispositions change; unrelated work remains
+unstaged and no changes have been pushed.

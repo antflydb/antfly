@@ -200,6 +200,7 @@ operator-docker-build: ## Build the antfly-operator Docker image.
 # ====================================================================================
 
 .PHONY: sql-parity-inventory-check sql-parity-evidence-check sql-parity-release-check sql-catalog-lifecycle-oracle-check sql-default-lifecycle-oracle-check sql-table-creation-oracle-check
+.PHONY: sql-expression-index-oracle-check
 
 sql-parity-inventory-check: ## Audit SQL parity inventory.
 	python3 scripts/check_sql_parity_inventory.py
@@ -218,3 +219,6 @@ sql-default-lifecycle-oracle-check: ## Check exact PostgreSQL default DDL and fu
 
 sql-table-creation-oracle-check: ## Check PostgreSQL generated/default CREATE and complete mutation postimages.
 	uv run --no-project --with 'psycopg[binary]==3.3.6' python -m unittest discover -s scripts -p test_sql_table_creation_lifecycle.py
+
+sql-expression-index-oracle-check: ## Check PostgreSQL expression/partial index volatility and mutation postimages.
+	uv run --no-project --with 'psycopg[binary]==3.3.6' python -m unittest discover -s scripts -p test_sql_expression_index_lifecycle.py

@@ -65,7 +65,11 @@ test "SQL default lifecycle retries only definite read admission" {
 }
 
 pub fn execute(ctx: *fixture.Context, statement: []const u8, retry: Retry) !http.HttpResponse {
-    const body = try std.json.Stringify.valueAlloc(ctx.alloc, .{ .statement = statement }, .{});
+    return executeIn(ctx, null, statement, retry);
+}
+
+pub fn executeIn(ctx: *fixture.Context, namespace: ?[]const u8, statement: []const u8, retry: Retry) !http.HttpResponse {
+    const body = try std.json.Stringify.valueAlloc(ctx.alloc, .{ .statement = statement, .namespace = namespace }, .{ .emit_null_optional_fields = false });
     defer ctx.alloc.free(body);
     const deadline = platform.time.monotonicNs() +| 15 * std.time.ns_per_s;
     while (true) {

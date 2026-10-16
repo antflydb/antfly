@@ -1,0 +1,164 @@
+# Copyright 2026 Antfly, Inc.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Original expression-index DDL and full mutation postimages against PostgreSQL."""
+
+import json
+import unittest
+import psycopg
+from generate_sql_postgres_reference import FIXTURES, postgres
+
+CASES = (
+    "sql-0017",
+    "sql-0712",
+    "sql-0713",
+    "sql-0714",
+    "sql-0715",
+    "sql-0716",
+    "sql-0717",
+    "sql-0718",
+    "sql-0722",
+    "sql-0723",
+)
+PARTIAL = {"sql-0722", "sql-0723"}
+UNIQUE = PARTIAL | {"sql-0017"}
+MUTABLE = {"sql-0712", "sql-0713"}
+
+
+def row(number, email, status):
+    return (f"00000000-0000-0000-0000-{number:012}", email, "tenant", status)
+
+
+class ExpressionIndexTest(unittest.TestCase):
+    def test_original_expression_index_lifecycles(self):
+        originals = {
+            entry["id"]: entry
+            for entry in json.loads(
+                (FIXTURES / "sql_parity_inventory.json").read_text()
+            )["entries"]
+        }
+        with postgres() as db:
+            print(
+                "PostgreSQL server version:",
+                db.execute("SHOW server_version_num").fetchone()[0],
+            )
+            for case in CASES:
+                with self.subTest(case=case):
+                    namespace = "expr_" + case.replace("-", "_")
+                    db.execute(f'CREATE SCHEMA "{namespace}"')
+                    db.execute(f'SET search_path TO "{namespace}"')
+                    db.execute(
+                        "CREATE TABLE usage_records(id UUID PRIMARY KEY,email TEXT,tenant_id TEXT,status TEXT)"
+                    )
+                    expected = [
+                        row(
+                            1,
+                            "Owner@Example.com",
+                            "active" if case in PARTIAL else "old-start",
+                        ),
+                        row(
+                            2,
+                            "other@example.com",
+                            "active" if case in PARTIAL else "old-finish",
+                        ),
+                    ]
+
+                    def verify():
+                        self.assertEqual(
+                            expected,
+                            db.execute(
+                                "SELECT id::text,email,tenant_id,status FROM usage_records ORDER BY id"
+                            ).fetchall(),
+                        )
+
+                    def insert(value):
+                        db.execute(
+                            "INSERT INTO usage_records(id,email,tenant_id,status) VALUES(%s::uuid,%s,%s,%s)",
+                            value,
+                        )
+
+                    def reject(statement, parameters, code):
+                        with self.assertRaises(psycopg.Error) as failure:
+                            db.execute(statement, parameters)
+                        self.assertEqual(code, failure.exception.sqlstate)
+                        verify()
+
+                    for value in expected:
+                        insert(value)
+                    verify()
+                    original = originals[case]
+                    self.assertEqual([], original["params"])
+                    if case in MUTABLE:
+                        reject(original["sql"], (), "42P17")
+                        self.assertEqual(
+                            [],
+                            db.execute(
+                                "SELECT indexname FROM pg_indexes WHERE schemaname=%s AND indexname != 'usage_records_pkey'",
+                                (namespace,),
+                            ).fetchall(),
+                        )
+                    else:
+                        self.assertEqual(
+                            "CREATE INDEX", db.execute(original["sql"]).statusmessage
+                        )
+                        verify()
+                        status = "active" if case in PARTIAL else "new-start"
+                        collision = row(3, "owner@example.com", status)
+                        update = "UPDATE usage_records SET email='OWNER@EXAMPLE.COM',status=%s WHERE id='00000000-0000-0000-0000-000000000002'"
+                        if case in UNIQUE:
+                            reject(
+                                "INSERT INTO usage_records(id,email,tenant_id,status) VALUES(%s::uuid,%s,%s,%s)",
+                                collision,
+                                "23505",
+                            )
+                            reject(update, (status,), "23505")
+                        else:
+                            insert(collision)
+                            expected.append(collision)
+                            db.execute(update, (status,))
+                            expected[1] = row(2, "OWNER@EXAMPLE.COM", status)
+                        verify()
+                        nullable = row(
+                            4,
+                            "owner@example.com" if case in PARTIAL else None,
+                            "inactive" if case in PARTIAL else None,
+                        )
+                        insert(nullable)
+                        expected.append(nullable)
+                        if case in PARTIAL:
+                            reject(
+                                "UPDATE usage_records SET status='active' WHERE id='00000000-0000-0000-0000-000000000004'",
+                                (),
+                                "23505",
+                            )
+                        verify()
+                    # Same mutation sequence as the native cold-restart phase.
+                    # PostgreSQL remains an independent semantics oracle, not a
+                    # substitute for Antfly owner-recovery qualification.
+                    db.execute(
+                        "DELETE FROM usage_records WHERE id='00000000-0000-0000-0000-000000000001'"
+                    )
+                    status = "active" if case in PARTIAL else "new-start"
+                    replacement = row(6, "owner@example.com", status)
+                    insert(replacement)
+                    expected = expected[1:] + [replacement]
+                    verify()
+                    if case in UNIQUE:
+                        reject(
+                            "INSERT INTO usage_records(id,email,tenant_id,status) VALUES(%s::uuid,%s,%s,%s)",
+                            row(7, "OWNER@EXAMPLE.COM", status),
+                            "23505",
+                        )
+                    db.execute("RESET search_path")

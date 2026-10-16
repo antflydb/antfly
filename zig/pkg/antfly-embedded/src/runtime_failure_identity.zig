@@ -623,6 +623,7 @@ const mappings = [_]Mapping{
     .{ .status = .storage_unavailable, .err = error.StorageUnavailable },
     .{ .status = .transaction_too_large, .err = error.TransactionTooLarge },
     .{ .status = .unsupported_operation, .err = error.UnsupportedOperation },
+    .{ .status = .unsupported_native_index_owner, .err = error.UnsupportedNativeIndexOwner },
     .{ .status = .incomplete_seed_artifact, .err = error.IncompleteSeedArtifact },
     .{ .status = .invalid_artifact_boundary, .err = error.InvalidArtifactBoundary },
     .{ .status = .invalid_artifact_chunk_size, .err = error.InvalidArtifactChunkSize },
@@ -1035,6 +1036,15 @@ test "native private index control errors retain distinct compiled identities" {
         try validateFailureEnvelope(status, &failure, abi.abi_version);
         try std.testing.expectEqualStrings(@errorName(expected), failure.errorName());
     }
+}
+
+test "index publication unsupported owner stays definite across compiled runtime boundaries" {
+    const status = statusFromError(error.UnsupportedNativeIndexOwner);
+    try std.testing.expectEqual(abi.Status.unsupported_native_index_owner, status);
+    try std.testing.expectError(error.UnsupportedNativeIndexOwner, statusToError(status));
+    const failure = failureFromError(error.UnsupportedNativeIndexOwner, .storage_owner, abi.abi_version, 23);
+    try validateFailureEnvelope(status, &failure, abi.abi_version);
+    try std.testing.expectEqualStrings("UnsupportedNativeIndexOwner", failure.errorName());
 }
 
 test "seed replica policy mismatch survives compiled runtime boundaries" {

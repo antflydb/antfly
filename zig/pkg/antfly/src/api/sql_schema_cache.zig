@@ -239,7 +239,9 @@ fn derive(layout: *Layout, json: []const u8, temporary: std.mem.Allocator, owned
     }
     var indexes: std.ArrayList(catalog.Index) = .empty;
     if (parsed.relational_indexes) |declarations| for (declarations.value) |index| {
-        if (index.where != null or index.keys.len == 0 or index.keys.len > 32) continue;
+        // SQL DDL emits an empty predicate list for total indexes. Presence
+        // alone is not partiality; only a nonempty predicate needs implication.
+        if ((if (index.where) |where| where.len != 0 else false) or index.keys.len == 0 or index.keys.len > 32) continue;
         const names = try owned.alloc([]const u8, index.keys.len);
         var direct = true;
         for (index.keys, names) |key, *name| {
@@ -311,6 +313,36 @@ test "SQL schema cache pins direct total index candidates with the layout" {
     try std.testing.expectEqualStrings("label_tenant_idx", table.indexes[1].name);
     try std.testing.expectEqualStrings("label", table.indexes[1].columns[0]);
     try std.testing.expectEqualStrings("tenant", table.indexes[1].columns[1]);
+}
+
+test "SQL schema cache retains SQL-lowered total indexes without admitting partial or expression access" {
+    var cache = Cache.init(std.testing.allocator);
+    defer cache.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var candidate_schema = try std.json.parseFromSliceLeaky(std.json.Value, a,
+        \\{"version":1,"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"label":{"type":"keyword"}},"additionalProperties":false}}}}
+    , .{});
+    for ([_][]const u8{
+        "CREATE INDEX direct_label ON items(label)",
+        "CREATE INDEX partial_label ON items(label) WHERE label='ready'",
+        "CREATE INDEX expression_label ON items(lower(label))",
+    }) |statement| {
+        var compiled = try @import("antfly_local_sources").sql_compiler.compile(a, statement, .{});
+        defer compiled.deinit();
+        try std.testing.expect(try @import("antfly_local_sources").sql_schema_ddl.apply(a, &candidate_schema, compiled.statement.catalog_ddl));
+        const bytes = try std.json.Stringify.valueAlloc(a, candidate_schema, .{});
+        for ([_]bool{ false, true }) |uncached| {
+            const table = if (uncached)
+                try cache.resolveWithEntryLimit(std.testing.io, a, bytes, 1, "physical", 1)
+            else
+                try cache.resolve(std.testing.io, a, bytes, 1, "physical");
+            try std.testing.expectEqual(@as(usize, 1), table.indexes.len);
+            try std.testing.expectEqualStrings("direct_label", table.indexes[0].name);
+            try std.testing.expectEqualStrings("label", table.indexes[0].columns[0]);
+        }
+    }
 }
 
 test "SQL schema cache owns named constraint kinds across eviction and allocation faults" {
