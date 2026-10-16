@@ -22,6 +22,95 @@ from generate_sql_postgres_reference import postgres
 
 
 class IntegerSumTest(unittest.TestCase):
+    def test_window_rank_and_ntile_signatures_and_validation(self):
+        import psycopg
+
+        with postgres() as db:
+            cursor = db.execute(
+                "SELECT row_number() OVER (), rank() OVER (), dense_rank() OVER (), ntile(2::smallint) OVER (), ntile(NULL) OVER () FROM (VALUES (1),(2),(3)) v(n)"
+            )
+            self.assertEqual(
+                [20, 20, 20, 23, 23],
+                [column.type_code for column in cursor.description],
+            )
+            self.assertTrue(all(row[4] is None for row in cursor.fetchmany(4)))
+            for query, state in [
+                ("SELECT ntile(2147483648) OVER ()", "42883"),
+                ("SELECT ntile(2::bigint) OVER ()", "42883"),
+                ("SELECT ntile(0) OVER ()", "22014"),
+                ("SELECT ntile(-1) OVER ()", "22014"),
+            ]:
+                with self.subTest(sql=query):
+                    with (
+                        self.assertRaises(psycopg.Error) as failure,
+                        db.transaction(force_rollback=True),
+                    ):
+                        db.execute(query)
+                    self.assertEqual(state, failure.exception.sqlstate)
+
+    def test_integer_average_preserves_numeric_scale_and_exact_window_results(self):
+        cases = [
+            (
+                "SELECT avg(n) FROM (VALUES (1::bigint),(1),(2)) v(n)",
+                ["1.3333333333333333"],
+            ),
+            (
+                "SELECT avg(n) FROM (VALUES (9223372036854775807::bigint),(9223372036854775807)) v(n)",
+                ["9223372036854775807"],
+            ),
+            (
+                "SELECT avg(n) FROM (VALUES (9007199254740993::bigint),(9007199254740994)) v(n)",
+                ["9007199254740993.5000"],
+            ),
+            (
+                "SELECT avg(n) FROM (VALUES (0::integer),(0)) v(n)",
+                ["0.00000000000000000000"],
+            ),
+            (
+                "SELECT avg(n) FROM (VALUES (-1::smallint),(2::smallint)) v(n)",
+                ["0.50000000000000000000"],
+            ),
+            (
+                "SELECT avg(DISTINCT n) FILTER (WHERE n>0) FROM (VALUES (1),(2),(2),(NULL),(-1)) v(n)",
+                ["1.5000000000000000"],
+            ),
+            (
+                "SELECT avg(n) FILTER (WHERE false) FROM (VALUES (1::bigint)) v(n)",
+                [None],
+            ),
+            (
+                "SELECT avg(n) OVER (ORDER BY i ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM (VALUES (0,9007199254740993::bigint),(1,9007199254740994::bigint),(2,NULL),(3,0::bigint)) v(i,n) ORDER BY i",
+                [
+                    "9007199254740993.0000",
+                    "9007199254740993.5000",
+                    "9007199254740994.0000",
+                    "0.00000000000000000000",
+                ],
+            ),
+            (
+                "SELECT avg(n) OVER (ORDER BY i ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING EXCLUDE CURRENT ROW) FROM (VALUES (0,1),(1,2),(2,3)) v(i,n) ORDER BY i",
+                ["2.5000000000000000", "2.0000000000000000", "1.5000000000000000"],
+            ),
+            (
+                "SELECT CASE WHEN true THEN avg(n) ELSE 0 END AS x FROM (VALUES (1),(2)) v(n) UNION SELECT 1.5::numeric",
+                ["1.5000000000000000"],
+            ),
+        ]
+        with postgres() as db:
+            for query, expected in cases:
+                with self.subTest(sql=query):
+                    cursor = db.execute(query)
+                    self.assertEqual(1700, cursor.description[0].type_code)
+                    actual = [row[0] for row in cursor.fetchmany(len(expected) + 1)]
+                    self.assertEqual(len(expected), len(actual))
+                    for number, text in zip(actual, expected, strict=True):
+                        if text is None:
+                            self.assertIsNone(number)
+                        else:
+                            self.assertEqual(
+                                Decimal(text).as_tuple(), number.as_tuple()
+                            )
+
     def test_joined_assignment_coerces_before_atomic_publication(self):
         import psycopg
 

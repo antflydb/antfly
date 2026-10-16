@@ -378,7 +378,7 @@ pub fn bindWithInvocation(alloc: Allocator, table: ?catalog.Table, statement: as
         };
         try operators.Aggregate.validate(kind, input_type);
         const input_element = if (index) |slot| input.projections[slot].?.output_type.element_type else null;
-        spec.* = .{ .kind = kind, .input_type = input_type, .input_element = if (kind == .sum and input_type == .integer) input_element orelse .int64 else input_element, .distinct = node.call.distinct };
+        spec.* = .{ .kind = kind, .input_type = input_type, .input_element = if ((kind == .sum or kind == .avg) and input_type == .integer) input_element orelse .int64 else input_element, .distinct = node.call.distinct };
         column.type = switch (kind) {
             .count => .integer,
             .avg => .number,
@@ -390,8 +390,9 @@ pub fn bindWithInvocation(alloc: Allocator, table: ?catalog.Table, statement: as
         // number/array tag. Exact decimals must not become float results.
         if (column.type == .array or kind == .min or kind == .max) column.element_type = if (index) |slot| input.projections[slot].?.output_type.element_type else null;
         if ((kind == .sum or kind == .avg) and input_element == .numeric) column.element_type = .numeric;
-        if (kind == .sum) {
-            const output = operators.Aggregate.sumType(.{ .kind = input_type, .element_type = input_element });
+        if (kind == .sum or kind == .avg) {
+            const domain: scalar.Type = .{ .kind = input_type, .element_type = input_element };
+            const output = if (kind == .sum) operators.Aggregate.sumType(domain) else operators.Aggregate.averageType(domain);
             column.type = output.kind orelse .string;
             column.element_type = output.element_type;
         }

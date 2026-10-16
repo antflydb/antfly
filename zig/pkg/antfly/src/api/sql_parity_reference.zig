@@ -44,6 +44,7 @@ test "SQL PostgreSQL reference distinguishes JSON null and validates ordered pee
 }
 
 const Reference = struct {
+    exact_builtin_types: bool = false,
     reference: []const u8 = "",
     entries: []const struct { id: []const u8, columns: []const []const u8, rows: []const []const Json, sql_nulls: ?[]const []const bool = null, column_oids: ?[]const u32 = null, ordered_groups: ?[]const OrderedGroup = null },
 };
@@ -86,12 +87,25 @@ fn postgresTypeMatches(kind: wire.SQLColumnType, oid: u32) bool {
 }
 
 fn postgresColumnMatches(column: wire.SQLColumn, oid: u32) bool {
+    if (oid == 1700) return column.type == .number and column.element_type == .numeric;
     if (column.type != .array) return postgresTypeMatches(column.type, oid);
     const element = column.element_type orelse return false;
     const native: @import("antfly_local_sources").sql_array_value.ElementType = switch (element) {
         inline else => |tag| @field(@import("antfly_local_sources").sql_array_value.ElementType, @tagName(tag)),
     };
     return native.arrayOid() == oid;
+}
+
+fn postgresBuiltinMatches(column: wire.SQLColumn, oid: u32) bool {
+    if (!postgresColumnMatches(column, oid)) return false;
+    return switch (oid) {
+        20 => column.element_type == null or column.element_type == .int64,
+        21 => column.element_type == .int16,
+        23 => column.element_type == .int32,
+        700 => column.element_type == .float32,
+        701 => column.element_type == null or column.element_type == .float64,
+        else => true,
+    };
 }
 
 fn equivalent(a: Json, b: Json) bool {
@@ -116,6 +130,20 @@ fn equivalent(a: Json, b: Json) bool {
             break :blk true;
         },
     };
+}
+
+test "SQL parity exact NUMERIC references reject lost bits scale and builtin identity" {
+    const a = std.testing.allocator;
+    const columns = [_]wire.SQLColumn{.{ .name = "n", .type = .number, .element_type = .numeric }};
+    try std.testing.expect(postgresColumnMatches(columns[0], 1700));
+    try std.testing.expect(!postgresColumnMatches(.{ .name = "n", .type = .number, .element_type = .float64 }, 1700));
+    try std.testing.expect(postgresBuiltinMatches(.{ .name = "tile", .type = .integer, .element_type = .int32 }, 23));
+    try std.testing.expect(!postgresBuiltinMatches(.{ .name = "tile", .type = .integer, .element_type = .int64 }, 23));
+    const expected = [_]Json{.{ .string = "9007199254740993.5000" }};
+    try std.testing.expect(try rowMatches(a, &columns, &expected, &.{false}, &expected));
+    for ([_]Json{ .{ .string = "9007199254740993.0000" }, .{ .string = "9007199254740993.5" }, .{ .float = 9007199254740994.0 } }) |wrong| {
+        try std.testing.expect(!try rowMatches(a, &columns, &.{wrong}, &.{false}, &expected));
+    }
 }
 
 fn rowMatches(alloc: std.mem.Allocator, columns: []const wire.SQLColumn, actual: []const Json, nulls: ?[]const bool, expected: []const Json) !bool {
@@ -152,6 +180,17 @@ fn rowMatchesWithNulls(alloc: std.mem.Allocator, columns: []const wire.SQLColumn
                 value = .{ .integer = try std.fmt.parseInt(i64, cell.string, 10) };
             },
             .number => {
+                if (column.element_type == .numeric and want == .string) {
+                    if (cell != .string) return false;
+                    const numeric = @import("antfly_local_sources").sql_numeric_value;
+                    var context: numeric.Context = .{ .alloc = alloc };
+                    var left = try numeric.parse(&context, cell.string);
+                    defer left.deinit();
+                    var right = try numeric.parse(&context, want.string);
+                    defer right.deinit();
+                    if (left.value.scale != right.value.scale or try numeric.order(&context, left.value, right.value) != .eq) return false;
+                    continue;
+                }
                 if (cell == .string) value = .{ .float = try std.fmt.parseFloat(f64, cell.string) };
                 // JSON has one numeric domain: a number column's integral
                 // float can serialize without a decimal point. Normalize
@@ -1207,7 +1246,7 @@ fn runReferenceWithDiscovery(alloc: std.mem.Allocator, handler: anytype, case_id
         };
         if (matches) if (expected.column_oids) |oids| {
             try std.testing.expectEqual(result.columns.len, oids.len);
-            for (result.columns, oids) |column, oid| if (!postgresColumnMatches(column, oid)) {
+            for (result.columns, oids) |column, oid| if (!(if (reference.value.exact_builtin_types) postgresBuiltinMatches(column, oid) else postgresColumnMatches(column, oid))) {
                 matches = false;
                 break;
             };

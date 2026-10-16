@@ -385,7 +385,7 @@ const Tree = struct {
                 }
             },
             .sum => {
-                if (self.spec.type != .integer and !self.spec.integer_numeric_sum) {
+                if (self.spec.type != .integer and !self.spec.integer_numeric_result) {
                     for ([_]f128{ right.number, right.compensation }) |value| {
                         if (!std.math.isFinite(result.number) or !std.math.isFinite(value)) {
                             result.number += value;
@@ -413,11 +413,11 @@ const Tree = struct {
         return self.finish(result);
     }
     fn querySetOutput(self: Tree, a: Allocator, bounds: FrameSet) !Datum {
-        if (!self.spec.integer_numeric_sum) return self.querySet(bounds);
+        if (!self.spec.integer_numeric_result) return self.querySet(bounds);
         var result: Node = .{};
         for (bounds.parts[0..bounds.len]) |part| result = try self.combine(result, try self.queryNode(part));
         if (result.count == 0) return .{};
-        return operators.Aggregate.integerSumOutput(a, result.integer_sum);
+        return if (self.spec.kind == .avg) operators.Aggregate.integerAverageOutput(a, result.integer_sum, result.count) else operators.Aggregate.integerSumOutput(a, result.integer_sum);
     }
     fn queryNode(self: Tree, bounds: Frame) !Node {
         var left = self.base + bounds.start;
@@ -762,7 +762,7 @@ const Sliding = struct {
     trues: u64 = 0,
     fn eligible(spec: binding.Spec) bool {
         if (spec.frame) |definition| if (definition.exclusion != .no_others) return false;
-        return spec.kind == .count or spec.kind == .bool_and or spec.kind == .bool_or or (spec.kind == .sum and (spec.type == .integer or spec.integer_numeric_sum));
+        return spec.kind == .count or spec.kind == .bool_and or spec.kind == .bool_or or spec.integer_numeric_result or (spec.kind == .sum and spec.type == .integer);
     }
     fn change(self: *Sliding, context: anytype, cells: anytype, indices: anytype, spec: binding.Spec, first: usize, end: usize, add: bool) !void {
         for (first..end) |position| {
@@ -778,7 +778,7 @@ const Sliding = struct {
             if (value.sql_null) continue;
             if (add) self.count += 1 else self.count -= 1;
             switch (spec.kind) {
-                .sum => {
+                .sum, .avg => {
                     if (value.value != .integer) return error.SqlTypeMismatch;
                     if (add) self.sum += value.value.integer else self.sum -= value.value.integer;
                 },
@@ -816,11 +816,11 @@ const Sliding = struct {
         };
     }
     fn queryOutput(self: *Sliding, context: anytype, a: Allocator, cells: anytype, indices: anytype, spec: binding.Spec, bounds: Frame) !Datum {
-        if (!spec.integer_numeric_sum) return self.query(context, cells, indices, spec, bounds);
+        if (!spec.integer_numeric_result) return self.query(context, cells, indices, spec, bounds);
         // Advance the same removable i128 state without narrowing the final
         // sum to int8. Empty frames retain SQL NULL, including after removal.
         try self.advance(context, cells, indices, spec, bounds);
-        return if (self.count == 0) .{} else operators.Aggregate.integerSumOutput(a, self.sum);
+        return if (self.count == 0) .{} else if (spec.kind == .avg) operators.Aggregate.integerAverageOutput(a, self.sum, self.count) else operators.Aggregate.integerSumOutput(a, self.sum);
     }
 };
 
@@ -833,7 +833,7 @@ pub fn evaluate(context: anytype, cells: anytype, indices: anytype, sort: bindin
     // between specifications/partitions instead of accumulating with input.
     const sliding = aggregate and Sliding.eligible(spec);
     var running: Sliding = .{};
-    const exact_numeric = (spec.kind == .sum or spec.kind == .avg) and spec.element_type == .numeric and !spec.integer_numeric_sum;
+    const exact_numeric = (spec.kind == .sum or spec.kind == .avg) and spec.element_type == .numeric and !spec.integer_numeric_result;
     const real_sum = spec.kind == .sum and spec.element_type == .float32;
     var numeric_tree: ?NumericTree = if (exact_numeric) try NumericTree.create(context, cells, indices, spec) else null;
     defer if (numeric_tree) |*value| value.deinit();
@@ -859,7 +859,7 @@ pub fn evaluate(context: anytype, cells: anytype, indices: anytype, sort: bindin
             .cume_dist => Datum.json(.{ .float = @as(f64, @floatFromInt((try at(peers_end, position)))) / @as(f64, @floatFromInt(indices.len)) }),
             .ntile => blk: {
                 const buckets = (try integer(try getCell(cells, try at(indices, 0), spec.arguments[0]))) orelse break :blk Datum{};
-                if (buckets <= 0) return error.InvalidSqlParameters;
+                if (buckets <= 0) return error.SqlInvalidNtileArgument;
                 const count: usize = @intCast(buckets);
                 const base = indices.len / count;
                 const remainder = indices.len % count;

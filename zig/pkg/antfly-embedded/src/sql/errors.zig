@@ -116,6 +116,7 @@ pub fn describe(err: anyerror) Diagnostic {
         error.SqlNonFiniteScalarStorage => .{ .code = "0A000", .message = "Scalar floating-point storage currently requires finite values.", .hint = "Use NUMERIC for stored NaN or Infinity values." },
         error.SqlInvalidParameterValue => .{ .code = "22023", .message = "The SQL type modifier is outside its supported range.", .hint = "NUMERIC precision must be 1..1000 and scale -1000..1000.", .retryable = false },
         error.SqlSubstringError => .{ .code = "22011", .message = "The substring start or length is invalid.", .retryable = false },
+        error.SqlInvalidNtileArgument => .{ .code = "22014", .message = "The argument of ntile must be greater than zero.", .retryable = false },
         error.InvalidSqlCharacterCode => .{ .code = "54000", .message = "The character code is not a nonzero Unicode scalar value.", .retryable = false },
         error.InvalidSqlDateTime => .{ .code = "22007", .message = "The datetime is invalid or outside the supported UTC nanosecond range.", .hint = "Use a valid ISO date or RFC3339 timestamp representable as unsigned epoch nanoseconds.", .retryable = false },
         error.SqlGroupingError => .{ .code = "42803", .message = "A grouped expression references an ungrouped column or invalid aggregate.", .hint = "Group every non-aggregate column and avoid nested aggregate functions.", .retryable = false },

@@ -9,7 +9,7 @@ a completion claim. PostgreSQL is the SQL standard and independent test oracle.
 ## Baseline and priorities
 
 The [original inventory](sql/parity-inventory.md) remains authoritative:
-524 implemented / 132 rejected / 113 superseded / 817 unresolved. Counts below
+526 implemented / 132 rejected / 113 superseded / 815 unresolved. Counts below
 are unresolved family pools, not promises that one implementation closes them.
 
 | Priority | Pool | Cases | Shared delivery boundary |
@@ -9481,3 +9481,76 @@ ownership and allocation-failure tests. Preserve constant-width i128 integer
 transitions rather than converting each input into an allocated NUMERIC. The
 larger catalog/session and captured-mutation pools remain the primary delivery
 priorities; this batch does not claim their activation or reduce their counts.
+
+### Exact integer averages and public builtin descriptors
+
+Integer AVG now binds to NUMERIC for int2/int4/int8 inputs. Grouped vectors,
+DISTINCT reducers, spill/checkpoint replay and associative partial merges retain
+one i128 sum and one count, rather than a floating mean or one allocated NUMERIC
+per input. Finalization divides exact allocation-free integer views using the
+bounded native NUMERIC kernel, preserving PostgreSQL's output scale and owning
+the result in the consumer region. Invalid floating-state checkpoints and sums
+outside their declared integer-width/count bounds reject before import.
+
+Ordinary running and sliding integer AVG frames use the existing removable
+constant-width state; they no longer need the indexed aggregate tree. Excluded
+frames still combine exact indexed sums/counts before the same finalization.
+This is a state-shape improvement, not a measured throughput claim. Exhaustive
+final-output allocation failures, widened partial sums, consumer ownership,
+forced 1000-group spilling and DISTINCT reductions have Debug coverage.
+
+The window qualification also found two builtin-descriptor issues. NTILE's
+result is int4, not int8; ranking functions retain int8 through symbolic set
+inference. NTILE accepts int2/int4 arguments and NULL, rejects int8 overloads
+before statement acquisition, and reports PostgreSQL 22014 for nonpositive
+bucket counts. HTTP description serialization now retains every supplied
+scalar builtin identity, not only NUMERIC and arrays; internal NULL provenance
+still never escapes. The existing public schema already permits these widths,
+so no new wire enum or generated API type is introduced.
+
+The separate numeric-window campaign keeps sql-1366 and sql-1376 unchanged.
+Its int4 amount and int8 quantity domains have 24 nonempty native rows, unique
+amount/rank frontiers and strictly increasing remainder prefixes, so LIMIT and
+OFFSET do not depend on arbitrary peer selection. PostgreSQL reference results
+retain NUMERIC digits/scale as strings. The native matcher requires their exact
+value, scale and builtin identity, plus integer/float widths for this campaign;
+it cannot qualify a float result by approximate comparison. Baseline campaign
+profiles and original SQL/parameters remain unchanged. The mounted metadata
+gate now passes and these two originals are qualified, bringing the inventory
+to 526 implemented / 132 rejected / 113 superseded / 815 unresolved.
+
+Validation at this checkpoint: the six-test focused Debug gate passes without
+leaks in `/private/tmp/antfly-sql-integer-avg-metadata-checkpoint-debug.log`.
+All five checked-in integer reduction/assignment/window PostgreSQL tests pass in
+`/private/tmp/antfly-sql-integer-avg-final-oracle.log`; all 124 reference-generator
+tests pass in `/private/tmp/antfly-sql-integer-avg-final-reference-units.log`.
+The exact two-case fixture reverifies in
+`/private/tmp/antfly-sql-integer-avg-window-reference-check.log`.
+The mounted gate passes five tests and 80/80 build steps, with zero failures or
+leaks, in `/private/tmp/antfly-sql-integer-avg-final-contract-public-debug.log`.
+It explicitly requires the strict-type fixture flag, so dropping that flag
+cannot silently downgrade the new cohort to coarse type matching. Five more
+prepared-resource, connection and pgwire-identity tests pass 80/80 steps in
+`/private/tmp/antfly-sql-integer-avg-prepared-public-debug.log`.
+The complete Debug SQL gate passes 862 core and 234 extracted tests, with three
+existing opt-in skips and no failures/leaks, in
+`/private/tmp/antfly-sql-integer-avg-complete-debug.log`.
+Earlier coarse-type mounted success did not qualify the originals: strict
+width checks found the serializer omission, retained in
+`/private/tmp/antfly-sql-integer-avg-final-public-debug.log`. The full run then
+exposed NTILE's untyped parameter still being inferred as int8. The shared
+shape constraint now infers int4; all eight affected tests pass in
+`/private/tmp/antfly-sql-integer-avg-parameter-debug.log`.
+
+Final review added a fail-closed ownership guard: a nonempty typed integer AVG
+cannot use borrowed primitive finalization, which has no result allocator and
+would otherwise expose its unused floating mean as zero. It must use owned
+NUMERIC finalization. The final rerun including this guard is
+`/private/tmp/antfly-sql-integer-avg-owned-finalization-debug.log`: 862 core and
+234 extracted tests pass, with three existing opt-in skips, zero failures/leaks,
+and 21/21 successful build steps. All eight affected tests including the guard
+also pass in `/private/tmp/antfly-sql-integer-avg-owned-focused-debug.log`.
+Inventory and Apache-boundary audits pass in
+`/private/tmp/antfly-sql-integer-avg-inventory.log` and
+`/private/tmp/antfly-sql-integer-avg-apache.log`; staged license headers, scoped
+Python checks and Zig formatting also pass. Unrelated edits remain unstaged.

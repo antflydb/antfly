@@ -48,6 +48,18 @@ from generate_sql_postgres_reference import (
 
 
 class ReferenceExtensionTest(unittest.TestCase):
+    def test_exact_numeric_read_reference_retains_digits_scale_and_type(self):
+        case = {
+            "id": "exact-numeric-average",
+            "sql": "SELECT avg(n) AS average FROM (VALUES (9007199254740993::bigint),(9007199254740994)) v(n)",
+            "params": [],
+        }
+        with postgres() as db:
+            reference = execute(db, case, read=True, exact_numeric=True)
+        self.assertEqual([1700], reference["column_oids"])
+        self.assertEqual([["9007199254740993.5000"]], reference["rows"])
+        self.assertEqual([[False]], reference["sql_nulls"])
+
     def test_explicit_integer_widths_are_not_silently_widened_in_the_oracle(self):
         self.assertEqual("bigint", pg_type({"type": "integer"}))
         for identity, expected in [

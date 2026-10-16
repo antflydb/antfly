@@ -52,7 +52,7 @@ pub const Column = struct {
         if (self.numeric_modifier) |modifier| {
             return writer.write(.{ .name = self.name, .type = self.type, .element_type = self.element_type, .numeric_modifier = modifier });
         }
-        if (self.type == .array or self.element_type == .numeric) {
+        if (self.type == .array or self.element_type != null) {
             try writer.write(.{ .name = self.name, .type = self.type, .element_type = self.element_type });
         } else try writer.write(.{ .name = self.name, .type = self.type });
     }
@@ -72,6 +72,14 @@ test "SQL column JSON excludes internal unknown NULL provenance" {
     const decimal = try std.json.Stringify.valueAlloc(std.testing.allocator, Column{ .name = "n", .type = .number, .element_type = .numeric }, .{});
     defer std.testing.allocator.free(decimal);
     try std.testing.expectEqualStrings("{\"name\":\"n\",\"type\":\"number\",\"element_type\":\"numeric\"}", decimal);
+    for ([_]@import("array_value.zig").ElementType{ .int16, .int32, .int64, .float32, .float64 }) |identity| {
+        const text = try std.json.Stringify.valueAlloc(std.testing.allocator, Column{ .name = "typed", .type = if (identity == .float32 or identity == .float64) .number else .integer, .element_type = identity, .untyped_null = true }, .{});
+        defer std.testing.allocator.free(text);
+        const decoded = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, text, .{});
+        defer decoded.deinit();
+        try std.testing.expectEqualStrings(@tagName(identity), decoded.value.object.get("element_type").?.string);
+        try std.testing.expect(decoded.value.object.get("untyped_null") == null);
+    }
 }
 pub const OrderKey = struct {
     source: union(enum) { output: usize, column: catalog.Column, expression: usize },

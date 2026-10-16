@@ -458,7 +458,7 @@ pub const Aggregate = struct {
                     .float => |v| v,
                     else => return error.SqlTypeMismatch,
                 };
-                if (self.kind == .sum) {
+                if (self.kind == .sum or integerAverage(self.kind, self.input_type, self.input_element)) {
                     if (self.input_type == .integer) {
                         if (value.value != .integer) return error.SqlTypeMismatch;
                         self.integer_sum = std.math.add(i128, self.integer_sum, value.value.integer) catch return error.SqlNumericOutOfRange;
@@ -540,7 +540,7 @@ pub const Aggregate = struct {
         return switch (self.kind) {
             .count => unreachable,
             .sum => Datum.json(if (self.input_type == .integer) .{ .integer = std.math.cast(i64, self.integer_sum) orelse return error.SqlNumericOutOfRange } else .{ .float = self.number_sum }),
-            .avg => Datum.json(.{ .float = self.mean }),
+            .avg => if (integerAverage(self.kind, self.input_type, self.input_element)) error.InvalidSqlBackendResponse else Datum.json(.{ .float = self.mean }),
             .bool_and, .bool_or => Datum.json(.{ .bool = self.boolean }),
             .min, .max => self.selected.?.row.values[0],
             .pattern_set => unreachable,
@@ -549,6 +549,18 @@ pub const Aggregate = struct {
 
     pub fn bigintSum(kind: Kind, input_type: ?ast.ColumnType, identity: ?@import("array_value.zig").ElementType) bool {
         return kind == .sum and input_type == .integer and identity == .int64;
+    }
+
+    pub fn integerAverage(kind: Kind, input_type: ?ast.ColumnType, identity: ?@import("array_value.zig").ElementType) bool {
+        return kind == .avg and input_type == .integer and (identity == .int16 or identity == .int32 or identity == .int64);
+    }
+
+    pub fn integerNumericOutput(kind: Kind, input_type: ?ast.ColumnType, identity: ?@import("array_value.zig").ElementType) bool {
+        return bigintSum(kind, input_type, identity) or integerAverage(kind, input_type, identity);
+    }
+
+    pub fn averageType(input: scalar.Type) scalar.Type {
+        return .{ .kind = .number, .element_type = if (input.kind == .integer or input.element_type == .numeric) .numeric else .float64, .nullable = true };
     }
 
     /// One signature for grouping, windows and symbolic set/recursive binding.
@@ -570,7 +582,27 @@ pub const Aggregate = struct {
     /// partial reducer. Integer transitions remain allocation-free and exact.
     pub fn finishOutput(self: *const Aggregate, result: Allocator) !Datum {
         if (self.count != 0 and bigintSum(self.kind, self.input_type, self.input_element)) return integerSumOutput(result, self.integer_sum);
+        if (self.count != 0 and integerAverage(self.kind, self.input_type, self.input_element)) return integerAverageOutput(result, self.integer_sum, self.count);
         return self.finish();
+    }
+
+    /// Exact sum/count division occurs once per result, never per input row.
+    /// The bounded division kernel supplies PostgreSQL's NUMERIC result scale.
+    pub fn integerAverageOutput(result: Allocator, sum: i128, count: u64) !Datum {
+        if (count == 0 or count > std.math.maxInt(i64)) return error.InvalidSqlBackendResponse;
+        const numeric = @import("numeric_value.zig");
+        var numerator_digits: [10]u16 = undefined;
+        var denominator_digits: [5]u16 = undefined;
+        const numerator = numeric.integer128View(sum, &numerator_digits);
+        const denominator = numeric.integerView(@intCast(count), &denominator_digits);
+        var context: numeric.Context = .{ .alloc = result };
+        var quotient = try numeric.divide(&context, numerator, denominator);
+        defer quotient.deinit();
+        const value = try result.create(numeric.Value);
+        errdefer result.destroy(value);
+        value.* = quotient.value;
+        value.digits = try result.dupe(u16, quotient.value.digits);
+        return Datum.typedNumeric(value);
     }
 
     pub fn integerSumOutput(result: Allocator, sum: i128) !Datum {
@@ -584,6 +616,90 @@ pub const Aggregate = struct {
         return Datum.typedNumeric(value);
     }
 };
+
+test "SQL integer AVG finalization preserves exact allocation free transitions" {
+    const Harness = struct {
+        fn run(a: Allocator) !void {
+            var no_memory = std.heap.FixedBufferAllocator.init(&.{});
+            var state = try Aggregate.initTyped(no_memory.allocator(), .avg, .integer, .int64);
+            defer state.deinit();
+            for ([_]i64{ 9007199254740993, 9007199254740994 }) |input| try state.update(Datum.json(.{ .integer = input }));
+            // Borrowed primitive finalization cannot allocate an exact result
+            // and must never expose the unused floating mean as a real zero.
+            try std.testing.expectError(error.InvalidSqlBackendResponse, state.finish());
+            defer {
+                std.debug.assert(state.count == 2);
+                std.debug.assert(state.integer_sum == 18014398509481987);
+                std.debug.assert(state.mean == 0);
+            }
+            const value = try state.finishOutput(a);
+            defer a.destroy(@constCast(value.numeric.?));
+            defer a.free(value.numeric.?.digits);
+            var context: @import("numeric_value.zig").Context = .{ .alloc = a };
+            const text = try @import("numeric_value.zig").format(&context, value.numeric.?.*);
+            defer a.free(text);
+            try std.testing.expectEqualStrings("9007199254740993.5000", text);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Harness.run, .{});
+}
+
+test "SQL integer AVG partial merges retain exact widened sums and consumer ownership" {
+    const a = std.testing.allocator;
+    const spec: AggregateSpec = .{ .kind = .avg, .input_type = .integer, .input_element = .int64 };
+    try std.testing.expect(exactMergeable(spec));
+    var state = try Aggregate.initTyped(a, .avg, .integer, .int64);
+    defer state.deinit();
+    try state.update(Datum.json(.{ .integer = std.math.maxInt(i64) }));
+    const encoded = try @import("aggregate_partial.zig").cell(a, state);
+    defer a.free(encoded.value.string);
+    const corrupt = try a.dupe(u8, encoded.value.string);
+    defer a.free(corrupt);
+    std.mem.writeInt(u64, corrupt[49..57], @bitCast(@as(f64, 1)), .little);
+    try std.testing.expectError(error.InvalidSqlSpill, @import("aggregate_partial.zig").decode(a, Datum.json(.{ .string = corrupt }), spec));
+    @memcpy(corrupt, encoded.value.string);
+    std.mem.writeInt(u128, corrupt[17..33], @bitCast(@as(i128, std.math.maxInt(i128))), .little);
+    try std.testing.expectError(error.InvalidSqlSpill, @import("aggregate_partial.zig").decode(a, Datum.json(.{ .string = corrupt }), spec));
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const result = blk: {
+        var restored = try @import("aggregate_partial.zig").decode(a, encoded, spec);
+        defer restored.deinit();
+        try @import("aggregate_partial.zig").merge(&restored, state);
+        try std.testing.expectEqual(@as(i128, std.math.maxInt(i64)) * 2, restored.integer_sum);
+        break :blk try restored.finishOutput(arena.allocator());
+    };
+    var context: @import("numeric_value.zig").Context = .{ .alloc = arena.allocator() };
+    try std.testing.expectEqualStrings("9223372036854775807", try @import("numeric_value.zig").format(&context, result.numeric.?.*));
+}
+
+test "SQL integer AVG spills exact vector and DISTINCT sums without per input numeric allocation" {
+    const a = std.testing.allocator;
+    const Hook = struct {
+        fn check(_: *anyopaque) anyerror!void {}
+    };
+    for ([_]bool{ false, true }) |distinct| {
+        var token: u8 = 0;
+        var manager: @import("spill.zig").Manager = .{ .alloc = a, .io = std.testing.io, .context = &token, .checkpoint = Hook.check, .async_writes = false };
+        defer manager.deinit();
+        const group = try Grouped.create(a, &.{.{ .kind = .avg, .input_type = .integer, .input_element = .int32, .distinct = distinct }}, .{ .bytes = 64 * 1024, .spill = &manager });
+        defer group.deinit();
+        for (0..3000) |i| try group.add(&.{Datum.json(.{ .integer = @intCast(i % 1000) })}, &.{Datum.json(.{ .integer = if (i < 1000) 1 else 2 })});
+        try std.testing.expect(group.external != null);
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        var seen: usize = 0;
+        while (true) {
+            _ = arena.reset(.free_all);
+            const row = (try group.nextResult(arena.allocator())) orelse break;
+            var context: @import("numeric_value.zig").Context = .{ .alloc = arena.allocator() };
+            try std.testing.expectEqualStrings(if (distinct) "1.5000000000000000" else "1.6666666666666667", try @import("numeric_value.zig").format(&context, row.aggregates[0].numeric.?.*));
+            seen += 1;
+        }
+        try std.testing.expectEqual(@as(usize, 1000), seen);
+        try std.testing.expect(manager.written_bytes > 0);
+    }
+}
 
 test "SQL bigint SUM output failures preserve allocation free transitions" {
     const Harness = struct {
@@ -664,7 +780,7 @@ pub const AggregateSpec = struct { kind: Aggregate.Kind, input_type: ?ast.Column
 pub fn exactMergeable(spec: AggregateSpec) bool {
     if (spec.distinct) return false;
     return spec.kind == .count or spec.kind == .bool_and or spec.kind == .bool_or or
-        (spec.kind == .sum and spec.input_type == .integer) or
+        (spec.kind == .sum and spec.input_type == .integer) or Aggregate.integerAverage(spec.kind, spec.input_type, spec.input_element) or
         ((spec.kind == .sum or spec.kind == .avg) and spec.input_type == .number and spec.input_element == .numeric);
 }
 pub const GroupBatch = struct {

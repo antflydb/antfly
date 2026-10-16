@@ -2,6 +2,8 @@
   "ledger_format": 1,
   "inventory_sha256": "c203a4dcf0094b75e1d3764e90beebddaf844a9ce604543c0a4dbc0ffe8ae173",
   "gates": {
+    "sql-original-numeric-windows-native-debug": {"command":["zig","build","public-api-parity-test","-Doptimize=Debug","-j1","-Dtest-filter=httpx SQL PostgreSQL original numeric windows preserve exact averages and ordering","-Dtest-filter=SQL parity exact NUMERIC references reject lost bits scale and builtin identity"],"cwd":"zig","timeout_seconds":1800},
+    "sql-original-numeric-windows-postgres": {"command":["uv","run","--project","scripts","--with","psycopg[binary]==3.3.6","python","scripts/generate_sql_postgres_reference.py","numeric_window","--check","zig/pkg/antfly-embedded/src/sql/fixtures/sql_numeric_window_reference.json"],"cwd":".","timeout_seconds":180},
     "sql-original-text-reads-native-debug": {"command":["zig","build","public-api-parity-test","-Doptimize=Debug","-j1","-Dtest-filter=httpx SQL PostgreSQL original text reads preserve escapes unicode and ordering","-Dtest-filter=SQL parity described parameter transport preserves JSON identity and NULLs"],"cwd":"zig","timeout_seconds":1800},
     "sql-original-text-reads-postgres": {"command":["uv","run","--project","scripts","--with","psycopg[binary]==3.3.6","python","scripts/generate_sql_postgres_reference.py","text_read","--check","zig/pkg/antfly-embedded/src/sql/fixtures/sql_text_read_reference.json"],"cwd":".","timeout_seconds":180},
     "sql-numeric-reduction-assignment-debug": {"command":["zig","build","sql-test","-Doptimize=Debug","-j1"],"cwd":"zig","timeout_seconds":1800},
@@ -13753,8 +13755,12 @@
     },
     {
       "id": "sql-1366",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "The unchanged original executes through mounted SQL over 24 native typed rows with unique amount/rank frontiers. PostgreSQL independently verifies its complete five-row OFFSET result, labels, builtin widths, SQL NULLs and exact NUMERIC AVG values/scales. Rank outputs retain int8, NTILE retains int4, and int4 source/value-window widths survive HTTP serialization. This is native single-owner read qualification, not broader distributed/catalog activation.",
+      "evidence": [
+        {"path":"zig/pkg/antfly/src/api/sql_text_campaign_test.zig","test":"httpx SQL PostgreSQL original numeric windows preserve exact averages and ordering","gate":"sql-original-numeric-windows-native-debug"},
+        {"path":"zig/pkg/antfly/src/api/sql_text_campaign_test.zig","test":"httpx SQL PostgreSQL original numeric windows preserve exact averages and ordering","gate":"sql-original-numeric-windows-postgres"}
+      ]
     },
     {
       "id": "sql-1367",
@@ -13888,8 +13894,12 @@
     },
     {
       "id": "sql-1376",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "The unchanged original MOD/remainder window statement executes through mounted SQL on an explicit int4 amount/int8 quantity profile with nonzero divisors and strictly ordered nonempty prefixes. PostgreSQL verifies all labels, widths, values, SQL NULLs and exact NUMERIC running SUM/AVG digits and scales; no floating reference comparison can qualify the averages. This does not certify unrelated locking or distributed activation contracts.",
+      "evidence": [
+        {"path":"zig/pkg/antfly/src/api/sql_text_campaign_test.zig","test":"httpx SQL PostgreSQL original numeric windows preserve exact averages and ordering","gate":"sql-original-numeric-windows-native-debug"},
+        {"path":"zig/pkg/antfly/src/api/sql_text_campaign_test.zig","test":"httpx SQL PostgreSQL original numeric windows preserve exact averages and ordering","gate":"sql-original-numeric-windows-postgres"}
+      ]
     },
     {
       "id": "sql-1377",

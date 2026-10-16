@@ -39,6 +39,7 @@ pub const typed_array_read_reference = @embedFile("fixtures/sql_typed_array_read
 pub const aggregate_read_reference = @embedFile("fixtures/sql_aggregate_read_reference.json");
 pub const join_read_reference = @embedFile("fixtures/sql_join_read_reference.json");
 pub const text_read_reference = @embedFile("fixtures/sql_text_read_reference.json");
+pub const numeric_window_reference = @embedFile("fixtures/sql_numeric_window_reference.json");
 pub const array_expansion_reference = @embedFile("fixtures/sql_array_expansion_reference.json");
 pub const joined_returning_reference = @embedFile("fixtures/sql_joined_returning_reference.json");
 pub const joined_returning_subquery_reference = @embedFile("fixtures/sql_joined_returning_subquery_reference.json");

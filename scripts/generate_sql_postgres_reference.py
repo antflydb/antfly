@@ -587,7 +587,7 @@ def empty_set_contract(db, case):
     return None
 
 
-def execute(db, case, read=False):
+def execute(db, case, read=False, exact_numeric=False):
     import psycopg
 
     if re.search(
@@ -611,7 +611,11 @@ def execute(db, case, read=False):
         )
         with cursor:
             result = cursor_result(
-                cursor, case, read, allow_empty=negative_contract is not None
+                cursor,
+                case,
+                read,
+                allow_empty=negative_contract is not None,
+                exact_numeric=exact_numeric,
             )
             if negative_contract is not None:
                 if result["rows"]:
@@ -620,7 +624,7 @@ def execute(db, case, read=False):
             return result
 
 
-def cursor_result(cursor, case, read, allow_empty=False):
+def cursor_result(cursor, case, read, allow_empty=False, exact_numeric=False):
     cursor.execute(
         case["sql"], execution_parameters(cursor.connection, case), binary=True
     )
@@ -659,6 +663,10 @@ def cursor_result(cursor, case, read, allow_empty=False):
                 )
                 if cursor.description[j].type_code in ARRAY_TYPES
                 and cursor.pgresult.get_value(i, j) is not None
+                else str(cell)
+                if exact_numeric
+                and cursor.description[j].type_code == 1700
+                and cell is not None
                 else encoded(cell)
                 for j, cell in enumerate(row)
             ]
@@ -1105,7 +1113,12 @@ def read_reference(db, cases, profile):
             try:
                 with db.transaction(force_rollback=True):
                     db.execute("SET TRANSACTION READ ONLY")
-                    entry = execute(db, case, read=True)
+                    entry = execute(
+                        db,
+                        case,
+                        read=True,
+                        exact_numeric=profile.get("exact_numeric", False),
+                    )
                     observer_sql = ORDER_OBSERVERS.get(
                         case["id"]
                     ) or aggregate_order_observer(case)
@@ -1117,6 +1130,7 @@ def read_reference(db, cases, profile):
                                 db,
                                 {**case, "sql": join_order_observer(case, False)},
                                 read=True,
+                                exact_numeric=profile.get("exact_numeric", False),
                             )
                             cut = int(offset.group(1))
                             if (
@@ -1142,7 +1156,12 @@ def read_reference(db, cases, profile):
                                 1,
                             )
                     if observer_sql:
-                        observer = execute(db, {**case, "sql": observer_sql}, read=True)
+                        observer = execute(
+                            db,
+                            {**case, "sql": observer_sql},
+                            read=True,
+                            exact_numeric=profile.get("exact_numeric", False),
+                        )
                         groups = []
                         key = object()
                         for row, nulls in zip(
@@ -1164,7 +1183,34 @@ def read_reference(db, cases, profile):
         "profile": profile,
         "entries": entries,
         "excluded": excluded,
+        **(
+            {"exact_builtin_types": True} if profile.get("exact_numeric", False) else {}
+        ),
     }
+
+
+def numeric_window_profile():
+    """Unique ordered frontiers and exact NUMERIC outputs, not float oracles."""
+    profile = json.loads((FIXTURES / "sql_read_campaign_profile.json").read_text())
+    profile["exact_numeric"] = True
+    properties(profile["schema"])["amount"] = {
+        "type": "integer",
+        "x-antfly-sql-type": "int32",
+    }
+    template = deepcopy(profile["rows"][0]["value"])
+    profile["rows"] = []
+    for i in range(24):
+        value = deepcopy(template)
+        value.update(
+            id=f"window-{i:02}",
+            status="open",
+            tenant_id="window-tenant",
+            organization_id="window-org",
+            amount=3 * i + (1 if i % 2 else 2),
+            quantity=3,
+        )
+        profile["rows"].append({"key": value["id"], "value": value})
+    return profile
 
 
 def text_read_profile():
@@ -1579,6 +1625,7 @@ def main():
             "read",
             "digest_read",
             "text_read",
+            "numeric_window",
             "typed_array_read",
             "aggregate_read",
             "set_read",
@@ -1652,6 +1699,7 @@ def main():
             "read",
             "digest_read",
             "text_read",
+            "numeric_window",
             "typed_array_read",
             "aggregate_read",
             "set_read",
@@ -1665,6 +1713,8 @@ def main():
                 if args.campaign == "join_read"
                 else text_read_profile()
                 if args.campaign == "text_read"
+                else numeric_window_profile()
+                if args.campaign == "numeric_window"
                 else set_read_profile()
                 if args.campaign == "set_read"
                 else typed_array_read_profile()

@@ -396,10 +396,10 @@ const Builder = struct {
                     }
                     const kind = std.meta.stringToEnum(@import("window_binding.zig").Kind, call.name) orelse return error.UndefinedSqlFunction;
                     switch (kind) {
-                        .row_number, .rank, .dense_rank => break :blk .{ .literal = .{ .integer = 0 } },
+                        .row_number, .rank, .dense_rank => break :blk .{ .cast = .{ .operand = try self.scalarNode(.{ .literal = .{ .integer = 0 } }), .type = .integer, .element_type = .int64 } },
                         .ntile => {
                             if (call.args.len != 1) return error.InvalidSqlParameters;
-                            if (self.shape_only) try self.constraints.append(self.alloc, .{ .expression = try self.inferenceExpression(call.args[0], columns), .expected = .integer });
+                            if (self.shape_only) try self.constraints.append(self.alloc, .{ .expression = try self.inferenceExpression(call.args[0], columns), .expected_type = .{ .kind = .integer, .element_type = .int32 } });
                             break :blk .{ .literal = .{ .integer = 0 } };
                         },
                         .percent_rank, .cume_dist => break :blk .{ .literal = .{ .number = 0 } },
@@ -423,13 +423,12 @@ const Builder = struct {
                     if (call.args.len != 1) return error.InvalidSqlParameters;
                     const argument = try self.inferenceExpression(call.args[0], columns);
                     break :blk switch (kind) {
-                        .sum => sum: {
+                        .sum, .avg => sum: {
                             const input = try self.setType(argument, if (self.shape_only) self.shape_columns.items else try self.scalarColumns(columns));
                             if (input.kind == null) break :sum argument.*;
-                            const output = @import("operators.zig").Aggregate.sumType(input);
+                            const output = if (kind == .sum) @import("operators.zig").Aggregate.sumType(input) else @import("operators.zig").Aggregate.averageType(input);
                             break :sum .{ .cast = .{ .operand = argument, .type = output.kind.?, .element_type = output.element_type } };
                         },
-                        .avg => .{ .cast = .{ .operand = argument, .type = .number } },
                         .bool_and, .bool_or => .{ .cast = .{ .operand = argument, .type = .boolean } },
                         .pattern_set => .{ .cast = .{ .operand = try self.scalarNode(.{ .cast = .{ .operand = argument, .type = .string } }), .type = .json } },
                         else => argument.*,

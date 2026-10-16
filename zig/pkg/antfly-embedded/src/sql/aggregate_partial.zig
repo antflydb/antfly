@@ -247,6 +247,25 @@ pub fn decode(a: A, value: Datum, spec: operators.AggregateSpec) !operators.Aggr
         v.* = @bitCast(try decoder.integer(u64));
         if (!std.math.isFinite(v.*) and !(sql_floating and ((i == 0 and spec.kind == .sum) or (i == 2 and spec.kind == .avg)))) return error.InvalidSqlSpill;
     }
+    if (operators.Aggregate.integerAverage(spec.kind, spec.input_type, spec.input_element)) {
+        // Integer AVG checkpoints carry only an exact sum/count. Reject a
+        // floating transition or an impossible width/count combination rather
+        // than silently interpreting another reducer's bytes as a zero mean.
+        for (numbers) |number| if (number != 0) return error.InvalidSqlSpill;
+        const lower: i128 = switch (spec.input_element.?) {
+            .int16 => std.math.minInt(i16),
+            .int32 => std.math.minInt(i32),
+            .int64 => std.math.minInt(i64),
+            else => unreachable,
+        };
+        const upper: i128 = switch (spec.input_element.?) {
+            .int16 => std.math.maxInt(i16),
+            .int32 => std.math.maxInt(i32),
+            .int64 => std.math.maxInt(i64),
+            else => unreachable,
+        };
+        if (sum < lower * count or sum > upper * count) return error.InvalidSqlSpill;
+    }
     if (spec.kind == .sum and spec.input_element == .float32) {
         const rounded: f32 = @floatCast(numbers[0]);
         if ((numbers[0] != @as(f64, rounded) and !(std.math.isNan(numbers[0]) and std.math.isNan(rounded))) or numbers[1] != 0 or numbers[2] != 0) return error.InvalidSqlSpill;
@@ -464,7 +483,9 @@ pub fn merge(target: *operators.Aggregate, source: operators.Aggregate) !void {
                 try operators.Aggregate.addFloatSum(&target.number_sum, &target.compensation, value);
             }
         },
-        .avg => {
+        .avg => if (operators.Aggregate.integerAverage(target.kind, target.input_type, target.input_element)) {
+            target.integer_sum = std.math.add(i128, target.integer_sum, source.integer_sum) catch return error.SqlNumericOutOfRange;
+        } else {
             const fraction = @as(f64, @floatFromInt(source.count)) / @as(f64, @floatFromInt(total));
             const delta = source.mean - target.mean;
             if (target.count == 0) {

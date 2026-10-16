@@ -3082,6 +3082,56 @@ test "SQL CTE aliases feed hash joins and grouped projection without stringifyin
     try std.testing.expectEqual(@as(usize, 1), backend.statement_closes);
 }
 
+test "SQL window ranks and ntile preserve PostgreSQL builtin widths and admission" {
+    var backend: TestBackend = .{};
+    var compiled = try compiler.compile(std.testing.allocator, "SELECT row_number() OVER (), rank() OVER (), dense_rank() OVER (), ntile(2::smallint) OVER (), ntile(NULL) OVER () FROM (VALUES (1),(2),(3)) v(n)", .{});
+    defer compiled.deinit();
+    var result = try execute(std.testing.allocator, backend.coordinated(), &compiled, &.{}, .{});
+    defer result.deinit();
+    for (result.output.columns, [_]@import("array_value.zig").ElementType{ .int64, .int64, .int64, .int32, .int32 }) |column, expected| try std.testing.expectEqual(@as(?@import("array_value.zig").ElementType, expected), column.element_type);
+    for (result.output.rows) |row| try std.testing.expect(row[4] == .null);
+    for ([_][]const u8{ "SELECT ntile(2147483648) OVER ()", "SELECT ntile(2::bigint) OVER ()" }) |sql| {
+        var rejected = try compiler.compile(std.testing.allocator, sql, .{});
+        defer rejected.deinit();
+        var empty: TestBackend = .{};
+        try std.testing.expectError(error.UndefinedSqlFunction, execute(std.testing.allocator, empty.coordinated(), &rejected, &.{}, .{}));
+        try std.testing.expectEqual(@as(usize, 0), empty.statement_opens);
+    }
+    for ([_][]const u8{ "SELECT ntile(0) OVER ()", "SELECT ntile(-1) OVER ()" }) |sql| {
+        var rejected = try compiler.compile(std.testing.allocator, sql, .{});
+        defer rejected.deinit();
+        try std.testing.expectError(error.SqlInvalidNtileArgument, execute(std.testing.allocator, backend.coordinated(), &rejected, &.{}, .{}));
+    }
+}
+
+test "SQL integer AVG preserves numeric signatures scale filters sliding exclusions and symbolic types" {
+    const Case = struct { sql: []const u8, values: []const ?[]const u8 };
+    for ([_]Case{
+        .{ .sql = "SELECT avg(n) FROM (VALUES (1::bigint),(1),(2)) v(n)", .values = &.{"1.3333333333333333"} },
+        .{ .sql = "SELECT avg(n) FROM (VALUES (9223372036854775807::bigint),(9223372036854775807)) v(n)", .values = &.{"9223372036854775807"} },
+        .{ .sql = "SELECT avg(n) FROM (VALUES (9007199254740993::bigint),(9007199254740994)) v(n)", .values = &.{"9007199254740993.5000"} },
+        .{ .sql = "SELECT avg(n) FROM (VALUES (0::integer),(0)) v(n)", .values = &.{"0.00000000000000000000"} },
+        .{ .sql = "SELECT avg(n) FROM (VALUES (-1::smallint),(2::smallint)) v(n)", .values = &.{"0.50000000000000000000"} },
+        .{ .sql = "SELECT avg(DISTINCT n) FILTER (WHERE n>0) FROM (VALUES (1),(2),(2),(NULL),(-1)) v(n)", .values = &.{"1.5000000000000000"} },
+        .{ .sql = "SELECT avg(n) FILTER (WHERE false) FROM (VALUES (1::bigint)) v(n)", .values = &.{null} },
+        .{ .sql = "SELECT avg(n) OVER (ORDER BY i ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM (VALUES (0,9007199254740993::bigint),(1,9007199254740994::bigint),(2,NULL),(3,0::bigint)) v(i,n) ORDER BY i", .values = &.{ "9007199254740993.0000", "9007199254740993.5000", "9007199254740994.0000", "0.00000000000000000000" } },
+        .{ .sql = "SELECT avg(n) OVER (ORDER BY i ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING EXCLUDE CURRENT ROW) FROM (VALUES (0,1),(1,2),(2,3)) v(i,n) ORDER BY i", .values = &.{ "2.5000000000000000", "2.0000000000000000", "1.5000000000000000" } },
+        .{ .sql = "SELECT CASE WHEN true THEN avg(n) ELSE 0 END AS x FROM (VALUES (1),(2)) v(n) UNION SELECT 1.5::numeric", .values = &.{"1.5000000000000000"} },
+    }) |case| {
+        var backend: TestBackend = .{};
+        var compiled = try compiler.compile(std.testing.allocator, case.sql, .{});
+        defer compiled.deinit();
+        var result = try execute(std.testing.allocator, backend.coordinated(), &compiled, &.{}, .{});
+        defer result.deinit();
+        try std.testing.expectEqual(ast.ColumnType.number, result.output.columns[0].type);
+        try std.testing.expectEqual(@as(?@import("array_value.zig").ElementType, .numeric), result.output.columns[0].element_type);
+        try std.testing.expectEqual(case.values.len, result.output.rows.len);
+        for (case.values, result.output.rows) |expected, row| {
+            if (expected) |text| try std.testing.expectEqualStrings(text, row[0].string) else try std.testing.expect(row[0] == .null);
+        }
+    }
+}
+
 test "SQL bigint SUM preserves exact numeric outputs through grouped and window plans" {
     const Case = struct { sql: []const u8, values: []const ?[]const u8 };
     for ([_]Case{

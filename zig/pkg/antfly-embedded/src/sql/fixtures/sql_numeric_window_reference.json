@@ -1,0 +1,1145 @@
+{
+  "format": 2,
+  "reference": "PostgreSQL exact SQL",
+  "profile": {
+    "format": 1,
+    "schema": {
+      "version": 1,
+      "storage_mode": "relational",
+      "default_type": "row",
+      "document_schemas": {
+        "row": {
+          "schema": {
+            "type": "object",
+            "properties": {
+              "id": {
+                "type": "keyword"
+              },
+              "name": {
+                "type": "keyword"
+              },
+              "status": {
+                "type": "keyword"
+              },
+              "organization_id": {
+                "type": "keyword"
+              },
+              "email": {
+                "type": "keyword"
+              },
+              "amount": {
+                "type": "integer",
+                "x-antfly-sql-type": "int32"
+              },
+              "quantity": {
+                "type": "integer"
+              },
+              "tenant_id": {
+                "type": "keyword"
+              },
+              "customer_id": {
+                "type": "keyword"
+              },
+              "created_at": {
+                "type": "keyword"
+              },
+              "enabled": {
+                "type": "boolean"
+              },
+              "kind": {
+                "type": "keyword"
+              },
+              "tags": {
+                "type": "json"
+              },
+              "metadata": {
+                "type": "json"
+              }
+            },
+            "additionalProperties": false
+          }
+        }
+      }
+    },
+    "rows": [
+      {
+        "key": "window-00",
+        "value": {
+          "id": "window-00",
+          "name": "Ada",
+          "status": "open",
+          "organization_id": "window-org",
+          "email": "ADA@EXAMPLE.TEST",
+          "amount": 2,
+          "quantity": 3,
+          "tenant_id": "window-tenant",
+          "customer_id": "c1",
+          "created_at": "2025-01-01T00:00:00Z",
+          "enabled": true,
+          "kind": "order",
+          "tags": [
+            "hot",
+            "new"
+          ],
+          "metadata": {
+            "source": "api",
+            "kind": "external",
+            "flags": [
+              "rated"
+            ],
+            "billing": {
+              "plan": "pro"
+            }
+          }
+        }
+      },
+      {
+        "key": "window-01",
+        "value": {
+          "id": "window-01",
+          "name": "Ada",
+          "status": "open",
+          "organization_id": "window-org",
+          "email": "ADA@EXAMPLE.TEST",
+          "amount": 4,
+          "quantity": 3,
+          "tenant_id": "window-tenant",
+          "customer_id": "c1",
+          "created_at": "2025-01-01T00:00:00Z",
+          "enabled": true,
+          "kind": "order",
+          "tags": [
+            "hot",
+            "new"
+          ],
+          "metadata": {
+            "source": "api",
+            "kind": "external",
+            "flags": [
+              "rated"
+            ],
+            "billing": {
+              "plan": "pro"
+            }
+          }
+        }
+      },
+      {
+        "key": "window-02",
+        "value": {
+          "id": "window-02",
+          "name": "Ada",
+          "status": "open",
+          "organization_id": "window-org",
+          "email": "ADA@EXAMPLE.TEST",
+          "amount": 8,
+          "quantity": 3,
+          "tenant_id": "window-tenant",
+          "customer_id": "c1",
+          "created_at": "2025-01-01T00:00:00Z",
+          "enabled": true,
+          "kind": "order",
+          "tags": [
+            "hot",
+            "new"
+          ],
+          "metadata": {
+            "source": "api",
+            "kind": "external",
+            "flags": [
+              "rated"
+            ],
+            "billing": {
+              "plan": "pro"
+            }
+          }
+        }
+      },
+      {
+        "key": "window-03",
+        "value": {
+          "id": "window-03",
+          "name": "Ada",
+          "status": "open",
+          "organization_id": "window-org",
+          "email": "ADA@EXAMPLE.TEST",
+          "amount": 10,
+          "quantity": 3,
+          "tenant_id": "window-tenant",
+          "customer_id": "c1",
+          "created_at": "2025-01-01T00:00:00Z",
+          "enabled": true,
+          "kind": "order",
+          "tags": [
+            "hot",
+            "new"
+          ],
+          "metadata": {
+            "source": "api",
+            "kind": "external",
+            "flags": [
+              "rated"
+            ],
+            "billing": {
+              "plan": "pro"
+            }
+          }
+        }
+      },
+      {
+        "key": "window-04",
+        "value": {
+          "id": "window-04",
+          "name": "Ada",
+          "status": "open",
+          "organization_id": "window-org",
+          "email": "ADA@EXAMPLE.TEST",
+          "amount": 14,
+          "quantity": 3,
+          "tenant_id": "window-tenant",
+          "customer_id": "c1",
+          "created_at": "2025-01-01T00:00:00Z",
+          "enabled": true,
+          "kind": "order",
+          "tags": [
+            "hot",
+            "new"
+          ],
+          "metadata": {
+            "source": "api",
+            "kind": "external",
+            "flags": [
+              "rated"
+            ],
+            "billing": {
+              "plan": "pro"
+            }
+          }
+        }
+      },
+      {
+        "key": "window-05",
+        "value": {
+          "id": "window-05",
+          "name": "Ada",
+          "status": "open",
+          "organization_id": "window-org",
+          "email": "ADA@EXAMPLE.TEST",
+          "amount": 16,
+          "quantity": 3,
+          "tenant_id": "window-tenant",
+          "customer_id": "c1",
+          "created_at": "2025-01-01T00:00:00Z",
+          "enabled": true,
+          "kind": "order",
+          "tags": [
+            "hot",
+            "new"
+          ],
+          "metadata": {
+            "source": "api",
+            "kind": "external",
+            "flags": [
+              "rated"
+            ],
+            "billing": {
+              "plan": "pro"
+            }
+          }
+        }
+      },
+      {
+        "key": "window-06",
+        "value": {
+          "id": "window-06",
+          "name": "Ada",
+          "status": "open",
+          "organization_id": "window-org",
+          "email": "ADA@EXAMPLE.TEST",
+          "amount": 20,
+          "quantity": 3,
+          "tenant_id": "window-tenant",
+          "customer_id": "c1",
+          "created_at": "2025-01-01T00:00:00Z",
+          "enabled": true,
+          "kind": "order",
+          "tags": [
+            "hot",
+            "new"
+          ],
+          "metadata": {
+            "source": "api",
+            "kind": "external",
+            "flags": [
+              "rated"
+            ],
+            "billing": {
+              "plan": "pro"
+            }
+          }
+        }
+      },
+      {
+        "key": "window-07",
+        "value": {
+          "id": "window-07",
+          "name": "Ada",
+          "status": "open",
+          "organization_id": "window-org",
+          "email": "ADA@EXAMPLE.TEST",
+          "amount": 22,
+          "quantity": 3,
+          "tenant_id": "window-tenant",
+          "customer_id": "c1",
+          "created_at": "2025-01-01T00:00:00Z",
+          "enabled": true,
+          "kind": "order",
+          "tags": [
+            "hot",
+            "new"
+          ],
+          "metadata": {
+            "source": "api",
+            "kind": "external",
+            "flags": [
+              "rated"
+            ],
+            "billing": {
+              "plan": "pro"
+            }
+          }
+        }
+      },
+      {
+        "key": "window-08",
+        "value": {
+          "id": "window-08",
+          "name": "Ada",
+          "status": "open",
+          "organization_id": "window-org",
+          "email": "ADA@EXAMPLE.TEST",
+          "amount": 26,
+          "quantity": 3,
+          "tenant_id": "window-tenant",
+          "customer_id": "c1",
+          "created_at": "2025-01-01T00:00:00Z",
+          "enabled": true,
+          "kind": "order",
+          "tags": [
+            "hot",
+            "new"
+          ],
+          "metadata": {
+            "source": "api",
+            "kind": "external",
+            "flags": [
+              "rated"
+            ],
+            "billing": {
+              "plan": "pro"
+            }
+          }
+        }
+      },
+      {
+        "key": "window-09",
+        "value": {
+          "id": "window-09",
+          "name": "Ada",
+          "status": "open",
+          "organization_id": "window-org",
+          "email": "ADA@EXAMPLE.TEST",
+          "amount": 28,
+          "quantity": 3,
+          "tenant_id": "window-tenant",
+          "customer_id": "c1",
+          "created_at": "2025-01-01T00:00:00Z",
+          "enabled": true,
+          "kind": "order",
+          "tags": [
+            "hot",
+            "new"
+          ],
+          "metadata": {
+            "source": "api",
+            "kind": "external",
+            "flags": [
+              "rated"
+            ],
+            "billing": {
+              "plan": "pro"
+            }
+          }
+        }
+      },
+      {
+        "key": "window-10",
+        "value": {
+          "id": "window-10",
+          "name": "Ada",
+          "status": "open",
+          "organization_id": "window-org",
+          "email": "ADA@EXAMPLE.TEST",
+          "amount": 32,
+          "quantity": 3,
+          "tenant_id": "window-tenant",
+          "customer_id": "c1",
+          "created_at": "2025-01-01T00:00:00Z",
+          "enabled": true,
+          "kind": "order",
+          "tags": [
+            "hot",
+            "new"
+          ],
+          "metadata": {
+            "source": "api",
+            "kind": "external",
+            "flags": [
+              "rated"
+            ],
+            "billing": {
+              "plan": "pro"
+            }
+          }
+        }
+      },
+      {
+        "key": "window-11",
+        "value": {
+          "id": "window-11",
+          "name": "Ada",
+          "status": "open",
+          "organization_id": "window-org",
+          "email": "ADA@EXAMPLE.TEST",
+          "amount": 34,
+          "quantity": 3,
+          "tenant_id": "window-tenant",
+          "customer_id": "c1",
+          "created_at": "2025-01-01T00:00:00Z",
+          "enabled": true,
+          "kind": "order",
+          "tags": [
+            "hot",
+            "new"
+          ],
+          "metadata": {
+            "source": "api",
+            "kind": "external",
+            "flags": [
+              "rated"
+            ],
+            "billing": {
+              "plan": "pro"
+            }
+          }
+        }
+      },
+      {
+        "key": "window-12",
+        "value": {
+          "id": "window-12",
+          "name": "Ada",
+          "status": "open",
+          "organization_id": "window-org",
+          "email": "ADA@EXAMPLE.TEST",
+          "amount": 38,
+          "quantity": 3,
+          "tenant_id": "window-tenant",
+          "customer_id": "c1",
+          "created_at": "2025-01-01T00:00:00Z",
+          "enabled": true,
+          "kind": "order",
+          "tags": [
+            "hot",
+            "new"
+          ],
+          "metadata": {
+            "source": "api",
+            "kind": "external",
+            "flags": [
+              "rated"
+            ],
+            "billing": {
+              "plan": "pro"
+            }
+          }
+        }
+      },
+      {
+        "key": "window-13",
+        "value": {
+          "id": "window-13",
+          "name": "Ada",
+          "status": "open",
+          "organization_id": "window-org",
+          "email": "ADA@EXAMPLE.TEST",
+          "amount": 40,
+          "quantity": 3,
+          "tenant_id": "window-tenant",
+          "customer_id": "c1",
+          "created_at": "2025-01-01T00:00:00Z",
+          "enabled": true,
+          "kind": "order",
+          "tags": [
+            "hot",
+            "new"
+          ],
+          "metadata": {
+            "source": "api",
+            "kind": "external",
+            "flags": [
+              "rated"
+            ],
+            "billing": {
+              "plan": "pro"
+            }
+          }
+        }
+      },
+      {
+        "key": "window-14",
+        "value": {
+          "id": "window-14",
+          "name": "Ada",
+          "status": "open",
+          "organization_id": "window-org",
+          "email": "ADA@EXAMPLE.TEST",
+          "amount": 44,
+          "quantity": 3,
+          "tenant_id": "window-tenant",
+          "customer_id": "c1",
+          "created_at": "2025-01-01T00:00:00Z",
+          "enabled": true,
+          "kind": "order",
+          "tags": [
+            "hot",
+            "new"
+          ],
+          "metadata": {
+            "source": "api",
+            "kind": "external",
+            "flags": [
+              "rated"
+            ],
+            "billing": {
+              "plan": "pro"
+            }
+          }
+        }
+      },
+      {
+        "key": "window-15",
+        "value": {
+          "id": "window-15",
+          "name": "Ada",
+          "status": "open",
+          "organization_id": "window-org",
+          "email": "ADA@EXAMPLE.TEST",
+          "amount": 46,
+          "quantity": 3,
+          "tenant_id": "window-tenant",
+          "customer_id": "c1",
+          "created_at": "2025-01-01T00:00:00Z",
+          "enabled": true,
+          "kind": "order",
+          "tags": [
+            "hot",
+            "new"
+          ],
+          "metadata": {
+            "source": "api",
+            "kind": "external",
+            "flags": [
+              "rated"
+            ],
+            "billing": {
+              "plan": "pro"
+            }
+          }
+        }
+      },
+      {
+        "key": "window-16",
+        "value": {
+          "id": "window-16",
+          "name": "Ada",
+          "status": "open",
+          "organization_id": "window-org",
+          "email": "ADA@EXAMPLE.TEST",
+          "amount": 50,
+          "quantity": 3,
+          "tenant_id": "window-tenant",
+          "customer_id": "c1",
+          "created_at": "2025-01-01T00:00:00Z",
+          "enabled": true,
+          "kind": "order",
+          "tags": [
+            "hot",
+            "new"
+          ],
+          "metadata": {
+            "source": "api",
+            "kind": "external",
+            "flags": [
+              "rated"
+            ],
+            "billing": {
+              "plan": "pro"
+            }
+          }
+        }
+      },
+      {
+        "key": "window-17",
+        "value": {
+          "id": "window-17",
+          "name": "Ada",
+          "status": "open",
+          "organization_id": "window-org",
+          "email": "ADA@EXAMPLE.TEST",
+          "amount": 52,
+          "quantity": 3,
+          "tenant_id": "window-tenant",
+          "customer_id": "c1",
+          "created_at": "2025-01-01T00:00:00Z",
+          "enabled": true,
+          "kind": "order",
+          "tags": [
+            "hot",
+            "new"
+          ],
+          "metadata": {
+            "source": "api",
+            "kind": "external",
+            "flags": [
+              "rated"
+            ],
+            "billing": {
+              "plan": "pro"
+            }
+          }
+        }
+      },
+      {
+        "key": "window-18",
+        "value": {
+          "id": "window-18",
+          "name": "Ada",
+          "status": "open",
+          "organization_id": "window-org",
+          "email": "ADA@EXAMPLE.TEST",
+          "amount": 56,
+          "quantity": 3,
+          "tenant_id": "window-tenant",
+          "customer_id": "c1",
+          "created_at": "2025-01-01T00:00:00Z",
+          "enabled": true,
+          "kind": "order",
+          "tags": [
+            "hot",
+            "new"
+          ],
+          "metadata": {
+            "source": "api",
+            "kind": "external",
+            "flags": [
+              "rated"
+            ],
+            "billing": {
+              "plan": "pro"
+            }
+          }
+        }
+      },
+      {
+        "key": "window-19",
+        "value": {
+          "id": "window-19",
+          "name": "Ada",
+          "status": "open",
+          "organization_id": "window-org",
+          "email": "ADA@EXAMPLE.TEST",
+          "amount": 58,
+          "quantity": 3,
+          "tenant_id": "window-tenant",
+          "customer_id": "c1",
+          "created_at": "2025-01-01T00:00:00Z",
+          "enabled": true,
+          "kind": "order",
+          "tags": [
+            "hot",
+            "new"
+          ],
+          "metadata": {
+            "source": "api",
+            "kind": "external",
+            "flags": [
+              "rated"
+            ],
+            "billing": {
+              "plan": "pro"
+            }
+          }
+        }
+      },
+      {
+        "key": "window-20",
+        "value": {
+          "id": "window-20",
+          "name": "Ada",
+          "status": "open",
+          "organization_id": "window-org",
+          "email": "ADA@EXAMPLE.TEST",
+          "amount": 62,
+          "quantity": 3,
+          "tenant_id": "window-tenant",
+          "customer_id": "c1",
+          "created_at": "2025-01-01T00:00:00Z",
+          "enabled": true,
+          "kind": "order",
+          "tags": [
+            "hot",
+            "new"
+          ],
+          "metadata": {
+            "source": "api",
+            "kind": "external",
+            "flags": [
+              "rated"
+            ],
+            "billing": {
+              "plan": "pro"
+            }
+          }
+        }
+      },
+      {
+        "key": "window-21",
+        "value": {
+          "id": "window-21",
+          "name": "Ada",
+          "status": "open",
+          "organization_id": "window-org",
+          "email": "ADA@EXAMPLE.TEST",
+          "amount": 64,
+          "quantity": 3,
+          "tenant_id": "window-tenant",
+          "customer_id": "c1",
+          "created_at": "2025-01-01T00:00:00Z",
+          "enabled": true,
+          "kind": "order",
+          "tags": [
+            "hot",
+            "new"
+          ],
+          "metadata": {
+            "source": "api",
+            "kind": "external",
+            "flags": [
+              "rated"
+            ],
+            "billing": {
+              "plan": "pro"
+            }
+          }
+        }
+      },
+      {
+        "key": "window-22",
+        "value": {
+          "id": "window-22",
+          "name": "Ada",
+          "status": "open",
+          "organization_id": "window-org",
+          "email": "ADA@EXAMPLE.TEST",
+          "amount": 68,
+          "quantity": 3,
+          "tenant_id": "window-tenant",
+          "customer_id": "c1",
+          "created_at": "2025-01-01T00:00:00Z",
+          "enabled": true,
+          "kind": "order",
+          "tags": [
+            "hot",
+            "new"
+          ],
+          "metadata": {
+            "source": "api",
+            "kind": "external",
+            "flags": [
+              "rated"
+            ],
+            "billing": {
+              "plan": "pro"
+            }
+          }
+        }
+      },
+      {
+        "key": "window-23",
+        "value": {
+          "id": "window-23",
+          "name": "Ada",
+          "status": "open",
+          "organization_id": "window-org",
+          "email": "ADA@EXAMPLE.TEST",
+          "amount": 70,
+          "quantity": 3,
+          "tenant_id": "window-tenant",
+          "customer_id": "c1",
+          "created_at": "2025-01-01T00:00:00Z",
+          "enabled": true,
+          "kind": "order",
+          "tags": [
+            "hot",
+            "new"
+          ],
+          "metadata": {
+            "source": "api",
+            "kind": "external",
+            "flags": [
+              "rated"
+            ],
+            "billing": {
+              "plan": "pro"
+            }
+          }
+        }
+      }
+    ],
+    "exact_numeric": true
+  },
+  "entries": [
+    {
+      "id": "sql-1366",
+      "columns": [
+        "tenant_id",
+        "id",
+        "row_num",
+        "rank",
+        "dense_rank",
+        "percent_rank",
+        "cume_dist",
+        "amount_bucket",
+        "prev_amount",
+        "next_status",
+        "first_amount",
+        "last_amount",
+        "partition_count",
+        "range_amount_count",
+        "running_sum",
+        "running_avg",
+        "running_min",
+        "running_max"
+      ],
+      "rows": [
+        [
+          "window-tenant",
+          "window-17",
+          7,
+          7,
+          7,
+          0.2608695652173913,
+          0.2916666666666667,
+          2,
+          56,
+          "open",
+          70,
+          2,
+          3,
+          9,
+          430,
+          "61.4285714285714286",
+          52,
+          70
+        ],
+        [
+          "window-tenant",
+          "window-16",
+          8,
+          8,
+          8,
+          0.30434782608695654,
+          0.3333333333333333,
+          2,
+          52,
+          "open",
+          70,
+          2,
+          3,
+          9,
+          480,
+          "60.0000000000000000",
+          50,
+          70
+        ],
+        [
+          "window-tenant",
+          "window-15",
+          9,
+          9,
+          9,
+          0.34782608695652173,
+          0.375,
+          2,
+          50,
+          "open",
+          70,
+          2,
+          3,
+          9,
+          526,
+          "58.4444444444444444",
+          46,
+          70
+        ],
+        [
+          "window-tenant",
+          "window-14",
+          10,
+          10,
+          10,
+          0.391304347826087,
+          0.4166666666666667,
+          2,
+          46,
+          "open",
+          70,
+          2,
+          3,
+          9,
+          570,
+          "57.0000000000000000",
+          44,
+          70
+        ],
+        [
+          "window-tenant",
+          "window-13",
+          11,
+          11,
+          11,
+          0.43478260869565216,
+          0.4583333333333333,
+          2,
+          44,
+          "open",
+          70,
+          2,
+          3,
+          9,
+          610,
+          "55.4545454545454545",
+          40,
+          70
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false,
+          false,
+          false,
+          false,
+          false,
+          false,
+          false,
+          false,
+          false,
+          false,
+          false,
+          false,
+          false,
+          false,
+          false,
+          false,
+          false,
+          false
+        ],
+        [
+          false,
+          false,
+          false,
+          false,
+          false,
+          false,
+          false,
+          false,
+          false,
+          false,
+          false,
+          false,
+          false,
+          false,
+          false,
+          false,
+          false,
+          false
+        ],
+        [
+          false,
+          false,
+          false,
+          false,
+          false,
+          false,
+          false,
+          false,
+          false,
+          false,
+          false,
+          false,
+          false,
+          false,
+          false,
+          false,
+          false,
+          false
+        ],
+        [
+          false,
+          false,
+          false,
+          false,
+          false,
+          false,
+          false,
+          false,
+          false,
+          false,
+          false,
+          false,
+          false,
+          false,
+          false,
+          false,
+          false,
+          false
+        ],
+        [
+          false,
+          false,
+          false,
+          false,
+          false,
+          false,
+          false,
+          false,
+          false,
+          false,
+          false,
+          false,
+          false,
+          false,
+          false,
+          false,
+          false,
+          false
+        ]
+      ],
+      "column_oids": [
+        25,
+        25,
+        20,
+        20,
+        20,
+        701,
+        701,
+        23,
+        23,
+        25,
+        23,
+        23,
+        20,
+        20,
+        20,
+        1700,
+        23,
+        23
+      ],
+      "affected": 0
+    },
+    {
+      "id": "sql-1376",
+      "columns": [
+        "tenant_id",
+        "id",
+        "running_remainder",
+        "average_shifted_remainder"
+      ],
+      "rows": [
+        [
+          "window-tenant",
+          "window-00",
+          "36",
+          "1.5000000000000000"
+        ],
+        [
+          "window-tenant",
+          "window-01",
+          "34",
+          "1.4782608695652174"
+        ],
+        [
+          "window-tenant",
+          "window-02",
+          "33",
+          "1.5000000000000000"
+        ],
+        [
+          "window-tenant",
+          "window-03",
+          "31",
+          "1.4761904761904762"
+        ],
+        [
+          "window-tenant",
+          "window-04",
+          "30",
+          "1.5000000000000000"
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false,
+          false,
+          false,
+          false
+        ],
+        [
+          false,
+          false,
+          false,
+          false
+        ],
+        [
+          false,
+          false,
+          false,
+          false
+        ],
+        [
+          false,
+          false,
+          false,
+          false
+        ],
+        [
+          false,
+          false,
+          false,
+          false
+        ]
+      ],
+      "column_oids": [
+        25,
+        25,
+        1700,
+        1700
+      ],
+      "affected": 0
+    }
+  ],
+  "excluded": [],
+  "exact_builtin_types": true,
+  "server_version": 180006
+}
