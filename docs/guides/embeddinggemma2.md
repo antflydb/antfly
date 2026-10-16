@@ -44,8 +44,8 @@ must remain consistent between indexing and retrieval.
 Existing flat inputs return one vector per text or media part. A group returns
 one vector for all its ordered content. Each request must use one form throughout.
 Ordered mixed/video groups use bounded prepared cohorts on CPU and Metal.
-Tower execution preserves each group's order; compatible completed inputs share
-length-bucketed backbone calls, with at most four groups and 8192 padded rows.
+Compatible image/audio parts share towers across groups while preserving each
+group's order; compatible completed inputs share length-bucketed backbone calls, with at most four groups and 8192 padded rows.
 The broker also admits CPU image/audio cohorts; callbacks and caller-owned
 profiling/preparation hooks keep their dedicated execution path. Queueing does
 not reserve model scratch. A fitting singleton remains available when cohort
@@ -516,10 +516,17 @@ reclamation refuses active/submitted command groups. Unloading releases payloads
 and their admission ownership; request workspace remains bounded independently.
 
 Vision normalization and two-axis RoPE execute together without intermediate
-transposes. Native dense vision attention uses bounded 256-query/1024-key
-tiles, SIMD row maxima and normalization, and no segmented-range sorting or
-masking. Scratch holds one packed head; BLAS or portable GEMM owns CPU
-parallelism; bounded row workers run only after each GEMM has completed.
+transposes. Native dense vision attention uses bounded GEMM tiles, SIMD row
+maxima and normalization, and no segmented-range sorting or masking. BLAS
+execution holds one packed head and a 1 MiB score tile; bounded row workers
+run only after each GEMM has completed. Without BLAS, a portable SIMD kernel
+packs head-major inputs once and runs independent heads around sequential
+register-tiled GEMM, avoiding nested worker pools.
+BLAS tiles calibrate over ordinary completed calls per geometry and batch size:
+each candidate gets one discarded warm sample and three measured samples, then
+the lower median wins. A fixed 64-entry metadata table bounds exploration and
+stores no tensors; failed calls release their tickets without training. Disable
+exploration with `ANTFLY_EMBEDDINGGEMMA2_DISABLE_ATTENTION_CALIBRATION=1`.
 Legacy layouts retain their existing path. Native backbone grouped
 attention preserves compact K/V heads and reuses their packed rows across query
 heads, with explicit score scaling and the same masks/windows as Metal. Compatible FFNs use fused GELU/product execution; CPU streams through
@@ -543,13 +550,37 @@ checked supplemental lease funds any larger encoder peak. The base lease never
 grows or loses ownership, and both leases outlive backend teardown. Resource
 pressure unwinds a cohort before retrying independent calls.
 
+Mixed cohorts gather image/raster and encoded/PCM audio parts into bounded tower
+waves. One CPU-only future wave may prepare while the current tower executes;
+its independent shared lease and allocator retire after join. Scatter maps keep
+part/group identity through geometry and audio-length differences. Invalid
+preparation marks the original group, and pressure drains all producers before
+independent execution retries.
+
+Model-owned packed linears combine compatible backbone QKV, gate/up and audio
+QKV weights under the existing cache class limits. Audio QKV packing requires
+equal input clamps and preserves each output clamp. Large QKV/Metal FFN inputs
+retain streaming projection to bound activation storage; native packed FFNs
+consume interleaved gate/up rows directly with portable SIMD workers. Dense
+native GEMM output skips redundant zero initialization when beta is zero.
+
+Embedding-only calls apply the final token RMSNorm, masked-mean pool hidden
+rows, then project once per item. Token-output callers retain the original
+per-token projection. The final bias-free linear commutes with masked mean;
+token RMSNorm does not. Metal pools, projects, truncates and normalizes the
+whole cohort inside its owned command frame and returns one compact readback.
+Admission accounts compact output vectors; the backbone workspace remains
+bounded independently. Dimension truncation stays after projection and before
+final L2 normalization.
+
 Warm embedding admission clones the loaded generation's validated manifest,
 including processor and capability policy, while briefly holding a model pin.
 Identity verification remains in place. Retirement/reload publishes a new
 snapshot; cold loads retain ordinary filesystem validation.
 
 For independent-versus-cohort replay, including unequal audio clips, mixed
-ordering, captioned video, partial failures and concurrent callers:
+ordering, repeated media spanning preparation waves, captioned video, partial
+failures and concurrent callers:
 
 ```sh
 python3 zig/pkg/inference/scripts/embeddinggemma2/cohort_qualify.py \
@@ -561,6 +592,20 @@ python3 zig/pkg/inference/scripts/embeddinggemma2/cohort_qualify.py \
 Repeat with `--backend native`. The receipt pins the binary, corpus and model
 identity and requires observed native batching; these correctness/scheduling
 checks do not qualify the recorded latency against PyTorch.
+
+For a paired CPU kernel diagnostic, including portable SIMD attention:
+
+```sh
+cd zig/pkg/inference
+ZIG_LOCAL_CACHE_DIR="$PWD/.zig-cache" \
+  ZIG_GLOBAL_CACHE_DIR="$PWD/.zig-cache/global" \
+  ANTFLY_BENCH_DENSE_VISION_TILES=1 VECLIB_MAXIMUM_THREADS=4 \
+  zig build test-embeddinggemma2 -Doptimize=ReleaseSafe \
+  -Dtest-filter="embeddinggemma2 dense vision tile benchmark"
+```
+
+This compares actual attention outputs and completed kernel times at several
+patch grids. It is a kernel diagnostic, not an end-to-end throughput gate.
 
 ### Per-case performance gate
 

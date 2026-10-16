@@ -1970,6 +1970,8 @@ pub const ComputeBackend = struct {
 
         /// Y = activation(gate) * up for decoder-runtime activation kinds.
         /// Backends may fuse the common gated-FFN activation/multiply pair.
+        /// Consume row-packed [gelu gate; up] without materializing either half.
+        packedGeluMultiply: ?*const fn (ctx: *anyopaque, input: CT, rows: usize, width: usize) anyerror!?CT = null,
         activationMultiply: ?*const fn (ctx: *anyopaque, gate: CT, up: CT, activation: DecoderRuntimeActivationKind) anyerror!?CT = null,
 
         /// Y = activation(gate) * sliceLastDim(source, start, stop).
@@ -2083,6 +2085,9 @@ pub const ComputeBackend = struct {
         /// This is the Q/K/V fast path for encoders with separate projection
         /// weights. Backends may fuse quantized kernels and bias application;
         /// otherwise the wrapper falls back to three independent `linear` calls.
+        /// Immutable model-owned variable-width packed projections. Decline
+        /// leaves callers on independent linears without runtime concatenation.
+        linearPackedNamed: ?*const fn (ctx: *anyopaque, input: CT, names: []const []const u8, widths: []const usize, rows: usize, in_dim: usize) anyerror!?CT = null,
         linearTripleNoBiasNamed: ?*const fn (ctx: *anyopaque, input: CT, names: [3][]const u8, rows: usize, in_dim: usize, out_dim: usize) anyerror!LinearTripleResult = null,
         linearTripleNoBias: ?*const fn (ctx: *anyopaque, input: CT, a: CT, b: CT, c: CT, rows: usize, in_dim: usize, out_dim: usize) anyerror!LinearTripleResult = null,
         linearTriple: ?*const fn (ctx: *anyopaque, input: CT, weight_a: CT, bias_a: CT, weight_b: CT, bias_b: CT, weight_c: CT, bias_c: CT, rows: usize, in_dim: usize, out_dim: usize) anyerror!LinearTripleResult = null,
@@ -3580,6 +3585,13 @@ pub const ComputeBackend = struct {
         errdefer self.free(first);
         const second = try self.linear(input_b, weight_b, bias_b, rows, in_dim, out_dim);
         return .{ .first = first, .second = second };
+    }
+
+    pub fn linearPackedNamed(self: *const ComputeBackend, input: CT, names: []const []const u8, widths: []const usize, rows: usize, in_dim: usize) !?CT {
+        if (names.len < 2 or names.len > 3 or widths.len != names.len) return error.InvalidTensorShape;
+        for (widths) |width| if (width == 0) return error.InvalidTensorShape;
+        if (self.vtable.linearPackedNamed) |op| return op(self.ptr, input, names, widths, rows, in_dim);
+        return null;
     }
 
     pub fn linearTripleNoBiasNamed(self: *const ComputeBackend, input: CT, names: [3][]const u8, rows: usize, in_dim: usize, out_dim: usize) !LinearTripleResult {

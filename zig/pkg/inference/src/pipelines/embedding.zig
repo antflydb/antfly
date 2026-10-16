@@ -817,7 +817,7 @@ pub const EmbeddingPipeline = struct {
         };
         if (self.execution_control) |control| try control.check();
 
-        if (self.config.resident_text_encoder and self.session.backend() == .metal and self.config.normalize and self.config.pooling == .mean and self.text_projection == null) {
+        if (self.config.resident_text_encoder and (self.session.backend() == .metal or self.session.backend() == .native) and self.config.normalize and self.config.pooling == .mean and self.text_projection == null) {
             if (session_factory.getEmbeddingGemma2Config(self.session)) |cfg| {
                 const dimensions = self.config.embedding_gemma2_dimensions;
                 if (!@import("../architectures/embedding_gemma2.zig").validDimension(dimensions)) return error.InvalidEmbeddingDimensions;
@@ -826,17 +826,22 @@ pub const EmbeddingPipeline = struct {
                 const mask = try alloc.alloc(i64, all_mask.len);
                 defer alloc.free(mask);
                 for (mask, all_mask) |*dest, source| dest.* = source;
-                const embeddings = try alloc.alloc([]f32, batch);
-                var initialized: usize = 0;
-                errdefer {
-                    for (embeddings[0..initialized]) |embedding| alloc.free(embedding);
-                    alloc.free(embeddings);
-                }
-                for (embeddings, 0..) |*embedding, index| {
-                    if (self.execution_control) |control| try control.check();
-                    embedding.* = try @import("embedding_gemma2.zig").preparedText(&managed.backend, alloc, cfg, ids_i64[index * effective_len ..][0..effective_len], mask[index * effective_len ..][0..effective_len], dimensions);
-                    initialized += 1;
-                }
+                const embeddings = if (batch * effective_len <= 8192)
+                    try @import("embedding_gemma2.zig").preparedTexts(&managed.backend, alloc, cfg, ids_i64, mask, batch, effective_len, dimensions)
+                else blk: {
+                    const vectors = try alloc.alloc([]f32, batch);
+                    var initialized: usize = 0;
+                    errdefer {
+                        for (vectors[0..initialized]) |vector| alloc.free(vector);
+                        alloc.free(vectors);
+                    }
+                    for (vectors, 0..) |*vector, index| {
+                        if (self.execution_control) |control| try control.check();
+                        vector.* = try @import("embedding_gemma2.zig").preparedText(&managed.backend, alloc, cfg, ids_i64[index * effective_len ..][0..effective_len], mask[index * effective_len ..][0..effective_len], dimensions);
+                        initialized += 1;
+                    }
+                    break :blk vectors;
+                };
                 self.last_resident_backend_timing = managed.backend.debugTimingSnapshot();
                 self.recordResidentProjection(.text, .success, "text.embeddinggemma2.pool_normalize.resident", batch, null);
                 return embeddings;

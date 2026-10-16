@@ -3046,8 +3046,8 @@ pub const LoadedModel = struct {
     pub fn embeddingPipelineLocked(self: *LoadedModel, allocator: std.mem.Allocator) EmbeddingPipeline {
         const tok = self.getTokenizer();
         const generic_encoder: ?session_factory.GenericEncoderArchConfig = session_factory.getGenericEncoderArchConfig(self.session) catch null;
-        const resident_text_encoder = (self.session.backend() == .metal or self.session.backend() == .cuda) and
-            session_factory.supportsResidentTextEncoder(self.session);
+        const resident_text_encoder = (self.session.backend() == .native and self.manifest.embedding_style == .embedding_gemma2) or
+            ((self.session.backend() == .metal or self.session.backend() == .cuda) and session_factory.supportsResidentTextEncoder(self.session));
         var pipeline = EmbeddingPipeline.init(allocator, self.session, tok, .{
             .max_length = self.manifest.maxTextSequenceLength(),
             .reject_truncation = self.manifest.embedding_style == .embedding_gemma2,

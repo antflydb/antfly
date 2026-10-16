@@ -431,8 +431,15 @@ fn attention(cb: *const ComputeBackend, allocator: std.mem.Allocator, cfg: Confi
     // Release each projection's producer temporaries before building the next.
     // Full-context CPU execution otherwise retains several redundant Q/K/V
     // copies until attention returns, exceeding the admitted workspace.
+    var names: [3][128]u8 = undefined;
+    const packed_rows = if (rows <= 512) try cb.linearPackedNamed(input, &.{
+        try std.fmt.bufPrint(&names[0], "language_model.layers.{d}.self_attn.q_proj.weight", .{layer}),
+        try std.fmt.bufPrint(&names[1], "language_model.layers.{d}.self_attn.k_proj.weight", .{layer}),
+        try std.fmt.bufPrint(&names[2], "language_model.layers.{d}.self_attn.v_proj.weight", .{layer}),
+    }, &.{ heads * d, kv * d, kv * d }, rows, cfg.hidden_size) else null;
+    defer if (packed_rows) |tensor| cb.free(tensor);
     const q = blk: {
-        var raw: ?CT = try linear(cb, layer, "self_attn.q_proj.weight", input, rows, cfg.hidden_size, heads * d);
+        var raw: ?CT = if (packed_rows) |tensor| try cb.sliceLastDim(tensor, 0, heads * d) else try linear(cb, layer, "self_attn.q_proj.weight", input, rows, cfg.hidden_size, heads * d);
         defer if (raw) |value| cb.free(value);
         var shaped: ?CT = try reshapeLastUse(cb, &raw, rows * heads, d);
         defer if (shaped) |value| cb.free(value);
@@ -446,7 +453,7 @@ fn attention(cb: *const ComputeBackend, allocator: std.mem.Allocator, cfg: Confi
     };
     defer cb.free(q);
     const kg = blk: {
-        var raw: ?CT = try linear(cb, layer, "self_attn.k_proj.weight", input, rows, cfg.hidden_size, kv * d);
+        var raw: ?CT = if (packed_rows) |tensor| try cb.sliceLastDim(tensor, heads * d, (heads + kv) * d) else try linear(cb, layer, "self_attn.k_proj.weight", input, rows, cfg.hidden_size, kv * d);
         defer if (raw) |value| cb.free(value);
         var shaped: ?CT = try reshapeLastUse(cb, &raw, rows * kv, d);
         defer if (shaped) |value| cb.free(value);
@@ -459,7 +466,7 @@ fn attention(cb: *const ComputeBackend, allocator: std.mem.Allocator, cfg: Confi
     };
     defer cb.free(kg);
     const vg = blk: {
-        var raw: ?CT = try linear(cb, layer, "self_attn.v_proj.weight", input, rows, cfg.hidden_size, kv * d);
+        var raw: ?CT = if (packed_rows) |tensor| try cb.sliceLastDim(tensor, (heads + kv) * d, (heads + 2 * kv) * d) else try linear(cb, layer, "self_attn.v_proj.weight", input, rows, cfg.hidden_size, kv * d);
         defer if (raw) |value| cb.free(value);
         var shaped: ?CT = try reshapeLastUse(cb, &raw, rows * kv, d);
         defer if (shaped) |value| cb.free(value);
@@ -567,6 +574,21 @@ fn encoderLayer(cb: *const ComputeBackend, allocator: std.mem.Allocator, cfg: Co
     defer cb.free(fnorm);
     var down: ?CT = blk: {
         const product = product: {
+            var names: [2][128]u8 = undefined;
+            if (cb.kind() == .native or rows <= 512) {
+                if (try cb.linearPackedNamed(fnorm, &.{
+                    try std.fmt.bufPrint(&names[0], "language_model.layers.{d}.mlp.gate_proj.weight", .{layer}),
+                    try std.fmt.bufPrint(&names[1], "language_model.layers.{d}.mlp.up_proj.weight", .{layer}),
+                }, &.{ cfg.intermediate_size, cfg.intermediate_size }, rows, h)) |packed_rows| {
+                    defer cb.free(packed_rows);
+                    if (cb.vtable.packedGeluMultiply) |op| if (try op(cb.ptr, packed_rows, rows, cfg.intermediate_size)) |product| break :product product;
+                    const gate = try cb.sliceLastDim(packed_rows, 0, cfg.intermediate_size);
+                    defer cb.free(gate);
+                    const up = try cb.sliceLastDim(packed_rows, cfg.intermediate_size, cfg.intermediate_size * 2);
+                    defer cb.free(up);
+                    break :product (try cb.activationMultiply(gate, up, .gelu)) orelse return error.EmbeddingGemma2OperationUnavailable;
+                }
+            }
             var gate: ?CT = try linear(cb, layer, "mlp.gate_proj.weight", fnorm, rows, h, cfg.intermediate_size);
             defer if (gate) |value| cb.free(value);
             const up = try linear(cb, layer, "mlp.up_proj.weight", fnorm, rows, h, cfg.intermediate_size);
@@ -725,6 +747,17 @@ test "embeddinggemma2 video cohorts cross former frame boundaries without single
 }
 
 pub fn forwardEmbeddingsCT(cb: *const ComputeBackend, allocator: std.mem.Allocator, cfg: Config, embeddings: CT, mask: []const i64, batch: usize, seq: usize) !CT {
+    return forwardEmbeddingsImpl(cb, allocator, cfg, embeddings, mask, batch, seq, null);
+}
+
+/// Embedding-only output: normalize tokens, pool, project once per item, then
+/// truncate and normalize. Token-level callers retain forwardEmbeddingsCT.
+pub fn forwardPooledEmbeddingsCT(cb: *const ComputeBackend, allocator: std.mem.Allocator, cfg: Config, embeddings: CT, mask: []const i64, batch: usize, seq: usize, dimensions: usize) !CT {
+    if (!validDimension(dimensions)) return error.InvalidEmbeddingDimensions;
+    return forwardEmbeddingsImpl(cb, allocator, cfg, embeddings, mask, batch, seq, dimensions);
+}
+
+fn forwardEmbeddingsImpl(cb: *const ComputeBackend, allocator: std.mem.Allocator, cfg: Config, embeddings: CT, mask: []const i64, batch: usize, seq: usize, dimensions: ?usize) !CT {
     if (cb.kind() != .native and cb.kind() != .metal and cb.kind() != .wasm) return error.UnsupportedEmbeddingGemma2Backend;
     if (cb.kind() == .metal and cb.decoderRuntimeHasActiveFrame()) return error.EmbeddingGemma2ExternalFrame;
     if (batch == 0 or seq == 0 or seq > max_tokens) return error.InvalidEmbeddingInputLength;
@@ -800,7 +833,7 @@ pub fn forwardEmbeddingsCT(cb: *const ComputeBackend, allocator: std.mem.Allocat
     defer cb.free(normalized);
     const projection = try cb.getWeight("language_model.embedding_projection.weight");
     defer cb.free(projection);
-    const result = try cb.linearNoBias(normalized, projection, rows, cfg.hidden_size, cfg.embedding_dim);
+    const result = if (dimensions) |dim| try poolProjectNormalize(cb, allocator, cfg, normalized, projection, mask, batch, seq, dim) else try cb.linearNoBias(normalized, projection, rows, cfg.hidden_size, cfg.embedding_dim);
     errdefer cb.free(result);
     if (shared_frame) {
         try cb.decoderRuntimeSubmitAndWaitFrame();
@@ -809,6 +842,66 @@ pub fn forwardEmbeddingsCT(cb: *const ComputeBackend, allocator: std.mem.Allocat
     try @import("../ops/metal_compute.zig").MetalCompute.releaseEmbeddingGemma2ActivationViews(cb);
     try cb.checkExecutionControl();
     return result;
+}
+
+/// Mean commutes only with the final linear projection, never with token RMSNorm.
+fn poolProjectNormalize(cb: *const ComputeBackend, a: std.mem.Allocator, cfg: Config, normalized: CT, projection: CT, mask: []const i64, batch: usize, seq: usize, dimensions: usize) !CT {
+    if (cb.kind() == .metal) {
+        const mean = cb.vtable.maskedMeanRows orelse return error.EmbeddingGemma2OperationUnavailable;
+        const normalize = cb.vtable.maskedMeanNormalizedRows orelse return error.EmbeddingGemma2OperationUnavailable;
+        const pooled = (try cb.allocUninitF32Shape(&.{ @intCast(batch), @intCast(cfg.hidden_size) })) orelse return error.EmbeddingGemma2OperationUnavailable;
+        defer cb.free(pooled);
+        for (0..batch) |item| {
+            try cb.checkExecutionControl();
+            const view = try cb.sliceRows2D(a, normalized, item * seq, seq, cfg.hidden_size);
+            defer cb.free(view);
+            const row = (try mean(cb.ptr, view, mask[item * seq ..][0..seq], cfg.hidden_size, cfg.hidden_size)) orelse return error.EmbeddingGemma2OperationUnavailable;
+            defer cb.free(row);
+            if (!try cb.copyRows2D(a, pooled, item, row, 0, 1, cfg.hidden_size)) return error.EmbeddingGemma2OperationUnavailable;
+        }
+        const projected = try cb.linearNoBias(pooled, projection, batch, cfg.hidden_size, cfg.embedding_dim);
+        defer cb.free(projected);
+        const output = (try cb.allocUninitF32Shape(&.{ @intCast(batch), @intCast(dimensions) })) orelse return error.EmbeddingGemma2OperationUnavailable;
+        errdefer cb.free(output);
+        for (0..batch) |item| {
+            const view = try cb.sliceRows2D(a, projected, item, 1, cfg.embedding_dim);
+            defer cb.free(view);
+            const row = (try normalize(cb.ptr, view, &.{1}, cfg.embedding_dim, dimensions)) orelse return error.EmbeddingGemma2OperationUnavailable;
+            defer cb.free(row);
+            if (!try cb.copyRows2D(a, output, item, row, 0, 1, dimensions)) return error.EmbeddingGemma2OperationUnavailable;
+        }
+        return output;
+    }
+    const values = try cb.toFloat32(normalized, a);
+    defer a.free(values);
+    const pooled = try a.alloc(f32, batch * cfg.hidden_size);
+    defer a.free(pooled);
+    @memset(pooled, 0);
+    for (0..batch) |item| {
+        var count: usize = 0;
+        const row = pooled[item * cfg.hidden_size ..][0..cfg.hidden_size];
+        for (mask[item * seq ..][0..seq], 0..) |active, token| {
+            if (active == 0) continue;
+            count += 1;
+            for (row, values[(item * seq + token) * cfg.hidden_size ..][0..cfg.hidden_size]) |*sum, value| sum.* += value;
+        }
+        if (count == 0) return error.EmptyEmbeddingInput;
+        for (row) |*value| value.* /= @as(f32, @floatFromInt(count));
+    }
+    const input = try cb.fromFloat32Shape(pooled, &.{ @intCast(batch), @intCast(cfg.hidden_size) });
+    defer cb.free(input);
+    const projected = try cb.linearNoBias(input, projection, batch, cfg.hidden_size, cfg.embedding_dim);
+    defer cb.free(projected);
+    const data = try cb.toFloat32(projected, a);
+    defer a.free(data);
+    const compact = try a.alloc(f32, batch * dimensions);
+    defer a.free(compact);
+    for (0..batch) |item| {
+        const vector = try @import("antfly_decisions").scoring.centroid(a, &.{data[item * cfg.embedding_dim ..][0..dimensions]}, dimensions);
+        defer a.free(vector);
+        @memcpy(compact[item * dimensions ..][0..dimensions], vector);
+    }
+    return cb.fromFloat32Shape(compact, &.{ @intCast(batch), @intCast(dimensions) });
 }
 
 fn expectBackendParity(a: std.mem.Allocator, cpu: *const ComputeBackend, gpu: *const ComputeBackend, x: CT, y: CT, stage: []const u8) !void {
@@ -1169,4 +1262,60 @@ test "embeddinggemma2 rejects incompatible checkpoint semantics" {
     const bytes = try std.json.Stringify.valueAlloc(a, parsed.value, .{});
     defer a.free(bytes);
     try std.testing.expectError(error.UnsupportedEmbeddingGemma2Geometry, parseConfig(a, bytes));
+}
+
+fn checkPooledProjection(cb: ComputeBackend, _: ComputeBackend) !void {
+    if (comptime @import("build_options").enable_metal) {
+        if (cb.kind() == .metal) {
+            const compute: *@import("../ops/metal_compute.zig").MetalCompute = @ptrCast(@alignCast(cb.ptr));
+            compute.require_f32_linears = true;
+        }
+    }
+    const a = std.testing.allocator;
+    const cfg = Config{ .hidden_size = 4 };
+    const nan = std.math.nan(f32);
+    const values = [_]f32{ 1, 2, 3, 4, nan, nan, nan, nan, -2, 1, 2, 3, 4, -1, 3, 2, nan, nan, nan, nan, nan, nan, nan, nan };
+    const mask = [_]i64{ 1, 0, 1, 1, 0, 0 };
+    var weights: [768 * 4]f32 = undefined;
+    for (&weights, 0..) |*value, i| value.* = @sin(@as(f32, @floatFromInt(i)) * 0.127);
+    const input = try cb.fromFloat32Shape(&values, &.{ 6, 4 });
+    defer cb.free(input);
+    const projection = try cb.fromFloat32Shape(&weights, &.{ 768, 4 });
+    defer cb.free(projection);
+    for ([_]usize{ 128, 256, 512, 768 }) |dim| {
+        var frame = false;
+        if (cb.kind() == .metal) frame = try cb.decoderRuntimeBeginFrame();
+        defer if (frame) cb.decoderRuntimeCancelFrame() catch {};
+        const before = @import("../ops/media_residency_test.zig").Transfers.snapshot(cb);
+        const result = try poolProjectNormalize(&cb, a, cfg, input, projection, &mask, 2, 3, dim);
+        defer cb.free(result);
+        if (frame) {
+            try cb.decoderRuntimeSubmitAndWaitFrame();
+            frame = false;
+        }
+        try before.expectUnchanged(cb);
+        const actual = try cb.toFloat32(result, a);
+        defer a.free(actual);
+        for (0..2) |item| {
+            var reference: [768]f32 = @splat(0);
+            var count: usize = 0;
+            for (mask[item * 3 ..][0..3], 0..) |active, row| {
+                if (active == 0) continue;
+                count += 1;
+                for (reference[0..dim], 0..) |*sum, col| for (values[(item * 3 + row) * 4 ..][0..4], weights[col * 4 ..][0..4]) |x, w| {
+                    sum.* += x * w;
+                };
+            }
+            for (reference[0..dim]) |*sum| sum.* /= @as(f32, @floatFromInt(count));
+            const expected = try @import("antfly_decisions").scoring.centroid(a, &.{reference[0..dim]}, dim);
+            defer a.free(expected);
+            for (expected, actual[item * dim ..][0..dim]) |x, y| try std.testing.expectApproxEqAbs(x, y, 2e-6);
+        }
+    }
+}
+test "embeddinggemma2 native pooled projection preserves masked token reference all dimensions" {
+    try @import("../ops/media_residency_test.zig").onNative(@import("../ops/media_residency_test.zig").noWeights, checkPooledProjection);
+}
+test "embeddinggemma2 Metal pooled projection stays resident across dimensions and independent items" {
+    try @import("../ops/media_residency_test.zig").onMetal(@import("../ops/media_residency_test.zig").noWeights, checkPooledProjection);
 }

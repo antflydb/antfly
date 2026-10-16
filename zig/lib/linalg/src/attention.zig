@@ -3051,8 +3051,8 @@ pub fn denseAttentionHostWithGemmIo(comptime Gemm: type, a: std.mem.Allocator, i
     const rows = try std.math.mul(usize, batch, sequence);
     const count = try std.math.mul(usize, rows, width);
     if (q.len != count or k.len != count or v.len != count) return error.InvalidAttentionShape;
-    const bq = 256;
-    const bk = 1024;
+    const bq = if (@hasDecl(Gemm, "dense_query_block")) Gemm.dense_query_block else 256;
+    const bk = if (@hasDecl(Gemm, "dense_key_block")) Gemm.dense_key_block else 1024;
     const output = try a.alloc(f32, count);
     errdefer a.free(output);
     const head_count = try std.math.mul(usize, sequence, dim);
@@ -3268,4 +3268,72 @@ test "embeddinggemma2 dense vision row workers drain cancellation before retry" 
     try std.testing.expectError(error.Canceled, Case.run(io));
     try std.testing.expect(Case.calls.load(.monotonic) >= 50);
     try Case.run(std.testing.io);
+}
+
+/// Portable dense attention uses independent head workers around sequential
+/// register-tiled SIMD GEMM. Pack once before dispatch; no nested GEMM workers.
+/// The existing head-major flash kernel owns online softmax and bounded tiles.
+pub fn denseAttentionPortableHostWithIo(a: std.mem.Allocator, io: ?std.Io, q: []const f32, k: []const f32, v: []const f32, batch: usize, sequence: usize, heads: usize, dim: usize) ![]f32 {
+    if (batch == 0 or sequence == 0 or heads == 0 or dim == 0) return error.InvalidAttentionShape;
+    const rows = try std.math.mul(usize, batch, sequence);
+    const width = try std.math.mul(usize, heads, dim);
+    const count = try std.math.mul(usize, rows, width);
+    if (q.len != count or k.len != count or v.len != count) return error.InvalidAttentionShape;
+    const storage = try a.alloc(f32, try std.math.mul(usize, count, 3));
+    defer a.free(storage);
+    const qh = storage[0..count];
+    const kh = storage[count..][0..count];
+    const vh = storage[2 * count ..];
+    for (0..batch) |b| for (0..heads) |h| {
+        if (io) |runtime| try runtime.checkCancel();
+        for (0..sequence) |row| {
+            const src = (b * sequence + row) * width + h * dim;
+            const dst = ((b * heads + h) * sequence + row) * dim;
+            @memcpy(qh[dst..][0..dim], q[src..][0..dim]);
+            @memcpy(kh[dst..][0..dim], k[src..][0..dim]);
+            @memcpy(vh[dst..][0..dim], v[src..][0..dim]);
+        }
+    };
+    const headed = try flashAttentionHostWithIo(a, io, qh, kh, vh, null, &.{}, batch, sequence, heads, dim);
+    defer a.free(headed);
+    const output = try a.alloc(f32, count);
+    errdefer a.free(output);
+    for (0..batch) |b| for (0..heads) |h| {
+        if (io) |runtime| try runtime.checkCancel();
+        for (0..sequence) |row| @memcpy(output[(b * sequence + row) * width + h * dim ..][0..dim], headed[((b * heads + h) * sequence + row) * dim ..][0..dim]);
+    };
+    return output;
+}
+
+test "embeddinggemma2 portable dense SIMD head workers preserve batch isolation and tails" {
+    const a = std.testing.allocator;
+    const count = 2 * 257 * 3 * 8;
+    const data = try a.alloc(f32, count);
+    defer a.free(data);
+    for (data, 0..) |*value, i| value.* = @sin(@as(f32, @floatFromInt(i)) * 0.173) * 0.5;
+    const actual = try denseAttentionPortableHostWithIo(a, std.testing.io, data, data, data, 2, 257, 3, 8);
+    defer a.free(actual);
+    const expected = try denseAttentionHostWithGemmIo(SegmentParallelTestGemm, a, std.testing.io, data, data, data, 2, 257, 3, 8);
+    defer a.free(expected);
+    for (expected, actual) |x, y| try std.testing.expectApproxEqAbs(x, y, 1e-6);
+}
+test "embeddinggemma2 portable dense scratch ownership survives allocation failure cancellation and retry" {
+    const Case = struct {
+        fn run(a: std.mem.Allocator, io: std.Io) !void {
+            const input: [18]f32 = @splat(0.25);
+            const output = try denseAttentionPortableHostWithIo(a, io, &input, &input, &input, 1, 3, 2, 3);
+            defer a.free(output);
+            for (output) |value| try std.testing.expectApproxEqAbs(@as(f32, 0.25), value, 1e-6);
+        }
+        fn cancel(_: ?*anyopaque) std.Io.Cancelable!void {
+            return error.Canceled;
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Case.run, .{std.testing.io});
+    var table = std.testing.io.vtable.*;
+    table.checkCancel = Case.cancel;
+    var io = std.testing.io;
+    io.vtable = &table;
+    try std.testing.expectError(error.Canceled, Case.run(std.testing.allocator, io));
+    try Case.run(std.testing.allocator, std.testing.io);
 }

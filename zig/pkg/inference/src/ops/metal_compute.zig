@@ -16891,20 +16891,55 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         return linearTripleNoBiasOp(ctx, input, weights[0], weights[1], weights[2], rows, in_dim, out_dim);
     }
 
-    fn packedMediaQkvSlot(self: *MetalCompute, weights: [3]CT, in_dim: usize, out_dim: usize) !?usize {
+    fn linearPackedNamedOp(ctx: *anyopaque, input: CT, names: []const []const u8, widths: []const usize, rows: usize, in_dim: usize) anyerror!?CT {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        if (!self.require_f32_linears or self.shared_provider_lease_io == null) return null;
+        const joined = try std.mem.join(self.allocator, "|", names);
+        defer self.allocator.free(joined);
+        const key = try std.mem.concat(self.allocator, u8, &.{ joined, ".linear.weight" });
+        defer self.allocator.free(key);
+        var total: usize = 0;
+        for (widths) |width| total = try std.math.add(usize, total, width);
+        if (self.provider_impl.embeddinggemma2_linear_cache.get(key)) |entry| {
+            if (entry.in_dim != in_dim or entry.out_dim != total) return error.InvalidTensorShape;
+            return try decoderRuntimeApplyLinearOp(ctx, &.{ .slot = entry.slot, .input = input, .in_dim = in_dim, .out_dim = total });
+        }
+        var weights: [3]CT = undefined;
+        var count: usize = 0;
+        defer for (weights[0..count]) |weight| freeOp(ctx, weight);
+        for (names, weights[0..names.len]) |name, *weight| {
+            weight.* = try getWeightOp(ctx, name);
+            count += 1;
+        }
+        const slot = (self.packedMediaLinearsSlot(weights[0..count], in_dim, widths) catch |err| switch (err) {
+            error.OutOfMemory => return null,
+            else => return err,
+        }) orelse return null;
+        _ = rows;
+        return try decoderRuntimeApplyLinearOp(ctx, &.{ .slot = slot, .input = input, .in_dim = in_dim, .out_dim = total });
+    }
+
+    fn packedMediaLinearsSlot(self: *MetalCompute, weights: []const CT, in_dim: usize, widths: []const usize) !?usize {
         if (!self.require_f32_linears or self.shared_provider_lease_io == null) return null;
         const policy = @import("../models/embedding_gemma2_weight_cache.zig");
         var names: [3][]const u8 = undefined;
-        for (weights, &names) |weight, *name| {
+        var out_dim: usize = 0;
+        var class: ?policy.MetalClass = null;
+        for (weights, names[0..weights.len], widths) |weight, *name, width| {
             const buf = toBuf(weight);
             const entry = buf.lazy_entry orelse return null;
             if (buf.mutable_state or entry.pin_count == 0 or hasHostView(buf) or buf.metal_tensor != null or bufHasAnyQuantizedStorage(buf) or buf.lazy_multiply != null) return null;
             const source = if (entry.host_loaded) |*loaded| &loaded.tensor else return null;
-            if ((source.dtype != .bf16 and source.dtype != .f32) or source.shape.len != 2 or source.shape[0] != out_dim or source.shape[1] != in_dim) return null;
+            if ((source.dtype != .bf16 and source.dtype != .f32) or source.shape.len != 2 or source.shape[0] != width or source.shape[1] != in_dim) return null;
             name.* = entry.tensor_ref.name;
-            if (policy.metalClass(name.*) != .vision) return null;
+            const next = policy.metalClass(name.*) orelse return null;
+            if (class != null and class.? != next) return null;
+            class = next;
+            out_dim = try std.math.add(usize, out_dim, width);
         }
-        const name = try std.fmt.allocPrint(self.allocator, "{s}|{s}|{s}.linear.weight", .{ names[0], names[1], names[2] });
+        const joined = try std.mem.join(self.allocator, "|", names[0..weights.len]);
+        defer self.allocator.free(joined);
+        const name = try std.mem.concat(self.allocator, u8, &.{ joined, ".linear.weight" });
         defer self.allocator.free(name);
         const provider = self.provider_impl;
         const cache = if (self.data.tier_cache) |*cache| cache else return null;
@@ -16912,12 +16947,17 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             if (bound != cache) return null;
         } else provider.embeddinggemma2_cache_admission = cache;
         if (provider.embeddinggemma2_linear_cache.get(name)) |entry| {
-            if (entry.in_dim != in_dim or entry.out_dim != 3 * out_dim) return error.InvalidTensorShape;
+            if (entry.in_dim != in_dim or entry.out_dim != out_dim) return error.InvalidTensorShape;
             return entry.slot;
         }
-        const bytes = (3 * out_dim * in_dim + 3 * out_dim) * @sizeOf(f32);
-        const used = provider.embeddinggemma2_vision_linear_cache_bytes;
-        if (used > policy.metal_vision_max_bytes or bytes > policy.metal_vision_max_bytes - used or provider.embeddinggemma2_linear_cache.count() >= policy.max_entries) return null;
+        const bytes = (out_dim * in_dim + out_dim) * @sizeOf(f32);
+        const used = switch (class.?) {
+            .vision => provider.embeddinggemma2_vision_linear_cache_bytes,
+            .audio => provider.embeddinggemma2_audio_linear_cache_bytes,
+            .language => provider.embeddinggemma2_linear_cache_bytes - provider.embeddinggemma2_vision_linear_cache_bytes - provider.embeddinggemma2_audio_linear_cache_bytes,
+        };
+        const limit = policy.classLimit(class.?);
+        if (used > limit or bytes > limit - used or provider.embeddinggemma2_linear_cache.count() >= policy.max_entries) return null;
         const slot = self.nextFreeDynamicLinearSlot() orelse return null;
         self.data.prefetch.lock();
         cache.reserve(.backend, bytes) catch {
@@ -16936,30 +16976,36 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         const owned_name = try owner.dupe(u8, name);
         defer if (!committed) owner.free(owned_name);
         try provider.embeddinggemma2_linear_cache.ensureUnusedCapacity(owner, 1);
-        const data = try self.allocator.alloc(f32, 3 * out_dim * in_dim);
+        const data = try self.allocator.alloc(f32, out_dim * in_dim);
         defer self.allocator.free(data);
-        for (weights, 0..) |weight, i| {
+        var offset: usize = 0;
+        for (weights, widths) |weight, width| {
             const values = try toFloat32Op(self, weight, self.allocator);
             defer self.allocator.free(values);
-            if (values.len != in_dim * out_dim) return error.InvalidTensorShape;
-            @memcpy(data[i * in_dim * out_dim ..][0 .. in_dim * out_dim], values);
+            if (values.len != in_dim * width) return error.InvalidTensorShape;
+            @memcpy(data[offset..][0 .. in_dim * width], values);
+            offset += in_dim * width;
         }
-        const combined_weight = try fromFloat32ShapeOp(self, data, &.{ @intCast(3 * out_dim), @intCast(in_dim) });
+        const combined_weight = try fromFloat32ShapeOp(self, data, &.{ @intCast(out_dim), @intCast(in_dim) });
         defer freeOp(self, combined_weight);
-        const bias = try self.cachedZeroBiasBuf(3 * out_dim);
+        const bias = try self.cachedZeroBiasBuf(out_dim);
         defer freeOp(self, bias);
         defer if (!committed) metal_runtime.clearRawLinearSlot(provider, slot);
-        if (!(try self.prepareLinearWithF32Storage(&.{ .slot = slot, .weight = combined_weight, .bias = bias, .in_dim = in_dim, .out_dim = 3 * out_dim, .prefer_f32_mps_fallback = true }, .owned_shared_if_unified))) return null;
-        provider.embeddinggemma2_linear_cache.putAssumeCapacityNoClobber(owned_name, .{ .slot = slot, .in_dim = in_dim, .out_dim = 3 * out_dim, .bytes = bytes });
+        if (!(try self.prepareLinearWithF32Storage(&.{ .slot = slot, .weight = combined_weight, .bias = bias, .in_dim = in_dim, .out_dim = out_dim, .prefer_f32_mps_fallback = true }, .owned_shared_if_unified))) return null;
+        provider.embeddinggemma2_linear_cache.putAssumeCapacityNoClobber(owned_name, .{ .slot = slot, .in_dim = in_dim, .out_dim = out_dim, .bytes = bytes });
         provider.embeddinggemma2_linear_cache_bytes += bytes;
-        provider.embeddinggemma2_vision_linear_cache_bytes += bytes;
+        switch (class.?) {
+            .vision => provider.embeddinggemma2_vision_linear_cache_bytes += bytes,
+            .audio => provider.embeddinggemma2_audio_linear_cache_bytes += bytes,
+            .language => {},
+        }
         committed = true;
         return slot;
     }
 
     fn linearTripleNoBiasOp(ctx: *anyopaque, input: CT, a: CT, b: CT, c: CT, rows: usize, in_dim: usize, out_dim: usize) anyerror!ops.LinearTripleResult {
         const self: *MetalCompute = @ptrCast(@alignCast(ctx));
-        const slot = self.packedMediaQkvSlot(.{ a, b, c }, in_dim, out_dim) catch |err| switch (err) {
+        const slot = self.packedMediaLinearsSlot(&.{ a, b, c }, in_dim, &.{ out_dim, out_dim, out_dim }) catch |err| switch (err) {
             error.OutOfMemory => null,
             else => return err,
         };
@@ -33069,6 +33115,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         vt.linearTriple = linearTripleOp;
         vt.linearTripleNoBias = linearTripleNoBiasOp;
         vt.linearTripleNoBiasNamed = linearTripleNoBiasNamedOp;
+        vt.linearPackedNamed = linearPackedNamedOp;
         vt.rmsNormHeadsRope = rmsNormHeadsRopeOp;
         vt.rope = ropeOp;
         vt.mrope = mropeOp;
@@ -33092,6 +33139,9 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         vt.runGatedDecoderBlock = runGatedDecoderBlockOp;
         vt.add = addOp;
         vt.multiply = multiplyOp;
+        // This native-only callback casts its context to NativeCompute. Metal
+        // keeps the bounded device slice/activation path for packed FFNs.
+        vt.packedGeluMultiply = null;
         vt.activationMultiply = activationMultiplyOp;
         vt.debugTimingSnapshot = debugTimingSnapshotOp;
         vt.directFamilyTimingSnapshot = directFamilyTimingSnapshotOp;
@@ -43210,4 +43260,61 @@ test "embeddinggemma2 Metal video pressure reclaims idle vision slots and preser
     }
     deinitSharedNativeProvider(&store);
     try std.testing.expectEqual(@as(usize, 0), controller.snapshot().backend_weight_bytes);
+}
+
+test "embeddinggemma2 Metal variable packed snapshots preserve shared cache frames and BF16 sources" {
+    if (comptime !build_options.enable_metal) return error.SkipZigTest;
+    if (!metal_runtime_mod.metalDeviceAvailable()) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const names = [_][]const u8{ "language_model.layers.0.self_attn.q_proj.weight", "language_model.layers.0.self_attn.k_proj.weight", "language_model.layers.0.self_attn.v_proj.weight" };
+    const widths = [_]usize{ 128, 64, 64 };
+    const shapes = [_][2]i64{ .{ 128, 64 }, .{ 64, 64 }, .{ 64, 64 } };
+    var values: [128 * 64]f32 = @splat(0.125);
+    var bf16: [128 * 64]u16 = @splat(0x3e00);
+    for ([_]bool{ false, true }) |narrow| {
+        var store = testMetalWeightStoreInit(a);
+        store.tier_cache = runtime_root.tier.cache.SharedCache.init(.{ .backend_limit_bytes = 1024 * 1024 });
+        defer store.tier_cache.?.deinitAdmission();
+        defer store.lazy_weights.deinit(a);
+        for (names, widths, &shapes) |name, width, *shape| {
+            try addLegacyGlinerMpsTestWeight(&store, name, values[0 .. width * 64], shape);
+            if (narrow) {
+                const source = &store.lazy_weights.getPtr(name).?.host_loaded.?.tensor;
+                source.data = std.mem.sliceAsBytes(bf16[0 .. width * 64]);
+                source.dtype = .bf16;
+            }
+        }
+        initPrefetchQueue(&store, a);
+        defer deinitPrefetchQueue(&store);
+        defer deinitSharedNativeProvider(&store);
+        for (0..2) |_| {
+            var compute = try MetalCompute.init(a, &store, null);
+            defer compute.deinit();
+            compute.require_f32_linears = true;
+            const cb = compute.computeBackend();
+            const ones: [64]f32 = @splat(1);
+            const input = try cb.ensureDeviceResidentOwned(try cb.fromFloat32Shape(&ones, &.{ 1, 64 }));
+            defer cb.free(input);
+            try std.testing.expect(try cb.decoderRuntimeBeginFrame());
+            defer cb.decoderRuntimeCancelFrame() catch {};
+            const result = (try cb.linearPackedNamed(input, &names, &widths, 1, 64)).?;
+            defer cb.free(result);
+            try std.testing.expect(cb.vtable.packedGeluMultiply == null);
+            const gate = try cb.sliceLastDim(result, 0, 128);
+            defer cb.free(gate);
+            const up = try cb.sliceLastDim(result, 128, 256);
+            defer cb.free(up);
+            const product = (try cb.activationMultiply(gate, up, .gelu)).?;
+            defer cb.free(product);
+            try cb.decoderRuntimeSubmitAndWaitFrame();
+            const actual = try cb.toFloat32(result, a);
+            defer a.free(actual);
+            try std.testing.expectEqual(@as(usize, 256), actual.len);
+            for (actual) |value| try std.testing.expectApproxEqAbs(@as(f32, 8), value, 1e-6);
+            const activated = try cb.toFloat32(product, a);
+            defer a.free(activated);
+            for (activated) |value| try std.testing.expectApproxEqAbs(@as(f32, 64), value, 1e-5);
+            try std.testing.expectEqual(@as(usize, 1), compute.provider_impl.embeddinggemma2_linear_cache.count());
+        }
+    }
 }

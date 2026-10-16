@@ -2480,6 +2480,50 @@ fn audioLightConv(
     return cb.add(input, pw2);
 }
 
+fn packedAudioQkv(cb: *const ComputeBackend, a: std.mem.Allocator, store: *ProjectorWeights, input: CT, rows: usize, width: usize, layer: usize) !?ops.LinearTripleResult {
+    if (store.gguf != null or rows > 512 or audioHostOps().clamp) return null;
+    var specs: [3]ClampSpec = undefined;
+    var names: [3][]u8 = undefined;
+    var count: usize = 0;
+    defer for (names[0..count]) |name| a.free(name);
+    for ([_][]const u8{ "q", "k", "v" }, 0..) |kind, i| {
+        const prefix = try std.fmt.allocPrint(a, "a.blk.{d}.attn_{s}", .{ layer, kind });
+        defer a.free(prefix);
+        specs[i] = .{};
+        inline for (.{ "input_min", "input_max", "output_min", "output_max" }) |bound| {
+            const key = try std.fmt.allocPrint(a, "{s}.{s}", .{ prefix, bound });
+            defer a.free(key);
+            var value = try store.optionalF32(key);
+            defer if (value) |*tensor| tensor.deinit();
+            if (value) |tensor| {
+                if (tensor.data.len != 1) return null;
+                @field(specs[i], bound) = tensor.data[0];
+            }
+        }
+        const key = try std.fmt.allocPrint(a, "{s}.weight", .{prefix});
+        defer a.free(key);
+        names[i] = try @import("embedding_gemma2_media_weights.zig").name(a, key);
+        count += 1;
+    }
+    for (specs[1..]) |spec| if (spec.input_min != specs[0].input_min or spec.input_max != specs[0].input_max) return null;
+    const clipped = if (specs[0].clipsInput()) try clampScalarCt(cb, a, input, rows, width, specs[0].input_min, specs[0].input_max) else input;
+    defer if (clipped != input) cb.free(clipped);
+    const packed_rows = (try cb.linearPackedNamed(clipped, &.{ names[0], names[1], names[2] }, &.{ width, width, width }, rows, width)) orelse return null;
+    defer cb.free(packed_rows);
+    var results: [3]CT = undefined;
+    var made: usize = 0;
+    errdefer for (results[0..made]) |tensor| cb.free(tensor);
+    for (specs, 0..) |spec, i| {
+        const view = try cb.sliceLastDim(packed_rows, i * width, (i + 1) * width);
+        if (spec.clipsOutput()) {
+            defer cb.free(view);
+            results[i] = try clampScalarCt(cb, a, view, rows, width, spec.output_min, spec.output_max);
+        } else results[i] = view;
+        made += 1;
+    }
+    return .{ .first = results[0], .second = results[1], .third = results[2] };
+}
+
 fn audioSelfAttention(
     cb: *const ComputeBackend,
     allocator: std.mem.Allocator,
@@ -2492,11 +2536,18 @@ fn audioSelfAttention(
     const valid_mask = inputs.valid_mask;
     const rows = valid_mask.len;
     var buf: [128]u8 = undefined;
-    const q = try linearNoBiasMaybeClipped(cb, allocator, store, input, try fmt(&buf, "a.blk.{d}.attn_q", .{layer}), rows, cfg.audio_hidden, cfg.audio_hidden);
+    const packed_rows = try packedAudioQkv(cb, allocator, store, input, rows, cfg.audio_hidden, layer);
+    var remaining_k = if (packed_rows) |value| @as(?CT, value.second) else null;
+    defer if (remaining_k) |tensor| cb.free(tensor);
+    var remaining_v = if (packed_rows) |value| @as(?CT, value.third) else null;
+    defer if (remaining_v) |tensor| cb.free(tensor);
+    const q = if (packed_rows) |value| value.first else try linearNoBiasMaybeClipped(cb, allocator, store, input, try fmt(&buf, "a.blk.{d}.attn_q", .{layer}), rows, cfg.audio_hidden, cfg.audio_hidden);
     defer cb.free(q);
-    const k = try linearNoBiasMaybeClipped(cb, allocator, store, input, try fmt(&buf, "a.blk.{d}.attn_k", .{layer}), rows, cfg.audio_hidden, cfg.audio_hidden);
+    const k = remaining_k orelse try linearNoBiasMaybeClipped(cb, allocator, store, input, try fmt(&buf, "a.blk.{d}.attn_k", .{layer}), rows, cfg.audio_hidden, cfg.audio_hidden);
+    remaining_k = null;
     defer cb.free(k);
-    const v = try linearNoBiasMaybeClipped(cb, allocator, store, input, try fmt(&buf, "a.blk.{d}.attn_v", .{layer}), rows, cfg.audio_hidden, cfg.audio_hidden);
+    const v = remaining_v orelse try linearNoBiasMaybeClipped(cb, allocator, store, input, try fmt(&buf, "a.blk.{d}.attn_v", .{layer}), rows, cfg.audio_hidden, cfg.audio_hidden);
+    remaining_v = null;
     defer cb.free(v);
     const rel = try linearNoBiasMaybeClipped(cb, allocator, store, inputs.rel_in, try fmt(&buf, "a.blk.{d}.attn_k_rel", .{layer}), cfg.attention_context_left, cfg.audio_hidden, cfg.audio_hidden);
     defer cb.free(rel);

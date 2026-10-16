@@ -1038,3 +1038,4 @@ test "sgemmTransBF16Weights column dispatch matches the serial kernel for few ro
 
 pub const segmentAttentionGroupedHostWithGemmIo = attention.segmentAttentionGroupedHostWithGemmIo;
 pub const denseAttentionHostWithGemmIo = attention.denseAttentionHostWithGemmIo;
+pub const denseAttentionPortableHostWithIo = attention.denseAttentionPortableHostWithIo;

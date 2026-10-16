@@ -98,6 +98,20 @@ def cases(video=None):
                 [clips[0], image, text("Describe.")],
             ]
         ],
+        "mixed_many": [
+            {
+                "content": [
+                    text(f"Many parts {i}."),
+                    image,
+                    clips[i],
+                    image,
+                    clips[i + 1],
+                    image,
+                    clips[i + 2],
+                ]
+            }
+            for i in range(2)
+        ],
         "video": [{"content": [text(f"Describe video {i}."), movie]} for i in range(2)],
     }
 
@@ -258,6 +272,16 @@ def qualify(args):
         compare.assert_agreement(successful[0], expected["audio"][0], 1e-5)
         compare.assert_agreement(successful[2], expected["audio"][1], 1e-5)
         report["partial_errors"] = len(result["errors"])
+        bad_mixed = {"content": [groups["mixed"][0]["content"][2], sound(1, 440)]}
+        result, _ = embed(
+            url, args, [groups["mixed"][0], bad_mixed, groups["mixed"][1]], "per_item"
+        )
+        successful = {row["index"]: row["embedding"] for row in result["data"]}
+        if set(successful) != {0, 2} or not result.get("errors"):
+            raise AssertionError("mixed tower failure lost group identity")
+        compare.assert_agreement(successful[0], expected["mixed"][0], 1e-5)
+        compare.assert_agreement(successful[2], expected["mixed"][1], 1e-5)
+        report["mixed_partial_errors"] = len(result["errors"])
     text = args.output.with_suffix(".cohort.log").read_text()
     trace = re.findall(r"gemma4-(group|audio)-cohort items=(\d+) execution=(\w+)", text)
     for expected_kind in ("group", "audio"):
@@ -266,12 +290,20 @@ def qualify(args):
             for kind, n, execution in trace
         ):
             raise AssertionError(f"no real {expected_kind} cohort execution observed")
+    towers = re.findall(r"gemma4-group-tower kind=(image|audio) items=(\d+)", text)
+    for kind in ("image", "audio"):
+        if not any(k == kind and int(n) > 1 for k, n in towers):
+            raise AssertionError(f"no cross-group {kind} tower batching observed")
+    if "gemma4-group-prepare overlap=true" not in text:
+        raise AssertionError("no mixed tower preparation overlap observed")
     if hashlib.sha256(args.binary.read_bytes()).hexdigest() != report["binary_sha256"]:
         raise AssertionError("qualification binary changed")
     report.update(
         status="pass",
         model_identity=identity,
         execution_observations=trace,
+        tower_observations=towers,
+        preparation_overlap=True,
         serial_log_sha256=hashlib.sha256(
             args.output.with_suffix(".serial.log").read_bytes()
         ).hexdigest(),

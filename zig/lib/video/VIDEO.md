@@ -241,6 +241,13 @@ at clip boundaries. Device media tokens compose without intermediate activation
 readbacks. Preparation leases retain ownership while separately admitted encoder
 supplements cover larger peaks; cancellation drains backend owners before both
 leases release. Cohort pressure falls back only after complete cleanup.
+Compatible mixed-group image/audio parts also share tower waves, with one
+separately admitted CPU preparation wave overlapping current tower execution.
+Scatter maps preserve source part order; errors retain their group identity.
+Embedding output keeps token RMSNorm before masked pooling, projects once per
+group and normalizes compact vectors. Metal retains the batch through one final
+readback. Packed model-owned projections share existing bounded cache classes;
+audio packing preserves independently declared clipping bounds.
 
 Descriptors, model identity, gaps and terminal coverage travel with the vectors.
 Overview sampling remains distinct from retrieval coverage; audio inclusion stays
