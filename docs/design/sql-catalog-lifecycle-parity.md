@@ -8325,3 +8325,47 @@ control-catalog and original inventory integrity checks pass.
 Native terminal fence release, accepted release-proof reconstruction, mounted
 cancellation scheduling and public online-index admission remain unfinished.
 No original SQL case credit or end-to-end activation is claimed.
+
+### Native cancellation release and independently reconstructed ACKs
+
+The native terminal cancellation intent contains metadata's accepted cleanup
+record and immutable cohort decision. A dedicated topology gate requires the
+actual local cleanup record, retired artifacts/private claims/source companions,
+the exact reserved binding and drained source. Generic topology release and
+cancel still cannot bypass index publication/cancellation ownership.
+
+Release stages a fixed checksummed terminal record, completed-epoch tombstone,
+fence lift, native clock and bounded retry-slot retirement in the same native
+transaction as the replay marker and durable outbox. The existing pending source
+window is already bounded and retired by cancellation cleanup; completion also
+checks its job prefix for orphan companions. No primary-row scan, live index
+deletion or whole-history cleanup occurs in terminal release. Published and
+canceled terminal slots supersede one another only after predecessor companion
+retirement has cleared admission.
+
+Exact retries use historical terminal evidence rather than re-auditing mutable
+data or depending on the now-retired job. Pending replication returns progress
+without a publication receipt. Primary and standby recovery validate the native
+clock, completed epoch and absence of the released job/fence.
+
+Metadata independently reconstructs cancellation release evidence from its
+accepted cleanup witness and cohort barrier, and requires the same root identity,
+generation, reporter and native binding. Both live ACK apply and cold recovery
+reject a signed action with substituted evidence, even if the retained proof and
+owner receipt/attestation hashes agree with the substitution.
+
+The frozen-source combined Debug gate passed 87/87 build steps in
+`/private/tmp/antfly-index-cancel-release-final-debug.log`: 134 test executions
+across native candidate, local storage, runtime-contract, metadata, ACK and
+service lanes, plus the cached pure progress lane, with no failures or leaks.
+Qualification includes aborts before/after all 11 terminal metadata writes,
+orphan-source refusal, strict record framing, pending-outbox reopen/retry,
+duplicate standby replay, foreign-namespace tombstone rejection, ordinary writes
+after release and stable release retries after another restart. Live/cold metadata
+forgery tests qualify independent receipt reconstruction. Formatting, diff,
+licensing, Apache boundary, control-catalog and inventory integrity checks pass.
+
+The leased ABI/root-generation pre-effect guard, mounted cancellation scheduling,
+and public online-index admission still require integration; this private storage
+effect is not public activation or SQL credit. Original accounting remains
+483 implemented / 862 unresolved.

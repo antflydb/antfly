@@ -8026,6 +8026,14 @@ pub const DB = struct {
                     defer prepared.deinit();
                     _ = try self.applyPreparedNativeIndexOwnerCancellationCompletion(&prepared, .{ .position = frame.position, .lsn = sequence });
                 },
+                .cancel_release => |intent| {
+                    var prepared = self.prepareNativeIndexOwnerCancellationRelease(intent, .{}) catch |err| {
+                        if (try self.replicationMutationAlreadyApplied(sequence)) return;
+                        return err;
+                    };
+                    defer prepared.deinit();
+                    _ = try self.applyPreparedNativeIndexOwnerCancellationRelease(&prepared, .{ .position = frame.position, .lsn = sequence });
+                },
                 .control => |command| {
                     var prepared = self.prepareNativeIndexOwnerControl(command) catch |err| {
                         // Another replay may retire inputs during preparation.
@@ -8634,6 +8642,18 @@ pub const DB = struct {
 
     pub fn applyPreparedNativeIndexOwnerCancellationCompletion(self: *DB, prepared: *native_index_control.PreparedCancellationCompletion, replay: ?NativeIndexReplay) !native_index_control.CancellationCompletionOutcome {
         return self.applyPreparedNativeIndexEffect(prepared, replay);
+    }
+
+    /// Trusted owner adapter only. The receiving server must pin the accepted
+    /// cleanup root and obtain fresh all-owner metadata release permission.
+    pub fn prepareNativeIndexOwnerCancellationRelease(self: *DB, intent: @import("relational_index_release.zig").CancellationIntent, context: @import("../../api/operation.zig").RequestContext) !native_index_control.PreparedCancellationRelease {
+        return native_index_control.PreparedCancellationRelease.init(self.alloc, self.core, intent, context);
+    }
+
+    pub fn applyPreparedNativeIndexOwnerCancellationRelease(self: *DB, prepared: *native_index_control.PreparedCancellationRelease, replay: ?NativeIndexReplay) !native_index_control.CancellationReleaseOutcome {
+        const outcome = try self.applyPreparedNativeIndexEffect(prepared, replay);
+        if (self.backend_runtime.io()) |io| self.native_index_build_cache.evict(io);
+        return outcome;
     }
 
     /// Canonical private-companion retirement, using the same transaction,

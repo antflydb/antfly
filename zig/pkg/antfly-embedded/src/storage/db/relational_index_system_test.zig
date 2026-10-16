@@ -1080,6 +1080,148 @@ fn testNativeCancellationCompletion(source: *db_mod.DB, binding: @import("relati
         try std.testing.expect(try topology.completed(&read) == null);
         try std.testing.expectEqual(binding, (try jobs.load(&read)).?);
     }
+    primary.local_execution.replication_async_batch_mirror = null;
+    try testNativeCancellationRelease(&primary, &standby, retried.record.?, options, dir.path(), standby_dir.path());
+}
+
+fn testNativeCancellationRelease(primary: *db_mod.DB, standby: *db_mod.DB, canceled: @import("relational_index_owner_job.zig").Canceled, options: db_mod.OpenOptions, primary_path: []const u8, standby_path: []const u8) !void {
+    const release = @import("relational_index_release.zig");
+    const jobs = @import("relational_index_owner_job.zig");
+    const topology = @import("relational_integrity_topology.zig");
+    const authority = @import("../source_authority.zig");
+    const intent: release.CancellationIntent = .{ .canceled = canceled, .metadata_decision = @splat(12) };
+    const Fault = struct {
+        txn: *docstore.DocStore.Txn,
+        fail_at: ?usize = null,
+        after: bool = false,
+        writes: usize = 0,
+        pub fn get(self: *@This(), key: []const u8) ![]const u8 {
+            return self.txn.get(key);
+        }
+        pub fn openCursor(self: *@This()) !docstore.DocStore.Txn.CursorAdapter {
+            return self.txn.openCursor();
+        }
+        fn before(self: *@This()) !void {
+            if (!self.after and self.fail_at == self.writes + 1) return error.TestCancellationReleaseWriteFailed;
+        }
+        fn completed(self: *@This()) !void {
+            self.writes += 1;
+            if (self.after and self.fail_at == self.writes) return error.TestCancellationReleaseWriteFailed;
+        }
+        pub fn put(self: *@This(), key: []const u8, value: []const u8) !void {
+            try self.before();
+            try self.txn.put(key, value);
+            try self.completed();
+        }
+        pub fn delete(self: *@This(), key: []const u8) !void {
+            try self.before();
+            try self.txn.delete(key);
+            try self.completed();
+        }
+    };
+    const writes = count: {
+        var txn = try primary.core.store.beginWriteTxn();
+        defer txn.abort();
+        var manager = try primary.core.initTxnManager();
+        defer manager.deinit();
+        var counter: Fault = .{ .txn = &txn };
+        _ = try release.CancellationRecord.stage(&counter, &manager, intent, null);
+        break :count counter.writes;
+    };
+    try std.testing.expectEqual(@as(usize, 11), writes);
+    for (1..writes + 1) |fail_at| for ([_]bool{ false, true }) |after| {
+        {
+            var txn = try primary.core.store.beginWriteTxn();
+            defer txn.abort();
+            var manager = try primary.core.initTxnManager();
+            defer manager.deinit();
+            var fault: Fault = .{ .txn = &txn, .fail_at = fail_at, .after = after };
+            try std.testing.expectError(error.TestCancellationReleaseWriteFailed, release.CancellationRecord.stage(&fault, &manager, intent, null));
+        }
+        var read = try primary.core.store.beginReadTxn();
+        defer read.abort();
+        try intent.requireCurrent(&read);
+        try std.testing.expect(try release.CancellationRecord.load(&read, intent) == null);
+        try std.testing.expectEqual(canceled.position.sequence, (try authority.load(&read)).?.sequence);
+    };
+    {
+        var txn = try primary.core.store.beginWriteTxn();
+        defer txn.abort();
+        const stream = @import("relational_index_private_claims.zig").SourceStream;
+        try txn.put(&stream.key(canceled.binding.id, 999, true), "orphan");
+        var manager = try primary.core.initTxnManager();
+        defer manager.deinit();
+        try std.testing.expectError(error.PrivateIndexCancellationPending, release.CancellationRecord.stage(&txn, &manager, intent, null));
+    }
+    var barrier: @import("antfly_runtime_abi").mutation_barrier.MutationBarrier = .{};
+    var publisher: TestNativeIndexPublisher = .{ .barrier = &barrier, .lsn = 7 };
+    defer if (publisher.payload) |bytes| alloc.free(bytes);
+    defer primary.local_execution.replication_async_batch_mirror = null;
+    primary.local_execution.replication_async_batch_mirror = publisher.asMirror();
+    var prepared = try primary.prepareNativeIndexOwnerCancellationRelease(intent, .{});
+    defer prepared.deinit();
+    const pending = try primary.applyPreparedNativeIndexOwnerCancellationRelease(&prepared, null);
+    try pending.validate();
+    try std.testing.expect(pending.replication_pending and pending.receipt == null and !pending.duplicate);
+    try std.testing.expectEqual(canceled.position.sequence + 1, pending.position.sequence);
+    const encoded = try (release.CancellationRecord{ .intent = intent, .position = pending.position }).encode();
+    for (0..encoded.len) |len| try std.testing.expectError(error.InvalidPrivateIndexNativeReceipt, release.CancellationRecord.decode(encoded[0..len]));
+    var corrupt = encoded;
+    corrupt[1289] = 1;
+    std.crypto.hash.Blake3.hash(corrupt[0..1296], corrupt[1296..1328], .{});
+    try std.testing.expectError(error.InvalidPrivateIndexNativeReceipt, release.CancellationRecord.decode(&corrupt));
+    primary.local_execution.replication_async_batch_mirror = null;
+    primary.close();
+    primary.* = try db_mod.DB.open(alloc, primary_path, options);
+    publisher.fail = false;
+    primary.local_execution.replication_async_batch_mirror = publisher.asMirror();
+    // Retry itself flushes the recovered outbox before taking a mutation lease.
+    var retry = try primary.prepareNativeIndexOwnerCancellationRelease(intent, .{});
+    defer retry.deinit();
+    const recovered = try primary.applyPreparedNativeIndexOwnerCancellationRelease(&retry, null);
+    try recovered.validate();
+    try std.testing.expect(recovered.duplicate and !recovered.replication_pending);
+    try std.testing.expectEqualDeep(try intent.receipt(pending.position), recovered.receipt.?);
+    const packet: @import("replication_record.zig").Record = .{ .kind = .batch_mutation, .payload_codec = .json, .cluster_id = 1, .timeline_id = 1, .epoch = 1, .lsn = 7, .previous_lsn = 6, .payload = publisher.payload.? };
+    try replication_ingress.applyRecord(standby, packet);
+    try replication_ingress.applyRecord(standby, packet);
+    standby.close();
+    standby.* = try db_mod.DB.open(alloc, standby_path, options);
+    try std.testing.expectEqual(@as(u64, 7), try standby.replicationAppliedSequence());
+    for ([_]*db_mod.DB{ primary, standby }) |db| {
+        var read = try db.core.store.beginReadTxn();
+        defer read.abort();
+        var active = (try @import("relational_index_catalog.zig").load(alloc, &read)).?;
+        defer active.deinit();
+        try jobs.verifyRecovery(alloc, &read, &active);
+        try std.testing.expect(try jobs.load(&read) == null);
+        try std.testing.expect(try topology.current(&read) == null);
+        try std.testing.expect((try topology.completed(&read)).?.eql(canceled.binding.fence));
+        try std.testing.expectEqual(pending.position, (try release.CancellationRecord.load(&read, intent)).?.position);
+        try topology.requireUnfenced(&read);
+    }
+    {
+        var txn = try primary.core.store.beginWriteTxn();
+        defer txn.abort();
+        var foreign = (try topology.completed(&txn)).?;
+        foreign.admission_epoch += 1;
+        foreign.namespace.range_id += 1;
+        try txn.put(topology.receipt_key, &try foreign.encode());
+        try std.testing.expectError(error.IntegrityTopologyChanged, release.CancellationRecord.verifyRecovery(&txn));
+    }
+    primary.local_execution.replication_async_batch_mirror = null;
+    try primary.batch(.{ .relational_schema_version = 1, .writes = &.{.{ .key = "after-cancel-release", .value = "{\"id\":99,\"email\":\"after-cancel@example.com\"}" }} });
+    const written = (try primary.get(alloc, "after-cancel-release")).?;
+    defer alloc.free(written);
+    try std.testing.expectEqualStrings("{\"id\":99,\"email\":\"after-cancel@example.com\"}", written);
+    primary.close();
+    primary.* = try db_mod.DB.open(alloc, primary_path, options);
+    var after_write = try primary.prepareNativeIndexOwnerCancellationRelease(intent, .{});
+    defer after_write.deinit();
+    const duplicate = try primary.applyPreparedNativeIndexOwnerCancellationRelease(&after_write, null);
+    try duplicate.validate();
+    try std.testing.expect(duplicate.duplicate);
+    try std.testing.expectEqual(pending.position, duplicate.position);
 }
 
 fn testInstalledIndexCheckpoint(database: *db_mod.DB, root_path: []const u8, intent: @import("relational_index_validation.zig").InstallIntent) !@import("relational_index_audit_checkpoint.zig").Summary {

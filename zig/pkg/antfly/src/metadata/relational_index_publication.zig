@@ -787,6 +787,10 @@ pub const NativeCancellationReleaseGrant = struct {
     decision_digest: Digest,
     cleanup_proof: RootProof,
 
+    pub fn intent(self: @This()) @FieldType(native_control.CancellationReleaseOutcome, "intent") {
+        return .{ .canceled = self.canceled, .metadata_decision = self.decision_digest };
+    }
+
     pub fn validateFor(self: @This(), group: u64, incarnation: local.metadata_incarnation.MetadataClusterIncarnation, head: progress.Head, owner: progress.OwnerState) !void {
         try owner.validate();
         const receipt = try self.canceled.receipt();
@@ -800,6 +804,20 @@ pub const NativeCancellationReleaseGrant = struct {
             !std.mem.eql(u8, &self.decision_digest, &try cancellationReleaseDecisionDigest(group, incarnation, head))) return error.InvalidCatalogRecord;
     }
 };
+
+/// Reconstruct terminal cancellation from the accepted cleanup checkpoint.
+/// A signed action tag alone is not evidence of the cohort release decision.
+pub fn requireNativeCancellationReleaseReceipt(group: u64, incarnation: local.metadata_incarnation.MetadataClusterIncarnation, head: progress.Head, owner: progress.OwnerState, canceled: StoredProof.Decoded, signed: SignedReceipt) !void {
+    const witness = canceled.cancellation orelse return error.InvalidCatalogRecord;
+    const grant: NativeCancellationReleaseGrant = .{ .canceled = witness.record, .cleanup_proof = canceled.signed.proof, .decision_digest = try cancellationReleaseDecisionDigest(group, incarnation, head) };
+    try grant.validateFor(group, incarnation, head, owner);
+    if (signed.receipt.position != .native or
+        !std.meta.eql(try grant.intent().receipt(signed.receipt.position.native), signed.receipt) or
+        !std.meta.eql(canceled.signed.proof.identity, signed.proof.identity) or
+        !std.meta.eql(canceled.signed.proof.authority, signed.proof.authority) or
+        canceled.signed.proof.root_generation != signed.proof.root_generation or
+        canceled.signed.proof.reporter_incarnation != signed.proof.reporter_incarnation) return error.IndexOwnerReceiptChanged;
+}
 
 pub const OwnerDecision = struct {
     pub const Attestation = struct {
@@ -1891,6 +1909,10 @@ pub fn verifyOwned(a: Allocator, txn: anytype, group: u64, table: u64) !Verified
                 var dispatch = try readDispatch(a, txn, group, owner.owner);
                 defer dispatch.deinit();
                 requireNativeCancellationWitness(group, head, owner, dispatch.value, witness, signed, prior_cleanup) catch return error.InvalidCatalogRecord;
+            }
+            if (action == .cancel_released and owner.owner.authority == .native) {
+                const cleanup = try storedProof(a, (try optionalGet(txn, try proofKey(&buf, group, table, @intCast(i), .canceled))) orelse return error.InvalidCatalogRecord, head, owner, .canceled);
+                requireNativeCancellationReleaseReceipt(group, std.fmt.bytesToHex(parsed.value.table_guard.incarnation, .lower), head, owner, cleanup, signed) catch return error.InvalidCatalogRecord;
             }
             if (action == .released and owner.owner.authority == .native) {
                 requireNativeReleaseReceipt(group, std.fmt.bytesToHex(parsed.value.table_guard.incarnation, .lower), head, owner, installed_proof orelse return error.InvalidCatalogRecord, signed) catch return error.InvalidCatalogRecord;

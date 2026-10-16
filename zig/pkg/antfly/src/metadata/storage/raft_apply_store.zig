@@ -6215,11 +6215,22 @@ pub const OwnerAckTestFixture = if (@import("builtin").is_test) struct {
                     try std.testing.expectEqual(.cancel_releasing, canceled_head.phase);
                     try std.testing.expectEqualDeep(prepared.head.reader_requirements, canceled_head.reader_requirements);
                     cleanup.expected_revision = canceled_head.revision;
+                    const accepted_cleanup = cleanup.cancellation;
                     cleanup.signed.receipt.action = .cancel_released;
                     cleanup.cancellation = null;
                     switch (cleanup.signed.receipt.position) {
                         .raft => |*position| position.index += 1,
                         .native => |*position| position.sequence += 1,
+                    }
+                    if (authority == .native) {
+                        const grant: index_publication.NativeCancellationReleaseGrant = .{ .canceled = accepted_cleanup.?.record, .cleanup_proof = cleanup.signed.proof, .decision_digest = try index_publication.cancellationReleaseDecisionDigest(group, incarnation, canceled_head) };
+                        cleanup.signed.receipt = try grant.intent().receipt(cleanup.signed.receipt.position.native);
+                        var forged = cleanup;
+                        forged.signed.receipt.evidence_digest[0] ^= 1;
+                        forged.signed.proof = try forged.signed.proof.sign(root, try forged.signed.receipt.digest());
+                        const forged_bytes = try std.json.Stringify.valueAlloc(a, forged, .{});
+                        defer a.free(forged_bytes);
+                        try std.testing.expectError(error.IndexOwnerReceiptChanged, store.prepareRelationalIndexOwnerAckTxn(&txn, group, forged_bytes));
                     }
                     cleanup.signed.proof = try cleanup.signed.proof.sign(root, try cleanup.signed.receipt.digest());
                     const release_bytes = try std.json.Stringify.valueAlloc(a, cleanup, .{});
@@ -6287,6 +6298,19 @@ pub const OwnerAckTestFixture = if (@import("builtin").is_test) struct {
                     try std.testing.expectEqual(null, try live.getEntry(.{ .namespace_id = plan.namespace_id, .name = plan.index_name }));
                     try std.testing.expectEqualDeep(plan.table_guard.owner, (try live.getClaim(.{ .namespace_id = plan.namespace_id, .name = plan.before.name })).?);
                     try verifyRelationCheckpointTxn(a, &txn);
+                    if (authority == .native) {
+                        var forged = cleanup.signed;
+                        forged.receipt.evidence_digest[0] ^= 1;
+                        forged.proof = try forged.proof.sign(root, try forged.receipt.digest());
+                        var owner = try index_progress.OwnerState.decode(try txn.get(try index_publication.ownerKey(&buf, group, ack.table_id, 0)));
+                        owner.receipts[@backingInt(index_progress.Action.cancel_released)] = try forged.receipt.digest();
+                        owner.attestations[@backingInt(index_progress.Action.cancel_released)] = try forged.commitment();
+                        try txn.put(try index_publication.ownerKey(&buf, group, ack.table_id, 0), &try owner.encode());
+                        try txn.put(try index_publication.proofKey(&buf, group, ack.table_id, 0, .cancel_released), &try forged.encode());
+                        // Consistent signatures and owner hashes cannot waive
+                        // the accepted all-owner cleanup/release decision.
+                        try std.testing.expectError(error.InvalidCatalogRecord, index_publication.verifyOwned(a, &txn, group, ack.table_id));
+                    }
                 }
                 const source = blk: {
                     var read = try store.store.beginReadTxn();
@@ -18008,6 +18032,8 @@ pub const RaftApplyStore = struct {
         if (ack.cancellation) |witness| try self.verifyRelationalIndexCancellationTxn(txn, group_id, head, previous_owner, witness, ack.signed);
         if (action == .released and ack.signed.receipt.owner.authority == .native)
             try self.verifyRelationalIndexReleaseTxn(txn, group_id, head, previous_owner, ack.signed);
+        if (action == .cancel_released and ack.signed.receipt.owner.authority == .native)
+            try self.verifyRelationalIndexCancellationReleaseTxn(txn, group_id, head, previous_owner, ack.signed);
         const root = try ack.signed.commitment();
         if (previous_evidence) |previous| {
             const old_grant = previous.signed.proof;
@@ -18167,6 +18193,14 @@ pub const RaftApplyStore = struct {
         try grant.validateFor(group_id, incarnation, head, owner);
         _ = try self.currentIndexBuildOwnerTxnImpl(txn, group_id, grant.installed.command.validation.command.binding, null, .installation);
         try index_publication.requireNativeReleaseReceipt(group_id, incarnation, head, owner, accepted, signed);
+    }
+
+    fn verifyRelationalIndexCancellationReleaseTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group_id: u64, head: index_progress.Head, owner: index_progress.OwnerState, signed: index_publication.SignedReceipt) !void {
+        var buf: [192]u8 = undefined;
+        const accepted = try index_publication.storedProof(self.alloc, try txn.get(try index_publication.proofKey(&buf, group_id, head.table_id, owner.owner.ordinal, .canceled)), head, owner, .canceled);
+        const incarnation = (try decodeMetadataIncarnationRecord(try txn.get(try metadataIncarnationKeyForGroup(&buf, group_id)))).incarnation;
+        _ = try self.currentIndexBuildOwnerTxnImpl(txn, group_id, (accepted.cancellation orelse return error.InvalidCatalogRecord).record.binding, null, .cancellation);
+        try index_publication.requireNativeCancellationReleaseReceipt(group_id, incarnation, head, owner, accepted, signed);
     }
 
     fn verifyRelationalIndexInstallationTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group_id: u64, witness: index_publication.InstallationWitness) !void {

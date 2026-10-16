@@ -675,6 +675,18 @@ pub const SourceStream = struct {
         try txn.delete(head_key);
         try txn.delete(consumption_key);
     }
+
+    /// stageCanceled retires the bounded pending window. A completion/release
+    /// additionally proves absence of orphan companions with one prefix seek;
+    /// it must never silently abandon source history after retiring the job.
+    pub fn requireCanceledRetired(txn: anytype, binding: jobs.Binding) !void {
+        if (try optional(txn, head_key) != null or try optional(txn, consumption_key) != null) return error.PrivateIndexCancellationPending;
+        const start = key(binding.id, 0, false);
+        const job_prefix = start[0 .. batch_prefix.len + 16];
+        var cursor = try txn.openCursor();
+        defer cursor.close();
+        if (try cursor.seekAtOrAfter(job_prefix)) |entry| if (std.mem.startsWith(u8, entry.key, job_prefix)) return error.PrivateIndexCancellationPending;
+    }
 };
 
 pub const max_bytes = 1024 * 1024;
@@ -1458,6 +1470,7 @@ pub fn requireRetired(txn: anytype, binding: jobs.Binding) !void {
     defer cursor.close();
     const start = generationPrefix(allocation.generation);
     if (try cursor.seekAtOrAfter(&start)) |entry| if (std.mem.startsWith(u8, entry.key, &start)) return error.PrivateIndexCancellationPending;
+    try SourceStream.requireCanceledRetired(txn, binding);
 }
 
 /// Deleting the first bounded inventory page is itself the durable continuation:

@@ -311,6 +311,7 @@ pub const Effect = union(enum) {
     cancel_intent: Admission,
     cancel_cleanup: jobs.Binding,
     cancel_complete: jobs.Binding,
+    cancel_release: release.CancellationIntent,
     claims: ClaimCommand,
     build: pages.Page.PrivateCommand,
     consume: ConsumeCommand,
@@ -331,6 +332,7 @@ pub const Effect = union(enum) {
             .validation_seal => |value| value.binding.fence.namespace,
             .install => |value| value.validation.command.binding.fence.namespace,
             .release => |value| value.installed.position.namespace,
+            .cancel_release => |value| value.canceled.position.namespace,
             .release_gc => |value| value.record.position.namespace,
             .build => |value| value.binding.fence.namespace,
             .cancel_intent => |value| value.fence.namespace,
@@ -348,6 +350,7 @@ pub const Effect = union(enum) {
             .validation_seal => |value| try value.validate(),
             .install => |value| try value.validate(),
             .release => |value| try value.validate(),
+            .cancel_release => |value| try value.validate(),
             .release_gc => |value| try value.validate(),
             .build => |value| try value.validate(),
             .cancel_intent => |value| try value.validate(),
@@ -1090,21 +1093,25 @@ pub const InstallationResponse = union(enum) {
     }
 };
 
-pub const ReleaseOutcome = struct {
-    intent: release.Intent,
-    position: Native,
-    duplicate: bool,
-    replication_pending: bool = false,
-    error_name: ?[]const u8 = null,
-    receipt: ?@import("relational_index_publication_progress.zig").Receipt = null,
-    pub fn validate(self: @This()) !void {
-        const expected = try self.intent.receipt(self.position);
-        if (self.replication_pending and self.error_name == null) return error.InvalidPrivateIndexNativeReceipt;
-        if (self.receipt) |value| {
-            if (self.replication_pending or self.error_name != null or !std.meta.eql(value, expected)) return error.InvalidPrivateIndexNativeReceipt;
-        } else if (!self.replication_pending and self.error_name == null) return error.InvalidPrivateIndexNativeReceipt;
-    }
-};
+pub const ReleaseOutcome = TerminalOutcome(release.Intent);
+pub const CancellationReleaseOutcome = TerminalOutcome(release.CancellationIntent);
+fn TerminalOutcome(comptime Intent: type) type {
+    return struct {
+        intent: Intent,
+        position: Native,
+        duplicate: bool,
+        replication_pending: bool = false,
+        error_name: ?[]const u8 = null,
+        receipt: ?@import("relational_index_publication_progress.zig").Receipt = null,
+        pub fn validate(self: @This()) !void {
+            const expected = try self.intent.receipt(self.position);
+            if (self.replication_pending and self.error_name == null) return error.InvalidPrivateIndexNativeReceipt;
+            if (self.receipt) |value| {
+                if (self.replication_pending or self.error_name != null or !std.meta.eql(value, expected)) return error.InvalidPrivateIndexNativeReceipt;
+            } else if (!self.replication_pending and self.error_name == null) return error.InvalidPrivateIndexNativeReceipt;
+        }
+    };
+}
 
 pub const CancellationCompletionOutcome = struct {
     binding: jobs.Binding,
@@ -1232,6 +1239,66 @@ pub const PreparedRelease = struct {
     }
     pub fn preparePayload(self: *@This()) !void {
         try prepareNativePayload(self, "release", self.intent, release.Record.max_wire_bytes);
+    }
+    pub fn finalizePayload(self: *@This(), position: Native) ![]const u8 {
+        return finalizeNativePayload(self, position);
+    }
+};
+
+/// The accepted cleanup cut enters the same commit/outbox/replay machinery as
+/// published release; the host must independently authorize its root/barrier.
+pub const PreparedCancellationRelease = struct {
+    pub const ApplyOutcome = CancellationReleaseOutcome;
+    alloc: Allocator,
+    intent: release.CancellationIntent,
+    context: RequestContext = .{},
+    payload: ?[]u8 = null,
+    prefix_len: usize = 0,
+
+    pub fn init(alloc: Allocator, core: *@import("core.zig").DBCore, intent: release.CancellationIntent, context: RequestContext) !@This() {
+        try context.ensureActive();
+        try intent.validate();
+        var read = try core.store.beginReadTxn();
+        defer read.abort();
+        if (try release.CancellationRecord.load(&read, intent) != null) try release.CancellationRecord.verifyRecovery(&read) else try intent.requireCurrent(&read);
+        return .{ .alloc = alloc, .intent = intent, .context = context };
+    }
+    pub fn deinit(self: *@This()) void {
+        if (self.payload) |bytes| self.alloc.free(bytes);
+        self.* = undefined;
+    }
+    pub fn validate(self: *const @This()) !void {
+        try self.context.ensureActive();
+        try self.intent.validate();
+    }
+    pub fn namespace(self: *const @This()) @FieldType(Native, "namespace") {
+        return self.intent.canceled.position.namespace;
+    }
+    pub fn validateReplay(self: *const @This(), position: Native) !void {
+        try (Frame{ .effect = .{ .cancel_release = self.intent }, .position = position }).validate();
+        _ = try self.intent.receipt(position);
+    }
+    pub fn replayDuplicateOutcome(self: *const @This(), position: Native) ApplyOutcome {
+        return .{ .intent = self.intent, .position = position, .duplicate = true };
+    }
+    pub fn stage(self: *@This(), core: anytype, txn: anytype, replay: ?Native) !ApplyOutcome {
+        try self.validate();
+        var manager = try core.initTxnManager();
+        defer manager.deinit();
+        const result = try release.CancellationRecord.stage(txn, &manager, self.intent, replay);
+        return .{ .intent = self.intent, .position = result.record.position, .duplicate = result.duplicate };
+    }
+    pub fn hasPublicationReceipt(_: *const @This()) bool {
+        return true;
+    }
+    pub fn populateReceipt(self: *const @This(), txn: anytype, outcome: *ApplyOutcome) !void {
+        const record = (try release.CancellationRecord.load(txn, self.intent)) orelse return error.InvalidPrivateIndexNativeReceipt;
+        if (!std.meta.eql(record.position, outcome.position)) return error.InvalidPrivateIndexNativeReceipt;
+        try release.CancellationRecord.verifyRecovery(txn);
+        outcome.receipt = try self.intent.receipt(record.position);
+    }
+    pub fn preparePayload(self: *@This()) !void {
+        try prepareNativePayload(self, "cancel_release", self.intent, max_cancellation_wire_bytes);
     }
     pub fn finalizePayload(self: *@This(), position: Native) ![]const u8 {
         return finalizeNativePayload(self, position);

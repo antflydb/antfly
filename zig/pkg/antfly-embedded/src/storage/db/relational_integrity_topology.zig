@@ -266,6 +266,20 @@ pub fn stageInstalledIndexRelease(alloc: std.mem.Allocator, txn: anytype, instal
     try txn.delete(fence_key);
 }
 
+/// Dedicated terminal cancellation gate: the actual cleanup checkpoint,
+/// complete local retirement and drained source must agree in this transaction.
+pub fn stageCanceledIndexRelease(txn: anytype, manager: *transactions.TxnManager, canceled: @import("relational_index_owner_job.zig").Canceled) !void {
+    const actual = (try @import("relational_index_owner_job.zig").Canceled.load(txn)) orelse return error.PrivateIndexCancellationPending;
+    if (!std.meta.eql(actual, canceled)) return error.PrivateIndexOwnerJobChanged;
+    try actual.requireCurrent(txn);
+    try requireDrained(txn, manager, canceled.binding.fence);
+    try @import("artifact_reconcile_intent.zig").requireAbsent(txn);
+    try @import("relational_integrity_generation_retirement.zig").requireClear(txn);
+    if (try optional(txn, receipt_key)) |bytes| if ((try Fence.decode(bytes)).admission_epoch >= canceled.binding.fence.admission_epoch) return error.IntegrityTopologyCompleted;
+    try stageReceipt(txn, canceled.binding.fence);
+    try txn.delete(fence_key);
+}
+
 /// Cancelling an ambiguously delivered begin consumes its epoch even if the
 /// begin has not arrived yet. Never releases another live lifecycle owner.
 pub fn stageCancel(txn: anytype, expected: Fence) !void {
