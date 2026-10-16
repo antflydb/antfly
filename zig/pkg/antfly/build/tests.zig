@@ -1090,6 +1090,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .filters = &.{
             "antfly client pkg compiles",
             "personal connections",
+            "query builder transport",
             "get index response timeout bounds the complete HTTP request",
             "list indexes response timeout bounds readiness preflight",
             "SQL client preserves typed parameters receipts and forbids replay",

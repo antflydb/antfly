@@ -353,3 +353,57 @@ test "personal connections preserve owner auth and forbid replay" {
         try std.testing.expectError(error.InvalidConnectionId, client.disconnectChatGPT("account?redirect=other"));
     }
 }
+
+test "query builder transport keeps agent lifetime auth and explicit deadlines without replay" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    const Assert = struct {
+        var test_io: std.Io = undefined;
+        fn request(info: httpx.testing_mod.RequestInfo) !void {
+            try std.testing.expectEqualStrings("Bearer planner-token", info.header("Authorization").?);
+            var body = try std.json.parseFromSlice(types.QueryBuilderRequest, std.testing.allocator, info.body, .{});
+            defer body.deinit();
+            try std.testing.expectEqualStrings("Find anatomy", body.value.intent);
+            try test_io.sleep(.fromMilliseconds(100), .awake);
+        }
+    };
+    Assert.test_io = io;
+    for ([_]enum { default_budget, explicit_budget, provider_failure }{ .default_budget, .explicit_budget, .provider_failure }) |mode| {
+        var server = try httpx.TestServer.start(a, io, &.{.{
+            .method = .POST,
+            .path = "/db/v1/agents/query-builder",
+            .respond = .{ .status = if (mode == .provider_failure) 503 else 200, .body = if (mode == .provider_failure) "{\"message\":\"unavailable\"}" else "{\"status\":\"completed\",\"query\":{}}" },
+            .assert_request = Assert.request,
+        }});
+        defer server.deinit();
+        var serving = try io.concurrent(httpx.TestServer.handleOne, .{&server});
+        defer serving.cancel(io) catch {};
+        // An aggressive ordinary-request default must not truncate model work;
+        // a permissive retry policy must not replay an ambiguous agent request.
+        var http = httpx.Client.initWithConfig(a, io, .{
+            .keep_alive = false,
+            .timeouts = .{ .request_ms = 1 },
+            .retry_policy = .{ .retry_only_idempotent = false, .max_retries = 3, .initial_delay_ms = 0 },
+        });
+        defer http.deinit();
+        var client = try AntflyClient.init(a, &http, server.baseUrl());
+        defer client.deinit();
+        try client.setBearer("planner-token");
+        const request: types.QueryBuilderRequest = .{ .intent = "Find anatomy" };
+        if (mode == .explicit_budget) {
+            try std.testing.expectError(error.Timeout, client.queryBuilderWithTimeout(request, 25));
+            serving.cancel(io) catch {};
+            try std.testing.expect(server.route_hits[0] <= 1);
+        } else {
+            if (mode == .provider_failure) {
+                try std.testing.expectError(error.ApiError, client.queryBuilderWithTimeout(request, 500));
+            } else {
+                var response = try client.queryBuilder(request);
+                defer response.deinit();
+                try std.testing.expectEqual(types.AgentStatus.completed, response.data.?.value.status.?);
+            }
+            try serving.await(io);
+            try std.testing.expectEqual(@as(usize, 1), server.route_hits[0]);
+        }
+    }
+}
