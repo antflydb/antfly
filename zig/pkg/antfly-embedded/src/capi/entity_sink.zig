@@ -495,10 +495,13 @@ fn merge(a: std.mem.Allocator, current: ?[]const u8, incoming: []const u8, key: 
     return (try @import("../storage/db/transform.zig").resolveDocumentTransform(a, current, .{ .key = key, .operations = ops.items, .upsert = true })) orelse return error.InvalidEntityPromotionDocument;
 }
 
-fn upsertBatch(ptr: *anyopaque, allocator: std.mem.Allocator, entries: []const callbacks.EntityUpsert) anyerror!void {
+pub fn upsertBatch(ptr: *anyopaque, allocator: std.mem.Allocator, entries: []const callbacks.EntityUpsert) anyerror!void {
     const handle: *h.Handle = @ptrCast(@alignCast(ptr));
     if (!h.liteOpenModeCanWrite(handle.open_mode)) return error.ReadOnly;
     if (entries.len == 0) return;
+    // Detached computation never owns the live SQL coordinator journal.
+    // Publish the canonical merge and decision under the owner/path fence.
+    if (handle.maintenance_publication) |publication| return publication.publishPromotions(allocator, entries);
     // Source-table workers share one destination coordinator. Serialize only
     // canonical read/merge/commit, never extraction, embedding or candidate work.
     handle.promotion_commit_mutex.lockUncancelable(h.handleLockIo());

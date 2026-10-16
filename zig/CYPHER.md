@@ -1169,6 +1169,11 @@ point lookups. Mutation and retained-identity lookups own private copies; incide
 before validating node deletion. Native conflict/range guards still certify
 the captured cut at commit. Producer visibility, regenerated field ownership,
 relationship postimages, and rollback remain shared across every clause.
+Detached Lite promotions validate their source catalog/replacement generation,
+then merge destinations and publish the SQL decision on the live coordinator
+under one short owner/path fence. Foreground recovery cannot abandon a partially
+prepared promotion. Runnable resolver/promotion debt keeps maintenance scheduled
+after enrichment is clean; blocked stages do not force a busy idle loop.
 
 Anchor scans visit each physical table once even when multiple logical labels
 share it, applying the union of their predicates before binding. Single-node
@@ -1183,7 +1188,7 @@ Path planning compares both endpoints before opening an anchor scan. Existing
 bindings and document-key seeks take precedence over constant property filters
 and label-only scans. Reverse execution restores the original order of named
 paths and variable-length relationship lists. `EXISTS` supplies one-row demand
-to ordinary terminal projections (and implicit projections on bare MATCH),
+to ordinary terminal projections (and implicit projections on MATCH/WITH bodies),
 preserving SKIP, LIMIT 0, DISTINCT and global-aggregation semantics.
 
 Read-only statements derive conservative property requirements and carry them
@@ -1206,7 +1211,9 @@ without changing parallel-edge multiplicity. Positive lower bounds capture the
 authorized reachable adjacency once. Acyclic graphs and repeatable walks use
 vertex/lower-bound distance states and share tied predecessors; bound-target
 backward reachability removes dead branches. Cyclic relationship/node-simple
-queries retain exact route histories and reuse captured adjacency. Their route
+queries retain exact route histories and reuse captured adjacency. Mapping ranges
+are sought directly during replay, which consumes logical execution work without
+charging physical reads again. Their route
 enumeration remains combinatorial when uniqueness requires it; neither vertex
 compression nor early deduplication may discard valid qualifying trails.
 

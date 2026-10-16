@@ -33577,8 +33577,11 @@ pub const DB = struct {
             .bounded_replay = true,
             .max_windows_per_index = 1,
         });
+        const resolution = self.resolutionStageStats();
+        const promotion = self.promotionStageStats();
         return self.core.nextDerivedSequence() > before or self.executor.snapshotStats().workers_with_replay_debt != 0 or
-            self.hasPendingGraphReplacements() or self.local_execution.relational_index_maintenance_sweep.isPending();
+            self.hasPendingGraphReplacements() or self.local_execution.relational_index_maintenance_sweep.isPending() or
+            (resolution.catch_up_required and !resolution.blocked) or (promotion.catch_up_required and !promotion.blocked);
     }
 
     pub fn rebuildDenseIndexesForTargetCoverage(self: *DB, alloc: Allocator) !usize {

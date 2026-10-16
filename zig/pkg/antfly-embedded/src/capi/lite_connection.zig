@@ -135,6 +135,22 @@ pub const PreparedPublication = struct {
         return result;
     }
 
+    pub fn publishPromotions(self: *@This(), allocator: std.mem.Allocator, entries: []const @import("../storage/db/runtime_callbacks.zig").EntityUpsert) !void {
+        const io = h.handleLockIo();
+        self.owner.gate.mutex.lockUncancelable(io);
+        defer self.owner.gate.mutex.unlock(io);
+        if (self.owner.stopping.load(.acquire)) return error.Canceled;
+        var lease = try native.lockWriterPathWithIo(alloc, io, self.owner.path);
+        defer lease.close();
+        // Validate source namespace/catalog and replacement generation before
+        // opening destination intents. Foreground recovery cannot observe or
+        // abandon an in-flight preparation while this fence is held.
+        _ = try self.current();
+        try @import("entity_sink.zig").upsertBatch(self.owner.current.?, allocator, entries);
+        self.refreshSnapshotCheckpoint();
+        self.owner.notifyMutation();
+    }
+
     const HeldStore = struct {
         publication: *PreparedPublication,
         path_lease: native.PathWriterLock,
@@ -656,6 +672,17 @@ pub const Owner = struct {
 
     fn hasPendingGeneratedEnrichment(database: *h.db_mod.DB) bool {
         if (database.hasPendingGraphReplacements()) return true;
+        // Replacement cutover may leave promotion behind an already-clean
+        // enrichment watermark. Runnable downstream stages still need detached
+        // database turns; blocked sinks must not keep an idle owner spinning.
+        if (database.resolution_runtime) |runtime| {
+            const pending = runtime.stats();
+            if (pending.catch_up_required and !pending.blocked) return true;
+        }
+        if (database.promotion_runtime) |runtime| {
+            const pending = runtime.stats();
+            if (pending.catch_up_required and !pending.blocked) return true;
+        }
         const runtime = database.enrichment_runtime orelse return false;
         return database.core.hasGeneratedEnrichmentTargets() and
             runtime.stats().applied_sequence < database.core.nextEnrichmentSequence();
