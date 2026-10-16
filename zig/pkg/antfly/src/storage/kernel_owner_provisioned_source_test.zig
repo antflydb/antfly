@@ -169,6 +169,12 @@ test "native index owner adapter executes fresh permission stages and recovers r
         completed: bool = false,
         completion_writes: usize = 0,
         lose_completion_reply: bool = true,
+        cleanup_ack: ?publication.Ack = null,
+        cleanup_acks: usize = 0,
+        release_acks: usize = 0,
+        cancellation_status_reads: usize = 0,
+        lose_cleanup_ack_reply: bool = true,
+        lose_release_ack_reply: bool = true,
         pub fn currentAuthority(self: *@This()) !?@import("../metadata/relational_index_worker.zig").Authority {
             const view = self.value.native_signing orelse return null;
             return .{ .metadata_incarnation = view.identity.metadata_incarnation, .binding_digest = view.binding_digest, .writer_generation = 1 };
@@ -176,7 +182,7 @@ test "native index owner adapter executes fresh permission stages and recovers r
         pub fn workJson(self: *@This(), a: std.mem.Allocator, query: @import("../metadata/relational_index_work.zig").Query) ![]u8 {
             const work = @import("../metadata/relational_index_work.zig");
             const response: work.Response = switch (query) {
-                .discover => |after| .{ .discovered = .{ .head = if (after == 0) self.value.head else null, .after_table = self.value.head.table_id, .exhausted = after != 0 } },
+                .discover => |after| .{ .discovered = .{ .head = if (after == 0 and self.value.head.phase != .canceled) self.value.head else null, .after_table = self.value.head.table_id, .exhausted = after != 0 or self.value.head.phase == .canceled } },
                 .head => |identity| blk: {
                     try identity.requireHead(self.value.head);
                     break :blk .{ .head = self.value.head };
@@ -191,6 +197,33 @@ test "native index owner adapter executes fresh permission stages and recovers r
         }
         pub fn systemCatalog(self: *@This(), a: std.mem.Allocator, context: local.api_operation.RequestContext, call: @import("../system_catalog/server_call.zig").Call) ![]u8 {
             try std.testing.expect(context.index_publication_authority);
+            if (call == .relational_index_owner_ack or call == .relational_index_owner_ack_status) {
+                const ack = if (call == .relational_index_owner_ack) call.relational_index_owner_ack else call.relational_index_owner_ack_status;
+                try ack.validate();
+                if (call == .relational_index_owner_ack) {
+                    const update = try progress.acknowledge(self.value.head, self.value.owner, ack.expected_revision, ack.signed.receipt);
+                    self.value.head = update.head;
+                    self.value.owner = update.owner;
+                    self.value.owner.attestations[@backingInt(ack.signed.receipt.action)] = try ack.signed.commitment();
+                    if (ack.signed.receipt.action == .canceled) {
+                        self.cleanup_ack = ack;
+                        self.cleanup_acks += @intFromBool(update.changed);
+                        self.value.native_cancel_release = .{ .canceled = ack.cancellation.?.record, .cleanup_proof = ack.signed.proof, .decision_digest = try publication.cancellationReleaseDecisionDigest(self.value.metadata_group_id, self.value.metadata_incarnation, self.value.head) };
+                        if (self.lose_cleanup_ack_reply) {
+                            self.lose_cleanup_ack_reply = false;
+                            return error.MetadataMutationOutcomeUnknown;
+                        }
+                    } else {
+                        try std.testing.expectEqual(progress.Action.cancel_released, ack.signed.receipt.action);
+                        self.release_acks += @intFromBool(update.changed);
+                        if (self.lose_release_ack_reply) {
+                            self.lose_release_ack_reply = false;
+                            return error.MetadataMutationOutcomeUnknown;
+                        }
+                    }
+                } else self.cancellation_status_reads += 1;
+                return std.json.Stringify.valueAlloc(a, publication.AckStatus{ .head = self.value.head, .owner = self.value.owner, .replication_pending = false }, .{});
+            }
             if (call == .relational_index_source_complete) {
                 const journal = @import("../metadata/relational_index_delivery_journal.zig");
                 const request_ = call.relational_index_source_complete;
@@ -220,6 +253,17 @@ test "native index owner adapter executes fresh permission stages and recovers r
                 return std.json.Stringify.valueAlloc(a, @import("../metadata/relational_index_delivery_journal.zig").Status{ .query = call.relational_index_source_accept_status, .head = self.acceptance, .replication_pending = self.acceptance_pending, .completed = self.completed }, .{});
             }
             var value = self.value;
+            if (call.relational_index_owner_decision.operation == .cancel or call.relational_index_owner_decision.operation == .cancel_release) {
+                value.disposition = try publication.ownerPermission(value.head, value.owner, call.relational_index_owner_decision.operation);
+                if (value.disposition == .acknowledged) {
+                    value.dispatch = null;
+                    value.inputs = null;
+                    value.native_signing = null;
+                    value.native_cancel_release = null;
+                    return std.json.Stringify.valueAlloc(a, value, .{});
+                }
+            }
+            if (call.relational_index_owner_decision.operation != .cancel_release) value.native_cancel_release = null;
             if (call.relational_index_owner_decision.claim_groups) |groups| {
                 if (groups.items.len != 0) return error.UnexpectedFixtureDestination;
                 value.claim_routes = .{ .items = &.{} };
@@ -246,6 +290,22 @@ test "native index owner adapter executes fresh permission stages and recovers r
             var result = try execution.step(a, self.owners, self.metadata, table, value, context);
             errdefer result.deinit();
             if (result.needsSigning()) try result.signNative(self.signing_root, 2, 3, 4);
+            if (result == .canceling) {
+                const encoded = try std.json.Stringify.valueAlloc(a, try result.response(), .{});
+                defer a.free(encoded);
+                try std.testing.expect(encoded.len <= 32 * 1024);
+                var wire = try std.json.parseFromSlice(execution.ControlResponse, a, encoded, .{ .allocate = .alloc_always, .ignore_unknown_fields = false });
+                defer wire.deinit();
+                try wire.value.validate(value);
+                var foreign = wire.value;
+                foreign.canceling.request.group_id += 1;
+                try std.testing.expectError(error.InvalidPrivateIndexNativeReceipt, foreign.validate(value));
+                if (wire.value.canceling.signed_ack != null) {
+                    foreign = wire.value;
+                    foreign.canceling.root_generation += 1;
+                    try std.testing.expectError(error.InvalidPrivateIndexNativeReceipt, foreign.validate(value));
+                }
+            }
             return result;
         }
         fn claimsDirect(ptr: *anyopaque, a: std.mem.Allocator, table: []const u8, owner_group: u64, value: execution.ClaimRequest, context: local.api_operation.RequestContext) !execution.ClaimResult {
@@ -292,6 +352,7 @@ test "native index owner adapter executes fresh permission stages and recovers r
     defer if (prepared) |*value| value.deinit();
     var metadata: Metadata = undefined;
     var reserved_receipt: progress.Receipt = undefined;
+    var fence_receipt: progress.Receipt = undefined;
     {
         var owners = kernel_owner_source.ProvisionedKernelOwnerSource.init(alloc, root, catalog.source(), read_gate.alreadyReadSafeBarrier());
         owners.online_source_authority = .native;
@@ -334,7 +395,7 @@ test "native index owner adapter executes fresh permission stages and recovers r
         defer fenced.deinit();
         try std.testing.expect(fenced == .controlled);
         try std.testing.expectEqual(root_generation, fenced.rootGeneration().?);
-        const fence_receipt = fenced.outcome().?.receipt.?;
+        fence_receipt = fenced.outcome().?.receipt.?;
         try std.testing.expectEqual(.fenced, fence_receipt.action);
         try std.testing.expect(fence_receipt.position == .native);
         var recovered_fence = try execution.step(alloc, &owners, &metadata, plan.before.name, request, .{});
@@ -427,6 +488,13 @@ test "native index owner adapter executes fresh permission stages and recovers r
         const signing_root = try local.storage_db_root_signing_identity.loadOrCreate(alloc, std.testing.io, root);
         const native_root: @import("../metadata/standalone_native_owner.zig").Binding = .{ .metadata_incarnation = metadata.value.metadata_incarnation, .node_id = 2, .store_id = 3, .root_incarnation = signing_root.root_incarnation };
         metadata.value.native_signing = .{ .identity = .{ .metadata_incarnation = native_root.metadata_incarnation, .node_id = 2, .store_id = 3, .root_incarnation = signing_root.root_incarnation, .public_key = signing_root.public_key }, .reporter_incarnation = 4, .binding_digest = try native_root.digest() };
+        // ACK-status recovery authenticates every visited stage, not only
+        // cancellation. Retain genuine signatures for the earlier native cuts.
+        for ([_]progress.Receipt{ fence_receipt, reserved_receipt }) |receipt| {
+            const view = metadata.value.native_signing.?;
+            const proof = try (publication.RootProof{ .identity = view.identity, .reporter_incarnation = view.reporter_incarnation, .authority = .{ .native = view.binding_digest }, .root_generation = root_generation, .signature = undefined }).sign(signing_root, try receipt.digest());
+            metadata.value.owner.attestations[@backingInt(receipt.action)] = try (publication.SignedReceipt{ .receipt = receipt, .proof = proof }).commitment();
+        }
         var build_request = source_request;
         build_request.operation = .build;
         var built = try execution.step(alloc, &owners, &metadata, plan.before.name, build_request, .{});
@@ -737,10 +805,21 @@ test "native index owner adapter executes fresh permission stages and recovers r
         try std.testing.expectEqual(@as(?publication.Ack, null), try signing_failure.completed.ack());
         try std.testing.expectEqual(completed.outcome.value.position, signing_failure.completed.outcome.value.position);
         const cleanup_progress = try progress.acknowledge(metadata.value.head, metadata.value.owner, metadata.value.head.revision, cleanup_ack.signed.receipt);
-        metadata.value.head = cleanup_progress.head;
-        metadata.value.owner = cleanup_progress.owner;
-        metadata.value.owner.attestations[@backingInt(progress.Action.canceled)] = try cleanup_ack.signed.commitment();
-        metadata.value.native_cancel_release = .{ .canceled = completed.outcome.value.record.?, .cleanup_proof = cleanup_ack.signed.proof, .decision_digest = try publication.cancellationReleaseDecisionDigest(metadata.value.metadata_group_id, metadata.value.metadata_incarnation, metadata.value.head) };
+        // Resume cancellation through the SAME private control port as normal
+        // builds, using a real compiled owner and a synthetic metadata journal.
+        var cancellation_scheduler: @import("../metadata/relational_index_worker.zig").Coordinator = .{};
+        defer cancellation_scheduler.deinit(std.testing.io);
+        var cancellation_now = @import("antfly_platform").time.monotonicNs();
+        for (0..80) |_| {
+            const before = transport.calls;
+            _ = try cancellation_scheduler.step(std.testing.io, alloc, null, &metadata, &local_transport, cancellation_now);
+            try std.testing.expect(transport.calls - before <= 1);
+            cancellation_now += 300 * std.time.ns_per_ms;
+            if (metadata.value.head.phase == .cancel_releasing) break;
+        }
+        try std.testing.expectEqual(progress.Phase.cancel_releasing, metadata.value.head.phase);
+        try std.testing.expectEqualDeep(cleanup_progress.head, metadata.value.head);
+        try std.testing.expectEqual(@as(usize, 1), metadata.cleanup_acks);
         const release_intent = metadata.value.native_cancel_release.?.intent();
         try std.testing.expectError(error.PrivateIndexRootRecoveryRequired, owners.applyNativeIndexOwnerCancellationReleaseAtRoot(alloc, group, plan.before.name, release_intent, 0, signing_root.root_incarnation, .{}));
         try std.testing.expectError(error.PrivateIndexRootRecoveryRequired, owners.applyNativeIndexOwnerCancellationReleaseAtRoot(alloc, group, plan.before.name, release_intent, root_generation + 1, signing_root.root_incarnation, .{}));
@@ -781,6 +860,22 @@ test "native index owner adapter executes fresh permission stages and recovers r
         try release_ack.validate();
         try std.testing.expect(release_ack.cancellation == null);
         try publication.requireNativeCancellationReleaseReceipt(metadata.value.metadata_group_id, metadata.value.metadata_incarnation, metadata.value.head, metadata.value.owner, try publication.StoredProof.decode(alloc, retained_proof.slice()), release_ack.signed);
+        for (0..100) |_| {
+            const before = transport.calls;
+            _ = try cancellation_scheduler.step(std.testing.io, alloc, null, &metadata, &local_transport, cancellation_now);
+            try std.testing.expect(transport.calls - before <= 1);
+            cancellation_now += 300 * std.time.ns_per_ms;
+            var resident = false;
+            for (cancellation_scheduler.jobs) |job| if (job) |current| {
+                for (current.owners) |owner| if (owner != null) {
+                    resident = true;
+                };
+            };
+            if (metadata.value.head.phase == .canceled and !resident) break;
+        }
+        try std.testing.expectEqual(progress.Phase.canceled, metadata.value.head.phase);
+        try std.testing.expectEqual(@as(usize, 1), metadata.release_acks);
+        try std.testing.expect(metadata.cancellation_status_reads >= 2);
         // A subsequent routing/root switch must not relabel the already
         // recovered receipt as belonging to the replacement physical root.
         root_generation += 1;

@@ -46,7 +46,7 @@ pub const Request = struct {
     table_id: u64,
     group_id: u64,
     id: [16]u8,
-    operation: enum { fence, reserve, build, source, validate, install, release },
+    operation: enum { fence, reserve, build, source, validate, install, release, cancel, cancel_complete, cancel_release },
     build_budget: ?local.storage_db_relational_index_jobs.Budget = null,
 
     pub fn validate(self: Request, group_id: u64) !void {
@@ -68,6 +68,8 @@ pub const Request = struct {
                 .validate => .validate,
                 .install => .install,
                 .release => .release,
+                .cancel, .cancel_complete => .cancel,
+                .cancel_release => .cancel_release,
             },
             .projection = projection,
         };
@@ -103,6 +105,7 @@ pub const Result = union(enum) {
     source: SourceResult,
     installing: InstallationResult,
     releasing: ReleaseResult,
+    canceling: struct { request: Request, result: CancellationResult },
 
     pub fn deinit(self: *Result) void {
         switch (self.*) {
@@ -114,6 +117,7 @@ pub const Result = union(enum) {
             .source => |*value| value.deinit(),
             .installing => |*value| value.outcome.deinit(),
             .releasing => |*value| value.outcome.deinit(),
+            .canceling => |*value| value.result.deinit(),
         }
         self.* = undefined;
     }
@@ -121,7 +125,7 @@ pub const Result = union(enum) {
     /// Borrowed until deinit; copying an outcome does not own error_name.
     pub fn outcome(self: *const Result) ?native.Outcome {
         return switch (self.*) {
-            .acknowledged, .building, .source, .installing, .releasing => null,
+            .acknowledged, .building, .source, .installing, .releasing, .canceling => null,
             .recovered => |value| value.outcome.value,
             .applied => |value| value.value,
             .controlled => |value| value.outcome.value,
@@ -138,6 +142,11 @@ pub const Result = union(enum) {
             .source => |value| value.root_generation,
             .installing => |value| value.root_generation,
             .releasing => |value| value.root_generation,
+            .canceling => |value| switch (value.result) {
+                .completed => |item| item.root_generation,
+                .released => |item| item.root_generation,
+                else => null,
+            },
             .acknowledged, .applied => null,
         };
     }
@@ -146,11 +155,16 @@ pub const Result = union(enum) {
         return switch (self.*) {
             .controlled => |*value| &value.signing,
             .recovered => |*value| &value.signing,
-            .acknowledged, .applied, .building, .source, .installing, .releasing => null,
+            .acknowledged, .applied, .building, .source, .installing, .releasing, .canceling => null,
         };
     }
 
     pub fn needsSigning(self: *Result) bool {
+        if (self.* == .canceling) return switch (self.canceling.result) {
+            .completed => |*value| value.needsSigning(),
+            .released => |*value| value.needsSigning(),
+            else => false,
+        };
         if (self.* == .installing) return self.installing.needsSigning();
         if (self.* == .releasing) return self.releasing.needsSigning();
         if (self.* == .source) return self.source.needsSigning();
@@ -171,6 +185,11 @@ pub const Result = union(enum) {
     /// Signing is post-commit decoration, never another physical effect. The
     /// caller must preserve the outcome if the local identity is unavailable.
     pub fn signNative(self: *Result, root: local.storage_db_root_signing_identity.State, node_id: u64, store_id: u64, reporter_incarnation: u64) !void {
+        if (self.* == .canceling) return switch (self.canceling.result) {
+            .completed => |*value| value.signNative(root, node_id, store_id, reporter_incarnation),
+            .released => |*value| value.signNative(root, node_id, store_id, reporter_incarnation),
+            else => error.NativeIndexSigningUnavailable,
+        };
         if (self.* == .installing) return self.installing.signNative(root, node_id, store_id, reporter_incarnation);
         if (self.* == .releasing) return self.releasing.signNative(root, node_id, store_id, reporter_incarnation);
         if (self.* == .source) return self.source.signNative(root, node_id, store_id, reporter_incarnation);
@@ -225,6 +244,14 @@ pub const Result = union(enum) {
     }
 
     pub fn signingFailed(self: *Result, failure: SigningFailure) void {
+        if (self.* == .canceling) {
+            switch (self.canceling.result) {
+                .completed => |*value| value.signingFailed(failure),
+                .released => |*value| value.signingFailed(failure),
+                else => {},
+            }
+            return;
+        }
         if (self.* == .releasing) {
             if (self.releasing.signed_receipt == null) self.releasing.signing_failure = failure;
             return;
@@ -257,6 +284,7 @@ pub const Result = union(enum) {
             .source => |*value| .{ .source = value.response() },
             .installing => |*value| .{ .installing = value.response() },
             .releasing => |*value| .{ .releasing = value.response() },
+            .canceling => |*value| .{ .canceling = try value.result.response(value.request) },
         };
     }
 };
@@ -405,6 +433,12 @@ pub const ControlResponse = union(enum) {
     source: SourceResponse,
     installing: InstallationControlResponse,
     releasing: ReleaseControlResponse,
+    canceling: CancellationControlResponse,
+
+    pub fn cancellationAck(self: @This(), request: Request) !?publication.Ack {
+        try self.validate(request);
+        return if (self == .canceling) self.canceling.signed_ack else null;
+    }
 
     pub fn releaseAck(self: @This(), request: Request) !?publication.Ack {
         try self.validate(request);
@@ -445,6 +479,7 @@ pub const ControlResponse = union(enum) {
             .source => |value| return value.validate(request),
             .installing => |value| return value.validate(request),
             .releasing => |value| return value.validate(request),
+            .canceling => |value| return value.validate(request),
             .building => |value| {
                 if ((request.operation != .build and request.operation != .validate) or value.root_generation == 0) return error.InvalidPrivateIndexNativeReceipt;
                 const binding = switch (value.outcome) {
@@ -511,7 +546,7 @@ pub const ControlResponse = union(enum) {
             .effect = switch (request.operation) {
                 .fence => .fenced,
                 .reserve => .reserved,
-                .build, .source, .validate, .install, .release => return error.InvalidPrivateIndexNativeReceipt,
+                .build, .source, .validate, .install, .release, .cancel, .cancel_complete, .cancel_release => return error.InvalidPrivateIndexNativeReceipt,
             },
         });
         if (binding.fence.namespace.table_id != request.table_id) return error.InvalidPrivateIndexNativeReceipt;
@@ -1101,6 +1136,46 @@ pub const CancellationResult = union(enum) {
     /// Local artifacts/claims only: cohort proof and epoch release are pending.
     retired,
 
+    /// Compact progress for the existing private control transport. Only a
+    /// complete signed ACK carries authority; unsigned progress never does.
+    pub fn response(self: *const @This(), request: Request) !CancellationControlResponse {
+        var result: CancellationControlResponse = .{ .step = std.meta.activeTag(self.*), .request = .{ .id = request.id, .table_id = request.table_id, .group_id = request.group_id } };
+        switch (self.*) {
+            .acknowledged => return error.InvalidPrivateIndexNativeReceipt,
+            .intent => |value| {
+                result.position = value.value.position;
+                result.replication_pending = value.value.replication_pending;
+                result.error_name = value.value.error_name;
+            },
+            .admitted, .fenced, .reserved, .cleanup => |value| {
+                result.position = value.value.position;
+                result.replication_pending = value.value.replication_pending;
+                result.error_name = value.value.error_name;
+            },
+            .completed => |value| {
+                try value.outcome.value.validate();
+                result.position = value.outcome.value.position;
+                result.replication_pending = value.outcome.value.replication_pending;
+                result.error_name = value.outcome.value.error_name;
+                result.root_generation = value.root_generation;
+                result.signed_ack = try value.ack();
+                result.signing_failure = value.signing_failure;
+            },
+            .released => |value| {
+                try value.outcome.value.validate();
+                result.position = value.outcome.value.position;
+                result.replication_pending = value.outcome.value.replication_pending;
+                result.error_name = value.outcome.value.error_name;
+                result.root_generation = value.root_generation;
+                result.signed_ack = try value.ack();
+                result.signing_failure = value.signing_failure;
+            },
+            .gc, .claim_gc, .retired => {},
+        }
+        try result.validate(request);
+        return result;
+    }
+
     pub fn deinit(self: *CancellationResult) void {
         switch (self.*) {
             .acknowledged, .retired => {},
@@ -1112,6 +1187,40 @@ pub const CancellationResult = union(enum) {
             .released => |value| value.outcome.deinit(),
         }
         self.* = undefined;
+    }
+};
+
+pub const CancellationControlResponse = struct {
+    request: CancellationRequest,
+    step: std.meta.Tag(CancellationResult),
+    position: ?local.storage_db_receipt_position.Native = null,
+    root_generation: u64 = 0,
+    replication_pending: bool = false,
+    error_name: ?[]const u8 = null,
+    signed_ack: ?publication.Ack = null,
+    signing_failure: ?SigningFailure = null,
+
+    pub fn validate(self: @This(), request: Request) !void {
+        if (self.request.table_id != request.table_id or self.request.group_id != request.group_id or !std.mem.eql(u8, &self.request.id, &request.id) or self.step == .acknowledged) return error.InvalidPrivateIndexNativeReceipt;
+        const terminal = self.step == .completed or self.step == .released;
+        if (self.replication_pending and self.error_name == null) return error.InvalidPrivateIndexNativeReceipt;
+        if (self.step == .retired and (self.position != null or self.replication_pending or self.error_name != null)) return error.InvalidPrivateIndexNativeReceipt;
+        if ((if (self.step == .completed) request.operation != .cancel_complete else if (self.step == .released) request.operation != .cancel_release else request.operation != .cancel) or
+            terminal != (self.root_generation != 0) or (!terminal and (self.signed_ack != null or self.signing_failure != null))) return error.InvalidPrivateIndexNativeReceipt;
+        if (self.position) |cut| {
+            try cut.validate();
+            if (cut.namespace.table_id != request.table_id) return error.InvalidPrivateIndexNativeReceipt;
+        } else if (terminal or self.signed_ack != null) return error.InvalidPrivateIndexNativeReceipt;
+        if (self.signed_ack) |ack| {
+            try ack.validate();
+            const receipt = ack.signed.receipt;
+            const expected_action: local.storage_db_relational_index_publication_progress.Action = if (self.step == .completed) .canceled else .cancel_released;
+            if (self.replication_pending or self.error_name != null or self.signing_failure != null or
+                ack.table_id != request.table_id or receipt.owner.group_id != request.group_id or !std.mem.eql(u8, &receipt.owner.plan_id, &request.id) or
+                receipt.owner.authority != .native or ack.signed.proof.authority != .native or
+                receipt.action != expected_action or receipt.position != .native or
+                !std.meta.eql(receipt.position.native, self.position.?) or ack.signed.proof.root_generation != self.root_generation) return error.InvalidPrivateIndexNativeReceipt;
+        }
     }
 };
 
@@ -1137,8 +1246,8 @@ pub fn cancelIntentStep(alloc: std.mem.Allocator, source: anytype, metadata: any
 }
 
 /// Resume cancellation with at most one new durable owner effect per call.
-/// This receiver still needs mounted authenticated RPC/signing and final global
-/// retirement before production activation. Physical retirement is NOT an ACK.
+/// The existing authenticated private control port mounts this step. Completion
+/// and all-owner release remain separate effects; physical GC is NOT an ACK.
 pub fn cancelStep(alloc: std.mem.Allocator, source: anytype, metadata: anytype, table_name: []const u8, request: CancellationRequest, context: operation.RequestContext) !CancellationResult {
     try context.ensureActive();
     var lookup: publication.OwnerRequest = .{ .table_id = request.table_id, .group_id = request.group_id, .id = request.id, .operation = .cancel };
@@ -1290,6 +1399,13 @@ fn requireTable(value: publication.OwnerDecision, table_name: []const u8) !void 
 pub fn step(alloc: std.mem.Allocator, source: anytype, metadata: anytype, table_name: []const u8, request: Request, context: operation.RequestContext) !Result {
     try context.ensureActive();
     try request.validate(request.group_id);
+    if (request.operation == .cancel or request.operation == .cancel_complete or request.operation == .cancel_release) {
+        if (comptime @hasDecl(@TypeOf(source.*), "nativeIndexOwnerCancellationState") and @hasDecl(@TypeOf(source.*), "completeNativeIndexOwnerCancellationAtRoot") and @hasDecl(@TypeOf(source.*), "applyNativeIndexOwnerCancellationReleaseAtRoot")) {
+            const cancellation: CancellationRequest = .{ .id = request.id, .table_id = request.table_id, .group_id = request.group_id };
+            const result = if (request.operation == .cancel_complete) try cancelCompletionStep(alloc, source, metadata, table_name, cancellation, context) else if (request.operation == .cancel_release) try cancelReleaseStep(alloc, source, metadata, table_name, cancellation, context) else try cancelStep(alloc, source, metadata, table_name, cancellation, context);
+            return if (result == .acknowledged) .acknowledged else .{ .canceling = .{ .request = request, .result = result } };
+        } else return error.UnsupportedNativeIndexOwner;
+    }
     const hot_request = request.lookup(.permission);
     try hot_request.validate();
     if (table_name.len == 0) return error.InvalidGenerationPublication;
@@ -1302,7 +1418,7 @@ pub fn step(alloc: std.mem.Allocator, source: anytype, metadata: anytype, table_
         const receipt_request: native.ReceiptRequest = .{ .identity = grant.identity, .effect = switch (request.operation) {
             .fence => .fenced,
             .reserve => .reserved,
-            .build, .source, .validate, .install, .release => return error.InvalidGenerationPublication,
+            .build, .source, .validate, .install, .release, .cancel, .cancel_complete, .cancel_release => return error.InvalidGenerationPublication,
         } };
         var recovered = try source.nativeIndexOwnerReceiptAtRoot(alloc, request.group_id, table_name, receipt_request, context);
         errdefer recovered.deinit();
@@ -1366,7 +1482,7 @@ pub fn step(alloc: std.mem.Allocator, source: anytype, metadata: anytype, table_
         const effect: @FieldType(native.ReceiptRequest, "effect") = switch (request.operation) {
             .fence => .fenced,
             .reserve => .reserved,
-            .build, .source, .validate, .install, .release => return error.InvalidGenerationPublication,
+            .build, .source, .validate, .install, .release, .cancel, .cancel_complete, .cancel_release => return error.InvalidGenerationPublication,
         };
         var recovered = try source.nativeIndexOwnerReceiptAtRoot(alloc, request.group_id, table_name, native.ReceiptRequest{ .identity = identity, .effect = effect }, context);
         if (recovered.outcome.value) |value| {

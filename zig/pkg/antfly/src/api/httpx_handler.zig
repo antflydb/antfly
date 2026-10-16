@@ -17352,7 +17352,7 @@ test "httpx private index control requires explicit service authority and mounts
     try Fixture.expectStatus(&handler, &request, 413, null);
     try std.testing.expectEqual(@as(usize, 0), fixture.effects);
     value.group_id = 7;
-    inline for (.{ .fence, .reserve }) |action| {
+    inline for (.{ .fence, .reserve, .cancel, .cancel_complete, .cancel_release }) |action| {
         value.operation = action;
         fixture.operation = action;
         const action_body = try std.json.Stringify.valueAlloc(alloc, value, .{});
@@ -17360,7 +17360,7 @@ test "httpx private index control requires explicit service authority and mounts
         try request.setBody(action_body);
         try Fixture.expectStatus(&handler, &request, 200, null);
     }
-    try std.testing.expectEqual(@as(usize, 2), fixture.effects);
+    try std.testing.expectEqual(@as(usize, 5), fixture.effects);
     fixture.operation = .fence;
     var mounted: HttpxE2eServer = undefined;
     try mounted.init(alloc, &api_server);
@@ -17377,7 +17377,7 @@ test "httpx private index control requires explicit service authority and mounts
     var response = try requestWithRetry(&client, client_io.io(), .POST, url, body, &headers, 20);
     defer response.deinit();
     try std.testing.expectEqual(@as(u16, 200), response.status.code);
-    try std.testing.expectEqual(@as(usize, 3), fixture.effects);
+    try std.testing.expectEqual(@as(usize, 6), fixture.effects);
 }
 
 test "httpx FK source control rejects missing service token in legacy internal mode" {

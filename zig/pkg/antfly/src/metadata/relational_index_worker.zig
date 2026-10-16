@@ -38,8 +38,20 @@ const idle_lifetime_ns = 60 * std.time.ns_per_s;
 // through its bounded capture even on a slowly scheduled replica.
 const max_job_quanta = 4096;
 
+/// Reconstructing a large cohort must leave useful work after walking owners
+/// that already acknowledged the phase. Otherwise a fixed residency budget can
+/// repeatedly expire at the same completed prefix and starve the remaining cut.
+fn jobQuantumBudget(owner_count: u16) usize {
+    const count: usize = owner_count;
+    // A source may have completed EOF while peers are still building. Its
+    // idempotent recovery traverses the producer state machine rather than an
+    // already-acknowledged control. Reserve that bounded walk as well.
+    return max_job_quanta + completed_owner_quanta * count + (count + work.max_routes - 1) / work.max_routes;
+}
+const completed_owner_quanta = 2 + std.meta.tags(producer.Phase).len;
+
 pub const Authority = struct { metadata_incarnation: [32]u8, binding_digest: [32]u8, writer_generation: u64 };
-const Stage = enum { refresh, control, acknowledge, resolve_ack, decide, resolve_decision, cancel, resolve_cancel, build, deliver, inventory, install, release };
+const Stage = enum { refresh, control, acknowledge, resolve_ack, decide, resolve_decision, cancel, resolve_cancel, build, deliver, inventory, install, release, cleanup, cleanup_complete, cancel_release };
 const Owner = struct {
     ordinal: u16,
     stage: Stage = .refresh,
@@ -124,12 +136,13 @@ const Job = struct {
     closing: *const std.atomic.Value(bool),
     touched_ns: u64,
     completed_quanta: usize = 0,
+    quantum_budget: usize = max_job_quanta,
     retry_at_ns: u64 = 0,
 
     fn init(base: std.mem.Allocator, manager: ?*resources.ResourceManager, closing: *const std.atomic.Value(bool), head: progress.Head, now_ns: u64) !*Job {
         const self = try base.create(Job);
         errdefer base.destroy(self);
-        self.* = .{ .base = base, .budget = if (manager) |value| resources.BudgetedAllocator.initReclaiming(value, .relational_preparation_working_set, base, 1) else null, .identity = .{ .table_id = head.table_id, .id = head.plan_id }, .capture = null, .closing = closing, .touched_ns = now_ns };
+        self.* = .{ .base = base, .budget = if (manager) |value| resources.BudgetedAllocator.initReclaiming(value, .relational_preparation_working_set, base, 1) else null, .identity = .{ .table_id = head.table_id, .id = head.plan_id }, .capture = null, .closing = closing, .touched_ns = now_ns, .quantum_budget = jobQuantumBudget(head.owner_count) };
         errdefer if (self.budget) |*budget| budget.deinit();
         self.capture = try work.Capture.init(self.allocator(), head);
         return self;
@@ -261,9 +274,10 @@ const Job = struct {
                     .building => .build,
                     .installing => .install,
                     .releasing => .release,
+                    .canceling => .cleanup,
+                    .cancel_releasing => .cancel_release,
                     else => {
-                        // Terminal and cancellation work have no forward
-                        // publication effect to dispatch here.
+                        // Terminal history has no owner effect left to run.
                         self.retireOwner(index);
                         self.retry_at_ns = now_ns +| std.time.ns_per_s;
                         return;
@@ -410,6 +424,35 @@ const Job = struct {
                 if (result == .pending) {
                     if (owner.stream.?.phase == prior) owner.retry_at_ns = now_ns +| retry_ns;
                 } else self.retireOwner(index);
+            },
+            .cleanup, .cleanup_complete, .cancel_release => {
+                const request: execution.Request = .{ .table_id = self.identity.table_id, .group_id = identity.group_id, .id = self.identity.id, .operation = switch (owner.stage) {
+                    .cleanup => .cancel,
+                    .cleanup_complete => .cancel_complete,
+                    .cancel_release => .cancel_release,
+                    else => unreachable,
+                } };
+                var response = transport.control(alloc, self.table_name.?, request, context_) catch |err| switch (@as(anyerror, err)) {
+                    error.MetadataReplicationPending => {
+                        owner.retry_at_ns = now_ns +| retry_ns;
+                        return;
+                    },
+                    else => return err,
+                };
+                defer response.deinit();
+                try response.value.validate(request);
+                if (response.value == .acknowledged) {
+                    self.retireOwner(index);
+                    return;
+                }
+                if (response.value != .canceling) return error.InvalidPrivateIndexNativeReceipt;
+                if (try response.value.cancellationAck(request)) |ack| {
+                    if (!std.meta.eql(ack.signed.receipt.owner, identity)) return error.InvalidIndexOwnerReceipt;
+                    owner.ack = ack;
+                    owner.stage = .acknowledge;
+                } else if (response.value.canceling.step == .retired) {
+                    owner.stage = .cleanup_complete;
+                } else owner.retry_at_ns = now_ns +| retry_ns;
             },
             .release => {
                 const request: execution.Request = .{ .table_id = self.identity.table_id, .group_id = identity.group_id, .id = self.identity.id, .operation = .release };
@@ -590,7 +633,7 @@ pub const Coordinator = struct {
         var free: ?usize = null;
         for (&self.jobs, 0..) |*slot, index| {
             if (slot.*) |job| {
-                if (!job.executing and (job.canceled.load(.acquire) or job.completed_quanta >= max_job_quanta or now_ns -| job.touched_ns >= idle_lifetime_ns)) {
+                if (!job.executing and (job.canceled.load(.acquire) or job.completed_quanta >= job.quantum_budget or now_ns -| job.touched_ns >= idle_lifetime_ns)) {
                     job.deinit();
                     slot.* = null;
                 }
@@ -682,6 +725,14 @@ pub const Coordinator = struct {
         return false;
     }
 };
+
+test "relational index publication scheduler reserves a full completed-owner sweep before useful work" {
+    for (1..progress.max_owners + 1) |count| {
+        const capture = (count + work.max_routes - 1) / work.max_routes;
+        try std.testing.expectEqual(max_job_quanta, jobQuantumBudget(@intCast(count)) - capture - completed_owner_quanta * count);
+    }
+    try std.testing.expectEqual(@as(usize, 57600), jobQuantumBudget(progress.max_owners));
+}
 
 test "relational index publication scheduler resolves failure cancellation without replaying uncertain mutations" {
     const Host = struct {
@@ -834,7 +885,7 @@ test "relational index publication scheduler bounds residency without evicting a
         var head = host.head;
         head.table_id = index + 1;
         slot.* = try Job.init(alloc, null, &coordinator.closing, head, 1);
-        slot.*.?.completed_quanta = max_job_quanta;
+        slot.*.?.completed_quanta = slot.*.?.quantum_budget;
     }
     const busy = coordinator.jobs[0].?;
     busy.executing = true;

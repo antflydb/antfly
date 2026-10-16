@@ -8440,3 +8440,64 @@ Apache boundary, control-catalog and inventory integrity checks pass.
 
 Private cancellation transport/scheduling, replacement-root adoption and public
 online-index admission remain unfinished; original SQL accounting is unchanged.
+
+### Cancellation on the shared private control transport and scheduler
+
+The existing private index-control request now admits cleanup, completion and
+cancel-release operations. They use the same HTTP route, in-process receiving
+port, service-authority/deadline gates and post-commit signing machinery as
+ordinary index controls. There is no separate cancellation route or public
+relational-index API. Providers without the complete cancellation contract fail
+closed rather than exposing only part of that lifecycle.
+
+Replies carry compact scoped progress and, when available, the complete signed
+ACK. They do not duplicate schema/manifest/cleanup outcome bodies. Progress alone,
+physical GC completion, pending replication or failed signing cannot acknowledge
+an owner. Validation binds request identity, native cut, action, root generation
+and witness/signature; local delivery retains ownership until serialization or
+consumption finishes.
+
+The bounded worker resumes canceling/cancel-releasing jobs. Each turn executes
+one receiving-port or metadata operation: cleanup advances at most one admitted
+native effect/page, completion obtains a signed durable cleanup checkpoint, and
+release uses metadata's all-owner barrier. ACK proposals and lost-reply status
+resolution reuse the existing ACK state machine. The all-owner barrier still
+prevents one owner's early local retirement from lifting the cohort's fences.
+
+Residency now reserves cohort capture and completed-owner recovery work in
+addition to the fixed useful-work allowance. A 4,096-owner capture/sweep cannot
+consume the entire allowance and repeatedly restart at the same completed prefix.
+The source-EOF recovery reservation derives from the producer state machine, not
+only the cheaper acknowledged-control path. Jobs/actors, per-turn effects and
+page memory stay bounded. This is work-count/liveness accounting, not a measured
+latency or large-cluster throughput claim; a pending-owner directory remains a
+possible improvement over repeated cohort sweeps.
+
+The frozen-source Debug gate passed 103/103 build steps in
+`/private/tmp/antfly-index-cancellation-mounted-final-debug-2.log`: 57 metadata,
+four ACK, one service and three real leased-adapter tests, without test failures
+or leaks. The real compiled-owner fixture uses a synthetic metadata journal,
+loses both cleanup and release ACK replies after commit, and requires status
+recovery with at most one receiving-port call per quantum. Compact wire roundtrips
+fit the 32 KiB control cap and reject foreign groups/root-generation substitutions.
+The cohort-budget test covers every admitted owner count through 4,096; it is
+arithmetic work-count evidence, not a full 4,096-owner deployment benchmark.
+
+The focused authenticated HTTP route test passed in
+`/private/tmp/antfly-index-cancellation-http-debug.log` (117/117 build steps).
+It covers the new cleanup/completion/release operations on the existing route,
+alongside service authorization, deadlines and body/scope limits. That log also
+retains an earlier Debug compile memory-cap warning (13.39 GB peak versus a
+12.88 GB declared bound); the final route test and build succeeded. This is not
+evidence that the compiler memory issue has been eliminated.
+
+Intermediate failures caught enum-literal inference, an incomplete test-provider
+contract and a direct test Job initializer missing its budget. The first real-owner
+lost-reply run correctly rejected missing earlier stage attestations in the
+synthetic metadata journal; the fixture now retains signatures for the genuine
+native fence/reserve cuts. Production ACK-status verification was not weakened.
+Formatting, diff, licensing, Apache boundary, control-catalog and original
+inventory integrity checks pass. Independent durable metadata verification
+remains covered by the metadata lane.
+Replacement-root adoption, hosted/Raft execution and public online-index admission
+remain unfinished. No original SQL case credit or complete SQL activation is claimed.
