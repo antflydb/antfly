@@ -85,7 +85,7 @@ pub const SegmentAttention = struct {
     num_heads: usize,
     head_dim: usize,
 };
-/// Grouped K/V rows retain their original head count. Optional device-only
+/// Grouped K/V rows retain their original head count. Optional compact-head
 /// contract: a declined request uses the caller's existing expanded-head path.
 pub const SegmentAttentionGrouped = struct {
     visibility: SegmentAttention,

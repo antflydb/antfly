@@ -43,8 +43,13 @@ must remain consistent between indexing and retrieval.
 
 Existing flat inputs return one vector per text or media part. A group returns
 one vector for all its ordered content. Each request must use one form throughout.
-Ordered mixed groups execute serially within the request workspace. Flat encoded
-image rows use bounded vision and embedding-encoder cohorts. Local PDF
+Ordered mixed/video groups use bounded prepared cohorts on CPU and Metal.
+Tower execution preserves each group's order; compatible completed inputs share
+length-bucketed backbone calls, with at most four groups and 8192 padded rows.
+The broker also admits CPU image/audio cohorts; callbacks and caller-owned
+profiling/preparation hooks keep their dedicated execution path. Queueing does
+not reserve model scratch. A fitting singleton remains available when cohort
+admission fails. Flat encoded image rows use bounded vision and embedding-encoder cohorts. Local PDF
 page embeddings borrow the renderer's RGBA pixels, including padded row strides,
 without PNG encoding or decoding. They share the encoded-image resize and
 projector, batching compatible patch grids before executing the embedding encoder
@@ -511,19 +516,51 @@ reclamation refuses active/submitted command groups. Unloading releases payloads
 and their admission ownership; request workspace remains bounded independently.
 
 Vision normalization and two-axis RoPE execute together without intermediate
-transposes. Native vision attention uses the existing BLAS-aware F32 segment
-tiles when system BLAS is available, without packing complete head-major Q/K/V
-copies or nesting head workers around threaded BLAS. No-BLAS targets and legacy
-layouts retain portable tiled attention. Compatible FFNs use fused GELU/product execution; CPU streams through
+transposes. Native dense vision attention uses bounded 256-query/1024-key
+tiles, SIMD row maxima and normalization, and no segmented-range sorting or
+masking. Scratch holds one packed head; BLAS or portable GEMM owns CPU
+parallelism; bounded row workers run only after each GEMM has completed.
+Legacy layouts retain their existing path. Native backbone grouped
+attention preserves compact K/V heads and reuses their packed rows across query
+heads, with explicit score scaling and the same masks/windows as Metal. Compatible FFNs use fused GELU/product execution; CPU streams through
 SIMD tiles and parallelizes large independent output ranges. Native audio local
 attention intersects legal key ranges once per query and uses SIMD reductions
 with at most four workers, retaining relative-position terms and logit capping.
 Cancellation drains all workers before borrowed inputs or scratch are released.
 
+Audio conformer cohorts concatenate independently subsampled clips. Shared
+projections and FFNs run across the cohort, while temporal attention and causal
+convolution reset at each clip boundary. Metal completes each owned conformer
+layer before releasing its activation views. Native preparation omits unused
+device DFT packing. Mixed image/audio/video prompts retain available device
+tokens through composition, and strict audio preparation validates duration
+using the decode consumed by the tower.
+
+Prepared mixed cohorts preserve source/model identity and per-item failures.
+Length buckets cap padding at 25%; original positions restore delivery order.
+Initial preparation and retained inputs stay admitted while an independently
+checked supplemental lease funds any larger encoder peak. The base lease never
+grows or loses ownership, and both leases outlive backend teardown. Resource
+pressure unwinds a cohort before retrying independent calls.
+
 Warm embedding admission clones the loaded generation's validated manifest,
 including processor and capability policy, while briefly holding a model pin.
 Identity verification remains in place. Retirement/reload publishes a new
 snapshot; cold loads retain ordinary filesystem validation.
+
+For independent-versus-cohort replay, including unequal audio clips, mixed
+ordering, captioned video, partial failures and concurrent callers:
+
+```sh
+python3 zig/pkg/inference/scripts/embeddinggemma2/cohort_qualify.py \
+  --binary zig/pkg/inference/zig-out/bin/antfly-inference-bench-server \
+  --model-dir /path/to/model --backend metal \
+  --output .benchmark-results/cohort-metal.json
+```
+
+Repeat with `--backend native`. The receipt pins the binary, corpus and model
+identity and requires observed native batching; these correctness/scheduling
+checks do not qualify the recorded latency against PyTorch.
 
 ### Per-case performance gate
 

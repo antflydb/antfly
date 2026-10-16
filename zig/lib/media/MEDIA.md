@@ -75,6 +75,16 @@ index admission charges actual construction and retained allocations rather than
 reserving its default maximum per reader. Limits are explicit ownership budgets,
 not physical RSS or opaque driver-memory guarantees.
 
+CPU and Metal ordered media groups may share a prepared backbone cohort,
+including video and mixed prompts. Towers retain independent source clocks and
+part ordering; length buckets bound padding and restore result order. CPU
+attention keeps grouped K/V compact and uses bounded dense vision tiles.
+Audio cohorts share conformer projections/FFNs while resetting temporal kernels
+at clip boundaries. Device media tokens compose without intermediate activation
+readbacks. Preparation leases retain ownership while separately admitted encoder
+supplements cover larger peaks; cancellation drains backend owners before both
+leases release. Cohort pressure falls back only after complete cleanup.
+
 ## MP4/MOV and fragmented input
 
 [mp4.Reader](src/mp4.zig) retains codec/configuration, geometry, display matrix,

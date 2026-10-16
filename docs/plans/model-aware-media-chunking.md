@@ -281,6 +281,16 @@ bounded exploration within admission, rather than assuming the largest fitting
 batch wins. Metal vision calibrates layer grouping separately for each geometry
 and frame-batch size within its admitted one/two-layer envelope. Owned live windows fill one final snapshot allocation, and sequential
 spools use admitted geometric growth with no full-input copy at EOF.
+CPU and Metal ordered media groups may share a prepared backbone cohort,
+including video and mixed prompts. Towers retain independent source clocks and
+part ordering; length buckets bound padding and restore result order. CPU
+attention keeps grouped K/V compact and uses bounded dense vision tiles.
+Audio cohorts share conformer projections/FFNs while resetting temporal kernels
+at clip boundaries. Device media tokens compose without intermediate activation
+readbacks. Preparation leases retain ownership while separately admitted encoder
+supplements cover larger peaks; cancellation drains backend owners before both
+leases release. Cohort pressure falls back only after complete cleanup.
+
 Busy provider queues normalize to retryable capacity errors at chunk execution;
 responses preserve the acknowledged prefix and an exact continuation, including
 with partial-result delivery enabled. Speculative preparation yields on that
@@ -289,7 +299,8 @@ pressure instead of making a successful serial request fail.
 Video windows can share one masked backbone execution: the endpoint groups two
 already available windows and the native API accepts at most four. Cohorts are
 bounded by estimated row length (2048), padding (25%) and shared admission. Metal
-also preserves the singleton frame/PLE regime at its 128/512-row boundaries.
+bounds total padded rows and uses workspace-bounded layer groups across the
+former 128/512-row frame boundaries.
 Rejected cohorts keep individual execution and preparation overlap; a compatible
 prefetched producer is consumed rather than discarded. Each window retains independent positions and normalized pooling. Decode/projection
 stays ordered, and one following preparation wave may overlap the backbone.

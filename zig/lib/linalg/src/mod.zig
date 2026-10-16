@@ -1035,3 +1035,6 @@ test "sgemmTransBF16Weights column dispatch matches the serial kernel for few ro
         try std.testing.expectEqualSlices(f32, want, got);
     }
 }
+
+pub const segmentAttentionGroupedHostWithGemmIo = attention.segmentAttentionGroupedHostWithGemmIo;
+pub const denseAttentionHostWithGemmIo = attention.denseAttentionHostWithGemmIo;

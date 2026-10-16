@@ -232,6 +232,16 @@ audio cohorts also derive sequence/output and host allowances from their known
 rows. Reductions reapply the session's workspace profile and cannot grow a lease.
 The allocator enforces the reduced host ceiling. Bounds do not alter sampling policy.
 
+CPU and Metal ordered media groups may share a prepared backbone cohort,
+including video and mixed prompts. Towers retain independent source clocks and
+part ordering; length buckets bound padding and restore result order. CPU
+attention keeps grouped K/V compact and uses bounded dense vision tiles.
+Audio cohorts share conformer projections/FFNs while resetting temporal kernels
+at clip boundaries. Device media tokens compose without intermediate activation
+readbacks. Preparation leases retain ownership while separately admitted encoder
+supplements cover larger peaks; cancellation drains backend owners before both
+leases release. Cohort pressure falls back only after complete cleanup.
+
 Descriptors, model identity, gaps and terminal coverage travel with the vectors.
 Overview sampling remains distinct from retrieval coverage; audio inclusion stays
 opt-in. See the design for source references, admission bounds and qualification.

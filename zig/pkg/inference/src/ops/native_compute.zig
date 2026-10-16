@@ -5050,6 +5050,7 @@ pub const vtable_impl = ComputeBackend.VTable{
     .cumulativeSum = &cumulativeSumOp,
     .cloneTensorShape = &cloneTensorShapeOp,
     .segmentAttention = &segmentAttentionOp,
+    .segmentAttentionGrouped = &segmentAttentionGroupedOp,
     .toFloat32 = &toFloat32Op,
     .exportTensorData = &exportTensorDataOp,
     .tensorDType = &tensorDTypeOp,
@@ -7607,10 +7608,10 @@ fn unpackHeadMajorTokens(allocator: std.mem.Allocator, src: []const f32, batch: 
 }
 
 /// Vision shares the system-BLAS-aware F32 tiled attention implementation
-/// with the backbone. Portable/no-BLAS and legacy layouts keep their route.
+/// with bounded dense vision tiles. Legacy layouts retain their route.
 fn embeddingGemma2VisionAttentionOp(ctx: *anyopaque, q: CT, k: CT, v: CT, batch: usize, sequence: usize, heads: usize, dim: usize) anyerror!CT {
     const self: *NativeCompute = @ptrCast(@alignCast(ctx));
-    if (!self.cache_embeddinggemma2_bf16_weights or !native.useBlas() or sequence < 32) return sdpaOp(ctx, q, k, v, &.{}, null, batch, sequence, heads, dim);
+    if (!self.cache_embeddinggemma2_bf16_weights or sequence < 32) return sdpaOp(ctx, q, k, v, &.{}, null, batch, sequence, heads, dim);
     const rows = std.math.mul(usize, batch, sequence) catch return error.InvalidAttentionShape;
     const hidden = std.math.mul(usize, heads, dim) catch return error.InvalidAttentionShape;
     const shape = [_]i64{ std.math.cast(i64, rows) orelse return error.InvalidAttentionShape, std.math.cast(i64, hidden) orelse return error.InvalidAttentionShape };
@@ -7618,21 +7619,7 @@ fn embeddingGemma2VisionAttentionOp(ctx: *anyopaque, q: CT, k: CT, v: CT, batch:
         const stored = tensorStoredShape(tensor) orelse return sdpaOp(ctx, q, k, v, &.{}, null, batch, sequence, heads, dim);
         if (!std.mem.eql(i64, stored, &shape)) return sdpaOp(ctx, q, k, v, &.{}, null, batch, sequence, heads, dim);
     }
-    if (rows > std.math.maxInt(u32)) return error.InvalidAttentionShape;
-    const ranges = try self.allocator.alloc(u32, try std.math.mul(usize, rows, 6));
-    defer self.allocator.free(ranges);
-    @memset(ranges, 0);
-    const positions = try self.allocator.alloc(i32, rows);
-    defer self.allocator.free(positions);
-    @memset(positions, 0); // Positions are irrelevant for an unlimited window.
-    for (0..rows) |row| {
-        const first = row / sequence * sequence;
-        ranges[row * 6] = @intCast(first);
-        ranges[row * 6 + 1] = @intCast(first + sequence);
-    }
-    // BLAS owns CPU parallelism for these dense tiles. Do not nest per-head
-    // workers around a threaded BLAS call or allocate head-major Q/K/V copies.
-    const output = try linalg.segmentAttentionHostWithGemmSerialIo(native.EmbeddingGemma2SegmentAttentionGemm(512), self.allocator, self.io, try getDataChecked(q), try getDataChecked(k), try getDataChecked(v), ranges, positions, positions, std.math.maxInt(u32), rows, rows, heads, dim);
+    const output = try linalg.denseAttentionHostWithGemmIo(native.SegmentAttentionGemm, self.allocator, self.io, try getDataChecked(q), try getDataChecked(k), try getDataChecked(v), batch, sequence, heads, dim);
     const tensor = try self.makeOwnedBuf(output);
     errdefer freeTensor(self, tensor);
     return try self.withLogicalShape(tensor, &shape);
@@ -41485,6 +41472,29 @@ fn segmentAttentionOp(ctx: *anyopaque, q: CT, k: CT, v: CT, request: *const ops.
     const result = try self.makeOwnedBuf(out);
     errdefer freeTensor(self, result);
     return try self.withLogicalShape(result, &.{ @intCast(request.queries), @intCast(request.num_heads * request.head_dim) });
+}
+
+fn segmentAttentionGroupedOp(ctx: *anyopaque, q: CT, k: CT, v: CT, request: *const ops.SegmentAttentionGrouped) anyerror!?CT {
+    const self: *NativeCompute = @ptrCast(@alignCast(ctx));
+    const r = request.visibility;
+    if (request.control) |control| try control.check();
+    const hidden = try std.math.mul(usize, r.num_heads, r.head_dim);
+    const output_count = try std.math.mul(usize, r.queries, hidden);
+    const head_scratch = try std.math.mul(usize, try std.math.add(usize, r.queries, r.keys), try std.math.mul(usize, r.head_dim, 2));
+    const bytes = try std.math.mul(usize, try std.math.add(usize, try std.math.add(usize, output_count, head_scratch), 512 * 1024), @sizeOf(f32));
+    if (bytes > request.workspace_limit_bytes) return null;
+    const out = if (r.queries >= 256 and (r.queries <= 512 or r.head_dim == 512))
+        try groupedAttentionForSession(native.EmbeddingGemma2SegmentAttentionGemm(1024), self, q, k, v, request)
+    else
+        try groupedAttentionForSession(native.SegmentAttentionGemm, self, q, k, v, request);
+    const result = try self.makeOwnedBuf(out);
+    errdefer freeTensor(self, result);
+    if (request.control) |control| try control.check();
+    return try self.withLogicalShape(result, &.{ @intCast(r.queries), @intCast(hidden) });
+}
+fn groupedAttentionForSession(comptime Gemm: type, self: *NativeCompute, q: CT, k: CT, v: CT, request: *const ops.SegmentAttentionGrouped) ![]f32 {
+    const r = request.visibility;
+    return linalg.segmentAttentionGroupedHostWithGemmIo(Gemm, self.allocator, self.io, try getDataChecked(q), try getDataChecked(k), try getDataChecked(v), r.ranges, r.query_positions, r.key_positions, r.window, r.queries, r.keys, r.num_heads, request.num_kv_heads, r.head_dim, request.score_scale);
 }
 
 fn segmentAttentionForSession(comptime Gemm: type, self: *NativeCompute, q: []const f32, k: []const f32, v: []const f32, request: *const ops.SegmentAttention) ![]f32 {
