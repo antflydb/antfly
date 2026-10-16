@@ -619,6 +619,14 @@ pub const ExecuteNamespaceTableGraphMetricActionPathParams = struct {
     action: []const u8,
 };
 
+/// Observe an exact index publication in an explicit namespace
+pub const GetNamespaceTableIndexPublicationPathParams = struct {
+    database_name: []const u8,
+    namespace_name: []const u8,
+    table_name: []const u8,
+    index_name: []const u8,
+};
+
 /// Repair an index generation
 pub const RepairNamespaceIndexPathParams = struct {
     database_name: []const u8,
@@ -1223,6 +1231,12 @@ pub const ExecuteGraphMetricActionPathParams = struct {
     action: []const u8,
 };
 
+/// Observe an exact index publication
+pub const GetIndexPublicationPathParams = struct {
+    table_name: []const u8,
+    index_name: []const u8,
+};
+
 /// Repair an index generation
 pub const RepairIndexPathParams = struct {
     table_name: []const u8,
@@ -1676,6 +1690,7 @@ pub const routes = [_]Route{
     .{ .method = "POST", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/indexes/{indexName}", .operation_id = "createNamespaceTableIndex", .request_body = .buffered, .streaming_response = false },
     .{ .method = "DELETE", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/indexes/{indexName}", .operation_id = "dropNamespaceTableIndex", .request_body = .none, .streaming_response = false },
     .{ .method = "POST", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/indexes/{indexName}/graph-metrics/{metricName}:{action}", .operation_id = "executeNamespaceTableGraphMetricAction", .request_body = .none, .streaming_response = false },
+    .{ .method = "GET", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/indexes/{indexName}/publication", .operation_id = "getNamespaceTableIndexPublication", .request_body = .none, .streaming_response = false },
     .{ .method = "POST", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/indexes/{indexName}/repair", .operation_id = "repairNamespaceIndex", .request_body = .buffered, .streaming_response = false },
     .{ .method = "POST", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/indexes/{indexName}/retry", .operation_id = "retryNamespaceIndex", .request_body = .buffered, .streaming_response = false },
     .{ .method = "POST", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/query", .operation_id = "queryNamespaceTable", .request_body = .buffered, .streaming_response = true },
@@ -1744,6 +1759,7 @@ pub const routes = [_]Route{
     .{ .method = "POST", .path = "/tables/{tableName}/indexes/{indexName}", .operation_id = "createIndex", .request_body = .buffered, .streaming_response = false },
     .{ .method = "DELETE", .path = "/tables/{tableName}/indexes/{indexName}", .operation_id = "dropIndex", .request_body = .none, .streaming_response = false },
     .{ .method = "POST", .path = "/tables/{tableName}/indexes/{indexName}/graph-metrics/{metricName}:{action}", .operation_id = "executeGraphMetricAction", .request_body = .none, .streaming_response = false },
+    .{ .method = "GET", .path = "/tables/{tableName}/indexes/{indexName}/publication", .operation_id = "getIndexPublication", .request_body = .none, .streaming_response = false },
     .{ .method = "POST", .path = "/tables/{tableName}/indexes/{indexName}/repair", .operation_id = "repairIndex", .request_body = .buffered, .streaming_response = false },
     .{ .method = "POST", .path = "/tables/{tableName}/indexes/{indexName}/retry", .operation_id = "retryIndex", .request_body = .buffered, .streaming_response = false },
     .{ .method = "GET", .path = "/tables/{tableName}/lake/catalog", .operation_id = "getLakeCatalog", .request_body = .none, .streaming_response = false },
@@ -1857,6 +1873,7 @@ pub const routes = [_]Route{
 //   fn createNamespaceTableIndex(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8, index_name: []const u8) !httpx.Response
 //   fn dropNamespaceTableIndex(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8, index_name: []const u8) !httpx.Response
 //   fn executeNamespaceTableGraphMetricAction(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8, index_name: []const u8, metric_name: []const u8, action: []const u8) !httpx.Response
+//   fn getNamespaceTableIndexPublication(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8, index_name: []const u8) !httpx.Response
 //   fn repairNamespaceIndex(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8, index_name: []const u8) !httpx.Response
 //   fn retryNamespaceIndex(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8, index_name: []const u8) !httpx.Response
 //   fn queryNamespaceTable(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8) !httpx.Response
@@ -1925,6 +1942,7 @@ pub const routes = [_]Route{
 //   fn createIndex(self: *Impl, ctx: *httpx.Context, table_name: []const u8, index_name: []const u8) !httpx.Response
 //   fn dropIndex(self: *Impl, ctx: *httpx.Context, table_name: []const u8, index_name: []const u8) !httpx.Response
 //   fn executeGraphMetricAction(self: *Impl, ctx: *httpx.Context, table_name: []const u8, index_name: []const u8, metric_name: []const u8, action: []const u8) !httpx.Response
+//   fn getIndexPublication(self: *Impl, ctx: *httpx.Context, table_name: []const u8, index_name: []const u8) !httpx.Response
 //   fn repairIndex(self: *Impl, ctx: *httpx.Context, table_name: []const u8, index_name: []const u8) !httpx.Response
 //   fn retryIndex(self: *Impl, ctx: *httpx.Context, table_name: []const u8, index_name: []const u8) !httpx.Response
 //   fn getLakeCatalog(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response

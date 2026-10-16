@@ -81,6 +81,43 @@ pub fn read(source: anytype, alloc: Allocator, context: local.api_operation.Requ
     return project(alloc, index_name, encoded, request, observed.value);
 }
 
+/// Resolve only the authorized logical table, never a catalog inventory or a
+/// key-routed substitute. The following metadata read rechecks this exact guard
+/// atomically with the retained publication, fencing drop/recreate and DDL races.
+pub fn readTable(source: anytype, alloc: Allocator, context: local.api_operation.RequestContext, target: local.system_catalog_domain.Target, index_name: []const u8, encoded: []const u8) ![]u8 {
+    if (!context.setting_admin or !context.index_publication_authority) return error.Forbidden;
+    try context.ensureActive();
+    _ = try Token.decode(encoded);
+    try target.validate();
+    const domain = local.system_catalog_domain;
+    const targets = [_]domain.RelationTarget{.{ .database = target.database, .namespace = target.namespace, .name = target.table }};
+    const request: domain.ResolveMany = .{ .relations = &targets };
+    const bytes = try source.systemCatalog(alloc, context, .{ .resolve_many = request });
+    defer alloc.free(bytes);
+    try context.ensureActive();
+    if (bytes.len == 0 or bytes.len > 16 * 1024) return error.InvalidCatalogRecord;
+    var parsed = try std.json.parseFromSlice(domain.ResolvedMany, alloc, bytes, .{});
+    defer parsed.deinit();
+    try parsed.value.validateRelations(request);
+    const owner = parsed.value.relations[0] orelse return error.TableNotFound;
+    if (owner.owner.kind != .table) return error.SqlWrongObjectType;
+    if (!std.mem.eql(u8, owner.logical_table, target.table)) return error.InvalidCatalogRecord;
+    return read(source, alloc, context, .{
+        .target = targets[0],
+        .logical_table = owner.logical_table,
+        .owner = owner.owner,
+        .incarnation = parsed.value.relation_epoch.?.incarnation,
+    }, index_name, encoded);
+}
+
+pub fn httpStatus(err: anyerror) u16 {
+    return switch (err) {
+        error.InvalidIndexPublicationToken => 400,
+        error.SqlWrongObjectType, error.MetadataIncarnationMismatch => 409,
+        else => local.system_catalog_domain.httpStatus(err),
+    };
+}
+
 fn encodeStatus(alloc: Allocator, index_name: []const u8, encoded: []const u8, observed: publication.AdmissionStatus) ![]u8 {
     return project(alloc, index_name, encoded, try Token.decode(encoded), observed);
 }
@@ -188,6 +225,71 @@ test "relational index publication public projection withholds unmirrored comple
     wrong_guard.owner.table_id += 1;
     try std.testing.expectError(error.CatalogGenerationChanged, read(&source, a, .{ .setting_admin = true, .index_publication_authority = true }, wrong_guard, "by_email", &encoded));
     try std.testing.expectEqual(@as(usize, 1), source.calls);
+}
+
+test "relational index publication recovery resolves one logical owner and fences replacement without replay" {
+    const domain = local.system_catalog_domain;
+    const Source = struct {
+        mode: enum { valid, replaced, raced, wrong_kind, wrong_name, old_peer } = .valid,
+        calls: usize = 0,
+        pub fn systemCatalog(self: *@This(), a: Allocator, context: local.api_operation.RequestContext, call: @import("../system_catalog/server_call.zig").Call) ![]u8 {
+            try std.testing.expect(context.setting_admin and context.index_publication_authority);
+            try std.testing.expect(!call.isMutation());
+            self.calls += 1;
+            switch (call) {
+                .resolve_many => |request| {
+                    try std.testing.expectEqual(@as(usize, 1), request.relations.len);
+                    try std.testing.expectEqual(@as(usize, 0), request.targets.len);
+                    try std.testing.expect(!request.include_query_definitions);
+                    try std.testing.expectEqualStrings("warehouse", request.relations[0].database);
+                    try std.testing.expectEqualStrings("sales", request.relations[0].namespace);
+                    try std.testing.expectEqualStrings("items", request.relations[0].name);
+                    const table_id: u64 = if (self.mode == .replaced) 102 else 101;
+                    return std.json.Stringify.valueAlloc(a, domain.ResolvedMany{
+                        .revision = 9,
+                        .tables = &.{},
+                        .relation_epoch = if (self.mode == .old_peer) null else .{ .incarnation = @splat(0x11), .revision = 9 },
+                        .relations = &.{.{ .table = .{ .table_id = table_id, .name = "physical:101" }, .logical_table = if (self.mode == .wrong_name) "other" else "items", .owner = .{ .kind = if (self.mode == .wrong_kind) .index else .table, .table_id = table_id, .schema_version = 3, .schema_digest = @splat(4) } }},
+                    }, .{});
+                },
+                .relational_index_status => |request| {
+                    if (self.mode == .raced) return error.CatalogGenerationChanged;
+                    try std.testing.expectEqualStrings("items", request.guard.logical_table);
+                    try std.testing.expectEqual(@as(u32, 3), request.guard.owner.schema_version);
+                    try std.testing.expectEqualDeep(@as([16]u8, @splat(0x11)), request.guard.incarnation);
+                    return std.json.Stringify.valueAlloc(a, publication.AdmissionStatus{ .metadata_incarnation = @splat('1') }, .{});
+                },
+                else => return error.TestUnexpectedResult,
+            }
+        }
+    };
+    const a = std.testing.allocator;
+    const token = try Token.encode(.{ .metadata_incarnation = @splat('1'), .table_id = 101, .id = @splat(2), .plan_digest = @splat(3) });
+    const target: domain.Target = .{ .database = "warehouse", .namespace = "sales", .table = "items" };
+    const context: local.api_operation.RequestContext = .{ .setting_admin = true, .index_publication_authority = true };
+    var source: Source = .{};
+    try std.testing.expectError(error.Forbidden, readTable(&source, a, .{}, target, "by_email", &token));
+    try std.testing.expectError(error.InvalidIndexPublicationToken, readTable(&source, a, context, target, "by_email", "bad"));
+    try std.testing.expectEqual(@as(usize, 0), source.calls);
+    const bytes = try readTable(&source, a, context, target, "by_email", &token);
+    defer a.free(bytes);
+    var parsed = try std.json.parseFromSlice(wire.IndexPublicationStatus, a, bytes, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqual(wire.IndexPublicationState.admission_unknown, parsed.value.state);
+    try std.testing.expectEqual(@as(usize, 2), source.calls);
+    source.mode = .replaced;
+    try std.testing.expectError(error.CatalogGenerationChanged, readTable(&source, a, context, target, "by_email", &token));
+    try std.testing.expectEqual(@as(usize, 3), source.calls);
+    source.mode = .raced;
+    try std.testing.expectError(error.CatalogGenerationChanged, readTable(&source, a, context, target, "by_email", &token));
+    try std.testing.expectEqual(@as(usize, 5), source.calls);
+    source.mode = .wrong_kind;
+    try std.testing.expectError(error.SqlWrongObjectType, readTable(&source, a, context, target, "by_email", &token));
+    source.mode = .wrong_name;
+    try std.testing.expectError(error.InvalidCatalogRecord, readTable(&source, a, context, target, "by_email", &token));
+    source.mode = .old_peer;
+    try std.testing.expectError(error.TableTopologyUpgradeRequired, readTable(&source, a, context, target, "by_email", &token));
+    try std.testing.expectEqual(@as(usize, 8), source.calls);
 }
 
 test "relational index publication DDL recovery fields match the generated public receipt contract" {

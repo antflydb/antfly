@@ -16,8 +16,14 @@
 package sdk
 
 import (
+	"context"
 	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"strings"
 	"testing"
+
+	"github.com/antflydb/antfly/go/pkg/sdk/oapi"
 )
 
 func TestIndexPublicationRecoveryPublicTypes(t *testing.T) {
@@ -46,5 +52,61 @@ func TestIndexPublicationRecoveryPublicTypes(t *testing.T) {
 	}
 	if receipt.IndexPublicationToken != status.PublicationToken || receipt.FkGenerationPublicationId != status.PublicationId {
 		t.Fatalf("receipt lost recovery identities: %+v", receipt)
+	}
+}
+
+func TestIndexPublicationRecoveryReadsExactScopeAndNeverReplays(t *testing.T) {
+	token := strings.Repeat("A", 171)
+	calls := 0
+	mode := "valid"
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		want := "/db/v1/tables/items%2Fa/indexes/by%20id%2F%23/publication"
+		if calls == 2 {
+			want = "/db/v1/databases/warehouse/namespaces/sales/tables/items%2Fa/indexes/by%20id%2F%23/publication"
+		}
+		if r.Method != "GET" || r.URL.EscapedPath() != want || r.URL.RawQuery != "" || r.Header.Get("X-Antfly-Index-Publication-Token") != token {
+			t.Errorf("unexpected recovery request: %s %s", r.Method, r.URL)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		if mode == "oversize" {
+			_, _ = w.Write([]byte(strings.Repeat("x", 16385)))
+			return
+		}
+		status := IndexPublicationStatus{IndexType: oapi.IndexPublicationStatusIndexTypeRelational, IndexName: "by id/#", PublicationToken: token, TableId: "18446744073709551615", State: IndexPublicationStateAdmissionUnknown, Phase: IndexPublicationPhasePublished, ReplicationPending: true}
+		if mode == "foreign" {
+			status.PublicationToken = strings.Repeat("B", 171)
+		}
+		if mode == "unconfirmed" {
+			status.State = IndexPublicationStatePublished
+		}
+		if mode == "invalid_state" {
+			status.State = "unknown"
+			status.ReplicationPending = false
+		}
+		_ = json.NewEncoder(w).Encode(status)
+	}))
+	defer server.Close()
+	client, err := NewAntflyClientWithOptions(server.URL, oapi.WithHTTPClient(server.Client()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	status, err := client.GetIndexPublication(ctx, "items/a", "by id/#", token)
+	if err != nil || status.State != IndexPublicationStateAdmissionUnknown {
+		t.Fatalf("exact recovery: %v, %+v", err, status)
+	}
+	if _, err := client.GetNamespaceTableIndexPublication(ctx, "warehouse", "sales", "items/a", "by id/#", token); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := client.GetIndexPublication(ctx, "items/a", "by id/#", "bad"); err == nil || calls != 2 {
+		t.Fatalf("invalid token must fail before IO: calls=%d, error=%v", calls, err)
+	}
+	for _, failure := range []string{"foreign", "unconfirmed", "invalid_state", "oversize"} {
+		mode = failure
+		before := calls
+		if _, err := client.GetIndexPublication(ctx, "items/a", "by id/#", token); err == nil || calls != before+1 {
+			t.Fatalf("%s: expected one failed read, calls=%d, error=%v", mode, calls, err)
+		}
 	}
 }

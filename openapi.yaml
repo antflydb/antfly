@@ -7392,6 +7392,55 @@ paths:
         - BasicAuth: []
         - ApiKeyAuth: []
         - BearerAuth: []
+  /db/v1/tables/{tableName}/indexes/{indexName}/publication:
+    parameters:
+      - name: tableName
+        in: path
+        required: true
+        schema:
+          type: string
+      - name: indexName
+        in: path
+        required: true
+        schema:
+          type: string
+    get:
+      summary: Observe an exact index publication
+      description: Requires administration of the current logical table and the retained recovery token.
+        This read never replays DDL. Unknown admission remains unknown, including after an absent or unmirrored
+        observation. Published is historical job completion, not current index query readiness.
+      tags:
+        - index_management
+      operationId: getIndexPublication
+      parameters:
+        - name: X-Antfly-Index-Publication-Token
+          in: header
+          required: true
+          schema:
+            $ref: '#/components/schemas/IndexPublicationToken'
+      responses:
+        '200':
+          description: Exact read-only publication observation
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/IndexPublicationStatus'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '403':
+          description: Current logical table administration is required
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          description: Table identity, publication identity or metadata incarnation changed
+        '426':
+          description: Authoritative relation ownership is not supported by the metadata owner
+        '503':
+          description: Metadata observation is unavailable; retain the token and retry this read
+      security:
+        - BasicAuth: []
+        - ApiKeyAuth: []
+        - BearerAuth: []
   /db/v1/sources:
     get:
       summary: List saved query sources
@@ -8745,6 +8794,65 @@ paths:
           $ref: '#/components/responses/InternalServerError'
         '501':
           description: Catalog target cannot be delegated to legacy table storage unambiguously.
+      security:
+        - BasicAuth: []
+        - ApiKeyAuth: []
+        - BearerAuth: []
+  /db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/indexes/{indexName}/publication:
+    parameters:
+      - name: databaseName
+        in: path
+        required: true
+        schema:
+          type: string
+      - name: namespaceName
+        in: path
+        required: true
+        schema:
+          type: string
+      - name: tableName
+        in: path
+        required: true
+        schema:
+          type: string
+      - name: indexName
+        in: path
+        required: true
+        schema:
+          type: string
+    get:
+      summary: Observe an exact index publication in an explicit namespace
+      description: Requires administration of the current logical table and its retained recovery token.
+        Unknown admission is not permission to replay DDL; published is historical job completion, not
+        current index query readiness.
+      tags:
+        - index_management
+      operationId: getNamespaceTableIndexPublication
+      parameters:
+        - name: X-Antfly-Index-Publication-Token
+          in: header
+          required: true
+          schema:
+            $ref: '#/components/schemas/IndexPublicationToken'
+      responses:
+        '200':
+          description: Exact read-only publication observation
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/IndexPublicationStatus'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '403':
+          description: Current logical table administration is required
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          description: Table identity, publication identity or metadata incarnation changed
+        '426':
+          description: Authoritative relation ownership is not supported by the metadata owner
+        '503':
+          description: Metadata observation is unavailable; retain the token and retry this read
       security:
         - BasicAuth: []
         - ApiKeyAuth: []

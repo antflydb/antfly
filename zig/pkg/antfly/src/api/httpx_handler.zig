@@ -7081,6 +7081,12 @@ pub const AntflyApiHandler = struct {
         return self.getIndex(ctx, table_name, index_name);
     }
 
+    pub fn getNamespaceTableIndexPublication(self: *AntflyApiHandler, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8, index_name: []const u8) !httpx.Response {
+        _ = database_name;
+        _ = namespace_name;
+        return self.getIndexPublication(ctx, table_name, index_name);
+    }
+
     pub fn createNamespaceTableIndex(self: *AntflyApiHandler, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8, index_name: []const u8) !httpx.Response {
         _ = database_name;
         _ = namespace_name;
@@ -9009,6 +9015,37 @@ pub const AntflyApiHandler = struct {
         return respondOwnedApiResponse(ctx, &resp);
     }
 
+    pub fn getIndexPublication(self: *AntflyApiHandler, ctx: *httpx.Context, table_name: []const u8, index_name: []const u8) !httpx.Response {
+        var identity: ?AuthenticatedIdentity = null;
+        defer if (identity) |*value| value.deinit(self.api_server.alloc);
+        if (try self.authorizeRequest(ctx, &identity)) |response| return response;
+        const alloc = ctx.allocator;
+        const decoded_table = (try decodePathParamOrBadRequest(ctx, table_name)) orelse return ctx.text("invalid path parameter");
+        defer alloc.free(decoded_table);
+        const decoded_index = (try decodePathParamOrBadRequest(ctx, index_name)) orelse return ctx.text("invalid path parameter");
+        defer alloc.free(decoded_index);
+        const route = system_catalog_routes.parseAlloc(alloc, http_server_mod.stripApiPrefix(ctx.request.uri.path)) catch
+            return jsonErrorResponse(ctx, 400, "invalid catalog target");
+        defer if (route) |value| value.deinit(alloc);
+        const target = (if (route) |value| value.target() else system_catalog.Target.literal(decoded_table)) catch
+            return jsonErrorResponse(ctx, 400, "invalid catalog target");
+        const resource = try target.resourceNameAlloc(alloc);
+        defer alloc.free(resource);
+        if (identity) |value| if (!http_server_mod.permissionsAllow(value.permissions, .table, resource, .admin))
+            return jsonErrorResponse(ctx, 403, "forbidden");
+        // These grants come only from authenticated ingress and current logical
+        // table authority, never the opaque token or a client-supplied owner.
+        var context = operationContext(ctx, identity);
+        context.setting_admin = true;
+        context.index_publication_authority = true;
+        const recovery = @import("index_publication_recovery.zig");
+        const bytes = recovery.readTable(self.api_server.source, alloc, context, target, decoded_index, ctx.header("x-antfly-index-publication-token") orelse "") catch |err|
+            return jsonErrorResponse(ctx, recovery.httpStatus(err), @errorName(err));
+        defer alloc.free(bytes);
+        try ctx.setHeader("cache-control", "no-store");
+        return jsonResponse(ctx, 200, bytes);
+    }
+
     pub fn createIndex(self: *AntflyApiHandler, ctx: *httpx.Context, table_name: []const u8, index_name: []const u8) !httpx.Response {
         var authenticated_identity: ?AuthenticatedIdentity = null;
         defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
@@ -10005,6 +10042,114 @@ test "system catalog SQL setting publication requires cluster admin and forwards
     defer allowed.deinit();
     try std.testing.expectEqual(@as(u16, 200), allowed.status.code);
     try std.testing.expectEqual(@as(usize, 1), source.calls);
+}
+
+test "public index publication recovery requires table admin and preserves exact logical scope" {
+    const alloc = std.testing.allocator;
+    var auth = try initTestAuthManager(alloc);
+    try bindTestAuthManager(alloc, &auth);
+    defer auth.manager.deinit();
+    defer auth.policy_store.deinit();
+    defer auth.store.deinit();
+    var permission = try usermgr.Permission.initOwned(alloc, .table, "*", .admin);
+    defer permission.deinit(alloc);
+    var admin = try auth.manager.createUser("index_admin", "secret", &.{permission});
+    defer admin.deinit(alloc);
+    var read_permission = try usermgr.Permission.initOwned(alloc, .table, "*", .read);
+    defer read_permission.deinit(alloc);
+    var reader = try auth.manager.createUser("index_reader", "secret", &.{read_permission});
+    defer reader.deinit(alloc);
+    const Source = struct {
+        calls: usize = 0,
+        database: []const u8 = "default",
+        namespace: []const u8 = "public",
+        replaced: bool = false,
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 77, .metrics = .{}, .projected_stores = 1 };
+        }
+        fn catalog(ptr: *anyopaque, a: std.mem.Allocator, context: operation_contract.RequestContext, call: @import("../system_catalog/server_call.zig").Call) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expect(context.setting_admin and context.index_publication_authority);
+            try std.testing.expect(!call.isMutation());
+            self.calls += 1;
+            switch (call) {
+                .resolve_many => |request| {
+                    try std.testing.expectEqual(@as(usize, 1), request.relations.len);
+                    try std.testing.expectEqualStrings(self.database, request.relations[0].database);
+                    try std.testing.expectEqualStrings(self.namespace, request.relations[0].namespace);
+                    try std.testing.expectEqualStrings("items/a", request.relations[0].name);
+                    const domain = @import("antfly_local_sources").system_catalog_domain;
+                    const id: u64 = if (self.replaced) 102 else 101;
+                    return std.json.Stringify.valueAlloc(a, domain.ResolvedMany{
+                        .revision = 9,
+                        .tables = &.{},
+                        .relation_epoch = .{ .incarnation = @splat(0x11), .revision = 9 },
+                        .relations = &.{.{ .table = .{ .table_id = id, .name = "physical:101" }, .logical_table = "items/a", .owner = .{ .kind = .table, .table_id = id, .schema_version = 3, .schema_digest = @splat(4) } }},
+                    }, .{});
+                },
+                .relational_index_status => |request| {
+                    try std.testing.expectEqualStrings("by/email", request.index_name);
+                    try std.testing.expectEqualStrings("items/a", request.guard.logical_table);
+                    return std.json.Stringify.valueAlloc(a, @import("../metadata/relational_index_publication.zig").AdmissionStatus{ .metadata_incarnation = @splat('1') }, .{});
+                },
+                else => return error.TestUnexpectedResult,
+            }
+        }
+        fn iface(self: *@This()) http_server_mod.StatusSource {
+            return .{ .ptr = self, .vtable = &.{ .status = status, .system_catalog = catalog } };
+        }
+    };
+    var source: Source = .{};
+    var api_server = ApiHttpServer.init(alloc, .{ .auth_enabled = true, .user_manager = &auth.manager }, source.iface(), null, null);
+    defer api_server.deinit();
+    var e2e: HttpxE2eServer = undefined;
+    try e2e.init(alloc, &api_server);
+    defer e2e.deinit();
+    var threaded = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer threaded.deinit();
+    var client = httpx.Client.initWithConfig(alloc, threaded.io(), .{ .keep_alive = false });
+    defer client.deinit();
+    const base = try e2e.baseUrl(alloc);
+    defer alloc.free(base);
+    const url = try std.fmt.allocPrint(alloc, "{s}/db/v1/tables/items%2Fa/indexes/by%2Femail/publication", .{base});
+    defer alloc.free(url);
+    const token = try @import("index_publication_recovery.zig").Token.encode(.{ .metadata_incarnation = @splat('1'), .table_id = 101, .id = @splat(2), .plan_digest = @splat(3) });
+    const reader_auth = try encodeBasicAuthorization(alloc, "index_reader", "secret");
+    defer alloc.free(reader_auth);
+    const admin_auth = try encodeBasicAuthorization(alloc, "index_admin", "secret");
+    defer alloc.free(admin_auth);
+    const reader_headers = [_][2][]const u8{ .{ "authorization", reader_auth }, .{ "X-Antfly-Index-Publication-Token", &token } };
+    var denied = try getWithRetry(&client, threaded.io(), url, &reader_headers, 20);
+    defer denied.deinit();
+    try std.testing.expectEqual(@as(u16, 403), denied.status.code);
+    try std.testing.expectEqual(@as(usize, 0), source.calls);
+    const missing_headers = [_][2][]const u8{.{ "authorization", admin_auth }};
+    var missing = try getWithRetry(&client, threaded.io(), url, &missing_headers, 20);
+    defer missing.deinit();
+    try std.testing.expectEqual(@as(u16, 400), missing.status.code);
+    try std.testing.expectEqual(@as(usize, 0), source.calls);
+    const admin_headers = [_][2][]const u8{ .{ "authorization", admin_auth }, .{ "X-Antfly-Index-Publication-Token", &token } };
+    var allowed = try getWithRetry(&client, threaded.io(), url, &admin_headers, 20);
+    defer allowed.deinit();
+    try std.testing.expectEqual(@as(u16, 200), allowed.status.code);
+    var result = try std.json.parseFromSlice(@import("antfly_indexes_openapi").types.IndexPublicationStatus, alloc, allowed.body.?, .{});
+    defer result.deinit();
+    try std.testing.expectEqualStrings(&token, result.value.publication_token);
+    try std.testing.expectEqual(@import("antfly_indexes_openapi").types.IndexPublicationState.admission_unknown, result.value.state);
+    try std.testing.expectEqual(@as(usize, 2), source.calls);
+    source.database = "warehouse";
+    source.namespace = "sales";
+    const scoped_url = try std.fmt.allocPrint(alloc, "{s}/db/v1/databases/warehouse/namespaces/sales/tables/items%2Fa/indexes/by%2Femail/publication", .{base});
+    defer alloc.free(scoped_url);
+    var scoped = try getWithRetry(&client, threaded.io(), scoped_url, &admin_headers, 20);
+    defer scoped.deinit();
+    try std.testing.expectEqual(@as(u16, 200), scoped.status.code);
+    try std.testing.expectEqual(@as(usize, 4), source.calls);
+    source.replaced = true;
+    var replaced = try getWithRetry(&client, threaded.io(), scoped_url, &admin_headers, 20);
+    defer replaced.deinit();
+    try std.testing.expectEqual(@as(u16, 409), replaced.status.code);
+    try std.testing.expectEqual(@as(usize, 5), source.calls);
 }
 
 test "store-root enrollment requires cluster admin and forwards only valid possession proof" {

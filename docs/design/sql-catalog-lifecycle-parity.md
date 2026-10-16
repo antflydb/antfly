@@ -8687,3 +8687,41 @@ The focused Go recovery-contract test, 58 Python recovery/maintenance/SQL tests
 and TypeScript SDK typecheck pass after final generation and formatting.
 `make generate`, `make fmt`, inventory integrity, Apache boundary, license headers,
 control catalog and whitespace checks pass. No latency benchmark is claimed.
+
+### Mounted public index-publication recovery reads
+
+Exact recovery is now a read-only subresource of the existing `/indexes` API,
+for both default tables and explicit database/namespace targets. The required
+token travels in a header rather than a URL. Trusted ingress checks current
+logical table administration before granting private capabilities; a token never
+authorizes a read. One bounded point lookup captures the logical owner without
+schema JSON or a catalog inventory. The following bounded metadata observation
+rechecks that exact guard atomically with the retained job. Replacement, ownership
+drift and metadata-incarnation mismatch are conflicts, never implicit rerouting
+or automatic replay. Successful observations are marked `Cache-Control: no-store`.
+
+Go, Python and TypeScript wrappers expose default and explicit-scope reads,
+preserve exact string identities and unknown admission, reject foreign handles
+and unconfirmed completion, and cap response bodies at 16 KiB. TypeScript shares
+its bounded, cancellation-aware request machinery with writes and maintenance;
+the method-neutral helper name now reflects GET/POST/DELETE support.
+
+Frozen-source Debug qualification passed 80/80 public-HTTP build steps (three
+selected tests) and 69/69 metadata build steps (66 metadata/index, four transport,
+one decoder-barrier tests), without failures or leaks. Logs are
+`/private/tmp/antfly-index-public-route-http-final-debug.log` and
+`/private/tmp/antfly-index-public-route-metadata-frozen-debug.log`.
+The mounted socket test covers table-admin versus read-only authorization,
+missing tokens before IO, escaped names, both route forms and replacement tables.
+The owner-resolution test also covers stale reads, wrong relation kinds/names
+and peers lacking authoritative ownership. Two focused Go tests, 14 Python
+recovery/maintenance tests, 69 TypeScript recovery/maintenance/row/SQL tests and
+SDK typechecking pass. Generation, formatting, inventory, license, Apache and
+control-catalog checks pass. Initial socket attempts required sandbox loopback
+access; a sampled Python startup stall was in macOS timezone notification, before
+the checker script, and static checks passed with the required OS access.
+
+This activates public recovery reads, not SQL index admission or an end-to-end
+distributed build. Public DDL token producers, replacement-root adoption and
+hosted/Raft execution remain unfinished. No original-case disposition or latency
+benchmark claim changes: 483 implemented / 862 unresolved.

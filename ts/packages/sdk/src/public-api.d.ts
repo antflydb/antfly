@@ -2498,6 +2498,29 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/db/v1/tables/{tableName}/indexes/{indexName}/publication": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                tableName: string;
+                indexName: string;
+            };
+            cookie?: never;
+        };
+        /**
+         * Observe an exact index publication
+         * @description Requires administration of the current logical table and the retained recovery token. This read never replays DDL. Unknown admission remains unknown, including after an absent or unmirrored observation. Published is historical job completion, not current index query readiness.
+         */
+        get: operations["getIndexPublication"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/db/v1/sources": {
         parameters: {
             query?: never;
@@ -3018,6 +3041,31 @@ export interface paths {
         post: operations["createNamespaceTableIndex"];
         /** Drop an index from an explicit namespace table */
         delete: operations["dropNamespaceTableIndex"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/indexes/{indexName}/publication": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                databaseName: string;
+                namespaceName: string;
+                tableName: string;
+                indexName: string;
+            };
+            cookie?: never;
+        };
+        /**
+         * Observe an exact index publication in an explicit namespace
+         * @description Requires administration of the current logical table and its retained recovery token. Unknown admission is not permission to replay DDL; published is historical job completion, not current index query readiness.
+         */
+        get: operations["getNamespaceTableIndexPublication"];
+        put?: never;
+        post?: never;
+        delete?: never;
         options?: never;
         head?: never;
         patch?: never;
@@ -26163,6 +26211,61 @@ export interface operations {
             500: components["responses"]["InternalServerError"];
         };
     };
+    getIndexPublication: {
+        parameters: {
+            query?: never;
+            header: {
+                "X-Antfly-Index-Publication-Token": components["schemas"]["IndexPublicationToken"];
+            };
+            path: {
+                tableName: string;
+                indexName: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Exact read-only publication observation */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["IndexPublicationStatus"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            /** @description Current logical table administration is required */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            404: components["responses"]["NotFound"];
+            /** @description Table identity, publication identity or metadata incarnation changed */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Authoritative relation ownership is not supported by the metadata owner */
+            426: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Metadata observation is unavailable; retain the token and retry this read */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
     listQuerySources: {
         parameters: {
             query?: never;
@@ -27352,6 +27455,63 @@ export interface operations {
             500: components["responses"]["InternalServerError"];
             /** @description Catalog target cannot be delegated to legacy table storage unambiguously. */
             501: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    getNamespaceTableIndexPublication: {
+        parameters: {
+            query?: never;
+            header: {
+                "X-Antfly-Index-Publication-Token": components["schemas"]["IndexPublicationToken"];
+            };
+            path: {
+                databaseName: string;
+                namespaceName: string;
+                tableName: string;
+                indexName: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Exact read-only publication observation */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["IndexPublicationStatus"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            /** @description Current logical table administration is required */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            404: components["responses"]["NotFound"];
+            /** @description Table identity, publication identity or metadata incarnation changed */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Authoritative relation ownership is not supported by the metadata owner */
+            426: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Metadata observation is unavailable; retain the token and retry this read */
+            503: {
                 headers: {
                     [name: string]: unknown;
                 };

@@ -78,6 +78,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "join planning",
         "public openapi contract module is generated and wired",
         "public enrollment encoding preserves a signed u128 root without JSON rounding",
+        "public index publication recovery requires table admin and preserves exact logical scope",
         "store-root enrollment requires cluster admin and forwards only valid possession proof",
         "admin openapi contract module is generated and wired",
         "internal openapi contract module is generated and wired",

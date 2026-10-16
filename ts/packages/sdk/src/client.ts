@@ -46,6 +46,7 @@ import type {
   GlobalQueryRequest,
   IndexMaintenanceRequest,
   IndexMaintenanceResponse,
+  IndexPublicationStatus,
   IndexStatus,
   LinearMergeRequest,
   LinearMergeResult,
@@ -179,6 +180,13 @@ export interface RestoreJobPage {
 export interface IndexOperations {
   list(tableName: string): Promise<IndexStatus[]>;
   get(tableName: string, indexName: string): Promise<IndexStatus>;
+  /** Observe a retained exact job without replaying DDL; published is not current query readiness. */
+  publication(
+    tableName: string,
+    indexName: string,
+    token: string,
+    options?: QueryExecutionOptions & { scope?: { database: string; namespace: string } }
+  ): Promise<IndexPublicationStatus>;
   create(tableName: string, indexName: string, config: CreateIndexRequest): Promise<CreatedIndex>;
   drop(tableName: string, indexName: string): Promise<true>;
   /** Resume the identical proof request after a partial/lost acknowledgement; proofs are never refreshed automatically. */
@@ -701,7 +709,7 @@ export class AntflyClient {
     return `${normalizeBaseUrl(this.config.baseUrl)}${path}`;
   }
 
-  private async postBoundedJSON<T>(
+  private async requestBoundedJSON<T>(
     path: string,
     body: unknown,
     options: WriteOptions | undefined,
@@ -710,7 +718,7 @@ export class AntflyClient {
     relational = false,
     errorFactory?: (status: number, body: unknown) => Error | undefined,
     redirect?: RequestRedirect,
-    method: "POST" | "DELETE" = "POST",
+    method: "POST" | "DELETE" | "GET" = "POST",
     credentials?: RequestCredentials,
     extraHeaders?: Record<string, string>
   ): Promise<{ data?: T; text: string; status: number }> {
@@ -906,7 +914,7 @@ export class AntflyClient {
     method: "POST" | "DELETE" = "POST",
     extraHeaders?: Record<string, string>
   ): Promise<T | undefined> {
-    const { data } = await this.postBoundedJSON<T>(
+    const { data } = await this.requestBoundedJSON<T>(
       path,
       request,
       {
@@ -1747,7 +1755,7 @@ export class AntflyClient {
     request: MultiBatchRequest,
     options?: WriteOptions
   ): Promise<MultiBatchResult> {
-    const { data } = await this.postBoundedJSON<MultiBatchResult>(
+    const { data } = await this.requestBoundedJSON<MultiBatchResult>(
       "/db/v1/batch",
       request,
       options,
@@ -1772,7 +1780,7 @@ export class AntflyClient {
     request: LinearMergeRequest,
     options?: WriteOptions
   ): Promise<LinearMergeResult> {
-    const { data } = await this.postBoundedJSON<LinearMergeResult>(
+    const { data } = await this.requestBoundedJSON<LinearMergeResult>(
       `/db/v1/tables/${encodeURIComponent(tableName)}/merge`,
       request,
       options,
@@ -1932,7 +1940,7 @@ export class AntflyClient {
       request: BatchRequest,
       options?: WriteOptions
     ): Promise<BatchResult> => {
-      const { data } = await this.postBoundedJSON<BatchResult>(
+      const { data } = await this.requestBoundedJSON<BatchResult>(
         `/db/v1/tables/${encodeURIComponent(tableName)}/batch`,
         request,
         options,
@@ -1984,7 +1992,7 @@ export class AntflyClient {
         request: RelationalRowMutationRequest,
         options?: WriteOptions
       ): Promise<BatchResult> => {
-        const { data } = await this.postBoundedJSON<BatchResult>(
+        const { data } = await this.requestBoundedJSON<BatchResult>(
           `/db/v1/tables/${encodeURIComponent(tableName)}/rows/mutate`,
           request,
           options,
@@ -2004,7 +2012,7 @@ export class AntflyClient {
         request: RelationalConstraintRetirementRequest,
         options?: WriteOptions
       ): Promise<RelationalConstraintRetryResponse> => {
-        const { data: result } = await this.postBoundedJSON<RelationalConstraintRetryResponse>(
+        const { data: result } = await this.requestBoundedJSON<RelationalConstraintRetryResponse>(
           `/db/v1/tables/${encodeURIComponent(tableName)}/constraints/retire`,
           request,
           options,
@@ -2022,7 +2030,7 @@ export class AntflyClient {
         request: RelationalRowMutationRequest,
         options?: WriteOptions
       ): Promise<BatchResult> => {
-        const { data: result } = await this.postBoundedJSON<BatchResult>(
+        const { data: result } = await this.requestBoundedJSON<BatchResult>(
           `/db/v1/tables/${encodeURIComponent(tableName)}/constraints/repair`,
           request,
           options,
@@ -2039,7 +2047,7 @@ export class AntflyClient {
         request: RelationalConstraintRetryRequest,
         options?: WriteOptions
       ): Promise<RelationalConstraintRetryResponse> => {
-        const { data: result } = await this.postBoundedJSON<RelationalConstraintRetryResponse>(
+        const { data: result } = await this.requestBoundedJSON<RelationalConstraintRetryResponse>(
           `/db/v1/tables/${encodeURIComponent(tableName)}/constraints/retry`,
           request,
           options,
@@ -2517,7 +2525,7 @@ export class AntflyClient {
     // Keep the submitted proof and its acknowledgement expectation stable even
     // when the caller reuses/mutates their request while awaiting this operation.
     const body = { ...request, owners: request.owners.map((owner) => ({ ...owner })) };
-    const { data, status } = await this.postBoundedJSON<IndexMaintenanceResponse>(
+    const { data, status } = await this.requestBoundedJSON<IndexMaintenanceResponse>(
       `/db/v1/tables/${encodeURIComponent(tableName)}/indexes/${encodeURIComponent(indexName)}/${action}`,
       body,
       { signal: options?.signal, maxRequestBytes: 128 * 1024, maxResponseBytes: 32 * 1024 },
@@ -2532,6 +2540,39 @@ export class AntflyClient {
   }
 
   indexes: IndexOperations = {
+    publication: async (tableName, indexName, token, options) => {
+      if (token.length !== 171 || !/^[A-Za-z0-9_-]{171}$/.test(token))
+        throw new Error("Invalid index publication token");
+      let prefix = "/db/v1";
+      if (options?.scope) {
+        prefix += `/databases/${encodeURIComponent(options.scope.database)}/namespaces/${encodeURIComponent(options.scope.namespace)}`;
+      }
+      const { data, status } = await this.requestBoundedJSON<IndexPublicationStatus>(
+        `${prefix}/tables/${encodeURIComponent(tableName)}/indexes/${encodeURIComponent(indexName)}/publication`,
+        undefined,
+        { signal: options?.signal, maxResponseBytes: 16 * 1024 },
+        "Failed to observe index publication",
+        "Encoding index publication",
+        false,
+        undefined,
+        undefined,
+        "GET",
+        undefined,
+        { "X-Antfly-Index-Publication-Token": token }
+      );
+      if (
+        status !== 200 ||
+        !data ||
+        data.publication_token !== token ||
+        data.index_name !== indexName ||
+        data.index_type !== "relational" ||
+        typeof data.replication_pending !== "boolean" ||
+        !["admission_unknown", "pending", "published", "failed", "canceled"].includes(data.state) ||
+        (data.replication_pending && data.state !== "admission_unknown")
+      )
+        throw new Error("Index publication response identity or confirmation mismatch");
+      return data;
+    },
     retry: (tableName, indexName, request, options) =>
       this.maintainIndex("retry", tableName, indexName, request, options),
     repair: (tableName, indexName, request, options) =>

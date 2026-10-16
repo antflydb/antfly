@@ -376,6 +376,14 @@ pub const ExecuteNamespaceTableGraphMetricActionPathParams = struct {
     action: []const u8,
 };
 
+/// Observe an exact index publication in an explicit namespace
+pub const GetNamespaceTableIndexPublicationPathParams = struct {
+    database_name: []const u8,
+    namespace_name: []const u8,
+    table_name: []const u8,
+    index_name: []const u8,
+};
+
 /// Repair an index generation
 pub const RepairNamespaceIndexPathParams = struct {
     database_name: []const u8,
@@ -980,6 +988,12 @@ pub const ExecuteGraphMetricActionPathParams = struct {
     action: []const u8,
 };
 
+/// Observe an exact index publication
+pub const GetIndexPublicationPathParams = struct {
+    table_name: []const u8,
+    index_name: []const u8,
+};
+
 /// Repair an index generation
 pub const RepairIndexPathParams = struct {
     table_name: []const u8,
@@ -1409,6 +1423,7 @@ pub const routes = [_]Route{
     .{ .method = "POST", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/indexes/{indexName}", .operation_id = "createNamespaceTableIndex", .request_body = .buffered, .streaming_response = false },
     .{ .method = "DELETE", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/indexes/{indexName}", .operation_id = "dropNamespaceTableIndex", .request_body = .none, .streaming_response = false },
     .{ .method = "POST", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/indexes/{indexName}/graph-metrics/{metricName}:{action}", .operation_id = "executeNamespaceTableGraphMetricAction", .request_body = .none, .streaming_response = false },
+    .{ .method = "GET", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/indexes/{indexName}/publication", .operation_id = "getNamespaceTableIndexPublication", .request_body = .none, .streaming_response = false },
     .{ .method = "POST", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/indexes/{indexName}/repair", .operation_id = "repairNamespaceIndex", .request_body = .buffered, .streaming_response = false },
     .{ .method = "POST", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/indexes/{indexName}/retry", .operation_id = "retryNamespaceIndex", .request_body = .buffered, .streaming_response = false },
     .{ .method = "POST", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/query", .operation_id = "queryNamespaceTable", .request_body = .buffered, .streaming_response = true },
@@ -1477,6 +1492,7 @@ pub const routes = [_]Route{
     .{ .method = "POST", .path = "/tables/{tableName}/indexes/{indexName}", .operation_id = "createIndex", .request_body = .buffered, .streaming_response = false },
     .{ .method = "DELETE", .path = "/tables/{tableName}/indexes/{indexName}", .operation_id = "dropIndex", .request_body = .none, .streaming_response = false },
     .{ .method = "POST", .path = "/tables/{tableName}/indexes/{indexName}/graph-metrics/{metricName}:{action}", .operation_id = "executeGraphMetricAction", .request_body = .none, .streaming_response = false },
+    .{ .method = "GET", .path = "/tables/{tableName}/indexes/{indexName}/publication", .operation_id = "getIndexPublication", .request_body = .none, .streaming_response = false },
     .{ .method = "POST", .path = "/tables/{tableName}/indexes/{indexName}/repair", .operation_id = "repairIndex", .request_body = .buffered, .streaming_response = false },
     .{ .method = "POST", .path = "/tables/{tableName}/indexes/{indexName}/retry", .operation_id = "retryIndex", .request_body = .buffered, .streaming_response = false },
     .{ .method = "GET", .path = "/tables/{tableName}/lake/catalog", .operation_id = "getLakeCatalog", .request_body = .none, .streaming_response = false },
@@ -1575,6 +1591,7 @@ pub fn ServerRouter(comptime Impl: type) type {
         if (!@hasDecl(Impl, "createNamespaceTableIndex")) @compileError("ServerRouter: Impl missing required method 'createNamespaceTableIndex'");
         if (!@hasDecl(Impl, "dropNamespaceTableIndex")) @compileError("ServerRouter: Impl missing required method 'dropNamespaceTableIndex'");
         if (!@hasDecl(Impl, "executeNamespaceTableGraphMetricAction")) @compileError("ServerRouter: Impl missing required method 'executeNamespaceTableGraphMetricAction'");
+        if (!@hasDecl(Impl, "getNamespaceTableIndexPublication")) @compileError("ServerRouter: Impl missing required method 'getNamespaceTableIndexPublication'");
         if (!@hasDecl(Impl, "repairNamespaceIndex")) @compileError("ServerRouter: Impl missing required method 'repairNamespaceIndex'");
         if (!@hasDecl(Impl, "retryNamespaceIndex")) @compileError("ServerRouter: Impl missing required method 'retryNamespaceIndex'");
         if (!@hasDecl(Impl, "queryNamespaceTable")) @compileError("ServerRouter: Impl missing required method 'queryNamespaceTable'");
@@ -1643,6 +1660,7 @@ pub fn ServerRouter(comptime Impl: type) type {
         if (!@hasDecl(Impl, "createIndex")) @compileError("ServerRouter: Impl missing required method 'createIndex'");
         if (!@hasDecl(Impl, "dropIndex")) @compileError("ServerRouter: Impl missing required method 'dropIndex'");
         if (!@hasDecl(Impl, "executeGraphMetricAction")) @compileError("ServerRouter: Impl missing required method 'executeGraphMetricAction'");
+        if (!@hasDecl(Impl, "getIndexPublication")) @compileError("ServerRouter: Impl missing required method 'getIndexPublication'");
         if (!@hasDecl(Impl, "repairIndex")) @compileError("ServerRouter: Impl missing required method 'repairIndex'");
         if (!@hasDecl(Impl, "retryIndex")) @compileError("ServerRouter: Impl missing required method 'retryIndex'");
         if (!@hasDecl(Impl, "getLakeCatalog")) @compileError("ServerRouter: Impl missing required method 'getLakeCatalog'");
@@ -1739,6 +1757,7 @@ pub fn ServerRouter(comptime Impl: type) type {
             try server.post("/databases/:databaseName/namespaces/:namespaceName/tables/:tableName/indexes/:indexName", httpx.Handler.bind(self.impl, createNamespaceTableIndex));
             try server.delete("/databases/:databaseName/namespaces/:namespaceName/tables/:tableName/indexes/:indexName", httpx.Handler.bind(self.impl, dropNamespaceTableIndex));
             try server.post("/databases/:databaseName/namespaces/:namespaceName/tables/:tableName/indexes/:indexName/graph-metrics/:metricName::action", httpx.Handler.bind(self.impl, executeNamespaceTableGraphMetricAction));
+            try server.get("/databases/:databaseName/namespaces/:namespaceName/tables/:tableName/indexes/:indexName/publication", httpx.Handler.bind(self.impl, getNamespaceTableIndexPublication));
             try server.post("/databases/:databaseName/namespaces/:namespaceName/tables/:tableName/indexes/:indexName/repair", httpx.Handler.bind(self.impl, repairNamespaceIndex));
             try server.post("/databases/:databaseName/namespaces/:namespaceName/tables/:tableName/indexes/:indexName/retry", httpx.Handler.bind(self.impl, retryNamespaceIndex));
             try server.post("/databases/:databaseName/namespaces/:namespaceName/tables/:tableName/query", httpx.Handler.bind(self.impl, queryNamespaceTable));
@@ -1807,6 +1826,7 @@ pub fn ServerRouter(comptime Impl: type) type {
             try server.post("/tables/:tableName/indexes/:indexName", httpx.Handler.bind(self.impl, createIndex));
             try server.delete("/tables/:tableName/indexes/:indexName", httpx.Handler.bind(self.impl, dropIndex));
             try server.post("/tables/:tableName/indexes/:indexName/graph-metrics/:metricName::action", httpx.Handler.bind(self.impl, executeGraphMetricAction));
+            try server.get("/tables/:tableName/indexes/:indexName/publication", httpx.Handler.bind(self.impl, getIndexPublication));
             try server.post("/tables/:tableName/indexes/:indexName/repair", httpx.Handler.bind(self.impl, repairIndex));
             try server.post("/tables/:tableName/indexes/:indexName/retry", httpx.Handler.bind(self.impl, retryIndex));
             try server.get("/tables/:tableName/lake/catalog", httpx.Handler.bind(self.impl, getLakeCatalog));
@@ -2194,6 +2214,16 @@ pub fn ServerRouter(comptime Impl: type) type {
             const metric_name = ctx.param("metricName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: metricName" });
             const action = ctx.param("action") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: action" });
             return impl.executeNamespaceTableGraphMetricAction(ctx, database_name, namespace_name, table_name, index_name, metric_name, action);
+        }
+
+        /// Observe an exact index publication in an explicit namespace
+        /// GET /databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/indexes/{indexName}/publication
+        fn getNamespaceTableIndexPublication(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
+            const database_name = ctx.param("databaseName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: databaseName" });
+            const namespace_name = ctx.param("namespaceName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: namespaceName" });
+            const table_name = ctx.param("tableName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: tableName" });
+            const index_name = ctx.param("indexName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: indexName" });
+            return impl.getNamespaceTableIndexPublication(ctx, database_name, namespace_name, table_name, index_name);
         }
 
         /// Repair an index generation
@@ -2728,6 +2758,14 @@ pub fn ServerRouter(comptime Impl: type) type {
             return impl.executeGraphMetricAction(ctx, table_name, index_name, metric_name, action);
         }
 
+        /// Observe an exact index publication
+        /// GET /tables/{tableName}/indexes/{indexName}/publication
+        fn getIndexPublication(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
+            const table_name = ctx.param("tableName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: tableName" });
+            const index_name = ctx.param("indexName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: indexName" });
+            return impl.getIndexPublication(ctx, table_name, index_name);
+        }
+
         /// Repair an index generation
         /// POST /tables/{tableName}/indexes/{indexName}/repair
         fn repairIndex(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
@@ -3091,6 +3129,7 @@ pub fn ServerRouter(comptime Impl: type) type {
 //   fn createNamespaceTableIndex(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8, index_name: []const u8) !httpx.Response
 //   fn dropNamespaceTableIndex(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8, index_name: []const u8) !httpx.Response
 //   fn executeNamespaceTableGraphMetricAction(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8, index_name: []const u8, metric_name: []const u8, action: []const u8) !httpx.Response
+//   fn getNamespaceTableIndexPublication(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8, index_name: []const u8) !httpx.Response
 //   fn repairNamespaceIndex(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8, index_name: []const u8) !httpx.Response
 //   fn retryNamespaceIndex(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8, index_name: []const u8) !httpx.Response
 //   fn queryNamespaceTable(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8) !httpx.Response
@@ -3159,6 +3198,7 @@ pub fn ServerRouter(comptime Impl: type) type {
 //   fn createIndex(self: *Impl, ctx: *httpx.Context, table_name: []const u8, index_name: []const u8) !httpx.Response
 //   fn dropIndex(self: *Impl, ctx: *httpx.Context, table_name: []const u8, index_name: []const u8) !httpx.Response
 //   fn executeGraphMetricAction(self: *Impl, ctx: *httpx.Context, table_name: []const u8, index_name: []const u8, metric_name: []const u8, action: []const u8) !httpx.Response
+//   fn getIndexPublication(self: *Impl, ctx: *httpx.Context, table_name: []const u8, index_name: []const u8) !httpx.Response
 //   fn repairIndex(self: *Impl, ctx: *httpx.Context, table_name: []const u8, index_name: []const u8) !httpx.Response
 //   fn retryIndex(self: *Impl, ctx: *httpx.Context, table_name: []const u8, index_name: []const u8) !httpx.Response
 //   fn getLakeCatalog(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
