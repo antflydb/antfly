@@ -2,6 +2,8 @@
   "ledger_format": 1,
   "inventory_sha256": "c203a4dcf0094b75e1d3764e90beebddaf844a9ce604543c0a4dbc0ffe8ae173",
   "gates": {
+    "sql-original-table-creation-native-debug": {"command":["zig","build","antfly-api-sql-table-creation-test","-Doptimize=Debug","-j1"],"cwd":"zig","timeout_seconds":1800},
+    "sql-original-table-creation-postgres": {"command":["uv","run","--no-project","--with","psycopg[binary]==3.3.6","python","-m","unittest","discover","-s","scripts","-p","test_sql_table_creation_lifecycle.py"],"cwd":".","timeout_seconds":180},
     "sql-original-default-lifecycle-native-debug": {"command":["zig","build","antfly-api-sql-default-lifecycle-test","-Doptimize=Debug","-j1"],"cwd":"zig","timeout_seconds":1800},
     "sql-original-default-lifecycle-postgres": {"command":["uv","run","--no-project","--with","psycopg[binary]==3.3.6","python","-m","unittest","discover","-s","scripts","-p","test_sql_default_lifecycle.py"],"cwd":".","timeout_seconds":180},
     "sql-original-numeric-windows-native-debug": {"command":["zig","build","public-api-parity-test","-Doptimize=Debug","-j1","-Dtest-filter=httpx SQL PostgreSQL original numeric windows preserve exact averages and ordering","-Dtest-filter=SQL parity exact NUMERIC references reject lost bits scale and builtin identity"],"cwd":"zig","timeout_seconds":1800},
@@ -7058,8 +7060,12 @@
     },
     {
       "id": "sql-0671",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "Unchanged generated-column CREATE executes through real metadata/data owners. PostgreSQL verifies UUID/NUMERIC/JSONB identities, exact ordinary and RETURNING writes, generated expressions, explicit assignment rejection, primary-key enforcement and complete future mutation postimages. Native coverage additionally checks exact committed JSONB tokens, cold owner restart and bounded publication under neutral Raft churn without weakening final authority checks.",
+      "evidence": [
+        {"path":"zig/pkg/antfly/src/api/sql_table_creation_integration_test.zig","test":"mounted SQL original generated and casted tables own creation enforcement and restart","gate":"sql-original-table-creation-native-debug"},
+        {"path":"zig/pkg/antfly/src/api/sql_table_creation_integration_test.zig","test":"mounted SQL original generated and casted tables own creation enforcement and restart","gate":"sql-original-table-creation-postgres"}
+      ]
     },
     {
       "id": "sql-0672",
@@ -7092,8 +7098,12 @@
     },
     {
       "id": "sql-0675",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "Unchanged casted-default CREATE executes through real metadata/data owners with PostgreSQL UUID/NUMERIC/boolean identities, exact wide decimal values, omitted versus explicit NULL versus DEFAULT writes, primary-key rejection and full future mutation postimages. The persisted declaration and enforcement survive cold data-owner restart; no schema or primary key is preinstalled or weakened.",
+      "evidence": [
+        {"path":"zig/pkg/antfly/src/api/sql_table_creation_integration_test.zig","test":"mounted SQL original generated and casted tables own creation enforcement and restart","gate":"sql-original-table-creation-native-debug"},
+        {"path":"zig/pkg/antfly/src/api/sql_table_creation_integration_test.zig","test":"mounted SQL original generated and casted tables own creation enforcement and restart","gate":"sql-original-table-creation-postgres"}
+      ]
     },
     {
       "id": "sql-0676",

@@ -21,81 +21,10 @@ const fixture = @import("sql_owner_test_fixture.zig");
 const http = @import("../raft/transport/http_common.zig");
 const wire = @import("antfly_metadata_openapi").types;
 const server = @import("http_server.zig");
-const Retry = enum { never, read, write_admission };
-const Diagnostic = struct {
-    code: []const u8,
-    message: []const u8,
-    retryable: bool = false,
-    transaction_status: []const u8 = "",
-    transaction_id: ?[]const u8 = null,
-    mutation_outcome: ?[]const u8 = null,
-    admission_outcome: ?[]const u8 = null,
-    status: ?[]const u8 = null,
-};
-
-fn definiteReadAdmission(diagnostic: Diagnostic) bool {
-    return diagnostic.retryable and std.mem.eql(u8, diagnostic.code, "53300") and
-        std.mem.startsWith(u8, diagnostic.message, "A consistent SQL statement read is temporarily unavailable.") and
-        std.mem.eql(u8, diagnostic.transaction_status, "idle") and diagnostic.transaction_id == null and
-        diagnostic.mutation_outcome == null and diagnostic.admission_outcome == null and diagnostic.status == null;
-}
-
-test "SQL default lifecycle retries only definite read admission" {
-    const safe: Diagnostic = .{ .code = "53300", .message = "A consistent SQL statement read is temporarily unavailable. Retry the complete statement after a bounded delay.", .retryable = true, .transaction_status = "idle" };
-    try std.testing.expect(definiteReadAdmission(safe));
-    var changed = safe;
-    changed.message = "The requested write is not yet visible within the readiness budget.";
-    try std.testing.expect(!definiteReadAdmission(changed));
-    changed = safe;
-    changed.transaction_id = "invalid";
-    try std.testing.expect(!definiteReadAdmission(changed));
-    changed = safe;
-    changed.status = "committed_pending";
-    try std.testing.expect(!definiteReadAdmission(changed));
-    changed = safe;
-    changed.mutation_outcome = "committed";
-    try std.testing.expect(!definiteReadAdmission(changed));
-    changed = safe;
-    changed.admission_outcome = "unknown";
-    try std.testing.expect(!definiteReadAdmission(changed));
-    changed = safe;
-    changed.transaction_status = "failed";
-    try std.testing.expect(!definiteReadAdmission(changed));
-    changed = safe;
-    changed.retryable = false;
-    try std.testing.expect(!definiteReadAdmission(changed));
-}
+const executeMode = @import("sql_owner_test_client.zig").execute;
 
 fn execute(ctx: *fixture.Context, statement: []const u8) !http.HttpResponse {
     return executeMode(ctx, statement, .never);
-}
-
-fn executeMode(ctx: *fixture.Context, statement: []const u8, retry: Retry) !http.HttpResponse {
-    const body = try std.json.Stringify.valueAlloc(ctx.alloc, .{ .statement = statement }, .{});
-    defer ctx.alloc.free(body);
-    const deadline = platform.time.monotonicNs() +| 15 * std.time.ns_per_s;
-    while (true) {
-        try ctx.checkDrivers();
-        const remaining = deadline -| platform.time.monotonicNs();
-        if (remaining == 0) return error.DefaultLifecycleReadTimeout;
-        var response = try fixture.requestWithTimeout(ctx.alloc, ctx.transport, ctx.headers, ctx.base, "/db/v1/sql", .POST, body, @intCast(@max(1, remaining / std.time.ns_per_ms)));
-        // Only the explicit no-admission read failure can repeat a write's
-        // preparation. 53300 alone also covers post-commit visibility waits!
-        // Never replay DDL, admitted writes, or ambiguous/unknown outcomes.
-        if (retry != .never and response.status == 503) {
-            var diagnostic = std.json.parseFromSlice(Diagnostic, ctx.alloc, response.body, .{ .ignore_unknown_fields = true }) catch |err| {
-                response.deinit(ctx.alloc);
-                return err;
-            };
-            defer diagnostic.deinit();
-            if (definiteReadAdmission(diagnostic.value)) {
-                response.deinit(ctx.alloc);
-                try ctx.io.sleep(.fromMilliseconds(20), .awake);
-                continue;
-            }
-        }
-        return response;
-    }
 }
 
 fn command(ctx: *fixture.Context, statement: []const u8, creation: bool) !void {

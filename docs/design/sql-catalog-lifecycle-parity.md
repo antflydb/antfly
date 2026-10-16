@@ -9752,3 +9752,57 @@ semantic source equality. The existing exact applied-cut, source/job/root and
 capability checks must be retained or replaced by equally strong durable
 proof-input/namespace fencing with explicit adoption. Neither original receives
 new coverage credit until the complete gate is reliable.
+
+### Bounded publication progress and original CREATE qualification
+
+The publication timeout is now fixed at the shared metadata proof boundary.
+Source and candidate verification retain bounded progress across completely
+observed heartbeat/report commits. A private replica-local input-domain fence
+tracks committed watermarks under the apply lane; its closed typed whitelist
+contains only store heartbeat and report updates/baselines. Every other command,
+observation gap or implicit catalog-index rebuild invalidates reuse. Unknown
+standalone/import/repair mutations and namespace installation bracket commits
+with O(1) namespace invalidation. Opening a read also fences namespace races,
+including foreign mutations that leave the Raft watermark unchanged.
+
+This is a scheduling hint, not publication authority. Completed evidence is
+explicitly rebound to an observed exact applied cut only within the same input
+domain and with exact source/job/root checks. Publication retains its strict
+transactional applied-position and capability checks. There are no new durable
+keys, extra LSM writes, public ABI fields or production reporter activation.
+The pending reporter namespace-generation activation remains unenabled.
+
+The deterministic restore/source fixture applies a real heartbeat Raft commit
+between bounded proof pages and requires forward progress and completion. It
+also rejects an unknown same-watermark writer and checks standalone-heartbeat
+progress. Pure tests cover observation gaps, stale reads, namespace changes,
+backward watermarks and counter exhaustion. The final combined Debug gate passes
+47 selected tests, zero skips/failures/leaks and 91/91 build steps in
+`/private/tmp/antfly-sql-publication-input-fence-namespace-debug.log`.
+Ten further fresh-owner CREATE/restart runs pass in
+`/private/tmp/antfly-sql-create-final-soak-{1..10}.log`.
+
+Original sql-0671 and sql-0675 now have dedicated mounted-native and PostgreSQL
+oracle gates. CREATE is executed unchanged, exactly once, through public SQL
+with its declared primary key. Tests verify physical committed JSONB tokens,
+full ordinary/RETURNING postimages, generated-column assignment rejection,
+primary-key/NULL rejection, defaults and cold owner restart. Neither DDL retries,
+manual coverage adoption nor longer deadlines are used. The matching PostgreSQL
+18.6 oracle passes in
+`/private/tmp/antfly-sql-table-creation-ordinary-returning-oracle.log`.
+Counts are now 531 implemented / 132 rejected / 113 superseded / 810 unresolved.
+No quorum-failover, wholly lost-response recovery or broad activation completion
+is claimed by this cohort.
+
+Final review added the existing independent standby publication/restart and
+forged-effect rejection regression to the dedicated publication gate. The
+expanded combined gate passes all 48 selected tests with zero skips/failures/
+leaks and 91/91 build steps in
+`/private/tmp/antfly-sql-publication-standby-final-debug.log`. The full SQL Debug
+rerun passes 1,102 tests with four existing opt-in skips, zero failures/leaks
+and 21/21 steps in `/private/tmp/antfly-sql-create-publication-full-debug.log`.
+The final PostgreSQL oracle rerun passes both tests against 18.6 in
+`/private/tmp/antfly-sql-create-qualified-postgres.log`. All 20 inventory-checker
+unit tests, staged license headers, scoped Python checks, Zig formatting,
+whitespace and the 2,062-file Apache-boundary audit pass. Unrelated edits remain
+unstaged; the checkpoint is local and unpushed.

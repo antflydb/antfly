@@ -2158,7 +2158,24 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     // own runtime campaign and independently requires no skips.
     const sql_owner_lifecycle_tests = b.addTest(.{
         .root_module = sql_owner_lifecycle_test_mod,
-        .filters = &.{ "mounted SQL ADD PRIMARY KEY publishes only validated fresh generation", "mounted SQL original unique indexes enforce exact postimages across owner restart", "mounted SQL regular unique index build failure is atomic", "mounted SQL original column defaults preserve old rows and recover future mutation semantics", "schema publication acknowledgement accepts only exact deterministic finalization", "table definition stamp distinguishes rejection from post-admission ambiguity", "SQL unknown mutation keeps native reconciliation receipt without allocation", "SQL default lifecycle retries only definite read admission" },
+        .filters = &.{
+            "mounted SQL ADD PRIMARY KEY publishes only validated fresh generation",
+            "mounted SQL original unique indexes enforce exact postimages across owner restart",
+            "mounted SQL regular unique index build failure is atomic",
+            "mounted SQL original column defaults preserve old rows and recover future mutation semantics",
+            "schema publication acknowledgement accepts only exact deterministic finalization",
+            "table definition stamp distinguishes rejection from post-admission ambiguity",
+            "SQL unknown mutation keeps native reconciliation receipt without allocation",
+            "SQL default lifecycle retries only definite read admission",
+            "mounted SQL original generated and casted tables own creation enforcement and restart",
+            "raft batch round trips",
+            "raft protocol barrier",
+            "relation publication fence",
+            "relation reconciliation worker",
+            "system catalog restore reconciliation authenticates source phases and canonical physical aliases",
+            "system catalog relation namespace transaction occupancy restore authenticates typed memberships across native fault paths",
+            "system catalog relation namespace transaction standby independently adopts publications resumes after restart and rejects forged effects",
+        },
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
         .max_rss = @as(usize, if (target.result.os.tag == .macos) 12 else 7) * 1024 * 1024 * 1024,
     });
@@ -2181,6 +2198,21 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const sql_schema_ack_run = addFilteredTestRunArtifactWithRuntimeFilters(b, sql_owner_lifecycle_tests, &.{ "schema publication acknowledgement accepts only exact deterministic finalization", "table definition stamp distinguishes rejection from post-admission ambiguity", "SQL unknown mutation keeps native reconciliation receipt without allocation", "SQL default lifecycle retries only definite read admission" });
     sql_schema_ack_run.addArg("--require-no-skips");
     sql_default_lifecycle_step.dependOn(&sql_schema_ack_run.step);
+    const sql_table_creation_run = addFilteredTestRunArtifactWithRuntimeFilters(b, sql_owner_lifecycle_tests, &.{"mounted SQL original generated and casted tables own creation enforcement and restart"});
+    sql_table_creation_run.addArg("--require-no-skips");
+    const sql_table_creation_step = b.step("antfly-api-sql-table-creation-test", "Run original generated/default table creation, primary-key enforcement and cold owner restart");
+    sql_table_creation_step.dependOn(&sql_table_creation_run.step);
+    sql_table_creation_step.dependOn(&sql_schema_ack_run.step);
+    const sql_batch_transport_run = addFilteredTestRunArtifactWithRuntimeFilters(b, sql_owner_lifecycle_tests, &.{ "raft batch round trips", "raft protocol barrier" });
+    sql_batch_transport_run.addArg("--require-no-skips");
+    sql_table_creation_step.dependOn(&sql_batch_transport_run.step);
+    b.step("antfly-api-sql-batch-transport-test", "Run exact-number Raft envelopes, ownership, allocation failures and protocol barriers")
+        .dependOn(&sql_batch_transport_run.step);
+    const sql_publication_progress_run = addFilteredTestRunArtifactWithRuntimeFilters(b, sql_owner_lifecycle_tests, &.{ "relation publication fence", "relation reconciliation worker", "system catalog restore reconciliation authenticates source phases and canonical physical aliases", "system catalog relation namespace transaction occupancy restore authenticates typed memberships across native fault paths", "system catalog relation namespace transaction standby independently adopts publications resumes after restart and rejects forged effects" });
+    sql_publication_progress_run.addArg("--require-no-skips");
+    sql_table_creation_step.dependOn(&sql_publication_progress_run.step);
+    b.step("antfly-api-sql-publication-progress-test", "Run bounded catalog publication under unrelated apply churn with strict mutation and namespace fencing")
+        .dependOn(&sql_publication_progress_run.step);
     const hosted_initial_fk_test_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/api_hosted_initial_fk_test_root.zig"),
         .target = target,

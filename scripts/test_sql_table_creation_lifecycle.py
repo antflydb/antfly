@@ -143,20 +143,38 @@ class TableCreationTest(unittest.TestCase):
                     oids, [column.type_code for column in db.execute(query).description]
                 )
             for index, row in enumerate(inputs["inputs"]):
-                inserted = db.execute(
+                statement = (
                     "INSERT INTO generated_expr_records(id,status,amount,fee,metadata) "
-                    "VALUES(%s::uuid,%s,%s::numeric,%s::numeric,%s::jsonb) "
-                    "RETURNING id::text AS id,status,amount::text AS amount,fee::text AS fee,"
-                    "metadata::text AS metadata,status_slug,amount_cents::text AS amount_cents,source_key",
-                    (
-                        row["id"],
-                        row["status"],
-                        row["amount"],
-                        row["fee"],
-                        row["metadata_json"],
-                    ),
+                    "VALUES(%s::uuid,%s,%s::numeric,%s::numeric,%s::jsonb)"
                 )
-                self.assertEqual([GENERATED_INITIAL[index]], inserted.fetchall())
+                parameters = (
+                    row["id"],
+                    row["status"],
+                    row["amount"],
+                    row["fee"],
+                    row["metadata_json"],
+                )
+                expected = GENERATED_INITIAL[index]
+                if index == 0:
+                    db.execute(statement, parameters)
+                    extra_id = "00000000-0000-0000-0000-000000000004"
+                    parameters = (extra_id,) + parameters[1:]
+                    expected = (extra_id,) + expected[1:]
+                inserted = db.execute(
+                    statement
+                    + " RETURNING id::text AS id,status,amount::text AS amount,fee::text AS fee,"
+                    "metadata::text AS metadata,status_slug,amount_cents::text AS amount_cents,source_key",
+                    parameters,
+                )
+                self.assertEqual([expected], inserted.fetchall())
+                if index == 0:
+                    self.assertEqual(
+                        "DELETE 1",
+                        db.execute(
+                            "DELETE FROM generated_expr_records WHERE id=%s::uuid",
+                            (extra_id,),
+                        ).statusmessage,
+                    )
             db.execute(
                 "INSERT INTO casted_defaults(id) VALUES('00000000-0000-0000-0000-000000000001')"
             )

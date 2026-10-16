@@ -42,7 +42,8 @@ pub const publication_snapshot_lifetime_ns = 60 * std.time.ns_per_s;
 /// Scan is injected so resource ownership and scheduling are fault-testable.
 pub fn PublicationPreparation(comptime Scan: type, comptime Proof: type) type {
     return struct {
-        const Cut = struct { state: r.State, root: ?r.Generation, fence: u64 };
+        pub const Fence = if (@hasDecl(Scan, "Fence")) Scan.Fence else u64;
+        const Cut = struct { state: r.State, root: ?r.Generation, fence: Fence };
         cut: ?Cut = null,
         scan: ?*Scan = null,
         proof: ?Proof = null,
@@ -81,9 +82,10 @@ pub fn PublicationPreparation(comptime Scan: type, comptime Proof: type) type {
         pub fn step(self: *@This(), host: anytype, work: r.Work, leader: Leader, now_ns: u64) !bool {
             return self.stepAtFence(host, work, leader.term, now_ns);
         }
-        /// Leaders fence by term; replica-local preparation fences by the
-        /// pinned applied-log position. Both also bind the exact source/root.
-        pub fn stepAtFence(self: *@This(), host: anytype, work: r.Work, fence: u64, now_ns: u64) !bool {
+        /// Leaders fence by term; replica-local preparation uses its observed
+        /// input domain or strict applied-position fallback. Both also bind
+        /// the exact source/root; final publication authority stays separate.
+        pub fn stepAtFence(self: *@This(), host: anytype, work: r.Work, fence: Fence, now_ns: u64) !bool {
             const state = work.current orelse {
                 self.cancel();
                 return false;
@@ -182,7 +184,7 @@ pub fn PublicationProofPool(comptime Scan: type, comptime Proof: type, comptime 
             };
             if (failure) |err| return err;
         }
-        pub fn step(self: *@This(), io: std.Io, host: anytype, work: r.Work, applied_index: u64, now_ns: u64) !?Proof {
+        pub fn step(self: *@This(), io: std.Io, host: anytype, work: r.Work, fence: ScanPreparation.Fence, now_ns: u64) !?Proof {
             if (!self.lane.tryLock()) return error.ResourceTemporarilyUnavailable;
             defer self.lane.unlock(io);
             if (self.closed) return error.CatalogPublicationScanClosed;
@@ -208,7 +210,7 @@ pub fn PublicationProofPool(comptime Scan: type, comptime Proof: type, comptime 
                 self.slots[index] = .{ .group = state.group_id, .used_at_ns = now_ns };
             }
             const slot = &self.slots[index].?;
-            if (slot.preparation.cut) |cut| if (cut.fence != applied_index or !std.meta.eql(cut.state, state) or !std.meta.eql(cut.root, work.root)) {
+            if (slot.preparation.cut) |cut| if (!std.meta.eql(cut.fence, fence) or !std.meta.eql(cut.state, state) or !std.meta.eql(cut.root, work.root)) {
                 slot.preparation.cancel();
             };
             slot.used_at_ns = now_ns;
@@ -219,7 +221,7 @@ pub fn PublicationProofPool(comptime Scan: type, comptime Proof: type, comptime 
                 };
                 if (active == max_scans) return error.ResourceTemporarilyUnavailable;
             }
-            _ = try slot.preparation.stepAtFence(host, work, applied_index, now_ns);
+            _ = try slot.preparation.stepAtFence(host, work, fence, now_ns);
             if (slot.preparation.stopped) return error.InvalidCatalogRecord;
             return slot.preparation.proof;
         }

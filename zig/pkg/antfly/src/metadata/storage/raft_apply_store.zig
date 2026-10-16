@@ -30,6 +30,7 @@ const relation_names = @import("antfly_local_sources").system_catalog_relation_n
 const relation_reconciliation = @import("antfly_local_sources").system_catalog_relation_reconciliation;
 const relation_control = @import("../relation_reconciliation_command.zig");
 const relation_worker = @import("../relation_reconciliation_worker.zig");
+const publication_fence = @import("../relation_publication_fence.zig");
 const command_journal = @import("command_journal.zig");
 const sql_settings = @import("antfly_local_sources").system_catalog_settings;
 const sql_policies = @import("antfly_local_sources").system_catalog_policies;
@@ -6857,7 +6858,7 @@ test "relational index publication admission reserves names atomically and survi
             defer guard.deinit();
             const before = try RaftApplyStore.relationSourceEpochTxn(&txn, group);
             const entries = [_]raft_state_machine.DecodedCommittedEntry{.{ .term = 1, .index = 1, .entry_type = .normal, .data = encoded }};
-            try store.projectEntriesTxn(&txn, group, &entries, 0);
+            _ = try store.projectEntriesTxn(&txn, group, &entries, 0);
             try std.testing.expect(before.eql(try RaftApplyStore.relationSourceEpochTxn(&txn, group)));
             const head = try index_publication.verifyJob(a, &txn, group, plan.before.table_id);
             try std.testing.expectEqual(@as(u64, 1), head.revision);
@@ -11970,6 +11971,67 @@ fn exerciseRestoreReconciliationCoverage(coverage: relation_reconciliation.Cover
         try std.testing.expectError(error.InvalidCatalogRecord, RaftApplyStore.prepareRelationPublicationProofTxn(a, &txn, ready));
         try std.testing.expect(try proof.matchesTxn(&txn)); // Scalar fences alone are insufficient.
     };
+    {
+        const Heartbeat = struct {
+            fn apply(owner: *RaftApplyStore, alloc: std.mem.Allocator, metadata_group: u64, index: u64) !void {
+                const wire = try encodeTransitionCommand(alloc, .{ .upsert_store_heartbeat = .{
+                    .store_id = 20,
+                    .node_id = 30,
+                    .reporter_incarnation = 77,
+                    .status_generation = 1,
+                    .available_bytes = index,
+                } });
+                defer alloc.free(wire);
+                const entries = try raft_state_machine.encodeCommittedEntries(alloc, &.{.{ .term = 1, .index = index, .entry_type = .normal, .data = wire }});
+                defer alloc.free(entries);
+                var outcome = try owner.applyCommittedBatch(metadata_group, index, entries);
+                defer outcome.deinit();
+            }
+        };
+        try store.applyStandaloneCommand(group, .{ .register_store = .{ .store_id = 20, .node_id = 30, .reporter_incarnation = 77, .status_generation = 1 } });
+        var index = try store.durableAppliedIndex(group) + 1;
+        try Heartbeat.apply(&store, a, group, index);
+        try store.cancelRelationPublicationProof(group);
+        try std.testing.expect((try store.stepRelationPublicationProof(ready, index)) == null);
+        index += 1;
+        try Heartbeat.apply(&store, a, group, index);
+        try std.testing.expect((try store.stepRelationPublicationProof(ready, index)) == null);
+        for (store.relation_publication_pool.slots) |slot| if (slot) |value| if (value.group == group) {
+            const progress = value.preparation.scan.?.verifier.state;
+            try std.testing.expect(progress.phase != .verifying_source or progress.pass.rows > 64);
+        };
+        var finished: ?RaftApplyStore.RelationPublicationProof = null;
+        for (0..32) |_| {
+            index += 1;
+            try Heartbeat.apply(&store, a, group, index);
+            if (try store.stepRelationPublicationProof(ready, index)) |complete| {
+                finished = complete;
+                break;
+            }
+        }
+        const complete = finished orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqual(index, complete.applied_index);
+        {
+            var read = try store.store.beginReadTxn();
+            defer read.abort();
+            try std.testing.expect(try complete.matchesTxn(&read));
+        }
+        // A non-Raft writer breaks adoption even without a changed applied
+        // watermark or semantic source epoch. No native activation is added.
+        try store.applyStandaloneCommand(group, .{ .upsert_store = .{ .store_id = 20, .node_id = 30, .reporter_incarnation = 77, .status_generation = 1 } });
+        try std.testing.expect(!store.relationProofTracking(group).canAdopt(complete.fence.?, index, index));
+        try std.testing.expect((try store.stepRelationPublicationProof(ready, index + 1)) == null);
+        var standalone_finished = false;
+        for (0..32) |round| {
+            try store.applyStandaloneCommand(group, .{ .upsert_store_heartbeat = .{ .store_id = 20, .node_id = 30, .reporter_incarnation = 77, .status_generation = 1, .available_bytes = round } });
+            if (try store.stepRelationPublicationProof(ready, index + 2 + round)) |standalone_proof| {
+                try std.testing.expectEqual(index, standalone_proof.applied_index);
+                standalone_finished = true;
+                break;
+            }
+        }
+        try std.testing.expect(standalone_finished);
+    }
     for ([_]bool{ false, true }) |epoch_change| {
         const baseline = try store.prepareRelationPublicationProof(a, ready);
         var pool_time: u64 = 0;
@@ -14541,6 +14603,10 @@ pub const RaftApplyStore = struct {
     next_lifecycle_listener_registration_id: u64 = 1,
     apply_mutex: std.Io.Mutex = .init,
     relation_publication_pool: RelationPublicationPool = .{},
+    relation_tracking_mutex: std.Io.Mutex = .init,
+    relation_tracking: std.AutoHashMapUnmanaged(u64, publication_fence.State) = .empty,
+    relation_tracking_generation: u64 = 1,
+    relation_tracking_enabled: bool = true,
     standby_probe_mutex: std.Io.Mutex = .init,
     standby_probe: ?StandbyRelationProbe = null,
     active_outcome: ?*CommittedApplyOutcome = null,
@@ -14614,6 +14680,7 @@ pub const RaftApplyStore = struct {
 
     pub fn deinit(self: *RaftApplyStore) void {
         self.relation_publication_pool.deinit(self.io_impl.io());
+        self.relation_tracking.deinit(self.alloc);
         self.checkpoints.deinit(self.alloc);
         self.verified_catalog_groups.deinit(self.alloc);
         for (self.projected_placement_intents.items) |*entry| freePlacementIntent(self.alloc, entry.intent);
@@ -15189,6 +15256,7 @@ pub const RaftApplyStore = struct {
         if (!current_timeline or frame.index != pending.next or record.lsn <= pending.last_lsn) return error.MetadataHAChunkSequenceGap;
         if (publication) |verified| {
             if (!try verified.proof.matchesTxn(&txn)) return error.CatalogPublicationProofPending;
+            if (verified.proof.fence) |fence| if (!self.relationProofTracking(descriptor.group_id).canAdopt(fence, verified.proof.applied_index, verified.proof.applied_index)) return error.CatalogPublicationProofPending;
             if (!std.meta.eql(verified.activation, try self.standbyRelationActivationTxn(&txn, descriptor.group_id, relation_control.publicationVersion(verified.proof.state.coverage))))
                 return error.TableTopologyProtocolUpgradeRequired;
         }
@@ -15366,7 +15434,7 @@ pub const RaftApplyStore = struct {
                 offset += length;
                 batch_bytes += bytes.len;
             }
-            try txn.commit();
+            try self.commitUntrackedRelationTxn(&txn);
             committed = true;
         }
         var extra: [1]u8 = undefined;
@@ -15577,7 +15645,7 @@ pub const RaftApplyStore = struct {
         });
         try self.stageStandaloneHotStandby(&txn, &capture, group_id);
         try self.checkHotStandby();
-        try self.commitStandaloneTxn(&txn, &outcome, &committed);
+        try self.commitStandaloneTxnWithImpact(&txn, &outcome, &committed, relationProofNeutralCommand(command));
         self.unlockHotStandbyTransition();
         transition_locked = false;
         try self.flushHotStandbyOutboxLocked();
@@ -15884,11 +15952,21 @@ pub const RaftApplyStore = struct {
         self.flushHotStandbyOutboxLocked() catch return error.MetadataReplicationPending;
     }
 
+    fn commitUntrackedRelationTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn) !void {
+        self.invalidateRelationProofTracking();
+        defer self.invalidateRelationProofTracking();
+        try txn.commit();
+    }
+
     fn commitStandaloneTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, outcome: *CommittedApplyOutcome, committed: *bool) !void {
+        return self.commitStandaloneTxnWithImpact(txn, outcome, committed, false);
+    }
+
+    fn commitStandaloneTxnWithImpact(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, outcome: *CommittedApplyOutcome, committed: *bool, neutral: bool) !void {
         if (outcome.failure) |err| return err;
         self.beginProjectionCommitBarriers(outcome);
         defer self.endProjectionCommitBarriers(outcome);
-        try txn.commit();
+        if (neutral) try txn.commit() else try self.commitUntrackedRelationTxn(txn);
         committed.* = true;
         self.active_outcome = null;
         self.dispatchCommittedOutcome(outcome);
@@ -21044,7 +21122,7 @@ pub const RaftApplyStore = struct {
                 else => return err,
             };
             _ = try self.ensureDerivedCatalogIndexesTxn(&txn, group_id);
-            try txn.commit();
+            try self.commitUntrackedRelationTxn(&txn);
             finished = true;
         }
         self.verified_catalog_groups.putAssumeCapacity(group_id, {});
@@ -21059,7 +21137,7 @@ pub const RaftApplyStore = struct {
         defer if (!finished) txn.abort();
         const rebuilt = try self.ensureDerivedCatalogIndexesTxn(&txn, group_id);
         if (rebuilt) {
-            try txn.commit();
+            try self.commitUntrackedRelationTxn(&txn);
         } else {
             txn.abort();
         }
@@ -21082,7 +21160,7 @@ pub const RaftApplyStore = struct {
         // evaluation, while this mutation is the production repair itself.
         if (!try self.ensureDerivedCatalogIndexesTxn(&txn, group_id))
             return error.InvalidDerivedCatalogIndex;
-        try txn.commit();
+        try self.commitUntrackedRelationTxn(&txn);
         finished = true;
     }
 
@@ -23608,6 +23686,8 @@ pub const RaftApplyStore = struct {
         defer alloc.free(deletes);
         for (existing, 0..) |row, i| deletes[i] = row.key;
         for (derived_existing, existing.len..) |row, i| deletes[i] = row.key;
+        self.invalidateRelationProofTracking();
+        defer self.invalidateRelationProofTracking();
         try self.store.putBatch(writes, deletes);
         _ = self.verified_catalog_groups.remove(group_id);
 
@@ -23871,6 +23951,7 @@ pub const RaftApplyStore = struct {
         };
         try self.checkpoints.ensureUnusedCapacity(self.alloc, 1);
         std.debug.assert(self.active_outcome == null);
+        try self.prepareRelationProofObservation(group_id);
         var outcome = CommittedApplyOutcome{
             .alloc = self.alloc,
             .collect_transition_deltas = collect_transition_deltas,
@@ -23882,6 +23963,7 @@ pub const RaftApplyStore = struct {
         var key_buf: [128]u8 = undefined;
         const key = try keyForGroup(&key_buf, group_id);
         try txn.put(key, &value);
+        var proof_neutral = false;
         {
             std.debug.assert(self.active_relation_page == null);
             self.active_relation_page = if (prepared.page) |*page| page else null;
@@ -23897,7 +23979,7 @@ pub const RaftApplyStore = struct {
             self.active_relation_initial_index = applied_index;
             defer self.active_relation_publication = null;
             defer self.active_relation_initial_index = null;
-            try self.projectEntriesTxn(&txn, group_id, decoded, applied_index);
+            proof_neutral = try self.projectEntriesTxn(&txn, group_id, decoded, applied_index);
         }
         if (outcome.failure) |err| return err;
         const extension_changed = for (outcome.committed_keys.items) |changed| {
@@ -23923,6 +24005,7 @@ pub const RaftApplyStore = struct {
         try txn.commit();
         committed = true;
 
+        self.observeRelationProofCommit(group_id, applied_index, commit_index, proof_neutral);
         self.checkpoints.putAssumeCapacity(group_id, checkpoint);
         outcome_guard.release();
         self.dispatchCommittedOutcome(&outcome);
@@ -23994,13 +24077,21 @@ pub const RaftApplyStore = struct {
         return false;
     }
 
-    fn projectEntriesTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group_id: u64, decoded: []const raft_state_machine.DecodedCommittedEntry, applied_index: u64) !void {
-        _ = try self.ensureDerivedCatalogIndexesTxn(txn, group_id);
+    fn projectEntriesTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group_id: u64, decoded: []const raft_state_machine.DecodedCommittedEntry, applied_index: u64) !bool {
+        var neutral = !try self.ensureDerivedCatalogIndexesTxn(txn, group_id);
 
         for (decoded) |entry| {
-            if (entry.index <= applied_index or entry.entry_type != .normal) continue;
-            var command = (try decodeTransitionCommand(self.alloc, entry.data)) orelse continue;
+            if (entry.index <= applied_index) continue;
+            if (entry.entry_type != .normal) {
+                neutral = false;
+                continue;
+            }
+            var command = (try decodeTransitionCommand(self.alloc, entry.data)) orelse {
+                neutral = false;
+                continue;
+            };
             defer command.deinit(self.alloc);
+            if (!relationProofNeutralCommand(command)) neutral = false;
             self.applyTransitionCommandTxn(txn, group_id, command) catch |err| {
                 // A stale index guard/head is an expected losing CAS, not a
                 // partially applied job. Only the adopted namespace path can
@@ -24027,6 +24118,7 @@ pub const RaftApplyStore = struct {
                 return err;
             };
         }
+        return neutral;
     }
 
     fn applyTransitionCommandTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group_id: u64, command: TransitionCommand) anyerror!void {
@@ -24126,6 +24218,7 @@ pub const RaftApplyStore = struct {
                 // comparing against the new watermark would reject every cut.
                 const initial = self.active_relation_initial_index orelse try durableAppliedIndexTxn(txn, group_id);
                 if (initial != proof.applied_index or !try proof.matchesSourceTxn(txn)) return error.CatalogGenerationChanged;
+                if (proof.fence) |fence| if (!self.relationProofTracking(group_id).canAdopt(fence, proof.applied_index, initial)) return error.CatalogGenerationChanged;
                 const prior = if (try stagingGet(txn, try relation_reconciliation.liveKey(&buf, group_id))) |live_bytes| try relation_reconciliation.LiveRoot.decode(live_bytes) else null;
                 _ = try relation_reconciliation.publishVerifiedRoot(txn, request.state, try relationSourceEpochTxn(txn, group_id), prior);
                 try txn.put(try relationWriterKeyForGroup(&buf, group_id), "AFRW01");
@@ -24263,6 +24356,57 @@ pub const RaftApplyStore = struct {
         return prepareRelationReconciliationPageTxn(a, &read, expected);
     }
 
+    fn prepareRelationProofObservation(self: *RaftApplyStore, group: u64) !void {
+        const io = self.io_impl.io();
+        self.relation_tracking_mutex.lockUncancelable(io);
+        defer self.relation_tracking_mutex.unlock(io);
+        const entry = try self.relation_tracking.getOrPut(self.alloc, group);
+        if (!entry.found_existing) entry.value_ptr.* = .{ .generation = self.relation_tracking_generation, .enabled = self.relation_tracking_enabled };
+    }
+
+    fn relationProofTracking(self: *RaftApplyStore, group: u64) publication_fence.State {
+        const io = self.io_impl.io();
+        self.relation_tracking_mutex.lockUncancelable(io);
+        defer self.relation_tracking_mutex.unlock(io);
+        if (self.relation_tracking_enabled) if (self.relation_tracking.get(group)) |state| {
+            if (state.generation == self.relation_tracking_generation) return state;
+        };
+        return .{ .generation = self.relation_tracking_generation, .enabled = self.relation_tracking_enabled };
+    }
+
+    fn observeRelationProofCommit(self: *RaftApplyStore, group: u64, before: u64, after: u64, neutral: bool) void {
+        const io = self.io_impl.io();
+        self.relation_tracking_mutex.lockUncancelable(io);
+        defer self.relation_tracking_mutex.unlock(io);
+        const state = self.relation_tracking.getPtr(group).?;
+        if (state.generation != self.relation_tracking_generation or !self.relation_tracking_enabled)
+            state.* = .{ .generation = self.relation_tracking_generation, .enabled = self.relation_tracking_enabled };
+        state.observe(before, after, neutral);
+    }
+
+    fn invalidateRelationProofTracking(self: *RaftApplyStore) void {
+        const io = self.io_impl.io();
+        self.relation_tracking_mutex.lockUncancelable(io);
+        defer self.relation_tracking_mutex.unlock(io);
+        self.relation_tracking_generation = std.math.add(u64, self.relation_tracking_generation, 1) catch exhausted: {
+            self.relation_tracking_enabled = false;
+            break :exhausted self.relation_tracking_generation;
+        };
+        // Namespace invalidation is O(1), independent of hosted group count.
+        // Each group starts a fresh observation domain lazily on its next use.
+    }
+
+    fn relationProofNeutralCommand(command: TransitionCommand) bool {
+        // One closed whitelist shared by native and standalone application.
+        // These commands never mutate tables, initial-FK/restore sources,
+        // candidates, seals or roots. Their independent runtime/storage
+        // capability floors do not replace final publication capability checks.
+        return switch (command) {
+            .upsert_store_heartbeat, .apply_store_report_update, .apply_store_report_baseline => true,
+            else => false,
+        };
+    }
+
     /// Complete source/candidate proof prepared outside the serialized apply
     /// section. This is not publication authority: the eventual publisher must
     /// also fence protocol capability and every producer's writer lifecycle.
@@ -24270,6 +24414,7 @@ pub const RaftApplyStore = struct {
         state: relation_reconciliation.State,
         applied_index: u64,
         root: ?relation_reconciliation.Generation,
+        fence: ?publication_fence.Cut = null,
 
         /// Call in the publishing write transaction. All intervening metadata
         /// application invalidates this local proof, including another page or
@@ -24291,8 +24436,9 @@ pub const RaftApplyStore = struct {
     };
 
     // Keep completed cuts separately from expensive source/restore snapshots.
-    // Replica-local evidence survives leadership changes, but never a changed
-    // applied position, source epoch, ready seal or root identity.
+    // Replica-local scans may span completely observed neutral commits. A
+    // completed scan still needs explicit adoption at the current exact apply
+    // cut; no source/job/root/capability authority is inferred from this cache.
     pub const RelationPublicationPool = relation_worker.PublicationProofPool(RelationPublicationScan, RelationPublicationProof, 8, 2);
 
     fn prepareRequestedRelationPublication(self: *RaftApplyStore, request: relation_control.Publication) !?RelationPublicationProof {
@@ -24319,6 +24465,7 @@ pub const RaftApplyStore = struct {
     pub fn stepRelationPublicationProof(self: *RaftApplyStore, expected: relation_reconciliation.State, now_ns: u64) !?RelationPublicationProof {
         _ = try expected.encode();
         if (expected.phase != .ready or expected.failure != .none) return error.InvalidCatalogRecord;
+        const namespace_before = self.relationProofTracking(expected.group_id).generation;
         var read = try self.store.beginReadTxn();
         defer read.abort();
         const observed = try PreparedRelationBatch.capture(&read, expected.group_id);
@@ -24332,15 +24479,28 @@ pub const RaftApplyStore = struct {
             pub fn beginPublicationScan(self_host: *@This(), state: relation_reconciliation.State) !*RelationPublicationScan {
                 const scan = try self_host.store.beginRelationPublicationScan(self_host.store.alloc, state);
                 errdefer scan.deinit();
-                // The pool observation and owned scan use different reads.
-                // Never attach a newer snapshot to an older cached fence.
-                if (!std.meta.eql(scan.verifier.proof, self_host.cut)) return error.CatalogGenerationChanged;
+                // Different reads may straddle observed neutral commits, but
+                // never an unknown mutation, source cut or namespace change.
+                const proof = scan.verifier.proof;
+                if (!std.meta.eql(proof.state, self_host.cut.state) or !std.meta.eql(proof.root, self_host.cut.root) or
+                    !std.meta.eql(proof.fence, self_host.cut.fence) or
+                    !self_host.store.relationProofTracking(state.group_id).canAdopt(self_host.cut.fence orelse return error.CatalogGenerationChanged, self_host.cut.applied_index, proof.applied_index)) return error.CatalogGenerationChanged;
                 return scan;
             }
         };
-        var host: Host = .{ .store = self, .cut = .{ .state = expected, .applied_index = observed.applied_index, .root = observed.root } };
+        const tracking = self.relationProofTracking(expected.group_id);
+        if (tracking.generation != namespace_before) return error.CatalogGenerationChanged;
+        const fence = tracking.capture(observed.applied_index);
+        var host: Host = .{ .store = self, .cut = .{ .state = expected, .applied_index = observed.applied_index, .root = observed.root, .fence = fence } };
         const work: relation_reconciliation.Work = .{ .epoch = observed.epoch, .current = observed.job, .root = observed.root };
-        return self.relation_publication_pool.step(self.io_impl.io(), &host, work, observed.applied_index, now_ns);
+        const cached = (try self.relation_publication_pool.step(self.io_impl.io(), &host, work, fence, now_ns)) orelse return null;
+        if (!self.relationProofTracking(expected.group_id).canAdopt(cached.fence orelse return error.CatalogGenerationChanged, cached.applied_index, observed.applied_index) or
+            !try cached.matchesSourceTxn(&read)) return error.CatalogGenerationChanged;
+        // This new certificate, not the cached base cut, enters proposal/apply.
+        // Unknown writes and namespace changes cannot be adopted by equality.
+        var adopted = cached;
+        adopted.applied_index = observed.applied_index;
+        return adopted;
     }
     pub fn cancelRelationPublicationProof(self: *RaftApplyStore, group: u64) !void {
         try self.relation_publication_pool.cancel(self.io_impl.io(), group);
@@ -24375,6 +24535,7 @@ pub const RaftApplyStore = struct {
     /// bound the scan lifetime too: an idle snapshot can retain engine pages.
     /// Completion, cancellation and errors release the snapshot immediately.
     pub const RelationPublicationScan = struct {
+        pub const Fence = publication_fence.Cut;
         a: std.mem.Allocator,
         owner: *RaftApplyStore,
         read: docstore.DocStore.Txn,
@@ -24394,8 +24555,8 @@ pub const RaftApplyStore = struct {
             self.open = false;
         }
         /// Release a long-lived engine snapshot without restarting verified
-        /// pages. Renewal is allowed only at the exact original metadata cut;
-        /// a changed apply position is not rebased from semantic equality.
+        /// pages. Renewal may cross completely observed neutral commits, never
+        /// a changed input domain or merely equivalent semantic source state.
         /// Any failure closes the handle, just like a failed page step.
         pub fn renew(self: *@This()) !void {
             if (self.proof != null) return;
@@ -24409,7 +24570,9 @@ pub const RaftApplyStore = struct {
             var next = try self.owner.store.beginReadTxn();
             var owned = true;
             defer if (owned) next.abort();
-            if (!try self.verifier.proof.matchesTxn(&next)) return error.CatalogGenerationChanged;
+            const applied = try durableAppliedIndexTxn(&next, self.verifier.proof.state.group_id);
+            if (!self.owner.relationProofTracking(self.verifier.proof.state.group_id).canAdopt(self.verifier.proof.fence orelse return error.CatalogGenerationChanged, self.verifier.proof.applied_index, applied) or
+                !try self.verifier.proof.matchesSourceTxn(&next)) return error.CatalogGenerationChanged;
             // Verify first, then close every old cursor/decoded source before
             // releasing its snapshot. Resume uses owned lexical state/totals,
             // never an engine pointer or a lookahead from the previous page.
@@ -24443,11 +24606,18 @@ pub const RaftApplyStore = struct {
     };
 
     pub fn beginRelationPublicationScan(self: *RaftApplyStore, a: std.mem.Allocator, expected: relation_reconciliation.State) !*RelationPublicationScan {
+        const namespace_before = self.relationProofTracking(expected.group_id).generation;
         const scan = try a.create(RelationPublicationScan);
         errdefer a.destroy(scan);
         scan.* = .{ .a = a, .owner = self, .read = try self.store.beginReadTxn(), .verifier = undefined };
         errdefer scan.read.abort();
         try scan.verifier.init(a, &scan.read, expected);
+        errdefer scan.verifier.deinit();
+        const tracking = self.relationProofTracking(expected.group_id);
+        // Never attach a newer namespace fence to an older immutable read,
+        // even when foreign mutation leaves the Raft watermark unchanged.
+        if (tracking.generation != namespace_before) return error.CatalogGenerationChanged;
+        scan.verifier.proof.fence = tracking.capture(scan.verifier.proof.applied_index);
         return scan;
     }
 
