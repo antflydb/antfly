@@ -15,18 +15,17 @@
 
 """Native graph access-path and staged SQL regression campaigns."""
 
-import os
 import json
-import conftest
+import os
 import subprocess
 import sys
 import time
 import uuid
 from pathlib import Path
 
+import conftest
 import pytest
 import requests
-
 from conftest import (
     AUTH_BOOTSTRAP_PASSWORD,
     DEFAULT_ANTFLY_BIN,
@@ -120,6 +119,25 @@ def test_authenticated_cypher_property_plans_and_sql_overlays(monkeypatch):
             ["1", "1000"],
         ], result
         first_memory = result["stats"]["memory_bytes"]
+        distinct = call(
+            f"/graphs/{graph}/query",
+            {
+                "query": "MATCH (n:D) RETURN DISTINCT n.score%2 AS bucket LIMIT 1",
+                "limits": {"scanned_anchors": 1, "memory_bytes": 2 << 20},
+            },
+        )
+        assert len(distinct["rows"]) == 1, distinct
+        assert distinct["stats"]["scanned_anchors"] == 1, distinct
+        joined = call(
+            f"/graphs/{graph}/query",
+            {
+                "query": "MATCH (a:D),(b:D) WHERE a.score<150 AND a.score=b.score RETURN count(*)",
+                "limits": {"scanned_anchors": 400, "memory_bytes": 8 << 20},
+            },
+            wait_for_index=True,
+        )
+        assert joined["rows"] == [[{"type": "integer", "value": "150"}]], joined
+        assert joined["stats"]["scanned_anchors"] <= 400, joined
         for predicate, anchors, values in (
             ("n.score>=1999", 1, ["1999"]),
             ("n.score IN [1999,1,1999,null]", 2, ["1", "1999"]),
@@ -191,6 +209,24 @@ def test_authenticated_cypher_property_plans_and_sql_overlays(monkeypatch):
         )
         assert complete["rows"] == [[{"type": "string", "value": "x" * 8192}]], complete
 
+        relation = f"GRAPH_TABLE({wide} MATCH (n IS W) COLUMNS(n.score AS score,n.payload AS unused)) g"
+        for statement, expected in (
+            (f"SELECT g.score FROM {relation} WHERE g.score=399", [["399"]]),
+            (f"SELECT count(*) FROM {relation}", [["400"]]),
+            (f"SELECT g.unused FROM {relation} WHERE g.score=399", [["x" * 8192]]),
+            (f"SELECT g.score FROM {relation} LIMIT 1", [["0"]]),
+            (
+                (
+                    f"SELECT a.score,b.score FROM {relation.replace(') g', ') a')} "
+                    f"CROSS JOIN GRAPH_TABLE({graph} MATCH (n IS D) COLUMNS(n.score AS score)) b "
+                    "WHERE a.score=399 AND b.score=1999"
+                ),
+                [["399", "1999"]],
+            ),
+        ):
+            sql = call("/sql", {"statement": statement})
+            assert sql["rows"] == expected, sql
+
         script = (
             Path(__file__).resolve().parents[2]
             / "scripts"
@@ -210,6 +246,7 @@ def test_authenticated_cypher_property_plans_and_sql_overlays(monkeypatch):
             result = subprocess.run(
                 command,
                 capture_output=True,
+                check=False,
                 text=True,
                 timeout=220,
                 env={

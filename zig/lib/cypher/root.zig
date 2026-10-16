@@ -13,6 +13,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+pub const expressions = @import("expressions.zig");
 pub const ast = @import("ast.zig");
 pub const compiler = @import("compiler.zig");
 pub const binder = @import("binder.zig");

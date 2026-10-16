@@ -31,8 +31,12 @@ pub fn reclaimingAllocator(input: std.mem.Allocator) std.mem.Allocator {
     }
     return current;
 }
+/// `unfiltered` certifies that every page in this scan enumerates the complete
+/// authorized table, without restricting it to the supplied property filters.
+/// An index/predicate-restricted scan must leave it false. Consumers still apply
+/// all label/predicate checks; the certificate only enables a reusable lookup.
 pub fn Page(comptime T: type) type {
-    return struct { items: []const T, next: ?[]const u8 = null, examined: ?usize = null };
+    return struct { items: []const T, next: ?[]const u8 = null, examined: ?usize = null, unfiltered: bool = false };
 }
 pub const FilterOp = enum { eq, lt, lte, gt, gte, in };
 pub const PropertyFilter = struct { property: []const u8, value: v.Value, op: FilterOp = .eq };

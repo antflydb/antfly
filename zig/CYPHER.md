@@ -1181,8 +1181,35 @@ terminal projections fuse their scan with unordered limits, stable ordered top-k
 (`SKIP + LIMIT` heap capacity), or global count/sum/avg/min/max accumulators.
 Ordinary unordered projections avoid singleton grouping and unused sorting
 records. Page/evaluation arenas are reclaimed between batches; retained heap
-entries and min/max values have independent lifetimes. DISTINCT, collect, grouped
-aggregation and correlated pattern expressions retain the general operator.
+entries and min/max values have independent lifetimes. Supported grouped reductions
+retain one accumulator per key. DISTINCT retains typed unique keys, including
+null and numeric equivalence, rather than every source row. Unordered DISTINCT
+propagates `SKIP + LIMIT` demand after deduplication; row-local `WITH DISTINCT`
+stages share their key set across producer pages. Collect and correlated pattern
+expressions retain the general operator.
+
+Independent all-path patterns feed their bindings directly into the next pattern
+without materializing Cartesian products. Ready equality constraints use native
+indexes, including properties of previously bound entities. An unindexed inner
+node scan can build a statement-local hash lookup only when every backend page
+certifies a complete, authorized, unfiltered scan. Its reclaimable cache is capped
+at the smaller of 8 MiB and one eighth of the statement memory limit; exceeding
+that cache quota releases it and resumes ordinary scans. Other predicates,
+relationship uniqueness, null equality and duplicate matches remain residual
+Cypher checks.
+
+SQL `GRAPH_TABLE` prunes unused row-local COLUMNS expressions and pushes compatible
+scalar property conditions into MATCH, preserving SQL residual comparisons.
+Aggregation, DISTINCT, ordering, optional matching and selected paths retain
+their required semantic barriers. Observable SQL `_id` values keep source
+ordinals, so those scans retain SQL predicates outside MATCH. Tagged graph
+continuations replay the same optimized relation with bounded page retention;
+legacy ordinal tokens keep their original unfiltered-source interpretation. Ordinary single-node
+relations expose a pull cursor: each SQL demand reads another bounded graph page
+under the same cut and cumulative work/memory ceilings. SQL LIMIT can stop the
+source without retaining previous pages. Advisory SQL row goals influence page
+size without truncating the relation. Each production binding owns its authority
+channel, RPC client and staged view for the cursor lifetime.
 
 Path planning compares every vertex before opening an anchor scan. Existing
 bindings and document-key seeks take precedence over constant property filters

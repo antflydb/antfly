@@ -182,12 +182,12 @@ pub fn Adapter(comptime DB: type, comptime GraphIndex: type, comptime EdgeScanCu
             for (found.documents) |document| if (try self.node(a, table, document.id, document.json)) |authorized| if (authorized.labels.len != 0) try nodes.append(a, authorized);
             const next = if (found.documents.len == limit) try a.dupe(u8, found.documents[found.documents.len - 1].id) else null;
             try checkpoint(ptr);
-            return .{ .items = try nodes.toOwnedSlice(a), .next = next, .examined = found.documents.len };
+            return .{ .items = try nodes.toOwnedSlice(a), .next = next, .examined = found.documents.len, .unfiltered = true };
         }
         const PropertyCursor = struct { branch: usize = 0, index: ?[]const u8 = null, after: ?[]const u8 = null, key: ?[]const u8 = null, schema_version: ?u32 = null, primary: bool = false };
         fn propertyFallback(ptr: *anyopaque, a: A, table: []const u8, cursor: PropertyCursor, limit: usize) !b.Page(*const v.Node) {
             const page = try scan(ptr, a, table, cursor.key, limit);
-            return .{ .items = page.items, .examined = page.examined, .next = if (page.next) |key| try std.json.Stringify.valueAlloc(a, PropertyCursor{ .key = key, .primary = true }, .{}) else null };
+            return .{ .items = page.items, .examined = page.examined, .unfiltered = page.unfiltered, .next = if (page.next) |key| try std.json.Stringify.valueAlloc(a, PropertyCursor{ .key = key, .primary = true }, .{}) else null };
         }
         fn filterCompatible(column_type: anytype, value: v.Value) bool {
             return switch (column_type) {

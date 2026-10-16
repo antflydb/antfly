@@ -1749,11 +1749,16 @@ pub const Adapter = struct {
         for (requests, owner.cursors) |request, *out| {
             try self.verify(owned, request.table);
             const child: catalog.Cursor = if (request.table.graph) |binding| blk: {
-                authority.name = binding.graph.name;
-                authority.record_id = binding.graph.incarnation;
-                authority.last_authority_check = null;
-                client.incarnation = binding.graph.incarnation;
-                client.revision = binding.graph.revision;
+                const graph_authority = try owned.create(@import("graph_execution.zig").AuthorityChannel);
+                graph_authority.* = authority.*;
+                graph_authority.name = binding.graph.name;
+                graph_authority.record_id = binding.graph.incarnation;
+                graph_authority.last_authority_check = null;
+                const graph_client = try owned.create(cypher.rpc.Client);
+                graph_client.* = client;
+                graph_client.channel.ptr = graph_authority;
+                graph_client.incarnation = binding.graph.incarnation;
+                graph_client.revision = binding.graph.revision;
                 const parameters = try owned.alloc(cypher.value.Entry, binding.definition.parameters.len);
                 for (binding.definition.parameters, parameters) |name, *parameter| {
                     const index = std.fmt.parseUnsigned(usize, name, 10) catch return error.InvalidSqlParameters;
@@ -1779,8 +1784,9 @@ pub const Adapter = struct {
                     if (std.mem.eql(u8, label.table, effects.table)) changed = true;
                 };
                 const graph_limits = @import("graph_execution.zig").limits(self.server);
-                var overlay: graph_overlay.View = .{ .client = &client, .rows = staged_rows.items, .effects = staged_effects.items, .limits = graph_limits };
-                break :blk try catalog.graph_relation.Cursor.open(a, binding.*, if (changed) overlay.backend() else client.backend(), parameters, request.request, graph_limits);
+                const overlay = try owned.create(graph_overlay.View);
+                overlay.* = .{ .client = graph_client, .rows = staged_rows.items, .effects = staged_effects.items, .limits = graph_limits };
+                break :blk try catalog.graph_relation.Cursor.open(a, binding.*, if (changed) overlay.backend() else graph_client.backend(), parameters, request.request, graph_limits);
             } else blk: {
                 var demanded = request.request;
                 demanded.primary_order = true;

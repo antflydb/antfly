@@ -1791,6 +1791,59 @@ fn markSelect(alloc: Allocator, needed: *std.StringHashMapUnmanaged(void), state
         try needed.put(alloc, order.field, {});
     };
 }
+fn constantScanOperand(program: scalar.Program, index: u32, depth: usize) bool {
+    if (depth >= 128 or index >= program.instructions.len) return false;
+    return switch (program.instructions[index].operation) {
+        .literal, .parameter => true,
+        .cast => |part| constantScanOperand(program, part.operand, depth + 1),
+        .unary => |part| (part.op == .positive or part.op == .negative) and constantScanOperand(program, part.operand, depth + 1),
+        else => false,
+    };
+}
+pub fn graphScanConditions(alloc: Allocator, source: *const Node, program: scalar.Program, index: u32, output: *std.ArrayList(catalog.Scan.GraphCondition), depth: usize) anyerror!void {
+    if (depth >= 128 or index >= program.instructions.len) return error.InvalidSqlProgram;
+    const instruction = program.instructions[index];
+    if (instruction.operation != .binary) return;
+    const binary = instruction.operation.binary;
+    if (binary.op == .@"and") {
+        try graphScanConditions(alloc, source, program, binary.left, output, depth + 1);
+        return graphScanConditions(alloc, source, program, binary.right, output, depth + 1);
+    }
+    var op: @FieldType(catalog.Condition, "op") = switch (binary.op) {
+        .eq => .eq,
+        .neq => .neq,
+        .lt => .lt,
+        .lte => .lte,
+        .gt => .gt,
+        .gte => .gte,
+        else => return,
+    };
+    var column_index = binary.left;
+    var value_index = binary.right;
+    if (program.instructions[column_index].operation != .column) {
+        column_index = binary.right;
+        value_index = binary.left;
+        op = switch (op) {
+            .lt => .gt,
+            .lte => .gte,
+            .gt => .lt,
+            .gte => .lte,
+            else => op,
+        };
+    }
+    if (program.instructions[column_index].operation != .column or !constantScanOperand(program, value_index, 0)) return;
+    const scan = source.operation.scan;
+    const ordinal = program.instructions[column_index].operation.column;
+    if (ordinal >= scan.source_columns.len) return error.InvalidSqlProgram;
+    const column = source.columns[ordinal];
+    if (column.element_type == .numeric or (column.type != .integer and column.type != .number and column.type != .string and column.type != .boolean)) return;
+    const name = scan.source_columns[ordinal];
+    if (std.mem.eql(u8, name, "_id")) return;
+    var operand = program;
+    operand.root = value_index;
+    try output.append(alloc, .{ .column = name, .op = op, .operand = operand });
+    if (output.items.len > 256) return error.SqlProgramLimitExceeded;
+}
 fn projectScans(builder: *Builder, node: *const Node, needed: *std.StringHashMapUnmanaged(void)) anyerror!void {
     switch (node.operation) {
         .singleton, .recursive_ref, .outer_ref, .literal_rows => {},
@@ -1815,6 +1868,14 @@ fn projectScans(builder: *Builder, node: *const Node, needed: *std.StringHashMap
         .scan => |scan| {
             var fields: std.ArrayList([]const u8) = .empty;
             const request = &builder.scans.items[scan.index];
+            // Graph row IDs are source ordinals. An observable ID must keep
+            // the unfiltered stream, even when another WHERE term is seekable.
+            for (node.columns, scan.source_columns) |column, name| {
+                if (needed.contains(column.internal) and std.mem.eql(u8, name, "_id")) {
+                    request.request.graph_conditions = &.{};
+                    request.request.graph_source_ordinals = true;
+                }
+            }
             for (node.columns, scan.source_columns) |column, name| {
                 if (!needed.contains(column.internal) or std.mem.eql(u8, name, "_id") or @import("joined_mutation.zig").isMetadata(name)) continue;
                 try fields.append(builder.alloc, (try request.table.column(name)).path);
@@ -1835,6 +1896,17 @@ fn projectScans(builder: *Builder, node: *const Node, needed: *std.StringHashMap
             try projectScans(builder, apply.left, needed);
         },
         .query => |query| {
+            // Push only the WHERE of the query which directly owns this scan.
+            // Derived LIMIT/grouping and joins keep their semantic boundaries.
+            if (query.source.operation == .scan) {
+                const request = &builder.scans.items[query.source.operation.scan.index].request;
+                if (builder.scans.items[query.source.operation.scan.index].table.graph != null) if (query.binding.scalars.predicate) |program| {
+                    var conditions: std.ArrayList(catalog.Scan.GraphCondition) = .empty;
+                    try conditions.appendSlice(builder.alloc, request.graph_conditions);
+                    try graphScanConditions(builder.alloc, query.source, program, program.root, &conditions, 0);
+                    request.graph_conditions = try conditions.toOwnedSlice(builder.alloc);
+                };
+            }
             var required = query.statement;
             // Transparent outputs retain ordinal slots, but cold forwarded
             // columns must not become physical scan dependencies.

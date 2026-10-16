@@ -45,7 +45,7 @@ pub const Request = struct {
     include_relationships: bool = false,
 };
 pub const Projection = struct { node: ?*const v.Node, relationships: []const *const v.Relationship = &.{} };
-const Reply = struct { work: usize = 0, relationships: []const std.json.Value = &.{}, values: []const std.json.Value = &.{}, next: ?[]const u8 = null, examined: ?usize = null, scores: []const f64 = &.{}, approximate: bool = false };
+const Reply = struct { unfiltered: bool = false, work: usize = 0, relationships: []const std.json.Value = &.{}, values: []const std.json.Value = &.{}, next: ?[]const u8 = null, examined: ?usize = null, scores: []const f64 = &.{}, approximate: bool = false };
 pub const Channel = struct { ptr: *anyopaque, call: *const fn (*anyopaque, A, []const u8) anyerror![]u8, checkpoint: ?*const fn (*anyopaque) anyerror!void = null };
 pub const Version = struct { incarnation: u64, revision: u64 };
 pub const Client = struct {
@@ -147,7 +147,7 @@ pub const Client = struct {
             if (value != .node or !std.mem.eql(u8, value.node.identity.table, table)) return error.CypherInvalidBackendPage;
             out.* = value.node;
         }
-        return .{ .items = nodes, .next = if (reply.next) |next| try a.dupe(u8, next) else null, .examined = reply.examined };
+        return .{ .items = nodes, .next = if (reply.next) |next| try a.dupe(u8, next) else null, .examined = reply.examined, .unfiltered = reply.unfiltered };
     }
     fn get(ptr: *anyopaque, a: A, identity: v.Identity) !?*const v.Node {
         const self = cast(ptr);
@@ -240,6 +240,7 @@ pub const Owner = struct {
         var values: std.ArrayList(wire.Value) = .empty;
         var next: ?[]const u8 = null;
         var examined: ?usize = null;
+        var unfiltered = false;
         var scores: std.ArrayList(f64) = .empty;
         var approximate = false;
         switch (request.operation) {
@@ -263,6 +264,7 @@ pub const Owner = struct {
                 for (page.items) |node| try values.append(scratch, .{ .value = .{ .node = node } });
                 next = page.next;
                 examined = page.examined;
+                unfiltered = page.unfiltered;
             },
             .get => {
                 const identity = request.identity orelse return error.InvalidCypherWireValue;
@@ -308,7 +310,7 @@ pub const Owner = struct {
             },
         }
         try self.backend.vtable.checkpoint(self.backend.ptr);
-        const result = try std.json.Stringify.valueAlloc(a, .{ .work = meter.units, .values = values.items, .next = next, .examined = examined, .scores = scores.items, .approximate = approximate }, .{});
+        const result = try std.json.Stringify.valueAlloc(a, .{ .work = meter.units, .unfiltered = unfiltered, .values = values.items, .next = next, .examined = examined, .scores = scores.items, .approximate = approximate }, .{});
         errdefer a.free(result);
         if (result.len > 32 << 20) return error.CypherResponseTooLarge;
         return result;

@@ -16,31 +16,67 @@
 //! Typed relational iterator execution. All physical cursors open together;
 //! hash join retains one build side and streams the probe side under quota.
 
-/// Search requests are execution-local, including statement captures used by
-/// mutation inputs. Never write parameter values into the immutable plan.
+/// Search requests and graph predicate operands bind per invocation, including
+/// mutation captures. Never write parameter values into the immutable plan.
 pub fn bindSearchScans(a: Allocator, input_scans: []const catalog.StatementScan, parameters: []const std.json.Value) ![]const catalog.StatementScan {
-    const has_search = for (input_scans) |scan| {
-        if (scan.request.search != null) break true;
+    const needs_binding = for (input_scans) |scan| {
+        if (scan.request.search != null or scan.request.graph_conditions.len != 0) break true;
     } else false;
-    return if (has_search) bound: {
+    return if (needs_binding) bound: {
         const bound_scans = try a.dupe(catalog.StatementScan, input_scans);
-        for (bound_scans) |*scan| if (scan.request.search) |original| {
-            const search = try a.create(catalog.Scan.Search);
-            search.* = original.*;
-            scan.request.search = search;
-            const expression = search.expression;
-            const request = if (expression.request == .parameter) parameters[expression.request.parameter - 1] else try describe.bindLiteral(a, expression.request, .string);
-            if (request != .string) return error.InvalidSqlParameters;
-            search.request_text = request.string;
-            if (expression.limit) |input| {
-                const limit = if (input == .parameter) parameters[input.parameter - 1] else try describe.bindLiteral(a, input, .integer);
-                const number = if (limit == .integer) limit.integer else if (limit == .string) std.fmt.parseInt(i64, limit.string, 10) catch return error.InvalidSqlParameters else return error.InvalidSqlParameters;
-                if (number < 1 or number > 10000) return error.InvalidSqlParameters;
-                search.limit = @intCast(number);
+        for (bound_scans) |*scan| {
+            if (scan.request.graph_conditions.len != 0) {
+                var conditions: std.ArrayList(catalog.Condition) = .empty;
+                try conditions.appendSlice(a, scan.request.conditions);
+                for (scan.request.graph_conditions) |condition| {
+                    const operand = condition.operand.evaluateInstruction(a, condition.operand.root, parameters) catch |err| {
+                        // Speculation is not an evaluation demand: a residual
+                        // may short-circuit or see no rows. Defer data errors
+                        // and speculative work ceilings to that original plan.
+                        if (err == error.SqlProgramLimitExceeded or std.mem.startsWith(u8, @import("errors.zig").describe(err).code, "22")) continue;
+                        return err;
+                    };
+                    try conditions.append(a, .{ .column = condition.column, .op = condition.op, .value = operand.value, .operand = operand });
+                }
+                scan.request.conditions = try conditions.toOwnedSlice(a);
+                scan.request.graph_conditions = &.{};
             }
-        };
+            if (scan.request.search) |original| {
+                const search = try a.create(catalog.Scan.Search);
+                search.* = original.*;
+                scan.request.search = search;
+                const expression = search.expression;
+                const request = if (expression.request == .parameter) parameters[expression.request.parameter - 1] else try describe.bindLiteral(a, expression.request, .string);
+                if (request != .string) return error.InvalidSqlParameters;
+                search.request_text = request.string;
+                if (expression.limit) |input| {
+                    const limit = if (input == .parameter) parameters[input.parameter - 1] else try describe.bindLiteral(a, input, .integer);
+                    const number = if (limit == .integer) limit.integer else if (limit == .string) std.fmt.parseInt(i64, limit.string, 10) catch return error.InvalidSqlParameters else return error.InvalidSqlParameters;
+                    if (number < 1 or number > 10000) return error.InvalidSqlParameters;
+                    search.limit = @intCast(number);
+                }
+            }
+        }
         break :bound bound_scans;
     } else input_scans;
+}
+
+/// The enclosing SELECT owns a predicate outside the relation's source tree.
+/// Attach that predicate at the same execution-local boundary as inner WHEREs.
+/// Mutation captures use this helper before their shared read cut is opened.
+pub fn outerGraphScans(a: Allocator, relation: *const binding.Bound, predicate: ?scalar.Program) ![]const catalog.StatementScan {
+    const program = predicate orelse return relation.scans;
+    if (relation.root.operation != .scan) return relation.scans;
+    const index = relation.root.operation.scan.index;
+    const source = relation.scans[index];
+    if (source.table.graph == null or source.request.graph_source_ordinals) return relation.scans;
+    var conditions: std.ArrayList(catalog.Scan.GraphCondition) = .empty;
+    try conditions.appendSlice(a, source.request.graph_conditions);
+    try binding.graphScanConditions(a, relation.root, program, program.root, &conditions, 0);
+    if (conditions.items.len == source.request.graph_conditions.len) return relation.scans;
+    const scans = try a.dupe(catalog.StatementScan, relation.scans);
+    scans[index].request.graph_conditions = try conditions.toOwnedSlice(a);
+    return scans;
 }
 
 const std = @import("std");
@@ -2146,7 +2182,7 @@ fn Source(comptime Context: type) type {
             if (self.engine.context.backend.regex_execution == null) self.engine.context.backend.regex_execution = &self.regex_execution;
             var search_arena = std.heap.ArenaAllocator.init(context.alloc);
             defer search_arena.deinit();
-            const scans = try bindSearchScans(search_arena.allocator(), relation.scans, context.parameters);
+            const scans = try bindSearchScans(search_arena.allocator(), try outerGraphScans(search_arena.allocator(), relation, context.binding.scalars.predicate), context.parameters);
             if (scans.len != 0) {
                 if (context.statement_capture) |capture| {
                     self.engine.cursors = try capture.cursors(relation);

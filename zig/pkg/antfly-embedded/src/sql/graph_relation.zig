@@ -146,12 +146,97 @@ fn json(a: A, value: cypher.value.Value) anyerror!std.json.Value {
         .node, .relationship, .path => try std.json.parseFromSliceLeaky(std.json.Value, a, try std.json.Stringify.valueAlloc(a, cypher.wire.Value{ .value = value }, .{}), .{ .allocate = .alloc_always, .parse_numbers = false }),
     };
 }
+// A scan predicate is SQL-typed. Push only comparisons whose direct scalar
+// projection has the same Cypher domain, retaining SQL residual checks below.
+// Aggregation, DISTINCT, ordering and path selection remain semantic barriers.
+fn scanQuery(a: A, binding: Binding, request: catalog.Scan) !cypher.ast.Query {
+    var query = binding.definition.query;
+    if (query.clauses.len != 2 or query.clauses[0].operation != .match or query.clauses[1].operation != .project) return query;
+    const original = query.clauses[1].operation.project.value;
+    if (original.distinct or original.wildcard or original.order.len != 0 or original.skip != null or original.limit != null or original.predicate != null) return query;
+    for (original.items) |item| if (cypher.expressions.aggregates(item.expression)) return query;
+    const clauses = try a.dupe(cypher.ast.Clause, query.clauses);
+    const operation = &clauses[0].operation.match;
+    var push = !operation.optional and !request.graph_source_ordinals and request.primary_key == null and request.after == null;
+    for (request.fields) |field| if (std.mem.eql(u8, field, "_id")) {
+        push = false;
+    };
+    for (operation.paths) |path| if (path.selector != .all) {
+        push = false;
+    };
+    if (push) for (request.conditions) |condition| {
+        const item = for (original.items) |candidate| {
+            if (std.mem.eql(u8, candidate.alias.?, condition.column)) break candidate;
+        } else continue;
+        if (item.expression.value != .property) continue;
+        const kind = expressionType(binding, item.expression);
+        if (kind != .integer and kind != .number and kind != .string and kind != .boolean) continue;
+        const datum = condition.datum();
+        if (datum.numeric != null or datum.array != null or datum.patterns != null) continue;
+        const predicate = try a.create(cypher.ast.Expr);
+        const span = item.expression.span;
+        if (condition.op == .is_null or condition.op == .is_not_null) {
+            predicate.* = .{ .span = span, .depth = item.expression.depth + 1, .value = .{ .unary = .{ .op = if (condition.op == .is_null) .is_null else .is_not_null, .operand = item.expression } } };
+        } else {
+            if (datum.sql_null) continue;
+            const literal: cypher.ast.Value = switch (datum.value) {
+                .integer => |value| if (kind == .integer or kind == .number) .{ .integer = value } else continue,
+                .number_string => |value| if (kind == .integer or kind == .number) .{ .integer = std.fmt.parseInt(i64, value, 10) catch continue } else continue,
+                .float => |value| if (kind == .number and std.math.isFinite(value)) .{ .number = value } else continue,
+                .string => |value| if (kind == .string) .{ .string = try a.dupe(u8, value) } else continue,
+                .bool => |value| if (kind == .boolean and (condition.op == .eq or condition.op == .neq)) .{ .boolean = value } else continue,
+                else => continue,
+            };
+            const operand = try a.create(cypher.ast.Expr);
+            operand.* = .{ .span = span, .value = .{ .literal = literal } };
+            predicate.* = .{ .span = span, .depth = item.expression.depth + 1, .value = .{ .binary = .{ .left = item.expression, .right = operand, .op = switch (condition.op) {
+                .eq => .eq,
+                .neq => .neq,
+                .lt => .lt,
+                .lte => .lte,
+                .gt => .gt,
+                .gte => .gte,
+                else => unreachable,
+            } } } };
+        }
+        if (operation.predicate) |previous| {
+            const depth = 1 + @max(previous.depth, predicate.depth);
+            if (depth > 64) continue;
+            const combined = try a.create(cypher.ast.Expr);
+            combined.* = .{ .span = span, .depth = depth, .value = .{ .binary = .{ .op = .@"and", .left = previous, .right = predicate } } };
+            operation.predicate = combined;
+        } else operation.predicate = predicate;
+    };
+    var items: std.ArrayList(cypher.ast.Item) = .empty;
+    for (original.items) |item| {
+        const name = item.alias.?;
+        var needed = false;
+        for (request.fields) |field| if (std.mem.eql(u8, name, field)) {
+            needed = true;
+        };
+        for (request.conditions) |condition| if (std.mem.eql(u8, name, condition.column)) {
+            needed = true;
+        };
+        if (needed) try items.append(a, item);
+    }
+    if (items.items.len == 0) {
+        const expression = try a.create(cypher.ast.Expr);
+        expression.* = .{ .span = clauses[1].span, .value = .{ .literal = .{ .integer = 1 } } };
+        try items.append(a, .{ .alias = "_antfly_scan_row", .expression = expression });
+    }
+    clauses[1].operation.project.value.items = try items.toOwnedSlice(a);
+    query.clauses = clauses;
+    return query;
+}
 pub const Cursor = struct {
     a: A,
     arena: std.heap.ArenaAllocator,
-    result: cypher.runtime.Result,
+    result: ?cypher.runtime.Result = null,
+    stream: ?*cypher.runtime.NodeCursor = null,
     request: catalog.Scan,
     position: usize = 0,
+    resume_position: usize = 0,
+    optimized: bool = true,
     pub fn open(a: A, binding: Binding, backend: cypher.backend.Backend, parameters: []const cypher.value.Entry, request: catalog.Scan, limits: cypher.runtime.Limits) !catalog.Cursor {
         const self = try a.create(Cursor);
         errdefer a.destroy(self);
@@ -161,20 +246,27 @@ pub const Cursor = struct {
         const fields = try owned.alloc([]const u8, request.fields.len);
         for (request.fields, fields) |field, *out| out.* = try owned.dupe(u8, field);
         const conditions = try owned.alloc(catalog.Condition, request.conditions.len);
-        for (request.conditions, conditions) |condition, *out| out.* = .{ .column = try owned.dupe(u8, condition.column), .op = condition.op, .value = try @import("../storage/typed_json.zig").clone(owned, condition.value) };
-        var compiled: cypher.compiler.Compiled = .{ .arena = std.heap.ArenaAllocator.init(a), .query = binding.definition.query, .parameters = binding.definition.parameters };
+        for (request.conditions, conditions) |condition, *out| out.* = .{ .column = try owned.dupe(u8, condition.column), .op = condition.op, .value = try @import("../storage/typed_json.zig").clone(owned, condition.value), .operand = try @import("operators.zig").cloneDatum(owned, condition.datum()) };
+        const optimized = if (request.after) |after| std.mem.startsWith(u8, after, "g:") else true;
+        const resume_position = if (request.after) |after| try std.fmt.parseUnsigned(usize, if (optimized) after[2..] else after, 10) else 0;
+        var query_request = request;
+        // Tagged tokens resume the same pruned/pushed relation. Legacy ordinal
+        // tokens retain their original unfiltered source interpretation.
+        if (optimized) query_request.after = null;
+        var compiled: cypher.compiler.Compiled = .{ .arena = std.heap.ArenaAllocator.init(a), .query = try scanQuery(owned, binding, query_request), .parameters = binding.definition.parameters };
         defer compiled.deinit();
-        var result = try cypher.runtime.execute(a, backend, binding.graph, &compiled, parameters, limits);
-        errdefer result.deinit();
+        const stream = try cypher.runtime.NodeCursor.open(a, backend, binding.graph, compiled.query, parameters, limits);
+        errdefer if (stream) |cursor| cursor.close();
+        var result: ?cypher.runtime.Result = if (stream == null) try cypher.runtime.execute(a, backend, binding.graph, &compiled, parameters, limits) else null;
+        errdefer if (result) |*value| value.deinit();
         var copied = request;
         copied.fields = fields;
         copied.conditions = conditions;
         copied.after = null;
         copied.primary_key = if (request.primary_key) |key| try owned.dupe(u8, key) else null;
-        const position = if (request.after) |after| try std.fmt.parseUnsigned(usize, after, 10) else 0;
-        if (position > result.rows.len) return error.InvalidSqlBackendResponse;
-        self.* = .{ .a = a, .arena = arena, .result = result, .request = copied, .position = position };
-        return .{ .ptr = self, .next = next, .close = close, .estimated_rows = result.rows.len };
+        if (result != null and resume_position > result.?.rows.len) return error.InvalidSqlBackendResponse;
+        self.* = .{ .a = a, .arena = arena, .result = result, .stream = stream, .request = copied, .position = if (stream != null) 0 else resume_position, .resume_position = resume_position, .optimized = optimized };
+        return .{ .ptr = self, .next = next, .close = close, .estimated_rows = if (result) |value| value.rows.len else null };
     }
     fn next(ptr: *anyopaque, a: A, limit: u32) !catalog.Page {
         const self: *Cursor = @ptrCast(@alignCast(ptr));
@@ -182,54 +274,83 @@ pub const Cursor = struct {
         var arena = std.heap.ArenaAllocator.init(a);
         errdefer arena.deinit();
         const owned = arena.allocator();
+        // row_goal is advisory: reduce page size, never truncate the source.
+        const page_limit: u32 = @intCast(@max(1, @min(limit, self.request.row_goal orelse limit)));
         var output: std.ArrayList(catalog.Row) = .empty;
         const names = try owned.alloc([]const u8, self.request.fields.len);
         for (self.request.fields, names) |name, *out| out.* = try owned.dupe(u8, name);
         const layout = try catalog.Row.TypedLayout.init(owned, names);
-        while (self.position < self.result.rows.len and output.items.len < limit) {
-            const index = self.position;
-            self.position += 1;
-            const values = self.result.rows[index];
-            const row_id = try std.fmt.allocPrint(owned, "{d}", .{index});
-            if (self.request.primary_key) |key| if (!std.mem.eql(u8, key, row_id)) continue;
-            var all: std.json.ObjectMap = .empty;
-            for (self.result.columns, values) |name, value| try all.put(owned, name, try json(owned, value));
-            const row: catalog.Row = .{ .id = row_id, .version = 0, .value = .{ .object = all } };
-            var accepted = true;
-            for (self.request.conditions) |condition| {
-                const cell = try row.cell(condition.column);
-                const matches = switch (condition.op) {
-                    .is_null => cell.sql_null,
-                    .is_not_null => !cell.sql_null,
-                    else => blk: {
-                        if (cell.sql_null or condition.value == .null) break :blk false;
-                        const order = try scalar.compareDatums(cell, scalar.Datum.fromJson(condition.value));
-                        break :blk switch (condition.op) {
-                            .eq => order == .eq,
-                            .neq => order != .eq,
-                            .lt => order == .lt,
-                            .lte => order != .gt,
-                            .gt => order == .gt,
-                            .gte => order != .lt,
-                            else => unreachable,
-                        };
-                    },
-                };
-                if (!matches) {
-                    accepted = false;
-                    break;
+        while (output.items.len < page_limit) {
+            var scratch = std.heap.ArenaAllocator.init(cypher.backend.reclaimingAllocator(a));
+            defer scratch.deinit();
+            const temporary = scratch.allocator();
+            const result_columns = if (self.stream) |stream| stream.columns else self.result.?.columns;
+            const rows: []const []const cypher.value.Value = if (self.stream) |stream| blk: {
+                const entries = try stream.next(temporary, page_limit - output.items.len);
+                const projected = try temporary.alloc([]const cypher.value.Value, entries.len);
+                for (entries, projected) |row, *out| {
+                    const values = try temporary.alloc(cypher.value.Value, row.len);
+                    for (row, values) |entry, *value| value.* = entry.value;
+                    out.* = values;
                 }
+                break :blk projected;
+            } else blk: {
+                if (self.position == self.result.?.rows.len) break;
+                break :blk self.result.?.rows[self.position..@min(self.result.?.rows.len, self.position + page_limit - output.items.len)];
+            };
+            if (rows.len == 0) {
+                if (self.position < self.resume_position) return error.InvalidSqlBackendResponse;
+                break;
             }
-            if (!accepted) continue;
-            const cells = try owned.alloc(scalar.Datum, self.request.fields.len);
-            for (self.request.fields, cells) |field, *out| out.* = try row.cell(field);
-            try output.append(owned, try catalog.Row.fromDatums(owned, row_id, layout, cells));
+            for (rows) |values| {
+                const index = self.position;
+                self.position += 1;
+                if (index < self.resume_position) continue;
+                const row_id = try std.fmt.allocPrint(temporary, "{d}", .{index});
+                if (self.request.primary_key) |key| if (!std.mem.eql(u8, key, row_id)) continue;
+                var all: std.json.ObjectMap = .empty;
+                for (result_columns, values) |name, value| try all.put(temporary, name, try json(temporary, value));
+                const row: catalog.Row = .{ .id = row_id, .version = 0, .value = .{ .object = all } };
+                var accepted = true;
+                for (self.request.conditions) |condition| {
+                    const cell = try row.cell(condition.column);
+                    const operand = condition.datum();
+                    const matches = switch (condition.op) {
+                        .is_null => cell.sql_null,
+                        .is_not_null => !cell.sql_null,
+                        else => blk: {
+                            if (cell.sql_null or operand.sql_null) break :blk false;
+                            const order = try scalar.compareDatums(cell, operand);
+                            break :blk switch (condition.op) {
+                                .eq => order == .eq,
+                                .neq => order != .eq,
+                                .lt => order == .lt,
+                                .lte => order != .gt,
+                                .gt => order == .gt,
+                                .gte => order != .lt,
+                                else => unreachable,
+                            };
+                        },
+                    };
+                    if (!matches) {
+                        accepted = false;
+                        break;
+                    }
+                }
+                if (!accepted) continue;
+                const cells = try owned.alloc(scalar.Datum, self.request.fields.len);
+                for (self.request.fields, cells) |field, *out| out.* = try @import("operators.zig").cloneDatum(owned, try row.cell(field));
+                try output.append(owned, try catalog.Row.fromDatums(owned, try owned.dupe(u8, row_id), layout, cells));
+            }
         }
-        return .{ .rows = try output.toOwnedSlice(owned), .owned_arena = arena, .after = if (self.position < self.result.rows.len) try std.fmt.allocPrint(owned, "{d}", .{self.position}) else null };
+        const more = if (self.stream) |stream| !stream.done else self.position < self.result.?.rows.len;
+        return .{ .rows = try output.toOwnedSlice(owned), .owned_arena = arena, .after = if (more) try std.fmt.allocPrint(owned, "{s}{d}", .{ if (self.optimized) "g:" else "", self.position }) else null };
     }
+
     fn close(ptr: *anyopaque) void {
         const self: *Cursor = @ptrCast(@alignCast(ptr));
-        self.result.deinit();
+        if (self.stream) |stream| stream.close();
+        if (self.result) |*result| result.deinit();
         self.arena.deinit();
         self.a.destroy(self);
     }
@@ -273,4 +394,86 @@ test "SQL GRAPH_TABLE derives columns and exposes typed rows from shared graph I
     try std.testing.expectEqualStrings("node", entity.object.get("type").?.string);
     const large = entity.object.get("value").?.object.get("properties").?.object.get("value").?.object.get("large").?;
     try std.testing.expectEqualStrings("9223372036854775807", large.object.get("value").?.string);
+}
+
+test "graph scan pushdown respects typed comparisons and cardinality barriers" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const dependencies = &[_]catalog.Table{.{ .id = 7, .physical_name = "docs", .schema_version = 1, .columns = &.{ .{ .name = "score", .path = "score", .type = .integer }, .{ .name = "payload", .path = "payload", .type = .string } } }};
+    const graph: cypher.catalog.Graph = .{ .name = "g", .incarnation = 1, .revision = 1, .labels = &.{.{ .name = "D", .table = "docs", .table_id = 7 }}, .relationships = &.{} };
+    var diagnostic: cypher.compiler.Diagnostic = .{};
+    const compiled = try cypher.compiler.compileInto(a, "MATCH (n:D) RETURN n.score AS score,n.payload AS unused", .{}, &diagnostic);
+    const binding: Binding = .{ .definition = .{ .name = .{ .table = "g" }, .query = compiled.query, .parameters = compiled.parameters }, .graph = graph, .catalog_json = "{}", .dependencies = dependencies };
+    const request: catalog.Scan = .{ .fields = &.{"score"}, .conditions = &.{.{ .column = "score", .op = .eq, .value = .{ .integer = 9 } }}, .limit = 1 };
+    const planned = try scanQuery(a, binding, request);
+    try std.testing.expectEqual(@as(usize, 1), planned.clauses[1].operation.project.value.items.len);
+    try std.testing.expect(planned.clauses[0].operation.match.predicate != null);
+    var mixed = request;
+    mixed.conditions = &.{.{ .column = "score", .op = .eq, .value = .{ .float = 1.5 } }};
+    try std.testing.expect((try scanQuery(a, binding, mixed)).clauses[0].operation.match.predicate == null);
+    var grouped = binding;
+    grouped.definition.query = (try cypher.compiler.compileInto(a, "MATCH (n:D) RETURN n.score AS score,count(*) AS total", .{}, &diagnostic)).query;
+    const grouped_plan = try scanQuery(a, grouped, request);
+    try std.testing.expect(grouped_plan.clauses[0].operation.match.predicate == null);
+    try std.testing.expectEqual(@as(usize, 2), grouped_plan.clauses[1].operation.project.value.items.len);
+}
+
+test "graph cursor resumes pushed pages and preserves observable source ordinals" {
+    const Fixture = struct {
+        const nodes = [_]cypher.value.Node{
+            .{ .identity = .{ .table = "docs", .key = "a" }, .labels = &.{"D"}, .properties = &.{ .{ .name = "id", .value = .{ .string = "a" } }, .{ .name = "rank", .value = .{ .integer = 0 } } } },
+            .{ .identity = .{ .table = "docs", .key = "b" }, .labels = &.{"D"}, .properties = &.{ .{ .name = "id", .value = .{ .string = "b" } }, .{ .name = "rank", .value = .{ .integer = 1 } } } },
+            .{ .identity = .{ .table = "docs", .key = "c" }, .labels = &.{"D"}, .properties = &.{ .{ .name = "id", .value = .{ .string = "c" } }, .{ .name = "rank", .value = .{ .integer = 2 } } } },
+        };
+        fn bind(_: *anyopaque, _: A, _: cypher.catalog.Graph) !void {}
+        fn checkpoint(_: *anyopaque) !void {}
+        fn scan(_: *anyopaque, a: A, _: []const u8, after: ?[]const u8, demand: usize) !cypher.backend.Page(*const cypher.value.Node) {
+            const start = if (after) |value| try std.fmt.parseUnsigned(usize, value, 10) else 0;
+            const end = @min(nodes.len, start + demand);
+            const output = try a.alloc(*const cypher.value.Node, end - start);
+            for (output, start..) |*out, index| out.* = &nodes[index];
+            return .{ .items = output, .next = if (end < nodes.len) try std.fmt.allocPrint(a, "{d}", .{end}) else null };
+        }
+        fn get(_: *anyopaque, _: A, _: cypher.value.Identity) !?*const cypher.value.Node {
+            return null;
+        }
+        fn expand(_: *anyopaque, _: A, _: cypher.catalog.Relationship, _: cypher.value.Identity, _: cypher.ast.Direction, _: ?[]const u8, _: usize) !cypher.backend.Page(*const cypher.value.Relationship) {
+            return .{ .items = &.{} };
+        }
+    };
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var diagnostic: cypher.compiler.Diagnostic = .{};
+    const compiled = try cypher.compiler.compileInto(a, "MATCH (n:D) RETURN n.id AS id,n.rank AS rank", .{}, &diagnostic);
+    const binding: Binding = .{ .definition = .{ .name = .{ .table = "g" }, .query = compiled.query, .parameters = compiled.parameters }, .graph = .{ .name = "g", .incarnation = 1, .revision = 1, .labels = &.{.{ .name = "D", .table = "docs", .table_id = 7 }}, .relationships = &.{} }, .catalog_json = "{}", .dependencies = &.{.{ .id = 7, .physical_name = "docs", .schema_version = 1, .columns = &.{ .{ .name = "id", .path = "id", .type = .string }, .{ .name = "rank", .path = "rank", .type = .integer } } }} };
+    var marker: u8 = 0;
+    const backend: cypher.backend.Backend = .{ .ptr = &marker, .vtable = &.{ .bind = Fixture.bind, .checkpoint = Fixture.checkpoint, .scan = Fixture.scan, .get = Fixture.get, .expand = Fixture.expand } };
+    var request: catalog.Scan = .{ .fields = &.{"id"}, .conditions = &.{.{ .column = "rank", .op = .gte, .value = .{ .integer = 1 } }}, .limit = 1, .row_goal = 1 };
+    const first = try Cursor.open(std.testing.allocator, binding, backend, &.{}, request, .{});
+    const page = try first.next(first.ptr, std.testing.allocator, 2);
+    defer page.deinit();
+    const continuing = try first.next(first.ptr, std.testing.allocator, 2);
+    defer continuing.deinit();
+    first.close(first.ptr);
+    try std.testing.expectEqualStrings("c", (try continuing.rows[0].cell("id")).value.string);
+    try std.testing.expectEqualStrings("b", (try page.rows[0].cell("id")).value.string);
+    try std.testing.expectEqualStrings("g:1", page.after.?);
+    request.after = page.after;
+    const resumed = try Cursor.open(std.testing.allocator, binding, backend, &.{}, request, .{});
+    defer resumed.close(resumed.ptr);
+    const last = try resumed.next(resumed.ptr, std.testing.allocator, 2);
+    defer last.deinit();
+    try std.testing.expectEqual(@as(usize, 1), last.rows.len);
+    try std.testing.expectEqualStrings("c", (try last.rows[0].cell("id")).value.string);
+    try std.testing.expect(last.after == null);
+    request.after = "1";
+    request.fields = &.{ "id", "_id" };
+    const legacy = try Cursor.open(std.testing.allocator, binding, backend, &.{}, request, .{});
+    defer legacy.close(legacy.ptr);
+    const ordinal = try legacy.next(legacy.ptr, std.testing.allocator, 1);
+    defer ordinal.deinit();
+    try std.testing.expectEqualStrings("b", (try ordinal.rows[0].cell("id")).value.string);
+    try std.testing.expectEqualStrings("1", (try ordinal.rows[0].cell("_id")).value.string);
 }

@@ -626,3 +626,91 @@ def test_cyclic_lower_bound_routes_reuse_reads_without_merging_histories(graph_d
         )
         assert result["rows"] == [[{"type": "integer", "value": str(expected)}]]
         assert result["stats"]["explored_edges"] == 4
+
+
+def test_pattern_equality_joins_use_indexes_or_bounded_hash_lookups(graph_db):
+    db = graph_db
+    populate(db, 150)
+    db.sql("INSERT INTO docs (_id,score) VALUES ('duplicate',1),('null',NULL)")
+    for indexed in (False, True):
+        if indexed:
+            db.sql("CREATE INDEX docs_score ON docs(score)")
+        result = db.cypher_json(
+            "g",
+            {
+                "query": "MATCH (a:D),(b:D) WHERE a.score=b.score RETURN count(*)",
+                "limits": {"scanned_anchors": 500, "memory_bytes": 4 << 20},
+            },
+        )
+        assert result["rows"] == [[{"type": "integer", "value": "153"}]]
+        assert result["stats"]["scanned_anchors"] <= 500
+        projected = db.cypher_json(
+            "g",
+            {
+                "query": "MATCH (a:D),(b:D) WHERE a.score=b.score RETURN a.score,b.score ORDER BY a.score,b.score",
+                "limits": {"scanned_anchors": 500, "memory_bytes": 4 << 20},
+            },
+        )
+        assert len(projected["rows"]) == 153
+        assert all(row[0] == row[1] for row in projected["rows"])
+        assert projected["stats"]["scanned_anchors"] <= 500
+
+
+def test_distinct_streams_unique_keys_and_propagates_limit_demand(graph_db):
+    db = graph_db
+    populate(db, 2000)
+    for query, expected in (
+        ("MATCH (n:D) RETURN DISTINCT n.score%2 AS bucket ORDER BY bucket", [["0"], ["1"]]),
+        ("MATCH (n:D) WITH DISTINCT n.score%2 AS bucket RETURN count(*)", [["2"]]),
+        ("MATCH (n:D) WITH DISTINCT n.score%2 AS bucket RETURN bucket ORDER BY bucket", [["0"], ["1"]]),
+    ):
+        result = db.cypher_json("g", {"query": query, "limits": {"memory_bytes": 2 << 20}})
+        assert [[cell["value"] for cell in row] for row in result["rows"]] == expected
+    limited = db.cypher_json(
+        "g",
+        {
+            "query": "MATCH (n:D) RETURN DISTINCT n.score%2 AS bucket LIMIT 1",
+            "limits": {"scanned_anchors": 1, "memory_bytes": 2 << 20},
+        },
+    )
+    assert limited["rows"] == [[{"type": "integer", "value": "0"}]]
+    assert limited["stats"]["scanned_anchors"] == 1
+
+
+def test_sql_graph_table_prunes_columns_pushes_filters_and_pulls_rows(graph_db):
+    db = graph_db
+    db.sql("CREATE TABLE wide (score BIGINT,payload TEXT)")
+    payload = "x" * 32768
+    for start in range(0, 1000, 50):
+        db.sql(
+            "INSERT INTO wide (_id,score,payload) VALUES "
+            + ",".join(f"('n{i}',{i},'{payload}')" for i in range(start, start + 50))
+        )
+    db.sql("CREATE INDEX wide_score ON wide(score)")
+    db.graph_catalog_json(
+        {
+            "action": "put",
+            "name": "wide",
+            "definition": {"labels": [{"name": "W", "table": "wide"}], "relationships": []},
+        }
+    )
+    relation = "GRAPH_TABLE(wide MATCH (n IS W) COLUMNS(n.score AS score,n.payload AS unused)) g"
+    assert db.sql(f"SELECT g.score FROM {relation} WHERE g.score=999")["rows"] == [["999"]]
+    # Observable virtual IDs retain source ordinals after SQL filtering.
+    assert db.sql(f"SELECT g._id,g.score FROM {relation} WHERE g.score=999")["rows"] == [["999", "999"]]
+    assert db.sql(f"SELECT g.score FROM {relation} WHERE g.score=999 AND g._id='999'")["rows"] == [["999"]]
+    assert db.sql(f"SELECT g.score FROM {relation} LIMIT 1")["rows"] == [["0"]]
+    assert db.sql(f"SELECT count(*) FROM {relation}")["rows"] == [["1000"]]
+    assert db.sql(f"SELECT g.unused FROM {relation} WHERE g.score=999")["rows"] == [[payload]]
+    for value in (999, 2):
+        assert db.sql(f"SELECT g.score,g.unused FROM {relation} WHERE g.score=$1", [value])["rows"] == [
+            [str(value), payload]
+        ]
+    assert db.sql(f"SELECT x.score FROM (SELECT g.score FROM {relation} LIMIT 1) x WHERE x.score=999")["rows"] == []
+    assert db.sql(f"SELECT count(*) FROM {relation} WHERE g.score=999.5")["rows"] == [["0"]]
+    assert (
+        db.sql(
+            f"SELECT g.score FROM {relation} WHERE g.score<0 AND g.score=CAST(CAST($1 AS TEXT) AS BIGINT)", ["invalid"]
+        )["rows"]
+        == []
+    )

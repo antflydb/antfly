@@ -53,7 +53,7 @@ const Fixture = struct {
             try output.append(a, node);
         }
         const next = if (output.items.len == limit) try a.dupe(u8, output.items[output.items.len - 1].identity.key) else null;
-        return .{ .items = try output.toOwnedSlice(a), .next = next };
+        return .{ .items = try output.toOwnedSlice(a), .next = next, .unfiltered = true };
     }
     fn get(ptr: *anyopaque, _: std.mem.Allocator, identity: v.Identity) !?*const v.Node {
         const self: *Fixture = @ptrCast(@alignCast(ptr));
@@ -996,4 +996,73 @@ test "document key seeks outrank arbitrarily many candidate predicates" {
     defer result.deinit();
     try std.testing.expectEqual(@as(i64, 0), result.rows[0][0].integer);
     try std.testing.expectEqual(@as(usize, 1), result.stats.scanned_anchors);
+}
+
+test "streaming distinct preserves typed keys filters pagination and grouping" {
+    try check("MATCH (n:Document) RETURN DISTINCT n.rank%2 AS bucket ORDER BY bucket", "[[0],[1]]");
+    try check("MATCH (n:Document) RETURN DISTINCT n.rank%2 AS bucket SKIP 1 LIMIT 1", "[[0]]");
+    try check("MATCH (n:Document) WITH DISTINCT n.rank%2 AS bucket RETURN count(*)", "[[2]]");
+    try check("MATCH (n:Document) WITH DISTINCT n.rank%2 AS bucket WHERE bucket=1 RETURN count(*)", "[[1]]");
+    try check("MATCH (n:Document) RETURN DISTINCT n.missing LIMIT 1", "[[null]]");
+    try check("MATCH (n:Document) RETURN DISTINCT n.rank%2 AS bucket,count(*) ORDER BY bucket", "[[0,1],[1,2]]");
+    try check("MATCH (n:Document) RETURN DISTINCT n.rank%2 AS bucket SKIP 1 LIMIT 0", "[]");
+}
+
+test "streaming pattern joins preserve equality bags and shared uniqueness" {
+    try check("MATCH (a:Document),(b:Document) WHERE a.rank=b.rank RETURN count(*)", "[[3]]");
+    try check("MATCH (a:Document),(b:Document) WHERE a.rank=b.rank RETURN a.id,b.id ORDER BY a.id", "[[\"a\",\"a\"],[\"b\",\"b\"],[\"c\",\"c\"]]");
+    try check("MATCH (a:Document),(b:Document) WHERE a.rank=b.rank AND a.id<>b.id RETURN count(*)", "[[0]]");
+    try check("MATCH (a:Document),(b:Document) WHERE a.missing=b.missing RETURN count(*)", "[[0]]");
+    try check("MATCH (a:Document)-[:CITES]->(b),(b)-[:CITES]->(c) RETURN count(*)", "[[6]]");
+}
+
+test "node pull cursor owns parameters and releases each page" {
+    var fixture: Fixture = .{};
+    var diagnostic: c.Diagnostic = .{};
+    var compiled = try c.compile(std.testing.allocator, "MATCH (n:Document) WHERE n.rank>$rank RETURN n.id AS id", .{}, &diagnostic);
+    defer compiled.deinit();
+    const cursor = (try runtime.NodeCursor.open(std.testing.allocator, fixture.backend(), graph, compiled.query, &.{.{ .name = "rank", .value = .{ .integer = 1 } }}, .{ .scanned_anchors = 3, .memory_bytes = 1 << 20 })).?;
+    defer cursor.close();
+    var page_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer page_arena.deinit();
+    const first = try cursor.next(page_arena.allocator(), 1);
+    try std.testing.expectEqual(@as(usize, 1), first.len);
+    try std.testing.expectEqualStrings("b", first[0][0].value.string);
+    _ = page_arena.reset(.free_all);
+    const second = try cursor.next(page_arena.allocator(), 1);
+    try std.testing.expectEqualStrings("c", second[0][0].value.string);
+    _ = page_arena.reset(.free_all);
+    try std.testing.expectEqual(@as(usize, 0), (try cursor.next(page_arena.allocator(), 1)).len);
+}
+
+test "oversized unindexed join cache declines without failing the query" {
+    const Wide = struct {
+        const payload: [256 << 10]u8 = @splat('x');
+        fn scan(ptr: *anyopaque, a: std.mem.Allocator, table: []const u8, after: ?[]const u8, demand: usize) !b.Page(*const v.Node) {
+            var page = try Fixture.scan(ptr, a, table, after, demand);
+            const nodes = try a.alloc(*const v.Node, page.items.len);
+            for (page.items, nodes) |node, *out| {
+                const copy = try a.create(v.Node);
+                copy.* = node.*;
+                const fields = try a.alloc(v.Entry, node.properties.len + 1);
+                @memcpy(fields[0..node.properties.len], node.properties);
+                fields[node.properties.len] = .{ .name = "payload", .value = .{ .string = &payload } };
+                copy.properties = fields;
+                out.* = copy;
+            }
+            page.items = nodes;
+            return page;
+        }
+    };
+    var fixture: Fixture = .{};
+    const backend = fixture.backend();
+    var vtable = backend.vtable.*;
+    vtable.scan = Wide.scan;
+    var diagnostic: c.Diagnostic = .{};
+    var compiled = try c.compile(std.testing.allocator, "MATCH (a:Document),(b:Document) WHERE a.rank=b.rank RETURN count(*)", .{}, &diagnostic);
+    defer compiled.deinit();
+    var result = try runtime.execute(std.testing.allocator, .{ .ptr = backend.ptr, .vtable = &vtable }, graph, &compiled, &.{}, .{ .memory_bytes = 4 << 20 });
+    defer result.deinit();
+    try std.testing.expectEqual(@as(i64, 3), result.rows[0][0].integer);
+    try std.testing.expect(result.stats.scanned_anchors > 9);
 }

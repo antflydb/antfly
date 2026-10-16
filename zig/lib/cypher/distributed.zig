@@ -205,7 +205,7 @@ pub const ReadSet = struct {
         const owner = self.snapshots[position.owner].backend;
         const page = if (owner.vtable.scan_where) |filtered| try filtered(owner.ptr, a, table, filters, position.after, limit) else try owner.vtable.scan(owner.ptr, a, table, position.after, limit);
         try checkpoint(ptr);
-        return .{ .items = page.items, .examined = page.examined, .next = try self.next(a, table, position, page.next) };
+        return .{ .items = page.items, .examined = page.examined, .unfiltered = page.unfiltered, .next = try self.next(a, table, position, page.next) };
     }
     fn get(ptr: *anyopaque, a: A, identity: v.Identity) !?*const v.Node {
         const self = cast(ptr);
