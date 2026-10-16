@@ -6162,12 +6162,52 @@ test "capi SQL idle native maintenance avoids runtime construction and resumes w
     const after_work = owner.test_runtime_snapshot_opens;
     for (0..8) |_| _ = try owner.maintenanceTurnForTest();
     try std.testing.expectEqual(after_work, owner.test_runtime_snapshot_opens);
+    {
+        const guard = public.enterHandle(handle, .exclusive).?;
+        defer guard.leave();
+        var result = try guard.handle.db.search(a, .{ .index_name = "body_text", .full_text = .{ .match = .{ .field = "body", .text = "indexed after idle" } }, .limit = 10 });
+        defer result.deinit();
+        try std.testing.expectEqual(@as(usize, 1), result.hits.len);
+        try std.testing.expectEqualStrings("doc", result.hits[0].id);
+    }
+    // A different writer's catalog change during an idle turn must reopen the
+    // serving runtime. It must never be adopted as our lease/allocator cleanup.
+    const External = struct {
+        path: []const u8,
+        failure: ?anyerror = null,
+        fn publish(self: *@This()) !void {
+            var lease = try lite_backend.native.lockWriterPathWithIo(a, shared.handleLockIo(), self.path);
+            defer lease.close();
+            const other = try public.openLiteHandleAllocWithRuntime(a, self.path, .{
+                .externally_locked = true,
+                .profile = .hosted,
+                .open_mode = .writer_no_replay,
+            }, false, shared.handleLockIo(), null);
+            other.lease_snapshot = true;
+            defer shared.closeHandle(other);
+            try other.db.core.store.put("\x00antfly/test/external-catalog", "external");
+        }
+        fn notify(ptr: *anyopaque, _: *shared.Handle) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.publish() catch |err| {
+                self.failure = err;
+            };
+        }
+    };
+    try std.testing.expect(!owner.maintenance_pending);
+    var external = External{ .path = path };
+    owner.test_after_capture = .{ .ptr = &external, .notify = External.notify };
+    defer owner.test_after_capture = null;
+    const before_external = owner.current.?;
+    _ = try owner.maintenanceTurnForTest();
+    owner.test_after_capture = null;
+    if (external.failure) |err| return err;
     const guard = public.enterHandle(handle, .exclusive).?;
     defer guard.leave();
-    var result = try guard.handle.db.search(a, .{ .index_name = "body_text", .full_text = .{ .match = .{ .field = "body", .text = "indexed after idle" } }, .limit = 10 });
-    defer result.deinit();
-    try std.testing.expectEqual(@as(usize, 1), result.hits.len);
-    try std.testing.expectEqualStrings("doc", result.hits[0].id);
+    try std.testing.expect(guard.handle != before_external);
+    const external_value = try guard.handle.db.core.store.get(a, "\x00antfly/test/external-catalog");
+    defer a.free(external_value);
+    try std.testing.expectEqualStrings("external", external_value);
 }
 
 test "capi lite inference service survives foreground and maintenance snapshots" {
@@ -6398,4 +6438,33 @@ test "capi SQL visibility waits for physical graph indexes and normalized vector
             try std.testing.expect(ready);
         }
     }
+}
+
+test "capi lite inference failed open drains the configured generation before releasing its service" {
+    if (!capi_build_options.inference_enabled or !lite_backend.capabilitiesForProfile(.native).local_inference_runtime) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var directory = try TestDirectory.init("capi-inference-open-unwind");
+    defer directory.cleanup();
+    const path = try tempTestAflitePath(a, directory.path(), "database");
+    defer a.free(path);
+    defer cleanupTestFile(path);
+    const options: public.LiteResolvedOpenOptions = .{
+        .externally_locked = true,
+        .generated_enrichment_replay = true,
+        .inference = .{ .local_runtime_configured = true },
+    };
+    const root = try public.openLiteHandleAllocWithRuntime(a, path, options, true, shared.handleLockIo(), null);
+    defer shared.closeHandle(root);
+    const service = root.lite_inference.?;
+    try root.db.core.store.put("\x00antfly/embedded/tables/v1", "{");
+    const references = service.references.load(.acquire);
+    // Catalog discovery fails after managed producers have been reconfigured
+    // on the new DB copy and the service reference has been retained.
+    try std.testing.expectError(error.UnexpectedEndOfInput, public.openLiteHandleAllocWithSharedInference(a, path, options, false, shared.handleLockIo(), null, root));
+    try std.testing.expectEqual(references, service.references.load(.acquire));
+    try std.testing.expect(service.lifetime.isAccepting());
+    var borrower = try service.lifetime.acquire();
+    borrower.deinit();
+    // Exercise final-service destruction through the same failed-open path.
+    try std.testing.expectError(error.UnexpectedEndOfInput, public.openLiteHandleAllocWithRuntime(a, path, options, false, shared.handleLockIo(), null));
 }

@@ -138,12 +138,8 @@ pub const EmbeddedInferenceProviderLifetime = struct {
 ///
 /// `io` must outlive the returned node; destroy it with
 /// `destroyEmbeddedInferenceNode` before releasing `io`.
-/// Result of `createEmbeddedInferenceNode`: the opaque node handle plus the
-/// resource-budget owner `configureLiteInferenceResourceBudget` installed on
-/// it (null only if that configuration step itself failed; the node is still
-/// usable, but every provider call will fail with the same
-/// `ResourceOwnerNotConfigured`-class error a caller reached before this
-/// existed).
+/// Construction returns a node with its resource-budget owner configured, or
+/// fails and destroys the partial node. No unusable runtime escapes an open.
 /// Explicit resource-budget overrides for `createEmbeddedInferenceNode`, 0
 /// meaning automatic/host-detected sizing. These mirror the CLI's
 /// `--inference-host-budget-mb`/`--inference-backend-budget-mb`/

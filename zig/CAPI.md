@@ -179,11 +179,10 @@ models or reset admission accounting; the service drains and closes after its
 last retained database snapshot is released. Standalone `antfly_inference`
 handles continue to own independent runtimes. Explicit database `models_dir`
 values are copied during open and remain valid after the caller releases its
-options buffer. Allocator-only checkpoint changes retain the current database
-runtime, and idle maintenance writer admission does not schedule new replay. Native
-connection refresh defers derived replay to the maintenance driver, so opening
-a foreground handle does not publish competing index bytes during a detached
-build.
+options buffer. Idle maintenance writer admission does not schedule new replay.
+An idle turn can retain the serving runtime across its own fenced allocator and
+lease cleanup when primary and immutable index roots remain unchanged. An
+external writer's commit still requires normal runtime validation and refresh.
 
 `antfly_db_status_json` includes `inference.memory_admission` for a local runtime.
 It records the last denied admission's pressure category, requested/admitted

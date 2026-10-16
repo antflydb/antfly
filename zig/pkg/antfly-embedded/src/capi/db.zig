@@ -2628,13 +2628,14 @@ pub fn openLiteHandleAllocWithSharedInference(
     inference_source: ?*Handle,
 ) !*Handle {
     if (create and !liteOpenModeCanWrite(resolved.open_mode)) return error.InvalidArgument;
+    var handle_owns_resources = false;
     // Each cached generation owns its storage pool. Retired cursors may keep
     // an older generation alive while the same index roots reopen in this one.
     var owned_runtime: ?db_mod.background_runtime.BackendRuntimeHandle = if (resolved.externally_locked and backend_runtime == null)
         try db_mod.background_runtime.BackendRuntimeHandle.initManualWithOwnedIo(alloc)
     else
         null;
-    errdefer if (owned_runtime) |*runtime| runtime.deinit();
+    errdefer if (!handle_owns_resources) if (owned_runtime) |*runtime| runtime.deinit();
     var backend = if (create)
         try lite_backend.Handle.createWithOptions(alloc, path, .{
             .externally_locked = resolved.externally_locked,
@@ -2649,7 +2650,7 @@ pub fn openLiteHandleAllocWithSharedInference(
             .no_sync = resolved.no_sync,
             .io = borrowed_io,
         });
-    errdefer backend.deinit();
+    errdefer if (!handle_owns_resources) backend.deinit();
     if (resolved.allocator_verification_owner) |verified| {
         if (!resolved.externally_locked) return error.InvalidArgument;
         try backend.native_docstore.?.file.inheritAllocatorVerification(verified);
@@ -2700,7 +2701,7 @@ pub fn openLiteHandleAllocWithSharedInference(
     opts.identity_namespace = identity.identity_namespace;
     opts.prefer_existing_identity_namespace = identity.prefer_existing_identity_namespace;
     var db = try db_mod.DB.open(alloc, path, opts);
-    errdefer db.close();
+    errdefer if (!handle_owns_resources) db.close();
 
     if (create) {
         // Antfly Lite databases provision the same default full-text index
@@ -2710,7 +2711,7 @@ pub fn openLiteHandleAllocWithSharedInference(
     }
 
     const handle = alloc.create(Handle) catch return error.OutOfMemory;
-    errdefer alloc.destroy(handle);
+    errdefer if (!handle_owns_resources) alloc.destroy(handle);
     handle.* = .{
         .alloc = alloc,
         .db = db,
@@ -2723,6 +2724,14 @@ pub fn openLiteHandleAllocWithSharedInference(
         .lite_inference_status = lite_backend.inferenceStatusForProfileWithOptions(resolved.profile, resolved.inference),
         .lite_generated_enrichment_replay = resolved.generated_enrichment_replay,
     };
+    // Transfer the complete generation before configuring producers. From this
+    // point even a failed open must drain the actual DB stored in the handle,
+    // then release inference, storage and IO in the ordinary close order.
+    handle_owns_resources = true;
+    errdefer {
+        handle.lease_snapshot = true;
+        handles.closeHandle(handle);
+    }
     // Native builds link local inference. The native profile starts a service
     // only when the caller requests it and the target advertises support;
     // hosted/freestanding surfaces retain caller-supplied inference.
@@ -2731,10 +2740,6 @@ pub fn openLiteHandleAllocWithSharedInference(
         capi_build_options.inference_enabled and
         lite_backend.capabilitiesForProfile(.native).local_inference_runtime)
     {
-        // `backend.deinit()`, `db.close()`, and `alloc.destroy(handle)` are
-        // already registered as `errdefer`s above (in that unwind order);
-        // adding any of that cleanup here too would run it twice on this
-        // error path. Only unwind the state this function itself owns.
         if (if (inference_source) |source| source.lite_inference else null) |service| {
             service.retain();
             handle.lite_inference = service;
@@ -2754,16 +2759,9 @@ pub fn openLiteHandleAllocWithSharedInference(
     // default full-text index, so this is a no-op there). Must run after
     // `startLiteEmbeddedInference` so an embedded local provider is already
     // attached to the handle when this reads it.
-    refreshLiteManagedEmbeddingRuntime(handle) catch |err| {
-        stopLiteEmbeddedInference(handle);
-        return err;
-    };
+    try refreshLiteManagedEmbeddingRuntime(handle);
     @import("entity_sink.zig").attach(handle, &handle.db);
-    @import("tables.zig").loadCatalog(handle) catch |err| {
-        stopLiteEmbeddedInference(handle);
-        alloc.free(handle.embedded_path.?);
-        return err;
-    };
+    try @import("tables.zig").loadCatalog(handle);
     if (!resolved.externally_locked) handle.database().*.startQuarantineRetryWorkerIfNeeded();
     return handle;
 }

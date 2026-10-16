@@ -790,6 +790,44 @@ pub const Owner = struct {
         return snapshot;
     }
 
+    // An idle turn can publish allocator/lease cleanup after the serving
+    // checkpoint has left the retained slots. Its old page IDs are then unsafe
+    // to traverse. Instead adopt only this turn's fenced housekeeping result,
+    // while the serving handle and its entry header are still unchanged.
+    fn adoptIdleMaintenanceCheckpoint(self: *Owner, foreground: *h.Handle, entry_header: native.Header, maintenance: *NativeStore) !void {
+        if (self.current != foreground or foreground.maintenance_references != 0 or needsOutcomeReconciliation(foreground)) return;
+        const store = foreground.owned_lite_backend.?.native_docstore.?;
+        if (!std.meta.eql(store.file.header, entry_header)) return;
+        var lease = native.lockWriterPathWithIo(alloc, h.handleLockIo(), self.path) catch |err| switch (err) {
+            error.FileBusy, error.WouldBlock => return,
+            else => return err,
+        };
+        defer lease.close();
+        var probe = try native.NativeFile.openWithIo(alloc, h.handleLockIo(), self.path, .{ .read_only = true, .internal_reader = true });
+        defer probe.close();
+        if (!std.meta.eql(probe.header, maintenance.file.header) or
+            (try probe.file.stat(probe.runtime())).inode != (try store.file.file.stat(store.file.runtime())).inode or
+            (try probe.file.stat(probe.runtime())).inode != (try maintenance.file.file.stat(maintenance.file.runtime())).inode) return;
+        var before = store.file.activeCheckpoint();
+        var after = probe.activeCheckpoint();
+        before.commit_sequence = 0;
+        after.commit_sequence = 0;
+        before.free_map_root_page = 0;
+        after.free_map_root_page = 0;
+        before.page_count = 0;
+        after.page_count = 0;
+        before.catalog_root_page = 0;
+        after.catalog_root_page = 0;
+        // This turn ran no DB work. Reclamation admission never rebases over
+        // external commits, so only lease metadata and allocator state may
+        // differ. Primary, namespace and immutable index roots must all match.
+        if (!std.meta.eql(before, after) or store.file.header.page_size != probe.header.page_size or
+            store.file.header.packed_records != probe.header.packed_records or
+            store.file.header.indexed_reclamation != probe.header.indexed_reclamation) return;
+        try store.refreshIndexPublicationCheckpoint(probe.header);
+        try store.file.inheritAllocatorVerification(&maintenance.file);
+    }
+
     /// Captures one table under the connection fence. The pinned runtime owns
     /// all provider/catalog state while computation runs outside that fence.
     /// Native writer admission below revalidates inode and checkpoint for every
@@ -906,6 +944,7 @@ pub const Owner = struct {
         root.maintenance_owner = self;
         root.maintenance_publication = &publication;
         const store = root.owned_lite_backend.?.native_docstore.?;
+        const foreground_header = foreground.owned_lite_backend.?.native_docstore.?.file.header;
         if (run_database) if (database.enrichment_runtime) |runtime| {
             if (self.embedding_memo == null) self.embedding_memo = memo_mod.QueryEmbeddingCache.init(alloc, io, .{ .max_bytes = embedding_memo_bytes, .ttl_ns = std.time.ns_per_min });
             runtime.dense_result_cache = .{ .ptr = self, .lookup = lookupEmbedding, .remember = rememberEmbedding };
@@ -967,6 +1006,9 @@ pub const Owner = struct {
             !std.meta.eql(self.current.?.owned_lite_backend.?.native_docstore.?.file.header, store.file.header)
         else
             self.current != root;
+        // Retaining the serving runtime does not hide physical progress. Run
+        // another bounded storage turn before declaring cleanup quiescent.
+        if (independent and !run_database) try self.adoptIdleMaintenanceCheckpoint(foreground, foreground_header, store);
         // A moved physical tip requires a prompt refresh, not another DB
         // replay pass. Reader leases/index housekeeping also move that tip;
         // treating them as enrichment debt makes idle runtime opens perpetual.
