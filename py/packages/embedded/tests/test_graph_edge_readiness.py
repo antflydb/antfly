@@ -750,8 +750,9 @@ def test_index_upgrade_and_retired_identity_management(tmp_path, storage, order)
         db.add_index(config)
         db.merge_resolver_keys("concepts", "entity/ada", "entity/canonical")
         db.run_until_idle()
+        # Producer ownership and replay handoffs require reader epoch 3.
         reader_version = db.capabilities()["minimum_reader_version"]
-        assert reader_version == db.status()["capabilities"]["minimum_reader_version"] == 2
+        assert reader_version == db.status()["capabilities"]["minimum_reader_version"] == 3
         with pytest.raises(antfly_embedded.InvalidArgumentError, match="retire"):
             db.drop_resolver_identity("concepts")
         upgraded = json.loads(json.dumps(config))
@@ -850,7 +851,7 @@ def test_fresh_replacement_and_rejected_target_preserve_identity(tmp_path, stora
         config["resolvers"][0]["promote"] = True
         config["replaces"] = "knowledge_v1"
         db.add_index(config)
-        assert db.capabilities()["minimum_reader_version"] == 2
+        assert db.capabilities()["minimum_reader_version"] == 3
         before = db.list_resolver_identities()
         # Existing-target replacement must reject non-graph old indexes before
         # registering changed inline resolver config, for either storage mode.
@@ -863,7 +864,7 @@ def test_fresh_replacement_and_rejected_target_preserve_identity(tmp_path, stora
         assert db.list_resolver_identities() == before
         db.add_index(config)
     with _open_graph_test(path, options) as db:
-        assert db.capabilities()["minimum_reader_version"] == 2
+        assert db.capabilities()["minimum_reader_version"] == 3
         assert db.list_resolver_identities() == before
 
 
@@ -944,7 +945,7 @@ def test_previous_reader_opens_plain_database_and_rejects_new_features(tmp_path)
         config = _resolver_graph("knowledge", "concepts")
         config["resolvers"][0]["promote"] = True
         db.add_index(config)
-        assert db.capabilities()["minimum_reader_version"] == 2
+        assert db.capabilities()["minimum_reader_version"] == 3
     # Hosted maintenance leaves the shadow pending deterministically. The old
     # writer must fail open before it can truncate the retained journal.
     with antfly_embedded.create_hosted(pending) as db:
@@ -1369,7 +1370,7 @@ def test_child_permanent_epoch_survives_root_temporary_fence(tmp_path, storage):
         with db.open_table("source") as table:
             table.add_index(_resolver_graph("knowledge", "concepts", destination="source"))
         assert db.cancel_replacement("new")
-        assert db.capabilities()["minimum_reader_version"] == 2
+        assert db.capabilities()["minimum_reader_version"] == 3
     with _open_graph_test(path, options) as db:
         # Permanent aggregation is durable, even before opening the child.
-        assert db.capabilities()["minimum_reader_version"] == 2
+        assert db.capabilities()["minimum_reader_version"] == 3
