@@ -243,6 +243,31 @@ const Backend = struct {
     }
 };
 
+test "SQL joined numeric assignments coerce before captured atomic commit" {
+    for ([_]struct { expression: []const u8, expected: []const u8 }{
+        .{ .expression = "1.5", .expected = "2" },
+        .{ .expression = "'2.5'::real", .expected = "2" },
+        .{ .expression = "9007199254740992.5::numeric", .expected = "9007199254740993" },
+    }) |case| {
+        var fixture: Backend = .{};
+        const sql = try std.fmt.allocPrint(std.testing.allocator, "UPDATE target t SET n={s},cold='new' FROM source s WHERE t._id=s.id RETURNING t.n", .{case.expression});
+        defer std.testing.allocator.free(sql);
+        var compiled = try compiler.compile(std.testing.allocator, sql, .{});
+        defer compiled.deinit();
+        var result = try runtime.execute(std.testing.allocator, fixture.backend(), &compiled, &.{}, .{});
+        defer result.deinit();
+        try std.testing.expectEqual(@as(usize, 1), fixture.commits);
+        try std.testing.expectEqual(@as(usize, 2), result.output.rows.len);
+        for (result.output.rows) |row| try std.testing.expectEqualStrings(case.expected, row[0].string);
+    }
+    var failing: Backend = .{};
+    var overflow = try compiler.compile(std.testing.allocator, "UPDATE target t SET n=CASE WHEN s.id='a' THEN 9007199254740993::numeric ELSE 18446744073709551614::numeric END,cold='new' FROM source s WHERE t._id=s.id", .{});
+    defer overflow.deinit();
+    try std.testing.expectError(error.InvalidSqlNumber, runtime.execute(std.testing.allocator, failing.backend(), &overflow, &.{}, .{}));
+    try std.testing.expectEqual(@as(usize, 0), failing.commits);
+    try std.testing.expectEqual(failing.captures, failing.closes);
+}
+
 test "SQL joined mutations retain arrays through coercion scratch retirement and typed DELETE RETURNING" {
     const local = @import("antfly_local_sources");
     for ([_]bool{ false, true }) |document| for ([_]struct { sql: []const u8, first: i64, lower: i32, parameters: []const std.json.Value = &.{}, whole_null: bool = false }{

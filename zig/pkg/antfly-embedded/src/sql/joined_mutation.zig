@@ -217,7 +217,7 @@ pub fn bind(alloc: Allocator, backend: catalog.Backend, table: catalog.Table, co
     const input = try alloc.create(describe.BoundStatement);
     input.* = try describe.bind(alloc, adapter.iface(), &selected, parameters);
     for (input.columns, expected.items) |actual, required| {
-        if (!actual.untyped_null and actual.type != required.kind and !(actual.type == .integer and required.kind == .number)) return if (required.kind == .array) error.SqlAssignmentTypeMismatch else error.SqlTypeMismatch;
+        if (!actual.untyped_null and actual.type != required.kind and !@import("builtin_cast.zig").numericAssignmentAllowed(actual.type, required.kind orelse return error.InvalidSqlBackendResponse)) return if (required.kind == .array) error.SqlAssignmentTypeMismatch else error.SqlTypeMismatch;
         if (actual.type == .array and required.kind == .array and !@import("builtin_cast.zig").assignmentAllowed(actual.element_type orelse return error.SqlAssignmentTypeMismatch, required.element_type orelse return error.SqlAssignmentTypeMismatch)) return error.SqlAssignmentTypeMismatch;
     }
     // FROM/USING columns also participate in RETURNING name resolution.
@@ -469,9 +469,9 @@ pub fn execute(execution: anytype, definition_: Bound) !runtime.Output {
                 old.typed_cells.?.presence = presence;
                 break :blk old;
             } else null;
-            if (!bound.deleting) for (bound.fields, bound.preserve, values[5..][0..bound.fields.len]) |field, preserve, datum| {
+            if (!bound.deleting) for (bound.fields, bound.preserve, values[5..][0..bound.fields.len], bound.input.columns[5..][0..bound.fields.len]) |field, preserve, datum, source_column| {
                 if (preserve and !present.contains(field.name)) continue;
-                try object.put(context.arena, field.path, try context.storageDatum(datum, field));
+                try object.put(context.arena, field.path, try context.storageDatumTyped(datum, field, source_column.element_type));
                 if (field.type == .json and !datum.sql_null and datum.value == .null) try json_null_fields.append(context.arena, field.path);
             };
             try mutations.append(context.alloc, .{ .key = key, .expected_version = version, .expected_content_digest = digest, .row = if (bound.deleting) null else .{ .object = object }, .json_null_fields = json_null_fields.items, .previous = previous });

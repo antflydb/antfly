@@ -158,6 +158,10 @@ def properties(schema):
 
 def pg_type(prop):
     kind = prop.get("type")
+    if kind == "integer" and "x-antfly-sql-type" in prop:
+        return {"int16": "smallint", "int32": "integer", "int64": "bigint"}[
+            prop["x-antfly-sql-type"]
+        ]
     if kind == "sql_array":
         element = prop.get("x-antfly-sql-type")
         if element not in ARRAY_ELEMENT_TYPES:
@@ -1163,6 +1167,53 @@ def read_reference(db, cases, profile):
     }
 
 
+def text_read_profile():
+    """Nonempty text witnesses; preserve the original SQL and parameters."""
+    profile = json.loads((FIXTURES / "sql_read_campaign_profile.json").read_text())
+    props = properties(profile["schema"])
+    props["status"]["nullable"] = True
+    props["email"]["nullable"] = True
+    # PostgreSQL chr accepts int4, not the storage-default int8.
+    props["amount"] = {"type": "integer", "x-antfly-sql-type": "int32"}
+    template = deepcopy(profile["rows"][0]["value"])
+    profile["rows"] = []
+    for i, status in enumerate(
+        [
+            "op_A",
+            "op%active",
+            "ACTIVE12",
+            "ACTIVE2",
+            "atest",
+            "étest",
+            "open",
+            "open",
+            "",
+            None,
+            "active",
+            "ready",
+        ]
+    ):
+        value = deepcopy(template)
+        value.update(
+            id=f"text-{i:02}",
+            status=status,
+            amount=[65, 66, 233, 128512, 67, 68, 69, 70, 0, 0, 71, 72][i],
+            quantity=i + 1,
+            organization_id=f"org-{i % 3}",
+            tenant_id="text-tenant",
+            created_at=f"2025-01-{i + 1:02}T00:00:00Z",
+            email=[
+                "ADA@EXAMPLE.TEST",
+                "grace@example.test",
+                "other@example.test",
+                None,
+            ][i % 4],
+        )
+        value["metadata"]["source"] = "manual" if i % 2 else "autoscale_delta"
+        profile["rows"].append({"key": value["id"], "value": value})
+    return profile
+
+
 def join_read_profile():
     """Typed join witnesses with real duplicate rows, NULLs and missing peers."""
     profile = json.loads((FIXTURES / "sql_read_campaign_profile.json").read_text())
@@ -1527,6 +1578,7 @@ def main():
         choices=[
             "read",
             "digest_read",
+            "text_read",
             "typed_array_read",
             "aggregate_read",
             "set_read",
@@ -1599,6 +1651,7 @@ def main():
         if args.campaign in {
             "read",
             "digest_read",
+            "text_read",
             "typed_array_read",
             "aggregate_read",
             "set_read",
@@ -1610,6 +1663,8 @@ def main():
             profile = (
                 join_read_profile()
                 if args.campaign == "join_read"
+                else text_read_profile()
+                if args.campaign == "text_read"
                 else set_read_profile()
                 if args.campaign == "set_read"
                 else typed_array_read_profile()

@@ -423,6 +423,12 @@ const Builder = struct {
                     if (call.args.len != 1) return error.InvalidSqlParameters;
                     const argument = try self.inferenceExpression(call.args[0], columns);
                     break :blk switch (kind) {
+                        .sum => sum: {
+                            const input = try self.setType(argument, if (self.shape_only) self.shape_columns.items else try self.scalarColumns(columns));
+                            if (input.kind == null) break :sum argument.*;
+                            const output = @import("operators.zig").Aggregate.sumType(input);
+                            break :sum .{ .cast = .{ .operand = argument, .type = output.kind.?, .element_type = output.element_type } };
+                        },
                         .avg => .{ .cast = .{ .operand = argument, .type = .number } },
                         .bool_and, .bool_or => .{ .cast = .{ .operand = argument, .type = .boolean } },
                         .pattern_set => .{ .cast = .{ .operand = try self.scalarNode(.{ .cast = .{ .operand = argument, .type = .string } }), .type = .json } },

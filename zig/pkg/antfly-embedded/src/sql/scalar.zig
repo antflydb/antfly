@@ -947,6 +947,32 @@ pub fn assignArray(alloc: Allocator, datum: Datum, target: arrays.ElementType, l
     return evaluator.castArray(datum, target);
 }
 
+/// Numeric assignment uses PostgreSQL's narrowing/range/rounding rules,
+/// without turning an already typed text/JSON value into numeric input.
+pub fn assignNumeric(alloc: Allocator, datum: Datum, source_identity: ?arrays.ElementType, target: arrays.ElementType, limits: EvalLimits) !Datum {
+    if (!builtin_cast.integral(target) and !builtin_cast.floating(target) and target != .numeric) return error.SqlAssignmentTypeMismatch;
+    if (datum.array != null or datum.patterns() != null or datum.temporal() != null) return error.SqlAssignmentTypeMismatch;
+    if (datum.sql_null) {
+        if (datum.value != .null or datum.numeric != null) return error.SqlTypeMismatch;
+        return datum;
+    }
+    const source: arrays.ElementType = if (datum.numeric != null) source: {
+        if (datum.value != .null) return error.SqlTypeMismatch;
+        break :source .numeric;
+    } else switch (datum.value) {
+        .integer => if (source_identity) |kind| if (builtin_cast.integral(kind)) kind else return error.SqlTypeMismatch else .int64,
+        .float => if (source_identity) |kind| if (builtin_cast.floating(kind)) kind else return error.SqlTypeMismatch else .float64,
+        else => return datum, // Existing unknown-literal admission owns text.
+    };
+    if (!builtin_cast.assignmentAllowed(source, target)) return error.SqlAssignmentTypeMismatch;
+    if (source == target) return datum;
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const program: Program = .{ .arena = &arena, .instructions = &.{}, .root = 0, .output_type = .{}, .parameter_types = &.{}, .parameter_descriptors = &.{}, .required_columns = &.{} };
+    var evaluator: Evaluator = .{ .program = &program, .alloc = alloc, .cells = &.{}, .parameters = &.{}, .limits = limits };
+    return evaluator.castDatumBuiltin(datum, source, target);
+}
+
 fn normalizeParameterType(descriptor: Type) !Type {
     try validateParameterType(descriptor);
     var result = descriptor;

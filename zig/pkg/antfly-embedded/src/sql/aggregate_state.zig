@@ -359,6 +359,11 @@ pub const Column = struct {
         };
         return (try self.snapshot(std.heap.page_allocator, index)).finish();
     }
+    pub fn finishOutput(self: *const Column, result: A, index: usize) !Datum {
+        if (!operators.Aggregate.bigintSum(self.spec.kind, self.spec.input_type, self.spec.input_element)) return self.finish(index);
+        const state = try self.snapshot(result, index);
+        return state.finishOutput(result);
+    }
 };
 
 test "SQL typed aggregate vectors match scalar states for nulls mixed numerics and extrema" {

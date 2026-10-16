@@ -246,6 +246,7 @@ test "api module compiles" {
     _ = @import("sql_catalog_campaign_test.zig");
     _ = @import("sql_name_resolution_test.zig");
     _ = @import("sql_join_campaign_test.zig");
+    _ = @import("sql_text_campaign_test.zig");
     _ = @import("sql_array_expansion_test.zig");
     _ = @import("online_merge_io.zig");
     _ = @import("sql_truncate.zig");

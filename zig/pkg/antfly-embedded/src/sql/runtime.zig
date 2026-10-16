@@ -414,7 +414,11 @@ pub const Context = struct {
     /// cell. Arrays remain typed until here; their null JSON placeholder must
     /// never be mistaken for either a SQL NULL or a JSONB null write.
     pub fn storageDatum(self: Context, datum: Datum, column: catalog.Column) !Json {
-        return encodeStorageDatum(self.arena, datum, column, self.limits.retained_bytes) catch |err| {
+        return self.storageDatumTyped(datum, column, null);
+    }
+
+    pub fn storageDatumTyped(self: Context, datum: Datum, column: catalog.Column, source_identity: ?@import("array_value.zig").ElementType) !Json {
+        return encodeStorageDatumTyped(self.arena, datum, column, source_identity, self.limits.retained_bytes) catch |err| {
             if (err == error.SqlNotNullViolation) return @import("errors.zig").notNull(self.backend.error_context, column.name);
             return err;
         };
@@ -1084,7 +1088,7 @@ pub const Context = struct {
                     if (key_index != null and i == key_index.?) continue;
                     if (statement.isDefault(row_index, i)) continue;
                     const datum = try self.insertValue(item, column, row_index, i, page.values[row_index - first][i]);
-                    const typed = try self.storageDatum(datum, column);
+                    const typed = try self.storageDatumTyped(datum, column, column.element_type);
                     const json_null = column.type == .json and typed == .null and !datum.sql_null;
                     if (json_null) try json_null_fields.append(self.arena, column.path);
                     try putField(self.arena, &object, column.path, typed);
@@ -1143,8 +1147,8 @@ pub const Context = struct {
             var key: ?[]const u8 = null;
             for (target_columns, bound.columns[0..statement.columns.len], row[0..statement.columns.len], 0..) |target, source_column, value_, cell_index| {
                 if (statement.isDefault(row_index, cell_index)) continue;
-                if (!value_.sql_null and source_column.type != target.type and !(source_column.type == .integer and target.type == .number) and !(statement.values_source_rows.len != 0 and source_column.type == .string and (target.type == .datetime or target.type == .json or target.type == .uuid))) return error.SqlTypeMismatch;
-                const typed = try self.storageDatum(value_, target);
+                if (!value_.sql_null and source_column.type != target.type and !@import("builtin_cast.zig").numericAssignmentAllowed(source_column.type, target.type) and !(statement.values_source_rows.len != 0 and source_column.type == .string and (target.type == .datetime or target.type == .json or target.type == .uuid))) return error.SqlTypeMismatch;
+                const typed = try self.storageDatumTyped(value_, target, source_column.element_type);
                 if (std.mem.eql(u8, target.name, "_id")) {
                     if (value_.sql_null or typed != .string or typed.string.len == 0) return error.SqlRowIdentityRequired;
                     if (!std.unicode.utf8ValidateSlice(typed.string)) return error.SqlTypeMismatch;
@@ -1217,11 +1221,11 @@ pub const Context = struct {
     fn insertValue(self: Context, literal: ast.Value, column: catalog.Column, row: usize, cell: usize, evaluated: ?Datum) !Datum {
         if (self.binding.scalars.insert_rows.len != 0 and self.binding.scalars.insert_rows[row][cell] != null) {
             const result = evaluated orelse return error.InvalidSqlProgram;
-            return describe.coerceDatum(self.arena, result, column.type, column.element_type);
+            return describe.assignDatum(self.arena, result, self.binding.scalars.insert_rows[row][cell].?.output_type.element_type, column.type, column.element_type, .{ .output_bytes = self.limits.retained_bytes });
         }
         if (literal == .parameter) {
             if (literal.parameter == 0) return error.InvalidSqlParameters;
-            return describe.coerceDatum(self.arena, try self.parameterDatum(literal.parameter - 1), column.type, column.element_type);
+            return describe.assignDatum(self.arena, try self.parameterDatum(literal.parameter - 1), self.binding.parameter_descriptors[literal.parameter - 1].element_type, column.type, column.element_type, .{ .output_bytes = self.limits.retained_bytes });
         }
         const result = try self.value(literal, column);
         return .{ .value = result, .sql_null = result == .null and !(column.type == .json and literal == .string) };
@@ -1291,7 +1295,7 @@ pub const Context = struct {
                 // not row scratch. Retain it once, as on the literal path;
                 // do not clone a wide prepared payload for every target row.
                 const value_ = try self.evaluate(self.arena, program.?, &.{});
-                typed = try self.storageDatum(value_, column);
+                typed = try self.storageDatumTyped(value_, column, program.?.output_type.element_type);
                 sql_null = value_.sql_null;
                 program = null;
             } else if (program == null) {
@@ -1401,7 +1405,7 @@ pub const Context = struct {
                             if (try row.hasField(column.path)) {
                                 const cell = try row.cell(column.path);
                                 if (column.type == .json and cell.value == .null and !cell.sql_null) try json_null_fields.append(self.arena, column.path);
-                                try putField(self.arena, &copy.object, column.path, try self.storageDatum(cell, column));
+                                try putField(self.arena, &copy.object, column.path, try self.storageDatumTyped(cell, column, column.element_type));
                             }
                         }
                         for (bound_assignments, 0..) |bound, assignment_index| {
@@ -1409,7 +1413,7 @@ pub const Context = struct {
                                 const assigned = if (evaluated) |batch| batch.assignments[assignment_index].?[batch.positions[row_index].?] else try self.evaluate(scratch, program, expression_cells);
                                 if (assigned.sql_null and !bound.column.nullable) return @import("errors.zig").notNull(self.backend.error_context, bound.column.name);
                                 if (bound.column.type == .json and !assigned.sql_null and assigned.value == .null) try json_null_fields.append(self.arena, bound.column.path);
-                                break :blk try self.storageDatum(assigned, bound.column);
+                                break :blk try self.storageDatumTyped(assigned, bound.column, program.output_type.element_type);
                             } else blk: {
                                 if (bound.column.type == .json and !bound.sql_null and bound.value == .null) try json_null_fields.append(self.arena, bound.column.path);
                                 break :blk bound.value;
@@ -1673,12 +1677,15 @@ fn putField(arena: std.mem.Allocator, object: *std.json.ObjectMap, path: []const
 /// independently prepared MERGE images. Never encode a typed array's JSON
 /// placeholder or retain payloads borrowed from an evaluator's scratch arena.
 pub fn encodeStorageDatum(arena: std.mem.Allocator, datum: Datum, column: catalog.Column, retained_bytes: usize) !Json {
+    return encodeStorageDatumTyped(arena, datum, column, null, retained_bytes);
+}
+
+pub fn encodeStorageDatumTyped(arena: std.mem.Allocator, datum: Datum, column: catalog.Column, source_identity: ?@import("array_value.zig").ElementType, retained_bytes: usize) !Json {
     if (datum.temporal() != null) {
         try datum.validateTemporal();
         return error.UnsupportedRelationalValueType; // requires schema/layout capability activation
     }
-    const assigned = if (column.type == .array) try @import("scalar.zig").assignArray(arena, datum, column.element_type orelse return error.SqlAssignmentTypeMismatch, .{ .output_bytes = retained_bytes }) else datum;
-    const checked = try describe.coerceDatum(arena, assigned, column.type, column.element_type);
+    const checked = try describe.assignDatum(arena, datum, source_identity, column.type, column.element_type, .{ .output_bytes = retained_bytes });
     if (checked.sql_null) {
         if (!column.nullable) return error.SqlNotNullViolation;
         return .null;
@@ -1688,7 +1695,31 @@ pub fn encodeStorageDatum(arena: std.mem.Allocator, datum: Datum, column: catalo
         var context: @import("numeric_value.zig").Context = .{ .alloc = arena, .max_output_bytes = retained_bytes };
         return .{ .string = try @import("numeric_value.zig").format(&context, value.*) };
     }
+    // Scalar floating storage is currently finite-only. Never let JSON
+    // serialization turn a valid SQL special value into a persisted SQL NULL.
+    if (checked.value == .float and !std.math.isFinite(checked.value.float)) return error.SqlNonFiniteScalarStorage;
     return clone(arena, checked.value);
+}
+
+test "SQL scalar floating storage rejects specials without serializing nullable NULLs" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    for ([_]@import("array_value.zig").ElementType{ .float32, .float64 }) |kind| {
+        const column: catalog.Column = .{ .name = "n", .path = "n", .type = .number, .element_type = kind, .nullable = true };
+        for ([_]f64{ std.math.nan(f64), std.math.inf(f64), -std.math.inf(f64) }) |number| try std.testing.expectError(error.SqlNonFiniteScalarStorage, encodeStorageDatumTyped(scratch, Datum.json(.{ .float = number }), column, kind, 1 << 20));
+        for ([_][]const u8{ "NaN", "Infinity", "-Infinity" }) |text| {
+            var context: @import("numeric_value.zig").Context = .{ .alloc = scratch };
+            var number = try @import("numeric_value.zig").parse(&context, text);
+            defer number.deinit();
+            try std.testing.expectError(error.SqlNonFiniteScalarStorage, encodeStorageDatumTyped(scratch, Datum.typedNumeric(&number.value), column, .numeric, 1 << 20));
+            // NUMERIC has a canonical special-value representation already;
+            // the finite-only floating barrier must not erase that capability.
+            const exact = try encodeStorageDatumTyped(scratch, Datum.typedNumeric(&number.value), .{ .name = "n", .path = "n", .type = .number, .element_type = .numeric }, .numeric, 1 << 20);
+            try std.testing.expectEqualStrings(text, exact.string);
+        }
+    }
 }
 
 pub fn clone(arena: std.mem.Allocator, value: Json) error{ OutOfMemory, SqlProgramLimitExceeded }!Json {
@@ -3049,6 +3080,29 @@ test "SQL CTE aliases feed hash joins and grouped projection without stringifyin
     try std.testing.expectEqualStrings("2", result.output.rows[0][0].string);
     try std.testing.expectEqualStrings("1", result.output.rows[0][1].string);
     try std.testing.expectEqual(@as(usize, 1), backend.statement_closes);
+}
+
+test "SQL bigint SUM preserves exact numeric outputs through grouped and window plans" {
+    const Case = struct { sql: []const u8, values: []const ?[]const u8 };
+    for ([_]Case{
+        .{ .sql = "SELECT sum(n) FROM (VALUES (9223372036854775807::bigint),(9223372036854775807::bigint)) v(n)", .values = &.{"18446744073709551614"} },
+        .{ .sql = "SELECT sum(DISTINCT n) FILTER (WHERE n>0) FROM (VALUES (9223372036854775807::bigint),(9223372036854775807::bigint),(-1::bigint)) v(n)", .values = &.{"9223372036854775807"} },
+        .{ .sql = "SELECT sum(n) FILTER (WHERE false) FROM (VALUES (1::bigint)) v(n)", .values = &.{null} },
+        .{ .sql = "SELECT sum(n) OVER (ORDER BY i ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM (VALUES (0,9223372036854775807::bigint),(1,9223372036854775807::bigint),(2,-9223372036854775807::bigint)) v(i,n) ORDER BY i", .values = &.{ "9223372036854775807", "18446744073709551614", "0" } },
+        .{ .sql = "SELECT sum(n) OVER (ORDER BY i ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING EXCLUDE CURRENT ROW) FROM (VALUES (0,9223372036854775807::bigint),(1,9223372036854775807::bigint),(2,-9223372036854775807::bigint)) v(i,n) ORDER BY i", .values = &.{ "0", "0", "18446744073709551614" } },
+    }) |case| {
+        var backend: TestBackend = .{};
+        var compiled = try compiler.compile(std.testing.allocator, case.sql, .{});
+        defer compiled.deinit();
+        var result = try execute(std.testing.allocator, backend.coordinated(), &compiled, &.{}, .{});
+        defer result.deinit();
+        try std.testing.expectEqual(ast.ColumnType.number, result.output.columns[0].type);
+        try std.testing.expectEqual(@as(?@import("array_value.zig").ElementType, .numeric), result.output.columns[0].element_type);
+        try std.testing.expectEqual(case.values.len, result.output.rows.len);
+        for (case.values, result.output.rows) |expected, row| {
+            if (expected) |text| try std.testing.expectEqualStrings(text, row[0].string) else try std.testing.expect(row[0] == .null);
+        }
+    }
 }
 
 test "SQL recursive type conflicts fail before physical statement admission" {

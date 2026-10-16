@@ -139,7 +139,7 @@ pub fn bind(alloc: std.mem.Allocator, backend: catalog.Backend, table: catalog.T
             binding.* = try @import("describe.zig").bind(alloc, backend, &compiled, parameters);
             if (binding.columns.len != 1) return error.InvalidSqlParameters;
             const target = try table.column(assignment.field);
-            if (binding.columns[0].type != target.type and !(binding.columns[0].type == .integer and target.type == .number)) return error.SqlTypeMismatch;
+            if (binding.columns[0].type != target.type and !@import("builtin_cast.zig").numericAssignmentAllowed(binding.columns[0].type, target.type)) return error.SqlTypeMismatch;
             later.* = .{ .query = query, .binding = binding };
             continue;
         }
@@ -158,6 +158,23 @@ pub fn bind(alloc: std.mem.Allocator, backend: catalog.Backend, table: catalog.T
         }
     }
     return .{ .columns = columns, .row_width = count, .assignments = assignments, .column_assignments = column_assignments, .deferred = deferred, .predicate = if (clause.predicate) |expression| try scalar.bindExpectedWithSettings(alloc, expression, columns, parameters, .boolean, .{ .invocation = backend.parameter_invocation }, backend.settings_view) else null, .arbiter_conditions = arbiter_conditions, .arbiter_expressions = arbiter_expressions };
+}
+
+fn assignmentIdentity(binding: Bound, assignment: ast.Assignment, index: usize) !?@import("array_value.zig").ElementType {
+    if (binding.assignments[index]) |program| return program.output_type.element_type;
+    if (assignment.deferred_scalar) {
+        if (index >= binding.deferred.len) return error.InvalidSqlBackendResponse;
+        const deferred = binding.deferred[index] orelse return error.InvalidSqlBackendResponse;
+        if (deferred.binding.columns.len != 1) return error.InvalidSqlBackendResponse;
+        return deferred.binding.columns[0].element_type;
+    }
+    if (assignment.capture_ordinal) |ordinal| {
+        const base = std.math.mul(usize, binding.row_width, 3) catch return error.InvalidSqlBackendResponse;
+        const slot = std.math.add(usize, base, ordinal) catch return error.InvalidSqlBackendResponse;
+        if (slot >= binding.columns.len) return error.InvalidSqlBackendResponse;
+        return binding.columns[slot].element_type;
+    }
+    return error.InvalidSqlBackendResponse;
 }
 
 fn bindArbiterPredicate(alloc: std.mem.Allocator, table: catalog.Table, expression: *const ast.Scalar) ![]const catalog.Condition {
@@ -408,12 +425,14 @@ fn resolvePrepared(context: anytype, table: catalog.Table, clause: ast.Conflict,
         for (table.columns, 0..) |column, column_index| {
             if (column.generated) continue;
             var datum = cells[column_index];
+            var source_identity = column.element_type;
             var assigned = false;
             if (binding.column_assignments[column_index]) |assignment_index| {
                 const assignment = clause.assignments[assignment_index];
                 // Omission, not NULL: native preparation owns DEFAULT and
                 // generated values, only after this owner passed WHERE.
                 if (assignment.use_default) continue;
+                source_identity = try assignmentIdentity(binding, assignment, assignment_index);
                 const program = binding.assignments[assignment_index];
                 datum = if (assignment.capture_ordinal != null and assignment.capture_expression == null) blk: {
                     const ordinal = assignment.capture_ordinal.?;
@@ -428,7 +447,7 @@ fn resolvePrepared(context: anytype, table: catalog.Table, clause: ast.Conflict,
             }
             if (!assigned and !try previous.hasField(column.name)) continue;
             if (column.type == .json and datum.value == .null and !datum.sql_null) try nulls.append(context.arena, column.name);
-            try row.put(context.arena, column.name, try context.storageDatum(datum, column));
+            try row.put(context.arena, column.name, try context.storageDatumTyped(datum, column, source_identity));
         }
         mutation.row = .{ .object = row };
         mutation.json_null_fields = nulls.items;
@@ -513,15 +532,17 @@ fn applyDecisionConflicts(context: anytype, scratch: std.mem.Allocator, table: c
         for (table.columns, 0..) |column, column_index| {
             if (column.generated) continue;
             var datum = candidate.cells[column_index];
+            var source_identity = column.element_type;
             var assigned = false;
             if (binding.column_assignments[column_index]) |index| {
                 if (clause.assignments[index].use_default) continue;
+                source_identity = try assignmentIdentity(binding, clause.assignments[index], index);
                 datum = assignment_values[index][row_index];
                 assigned = true;
             }
             if (!assigned and !candidate.presence[column_index]) continue;
             if (column.type == .json and datum.value == .null and !datum.sql_null) try nulls.append(context.arena, column.name);
-            try row.put(context.arena, column.name, try context.storageDatum(datum, column));
+            try row.put(context.arena, column.name, try context.storageDatumTyped(datum, column, source_identity));
         }
         candidate.mutation.row = .{ .object = row };
         candidate.mutation.json_null_fields = nulls.items;

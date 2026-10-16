@@ -556,7 +556,7 @@ fn bindImpl(allocator: std.mem.Allocator, backend: catalog.Backend, compiled: *c
             const destination = try table.column(name);
             if (source_column.type == .array and destination.type == .array and !@import("builtin_cast.zig").assignmentAllowed(source_column.element_type orelse return error.SqlAssignmentTypeMismatch, destination.element_type orelse return error.SqlAssignmentTypeMismatch)) return error.SqlAssignmentTypeMismatch;
             const untyped_null = source_column.untyped_null;
-            if (!untyped_null and source_column.type != destination.type and !(source_column.type == .integer and destination.type == .number) and !(insertion.values_source_rows.len != 0 and source_column.type == .string and (destination.type == .datetime or destination.type == .json or destination.type == .uuid))) return error.SqlTypeMismatch;
+            if (!untyped_null and source_column.type != destination.type and !@import("builtin_cast.zig").numericAssignmentAllowed(source_column.type, destination.type) and !(insertion.values_source_rows.len != 0 and source_column.type == .string and (destination.type == .datetime or destination.type == .json or destination.type == .uuid))) return error.SqlTypeMismatch;
         }
         result.insert_source = bound;
         result.parameter_types = bound.parameter_types;
@@ -912,6 +912,13 @@ fn bindOrder(alloc: std.mem.Allocator, table: catalog.Table, statement: ast.Sele
 /// f64. Native number columns intentionally have IEEE-754 semantics.
 /// Typed internal boundaries must never coerce an array's JSON placeholder.
 /// Array element descriptors are part of the type, not inferred from values.
+/// Preserve the source builtin through PostgreSQL assignment casts. In
+/// particular real->numeric must not acquire double precision's formatting.
+pub fn assignDatum(alloc: std.mem.Allocator, raw: @import("scalar.zig").Datum, source_identity: ?@import("array_value.zig").ElementType, kind: ast.ColumnType, element_type: ?@import("array_value.zig").ElementType, limits: @import("scalar.zig").EvalLimits) !@import("scalar.zig").Datum {
+    const assigned = if (kind == .array) try @import("scalar.zig").assignArray(alloc, raw, element_type orelse return error.SqlAssignmentTypeMismatch, limits) else if (kind == .integer or kind == .number) try @import("scalar.zig").assignNumeric(alloc, raw, source_identity, element_type orelse (if (kind == .integer) .int64 else .float64), limits) else raw;
+    return coerceDatum(alloc, assigned, kind, element_type);
+}
+
 pub fn coerceDatum(alloc: std.mem.Allocator, raw: @import("scalar.zig").Datum, kind: ast.ColumnType, element_type: ?@import("array_value.zig").ElementType) !@import("scalar.zig").Datum {
     if (raw.temporal() != null) {
         try raw.validateTemporal();

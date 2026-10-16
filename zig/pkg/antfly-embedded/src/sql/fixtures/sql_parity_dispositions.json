@@ -2,6 +2,9 @@
   "ledger_format": 1,
   "inventory_sha256": "c203a4dcf0094b75e1d3764e90beebddaf844a9ce604543c0a4dbc0ffe8ae173",
   "gates": {
+    "sql-original-text-reads-native-debug": {"command":["zig","build","public-api-parity-test","-Doptimize=Debug","-j1","-Dtest-filter=httpx SQL PostgreSQL original text reads preserve escapes unicode and ordering","-Dtest-filter=SQL parity described parameter transport preserves JSON identity and NULLs"],"cwd":"zig","timeout_seconds":1800},
+    "sql-original-text-reads-postgres": {"command":["uv","run","--project","scripts","--with","psycopg[binary]==3.3.6","python","scripts/generate_sql_postgres_reference.py","text_read","--check","zig/pkg/antfly-embedded/src/sql/fixtures/sql_text_read_reference.json"],"cwd":".","timeout_seconds":180},
+    "sql-numeric-reduction-assignment-debug": {"command":["zig","build","sql-test","-Doptimize=Debug","-j1"],"cwd":"zig","timeout_seconds":1800},
     "sql-original-joins-native-debug": {"command":["zig","build","public-api-parity-test","-Doptimize=Debug","-j1","-Dtest-filter=httpx SQL PostgreSQL original joins preserve match scopes nulls and bags"],"cwd":"zig","timeout_seconds":1800},
     "sql-original-joins-postgres": {"command":["uv","run","--project","scripts","--with","psycopg[binary]==3.3.6","python","scripts/generate_sql_postgres_reference.py","join_read","--check","zig/pkg/antfly-embedded/src/sql/fixtures/sql_join_read_reference.json"],"cwd":".","timeout_seconds":180},
     "sql-original-name-resolution-native-debug": {"command":["zig","build","public-api-parity-test","-Doptimize=Debug","-j1","-Dtest-filter=httpx SQL original PostgreSQL name resolution rejects aliases before data reads","-Dtest-filter=httpx SQL PostgreSQL original aggregate reads preserve filters captures and nulls"],"cwd":"zig","timeout_seconds":1800},
@@ -1716,8 +1719,12 @@
     },
     {
       "id": "sql-0190",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "Exact original SQL and logical parameter values match PostgreSQL through native-declared text[] transport. Only the legacy fixture transport becomes a lossless array envelope; untyped JSON arrays remain rejected as SQL arrays, and JSONB parameters retain JSON identity. Nonempty native results verify labels, OIDs, SQL NULLs and ordering.",
+      "evidence": [
+        {"path":"zig/pkg/antfly/src/api/sql_text_campaign_test.zig","test":"httpx SQL PostgreSQL original text reads preserve escapes unicode and ordering","gate":"sql-original-text-reads-native-debug"},
+        {"path":"zig/pkg/antfly/src/api/sql_text_campaign_test.zig","test":"httpx SQL PostgreSQL original text reads preserve escapes unicode and ordering","gate":"sql-original-text-reads-postgres"}
+      ]
     },
     {
       "id": "sql-0191",
@@ -1802,8 +1809,12 @@
     },
     {
       "id": "sql-0194",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "Exact original SQL and logical parameter values match PostgreSQL through native-declared text[] transport. Only the legacy fixture transport becomes a lossless array envelope; untyped JSON arrays remain rejected as SQL arrays, and JSONB parameters retain JSON identity. Nonempty native results verify labels, OIDs, SQL NULLs and ordering.",
+      "evidence": [
+        {"path":"zig/pkg/antfly/src/api/sql_text_campaign_test.zig","test":"httpx SQL PostgreSQL original text reads preserve escapes unicode and ordering","gate":"sql-original-text-reads-native-debug"},
+        {"path":"zig/pkg/antfly/src/api/sql_text_campaign_test.zig","test":"httpx SQL PostgreSQL original text reads preserve escapes unicode and ordering","gate":"sql-original-text-reads-postgres"}
+      ]
     },
     {
       "id": "sql-0195",
@@ -2001,23 +2012,39 @@
     },
     {
       "id": "sql-0210",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "Exact original SQL executes over nonempty typed native rows and matches PostgreSQL values, labels, builtin OIDs, SQL NULLs and ordering. The fixture declares int4 amount explicitly for chr(integer), without changing the source SQL or logical parameters.",
+      "evidence": [
+        {"path":"zig/pkg/antfly/src/api/sql_text_campaign_test.zig","test":"httpx SQL PostgreSQL original text reads preserve escapes unicode and ordering","gate":"sql-original-text-reads-native-debug"},
+        {"path":"zig/pkg/antfly/src/api/sql_text_campaign_test.zig","test":"httpx SQL PostgreSQL original text reads preserve escapes unicode and ordering","gate":"sql-original-text-reads-postgres"}
+      ]
     },
     {
       "id": "sql-0211",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "Exact original SQL and logical parameter values match PostgreSQL through native-declared text[] transport. Only the legacy fixture transport becomes a lossless array envelope; untyped JSON arrays remain rejected as SQL arrays, and JSONB parameters retain JSON identity. Nonempty native results verify labels, OIDs, SQL NULLs and ordering.",
+      "evidence": [
+        {"path":"zig/pkg/antfly/src/api/sql_text_campaign_test.zig","test":"httpx SQL PostgreSQL original text reads preserve escapes unicode and ordering","gate":"sql-original-text-reads-native-debug"},
+        {"path":"zig/pkg/antfly/src/api/sql_text_campaign_test.zig","test":"httpx SQL PostgreSQL original text reads preserve escapes unicode and ordering","gate":"sql-original-text-reads-postgres"}
+      ]
     },
     {
       "id": "sql-0212",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "Exact original SQL and logical parameter values match PostgreSQL through native-declared text[] transport. Only the legacy fixture transport becomes a lossless array envelope; untyped JSON arrays remain rejected as SQL arrays, and JSONB parameters retain JSON identity. Nonempty native results verify labels, OIDs, SQL NULLs and ordering.",
+      "evidence": [
+        {"path":"zig/pkg/antfly/src/api/sql_text_campaign_test.zig","test":"httpx SQL PostgreSQL original text reads preserve escapes unicode and ordering","gate":"sql-original-text-reads-native-debug"},
+        {"path":"zig/pkg/antfly/src/api/sql_text_campaign_test.zig","test":"httpx SQL PostgreSQL original text reads preserve escapes unicode and ordering","gate":"sql-original-text-reads-postgres"}
+      ]
     },
     {
       "id": "sql-0213",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "Exact original SQL and logical parameter values match PostgreSQL through native-declared text[] transport. Only the legacy fixture transport becomes a lossless array envelope; untyped JSON arrays remain rejected as SQL arrays, and JSONB parameters retain JSON identity. Nonempty native results verify labels, OIDs, SQL NULLs and ordering.",
+      "evidence": [
+        {"path":"zig/pkg/antfly/src/api/sql_text_campaign_test.zig","test":"httpx SQL PostgreSQL original text reads preserve escapes unicode and ordering","gate":"sql-original-text-reads-native-debug"},
+        {"path":"zig/pkg/antfly/src/api/sql_text_campaign_test.zig","test":"httpx SQL PostgreSQL original text reads preserve escapes unicode and ordering","gate":"sql-original-text-reads-postgres"}
+      ]
     },
     {
       "id": "sql-0214",
@@ -2038,8 +2065,12 @@
     },
     {
       "id": "sql-0217",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "Exact original SQL executes over nonempty typed native rows and matches PostgreSQL values, labels, builtin OIDs, SQL NULLs and ordering. The fixture declares int4 amount explicitly for chr(integer), without changing the source SQL or logical parameters.",
+      "evidence": [
+        {"path":"zig/pkg/antfly/src/api/sql_text_campaign_test.zig","test":"httpx SQL PostgreSQL original text reads preserve escapes unicode and ordering","gate":"sql-original-text-reads-native-debug"},
+        {"path":"zig/pkg/antfly/src/api/sql_text_campaign_test.zig","test":"httpx SQL PostgreSQL original text reads preserve escapes unicode and ordering","gate":"sql-original-text-reads-postgres"}
+      ]
     },
     {
       "id": "sql-0218",
@@ -2049,8 +2080,12 @@
     },
     {
       "id": "sql-0219",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "Exact original SQL executes over nonempty typed native rows and matches PostgreSQL values, labels, builtin OIDs, SQL NULLs and ordering. The fixture declares int4 amount explicitly for chr(integer), without changing the source SQL or logical parameters.",
+      "evidence": [
+        {"path":"zig/pkg/antfly/src/api/sql_text_campaign_test.zig","test":"httpx SQL PostgreSQL original text reads preserve escapes unicode and ordering","gate":"sql-original-text-reads-native-debug"},
+        {"path":"zig/pkg/antfly/src/api/sql_text_campaign_test.zig","test":"httpx SQL PostgreSQL original text reads preserve escapes unicode and ordering","gate":"sql-original-text-reads-postgres"}
+      ]
     },
     {
       "id": "sql-0220",
@@ -2735,8 +2770,12 @@
     },
     {
       "id": "sql-0252",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "Exact original SQL executes over nonempty typed native rows and matches PostgreSQL values, labels, builtin OIDs, SQL NULLs and ordering. The fixture declares int4 amount explicitly for chr(integer), without changing the source SQL or logical parameters.",
+      "evidence": [
+        {"path":"zig/pkg/antfly/src/api/sql_text_campaign_test.zig","test":"httpx SQL PostgreSQL original text reads preserve escapes unicode and ordering","gate":"sql-original-text-reads-native-debug"},
+        {"path":"zig/pkg/antfly/src/api/sql_text_campaign_test.zig","test":"httpx SQL PostgreSQL original text reads preserve escapes unicode and ordering","gate":"sql-original-text-reads-postgres"}
+      ]
     },
     {
       "id": "sql-0253",
@@ -2886,8 +2925,12 @@
     },
     {
       "id": "sql-0260",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "Exact original SQL executes over nonempty typed native rows and matches PostgreSQL values, labels, builtin OIDs, SQL NULLs and ordering. The fixture declares int4 amount explicitly for chr(integer), without changing the source SQL or logical parameters.",
+      "evidence": [
+        {"path":"zig/pkg/antfly/src/api/sql_text_campaign_test.zig","test":"httpx SQL PostgreSQL original text reads preserve escapes unicode and ordering","gate":"sql-original-text-reads-native-debug"},
+        {"path":"zig/pkg/antfly/src/api/sql_text_campaign_test.zig","test":"httpx SQL PostgreSQL original text reads preserve escapes unicode and ordering","gate":"sql-original-text-reads-postgres"}
+      ]
     },
     {
       "id": "sql-0261",
@@ -3162,8 +3205,12 @@
     },
     {
       "id": "sql-0280",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "Exact original SQL and logical parameter values match PostgreSQL through native-declared text[] transport. Only the legacy fixture transport becomes a lossless array envelope; untyped JSON arrays remain rejected as SQL arrays, and JSONB parameters retain JSON identity. Nonempty native results verify labels, OIDs, SQL NULLs and ordering.",
+      "evidence": [
+        {"path":"zig/pkg/antfly/src/api/sql_text_campaign_test.zig","test":"httpx SQL PostgreSQL original text reads preserve escapes unicode and ordering","gate":"sql-original-text-reads-native-debug"},
+        {"path":"zig/pkg/antfly/src/api/sql_text_campaign_test.zig","test":"httpx SQL PostgreSQL original text reads preserve escapes unicode and ordering","gate":"sql-original-text-reads-postgres"}
+      ]
     },
     {
       "id": "sql-0281",
@@ -3221,8 +3268,12 @@
     },
     {
       "id": "sql-0283",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "Exact original SQL and logical parameter values match PostgreSQL through native-declared text[] transport. Only the legacy fixture transport becomes a lossless array envelope; untyped JSON arrays remain rejected as SQL arrays, and JSONB parameters retain JSON identity. Nonempty native results verify labels, OIDs, SQL NULLs and ordering.",
+      "evidence": [
+        {"path":"zig/pkg/antfly/src/api/sql_text_campaign_test.zig","test":"httpx SQL PostgreSQL original text reads preserve escapes unicode and ordering","gate":"sql-original-text-reads-native-debug"},
+        {"path":"zig/pkg/antfly/src/api/sql_text_campaign_test.zig","test":"httpx SQL PostgreSQL original text reads preserve escapes unicode and ordering","gate":"sql-original-text-reads-postgres"}
+      ]
     },
     {
       "id": "sql-0284",
@@ -3232,18 +3283,30 @@
     },
     {
       "id": "sql-0285",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "Exact original SQL and logical parameter values match PostgreSQL through native-declared text[] transport. Only the legacy fixture transport becomes a lossless array envelope; untyped JSON arrays remain rejected as SQL arrays, and JSONB parameters retain JSON identity. Nonempty native results verify labels, OIDs, SQL NULLs and ordering.",
+      "evidence": [
+        {"path":"zig/pkg/antfly/src/api/sql_text_campaign_test.zig","test":"httpx SQL PostgreSQL original text reads preserve escapes unicode and ordering","gate":"sql-original-text-reads-native-debug"},
+        {"path":"zig/pkg/antfly/src/api/sql_text_campaign_test.zig","test":"httpx SQL PostgreSQL original text reads preserve escapes unicode and ordering","gate":"sql-original-text-reads-postgres"}
+      ]
     },
     {
       "id": "sql-0286",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "Exact original SQL and logical parameter values match PostgreSQL through native-declared text[] transport. Only the legacy fixture transport becomes a lossless array envelope; untyped JSON arrays remain rejected as SQL arrays, and JSONB parameters retain JSON identity. Nonempty native results verify labels, OIDs, SQL NULLs and ordering.",
+      "evidence": [
+        {"path":"zig/pkg/antfly/src/api/sql_text_campaign_test.zig","test":"httpx SQL PostgreSQL original text reads preserve escapes unicode and ordering","gate":"sql-original-text-reads-native-debug"},
+        {"path":"zig/pkg/antfly/src/api/sql_text_campaign_test.zig","test":"httpx SQL PostgreSQL original text reads preserve escapes unicode and ordering","gate":"sql-original-text-reads-postgres"}
+      ]
     },
     {
       "id": "sql-0287",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "Exact original SQL and logical parameter values match PostgreSQL through native-declared text[] transport. Only the legacy fixture transport becomes a lossless array envelope; untyped JSON arrays remain rejected as SQL arrays, and JSONB parameters retain JSON identity. Nonempty native results verify labels, OIDs, SQL NULLs and ordering.",
+      "evidence": [
+        {"path":"zig/pkg/antfly/src/api/sql_text_campaign_test.zig","test":"httpx SQL PostgreSQL original text reads preserve escapes unicode and ordering","gate":"sql-original-text-reads-native-debug"},
+        {"path":"zig/pkg/antfly/src/api/sql_text_campaign_test.zig","test":"httpx SQL PostgreSQL original text reads preserve escapes unicode and ordering","gate":"sql-original-text-reads-postgres"}
+      ]
     },
     {
       "id": "sql-0288",
@@ -3306,13 +3369,21 @@
     },
     {
       "id": "sql-0295",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "Exact original SQL and logical parameter values match PostgreSQL through native-declared text[] transport. Only the legacy fixture transport becomes a lossless array envelope; untyped JSON arrays remain rejected as SQL arrays, and JSONB parameters retain JSON identity. Nonempty native results verify labels, OIDs, SQL NULLs and ordering.",
+      "evidence": [
+        {"path":"zig/pkg/antfly/src/api/sql_text_campaign_test.zig","test":"httpx SQL PostgreSQL original text reads preserve escapes unicode and ordering","gate":"sql-original-text-reads-native-debug"},
+        {"path":"zig/pkg/antfly/src/api/sql_text_campaign_test.zig","test":"httpx SQL PostgreSQL original text reads preserve escapes unicode and ordering","gate":"sql-original-text-reads-postgres"}
+      ]
     },
     {
       "id": "sql-0296",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "Exact original SQL and logical parameter values match PostgreSQL through native-declared text[] transport. Only the legacy fixture transport becomes a lossless array envelope; untyped JSON arrays remain rejected as SQL arrays, and JSONB parameters retain JSON identity. Nonempty native results verify labels, OIDs, SQL NULLs and ordering.",
+      "evidence": [
+        {"path":"zig/pkg/antfly/src/api/sql_text_campaign_test.zig","test":"httpx SQL PostgreSQL original text reads preserve escapes unicode and ordering","gate":"sql-original-text-reads-native-debug"},
+        {"path":"zig/pkg/antfly/src/api/sql_text_campaign_test.zig","test":"httpx SQL PostgreSQL original text reads preserve escapes unicode and ordering","gate":"sql-original-text-reads-postgres"}
+      ]
     },
     {
       "id": "sql-0297",
@@ -12071,8 +12142,13 @@
     },
     {
       "id": "sql-1236",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "Exact original grouped SUM and USING-order query matches PostgreSQL over native bigint rows. SUM(bigint) retains allocation-free i128 transitions and exact NUMERIC output across grouped/spilled/window/set plans; exact wire and assignment regressions cover values beyond int8 and atomic range failure.",
+      "evidence": [
+        {"path":"zig/pkg/antfly/src/api/sql_text_campaign_test.zig","test":"httpx SQL PostgreSQL original text reads preserve escapes unicode and ordering","gate":"sql-original-text-reads-native-debug"},
+        {"path":"zig/pkg/antfly/src/api/sql_text_campaign_test.zig","test":"httpx SQL PostgreSQL original text reads preserve escapes unicode and ordering","gate":"sql-original-text-reads-postgres"},
+        {"path":"zig/pkg/antfly-embedded/src/sql/runtime.zig","test":"SQL bigint SUM preserves exact numeric outputs through grouped and window plans","gate":"sql-numeric-reduction-assignment-debug"}
+      ]
     },
     {
       "id": "sql-1237",
@@ -13786,8 +13862,12 @@
     },
     {
       "id": "sql-1374",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "Exact original SQL executes over nonempty typed native rows and matches PostgreSQL values, labels, builtin OIDs, SQL NULLs and ordering. The fixture declares int4 amount explicitly for chr(integer), without changing the source SQL or logical parameters.",
+      "evidence": [
+        {"path":"zig/pkg/antfly/src/api/sql_text_campaign_test.zig","test":"httpx SQL PostgreSQL original text reads preserve escapes unicode and ordering","gate":"sql-original-text-reads-native-debug"},
+        {"path":"zig/pkg/antfly/src/api/sql_text_campaign_test.zig","test":"httpx SQL PostgreSQL original text reads preserve escapes unicode and ordering","gate":"sql-original-text-reads-postgres"}
+      ]
     },
     {
       "id": "sql-1375",

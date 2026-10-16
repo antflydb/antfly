@@ -389,7 +389,7 @@ pub const Candidates = struct {
                         } else false;
                         if (overwritten) continue;
                         if (!present.contains(field.name)) continue;
-                        try object.put(alloc, field.path, try @import("runtime.zig").encodeStorageDatum(alloc, cells[index], field, max_bytes));
+                        try object.put(alloc, field.path, try @import("runtime.zig").encodeStorageDatumTyped(alloc, cells[index], field, field.element_type, max_bytes));
                         if (!cells[index].sql_null and cells[index].value == .null and field.type == .json) try json_null_fields.append(alloc, field.path);
                     }
                 }
@@ -400,7 +400,7 @@ pub const Candidates = struct {
                 if (assignment.program == null) continue; // DEFAULT: native preparation fills the absent cell.
                 const field = assignment.column;
                 if (datum.sql_null and !field.nullable) return @import("errors.zig").notNull(backend.error_context, field.name);
-                const typed = try @import("runtime.zig").encodeStorageDatum(alloc, datum, field, max_bytes);
+                const typed = try @import("runtime.zig").encodeStorageDatumTyped(alloc, datum, field, assignment.program.?.output_type.element_type, max_bytes);
                 if (std.mem.eql(u8, field.name, "_id")) {
                     if (!inserting or datum.sql_null or typed != .string or typed.string.len == 0) return error.SqlRowIdentityRequired;
                     key = typed.string;

@@ -628,7 +628,6 @@ test "SQL set inference respects pairwise and derived type boundaries" {
         "(SELECT $1 AS x LIMIT 1) UNION SELECT 1",
         "SELECT COALESCE($1::bigint, NULL) AS x UNION SELECT 1",
         "SELECT NULL::bigint AS x UNION SELECT NULL UNION SELECT $1 UNION SELECT 1",
-        "SELECT CASE WHEN TRUE THEN SUM($1::bigint) ELSE 0 END AS x UNION SELECT 1",
         "WITH n AS (SELECT NULL::bigint AS x) SELECT COALESCE(n.x,$1) AS x FROM n UNION SELECT 1",
     }) |sql| {
         var compiled = try compiler.compile(std.testing.allocator, sql, .{});
@@ -637,6 +636,12 @@ test "SQL set inference respects pairwise and derived type boundaries" {
         defer result.deinit();
         try std.testing.expectEqual(@import("ast.zig").ColumnType.integer, result.output.columns[0].type);
     }
+    var numeric_query = try compiler.compile(std.testing.allocator, "SELECT CASE WHEN TRUE THEN SUM($1::bigint) ELSE 0 END AS x UNION SELECT 1", .{});
+    defer numeric_query.deinit();
+    var numeric_result = try runtime.execute(std.testing.allocator, backend.backend(), &numeric_query, &.{.{ .integer = 1 }}, .{});
+    defer numeric_result.deinit();
+    try std.testing.expectEqual(@import("ast.zig").ColumnType.number, numeric_result.output.columns[0].type);
+    try std.testing.expectEqual(@as(?@import("array_value.zig").ElementType, .numeric), numeric_result.output.columns[0].element_type);
     var predicate_query = try compiler.compile(std.testing.allocator, "SELECT $1 AS x WHERE $1=1 UNION ALL SELECT 1.5", .{});
     defer predicate_query.deinit();
     var predicate_result = try runtime.execute(std.testing.allocator, backend.backend(), &predicate_query, &.{.{ .integer = 1 }}, .{});

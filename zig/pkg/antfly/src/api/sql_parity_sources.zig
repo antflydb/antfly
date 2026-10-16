@@ -33,6 +33,7 @@ pub fn Tables(comptime count: usize) type {
         records: [count]local.common_topology_records.TableRecord,
         reads: [count]table_reads.BoundTableReadSource,
         captures: usize = 0,
+        native_reads: std.atomic.Value(usize) = .init(0),
         lookup_calls: std.atomic.Value(usize) = .init(0),
         unbounded_reads: std.atomic.Value(usize) = .init(0),
         // This concrete fixture owns BoundTableReadSource handles. Inspect its
@@ -156,6 +157,7 @@ pub fn Tables(comptime count: usize) type {
                     }
                 }
             }
+            if (view != null) _ = self.native_reads.fetchAdd(1, .monotonic);
             return view;
         }
         fn scan(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8, _: []const u8, _: db.types.ScanOptions, _: raft.ReadConsistency) !?native.ScanResponse {

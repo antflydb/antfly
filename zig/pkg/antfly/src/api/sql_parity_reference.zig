@@ -236,9 +236,77 @@ fn expectMutationRejected(alloc: std.mem.Allocator, handler: anytype, statement:
 }
 
 fn execute(alloc: std.mem.Allocator, handler: anytype, case: *const fixtures.Corpus.Case) !std.json.Parsed(wire.SQLResponse) {
+    return executeWithTransport(alloc, handler, case, false);
+}
+
+fn describedParameters(a: std.mem.Allocator, values: []const Json, descriptors: []const @import("antfly_local_sources").sql_scalar.Type) ![]const Json {
+    const local = @import("antfly_local_sources");
+    if (values.len != descriptors.len) return error.InvalidParityParameters;
+    const output = try a.dupe(Json, values);
+    for (output, descriptors) |*value, descriptor| {
+        if (value.* != .array or descriptor.kind != .array) continue;
+        // Mirror the PostgreSQL oracle's explicit text[] transport adapter.
+        // Never infer an SQL array from JSON shape or convert JSONB columns.
+        if (descriptor.element_type != .text) return error.InvalidParityParameters;
+        const cells = try a.alloc(local.sql_scalar.Datum, value.array.items.len);
+        for (value.array.items, cells) |cell, *out| {
+            if (cell != .string and cell != .null) return error.InvalidParityParameters;
+            out.* = local.sql_scalar.Datum.fromJson(cell);
+        }
+        const length = std.math.cast(u32, cells.len) orelse return error.InvalidParityParameters;
+        const dimensions: []const local.sql_array_value.Dimension = if (cells.len == 0) &.{} else &.{.{ .length = length, .lower = 1 }};
+        const array = try local.sql_array_value.Value.init(.text, dimensions, cells, .{});
+        value.* = try local.sql_array_wire.toJsonLeaky(a, array, .{});
+    }
+    return output;
+}
+
+test "SQL parity described parameter transport preserves JSON identity and NULLs" {
+    const local = @import("antfly_local_sources");
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    const input = (try std.json.parseFromSliceLeaky(Json, scratch, "[[\"a\",null],[\"b\",null]]", .{})).array.items;
+    const descriptors: []const local.sql_scalar.Type = &.{ .{ .kind = .json }, .{ .kind = .array, .element_type = .text } };
+    const output = try describedParameters(scratch, input, descriptors);
+    try std.testing.expect(output[0] == .array);
+    try std.testing.expect(output[1] == .object);
+    try std.testing.expect(input[1] == .array);
+    var frame = try local.sql_parameter_frame.Frame.prepareJson(a, descriptors, output, .{});
+    defer frame.deinit();
+    try std.testing.expect(frame.values[0].array == null and frame.values[0].value == .array);
+    try std.testing.expectEqualStrings("b", frame.values[1].array.?.elements[0].value.string);
+    try std.testing.expect(frame.values[1].array.?.elements[1].sql_null);
+    try std.testing.expectEqual(@as(i32, 1), frame.values[1].array.?.dimensions[0].lower);
+    try std.testing.expectError(error.InvalidParityParameters, describedParameters(scratch, input[0..1], &.{.{ .kind = .array, .element_type = .int64 }}));
+    const bad = (try std.json.parseFromSliceLeaky(Json, scratch, "[[1]]", .{})).array.items;
+    try std.testing.expectError(error.InvalidParityParameters, describedParameters(scratch, bad, descriptors[1..]));
+    // This is transport adaptation in the evidence fixture, not a new API
+    // coercion: unchanged plain JSON arrays still fail declared SQL frames.
+    try std.testing.expectError(error.SqlTypeMismatch, local.sql_parameter_frame.Frame.prepareJson(a, descriptors, input, .{}));
+}
+
+fn executeWithTransport(alloc: std.mem.Allocator, handler: anytype, case: *const fixtures.Corpus.Case, comptime described_transport: bool) !std.json.Parsed(wire.SQLResponse) {
     var parameter_arena = std.heap.ArenaAllocator.init(alloc);
     defer parameter_arena.deinit();
-    const parameters = try fixtures.Corpus.logicalParameters(parameter_arena.allocator(), case);
+    var parameters = try fixtures.Corpus.logicalParameters(parameter_arena.allocator(), case);
+    if (described_transport) {
+        var has_array = false;
+        for (parameters) |value| if (value == .array) {
+            has_array = true;
+            break;
+        };
+        if (has_array) {
+            var compiled = try compiler.compile(alloc, case.sql, .{});
+            defer compiled.deinit();
+            var identity: ?@import("http_server.zig").AuthenticatedIdentity = null;
+            var adapter: @import("sql_execution.zig").Adapter = .{ .server = handler.api_server, .identity = &identity, .context = .{} };
+            var description = try @import("antfly_local_sources").sql_describe.describe(alloc, adapter.backend(), &compiled, &.{});
+            defer description.deinit();
+            parameters = try describedParameters(parameter_arena.allocator(), parameters, description.binding.parameter_descriptors);
+        }
+    }
     const body = try std.json.Stringify.valueAlloc(alloc, .{ .statement = case.sql, .parameters = parameters }, .{});
     defer alloc.free(body);
     var request = try httpx.Request.init(alloc, .POST, "http://127.0.0.1/db/v1/sql");
@@ -1078,15 +1146,21 @@ fn runArrayResults(alloc: std.mem.Allocator, handler: anytype) !void {
 
 pub fn runReference(alloc: std.mem.Allocator, handler: anytype, case_ids: []const []const u8, reference_bytes: []const u8) !void {
     const discovery = try std.testing.environ.containsUnempty(alloc, "ANTFLY_SQL_READ_DISCOVERY");
-    return runReferenceWithDiscovery(alloc, handler, case_ids, reference_bytes, discovery);
+    return runReferenceWithDiscovery(alloc, handler, case_ids, reference_bytes, discovery, false);
 }
 
 /// Evidence gates must fail closed even in a discovery-configured shell.
 pub fn runReferenceStrict(alloc: std.mem.Allocator, handler: anytype, case_ids: []const []const u8, reference_bytes: []const u8) !void {
-    return runReferenceWithDiscovery(alloc, handler, case_ids, reference_bytes, false);
+    return runReferenceWithDiscovery(alloc, handler, case_ids, reference_bytes, false, false);
 }
 
-fn runReferenceWithDiscovery(alloc: std.mem.Allocator, handler: anytype, case_ids: []const []const u8, reference_bytes: []const u8, discovery: bool) !void {
+/// Only legacy fixture transport changes: native binding must first declare
+/// text[]; production ingress continues rejecting untyped plain JSON arrays.
+pub fn runReferenceDescribedTransportStrict(alloc: std.mem.Allocator, handler: anytype, case_ids: []const []const u8, reference_bytes: []const u8) !void {
+    return runReferenceWithDiscovery(alloc, handler, case_ids, reference_bytes, false, true);
+}
+
+fn runReferenceWithDiscovery(alloc: std.mem.Allocator, handler: anytype, case_ids: []const []const u8, reference_bytes: []const u8, discovery: bool, comptime described_transport: bool) !void {
     var corpus = try fixtures.Corpus.init(alloc);
     defer corpus.deinit();
     const reference = try std.json.parseFromSlice(Reference, alloc, reference_bytes, .{ .ignore_unknown_fields = true });
@@ -1098,7 +1172,7 @@ fn runReferenceWithDiscovery(alloc: std.mem.Allocator, handler: anytype, case_id
         try std.testing.expectEqualStrings(case_id, expected.id);
         const case = try corpus.get(expected.id);
         try std.testing.expect(!std.mem.eql(u8, case.source_expectation, "rejection"));
-        const parsed = execute(alloc, handler, case) catch |err| {
+        const parsed = executeWithTransport(alloc, handler, case, described_transport) catch |err| {
             if (err == error.NativeParityAdmissionFailed) {
                 if (!discovery) failures += 1;
                 continue;

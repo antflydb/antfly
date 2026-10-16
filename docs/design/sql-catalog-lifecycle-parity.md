@@ -9,14 +9,14 @@ a completion claim. PostgreSQL is the SQL standard and independent test oracle.
 ## Baseline and priorities
 
 The [original inventory](sql/parity-inventory.md) remains authoritative:
-505 implemented / 132 rejected / 113 superseded / 836 unresolved. Counts below
+524 implemented / 132 rejected / 113 superseded / 817 unresolved. Counts below
 are unresolved family pools, not promises that one implementation closes them.
 
 | Priority | Pool | Cases | Shared delivery boundary |
 | --- | --- | ---: | --- |
 | 1 | DDL, catalog and sessions | 308 | Public relation ownership, schema/index activation and retirement, session lifecycle and recovery |
 | 2 | Source/joined mutations and MERGE/recursion | 128 | Captured source ownership, bounded selection, atomic commit and distributed failure evidence |
-| 3 | Read and query | 130 | Faithful typed fixtures, binding/correlation, endpoint results and diagnostics |
+| 3 | Read and query | 113 | Faithful typed fixtures, binding/correlation, endpoint results and diagnostics |
 | 4 | Document writes | 70 | Document-specific schema/index profiles, complete postimages and integrity admission |
 | 5 | Historically unsupported writes | 92 | Individual PostgreSQL contract review, implementations or proven required rejections |
 
@@ -9342,3 +9342,142 @@ The checked-in oracle passed both tests against owned PostgreSQL 18.6 in
 `/private/tmp/antfly-sql-recursive-type-oracle.log`. Formatting, Ruff, licensing,
 Apache boundary, control-catalog and original-inventory checks pass; original
 case counts remain 505 implemented / 132 rejected / 113 superseded / 836 unresolved.
+
+### Text-read qualification and bigint SUM output: implementation checkpoints
+
+The new `text_read` campaign retains nineteen exact original statements and
+parameters. Its separate relational fixture has explicit int4 `amount` for
+PostgreSQL's `chr(integer)` signature, nullable status/email, literal escaped
+wildcards, Unicode, regex matches/nonmatches, and nonempty ANY/SOME/ALL and
+text-array results. Existing scalar and stored-array campaign fixtures are not
+rewritten. The oracle checks values, labels, builtin OIDs, SQL NULL provenance
+and ordering against an owned PostgreSQL 18 instance. The native mounted test
+uses point metadata resolution and retained native readers, with no lookup or
+raw scan/query fallback. Full key-range native scans are legitimate for these
+queries; reader openings also include metadata-only schema views and are not
+an I/O counter or a performance benchmark.
+
+The initial seven-case Debug API run exposed a real shared signature bug:
+`SUM(bigint)` returned int8 instead of PostgreSQL NUMERIC (`sql-1236`). The other
+six original read contracts passed. The resulting fix normalizes
+integer SUM input identities at binding and retains allocation-free i128
+transitions, including exact partial/checkpoint interchange. NUMERIC results
+are constructed once in the consumer's result arena without narrowing through
+int8 or floating point. Grouped vectors, DISTINCT/spill finalization, and
+window sliding/tree output use that boundary. Smallint/integer SUM retains an
+int8 result. Window exclusions preserve the existing tree and ordinary sliding
+frames retain their removable constant-memory state. Integer AVG parity is
+separate unfinished work, not fixed by this SUM checkpoint.
+
+Validation so far: all nineteen originals pass repeatable PostgreSQL reference
+verification in `/private/tmp/antfly-sql-text-read-reference-check.log`.
+The widened-SUM PostgreSQL regression passes in
+`/private/tmp/antfly-sql-bigint-sum-oracle.log`; the reference generator's 123
+tests passed before the final fixture expansion. Source syntax, formatting,
+licensing, Apache boundary and original-inventory checks pass. The initial
+native failure is retained in
+`/private/tmp/antfly-sql-text-read-public-debug.log`. Native validation of the
+SUM fix, partial-state ownership, and expanded nineteen-case cohort remains
+pending at that checkpoint: only 1.8 GiB of disk remained and cleanup approval
+had been requested. No parity dispositions changed at that checkpoint.
+
+An additional bounded validation step is now complete: the existing isolated
+`zig build sql-numeric-test -Doptimize=Debug -j1 --summary all` gate passed
+36 tests with one opt-in benchmark skipped and zero failures/leaks in
+`/private/tmp/antfly-sql-wide-integer-numeric-debug.log`. This includes exact,
+allocation-free i128 minimum/maximum, widened int8-sum, zero, sign and trailing
+base-10000-group checks. It verifies the numeric kernel, not SQL execution.
+New SUM executor tests also cover final-output allocation failures without
+transition-state mutation and forced external grouped/DISTINCT reductions
+over 1000 groups. Those executor tests were still pending the larger Debug
+build at that checkpoint; the isolated gate was not substituted for them or
+the mounted API cohort.
+
+### Qualified original text reads and shared numeric assignments
+
+Nineteen original cases are now qualified, not reclassified as unsupported:
+`sql-0190`, `sql-0194`, `sql-0210` through `sql-0213`, `sql-0217`, `sql-0219`,
+`sql-0252`, `sql-0260`, `sql-0280`, `sql-0283`, `sql-0285` through `sql-0287`,
+`sql-0295`, `sql-0296`, `sql-1236` and `sql-1374`. The inventory checker reports
+524 implemented / 132 rejected / 113 superseded / 817 unresolved. Seventeen
+closures are read-family cases, one is aggregate and one is window. The pinned
+original corpus and its hashes are unchanged.
+
+The twelve array-parameter cases retain their original logical values. Their
+historical JSON parameter transport is adapted only after the native binder
+declares text[]. The fixture sends a lossless SQL array envelope, mirroring the
+PostgreSQL oracle's declared-OID parameter transport. Production ingress still
+rejects plain JSON arrays as SQL arrays. A dedicated negative test verifies
+that JSONB values stay JSON, input arrays are not mutated, SQL NULL elements
+survive, and other array element types are not silently inferred. The source
+cases do not mandate a schema; the campaign explicitly declares the tested
+int4 amount domain rather than changing the SQL or overriding the baseline
+campaign. This is not qualification of document-array reinterpretation.
+
+SUM output typing is shared by grouping, windows and symbolic set/recursive
+inference. CASE/UNION can no longer inherit a SUM input's integer descriptor
+when its output is NUMERIC. Exact numeric API assertions check both builtin
+identity and the complete decimal string, including a sum beyond int8, without
+the generic floating reference comparator. Persisted lake partials retain
+their existing exact i128 representation; final SQL values become NUMERIC.
+Publication, append/removal subtree reuse and keyed reduction tests assert
+exact typed output rather than reading a NUMERIC value's JSON placeholder.
+
+Numeric assignment admission and execution now share PostgreSQL narrowing
+rules across VALUES, source INSERT, ordinary/joined UPDATE, MERGE and conflict
+paths. Conversion retains the source builtin identity, including real's
+precision when assigning to NUMERIC. Source, deferred and captured conflict
+assignments carry that identity through the final storage boundary. Tests
+verify exact large integers, NUMERIC ties-away rounding, floating ties-to-even,
+and whole-statement abort when a later source value overflows. PostgreSQL's
+NUMERIC NaN-to-integer diagnostic remains 0A000, distinct from finite overflow
+22003. Read captures close before any successful mutation callback.
+
+The existing scalar floating storage format remains finite-only. A new
+fail-closed boundary rejects NaN/Infinity before JSON serialization could turn
+them into a stored nullable NULL, with an actionable 0A000 diagnostic. NUMERIC
+special-value storage remains supported. Full non-finite scalar floating
+storage requires its own format/index/canonicalization capability work and is
+not claimed complete or given original-case credit here. Integer AVG parity
+and the other catalog/session/SQL backlog also remain open.
+
+Evidence: the nineteen-case mounted API gate and strict transport regression
+pass in `/private/tmp/antfly-sql-text-read-qualified-public-debug.log`.
+The broader six-test mounted suite, including original joins/aggregates,
+read/mutation and array expansion, passes 80/80 build steps with no leaks in
+`/private/tmp/antfly-sql-numeric-reduction-assignment-public-debug.log`.
+The prior complete Debug SQL gate passed 857 core and 233 extracted tests,
+with three existing opt-in skips and zero failures/leaks, in
+`/private/tmp/antfly-sql-numeric-reduction-assignment-full-debug.log`; the final
+joined refinement passed 33 affected tests in
+`/private/tmp/antfly-sql-numeric-joined-final-debug.log`. All three checked-in
+NUMERIC PostgreSQL oracle tests pass in
+`/private/tmp/antfly-sql-numeric-joined-final-oracle.log`. The nineteen original
+references reverify in
+`/private/tmp/antfly-sql-numeric-final-postgres-reference.log`, and the ledger
+audit is `/private/tmp/antfly-sql-numeric-final-inventory.log`.
+The final full-source Debug SQL rerun passes 857 core and 234 extracted tests,
+with three existing opt-in skips and zero failures/leaks, in
+`/private/tmp/antfly-sql-numeric-final-complete-debug.log` (21/21 build steps).
+The three persisted lake-partial tests pass in
+`/private/tmp/antfly-sql-numeric-lake-partials-final-debug.log` (51/51 steps,
+zero skips/failures/leaks). Their first assertion-helper rerun incorrectly
+compared typed NUMERIC with an unconverted integer datum; the final helper uses
+an allocation-free exact NUMERIC integer view on both sides, preserving the
+full integer value without floating conversion. This is a test-only correction,
+not a change to the persisted partial format or production comparison rules.
+The final inventory and Apache-boundary audits pass in
+`/private/tmp/antfly-sql-numeric-handoff-inventory.log` and
+`/private/tmp/antfly-sql-numeric-handoff-apache.log`; staged license headers and
+Zig formatting also pass. Cache GC was previewed only: no caches were deleted.
+Allocation-free transitions and bounded spill ownership are tested mechanisms;
+no unmeasured throughput speedup is claimed.
+
+Integer AVG remains a shared correctness gap, not another floating-output alias
+to qualify. Its completion must cover integer-width signatures in grouped,
+window and symbolic binding, exact sum/count transitions and partial merges,
+removable window frames/exclusions, PostgreSQL NUMERIC division scale, consumer
+ownership and allocation-failure tests. Preserve constant-width i128 integer
+transitions rather than converting each input into an allocated NUMERIC. The
+larger catalog/session and captured-mutation pools remain the primary delivery
+priorities; this batch does not claim their activation or reduce their counts.

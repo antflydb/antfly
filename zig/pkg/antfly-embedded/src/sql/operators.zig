@@ -546,7 +546,116 @@ pub const Aggregate = struct {
             .pattern_set => unreachable,
         };
     }
+
+    pub fn bigintSum(kind: Kind, input_type: ?ast.ColumnType, identity: ?@import("array_value.zig").ElementType) bool {
+        return kind == .sum and input_type == .integer and identity == .int64;
+    }
+
+    /// One signature for grouping, windows and symbolic set/recursive binding.
+    /// SUM loses an input NUMERIC typmod; it does not lose builtin identity.
+    pub fn sumType(input: scalar.Type) scalar.Type {
+        var output = input;
+        output.nullable = true;
+        output.numeric_modifier = null;
+        if (input.kind == .integer) {
+            if (input.element_type == null or input.element_type == .int64) {
+                output.kind = .number;
+                output.element_type = .numeric;
+            } else output.element_type = .int64;
+        }
+        return output;
+    }
+
+    /// SQL output belongs to the consumer's result arena, not a temporary
+    /// partial reducer. Integer transitions remain allocation-free and exact.
+    pub fn finishOutput(self: *const Aggregate, result: Allocator) !Datum {
+        if (self.count != 0 and bigintSum(self.kind, self.input_type, self.input_element)) return integerSumOutput(result, self.integer_sum);
+        return self.finish();
+    }
+
+    pub fn integerSumOutput(result: Allocator, sum: i128) !Datum {
+        const numeric = @import("numeric_value.zig");
+        var storage: [10]u16 = undefined;
+        const view = numeric.integer128View(sum, &storage);
+        const value = try result.create(numeric.Value);
+        errdefer result.destroy(value);
+        value.* = view;
+        value.digits = try result.dupe(u16, view.digits);
+        return Datum.typedNumeric(value);
+    }
 };
+
+test "SQL bigint SUM output failures preserve allocation free transitions" {
+    const Harness = struct {
+        fn run(a: Allocator) !void {
+            var no_memory = std.heap.FixedBufferAllocator.init(&.{});
+            var state = try Aggregate.initTyped(no_memory.allocator(), .sum, .integer, .int64);
+            defer state.deinit();
+            try state.update(Datum.json(.{ .integer = std.math.maxInt(i64) }));
+            try state.update(Datum.json(.{ .integer = std.math.maxInt(i64) }));
+            defer {
+                std.debug.assert(state.count == 2);
+                std.debug.assert(state.integer_sum == @as(i128, std.math.maxInt(i64)) * 2);
+            }
+            const value = try state.finishOutput(a);
+            defer a.destroy(@constCast(value.numeric.?));
+            defer a.free(value.numeric.?.digits);
+            var context: @import("numeric_value.zig").Context = .{ .alloc = a };
+            const text = try @import("numeric_value.zig").format(&context, value.numeric.?.*);
+            defer a.free(text);
+            try std.testing.expectEqualStrings("18446744073709551614", text);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Harness.run, .{});
+}
+
+test "SQL bigint SUM spilled vector and distinct reducers retain exact outputs" {
+    const a = std.testing.allocator;
+    const Hook = struct {
+        fn check(_: *anyopaque) anyerror!void {}
+    };
+    for ([_]bool{ false, true }) |distinct| {
+        var token: u8 = 0;
+        var manager: @import("spill.zig").Manager = .{ .alloc = a, .io = std.testing.io, .context = &token, .checkpoint = Hook.check, .async_writes = false };
+        defer manager.deinit();
+        const group = try Grouped.create(a, &.{.{ .kind = .sum, .input_type = .integer, .input_element = .int64, .distinct = distinct }}, .{ .bytes = 64 * 1024, .spill = &manager });
+        defer group.deinit();
+        for (0..4000) |i| try group.add(&.{Datum.json(.{ .integer = @intCast(i % 1000) })}, &.{Datum.json(.{ .integer = if (i / 1000 % 2 == 0) std.math.maxInt(i64) else -1 })});
+        try std.testing.expect(group.external != null);
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        var seen: usize = 0;
+        while (true) {
+            _ = arena.reset(.free_all);
+            const row = (try group.nextResult(arena.allocator())) orelse break;
+            var context: @import("numeric_value.zig").Context = .{ .alloc = arena.allocator() };
+            const text = try @import("numeric_value.zig").format(&context, row.aggregates[0].numeric.?.*);
+            try std.testing.expectEqualStrings(if (distinct) "9223372036854775806" else "18446744073709551612", text);
+            seen += 1;
+        }
+        try std.testing.expectEqual(@as(usize, 1000), seen);
+        try std.testing.expect(manager.written_bytes > 0);
+    }
+}
+
+test "SQL bigint SUM partials retain i128 transitions and own numeric output" {
+    const a = std.testing.allocator;
+    var state = try Aggregate.initTyped(a, .sum, .integer, .int64);
+    defer state.deinit();
+    try state.update(Datum.json(.{ .integer = std.math.maxInt(i64) }));
+    try state.update(Datum.json(.{ .integer = std.math.maxInt(i64) }));
+    const encoded = try @import("aggregate_partial.zig").cell(a, state);
+    defer a.free(encoded.value.string);
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const result = blk: {
+        var restored = try @import("aggregate_partial.zig").decode(a, encoded, .{ .kind = .sum, .input_type = .integer, .input_element = .int64 });
+        defer restored.deinit();
+        break :blk try restored.finishOutput(arena.allocator());
+    };
+    var context: @import("numeric_value.zig").Context = .{ .alloc = arena.allocator() };
+    try std.testing.expectEqualStrings("18446744073709551614", try @import("numeric_value.zig").format(&context, result.numeric.?.*));
+}
 
 pub const AggregateSpec = struct { kind: Aggregate.Kind, input_type: ?ast.ColumnType = null, input_element: ?@import("array_value.zig").ElementType = null, distinct: bool = false };
 
@@ -979,7 +1088,7 @@ pub const Grouped = struct {
             fn cell(raw: *anyopaque, alloc: Allocator, row: usize, column: usize) anyerror!Datum {
                 const reader: *@This() = @ptrCast(@alignCast(raw));
                 const index = reader.begin + row;
-                if (!reader.exact) return reader.group.state_columns[column].finish(index);
+                if (!reader.exact) return reader.group.state_columns[column].finishOutput(alloc, index);
                 const state = try reader.group.state_columns[column].snapshot(alloc, index);
                 return @import("aggregate_partial.zig").cell(alloc, state);
             }
@@ -1530,7 +1639,7 @@ pub const Grouped = struct {
         self.finished = true;
         const values = try alloc.alloc(Datum, self.specs.len);
         errdefer alloc.free(values);
-        for (self.state_columns, values) |*column, *value| value.* = try column.finish(index);
+        for (self.state_columns, values) |*column, *value| value.* = try column.finishOutput(alloc, index);
         return .{ .keys = try self.key_columns.row(self.results.allocator(), index), .aggregates = values, .ordinal = self.groups.items[index].ordinal };
     }
 

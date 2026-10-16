@@ -48,6 +48,21 @@ from generate_sql_postgres_reference import (
 
 
 class ReferenceExtensionTest(unittest.TestCase):
+    def test_explicit_integer_widths_are_not_silently_widened_in_the_oracle(self):
+        self.assertEqual("bigint", pg_type({"type": "integer"}))
+        for identity, expected in [
+            ("int16", "smallint"),
+            ("int32", "integer"),
+            ("int64", "bigint"),
+        ]:
+            with self.subTest(identity=identity):
+                self.assertEqual(
+                    expected,
+                    pg_type({"type": "integer", "x-antfly-sql-type": identity}),
+                )
+        with self.assertRaises(KeyError):
+            pg_type({"type": "integer", "x-antfly-sql-type": "text"})
+
     def test_json_parameter_transport_uses_only_server_declared_array_identity(self):
         from psycopg.types.json import Jsonb
 

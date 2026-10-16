@@ -498,7 +498,7 @@ fn bindDescriptorsWithInvocation(alloc: Allocator, table: ?catalog.Table, statem
                 const expression = try builder.assignmentNode(assignment.expression, assignment.value, column);
                 program.* = try builder.assignmentProgram(expression, column);
                 const kind = program.*.?.output_type.kind;
-                if (kind != null and kind != column.type and !(kind == .integer and column.type == .number)) return error.SqlTypeMismatch;
+                if (kind != null and kind != column.type and !@import("builtin_cast.zig").numericAssignmentAllowed(kind, column.type)) return error.SqlTypeMismatch;
             }
             out.assignments = programs;
         },
@@ -543,7 +543,7 @@ fn bindInsert(alloc: Allocator, table: catalog.Table, statement: ast.Insert, par
             const node = try builder.assignmentNode(expression, literal, column);
             program.* = try builder.assignmentProgram(node, column);
             const kind = program.*.?.output_type.kind;
-            if (kind != null and kind != column.type and !(kind == .integer and column.type == .number)) return error.SqlTypeMismatch;
+            if (kind != null and kind != column.type and !@import("builtin_cast.zig").numericAssignmentAllowed(kind, column.type)) return error.SqlTypeMismatch;
         }
         row.* = programs;
     }
@@ -674,7 +674,7 @@ const Builder = struct {
 
     fn assignmentProgram(self: *Builder, expression: *const ast.Scalar, column: catalog.Column) !scalar.Program {
         const program_ = try self.programType(expression, .{ .kind = column.type, .element_type = column.element_type, .numeric_modifier = column.numeric_modifier }, true);
-        if (program_.output_type.kind != null and program_.output_type.kind != column.type and !(program_.output_type.kind == .integer and column.type == .number)) return error.SqlAssignmentTypeMismatch;
+        if (program_.output_type.kind != null and program_.output_type.kind != column.type and !@import("builtin_cast.zig").numericAssignmentAllowed(program_.output_type.kind, column.type)) return error.SqlAssignmentTypeMismatch;
         return program_;
     }
 

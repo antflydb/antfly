@@ -113,6 +113,7 @@ pub fn describe(err: anyerror) Diagnostic {
         error.CatalogPublicationProofPending, error.CatalogOccupancyNotReady => .{ .code = "53300", .message = "The relation catalog publication is not ready to authorize this DDL.", .hint = "No schema change was admitted. Wait for catalog publication, then retry the complete DDL.", .retryable = true },
         error.SettingAuthorityUnavailable => .{ .code = "53300", .message = "The metadata setting authority is not configured for this SQL operation.", .hint = "Ask an operator to configure trusted setting authority, then inspect schema state before resubmitting DDL. Do not automatically replay a mutation.", .retryable = false },
         error.SqlNumericOutOfRange => .{ .code = "22003", .message = "A numeric expression exceeds its supported range.", .retryable = false },
+        error.SqlNonFiniteScalarStorage => .{ .code = "0A000", .message = "Scalar floating-point storage currently requires finite values.", .hint = "Use NUMERIC for stored NaN or Infinity values." },
         error.SqlInvalidParameterValue => .{ .code = "22023", .message = "The SQL type modifier is outside its supported range.", .hint = "NUMERIC precision must be 1..1000 and scale -1000..1000.", .retryable = false },
         error.SqlSubstringError => .{ .code = "22011", .message = "The substring start or length is invalid.", .retryable = false },
         error.InvalidSqlCharacterCode => .{ .code = "54000", .message = "The character code is not a nonzero Unicode scalar value.", .retryable = false },
