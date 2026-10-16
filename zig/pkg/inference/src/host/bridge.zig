@@ -23,10 +23,9 @@ const http_abi = @import("antfly_runtime_abi").http_abi;
 const native_abi = @import("antfly_runtime_abi").native_abi;
 const antfly_image = @import("antfly_image");
 
-// The merged ABI includes both CUDA preload precision and raster embedding
-// asset pins/output dimensions. Each parent independently used version 28
-// for a different layout, so neither can interoperate with this runtime.
-pub const abi_version: u32 = 29;
+// Version 30 makes execution placement an explicit host-owned context field
+// and appends embedded memory-admission diagnostics to the function table.
+pub const abi_version: u32 = 30;
 pub const ai_api_prefix = "/ai/v1";
 pub const public_api_prefix = "/ml/v1";
 pub const Status = error_abi.Status;
@@ -89,6 +88,9 @@ pub const ProcessMemoryLimitProvenance = enum(u8) {
     unavailable = 5,
 };
 
+/// Placement belongs to the calling surface, not to runtime JSON settings.
+pub const ExecutionHost = enum(c_int) { server = 0, embedded = 1 };
+
 pub const CreateContext = extern struct {
     abi_version: u32,
     struct_size: u32 = @sizeOf(@This()),
@@ -114,6 +116,7 @@ pub const CreateContext = extern struct {
     /// Host-owned inference executor retained until destroy returns.
     executor: native_abi.IoBorrow,
     out_handle: *?*anyopaque,
+    execution_host: ExecutionHost = .server,
 };
 
 pub const ConfigureContext = extern struct {
@@ -330,6 +333,7 @@ pub const Capability = struct {
     pub const resource_budget: u64 = 1 << 2;
     pub const request_admission: u64 = 1 << 3;
     pub const model_pull: u64 = 1 << 4;
+    pub const memory_admission: u64 = 1 << 5;
 };
 
 /// One download progress report from `FunctionTable.pull_model`.
@@ -367,6 +371,25 @@ pub const PullModelContext = extern struct {
     on_result: *const fn (?*anyopaque, String) callconv(.c) void,
 };
 
+/// Snapshot of the last denied memory admission, independent of any one request.
+/// A zero timestamp means this runtime has not recorded a denial.
+pub const MemoryAdmissionStats = extern struct {
+    pressure: enum(c_int) { none, shared_host, shared_unified, domain_host, domain_backend, domain_combined, domain_kv, domain_scratch, external_budget, live_host, unknown } = .none,
+    denied_count: u64 = 0,
+    last_denied_ns: u64 = 0,
+    request_count: u64 = 0,
+    requested_host_bytes: u64 = 0,
+    requested_backend_bytes: u64 = 0,
+    requested_kv_bytes: u64 = 0,
+    requested_scratch_bytes: u64 = 0,
+    admitted_host_bytes: u64 = 0,
+    admitted_backend_bytes: u64 = 0,
+    host_limit_bytes: u64 = 0,
+    backend_limit_bytes: u64 = 0,
+    combined_limit_bytes: u64 = 0,
+    available_memory_bytes: u64 = 0,
+};
+
 pub const RequestAdmissionStats = extern struct {
     capacity: usize,
     in_flight: usize,
@@ -394,6 +417,7 @@ pub const FunctionTable = extern struct {
     request_admission_stats: *const fn (*anyopaque, *RequestAdmissionStats) callconv(.c) void,
     /// Downloads models into a models directory. Needs no runtime handle.
     pull_model: *const fn (*const PullModelContext) callconv(.c) Status,
+    memory_admission_stats: ?*const fn (*anyopaque, *MemoryAdmissionStats) callconv(.c) Status = null,
 };
 
 pub fn validContext(comptime T: type, version: u32, struct_size: u32) bool {
@@ -416,7 +440,7 @@ pub fn requiredFunctionTableSize(required_capabilities: u64) ?u32 {
         Capability.route_manifest |
         Capability.resource_budget |
         Capability.request_admission |
-        Capability.model_pull;
+        Capability.model_pull | Capability.memory_admission;
     if (required_capabilities & ~known != 0) return null;
     var required = functionTableFieldEnd("capabilities");
     // Provider lifetime includes destruction even though the invoke operations
@@ -431,6 +455,8 @@ pub fn requiredFunctionTableSize(required_capabilities: u64) ?u32 {
         required = @max(required, functionTableFieldEnd("request_admission_stats"));
     if (required_capabilities & Capability.model_pull != 0)
         required = @max(required, functionTableFieldEnd("pull_model"));
+    if (required_capabilities & Capability.memory_admission != 0)
+        required = @max(required, functionTableFieldEnd("memory_admission_stats"));
     return required;
 }
 

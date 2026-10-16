@@ -433,7 +433,7 @@ test "gliner boundary socket pinned small real HTTP success atomic recovery and 
         node.test_allow_unqualified_gliner_boundary = true;
         {
             const control = Control{ .io = std.testing.io, .hard_cancellation = node.hard_cancellation_watchdog.?.boundary(), .deadline_ns = clock() + request_timeout_ms * std.time.ns_per_ms };
-            var lease = try control.enterUninterruptible(.process_required);
+            var lease = try control.enterUninterruptible(.uninterruptible);
             lease.deinit();
             _ = try shared.idle(&node);
         }

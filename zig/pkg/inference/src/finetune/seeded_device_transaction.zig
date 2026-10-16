@@ -593,7 +593,7 @@ test "seeded device transaction control preserves worker carrier both cancellati
     {
         // This exercises the real process-required guard/monitor contract
         // without a process, thread, device, timer or tensor allocation.
-        var guard = try active.enterUninterruptible(.process_required);
+        var guard = try active.enterUninterruptible(.uninterruptible);
         defer guard.deinit();
         const monitor = original.monitor.?;
         try std.testing.expectEqual(future - 2, monitor.deadline_ns.?);
@@ -625,7 +625,7 @@ test "seeded device transaction control preserves worker carrier both cancellati
     try std.testing.expectEqual(request.io.?, active.io.?);
     try std.testing.expectEqual(future - 3, active.deadline_ns.?);
     {
-        var guard = try active.enterUninterruptible(.process_required);
+        var guard = try active.enterUninterruptible(.uninterruptible);
         defer guard.deinit();
         try requested.monitor.?.check();
     }
@@ -638,7 +638,7 @@ test "seeded device transaction control preserves worker carrier both cancellati
     try std.testing.expectError(error.Timeout, active.check());
     combined.original = null;
     combined.request = .{};
-    try std.testing.expectError(error.ProcessIsolationRequired, combined.control().enterUninterruptible(.process_required));
+    try std.testing.expectError(error.ProcessIsolationRequired, combined.control().enterUninterruptible(.uninterruptible));
 }
 
 /// Prepare independent resident replacements without modifying any borrowed

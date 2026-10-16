@@ -324,3 +324,28 @@ def test_pull_cancel_on_first_report_then_full_pull_succeeds(tmp_path: Path) -> 
         # completes successfully.
         result = inf.pull({"model": PULL_TEST_MODEL})
         assert "models" in result
+
+
+def test_native_database_needs_no_worker_across_writes_and_reopen(
+    aflite_path: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("ANTFLY_INFERENCE_WORKER", str(tmp_path / "missing-worker"))
+    options = antfly_embedded.OpenOptions(
+        local_runtime_configured=True,
+        generated_enrichment_replay=True,
+        models_dir=tmp_path / "models",
+        busy_timeout=5.0,
+    )
+    with antfly_embedded.create_with_options(aflite_path, options) as db:
+        if not db.capabilities()["local_inference_runtime"]:
+            pytest.skip("local inference is not advertised by this build")
+        for i in range(20):
+            db.batch_json({"inserts": {f"doc:{i}": {"body": f"synthetic row {i}"}}})
+            admission = db.status()["inference"]["memory_admission"]
+            assert admission["pressure"] == "none"
+            assert admission["denied_count"] == 0
+        db.run_until_idle()
+        assert db.lookup("doc:19") is not None
+    with antfly_embedded.open_with_options(aflite_path, options) as db:
+        assert db.lookup("doc:19") is not None
+        assert db.status()["inference"]["memory_admission"]["denied_count"] == 0

@@ -149,7 +149,7 @@ const Fixture = struct {
     }
     fn interruption(raw: *anyopaque) inference.execution_control.Interruption {
         const self: *@This() = @ptrCast(@alignCast(raw));
-        return if (self.hard or self.bounded_rerank or self.bounded_embed) .process_required else .cooperative;
+        return if (self.hard or self.bounded_rerank or self.bounded_embed) .uninterruptible else .cooperative;
     }
     fn close(_: *anyopaque) void {}
     const vtable = Session.VTable{

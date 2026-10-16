@@ -73,8 +73,8 @@ pub use maintenance::{
 };
 #[cfg(feature = "serde")]
 pub use status::{
-    Capabilities, InferenceStatus, PendingWorkStatus, ReplayGeneratedEnrichmentsResult, Status,
-    StorageStatus, TypedError, TypedResult,
+    Capabilities, InferenceStatus, MemoryAdmissionStats, PendingWorkStatus,
+    ReplayGeneratedEnrichmentsResult, Status, StorageStatus, TypedError, TypedResult,
 };
 
 #[cfg(feature = "serde")]

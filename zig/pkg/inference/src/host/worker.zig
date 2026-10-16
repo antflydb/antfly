@@ -145,12 +145,22 @@ pub fn invokeHttp(client: *Client, route: []const u8, context: *const bridge.Htt
             response.body = "{\"error\":\"inference request too large\"}";
             return response;
         }
-        if (err == error.ResourceTemporarilyUnavailable or err == error.QueueFull) {
+        if (err == error.InferenceWorkerExecutableNotConfigured) {
+            var response = httpx.Response.init(client.alloc, 503);
+            errdefer response.deinit();
+            try response.headers.append("content-type", "application/json");
+            response.body = "{\"error\":\"inference worker executable not configured; set ANTFLY_INFERENCE_WORKER to an antfly-inference-worker or antfly-lite executable\",\"code\":\"InferenceWorkerExecutableNotConfigured\"}";
+            return response;
+        }
+        if (err == error.InferenceWorkerUnavailable or err == error.ResourceTemporarilyUnavailable or err == error.QueueFull) {
             var response = httpx.Response.init(client.alloc, 503);
             errdefer response.deinit();
             try response.headers.append("content-type", "application/json");
             try response.headers.append("retry-after", "1");
-            response.body = "{\"error\":\"inference worker unavailable; retry the request\"}";
+            response.body = if (err == error.InferenceWorkerUnavailable)
+                "{\"error\":\"inference worker stopped or its transport failed; retry the request and check worker stderr if this persists\",\"code\":\"InferenceWorkerUnavailable\"}"
+            else
+                "{\"error\":\"inference capacity temporarily unavailable; retry the request\",\"code\":\"ResourceTemporarilyUnavailable\"}";
             return response;
         }
         return err;
@@ -219,7 +229,7 @@ pub const Client = struct {
         if (control.check) |check| try check(control.ptr);
         if (self.worker) |worker| {
             if (!worker.endpoint.closed.load(.acquire)) return worker;
-            if (self.active != 0) return error.ResourceTemporarilyUnavailable;
+            if (self.active != 0) return error.InferenceWorkerUnavailable;
             worker.destroy();
             self.worker = null;
         }
@@ -228,13 +238,19 @@ pub const Client = struct {
         errdefer self.alloc.destroy(worker);
         const executable = try resolveWorkerExecutable(self.alloc, self.io);
         defer self.alloc.free(executable);
-        const child = try std.process.spawn(self.io, .{
+        const child = std.process.spawn(self.io, .{
             .argv = &.{ executable, "inference", "_worker" },
             .stdin = .pipe,
             .stdout = .pipe,
             .stderr = .inherit,
             .environ_map = &self.environment,
-        });
+        }) catch |err| {
+            std.log.warn("could not start inference worker executable={s} err={s}; set {s} to an executable antfly-inference-worker or antfly-lite binary", .{ executable, @errorName(err), worker_executable_env });
+            return switch (err) {
+                error.FileNotFound, error.AccessDenied, error.InvalidExe => error.InferenceWorkerExecutableNotConfigured,
+                else => err,
+            };
+        };
         worker.* = .{
             .owner = self,
             .child = child,
@@ -304,7 +320,7 @@ fn callSegments(endpoint: *rpc.Endpoint, operation: wire.Operation, options: []c
     var framed = payload;
     framed.metadata = header;
     const response = endpoint.call(framed, control) catch |err| switch (err) {
-        error.InferenceWorkerUnavailable, error.InferenceWorkerRequestFailed, error.BrokenPipe => return error.ResourceTemporarilyUnavailable,
+        error.InferenceWorkerUnavailable, error.InferenceWorkerRequestFailed, error.BrokenPipe => return error.InferenceWorkerUnavailable,
         else => return err,
     };
     errdefer response.deinit();
@@ -369,7 +385,7 @@ fn findOnPathAlloc(alloc: std.mem.Allocator, io: std.Io, name: []const u8) !?[]u
 /// Resolves the executable used to spawn the sandboxed inference worker
 /// (`<exe> inference _worker`, host-owned and replaceable so a crashing GPU
 /// driver call or unabortable native session load cannot take the caller
-/// down with it -- see `BackendRuntime.requiresProcessIsolation`). The
+/// down with it -- see `BackendRuntime.hasUninterruptibleCalls`). The
 /// `antfly` CLI binary re-execs itself, which is correct: `argv[0]` names the
 /// `antfly` binary the user launched. A library host (libantfly linked into a
 /// Go test binary, `examples/dogfood`, or any other consumer) has no such
@@ -1007,12 +1023,14 @@ test "inference worker retains reservations until reaped cleanup and owns partia
         var fail_at: usize = 0;
         var groups: usize = 0;
         var kills: usize = 0;
+        var missing_executable: bool = false;
         fn concurrent(raw: ?*anyopaque, group: *std.Io.Group, context: []const u8, alignment: std.mem.Alignment, start: *const fn (*const anyopaque) void) std.Io.ConcurrentError!void {
             groups += 1;
             if (groups == fail_at) return error.ConcurrencyUnavailable;
             return std.testing.io.vtable.groupConcurrent(raw, group, context, alignment, start);
         }
         fn spawn(raw: ?*anyopaque, options: std.process.SpawnOptions) std.process.SpawnError!std.process.Child {
+            if (missing_executable) return error.FileNotFound;
             var modified = options;
             modified.argv = &.{"/bin/cat"};
             modified.environ_map = null;
@@ -1037,6 +1055,14 @@ test "inference worker retains reservations until reaped cleanup and owns partia
     vtable.processSpawn = Fault.spawn;
     vtable.childKill = Fault.kill;
     client.io = .{ .userdata = std.testing.io.userdata, .vtable = &vtable };
+    // A missing override/sibling must stay actionable across the ABI and
+    // must not enter the transient worker restart/capacity retry path.
+    Fault.missing_executable = true;
+    Fault.kills = 0;
+    try std.testing.expectError(error.InferenceWorkerExecutableNotConfigured, client.ensureWorker(.{}));
+    try std.testing.expectEqual(@as(usize, 0), Fault.kills);
+    try std.testing.expect(client.worker == null);
+    Fault.missing_executable = false;
     // Failure before any reader, failure after the reader owns cleanup, and
     // failure during initialization must all use the same child handle. With
     // no injected spawn failure, cat echoes our offer as an invalid peer frame.
@@ -1045,7 +1071,7 @@ test "inference worker retains reservations until reaped cleanup and owns partia
         Fault.groups = 0;
         Fault.kills = 0;
         try std.testing.expectError(
-            if (fail_at == 0) error.ResourceTemporarilyUnavailable else error.ConcurrencyUnavailable,
+            if (fail_at == 0) error.InferenceWorkerUnavailable else error.ConcurrencyUnavailable,
             client.ensureWorker(.{}),
         );
         try std.testing.expectEqual(@as(usize, 1), Fault.kills);

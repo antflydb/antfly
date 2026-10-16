@@ -64,7 +64,6 @@ fn sec(ns: u64) f64 {
     return @as(f64, @floatFromInt(ns)) / std.time.ns_per_s;
 }
 pub fn main(init: std.process.Init) !void {
-    internal.execution_control.allowUninterruptibleInProcess();
     const a = std.heap.smp_allocator;
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();

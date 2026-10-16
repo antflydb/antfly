@@ -357,7 +357,7 @@ fn verifyEnvironment() !void {
 
 fn closeSession(session: Session, watchdog: *Watchdog) void {
     const control = controlFor(watchdog, teardown_timeout_ms) catch inference.platform.process.exitImmediately(1);
-    var guard = control.enterUninterruptible(.process_required) catch inference.platform.process.exitImmediately(1);
+    var guard = control.enterUninterruptible(.uninterruptible) catch inference.platform.process.exitImmediately(1);
     defer guard.deinit();
     session.close();
 }
@@ -405,7 +405,7 @@ pub fn main(init: std.process.Init) !void {
     const process_memory_baseline = inference.metal_tensor.memoryStatsSnapshot();
     if (process_memory_baseline.device_owned_live_bytes != 0 or process_memory_baseline.host_mirror_live_bytes != 0) return error.BenchmarkUnexpectedStartupOwner;
     const session = blk: {
-        var guard = try startup.enterUninterruptible(.process_required);
+        var guard = try startup.enterUninterruptible(.uninterruptible);
         defer guard.deinit();
         break :blk try factory.createMetalSession(a, options.model_dir);
     };

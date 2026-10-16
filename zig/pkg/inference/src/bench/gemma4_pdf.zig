@@ -97,7 +97,6 @@ fn seconds(ns: u64) f64 {
 }
 
 pub fn main(init: std.process.Init) !void {
-    internal.execution_control.allowUninterruptibleInProcess();
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
     const out = arena.allocator();
@@ -273,7 +272,7 @@ pub fn main(init: std.process.Init) !void {
             if (retained_bytes > 256 * 1024 * 1024) return error.ResourceLimitExceeded;
             var timings = pipeline.MediaTimings{};
             if (do_model) {
-                const result = try pipeline.embedRasters(a, session.?, tokenizer.?, views[0..count], .{ .resident_images = resident, .timings = &timings }, null, null);
+                const result = try pipeline.embedRasters(a, session.?, tokenizer.?, views[0..count], .{ .resident_images = resident, .timings = &timings }, null, .{ .native_call_policy = .in_process });
                 defer a.free(result.vectors);
                 defer for (result.vectors) |v| a.free(v);
                 if (iteration + 1 == warmups + iterations) for (wave_items, result.vectors) |item, v| try saved.append(out, .{ .document = item.document, .page = item.page, .values = try out.dupe(f32, v) });

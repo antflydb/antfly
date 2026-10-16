@@ -90,6 +90,25 @@ pub struct StorageStatus {
     pub page_count: Option<u64>,
 }
 
+/// Historical snapshot of the local runtime's last denied memory admission.
+#[derive(Debug, Clone, Deserialize)]
+pub struct MemoryAdmissionStats {
+    pub pressure: String,
+    pub denied_count: u64,
+    pub last_denied_ns: u64,
+    pub request_count: u64,
+    pub requested_host_bytes: u64,
+    pub requested_backend_bytes: u64,
+    pub requested_kv_bytes: u64,
+    pub requested_scratch_bytes: u64,
+    pub admitted_host_bytes: u64,
+    pub admitted_backend_bytes: u64,
+    pub host_limit_bytes: u64,
+    pub backend_limit_bytes: u64,
+    pub combined_limit_bytes: u64,
+    pub available_memory_bytes: u64,
+}
+
 /// Reports the configured inference execution mode for a Lite handle. See
 /// `go/pkg/embedded/status.go`'s `InferenceStatus` doc comment for the budget
 /// field semantics (0 vs. "resolved" values).
@@ -111,6 +130,8 @@ pub struct InferenceStatus {
     pub process_memory_budget_mb: u32,
     pub process_memory_limit_bytes: u64,
     pub process_memory_limit_source: String,
+    #[serde(default)]
+    pub memory_admission: Option<MemoryAdmissionStats>,
 }
 
 /// Describes the Lite feature contract advertised by a handle.
@@ -172,6 +193,8 @@ pub struct PendingWorkStatus {
     pub promotion: serde_json::Value,
     #[serde(default)]
     pub text_merge: serde_json::Value,
+    #[serde(default)]
+    pub replacements: Vec<serde_json::Value>,
 }
 
 /// The typed form of [`Database::status_json`]. `stats` is kept as raw JSON

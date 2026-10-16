@@ -99,7 +99,7 @@ fn cached(node: *Node, directory: []const u8, pins: pipeline.PublishedModelFiles
     try std.testing.expectEqualStrings(directory, loaded.model_dir);
     try std.testing.expectEqual(handles, loaded.active_handles);
     try std.testing.expectEqual(.metal, loaded.session.backend());
-    try std.testing.expectEqual(.process_required, loaded.session.interruption());
+    try std.testing.expectEqual(.uninterruptible, loaded.session.interruption());
     try std.testing.expect(loaded.targetInferenceExecutionMutex() != null);
     try std.testing.expectEqual(boundary.Backbone.small, (try factory.getGlinerBoundaryConfig(loaded.session)).backbone);
     const identity = try factory.getGlinerBoundaryIdentity(loaded.session);

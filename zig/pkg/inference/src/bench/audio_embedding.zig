@@ -22,7 +22,6 @@ const grouped = inference.pipelines.embedding_gemma2;
 const Sample = struct { seconds: f64, execution: []const u8, media: grouped.MediaTimings };
 
 pub fn main(init: std.process.Init) !void {
-    inference.execution_control.allowUninterruptibleInProcess();
     const a = std.heap.smp_allocator;
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
@@ -57,6 +56,7 @@ pub fn main(init: std.process.Init) !void {
     if (batch == 0 or batch > 32 or paths.items.len == 0 or iterations == 0 or iterations > 1000 or warmups > 100) return error.InvalidBenchmark;
     var sessions = inference.backends.SessionManager.initWithIo(a, init.io);
     sessions.preferred_backends = &.{.metal};
+    sessions.native_call_policy = .in_process;
     var manager = inference.server.model_manager.ModelManager.init(a, sessions);
     defer manager.deinit();
     const start = inference.platform.time.monotonicNs();
@@ -78,6 +78,7 @@ pub fn main(init: std.process.Init) !void {
     var vectors: [][]f32 = &.{};
     for (0..warmups + iterations) |iteration| {
         var pipeline = loaded.embeddingPipeline(a);
+        pipeline.execution_control = .{ .native_call_policy = .in_process };
         var media: grouped.MediaTimings = .{};
         if (comptime @hasField(embedding.EmbeddingConfig, "audio_prepared_batches")) pipeline.config.audio_prepared_batches = batching;
         if (comptime @hasField(embedding.EmbeddingConfig, "audio_prepare_ahead")) pipeline.config.audio_prepare_ahead = ahead;

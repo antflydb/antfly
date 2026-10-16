@@ -308,7 +308,7 @@ fn runBackend(comptime backend: Backend, directory: []const u8, corpus: *const C
     // This independent guard spans constructor and physical close. The
     // deliberate cancellation is cooperative at a completed-window cut, and
     // is never installed as a fatal watchdog callback.
-    var lifetime_guard = try lifetime.enterUninterruptible(if (on_device) .process_required else .cooperative);
+    var lifetime_guard = try lifetime.enterUninterruptible(if (on_device) .uninterruptible else .cooperative);
     defer lifetime_guard.deinit();
     try pinnedFiles(a, directory, corpus.reference.model_files, lifetime);
     const session = switch (backend) {

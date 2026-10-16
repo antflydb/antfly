@@ -34,6 +34,25 @@ type StorageStatus struct {
 	PageCount          *uint64 `json:"page_count,omitempty"`
 }
 
+// MemoryAdmissionStats is the historical snapshot of the local runtime's last
+// denied memory admission. LastDeniedNS uses the process monotonic clock.
+type MemoryAdmissionStats struct {
+	Pressure              string `json:"pressure"`
+	DeniedCount           uint64 `json:"denied_count"`
+	LastDeniedNS          uint64 `json:"last_denied_ns"`
+	RequestCount          uint64 `json:"request_count"`
+	RequestedHostBytes    uint64 `json:"requested_host_bytes"`
+	RequestedBackendBytes uint64 `json:"requested_backend_bytes"`
+	RequestedKVBytes      uint64 `json:"requested_kv_bytes"`
+	RequestedScratchBytes uint64 `json:"requested_scratch_bytes"`
+	AdmittedHostBytes     uint64 `json:"admitted_host_bytes"`
+	AdmittedBackendBytes  uint64 `json:"admitted_backend_bytes"`
+	HostLimitBytes        uint64 `json:"host_limit_bytes"`
+	BackendLimitBytes     uint64 `json:"backend_limit_bytes"`
+	CombinedLimitBytes    uint64 `json:"combined_limit_bytes"`
+	AvailableMemoryBytes  uint64 `json:"available_memory_bytes"`
+}
+
 // InferenceStatus reports the configured inference execution mode for a Lite
 // handle. A fresh core Lite database normally reports Configured=false and
 // NoInferenceConfiguredOK=true.
@@ -54,22 +73,23 @@ type StorageStatus struct {
 // these stay at their zero-value/"automatic" defaults until a local runtime
 // is actually started.
 type InferenceStatus struct {
-	Mode                     string   `json:"mode"`
-	AvailableModes           []string `json:"available_modes"`
-	Configured               bool     `json:"configured"`
-	RemoteProviderConfigured bool     `json:"remote_provider_configured"`
-	LocalRuntimeConfigured   bool     `json:"local_runtime_configured"`
-	LocalRuntimeAvailable    bool     `json:"local_runtime_available"`
-	CallerSuppliedArtifacts  bool     `json:"caller_supplied_artifacts"`
-	NoInferenceConfiguredOK  bool     `json:"no_inference_configured_ok"`
-	HostBudgetMB             uint32   `json:"host_budget_mb"`
-	BackendBudgetMB          uint32   `json:"backend_budget_mb"`
-	CombinedBudgetMB         uint32   `json:"combined_budget_mb"`
-	KVBudgetMB               uint32   `json:"kv_budget_mb"`
-	ScratchBudgetMB          uint32   `json:"scratch_budget_mb"`
-	ProcessMemoryBudgetMB    uint32   `json:"process_memory_budget_mb"`
-	ProcessMemoryLimitBytes  uint64   `json:"process_memory_limit_bytes"`
-	ProcessMemoryLimitSource string   `json:"process_memory_limit_source"`
+	Mode                     string                `json:"mode"`
+	AvailableModes           []string              `json:"available_modes"`
+	Configured               bool                  `json:"configured"`
+	RemoteProviderConfigured bool                  `json:"remote_provider_configured"`
+	LocalRuntimeConfigured   bool                  `json:"local_runtime_configured"`
+	LocalRuntimeAvailable    bool                  `json:"local_runtime_available"`
+	CallerSuppliedArtifacts  bool                  `json:"caller_supplied_artifacts"`
+	NoInferenceConfiguredOK  bool                  `json:"no_inference_configured_ok"`
+	HostBudgetMB             uint32                `json:"host_budget_mb"`
+	BackendBudgetMB          uint32                `json:"backend_budget_mb"`
+	CombinedBudgetMB         uint32                `json:"combined_budget_mb"`
+	KVBudgetMB               uint32                `json:"kv_budget_mb"`
+	ScratchBudgetMB          uint32                `json:"scratch_budget_mb"`
+	ProcessMemoryBudgetMB    uint32                `json:"process_memory_budget_mb"`
+	ProcessMemoryLimitBytes  uint64                `json:"process_memory_limit_bytes"`
+	ProcessMemoryLimitSource string                `json:"process_memory_limit_source"`
+	MemoryAdmission          *MemoryAdmissionStats `json:"memory_admission,omitempty"`
 }
 
 // Capabilities describes the Lite feature contract advertised by a handle.
@@ -115,15 +135,16 @@ type Capabilities struct {
 // work. The nested maintenance telemetry is intentionally retained as raw JSON
 // because it is operational detail rather than control-plane contract.
 type PendingWorkStatus struct {
-	DerivedTargetSequence               uint64          `json:"derived_target_sequence"`
-	HasAsyncIndexes                     bool            `json:"has_async_indexes"`
-	PortableImportPublicationInProgress bool            `json:"portable_import_publication_in_progress"`
-	PortableImportRecoveryRequired      bool            `json:"portable_import_recovery_required"`
-	PortableRuntimeActivationPending    bool            `json:"portable_runtime_activation_pending"`
-	Enrichment                          json.RawMessage `json:"enrichment"`
-	Resolution                          json.RawMessage `json:"resolution"`
-	Promotion                           json.RawMessage `json:"promotion"`
-	TextMerge                           json.RawMessage `json:"text_merge"`
+	DerivedTargetSequence               uint64            `json:"derived_target_sequence"`
+	HasAsyncIndexes                     bool              `json:"has_async_indexes"`
+	PortableImportPublicationInProgress bool              `json:"portable_import_publication_in_progress"`
+	PortableImportRecoveryRequired      bool              `json:"portable_import_recovery_required"`
+	PortableRuntimeActivationPending    bool              `json:"portable_runtime_activation_pending"`
+	Enrichment                          json.RawMessage   `json:"enrichment"`
+	Resolution                          json.RawMessage   `json:"resolution"`
+	Promotion                           json.RawMessage   `json:"promotion"`
+	TextMerge                           json.RawMessage   `json:"text_merge"`
+	Replacements                        []json.RawMessage `json:"replacements,omitempty"`
 }
 
 // Status is the typed form of StatusJSON. Stats is retained as raw JSON because

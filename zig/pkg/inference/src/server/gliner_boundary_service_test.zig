@@ -340,7 +340,7 @@ test "gliner boundary v2 pinned small HTTP handler qualification and atomic reco
         // request lease. Native CPU execution itself remains cooperative.
         {
             const control = Control{ .io = std.testing.io, .hard_cancellation = node.hard_cancellation_watchdog.?.boundary(), .deadline_ns = platform.time.monotonicNs() + 180 * std.time.ns_per_s };
-            var guard = try control.enterUninterruptible(.process_required);
+            var guard = try control.enterUninterruptible(.uninterruptible);
             guard.deinit();
             _ = try idle(&node);
         }
@@ -712,7 +712,7 @@ fn longExecutorHttpCanonicalShape(metal: bool, environment: [:0]const u8) !void 
         .max_loaded_models = 1,
         .max_concurrent_requests = 1,
         // Metal is a process-required backend (backends.zig's
-        // requiresProcessIsolation); ModelManager refuses to close/reopen
+        // hasUninterruptibleCalls); ModelManager refuses to close/reopen
         // such a session unless the harness opts in here (mirrors
         // gliner_boundary_metal_socket_test.zig's Node.init config).
         .process_termination_available = true,

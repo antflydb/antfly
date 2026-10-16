@@ -31,7 +31,6 @@ fn now() !u64 {
 pub fn main(init: std.process.Init) !void {
     // This executable is an offline child; its driver can terminate the entire
     // process. Production request boundary requirements are unchanged.
-    internal.execution_control.allowUninterruptibleInProcess();
     const a = std.heap.c_allocator;
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
@@ -122,12 +121,12 @@ pub fn main(init: std.process.Init) !void {
                     var images: [8][]const u8 = undefined;
                     @memset(images[0..batch], bytes);
                     if (batching) {
-                        const result = try pipeline.embedImages(workspace, session, tokenizer, images[0..batch], .{ .prepare_ahead = prepare_ahead, .timings = &media }, null, null, null);
+                        const result = try pipeline.embedImages(workspace, session, tokenizer, images[0..batch], .{ .prepare_ahead = prepare_ahead, .timings = &media }, null, .{ .native_call_policy = .in_process }, null);
                         defer workspace.free(result.vectors);
                         defer for (result.vectors) |vector| workspace.free(vector);
                         for (result.vectors) |vector| try values.appendSlice(workspace, vector);
                     } else for (images[0..batch]) |encoded| {
-                        const result = try pipeline.embed(workspace, session, tokenizer, .{ .content = &.{.{ .image = encoded }} }, .{}, null, null);
+                        const result = try pipeline.embed(workspace, session, tokenizer, .{ .content = &.{.{ .image = encoded }} }, .{}, null, .{ .native_call_policy = .in_process });
                         defer workspace.free(result.vector);
                         try values.appendSlice(workspace, result.vector);
                     }
@@ -147,12 +146,12 @@ pub fn main(init: std.process.Init) !void {
                     var rasters: [8]Raster = undefined;
                     for (rasters[0..batch]) |*raster| raster.* = .{ .bytes = rgba, .width = decoded.width, .height = decoded.height, .stride_bytes = @as(usize, decoded.width) * 4 };
                     if (batching) {
-                        const result = try pipeline.embedRasters(workspace, session, tokenizer, rasters[0..batch], .{ .prepare_ahead = prepare_ahead, .timings = &media }, null, null);
+                        const result = try pipeline.embedRasters(workspace, session, tokenizer, rasters[0..batch], .{ .prepare_ahead = prepare_ahead, .timings = &media }, null, .{ .native_call_policy = .in_process });
                         defer workspace.free(result.vectors);
                         defer for (result.vectors) |vector| workspace.free(vector);
                         for (result.vectors) |vector| try values.appendSlice(workspace, vector);
                     } else for (rasters[0..batch]) |raster| {
-                        const result = try pipeline.embed(workspace, session, tokenizer, .{ .content = &.{.{ .raster = raster }} }, .{}, null, null);
+                        const result = try pipeline.embed(workspace, session, tokenizer, .{ .content = &.{.{ .raster = raster }} }, .{}, null, .{ .native_call_policy = .in_process });
                         defer workspace.free(result.vector);
                         try values.appendSlice(workspace, result.vector);
                     }
