@@ -570,6 +570,7 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
         "capi lite explicit resource budget overrides are reported in status",
         "capi lite inference service survives foreground and maintenance snapshots",
         "capi lite inference producer retry is visible in graph replacement status",
+        "capi lite inference failed open drains the configured generation before releasing its service",
         "capi lite defaults embedded generation budgets when no override is given",
         "capi lite drains an antfly embedder with no api_url through the embedded inference provider",
         "capi inference options are prefix compatible and reject unknown flags and reserved bits",
