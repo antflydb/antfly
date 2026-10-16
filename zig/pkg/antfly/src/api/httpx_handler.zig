@@ -3428,21 +3428,21 @@ pub const AntflyApiHandler = struct {
         var principal: [32]u8 = undefined;
         std.crypto.hash.sha2.Sha256.hash(identity.credential_principal, &principal, .{});
         const runtime = self.api_server.retainedReadRuntime() catch return textResponse(ctx, 503, "retained read owner unavailable");
-        const encoded = rpc.execute(ctx.allocator, .{ .registry = &runtime.registry, .source = source }, .{
+        const encoded = rpc.executeWithCodec(ctx.allocator, .{ .registry = &runtime.registry, .source = source }, .{
             .principal = principal,
             .authorization_revision = 1,
             .table_id = route.table_id,
             .group_id = route.route.group_id,
             .topology_revision = route.topology_epoch,
             .schema_version = parsed.value.schema_version,
-        }, params.table_name, parsed.value) catch |err| return textResponse(ctx, switch (err) {
+        }, params.table_name, parsed.value, @import("retained_read_page.zig").formatForAccept(ctx.header("accept") orelse "")) catch |err| return textResponse(ctx, switch (err) {
             error.InvalidRetainedReadLease, error.InvalidRetainedReadToken, error.InvalidRetainedReadQuery, error.InvalidRetainedReadPageLimit => 400,
             error.RetainedReadAdmissionExceeded, error.RetainedReadBusy => 429,
             error.RetainedReadNotFound, error.RetainedReadExpired, error.RetainedReadScopeChanged, error.RetainedReadSequenceMismatch, error.SqlRangeTrackingRequired => 409,
             else => 503,
         }, @errorName(err));
         defer ctx.allocator.free(encoded);
-        try ctx.setHeader("content-type", "application/json");
+        try ctx.setHeader("content-type", if (std.mem.startsWith(u8, encoded, @import("retained_read_page.zig").compact_magic)) @import("retained_read_page.zig").compact_media_type else if (std.mem.startsWith(u8, encoded, @import("retained_read_page.zig").magic)) @import("retained_read_page.zig").media_type else "application/json");
         return ctx.response.body(try ctx.allocator.dupe(u8, encoded)).build();
     }
 

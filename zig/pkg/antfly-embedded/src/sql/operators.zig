@@ -1637,8 +1637,16 @@ pub fn cloneDatum(alloc: Allocator, value: Datum) anyerror!Datum {
         if (value.sql_null or value.patterns != null or value.value != .null) return error.SqlTypeMismatch;
         const owned = try alloc.create(@import("array_value.zig").Value);
         const dimensions = try alloc.dupe(@import("array_value.zig").Dimension, array.dimensions);
-        const elements = try alloc.alloc(Datum, array.elements.len);
-        for (array.elements, elements) |element, *out| {
+        if (array.stored) |stored| {
+            const copy = try alloc.create(@import("../common/sql_array_layout.zig").View);
+            copy.* = stored.*;
+            copy.bytes = try alloc.dupe(u8, stored.bytes);
+            owned.* = .{ .element_type = array.element_type, .dimensions = dimensions, .stored = copy };
+            return Datum.typedArray(owned);
+        }
+        const elements = try alloc.alloc(Datum, array.cardinality());
+        for (0..array.cardinality(), elements) |array_cell_0, *out| {
+            const element = array.flatCell(array_cell_0);
             if (element.array != null) return error.SqlTypeMismatch;
             out.* = try cloneDatum(alloc, element);
         }
@@ -1671,8 +1679,10 @@ fn cloneJson(alloc: Allocator, value: Json, depth: usize) error{ OutOfMemory, Sq
 pub fn datumBytes(value: Datum) anyerror!usize {
     if (value.numeric) |number| return @sizeOf(Datum) + @sizeOf(@import("numeric_value.zig").Value) + number.digits.len * 2;
     if (value.array) |array| {
+        if (array.stored) |stored| return @sizeOf(Datum) + @sizeOf(@import("array_value.zig").Value) + array.dimensions.len * @sizeOf(@import("array_value.zig").Dimension) + @sizeOf(@import("../common/sql_array_layout.zig").View) + stored.bytes.len;
         var bytes: usize = @sizeOf(Datum) + @sizeOf(@import("array_value.zig").Value) + array.dimensions.len * @sizeOf(@import("array_value.zig").Dimension);
-        for (array.elements) |element| {
+        for (0..array.cardinality()) |array_cell_0| {
+            const element = array.flatCell(array_cell_0);
             if (element.array != null) return error.SqlTypeMismatch;
             bytes +|= try datumBytes(element);
         }

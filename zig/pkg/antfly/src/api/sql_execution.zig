@@ -1200,9 +1200,9 @@ pub const Adapter = struct {
             for (page.rows, rows) |row, *out| {
                 if (row.schema_version != self.schema_version) return error.CatalogGenerationChanged;
                 if (self.require_primary_digest and row.expected_content_digest == null) return error.InvalidSqlBackendResponse;
-                out.* = try self.projection.adaptBorrowed(page.arena.allocator(), layout, .{ .id = row.id, .version = row.version, .value = row.value, .sql_nulls = row.sql_nulls, .expected_content_digest = row.expected_content_digest, .document = row.document });
+                out.* = try self.projection.adaptBorrowed(page.arena.allocator(), layout, row.sqlRow());
             }
-            return .{ .rows = rows, .after = page.after, .owned_arena = page.arena };
+            return .{ .rows = rows, .after = page.after, .storage_page = page };
         }
 
         fn close(ptr: *anyopaque) void {
@@ -2054,39 +2054,13 @@ pub const Adapter = struct {
     }
 
     fn scan(ptr: *anyopaque, alloc: std.mem.Allocator, table: catalog.Table, request: catalog.Scan) !catalog.Page {
-        // The stateless wire fallback is relational-only. Document SQL needs
-        // its retained native view to preserve projection/null and TTL semantics.
-        if (table.storage_mode != .relational or request.include_primary_digest) return error.UnsupportedSqlExecution;
-        const self: *Adapter = @ptrCast(@alignCast(ptr));
-        const scan_request = try self.prepareScan(alloc, table, request);
-        const source = self.server.table_reads orelse return error.TableNotFound;
-        var response = (try source.scan(alloc, table.physical_name, scan_request.from, scan_request.to, scan_request.opts, .read_index)) orelse return error.TableNotFound;
-        defer response.deinit(alloc);
-        var rows: std.ArrayList(catalog.Row) = .empty;
-        const projection = try @import("antfly_local_sources").sql_document_row.Projection.init(alloc, table, request.fields);
-        defer projection.deinit(alloc);
-        const layout = try projection.pageLayout(alloc);
-        var lines = std.mem.splitScalar(u8, response.ndjson, '\n');
-        while (lines.next()) |line| {
-            if (line.len == 0) continue;
-            if (rows.items.len >= request.limit) return error.InvalidSqlBackendResponse;
-            const row = try std.json.parseFromSliceLeaky(wire.RelationalRow, alloc, line, .{ .parse_numbers = false, .allocate = .alloc_always });
-            if (request.primary_key) |key| {
-                if (rows.items.len != 0 or !std.mem.eql(u8, row._id, key)) return error.InvalidSqlBackendResponse;
-            }
-            if (row.schema_version != table.schema_version) return error.CatalogGenerationChanged;
-            const sql_nulls = try alloc.alloc(bool, row.row.map.count());
-            for (row.row.map.values(), sql_nulls) |value, *is_null| is_null.* = value == .null;
-            for (row.json_null_fields orelse &.{}) |field| {
-                const column = table.column(field) catch return error.InvalidSqlBackendResponse;
-                if (column.type != .json) return error.InvalidSqlBackendResponse;
-                const index = row.row.map.getIndex(field) orelse return error.InvalidSqlBackendResponse;
-                if (!sql_nulls[index]) return error.InvalidSqlBackendResponse;
-                sql_nulls[index] = false;
-            }
-            try rows.append(alloc, try projection.adaptBorrowed(alloc, layout, .{ .id = row._id, .version = try std.fmt.parseInt(u64, row.version, 10), .value = .{ .object = row.row.map }, .sql_nulls = sql_nulls }));
-        }
-        return .{ .rows = rows.items, .after = if (request.primary_key == null and rows.items.len == request.limit) rows.items[rows.items.len - 1].id else null };
+        // SQL execution requires retained typed pages. Public HTTP/NDJSON
+        // scans have no statement snapshot or native-cell ownership contract;
+        // do not silently choose that transport when a provider lacks SQL.
+        _ = ptr;
+        _ = alloc;
+        if (table.storage_mode == .document or request.include_primary_digest) return error.UnsupportedSqlExecution;
+        return error.SqlStatementSnapshotRequired;
     }
 
     fn prepareMutations(ptr: *anyopaque, alloc: std.mem.Allocator, table: catalog.Table, input: []const catalog.Mutation) ![]const catalog.Mutation {
@@ -3991,7 +3965,7 @@ test "SQL API cross-table MERGE retains both source and target range proofs" {
     try std.testing.expectEqual(attempts_before_proof_failure, fake.commit_attempts);
 }
 
-test "SQL document reads reject the relational stateless fallback before transport" {
+test "SQL stateless fallback rejects JSON scans before transport" {
     var identity: ?http_server.AuthenticatedIdentity = null;
     var io_impl = std.Io.Threaded.init(std.testing.allocator, .{});
     defer io_impl.deinit();
@@ -4000,6 +3974,7 @@ test "SQL document reads reject the relational stateless fallback before transpo
     // poisoned so rejected requests cannot touch those authorities.
     server.embedding_provider_runtime.io = io_impl.io();
     var adapter = Adapter{ .server = &server, .identity = &identity, .context = .{} };
+    try std.testing.expectError(error.SqlStatementSnapshotRequired, Adapter.scan(&adapter, std.testing.allocator, .{ .id = 1, .physical_name = "rows", .schema_version = 1, .storage_mode = .relational, .columns = &.{} }, .{ .fields = &.{}, .limit = 1 }));
     try std.testing.expectError(error.UnsupportedSqlExecution, Adapter.scan(&adapter, std.testing.allocator, .{
         .id = 1,
         .physical_name = "docs",

@@ -39,6 +39,7 @@ test {
     _ = @import("api/sql_connection_record.zig");
     _ = @import("api/sql_connections.zig");
     _ = @import("api/kernel_owner_source.zig");
+    _ = @import("api/sql_execution.zig");
     _ = @import("api/sql_pgwire.zig");
     _ = @import("api/sql_execution.zig");
     _ = @import("antfly_local_sources").sql_read_fence;

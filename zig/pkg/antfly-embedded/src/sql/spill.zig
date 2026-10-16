@@ -596,6 +596,7 @@ pub const File = struct {
     }
 };
 const Encoder = struct {
+    compact_arrays: bool = true,
     manager: ?*Manager = null,
     a: Allocator,
     bytes: *std.ArrayList(u8),
@@ -615,38 +616,55 @@ const Encoder = struct {
     }
     fn cells(self: *Encoder, values: []const Datum) anyerror!void {
         try self.word(values.len);
-        for (values) |value| {
-            try self.append(&.{@intFromBool(value.sql_null)});
-            if (value.numeric) |number| {
-                if (value.sql_null or value.array != null or value.patterns != null or value.value != .null) return error.SqlTypeMismatch;
-                const numeric = @import("numeric_value.zig");
-                const binary = @import("numeric_binary.zig");
-                var context: numeric.Context = .{ .alloc = self.a, .max_output_bytes = self.limit };
-                const length = try binary.encodedSize(&context, number.*);
-                try self.append(&.{10});
-                try self.word(length);
-                if (length > self.limit -| self.bytes.items.len) return error.SqlProgramLimitExceeded;
-                const start = self.bytes.items.len;
-                try self.bytes.resize(self.a, start + length);
-                var writer: std.Io.Writer = .fixed(self.bytes.items[start..]);
-                try binary.encode(&context, number.*, &writer);
-            } else if (value.array) |array| {
-                if (value.sql_null or value.patterns != null or value.value != .null) return error.SqlTypeMismatch;
-                const validated = try @import("array_value.zig").Value.init(array.element_type, array.dimensions, array.elements, if (self.manager) |manager| manager.array_limits else .{});
-                if (validated.dimensions.len != array.dimensions.len) return error.InvalidSqlArrayShape;
-                try self.append(&.{ 9, @backingInt(array.element_type) });
-                try self.word(array.dimensions.len);
-                for (array.dimensions) |dimension| {
-                    try self.word(dimension.length);
-                    try self.word(@bitCast(@as(i64, dimension.lower)));
+        for (values) |value| try self.cell(value);
+    }
+    fn cell(self: *Encoder, value: Datum) anyerror!void {
+        try self.append(&.{@intFromBool(value.sql_null)});
+        if (value.numeric) |number| {
+            if (value.sql_null or value.array != null or value.patterns != null or value.value != .null) return error.SqlTypeMismatch;
+            const numeric = @import("numeric_value.zig");
+            const binary = @import("numeric_binary.zig");
+            var context: numeric.Context = .{ .alloc = self.a, .max_output_bytes = self.limit };
+            const length = try binary.encodedSize(&context, number.*);
+            try self.append(&.{10});
+            try self.word(length);
+            if (length > self.limit -| self.bytes.items.len) return error.SqlProgramLimitExceeded;
+            const start = self.bytes.items.len;
+            try self.bytes.resize(self.a, start + length);
+            var writer: std.Io.Writer = .fixed(self.bytes.items[start..]);
+            try binary.encode(&context, number.*, &writer);
+        } else if (value.array) |array| {
+            if (value.sql_null or value.patterns != null or value.value != .null) return error.SqlTypeMismatch;
+            const validated = try array.validate(if (self.manager) |manager| manager.array_limits else .{});
+            if (validated.dimensions.len != array.dimensions.len) return error.InvalidSqlArrayShape;
+            if (self.compact_arrays and @import("array_compact.zig").supported(array.element_type)) {
+                try self.append(&.{ 11, @backingInt(array.element_type) });
+                if (array.stored) |stored| {
+                    try self.text(stored.bytes);
+                } else {
+                    var prepared = try @import("array_storage.zig").Prepared.init(self.a, array.*, .{ .values = if (self.manager) |m| m.array_limits else .{}, .wire_bytes = self.limit });
+                    defer prepared.deinit();
+                    try self.word(prepared.encoded_size);
+                    if (prepared.encoded_size > self.limit -| self.bytes.items.len) return error.SqlProgramLimitExceeded;
+                    const start = self.bytes.items.len;
+                    try self.bytes.resize(self.a, start + prepared.encoded_size);
+                    try prepared.writeInto(self.bytes.items[start..]);
                 }
-                try self.cells(array.elements);
-            } else if (value.patterns) |pattern| {
-                const id = try (self.manager orelse return error.InvalidSqlSpill).patternId(pattern);
-                try self.append(&.{8});
-                try self.word(id);
-            } else try self.json(value.value, 0);
-        }
+                return;
+            }
+            try self.append(&.{ 9, @backingInt(array.element_type) });
+            try self.word(array.dimensions.len);
+            for (array.dimensions) |dimension| {
+                try self.word(dimension.length);
+                try self.word(@bitCast(@as(i64, dimension.lower)));
+            }
+            try self.word(array.cardinality());
+            for (0..array.cardinality()) |index| try self.cell(array.flatCell(index));
+        } else if (value.patterns) |pattern| {
+            const id = try (self.manager orelse return error.InvalidSqlSpill).patternId(pattern);
+            try self.append(&.{8});
+            try self.word(id);
+        } else try self.json(value.value, 0);
     }
     fn json(self: *Encoder, value: std.json.Value, depth: usize) anyerror!void {
         if (depth > 64) return error.SqlProgramLimitExceeded;
@@ -686,6 +704,8 @@ const Encoder = struct {
     }
 };
 const Decoder = struct {
+    borrow_compact: bool = false,
+    compact_arrays: bool = true,
     manager: ?*Manager = null,
     a: Allocator,
     bytes: []const u8,
@@ -731,7 +751,22 @@ const Decoder = struct {
         for (values) |*value| {
             const flag = try self.byte();
             if (flag > 1) return error.InvalidSqlSpill;
-            if (self.position < self.bytes.len and self.bytes[self.position] == 10) {
+            if (self.position < self.bytes.len and self.bytes[self.position] == 11) {
+                self.position += 1;
+                if (!self.compact_arrays or flag != 0) return error.InvalidSqlSpill;
+                const arrays = @import("array_value.zig");
+                const kind = std.enums.fromInt(arrays.ElementType, try self.byte()) orelse return error.InvalidSqlSpill;
+                if (!@import("array_compact.zig").supported(kind)) return error.InvalidSqlSpill;
+                const bytes = try self.take(try self.count());
+                const array = try self.a.create(arrays.Value);
+                const storage = @import("array_storage.zig");
+                const options: storage.Options = .{ .values = if (self.manager) |m| m.array_limits else .{}, .wire_bytes = bytes.len };
+                array.* = (if (self.borrow_compact) storage.borrowLeaky(self.a, kind, bytes, options) else storage.viewLeaky(self.a, kind, bytes, options)) catch |err| return switch (err) {
+                    error.OutOfMemory => err,
+                    else => error.InvalidSqlSpill,
+                };
+                value.* = Datum.typedArray(array);
+            } else if (self.position < self.bytes.len and self.bytes[self.position] == 10) {
                 value.* = try self.numeric(flag);
             } else if (self.position < self.bytes.len and self.bytes[self.position] == 9) {
                 self.position += 1;
@@ -851,7 +886,12 @@ pub const ColumnarBlock = struct {
     }
 };
 const columnar_v1_magic = "NCB\x01";
+pub const ColumnarVersion = enum { v1, v2 };
+const columnar_v2_magic = "NCB\x02";
 pub fn encodeColumnarBlockAlloc(a: Allocator, rows: []const Row, max_bytes: usize) ![]u8 {
+    return encodeColumnarBlockVersionAlloc(a, rows, max_bytes, .v1);
+}
+pub fn encodeColumnarBlockVersionAlloc(a: Allocator, rows: []const Row, max_bytes: usize, version: ColumnarVersion) ![]u8 {
     if (rows.len == 0 or rows.len > 256 or rows[0].values.len > 1024 or rows[0].keys.len > 256) return error.InvalidSqlSpill;
     for (rows) |row| {
         if (row.values.len != rows[0].values.len or row.keys.len != rows[0].keys.len) return error.InvalidSqlSpill;
@@ -860,8 +900,8 @@ pub fn encodeColumnarBlockAlloc(a: Allocator, rows: []const Row, max_bytes: usiz
     }
     var bytes: std.ArrayList(u8) = .empty;
     errdefer bytes.deinit(a);
-    var encoder: Encoder = .{ .a = a, .bytes = &bytes, .limit = max_bytes };
-    try encoder.append(columnar_v1_magic);
+    var encoder: Encoder = .{ .compact_arrays = version == .v2, .a = a, .bytes = &bytes, .limit = max_bytes };
+    try encoder.append(if (version == .v1) columnar_v1_magic else columnar_v2_magic);
     try encoder.word(rows.len);
     try encoder.word(rows[0].values.len);
     try encoder.word(rows[0].keys.len);
@@ -875,8 +915,10 @@ pub fn encodeColumnarBlockAlloc(a: Allocator, rows: []const Row, max_bytes: usiz
 /// payload copy or per-row cell array is needed. The caller resets the arena
 /// only after all lanes drain, including on malformed input/allocation failure.
 pub fn decodeColumnarBlockInArena(a: Allocator, bytes: []const u8, max_bytes: usize) !ColumnarBlock {
-    if (bytes.len > max_bytes or bytes.len < columnar_v1_magic.len or !std.mem.eql(u8, bytes[0..columnar_v1_magic.len], columnar_v1_magic)) return error.InvalidSqlSpill;
-    var decoder: Decoder = .{ .a = a, .bytes = bytes, .position = columnar_v1_magic.len };
+    if (bytes.len > max_bytes or bytes.len < columnar_v1_magic.len) return error.InvalidSqlSpill;
+    const compact = std.mem.startsWith(u8, bytes, columnar_v2_magic);
+    if (!compact and !std.mem.startsWith(u8, bytes, columnar_v1_magic)) return error.InvalidSqlSpill;
+    var decoder: Decoder = .{ .borrow_compact = true, .compact_arrays = compact, .a = a, .bytes = bytes, .position = columnar_v1_magic.len };
     const count = try decoder.count();
     const width = try decoder.count();
     const key_width = try decoder.count();
@@ -1306,7 +1348,7 @@ pub const Sequential = struct {
                 break :blk try snappy.decode(owned, encoded);
             } else encoded;
             if (std.hash.Wyhash.hash(0, payload) != std.mem.readInt(u64, header[8..16], .little)) return error.InvalidSqlSpill;
-            var decoder: Decoder = .{ .manager = file.manager, .a = owned, .bytes = payload };
+            var decoder: Decoder = .{ .borrow_compact = true, .manager = file.manager, .a = owned, .bytes = payload };
             const count = try decoder.count();
             const width = try decoder.count();
             const key_width = try decoder.count();
@@ -1730,7 +1772,7 @@ pub const Sequential = struct {
                 break :blk try snappy.decode(owned, encoded);
             } else encoded;
             if (std.hash.Wyhash.hash(0, payload) != std.mem.readInt(u64, header[8..16], .little)) return error.InvalidSqlSpill;
-            var decoder: Decoder = .{ .manager = self.file.manager, .a = owned, .bytes = payload };
+            var decoder: Decoder = .{ .borrow_compact = true, .manager = self.file.manager, .a = owned, .bytes = payload };
             const count_rows = try decoder.count();
             const width_values = try decoder.count();
             const width_keys = try decoder.count();
@@ -2735,8 +2777,8 @@ test "SQL typed array spill codec preserves complete cells and rejects every tru
             const cells = try decoder.cells();
             try std.testing.expectEqual(std.math.Order.eq, try scalar.compareDatums(Datum.typedArray(&value), cells[0]));
             try std.testing.expectEqual(try scalar.semanticHashDatum(Datum.typedArray(&value)), try scalar.semanticHashDatum(cells[0]));
-            try std.testing.expect(!cells[0].array.?.elements[0].sql_null);
-            try std.testing.expect(cells[0].array.?.elements[1].sql_null);
+            try std.testing.expect(!cells[0].array.?.flatCell(0).sql_null);
+            try std.testing.expect(cells[0].array.?.flatCell(1).sql_null);
             for (0..bytes.items.len) |length| {
                 _ = arena.reset(.free_all);
                 decoder = .{ .manager = &manager, .a = arena.allocator(), .bytes = bytes.items[0..length] };
@@ -2756,7 +2798,7 @@ test "SQL typed array spill codec preserves complete cells and rejects every tru
             bytes.items[10] = kind;
         }
     };
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, Harness.run, .{});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Harness.run, .{});
 }
 
 test "SQL typed array row and column spill preserve dimensions and NULL provenance" {
@@ -2800,7 +2842,7 @@ test "SQL typed array row and column spill preserve dimensions and NULL provenan
     manager.array_limits.elements = 65536;
     const compact_offset = try file.append(.{ .values = &.{Datum.typedArray(&compact)}, .keys = &.{}, .ordinal = 8 }, none);
     const compact_row = try file.read(arena.allocator(), compact_offset);
-    try std.testing.expectEqual(@as(usize, 32), compact_row.row.values[0].array.?.elements.len);
+    try std.testing.expectEqual(@as(usize, 32), compact_row.row.values[0].array.?.cardinality());
 }
 
 test "SQL spill quotas cancellation and corrupt records fail without leaked files" {
@@ -3883,7 +3925,7 @@ test "SQL native immutable column blocks reject truncation versions and callback
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
     const bad = try arena.allocator().dupe(u8, bytes);
-    bad[3] = 2;
+    bad[3] = 255;
     try std.testing.expectError(error.InvalidSqlSpill, decodeColumnarBlockInArena(arena.allocator(), bad, 4096));
     try std.testing.expectError(error.InvalidSqlSpill, decodeColumnarBlockInArena(arena.allocator(), bytes, bytes.len - 1));
     var callback: scalar.PatternSet = undefined;
@@ -4274,4 +4316,83 @@ test "SQL presorted streams retain one run without merge rewrites" {
     try std.testing.expect((try sort.next(a)) == null);
     try std.testing.expectEqual(@as(usize, 1), manager.peak_files);
     try std.testing.expectEqual(@as(usize, 0), manager.merges);
+}
+
+test "SQL compact columnar arrays preserve v1 compatibility and avoid element expansion" {
+    const a = std.testing.allocator;
+    const arrays = @import("array_value.zig");
+    const cells = try a.alloc(Datum, 32768);
+    defer a.free(cells);
+    @memset(cells, .json(.{ .integer = 42 }));
+    const array = try arrays.Value.init(.int64, &.{.{ .length = 32768, .lower = -3 }}, cells, .{});
+    const rows = [_]Row{.{ .values = &.{.typedArray(&array)}, .keys = &.{}, .ordinal = 7 }};
+    var peaks: [2]usize = undefined;
+    var sizes: [2]usize = undefined;
+    for ([_]ColumnarVersion{ .v1, .v2 }, 0..) |version, i| {
+        const bytes = try encodeColumnarBlockVersionAlloc(a, &rows, 8 * 1024 * 1024, version);
+        defer a.free(bytes);
+        sizes[i] = bytes.len;
+        var nr: @import("../storage/lite/test_allocator.zig").NoResizeAllocator = .{ .backing = a };
+        var budget: @import("../storage/lite/test_allocator.zig").BudgetAllocator = .{ .backing = nr.allocator() };
+        {
+            var arena = std.heap.ArenaAllocator.init(budget.allocator());
+            defer arena.deinit();
+            const block = try decodeColumnarBlockInArena(arena.allocator(), bytes, 8 * 1024 * 1024);
+            const decoded = (try block.cell(0, 0)).array.?;
+            try std.testing.expectEqual(version == .v2, decoded.stored != null);
+            try std.testing.expectEqual(@as(usize, 32768), decoded.cardinality());
+            try std.testing.expectEqual(@as(i64, 42), decoded.flatCell(32767).value.integer);
+            try std.testing.expectEqual(@as(i32, -3), decoded.dimensions[0].lower);
+            peaks[i] = budget.peak;
+        }
+        try std.testing.expectEqual(@as(usize, 0), budget.live);
+        if (version == .v2) {
+            // A v1 decoder must reject the v2-only tag, even if framing was
+            // maliciously relabeled. Existing NCB1 bytes/goldens stay frozen.
+            bytes[3] = 1;
+            var arena = std.heap.ArenaAllocator.init(a);
+            defer arena.deinit();
+            try std.testing.expectError(error.InvalidSqlSpill, decodeColumnarBlockInArena(arena.allocator(), bytes, 8 * 1024 * 1024));
+        }
+    }
+    try std.testing.expect(peaks[1] < peaks[0] / 4);
+    try std.testing.expect(sizes[1] < sizes[0]);
+    std.debug.print("SQL compact columnar: v1_decode_peak={} v2_decode_peak={} v1_bytes={} v2_bytes={}\n", .{ peaks[0], peaks[1], sizes[0], sizes[1] });
+}
+
+test "SQL compact columnar arrays reject truncation and unwind allocation failures" {
+    const Probe = struct {
+        fn run(a: Allocator) !void {
+            var source = try @import("array_text.zig").decode(a, .text, "[-1:1]={\"é\",NULL,\"retained\"}", .{});
+            defer source.deinit();
+            const input = [_]Row{.{ .values = &.{.typedArray(&source.value)}, .keys = &.{}, .ordinal = 9 }};
+            const bytes = try encodeColumnarBlockVersionAlloc(a, &input, 4096, .v2);
+            defer a.free(bytes);
+            var arena = std.heap.ArenaAllocator.init(a);
+            defer arena.deinit();
+            const block = try decodeColumnarBlockInArena(arena.allocator(), bytes, 4096);
+            const output = (try block.cell(0, 0)).array.?;
+            try std.testing.expect(output.stored != null);
+            try std.testing.expectEqualStrings("retained", output.flatCell(2).value.string);
+            // Record decoders free their temporary input after returning.
+            // The default decoder must own compact payload bytes separately.
+            var record: std.ArrayList(u8) = .empty;
+            defer record.deinit(a);
+            var writer: Encoder = .{ .a = a, .bytes = &record, .limit = 4096 };
+            try writer.cells(&.{.typedArray(&source.value)});
+            var reader: Decoder = .{ .a = arena.allocator(), .bytes = record.items };
+            const kept = try reader.cells();
+            @memset(record.items, 0);
+            try std.testing.expectEqualStrings("retained", kept[0].array.?.flatCell(2).value.string);
+            for (0..bytes.len) |end| {
+                var partial = std.heap.ArenaAllocator.init(a);
+                defer partial.deinit();
+                if (decodeColumnarBlockInArena(partial.allocator(), bytes[0..end], 4096)) |_| return error.ExpectedTruncation else |err| switch (err) {
+                    error.OutOfMemory => return err,
+                    else => try std.testing.expectEqual(error.InvalidSqlSpill, err),
+                }
+            }
+        }
+    };
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Probe.run, .{});
 }

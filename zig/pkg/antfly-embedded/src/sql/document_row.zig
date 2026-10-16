@@ -202,7 +202,27 @@ pub const Projection = struct {
     /// nested JSONB/string cloning occurs. Legacy scalar-only pages stay cheap.
     pub fn adaptBorrowed(self: Projection, alloc: std.mem.Allocator, layout: ?catalog.Row.TypedLayout, row: catalog.Row) !catalog.Row {
         if (!self.has_typed_cells) return row;
-        const directory = layout orelse return error.InvalidSqlBackendResponse;
+        if (row.typed_cells) |native| {
+            var direct = native.layout.names.len == self.columns.len;
+            if (direct) for (self.columns, native.layout.names) |column, name| {
+                if (!std.mem.eql(u8, column.name, name) or !std.mem.eql(u8, column.path, name)) {
+                    direct = false;
+                    break;
+                }
+                const cell = try row.cell(name);
+                if (cell.sql_null and !column.nullable) return error.InvalidSqlBackendResponse;
+                if (!cell.sql_null and ((column.type == .array and cell.array == null) or
+                    (column.element_type == .numeric and column.type != .array and cell.numeric == null)))
+                {
+                    direct = false;
+                    break;
+                }
+            };
+            // Native storage already owns complete cells. Retain physical
+            // column blocks and page directories through the projection seam.
+            if (direct) return row;
+        }
+        const directory = layout orelse if (row.typed_cells) |cells| cells.layout else return error.InvalidSqlBackendResponse;
         if (directory.names.len != self.columns.len) return error.InvalidSqlBackendResponse;
         const cells = try alloc.alloc(catalog.Row.Cell, self.columns.len);
         const presence = try alloc.alloc(bool, self.columns.len);
@@ -419,8 +439,8 @@ test "SQL native array projection retains presence and page ownership" {
     try std.testing.expect(!try owned.hasField("missing"));
     const array = (try owned.cell("a")).array.?;
     try std.testing.expectEqual(@as(i32, -3), array.dimensions[0].lower);
-    try std.testing.expectEqual(std.math.maxInt(i64), array.elements[0].value.integer);
-    try std.testing.expect(array.elements[1].sql_null);
+    try std.testing.expectEqual(std.math.maxInt(i64), array.flatCell(0).value.integer);
+    try std.testing.expect(array.flatCell(1).sql_null);
     var malformed = owned;
     malformed.typed_cells.?.presence = &.{false};
     try std.testing.expectError(error.InvalidSqlBackendResponse, malformed.hasField("a"));
@@ -488,7 +508,7 @@ test "SQL NUMERIC native projection owns exact coefficients presence and mixed t
             try std.testing.expectEqualStrings("9007199254740993.1200", text);
             const array = (try owned.cell("a")).array.?;
             try std.testing.expectEqual(@as(i32, -3), array.dimensions[0].lower);
-            try std.testing.expectEqualStrings("owned", array.elements[0].value.string);
+            try std.testing.expectEqualStrings("owned", array.flatCell(0).value.string);
             try std.testing.expectEqualStrings("retained", (try owned.cell("label")).value.string);
         }
     };
