@@ -130,7 +130,7 @@ jobs:
         run: bash "$GITHUB_WORKSPACE/scripts/ci/zig_vopr_qualify.sh" runtime
       - name: Retain qualification disk measurements
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: vopr-qualify-disk
           path: ${{ runner.temp }}/vopr-qualify-disk.json
@@ -190,7 +190,7 @@ jobs:
             --cache-dir "$VOPR_LOCAL_CACHE_DIR"
       - name: Retain runner build disk measurements
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: vopr-build-disk
           path: ${{ runner.temp }}/vopr-build-disk.json
@@ -210,7 +210,7 @@ jobs:
       - name: Retain qualification diagnostics
         if: always()
         timeout-minutes: 5
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: vopr-qualification-diagnostics
           path: |
@@ -230,7 +230,7 @@ jobs:
         with:
           path: ${{ runner.temp }}/vopr-cached-runner/vopr.tar.gz
           key: vopr-runner-v1-${{ runner.os }}-${{ runner.arch }}-${{ inputs.head_sha || github.sha }}
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: vopr-runner
           path: ${{ runner.temp }}/vopr-cached-runner/vopr.tar.gz
@@ -266,7 +266,7 @@ jobs:
           submodules: true
       - name: Sample ARC runner disk use
         uses: ./.github/actions/runner-disk-audit
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: vopr-runner
           path: ${{ runner.temp }}/runner
@@ -309,7 +309,7 @@ jobs:
       - name: Retain shard 0 diagnostics first
         if: always()
         timeout-minutes: 5
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: vopr-diagnostics-${{ matrix.scenario }}--0
           path: |
@@ -324,7 +324,7 @@ jobs:
       - name: Retain shard 0 replay traces
         if: always()
         timeout-minutes: 40
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: vopr-run-${{ matrix.scenario }}--0
           path: |
@@ -338,7 +338,7 @@ jobs:
       - name: Retain shard 1 diagnostics first
         if: always()
         timeout-minutes: 5
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: vopr-diagnostics-${{ matrix.scenario }}--1
           path: |
@@ -353,7 +353,7 @@ jobs:
       - name: Retain shard 1 replay traces
         if: always()
         timeout-minutes: 40
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: vopr-run-${{ matrix.scenario }}--1
           path: |
@@ -426,7 +426,7 @@ jobs:
           done
       - name: Retain production binary and build evidence
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: production-soak-binary
           path: |
@@ -462,8 +462,8 @@ jobs:
           echo "ANTFLY_E2E_REGRESSION_REPORT_DIR=$RUNNER_TEMP/production-e2e-soak/reports" >> "$GITHUB_ENV"
       - name: Install native debugger
         run: sudo apt-get update && sudo apt-get install -y gdb
-      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+      - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: production-soak-binary
           path: ${{ runner.temp }}/production-e2e-soak
@@ -557,7 +557,7 @@ jobs:
       - name: Retain production executable and reports
         if: always()
         timeout-minutes: 20
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: production-e2e-soak
           path: |
@@ -568,7 +568,7 @@ jobs:
       - name: Retain stopped server roots separately
         if: always()
         timeout-minutes: 10
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: production-e2e-soak-roots
           path: ${{ runner.temp }}/production-e2e-soak/tmp
@@ -606,8 +606,8 @@ jobs:
           echo "ANTFLY_E2E_REGRESSION_REPORT_DIR=$RUNNER_TEMP/production-e2e-soak/reports" >> "$GITHUB_ENV"
       - name: Install native debugger
         run: sudo apt-get update && sudo apt-get install -y gdb
-      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+      - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: production-soak-binary
           path: ${{ runner.temp }}/production-e2e-soak
@@ -650,7 +650,7 @@ jobs:
       - name: Retain cluster restore reports
         if: always()
         timeout-minutes: 10
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: cluster-restore-${{ matrix.profile }}
           path: |
@@ -661,7 +661,7 @@ jobs:
       - name: Retain stopped server roots separately
         if: always()
         timeout-minutes: 10
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: cluster-restore-${{ matrix.profile }}-roots
           path: ${{ runner.temp }}/production-e2e-soak/tmp
@@ -681,14 +681,14 @@ jobs:
           submodules: true
       - name: Sample ARC runner disk use
         uses: ./.github/actions/runner-disk-audit
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: vopr-runner
           path: ${{ runner.temp }}/runner
       - run: tar -C "$RUNNER_TEMP/runner" -xzf "$RUNNER_TEMP/runner/vopr.tar.gz"
       - name: Download standby shards
         if: always() && !cancelled()
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           pattern: vopr-run-standby--*
           path: ${{ runner.temp }}/vopr-shards/standby
@@ -704,7 +704,7 @@ jobs:
       - name: Retain standby corpus diagnostics
         if: always()
         timeout-minutes: 5
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: vopr-corpus-diagnostics-standby
           path: |
@@ -716,7 +716,7 @@ jobs:
       - name: Retain standby merged corpus
         if: always()
         timeout-minutes: 40
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: vopr-corpus-standby
           path: ${{ runner.temp }}/vopr-corpus/standby
@@ -734,7 +734,7 @@ jobs:
         run: rm -rf "$RUNNER_TEMP/vopr-corpus-retained"
       - name: Download raft shards
         if: always() && !cancelled()
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           pattern: vopr-run-raft--*
           path: ${{ runner.temp }}/vopr-shards/raft
@@ -750,7 +750,7 @@ jobs:
       - name: Retain raft corpus diagnostics
         if: always()
         timeout-minutes: 5
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: vopr-corpus-diagnostics-raft
           path: |
@@ -762,7 +762,7 @@ jobs:
       - name: Retain raft merged corpus
         if: always()
         timeout-minutes: 40
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: vopr-corpus-raft
           path: ${{ runner.temp }}/vopr-corpus/raft
@@ -780,7 +780,7 @@ jobs:
         run: rm -rf "$RUNNER_TEMP/vopr-corpus-retained"
       - name: Download distributed-data shards
         if: always() && !cancelled()
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           pattern: vopr-run-distributed-data--*
           path: ${{ runner.temp }}/vopr-shards/distributed-data
@@ -796,7 +796,7 @@ jobs:
       - name: Retain distributed-data corpus diagnostics
         if: always()
         timeout-minutes: 5
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: vopr-corpus-diagnostics-distributed-data
           path: |
@@ -808,7 +808,7 @@ jobs:
       - name: Retain distributed-data merged corpus
         if: always()
         timeout-minutes: 40
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: vopr-corpus-distributed-data
           path: ${{ runner.temp }}/vopr-corpus/distributed-data
@@ -826,7 +826,7 @@ jobs:
         run: rm -rf "$RUNNER_TEMP/vopr-corpus-retained"
       - name: Download standby-scaling shards
         if: always() && !cancelled()
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           pattern: vopr-run-standby-scaling--*
           path: ${{ runner.temp }}/vopr-shards/standby-scaling
@@ -842,7 +842,7 @@ jobs:
       - name: Retain standby-scaling corpus diagnostics
         if: always()
         timeout-minutes: 5
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: vopr-corpus-diagnostics-standby-scaling
           path: |
@@ -854,7 +854,7 @@ jobs:
       - name: Retain standby-scaling merged corpus
         if: always()
         timeout-minutes: 40
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: vopr-corpus-standby-scaling
           path: ${{ runner.temp }}/vopr-corpus/standby-scaling
@@ -872,7 +872,7 @@ jobs:
         run: rm -rf "$RUNNER_TEMP/vopr-corpus-retained"
       - name: Download secrets shards
         if: always() && !cancelled()
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           pattern: vopr-run-secrets--*
           path: ${{ runner.temp }}/vopr-shards/secrets
@@ -888,7 +888,7 @@ jobs:
       - name: Retain secrets corpus diagnostics
         if: always()
         timeout-minutes: 5
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: vopr-corpus-diagnostics-secrets
           path: |
@@ -900,7 +900,7 @@ jobs:
       - name: Retain secrets merged corpus
         if: always()
         timeout-minutes: 40
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: vopr-corpus-secrets
           path: ${{ runner.temp }}/vopr-corpus/secrets
