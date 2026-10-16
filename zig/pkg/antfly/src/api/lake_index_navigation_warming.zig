@@ -231,9 +231,10 @@ pub fn warmPublicationWithin(a: A, server: *@import("http_server.zig").ApiHttpSe
             domain = root.domain;
             selected = .{ root.term_statistics, root.term_directory.branches, root.term_directory.leaves, root.directories.routing, root.directories.segments, root.directories.files, root.serving_routes, root.segment_files, root.source_routes, root.tie_bounds };
         } else if (declaration.artifact.kind == .ordered_row_index) {
-            const root = try @import("lake_index_ordered_rows.zig").loadRoot(sa, store.artifactStore(), declaration.artifact, token, cached);
+            const root = try @import("lake_index_ordered_rows.zig").loadRootLazy(sa, store.artifactStore(), declaration.artifact, token, cached);
             domain = root.domain;
             selected[0..4].* = .{ root.page, root.reverse, root.ties, root.predicates };
+            if (root.file_dictionary) |dictionary| selected[4..7].* = .{ dictionary.slots, dictionary.names, dictionary.public };
         } else continue;
         for (selected) |ref| if (ref) |page| {
             if (count == roots.len) break;

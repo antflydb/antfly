@@ -888,7 +888,7 @@ with independent admission and conservative accounting for all pinned buffers.
 ### Compact coverage, bounded patterns, and recent-vector scheduling
 
 Reader protocol 47 introduced the separation between the canonical data census
-digest and qualified delete-object evidence; the current reader protocol is 48.
+digest and qualified delete-object evidence; the current reader protocol is 49.
 The publication owns a version-2 source-navigation root containing that digest and, for explicitly immutable sources, the exact
 freshly discovered source-plan identity. Selection checks current binding,
 credentials, schema, snapshot, file count, and reader authority before using this
@@ -1192,3 +1192,58 @@ and loads version records only for applicable delete files. Publication still
 checks fresh providers before and after construction. Recipe mismatch, deadline,
 credential changes and lost reader/snapshot authority remain errors; absent
 proofs and exhausted optional routing admission use fresh qualification.
+
+
+### Shared public ordering and bounded publication scan planning
+
+Reader protocol 49 publishes ordered serving/checkpoint roots as versions 9/10.
+Versions 5/6 and 7/8 remain readable for migration and reader-safe collection.
+Every ordered index borrows the publication's authenticated public-digest-to-file
+name directory. Each index keeps its own stable file slots, including retired
+slots; a name lookup translates shared navigation to that index's coordinates.
+The live public-file count is independent of its historical slot count. Snapshot
+changes replace the shared reference without rewriting unchanged slot/name trees.
+Fresh slot trees are bulk-built in slot order; hashed dictionaries use bounded
+512 KiB sort runs with a four-run merge limit. Incremental edits still copy only
+changed paths.
+
+A sequential prefix of at most 65 file records identifies wide groups; small
+groups pay no separate cardinality seek. For large or sufficiently dense
+logical-key ties, public ordering walks that shared directory in digest order and probes exact tie membership. A small LIMIT
+can stop before reading every participating file. Continuation seeks start at
+the boundary digest and preserve physical row coordinates, ascending/descending
+IDs, backward pages and transitions between tuples. Small or sparse ties retain
+local ordering and its scoped cache; groups above 4,096 files always use lazy
+intersection to bound preparation memory. Counts choose execution strategy only;
+exact membership and native rows decide results. Sparse large groups may still
+require many directory probes, so representative archive benchmarks remain
+necessary.
+
+Publication scans can freeze at most eight file descriptors into a private
+statement view, with an independent iterator preserving serial fallback after
+setup failure. Unordered scans then use the existing shared row-group work queue;
+single-file ordered scans split row groups into contiguous canonical ranges.
+Ordered multi-file scans keep lazy contiguous file ranges so later descriptor or
+footer errors cannot displace a valid earlier prefix. Larger inventories continue to
+stream digest ranges and retain bounded per-lane file views. Startup warming
+loads compact ordered roots and selected dictionary pages under the existing
+page/time budget, avoiding full dictionary materialization.
+
+Ordinary and resumable GC now use one source-navigation dependency walker,
+including delete-version proof pages. An actual bounded-sweep regression pins an
+old publication, replaces its proof, verifies the page survives collection, then
+releases the last reader and verifies retirement. Other regressions cover shared
+dictionaries with distinct slot histories, bulk write counts, bounded sparse-tie
+prefix work and continuation boundaries, small-scan allocation failures, and
+real cold Iceberg scans with one/two files and many Parquet row groups.
+
+
+Qualification with origin/main `f9f1582346` included: the Debug CLI built;
+495 integration tests (184 shared-engine + 311 server) and 90 focused tests
+(22 + 68) passed without failures or leaks. All 48 real Parquet/Iceberg E2Es
+passed in 636.58 seconds. The final ordered-scan refinement passed its native
+allocation/row-group regression and four ordered/cold-Iceberg E2Es against the
+rebuilt CLI (28.09 seconds). Compiler-derived error metadata, formatting/lint,
+source licenses, whitespace and the Apache boundary (2,065 files) passed.
+Live-provider retention qualification and representative archive latency/RSS
+benchmarks remain deferred; these E2E timings are functional qualification.

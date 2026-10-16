@@ -1597,7 +1597,10 @@ def test_native_iceberg_accepted_text_windows_and_retained_cut_restart(
             held_intents.rename(intents)
 
 
-def test_cold_indexed_iceberg_queries_use_publication_file_navigation(tmp_path):
+@pytest.mark.parametrize("file_count", [1, 2])
+def test_cold_indexed_iceberg_queries_use_publication_file_navigation(
+    tmp_path, file_count
+):
     """Cold search and SQL point reads must not reopen data manifests."""
     if not os.environ.get("ANTFLY_E2E_FULL_LAKE"):
         for dependency in ("pyiceberg", "fastavro", "pyarrow"):
@@ -1621,20 +1624,32 @@ def test_cold_indexed_iceberg_queries_use_publication_file_navigation(tmp_path):
             NestedField(2, "body", StringType(), required=False),
             NestedField(3, "label", StringType(), required=False),
         ),
+        properties={"write.parquet.row-group-limit": "16"},
     )
-    for start in (0, 100):
+    rows_per_file = 200 // file_count
+    for start in range(0, 200, rows_per_file):
         table.append(
             pa.table(
                 {
-                    "amount": range(start, start + 100),
-                    "body": ["needle common"] * 100,
+                    "amount": range(start, start + rows_per_file),
+                    "body": ["needle common"] * rows_per_file,
                     "label": [
                         "kept" if i == 101 else "other"
-                        for i in range(start, start + 100)
+                        for i in range(start, start + rows_per_file)
                     ],
                 }
             )
         )
+    # Real row groups exercise publication enumeration even in a single file.
+    import pyarrow.parquet as pq
+
+    tasks = list(table.scan().plan_files())
+    assert len(tasks) == file_count
+    assert all(
+        pq.ParquetFile(Path(task.file.file_path.removeprefix("file://"))).num_row_groups
+        > 1
+        for task in tasks
+    )
     root = tmp_path / "lake"
     _export_table(table, root)
     binary = resolve_binary_path(os.environ.get("ANTFLY_BIN", str(DEFAULT_ANTFLY_BIN)))
@@ -1700,6 +1715,15 @@ def test_cold_indexed_iceberg_queries_use_publication_file_navigation(tmp_path):
             "/sql",
             {"statement": "SELECT label FROM cold_navigation WHERE label = 'kept'"},
         )["rows"] == [["kept"]]
+        # SUM cannot use the metadata-only COUNT shortcut. Its residual predicate
+        # uses row-group workers over the bounded publication view.
+        assert call(
+            "POST",
+            "/sql",
+            {
+                "statement": "SELECT SUM(amount) FROM cold_navigation WHERE label = 'other'"
+            },
+        )["rows"] == [["19799"]]
         query = {
             "full_text_search": {"field": "body", "term": "common"},
             "fields": ["amount"],

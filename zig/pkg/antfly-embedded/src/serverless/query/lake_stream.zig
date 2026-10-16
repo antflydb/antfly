@@ -382,6 +382,63 @@ pub const Stream = struct {
         const files = try a.dupe(usize, &.{0});
         return .{ .alloc = a, .source = view, .columns = columns, .predicates = predicates, .context = context, .limits = limits, .files = files, .file_index = 1, .iterator = iterator, .iterator_parent = parent, .schema_contract = if (parent.iceberg_schema) |schema| schema.columns else &.{} };
     }
+    /// A tiny authenticated inventory can reuse native row-group scheduling.
+    /// Construction uses an independent iterator, so failure leaves this cursor
+    /// untouched for serial fallback. Large inventories remain streamed.
+    pub fn freezeSmallEnumeration(self: *Stream, maximum_files: usize) !bool {
+        const iterator = self.iterator orelse return false;
+        if (self.iterator_started) return false;
+        const parent = self.iterator_parent.?;
+        const count = parent.fileCount();
+        if (count == 0 or count > @min(maximum_files, 8)) return false;
+        const split = iterator.split orelse return false;
+        const copy = try split(iterator.ptr, self.alloc, 0, 1, self.context);
+        defer copy.close(copy.ptr);
+        const entries = try self.alloc.alloc(external.FileEntry, count);
+        var owned: usize = 0;
+        errdefer {
+            for (entries[0..owned]) |*file| file.deinit(self.alloc);
+            self.alloc.free(entries);
+        }
+        const pinned = try self.alloc.alloc(bool, count);
+        errdefer self.alloc.free(pinned);
+        const order = try self.alloc.alloc(usize, count);
+        errdefer self.alloc.free(order);
+        var view = try parent.parallelView(self.alloc);
+        errdefer view.closeParallelView(parent);
+        for (entries, pinned, order, 0..) |*file, *pin, *index, i| {
+            file.* = (try copy.next(copy.ptr, self.alloc, self.context)) orelse return error.InvalidExternalSourceInventory;
+            owned += 1;
+            pin.* = view.immutable_objects and (file.etag.len != 0 or (file.version_id.len != 0 and !std.mem.startsWith(u8, file.version_id, "iceberg:") and !std.mem.startsWith(u8, file.version_id, "object-stat:")));
+            index.* = i;
+        }
+        if (try copy.next(copy.ptr, self.alloc, self.context)) |extra_| {
+            var extra = extra_;
+            extra.deinit(self.alloc);
+            return error.InvalidExternalSourceInventory;
+        }
+        if (view.delete_lease) |lease| lease.release();
+        view.delete_lease = null;
+        view.prepared_deletes = null;
+        view.inventory.files = entries;
+        view.scanner.inventory = view.inventory;
+        view.catalog_files = true;
+        view.catalog_files_owned = true;
+        view.selected_catalog_view = true;
+        view.plan_identity = null;
+        view.version_parent = null;
+        view.pinned_files = pinned;
+        view.pinned_files_owned = true;
+        self.source.closeParallelView(parent);
+        self.source.* = view;
+        if (self.owns_files) self.alloc.free(self.files);
+        self.files = order;
+        self.owns_files = true;
+        self.file_index = 0;
+        iterator.close(iterator.ptr);
+        self.iterator = null;
+        return true;
+    }
     fn nextEnumeratedFile(self: *Stream) !bool {
         const iterator = self.iterator.?;
         self.iterator_started = true;
@@ -611,11 +668,11 @@ pub const Stream = struct {
         };
         if (self.owns_files) self.alloc.free(self.files);
         self.mapped_columns.deinit(self.alloc);
-        if (self.iterator) |iterator| {
-            self.source.closeParallelView(self.iterator_parent.?);
+        if (self.iterator_parent) |parent| {
+            self.source.closeParallelView(parent);
             self.alloc.destroy(self.source);
-            iterator.close(iterator.ptr);
         }
+        if (self.iterator) |iterator| iterator.close(iterator.ptr);
         self.* = undefined;
     }
     fn clearBatch(self: *Stream) void {

@@ -489,7 +489,13 @@ const Owner = struct {
     }
     fn splitOrdered(raw: *anyopaque, a: Allocator, maximum: usize) !?[]catalog.Cursor {
         const self: *Owner = @ptrCast(@alignCast(raw));
-        if (self.stream.iterator != null) return self.splitEnumerated(a, maximum);
+        if (self.started or self.dynamic != null or self.stream.partition_count != 1 or maximum < 2 or self.stream.source.scanner.shared_reader == null) return null;
+        if (self.stream.iterator != null) {
+            // Preserve deferred descriptor/footer errors in later file ranges.
+            // A single file can safely freeze its descriptor before splitting
+            // its row groups; unordered scans may freeze a few files below.
+            if (self.stream.iterator_parent.?.fileCount() != 1 or !try self.stream.freezeSmallEnumeration(maximum)) return self.splitEnumerated(a, maximum);
+        }
         if (self.stream.selection != null) return null;
         if (self.started or self.dynamic != null or self.stream.partition_count != 1 or maximum < 2 or self.stream.source.scanner.shared_reader == null) return null;
         // Multiple files form lazy contiguous ranges. Opening a later footer
@@ -517,7 +523,7 @@ const Owner = struct {
         const self: *Owner = @ptrCast(@alignCast(raw));
         if (self.stream.selection != null) return null;
         if (self.started or self.dynamic != null or self.stream.partition_count != 1) return null;
-        if (self.stream.iterator != null) return self.splitEnumerated(a, maximum);
+        if (self.stream.iterator != null and !try self.stream.freezeSmallEnumeration(maximum)) return self.splitEnumerated(a, maximum);
         const count = try self.stream.partitionCount(maximum);
         if (count < 2) return null;
         return try self.splitChildren(a, count, false);
@@ -1746,9 +1752,16 @@ test "lake SQL paged publication scans retain one file and split independent ord
                 try context.ensureActive();
                 if (self.position == self.end) return null;
                 const file = self.nav.inventory.files[self.nav.order[self.position]];
-                const bytes = try std.json.Stringify.valueAlloc(alloc, file, .{});
+                var inventory = self.nav.inventory;
+                inventory.files = @constCast(&[_]@import("../serverless/external_source/types.zig").FileEntry{file});
+                const codec = @import("../serverless/external_source/codec.zig");
+                const bytes = try codec.encodeAlloc(alloc, inventory);
                 defer alloc.free(bytes);
-                const copy = try std.json.parseFromSliceLeaky(@import("../serverless/external_source/types.zig").FileEntry, alloc, bytes, .{ .allocate = .alloc_always });
+                var owned = try codec.decodeAlloc(alloc, bytes);
+                defer owned.deinit(alloc);
+                const copy = owned.files[0];
+                alloc.free(owned.files);
+                owned.files = &.{};
                 self.position += 1;
                 return copy;
             }
@@ -1843,4 +1856,81 @@ test "lake SQL paged publication scans retain one file and split independent ord
         }
     };
     try std.testing.checkAllAllocationFailures(a, Failure.run, .{ lake.table, &lake.source });
+    // Tiny inventories use private bounded views, leaving the source unchanged.
+    navigation.order = order[0..2];
+    lake.source.file_navigation.?.count = 2;
+    try std.testing.checkAllAllocationFailures(a, Failure.run, .{ lake.table, &lake.source });
+    const Small = struct {
+        fn run(alloc: Allocator, table: catalog.Table, source: *serving.ServingSource) !void {
+            const cursor = try openPinned(alloc, table, .{ .fields = &.{"amount"}, .limit = 1024 }, .{}, source);
+            defer cursor.close(cursor.ptr);
+            const parts = (try cursor.split_scan.?(cursor.ptr, alloc, 3)).?;
+            defer {
+                for (parts) |part| part.close(part.ptr);
+                alloc.free(parts);
+            }
+            const owner: *Owner = @ptrCast(@alignCast(cursor.ptr));
+            try std.testing.expect(owner.stream.iterator == null);
+            try std.testing.expect(owner.stream.work != null);
+            try std.testing.expectEqual(@as(usize, 2), owner.stream.source.inventory.files.len);
+            try std.testing.expectEqual(@as(usize, 0), source.inventory.files.len);
+            var rows_seen: usize = 0;
+            for (parts) |part| while (true) {
+                const page = try part.next(part.ptr, alloc, 2);
+                defer page.deinit();
+                rows_seen += page.rows.len;
+                if (page.after == null) break;
+            };
+            try std.testing.expectEqual(@as(usize, 6), rows_seen);
+        }
+    };
+    try Small.run(a, lake.table, &lake.source);
+    try std.testing.checkAllAllocationFailures(a, Small.run, .{ lake.table, &lake.source });
+    // One independently produced Parquet file still exposes multiple workers.
+    var single: TestLake = .{ .memory = TestLake.storage.MemoryObjectStorage.init(a) };
+    try single.populateData(a, 1, @embedFile("../serverless/query/testdata/pyarrow_plain_nullable_snappy.parquet"));
+    defer single.deinit(a);
+    try single.source.attachCache(&cache, single.table.external_base_source.?.binding, .{ .io = std.testing.io });
+    var single_navigation: Navigation = .{ .inventory = single.inventory, .order = &.{0} };
+    single.source.inventory.files = &.{};
+    single.source.scanner.inventory = single.source.inventory;
+    single.source.inventory_owned = false;
+    single.source.file_navigation = .{ .ptr = &single_navigation, .count = 1, .plan = @splat(2), .lookup = Navigation.lookup, .close = Navigation.close, .enumerate = Navigation.enumerate };
+    var single_ids: std.ArrayList([]const u8) = .empty;
+    defer {
+        for (single_ids.items) |id| a.free(id);
+        single_ids.deinit(a);
+    }
+    {
+        const serial = try openPinned(a, single.table, .{ .fields = &.{"amount"}, .limit = 1024 }, .{}, &single.source);
+        defer serial.close(serial.ptr);
+        while (true) {
+            const page = try serial.next(serial.ptr, a, 128);
+            defer page.deinit();
+            for (page.rows) |row| try single_ids.append(a, try a.dupe(u8, row.id));
+            if (page.after == null) break;
+        }
+    }
+    const parallel = try openPinned(a, single.table, .{ .fields = &.{"amount"}, .limit = 1024 }, .{}, &single.source);
+    defer parallel.close(parallel.ptr);
+    const lanes = (try parallel.split_ordered.?(parallel.ptr, a, 4)).?;
+    defer {
+        for (lanes) |lane| lane.close(lane.ptr);
+        a.free(lanes);
+    }
+    const single_owner: *Owner = @ptrCast(@alignCast(parallel.ptr));
+    try std.testing.expect(single_owner.stream.iterator == null);
+    try std.testing.expect(single_owner.stream.work.?.units.len > 1);
+    try std.testing.expect(lanes.len > 1);
+    var single_seen: usize = 0;
+    for (lanes) |lane| while (true) {
+        const page = try lane.next(lane.ptr, a, 128);
+        defer page.deinit();
+        for (page.rows) |row| {
+            try std.testing.expectEqualStrings(single_ids.items[single_seen], row.id);
+            single_seen += 1;
+        }
+        if (page.after == null) break;
+    };
+    try std.testing.expectEqual(single_ids.items.len, single_seen);
 }

@@ -57,6 +57,10 @@ pub const Root = struct {
     private: ?tree.Ref = null,
     delete_proof: ?DeleteProof = null,
 };
+/// Every GC mode traverses the same authenticated navigation edges.
+pub fn dependencies(root: Root) [4]?tree.Ref {
+    return .{ root.files, root.public, root.private, if (root.delete_proof) |proof| proof.versions else null };
+}
 const Proof = struct { id: [32]u8, digest: [32]u8, index: usize };
 pub const Summary = struct {
     first: [32]u8,
@@ -121,6 +125,7 @@ fn proofLower(proofs: []const Proof, id: [32]u8, inclusive: bool) usize {
 }
 const Record = struct { file: local.serverless_external_source_types.FileEntry, digest: [32]u8, deletes: [32]u8 };
 pub const Delta = struct {
+    public_navigation: ?@import("lake_index_ordered_files.zig").Public = null,
     source: []const u8,
     schema: []const u8,
     prior_snapshot: ?[]const u8,
@@ -444,7 +449,7 @@ pub fn buildProven(a: A, out: A, store: *stores.ArtifactStore, provider: *Provid
     defer a.free(bytes);
     var uploaded = try store.putWithCancellation(bytes, token);
     defer uploaded.deinit(store.allocator);
-    return .{ .stats = stats, .ref = .{ .kind = .doc_values, .metadata_version = 2, .artifact_id = try out.dupe(u8, uploaded.artifact_id), .checksum = try out.dupe(u8, uploaded.checksum), .byte_len = uploaded.byte_len }, .delta = .{ .source = inv.source_id, .schema = inv.schema_fingerprint, .prior_count = if (compatible) prior.?.count else 0, .prior_snapshot = if (compatible) try out.dupe(u8, prior.?.snapshot) else null, .files = current, .changed = changed, .prior_changed = prior_changed.items, .by_id = native_by_id } };
+    return .{ .stats = stats, .ref = .{ .kind = .doc_values, .metadata_version = 2, .artifact_id = try out.dupe(u8, uploaded.artifact_id), .checksum = try out.dupe(u8, uploaded.checksum), .byte_len = uploaded.byte_len }, .delta = .{ .public_navigation = .{ .root = root.public, .count = root.count, .source = inv.source_id, .snapshot = inv.snapshot_id }, .source = inv.source_id, .schema = inv.schema_fingerprint, .prior_count = if (compatible) prior.?.count else 0, .prior_snapshot = if (compatible) try out.dupe(u8, prior.?.snapshot) else null, .files = current, .changed = changed, .prior_changed = prior_changed.items, .by_id = native_by_id } };
 }
 /// The resolver borrows fresh publication authority. Only immutable root/page
 /// payloads enter shared caches; request contexts never escape this owner.

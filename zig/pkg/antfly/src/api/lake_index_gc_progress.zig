@@ -140,7 +140,7 @@ pub const Progress = struct {
                         try stores.chargeReadBudget(&collector.remaining_reads, ref.byte_len);
                         const navigation = try @import("lake_source_navigation.zig").load(a, collector.store, ref, collector.cancellation(), null);
                         if (!std.mem.eql(u8, &navigation.domain, &self.value.domain)) return error.InvalidNativeLakeGcReference;
-                        for ([_]?tree.Ref{ navigation.files, navigation.public, navigation.private }) |root| if (root) |page| try self.enqueue(.{ .page = .{ .ref = page, .ordered_rows = false } });
+                        for (@import("lake_source_navigation.zig").dependencies(navigation)) |root| if (root) |page| try self.enqueue(.{ .page = .{ .ref = page, .ordered_rows = false } });
                     }
                 }
                 var hydrated = publication;
@@ -477,4 +477,72 @@ test "external lake global frontier cloud retirement keeps locked stores and dra
     try std.testing.expectEqual(@as(usize, 1), drained.deleted);
     try std.testing.expectEqual(@as(usize, 0), harness.state.stores.len);
     try std.testing.expectEqual(serial, provider.serial);
+}
+
+test "external lake global frontier resumable GC retains delete-version pages until the last reader retires" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const ca = arena.allocator();
+    var directory = try local.common_test_directory.TestDirectory.init("delete-proof-resumable-gc");
+    defer directory.cleanup();
+    var fs = try @import("../serverless/artifacts/fs_store.zig").FsStore.init(a, directory.path());
+    defer fs.deinit();
+    var store = fs.artifactStore();
+    const identity: [32]u8 = @splat(7);
+    const domain = @import("lake_index_publication.zig").uploadDomainWithNamespace(1, identity, null);
+    store.upload_scope = try stores.UploadScope.forPublication(domain, 1, std.testing.io);
+    var reads: u64 = 16 * 1024 * 1024;
+    var writes: u64 = 16 * 1024 * 1024;
+    var pages: page_store.PageStore = .{ .domain = domain, .attempt = store.upload_scope.?.attempt, .artifacts = &store, .remaining_read_bytes = &reads, .remaining_write_bytes = &writes };
+    var builder: tree.SortedBuilder = .{ .alloc = a, .store = pages.store() };
+    defer builder.deinit();
+    try builder.add(&@as([32]u8, @splat(0)), "exact provider delete selector");
+    const versions = (try builder.finish()).?;
+    const navigation: @import("lake_source_navigation.zig").Root = .{ .domain = domain, .source = "source", .schema = "schema", .snapshot = "first", .count = 0, .coverage = .{ .plan = @splat(1), .data = @splat(2) }, .delete_proof = .{ .recipe = @splat(3), .digest = @splat(4), .source = @splat(5), .data = @splat(2), .count = 1, .versions = versions } };
+    var nav_ref = try store.put(try std.json.Stringify.valueAlloc(ca, navigation, .{}));
+    defer nav_ref.deinit(a);
+    var inventory = try store.put("inventory");
+    defer inventory.deinit(a);
+    var publication: local.metadata_lake_index_catalog.Publication = .{ .reader_protocol = local.metadata_lake_index_catalog.native_reader_protocol, .generation = 1, .token = store.upload_scope.?.attempt, .signature = .{ .desired = @splat(1), .source = @splat(5), .credentials = @splat(2), .store = identity }, .published_at_ms = 1, .base_source = .{ .external_iceberg = .{ .format = .iceberg, .source_uri = "s3://bucket/table", .snapshot_id = "first", .schema_fingerprint = "schema", .file_inventory_artifact = inventory.artifact_id } }, .inventory = .{ .kind = .external_base_source, .artifact_id = inventory.artifact_id, .checksum = inventory.checksum, .byte_len = inventory.byte_len }, .source_navigation = .{ .kind = .doc_values, .metadata_version = 2, .artifact_id = nav_ref.artifact_id, .checksum = nav_ref.checksum, .byte_len = nav_ref.byte_len } };
+    const Harness = struct {
+        a: A,
+        state: lifecycle.State,
+        fn read(raw: *anyopaque, alloc: A, _: u64, _: local.api_operation.RequestContext) ![]u8 {
+            return lifecycle.encode(alloc, @as(*@This(), @ptrCast(@alignCast(raw))).state);
+        }
+        fn mutate(raw: *anyopaque, _: u64, revision: u64, mutation: lifecycle.Mutation, _: local.api_operation.RequestContext) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (revision != self.state.revision) return error.CatalogGenerationChanged;
+            self.state = try mutation.apply(self.a, self.state);
+        }
+        fn collect(self: *@This(), store_: stores.ArtifactStore, identity_: [32]u8, token: [16]u8) !void {
+            for (0..64) |_| {
+                var collector: gc.Collector = .{ .a = std.testing.allocator, .table = 1, .authority = .{ .ptr = self, .context = .{}, .read = read, .mutate = mutate }, .store = store_, .identity = identity_, .context = .{}, .token = token, .options = .{ .dry_run = false, .max_marked = 1, .max_deleted = 1 } };
+                if ((try collector.run()).complete) return;
+            }
+            return error.TestUnexpectedResult;
+        }
+    };
+    var harness: Harness = .{ .a = ca, .state = try (lifecycle.State{}).synchronize(ca, .{ .generation = 1, .published = publication }) };
+    const now = @import("antfly_platform").time.realtimeNs() / std.time.ns_per_ms;
+    harness.state = try harness.state.acquire(ca, @splat(9), 1, now);
+    store.upload_scope = try stores.UploadScope.forPublication(domain, 2, std.testing.io);
+    var next = navigation;
+    next.delete_proof = null;
+    next.snapshot = "second";
+    var next_ref = try store.put(try std.json.Stringify.valueAlloc(ca, next, .{}));
+    defer next_ref.deinit(a);
+    publication.generation = 2;
+    publication.token = store.upload_scope.?.attempt;
+    publication.source_navigation = .{ .kind = .doc_values, .metadata_version = 2, .artifact_id = next_ref.artifact_id, .checksum = next_ref.checksum, .byte_len = next_ref.byte_len };
+    publication.base_source.external_iceberg.snapshot_id = "second";
+    harness.state = try harness.state.synchronize(ca, .{ .generation = 2, .published = publication });
+    try harness.collect(store, identity, @splat(6));
+    const selector_id = try page_store.PageStore.identity(domain, versions);
+    const retained = try store.getAlloc(&selector_id);
+    a.free(retained);
+    harness.state = try harness.state.release(ca, @splat(9));
+    try harness.collect(store, identity, @splat(8));
+    try std.testing.expectError(error.FileNotFound, store.getAlloc(&selector_id));
 }

@@ -251,7 +251,7 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
             };
             const retained = try a.alloc(bool, slot_names.items.len);
             errdefer a.free(retained);
-            try entries.append(a, .{ .tuple = tuple, .predicate = predicate, .binding = binding, .name = name, .cover = cover, .sort = spill.Sort.init(a, &manager, &orders, sort_workspace_bytes / (end - first)), .changed = changed, .slots = slots, .built_hashes = built_hashes, .retained = retained, .root_arena = .init(a), .initial_build = prior == null or prior.?.building, .delta = .{ .previous = prior, .keep = keep, .files = slot_names.items, .fingerprints = slot_hashes.items } });
+            try entries.append(a, .{ .tuple = tuple, .predicate = predicate, .binding = binding, .name = name, .cover = cover, .sort = spill.Sort.init(a, &manager, &orders, sort_workspace_bytes / (end - first)), .changed = changed, .slots = slots, .built_hashes = built_hashes, .retained = retained, .root_arena = .init(a), .initial_build = prior == null or prior.?.building, .delta = .{ .previous = prior, .keep = keep, .files = slot_names.items, .fingerprints = slot_hashes.items, .public_navigation = if (input.native_delta) |delta| delta.public_navigation else null } });
             entries.items[entries.items.len - 1].sort.shared_runs = true;
             entries.items[entries.items.len - 1].sort.encoded_bytes = true;
         }
@@ -375,7 +375,7 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
                 const keep = try a.dupe(bool, entry.delta.keep);
                 defer a.free(keep);
                 if (slot < keep.len) keep[slot] = false;
-                var delta: ordered.Delta = .{ .previous = entry.delta.previous, .keep = keep, .files = entry.delta.files, .fingerprints = entry.built_hashes };
+                var delta: ordered.Delta = .{ .previous = entry.delta.previous, .keep = keep, .files = entry.delta.files, .fingerprints = entry.built_hashes, .public_navigation = entry.delta.public_navigation };
                 if (entry.reverse) |reverse| {
                     delta.built_reverse = try reverse.finish();
                     delta.reverse_built = true;

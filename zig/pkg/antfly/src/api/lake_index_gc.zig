@@ -135,8 +135,7 @@ pub const Collector = struct {
             _ = try self.mark(.{ .artifact_id = ref.artifact_id, .checksum = ref.checksum, .byte_len = ref.byte_len });
             try stores.chargeReadBudget(&self.remaining_reads, ref.byte_len);
             const navigation = try @import("lake_source_navigation.zig").load(a, self.store, ref, self.cancellation(), null);
-            for ([_]?@import("../serverless/graph_segment/page_tree.zig").Ref{ navigation.files, navigation.public, navigation.private }) |root| try self.markPages(a, navigation.domain, root, false);
-            if (navigation.delete_proof) |proof| try self.markPages(a, navigation.domain, proof.versions, false);
+            for (@import("lake_source_navigation.zig").dependencies(navigation)) |root| try self.markPages(a, navigation.domain, root, false);
         }
         for (hydrated.declarations) |declaration| try self.markArtifact(a, declaration.artifact);
         for (hydrated.file_contributions) |contribution| try self.markArtifact(a, contribution.artifact);

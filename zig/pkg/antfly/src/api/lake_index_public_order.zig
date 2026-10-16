@@ -28,6 +28,12 @@ pub const Cursor = struct {
     group_arena: std.heap.ArenaAllocator,
     file_arena: std.heap.ArenaAllocator,
     directory: ?tree.Cursor = null,
+    public_files: ?tree.Cursor = null,
+    public_digest: [32]u8 = undefined,
+    requested_rows: usize = 1,
+    /// Diagnostic counts exact membership probes, independent of cache warmth.
+    public_probes: usize = 0,
+    group_counts: usize = 0,
     pending: ?tree.Cursor.Record = null,
     reader: *ordered.Reader,
     navigation: ?*Navigation = null,
@@ -110,6 +116,7 @@ pub const Cursor = struct {
     }
     pub fn deinit(self: *Cursor) void {
         if (self.rows) |*rows| rows.deinit();
+        if (self.public_files) |*files| files.deinit();
         self.group_arena.deinit();
         if (self.navigation) |navigation| {
             navigation.cache.deinit();
@@ -175,7 +182,61 @@ pub const Cursor = struct {
                 return true;
             }
         }
-        self.files = try self.readGroup(ca, first);
+        // Intersect large tie groups with the already sorted snapshot file
+        // directory. Dense groups can return their first rows without decoding
+        // and sorting every participant. Small/sparse groups keep bounded local
+        // sorting; estimates choose work only, never establish membership.
+        var seed: std.ArrayList(u32) = .empty;
+        var following: ?tree.Cursor.Record = first;
+        if (self.reader.root.file_dictionary) |dictionary| if (dictionary.public != null and dictionary.count > 64) {
+            if (first.value.len != 8) return error.InvalidNativeLakeRowIndex;
+            const first_rows = std.mem.readInt(u64, first.value[0..8], .big);
+            // Consume only records needed by the ordinary sequential path.
+            // Distinct/small groups never pay a separate tree cardinality seek.
+            while (following) |record| {
+                if (record.key.len < 4) return error.InvalidNativeLakeRowIndex;
+                if (record.key.len != self.group.len + 4 or !std.mem.eql(u8, record.key[0..self.group.len], self.group)) {
+                    self.pending = record;
+                    following = null;
+                    break;
+                }
+                if (record.value.len != 8 or std.mem.readInt(u64, record.value[0..8], .big) == 0) return error.InvalidNativeLakeRowIndex;
+                const slot = std.mem.readInt(u32, record.key[record.key.len - 4 ..][0..4], .big);
+                if (slot >= dictionary.count) return error.InvalidNativeLakeRowIndex;
+                try seed.append(ca, slot);
+                following = try self.directory.?.next();
+                if (seed.items.len == 65) break;
+            }
+            if (seed.items.len > 64) {
+                const end = try orderedSuccessor(ca, self.group);
+                const participating = try tree.countRange(self.a, self.navigation.?.cache.store(), self.reader.root.ties, self.group, end);
+                self.group_counts += 1;
+                const total: u64 = if (dictionary.public_names) dictionary.public_count else dictionary.count;
+                const desired_files = @max(1, self.requested_rows / @max(1, first_rows));
+                if (participating > 4096 or (participating > 64 and participating *| participating >= total *| desired_files)) {
+                    self.directory.?.deinit();
+                    self.directory = null;
+                    self.directory = if (self.reverse)
+                        try tree.Cursor.initReverse(self.a, self.navigation.?.cache.store(), self.reader.root.ties, self.lower, self.group)
+                    else if (end) |after|
+                        try tree.Cursor.init(self.a, self.navigation.?.cache.store(), self.reader.root.ties, after, self.upper)
+                    else
+                        null;
+                    if (self.directory == null) self.exhausted = true;
+                    const boundary = self.boundary != null and std.mem.eql(u8, self.group, self.boundary.?);
+                    const lower = if (boundary and !self.reverse_ids) &self.boundary_digest.? else "";
+                    const upper = if (boundary and self.reverse_ids) try std.mem.concat(ca, u8, &.{ &self.boundary_digest.?, &.{0} }) else null;
+                    self.public_files = if (self.reverse_ids)
+                        try tree.Cursor.initReverse(self.a, self.reader.dictionaryStore(), dictionary.public, lower, upper)
+                    else
+                        try tree.Cursor.init(self.a, self.reader.dictionaryStore(), dictionary.public, lower, upper);
+                    self.files = &.{};
+                    self.file_position = 0;
+                    return true;
+                }
+            }
+        };
+        self.files = try self.readGroup(ca, following, seed);
         // Small groups already fit in a directory page: reseeking a cached one
         // would cost more reads than sequential traversal. Reserve residency
         // for groups whose encoded records span pages.
@@ -210,8 +271,8 @@ pub const Cursor = struct {
         return true;
     }
     const GroupFiles = struct { files: []const u32 };
-    fn readGroup(self: *Cursor, a: A, first: tree.Cursor.Record) ![]const u32 {
-        var files: std.ArrayList(u32) = .empty;
+    fn readGroup(self: *Cursor, a: A, first: ?tree.Cursor.Record, seed: std.ArrayList(u32)) ![]const u32 {
+        var files = seed;
         errdefer files.deinit(a);
         var record_next: ?tree.Cursor.Record = first;
         while (record_next) |record| {
@@ -274,7 +335,8 @@ pub const Cursor = struct {
         var lower: []const u8 = try std.mem.concat(ca, u8, &.{ self.group, &file });
         var upper = try orderedSuccessor(ca, lower);
         if (self.boundary) |boundary| if (std.mem.eql(u8, self.group, boundary)) {
-            const relation = std.mem.order(u8, &self.group_digests.get(slot).?, &self.boundary_digest.?);
+            const digest = if (self.public_files != null) self.public_digest else self.group_digests.get(slot).?;
+            const relation = std.mem.order(u8, &digest, &self.boundary_digest.?);
             if (relation == (if (self.reverse_ids) std.math.Order.gt else .lt)) return false;
             if (relation == .eq) {
                 const key = try std.mem.concat(ca, u8, &.{ lower, &self.boundary_coordinate });
@@ -289,6 +351,7 @@ pub const Cursor = struct {
     }
     pub fn next(self: *Cursor, a: A, count: usize) ![]const local.storage_rowsource_types.RowRef {
         if (count == 0 or count > 65536) return error.InvalidNativeLakeRowIndex;
+        self.requested_rows = count;
         var result: std.ArrayList(local.storage_rowsource_types.RowRef) = .empty;
         errdefer result.deinit(a);
         while (result.items.len < count) {
@@ -299,6 +362,32 @@ pub const Cursor = struct {
                 }
                 rows.deinit();
                 self.rows = null;
+            }
+            if (self.public_files) |*files| {
+                var found = false;
+                while (try files.next()) |record| {
+                    try self.reader.pages.cancellation.check();
+                    if (self.reader.cached) |cached| try cached.context.ensureActive();
+                    _ = self.file_arena.reset(.retain_capacity);
+                    const scratch = self.file_arena.allocator();
+                    if (record.key.len != 32) return error.InvalidNativeLakeRowIndex;
+                    const slot = try self.reader.publicRecordSlot(scratch, record);
+                    const key = try std.mem.concat(scratch, u8, &.{ self.group, &ordered.file_dictionary.slotKey(slot) });
+                    var membership = try tree.Cursor.init(self.a, self.navigation.?.cache.store(), self.reader.root.ties, key, null);
+                    defer membership.deinit();
+                    self.public_probes += 1;
+                    const entry = (try membership.next()) orelse continue;
+                    if (!std.mem.eql(u8, entry.key, key)) continue;
+                    if (entry.value.len != 8 or std.mem.readInt(u64, entry.value[0..8], .big) == 0) return error.InvalidNativeLakeRowIndex;
+                    self.public_digest = record.key[0..32].*;
+                    if (try self.openFile(slot)) {
+                        found = true;
+                        break;
+                    }
+                }
+                if (found) continue;
+                files.deinit();
+                self.public_files = null;
             }
             if (self.file_position < self.files.len) {
                 const position = if (self.reverse_ids) self.files.len - self.file_position - 1 else self.file_position;
