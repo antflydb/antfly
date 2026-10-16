@@ -640,11 +640,28 @@ const Owner = struct {
         mutex: std.Io.Mutex = .init,
         changed: std.Io.Condition = .init,
         inline_mutex: std.atomic.Mutex = .unlocked,
-        children: []catalog.Cursor = &.{},
-        next: usize = 0,
-        active: usize = 0,
+        // Two independently owned windows cap retained footer/work state at
+        // eight files. An idle lane plans the next while earlier claims run.
+        windows: [2]Window = @splat(.{}),
         users: std.atomic.Value(usize) = .init(0),
         ended: bool = false,
+        failure: ?anyerror = null,
+        windows_planned: usize = 0,
+        peak_windows: usize = 0,
+        const Window = struct {
+            stream: ?@import("../serverless/query/lake_stream.zig").Stream = null,
+            children: []catalog.Cursor = &.{},
+            next: usize = 0,
+            active: usize = 0,
+            fn clear(self: *@This(), a: Allocator) void {
+                std.debug.assert(self.active == 0);
+                for (self.children[self.next..]) |child| child.close(child.ptr);
+                a.free(self.children);
+                if (self.stream) |*stream| stream.deinit();
+                self.* = .{};
+            }
+        };
+        const Claim = struct { cursor: catalog.Cursor, window: usize };
         fn lock(self: *@This()) !void {
             try self.context.ensureActive();
             if (self.io) |io| try self.mutex.lock(io) else @import("antfly_platform").sync.lockYielding(&self.inline_mutex);
@@ -668,51 +685,58 @@ const Owner = struct {
             }
             try self.context.ensureActive();
         }
-        fn release(self: *@This(), cursor: catalog.Cursor) void {
-            cursor.close(cursor.ptr);
+        fn release(self: *@This(), claim_: Claim) void {
+            claim_.cursor.close(claim_.cursor.ptr);
             if (self.io) |io| self.mutex.lockUncancelable(io) else @import("antfly_platform").sync.lockYielding(&self.inline_mutex);
-            self.active -= 1;
+            self.windows[claim_.window].active -= 1;
             if (self.io) |io| self.changed.broadcast(io);
             self.unlock();
         }
-        fn claim(self: *@This()) !?catalog.Cursor {
+        fn claim(self: *@This()) !?Claim {
             while (true) {
                 try self.lock();
-                if (self.next < self.children.len) {
-                    const child = self.children[self.next];
-                    self.next += 1;
-                    self.active += 1;
-                    self.unlock();
-                    return child;
+                defer self.unlock();
+                if (self.failure) |err| return err;
+                for (&self.windows, 0..) |*window, index| {
+                    if (window.next < window.children.len) {
+                        const child = window.children[window.next];
+                        window.next += 1;
+                        window.active += 1;
+                        return .{ .cursor = child, .window = index };
+                    }
                 }
-                if (self.active != 0) {
-                    self.wait() catch |err| {
-                        self.unlock();
+                if (self.ended) return null;
+                for (&self.windows) |*window| {
+                    if (window.active != 0) continue;
+                    window.clear(self.locked.allocator());
+                    const original = self.parent.stream.alloc;
+                    self.parent.stream.alloc = self.locked.allocator();
+                    defer self.parent.stream.alloc = original;
+                    window.children = (splitUnorderedBatch(self.parent, self.locked.allocator(), self.maximum) catch |err| {
+                        self.failure = err;
+                        return err;
+                    }) orelse {
+                        self.ended = true;
+                        return null;
+                    };
+                    window.stream = self.parent.stream.detachWork() catch |err| {
+                        window.clear(self.locked.allocator());
+                        self.failure = err;
                         return err;
                     };
-                    self.unlock();
-                    continue;
+                    self.windows_planned += 1;
+                    var live: usize = 0;
+                    for (self.windows) |held| live += @intFromBool(held.stream != null);
+                    self.peak_windows = @max(self.peak_windows, live);
+                    break;
+                } else {
+                    try self.wait();
                 }
-                defer self.unlock();
-                if (self.ended) return null;
-                self.locked.allocator().free(self.children);
-                self.children = &.{};
-                self.next = 0;
-                const original = self.parent.stream.alloc;
-                self.parent.stream.alloc = self.locked.allocator();
-                defer self.parent.stream.alloc = original;
-                self.children = (try splitUnorderedBatch(self.parent, self.locked.allocator(), self.maximum)) orelse {
-                    self.ended = true;
-                    return null;
-                };
-                // Unordered reducers claim individual row-group ranges, never
-                // a fixed digest/file lane. A hot file can occupy every worker.
             }
         }
         fn deinit(self: *@This()) void {
-            std.debug.assert(self.users.load(.acquire) == 0 and self.active == 0);
-            for (self.children[self.next..]) |child| child.close(child.ptr);
-            self.locked.allocator().free(self.children);
+            std.debug.assert(self.users.load(.acquire) == 0);
+            for (&self.windows) |*window| window.clear(self.locked.allocator());
             if (self.producer) |producer| producer.close(producer.ptr);
             self.alloc.destroy(self);
         }
@@ -720,7 +744,7 @@ const Owner = struct {
     const RollingLane = struct {
         a: Allocator,
         queue: *RollingQueue,
-        current: ?catalog.Cursor = null,
+        current: ?RollingQueue.Claim = null,
         finished: bool = false,
         stopped: bool = false,
         fn release(self: *@This()) void {
@@ -738,7 +762,7 @@ const Owner = struct {
             const self: *@This() = @ptrCast(@alignCast(raw));
             errdefer self.release();
             while (try self.acquire()) {
-                const cursor = self.current.?;
+                const cursor = self.current.?.cursor;
                 var page = try cursor.next(cursor.ptr, a, limit);
                 self.finished = page.after == null;
                 if (page.rows.len == 0) {
@@ -754,7 +778,7 @@ const Owner = struct {
             const self: *@This() = @ptrCast(@alignCast(raw));
             errdefer self.release();
             while (try self.acquire()) {
-                const cursor = self.current.?;
+                const cursor = self.current.?.cursor;
                 var page = try cursor.next_columns.?(cursor.ptr, a, limit);
                 self.finished = page.after == null;
                 if (page.selection.len == 0) continue;
@@ -2051,6 +2075,71 @@ test "lake SQL paged publication scans retain one file and split independent ord
     lake.source.scanner.inventory = lake.source.inventory;
     lake.source.inventory_owned = false;
     lake.source.file_navigation = .{ .ptr = &navigation, .count = lake.inventory.files.len, .plan = @splat(1), .lookup = Navigation.lookup, .close = Navigation.close, .enumerate = Navigation.enumerate, .estimates = .{ .rows = 30, .bytes = 1000 } };
+    {
+        const Backend = struct {
+            lake: *TestLake,
+            fn resolve(raw: *anyopaque, _: Allocator, _: @import("ast.zig").Name, _: catalog.Action) !catalog.Table {
+                return @as(*@This(), @ptrCast(@alignCast(raw))).lake.table;
+            }
+            fn scan(_: *anyopaque, _: Allocator, _: catalog.Table, _: catalog.Scan) !catalog.Page {
+                return error.UnexpectedStatelessScan;
+            }
+            fn openScan(raw: *anyopaque, alloc: Allocator, table: catalog.Table, request: catalog.Scan) !?catalog.Cursor {
+                return try openPinned(alloc, table, request, .{}, &@as(*@This(), @ptrCast(@alignCast(raw))).lake.source);
+            }
+            fn mutate(_: *anyopaque, _: Allocator, _: Allocator, _: catalog.Table, _: []const catalog.Mutation) !catalog.MutationOutcome {
+                return error.UnexpectedMutation;
+            }
+            fn checkpoint(_: *anyopaque) !void {}
+        };
+        var fixture: Backend = .{ .lake = &lake };
+        var compiled = try @import("compiler.zig").compile(a, "SELECT SUM(amount), COUNT(*) FROM events", .{});
+        defer compiled.deinit();
+        for ([_]bool{ false, true }) |parallel| {
+            const backend: catalog.Backend = .{ .ptr = &fixture, .vtable = &.{ .resolve = Backend.resolve, .scan = Backend.scan, .open_scan = Backend.openScan, .mutate = Backend.mutate, .checkpoint = Backend.checkpoint }, .execution_io = if (parallel) std.testing.io else null };
+            // Ten real data pages fit exactly. Worker EOF responses spend no
+            // extra page credit and cannot conceal an eleventh data page.
+            var output = try @import("runtime.zig").execute(a, backend, &compiled, &.{}, .{ .scan_pages = 10, .scan_rows = 30 });
+            defer output.deinit();
+            try std.testing.expectEqualStrings("60", output.output.rows[0][0].string);
+            try std.testing.expectEqualStrings("30", output.output.rows[0][1].string);
+            try std.testing.expectError(error.SqlProgramLimitExceeded, @import("runtime.zig").execute(a, backend, &compiled, &.{}, .{ .scan_pages = 9, .scan_rows = 30 }));
+        }
+    }
+    {
+        const rolling = try openPinned(a, lake.table, .{ .fields = &.{"amount"}, .limit = 1024 }, .{}, &lake.source);
+        defer rolling.close(rolling.ptr);
+        const ranges = (try rolling.split_scan.?(rolling.ptr, a, 3)).?;
+        defer a.free(ranges);
+        defer for (ranges) |range| range.close(range.ptr);
+        var first_arena = std.heap.ArenaAllocator.init(a);
+        defer first_arena.deinit();
+        const first = try ranges[0].next_columns.?(ranges[0].ptr, first_arena.allocator(), 1);
+        try std.testing.expectEqual(@as(usize, 1), first.selection.len);
+        // Retain the first claim and its borrowed vectors while another lane
+        // finishes later windows. A window barrier would deadlock this drain.
+        var seen: usize = 1;
+        while (true) {
+            var arena = std.heap.ArenaAllocator.init(a);
+            defer arena.deinit();
+            const page = try ranges[1].next_columns.?(ranges[1].ptr, arena.allocator(), 4);
+            seen += page.selection.len;
+            if (page.after == null) break;
+        }
+        const queue = @as(*Owner, @ptrCast(@alignCast(rolling.ptr))).rolling_queue.?;
+        try std.testing.expect(queue.windows_planned >= 3);
+        try std.testing.expectEqual(@as(usize, 2), queue.peak_windows);
+        try std.testing.expectEqual(@as(usize, 1), queue.windows[0].active);
+        try std.testing.expectEqual(@as(i64, 1), (try first.cell(first_arena.allocator(), 0, "amount")).value.integer);
+        while (true) {
+            var arena = std.heap.ArenaAllocator.init(a);
+            defer arena.deinit();
+            const page = try ranges[0].next_columns.?(ranges[0].ptr, arena.allocator(), 4);
+            seen += page.selection.len;
+            if (page.after == null) break;
+        }
+        try std.testing.expectEqual(@as(usize, 30), seen);
+    }
     var ids: std.ArrayList([]const u8) = .empty;
     defer {
         for (ids.items) |id| a.free(id);

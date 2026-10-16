@@ -77,6 +77,9 @@ admitted: u64 = 0,
 summary_cache_hits: u64 = 0,
 prefetch_reads: u64 = 8 * 1024 * 1024,
 prefetch_tasks: usize = 0,
+parallel_bound_results: usize = 0,
+bounds_computed: usize = 0,
+bound_workers: [2]?*Self = @splat(null),
 pending: ?Pending = null,
 selection: ?[]const Id = null,
 proof: ?*@import("lake_index_pack_proof.zig") = null,
@@ -197,6 +200,10 @@ pub fn deinit(self: *Self) void {
     // for their charged work, before any borrowed request state is released.
     if (self.metrics) |metrics| metrics.recordNavigation(.{ .queries = 1, .admitted_segments = self.admitted, .admission_windows = self.admission_windows, .subtree_reductions = self.reductions, .pruned_ranges = self.pruned_ranges, .overflow_subtrees = self.overflow_subtrees, .metadata_read_bytes = self.charged_bytes, .summary_cache_hits = self.summary_cache_hits });
     const a = self.a;
+    for (self.bound_workers) |owned| if (owned) |worker| {
+        worker.plan = null; // Immutable syntax is owned by this coordinator.
+        worker.deinit();
+    };
     for (self.pattern_matchers.items) |entry| entry.matcher.deinit();
     self.pattern_matchers.deinit(self.budget.allocator());
     self.score_ceilings.deinit(self.budget.allocator());
@@ -495,6 +502,7 @@ const Range = struct {
 };
 fn bound(self: *Self, input_first: Id, input_last: Id) !?Node {
     try self.check();
+    self.bounds_computed += 1;
     var first = input_first;
     var last = input_last;
     if (self.selection) |ids| {
@@ -531,92 +539,113 @@ fn bound(self: *Self, input_first: Id, input_last: Id) !?Node {
     }
     return null;
 }
-/// Warm immutable sibling/term pages with independent readers and scratch.
-/// Only the coordinator mutates scores, summaries, quotas and traversal order.
-fn prefetchSiblings(self: *Self, first: Id, left_end: Id, boundary: Id, last: Id) !void {
-    const io = self.cached.context.io orelse return;
-    if (self.prefetch_reads < 2 * 1024 * 1024) return;
-    const Term = struct { field: []const u8, term: []const u8 };
-    var terms: [8]Term = undefined;
-    var used: usize = 0;
-    var fields = self.plan.?.stats.fields.iterator();
-    gather: while (fields.next()) |field| {
-        var keys = field.value_ptr.frequencies.keyIterator();
-        while (keys.next()) |term| {
-            terms[used] = .{ .field = field.key_ptr.*, .term = term.* };
-            used += 1;
-            if (used == terms.len) break :gather;
-        }
-    }
-    if (used == 0) return;
-    const Warm = struct {
-        owner: *Self,
-        terms: []const Term,
-        first: Id,
-        last: Id,
+fn boundWorker(self: *Self, index: usize) ?*Self {
+    if (self.bound_workers[index]) |worker| return worker;
+    const backing = @import("antfly_platform").allocator.processAllocator(std.heap.page_allocator);
+    const worker = backing.create(Self) catch return null;
+    worker.* = .{ .a = backing, .budget = .{ .backing = backing, .limit = 2 * 1024 * 1024 }, .root = self.root, .store = self.store, .cached = self.cached, .token = self.token, .plan = self.plan };
+    const a = worker.budget.allocator();
+    worker.scratch = .init(a);
+    worker.syntax = .init(a);
+    worker.pages = .{ .domain = worker.root.domain, .artifacts = &worker.store, .cancellation = worker.token, .remaining_read_bytes = &worker.reads, .remaining_write_bytes = &worker.writes, .read_cache = .{ .ptr = worker, .read = readPage } };
+    worker.cache = .{ .alloc = a, .underlying = worker.pages.store() };
+    self.bound_workers[index] = worker;
+    return worker;
+}
+/// Independent readers compute authenticated bounds, rather than warming
+/// pages and then traversing the same ranges again on the coordinator. Only
+/// completed values/counters cross the join; ranking and budgets stay ordered.
+fn siblingBounds(self: *Self, first: Id, left_end: Id, boundary: Id, last: Id) ![2]?Node {
+    const io = self.cached.context.io orelse return .{ try self.bound(first, left_end), try self.bound(boundary, last) };
+    if (self.prefetch_reads < 2 * 1024 * 1024) return .{ try self.bound(first, left_end), try self.bound(boundary, last) };
+    const Bounds = struct { first: Id, last: Id };
+    var ranges = [_]?Bounds{ .{ .first = first, .last = left_end }, .{ .first = boundary, .last = last } };
+    // A spilled selection proof owns a mutable file reader. Clip it on the
+    // coordinator; workers borrow only the immutable resulting hash ranges.
+    if (self.proof) |proof| for (&ranges) |*range| {
+        const clipped = try @import("lake_index_pack_proof.zig").clip(proof, range.*.?.first, range.*.?.last);
+        range.* = if (clipped) |value| .{ .first = value.first, .last = value.last } else null;
+    };
+    const Worker = struct {
+        worker: *Self,
+        range: Bounds,
         reads: u64 = 1024 * 1024,
-        done: std.Io.Event = .unset,
-        fn read(raw: *anyopaque, a: A, store: *stores.ArtifactStore, ref: local.serverless_manifest_artifact_ref.ArtifactRef, _: u64, length: usize, _: Id, token: Token, budget: *u64) ![]u8 {
-            const warm: *@This() = @ptrCast(@alignCast(raw));
-            try warm.owner.cached.context.ensureActive();
-            try stores.chargeReadBudget(budget, length);
-            return artifacts.readArtifact(a, store.*, .{ .artifact_id = ref.artifact_id, .checksum = ref.checksum, .byte_len = ref.byte_len }, token, warm.owner.cached);
-        }
-        fn run(warm: *@This()) anyerror!void {
-            defer warm.done.set(warm.owner.cached.context.io.?);
-            var memory: local.sql_memory_budget = .{ .backing = @import("antfly_platform").allocator.processAllocator(std.heap.page_allocator), .limit = 2 * 1024 * 1024 };
-            var arena = std.heap.ArenaAllocator.init(memory.allocator());
-            defer arena.deinit();
-            var store = warm.owner.store;
-            var writes: u64 = 0;
-            var pages: page_store.PageStore = .{ .domain = warm.owner.root.domain, .artifacts = &store, .cancellation = warm.owner.token, .remaining_read_bytes = &warm.reads, .remaining_write_bytes = &writes, .read_cache = .{ .ptr = warm, .read = read } };
-            var cache: tree.Cache = .{ .alloc = memory.allocator(), .underlying = pages.store() };
-            defer cache.deinit();
-            const Fold = struct {
-                pub fn aggregate(_: *@This(), _: []const u8, _: u64) !void {}
-                pub fn record(_: *@This(), _: []const u8, _: []const u8) !void {}
-            };
-            for (warm.terms) |term| {
-                try warm.owner.check();
-                _ = arena.reset(.retain_capacity);
-                const a = arena.allocator();
-                const key = try corpus.statistics.keyAlloc(a, term.field, term.term);
-                const prefix = try corpus.term_directory.prefixAlloc(a, key);
-                const lower = try std.mem.concat(a, u8, &.{ prefix, &warm.first });
-                const upper = try std.mem.concat(a, u8, &.{ prefix, &warm.last, &.{0} });
-                var fold: Fold = .{};
-                try tree.reduceRange(a, cache.store(), warm.owner.root.term_directory.leaves, lower, upper, &fold);
+        charged: u64 = 0,
+        reductions: u64 = 0,
+        hits: u64 = 0,
+        ceilings: u64 = 0,
+        patterns: u64 = 0,
+        pattern_compilations: u64 = 0,
+        fn run(job: *@This()) anyerror!?Node {
+            const worker = job.worker;
+            worker.reads = job.reads;
+            worker.charged_bytes = 0;
+            worker.reductions = 0;
+            worker.summary_cache_hits = 0;
+            worker.score_ceiling_hits = 0;
+            worker.pattern_reductions = 0;
+            const prior_compilations = worker.pattern_compilations;
+            defer {
+                job.reads = worker.reads;
+                job.charged = worker.charged_bytes;
+                job.reductions = worker.reductions;
+                job.hits = worker.summary_cache_hits;
+                job.ceilings = worker.score_ceiling_hits;
+                job.patterns = worker.pattern_reductions;
+                job.pattern_compilations = worker.pattern_compilations - prior_compilations;
             }
+            return worker.bound(job.range.first, job.range.last);
         }
     };
-    var workers = [_]Warm{
-        .{ .owner = self, .terms = terms[0..used], .first = first, .last = left_end },
-        .{ .owner = self, .terms = terms[0..used], .first = boundary, .last = last },
-    };
+    var jobs: [2]Worker = undefined;
     const scheduler = local.sql_parallel_scheduler;
-    var tasks: [2]?scheduler.Task(anyerror!void) = @splat(null);
-    defer for (&tasks, &workers) |*handle, *worker| if (handle.*) |task_| {
-        var task = task_;
+    var tasks: [2]?scheduler.Task(anyerror!?Node) = @splat(null);
+    var result: [2]?Node = @splat(null);
+    var failures: [2]?anyerror = @splat(null);
+    // Every admitted worker must finish, even when an earlier bound fails.
+    defer for (&tasks, &jobs) |*handle, *job| if (handle.*) |*task| {
         _ = task.cancel(io) catch {};
-        self.prefetch_reads += worker.reads;
-        self.charged_bytes += 1024 * 1024 - worker.reads;
+        self.prefetch_reads += job.reads;
+        self.charged_bytes += job.charged;
     };
-    for (&workers, &tasks) |*worker, *task| {
-        task.* = scheduler.global().submitIoTransient(io, 2 * 1024 * 1024, Warm.run, .{worker});
+    for (ranges, &jobs, &tasks, 0..) |range, *job, *task, index| if (range) |value| {
+        const worker = self.boundWorker(index) orelse continue;
+        worker.selection = self.selection;
+        job.* = .{ .worker = worker, .range = value };
+        task.* = scheduler.global().submitIoTransient(io, 2 * 1024 * 1024, Worker.run, .{job});
         if (task.* != null) {
             self.prefetch_reads -= 1024 * 1024;
             self.prefetch_tasks += 1;
         }
+    };
+    for (ranges, &tasks, &jobs, 0..) |range, *handle, *job, index| {
+        if (range == null) continue;
+        if (handle.*) |*task| {
+            result[index] = task.await(io) catch |err| blk: {
+                failures[index] = err;
+                break :blk null;
+            };
+            if (failures[index] == null) self.parallel_bound_results += 1;
+            handle.* = null;
+            self.prefetch_reads += job.reads;
+            self.charged_bytes += job.charged;
+            self.reductions += job.reductions;
+            self.summary_cache_hits += job.hits;
+            self.score_ceiling_hits += job.ceilings;
+            self.pattern_reductions += job.patterns;
+            self.pattern_compilations += job.pattern_compilations;
+        } else failures[index] = error.ParallelBoundAdmissionDeclined;
     }
-    for (&tasks, &workers) |*handle, *worker| if (handle.*) |task_| {
-        try worker.done.wait(io);
-        var task = task_;
-        handle.* = null;
-        task.await(io) catch {}; // optional warming never proves absence
-        self.prefetch_reads += worker.reads;
-        self.charged_bytes += 1024 * 1024 - worker.reads;
+    for (failures, ranges, 0..) |failure, range, index| if (failure) |err| {
+        // Optional workspace/read admission can decline. Recompute required
+        // work serially without suppressing corruption or cancellation errors.
+        switch (err) {
+            error.OutOfMemory, error.ArtifactReadBudgetExceeded, error.ParallelBoundAdmissionDeclined => result[index] = try self.bound(range.?.first, range.?.last),
+            else => return err,
+        }
     };
     try self.check();
+    return result;
 }
 pub fn next(self: *Self, cutoff: ?f32) !?Id {
     return self.nextRanked(cutoff, null);
@@ -654,9 +683,9 @@ pub fn nextRanked(self: *Self, cutoff: ?f32, position: ?Position) !?Id {
             left_end[i] -%= 1;
             if (left_end[i] != 255) break;
         }
-        try self.prefetchSiblings(node.first, left_end, boundary, node.last);
-        const left = try self.bound(node.first, left_end);
-        const right = try self.bound(boundary, node.last);
+        const bounds = try self.siblingBounds(node.first, left_end, boundary, node.last);
+        const left = bounds[0];
+        const right = bounds[1];
         const fallback = depth_first or self.heap.items.len + @as(usize, @intFromBool(left != null)) + @as(usize, @intFromBool(right != null)) > self.frontier_limit;
         if (fallback) {
             if (!depth_first) self.overflow_subtrees += 1;
@@ -779,6 +808,8 @@ test "external lake global frontier reaches late competitive segments and comple
     defer warmed.deinit();
     try std.testing.expectEqual(last, (try warmed.next(null)).?);
     try std.testing.expect(warmed.prefetch_tasks > 0);
+    try std.testing.expect(warmed.parallel_bound_results > 0);
+    try std.testing.expect(warmed.bounds_computed < frontier.bounds_computed);
     try std.testing.expect(warmed.prefetch_reads <= 8 * 1024 * 1024);
     try std.testing.expectEqual(@as(u64, 256 * 1024 * 1024) - warmed.reads + (8 * 1024 * 1024 - warmed.prefetch_reads), warmed.charged_bytes);
     // Ordinary task admission remains pinned until the handle is joined, so
@@ -787,12 +818,13 @@ test "external lake global frontier reaches late competitive segments and comple
         fn run() void {}
     };
     var held = local.sql_parallel_scheduler.global().submitIo(std.testing.io, 32 * 1024 * 1024, Hold.run, .{}).?;
-    defer held.await(std.testing.io);
+    defer if (held.future != null) held.await(std.testing.io);
     const saturated = (try create(a, root, store, warm_cached, .none, .{ .term = .{ .field = "body", .term = "common" } }, .{}, .{})).?;
     defer saturated.deinit();
     try std.testing.expectEqual(last, (try saturated.next(null)).?);
     try std.testing.expectEqual(@as(usize, 0), saturated.prefetch_tasks);
     try std.testing.expectEqual(@as(u64, 8 * 1024 * 1024), saturated.prefetch_reads);
+    held.await(std.testing.io);
 
     const strong = local.section_inverted.bm25Score(100, 100, 8192, 8192, 100, .{});
     try std.testing.expect((try frontier.next(strong)) == null);
@@ -813,7 +845,7 @@ test "external lake global frontier reaches late competitive segments and comple
     }
     try std.testing.expectEqual(seen.len, count);
     try std.testing.expect(!complete.pruned);
-    const conjunction = (try create(a, root, store, cached, .none, .{ .bool_query = .{ .must = &.{
+    const conjunction = (try create(a, root, store, warm_cached, .none, .{ .bool_query = .{ .must = &.{
         .{ .term = .{ .field = "body", .term = "common" } },
         .{ .term = .{ .field = "body", .term = "rare" } },
     } } }, .{}, .{})).?;
@@ -878,7 +910,7 @@ test "external lake global frontier reaches late competitive segments and comple
     tie_store.reduce = ties.reduce;
     var tied_root = root;
     tied_root.tie_bounds = try tree.buildSorted(a, tie_store, &tie_source);
-    const tied = (try create(a, tied_root, store, cached, .none, .{ .prefix = .{ .field = "body", .prefix = "ra" } }, .{}, .{})).?;
+    const tied = (try create(a, tied_root, store, warm_cached, .none, .{ .prefix = .{ .field = "body", .prefix = "ra" } }, .{}, .{})).?;
     defer tied.deinit();
     try std.testing.expectEqual(last, (try tied.nextRanked(null, null)).?);
     try std.testing.expect((try tied.nextRanked(1, .{ .file = @splat(0), .rank = 0 })) == null);
@@ -936,11 +968,13 @@ test "external lake global frontier reaches late competitive segments and comple
     defer broad.deinit();
     try std.testing.expect((try broad.next(null)) == null);
     try std.testing.expectEqual(@as(u64, 1), broad.pattern_compilations);
-    const unexpanded = (try create(a, broad_root, store, cached, .none, .{ .regexp = .{ .field = "body", .pattern = ".*" } }, .{}, .{})).?;
+    const unexpanded = (try create(a, broad_root, store, warm_cached, .none, .{ .regexp = .{ .field = "body", .pattern = ".*" } }, .{}, .{})).?;
     defer unexpanded.deinit();
     try std.testing.expect((try unexpanded.next(null)) != null);
     try std.testing.expect((try unexpanded.next(null)) != null);
-    try std.testing.expectEqual(@as(u64, 1), unexpanded.pattern_compilations);
+    // One compilation per persistent lane, across every visited range.
+    try std.testing.expect(unexpanded.pattern_compilations <= 3);
+    try std.testing.expect(unexpanded.parallel_bound_results > 0);
     try std.testing.expect(unexpanded.pattern_reductions > 0);
     const Entries = struct {
         records: []const tree.Cursor.Record,

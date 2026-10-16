@@ -4937,3 +4937,59 @@ The production disk guard remained enabled. Compiler-derived error metadata,
 Zig/Python formatting and lint, whitespace, source licenses and the Apache
 boundary (2,065 source files) passed. Archive-scale latency/RSS and live-provider
 retention qualification remain deferred.
+
+
+## Adaptive reducers, overlapping work windows, and direct parallel bounds
+
+Footer lookahead completion state belongs to its worker until joining. Required
+navigation checks task ownership before reading EOF or other worker-written
+fields, including when it advances faster than speculation.
+
+Aggregate workers exempt terminal empty EOF from logical page admission, just
+like ordered delivery. Nonterminal empty responses still consume page credit.
+Each reducer now owns a stable, reclaiming allocator budget covering its local
+state and execution scratch; source buffers remain cursor-owned under the
+statement's existing physical scan limits. Adaptive admission reserves half of the
+node's temporary-work allowance for I/O, starts admitted sibling workers behind
+a readiness barrier, and executes one lane on the caller. At the default node
+and statement budgets, four lanes receive 8 MiB each and three concurrent CPU
+leases consume 24 MiB; a 16 MiB footer task can still run. Local hash states
+spill within their workspace or fall back to the untouched pinned parent.
+
+Unordered publication scans retain at most two independently owned four-file
+windows. A producer transfers its planned descriptors, version pins, and work
+census to a window owner while retaining the same monotonic enumeration cursor
+and optional lookahead owner. Idle lanes can plan and claim the next window
+while earlier claims remain active. Each window closes only after its own last
+claim releases; planning failures become sticky rather than allowing another
+lane to skip an already advanced source range. Ordered delivery keeps its
+existing file/row-group order and deferred-error contract.
+
+Text frontier siblings compute authenticated bounds on independent I/O lanes
+and return their final bounds and counters to the coordinator. Successful work
+is not reduced again by a serial traversal. Two persistent worker owners each
+have a 2 MiB budget for private navigation pages, scratch, score-ceiling caches,
+and compiled pattern state, alongside the coordinator's existing 8 MiB budget.
+Patterns compile at most once per lane for a query. Immutable prepared syntax
+and selection arrays are borrowed through joining; spilled selection clipping,
+score-heap updates, and read accounting remain coordinator-owned. Optional
+workspace/read admission failures retry the required bound serially; corruption
+and cancellation remain errors. The existing 8 MiB parallel-read allowance
+accounts for every attempted worker read, including failed attempts.
+
+Regressions exercise exact aggregate page limits, preserved I/O headroom,
+retained early-window vectors while later windows drain, concurrent Boolean and
+pattern bounds, exact ties, scheduler denial, and fewer coordinator traversals.
+Archive-scale throughput and latency improvements still require measurement.
+
+
+Qualification with merged origin/main `464b41145f`: the final Debug server built;
+all 498 native lake tests (185 shared-engine and 313 server), nine focused SQL
+contracts, and 29 runtime error ABI tests passed. Native tests reported zero
+failures and leaks. The final direct parallel-bound regression also passed,
+including fewer coordinator traversals, Boolean conjunctions, exact ties,
+reused broad-pattern compilation, and saturated-I/O fallback. All 50 real
+Parquet/Iceberg E2Es passed in one run (608.00 seconds), with the production disk
+guard enabled. Generated error identities, formatting, whitespace, source
+licenses, and the 2,065-file Apache boundary passed. Real-provider retention and
+representative archive-scale latency/RSS qualification remain deferred.

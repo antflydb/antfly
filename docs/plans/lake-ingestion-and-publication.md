@@ -1338,3 +1338,26 @@ The initial checkpoint handles the snapshot delta; subsequent file checkpoints
 authenticate and edit only that file's dictionary/retirement paths. This preserves
 stable slot histories and old-reader roots without repeated archive-sized mask
 walks during sparse incremental publication.
+
+
+### Overlapping windows and direct metadata reduction
+
+Unordered SQL scans keep at most two independently owned windows of four files.
+An idle consumer can plan and consume later work while an earlier claim retains
+its footer and borrowed columns. The producer keeps one monotonic enumeration
+cursor; every window pins its own plans until its last claim closes. Planning
+errors are sticky across consumers. Aggregate worker EOF is administrative and
+spends no logical scan page; nonterminal empty pages remain quota-bounded.
+
+Reducers select fan-out from useful workspace and shared CPU admission, reserve
+node I/O headroom, and retain local state in explicit worker allocator budgets.
+One caller lane and admitted siblings share the operator's bounded allowance.
+Local spill/fallback preserves the original pinned source and exact reducers.
+
+Publication-wide text navigation computes sibling score bounds concurrently
+with independent, bounded navigation/pattern caches. Only completed reductions
+and accounting cross back to the coordinator; successful bounds avoid a second
+serial traversal. Prepared syntax remains immutable, and spilled selection
+clipping, ranking, errors, and read-budget reconciliation retain one owner.
+Worker memory/admission failures use the required serial path. Cloud retention
+qualification on real providers remains deferred.

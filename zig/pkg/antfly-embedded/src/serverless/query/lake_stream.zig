@@ -209,7 +209,10 @@ pub const Stream = struct {
             self.enumeration_lookahead = warm;
         }
         const warm = self.enumeration_lookahead.?;
-        if (warm.disabled or warm.ended or warm.task != null) return;
+        // Worker-owned fields are read only after the task has joined. In
+        // particular, EOF can race with another required window advancing.
+        if (warm.task != null) return;
+        if (warm.disabled or warm.ended) return;
         warm.target = self.enumerated_files;
         warm.width = @max(1, @min(4, width));
         warm.task = @import("../../sql/parallel_scheduler.zig").global().submitIoTransient(io, 16 * 1024 * 1024, EnumerationLookahead.run, .{warm});
@@ -809,6 +812,32 @@ pub const Stream = struct {
         self.owns_files = true;
         self.file_index = 0;
         return true;
+    }
+    /// Transfer a planned window to a stable owner while the producer keeps
+    /// the same monotonic enumeration cursor. Children borrow this window's
+    /// descriptors and work census until its last claim closes.
+    pub fn detachWork(self: *Stream) !Stream {
+        std.debug.assert(self.iterator != null and self.work != null);
+        var following = try initEnumerated(self.alloc, self.iterator_parent.?, self.columns, self.predicates, self.context, self.limits);
+        // Initialization is the only fallible step; the original remains
+        // intact on allocation failure, including all borrowed child plans.
+        following.iterator.?.close(following.iterator.?.ptr);
+        following.iterator = self.iterator;
+        following.iterator_started = self.iterator_started;
+        following.enumerated_files = self.enumerated_files;
+        following.enumeration_lookahead = self.enumeration_lookahead;
+        following.enumeration_prefetch_tasks = self.enumeration_prefetch_tasks;
+        following.enumeration_prefetch_files = self.enumeration_prefetch_files;
+        following.schema_contract = self.schema_contract;
+        following.identity_only = self.identity_only;
+        following.examined = self.examined;
+        following.filter = self.filter;
+        following.filter_columns = self.filter_columns;
+        self.iterator = null;
+        self.enumeration_lookahead = null;
+        const window = self.*;
+        self.* = following;
+        return window;
     }
     fn releaseWork(self: *Stream) void {
         if (self.owns_work) if (self.work) |work| {
