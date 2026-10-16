@@ -283,8 +283,8 @@ pub fn embedPreparedLiveCached(out: std.mem.Allocator, session: Session, tokeniz
 pub fn embed(out: std.mem.Allocator, session: Session, tokenizer: Tokenizer, group: Group, options: Options, lock: ?*std.atomic.Mutex, control: ?Control) !Result {
     return embedCached(out, session, tokenizer, group, options, lock, control, null);
 }
-fn speculationPressure(err: anyerror) bool {
-    return err == error.OutOfMemory or err == error.SharedAdmissionExceeded or err == error.MemoryBudgetExceeded or err == error.InferenceAdmissionQueueFull or err == error.ConcurrencyUnavailable;
+pub fn videoSpeculationPressure(err: anyerror) bool {
+    return err == error.ResourceTemporarilyUnavailable or err == error.OutOfMemory or err == error.SharedAdmissionExceeded or err == error.MemoryBudgetExceeded or err == error.InferenceAdmissionQueueFull or err == error.ConcurrencyUnavailable;
 }
 pub fn embedCached(out: std.mem.Allocator, session: Session, tokenizer: Tokenizer, group: Group, options: Options, lock: ?*std.atomic.Mutex, control: ?Control, cache: ?*FrameCache) !Result {
     if (cache) |owner| {
@@ -333,7 +333,7 @@ fn embedScoped(a: std.mem.Allocator, session: Session, tokenizer: Tokenizer, gro
         device_bytes = if (session.backend() == .metal) try ahead.plan.deviceBytes() else 0;
         command_slots = ahead.plan.commands;
     } else if (has_video) {
-        var preflight = session.admitHostPreprocess(512 * 1024 * 1024) catch |err| return if (options.video_ahead != null and speculationPressure(err)) error.SpeculativeVideoAdmissionDenied else err;
+        var preflight = session.admitHostPreprocess(512 * 1024 * 1024) catch |err| return if (options.video_ahead != null and videoSpeculationPressure(err)) error.SpeculativeVideoAdmissionDenied else err;
         defer preflight.deinit();
         var host_budget = media_admission.Pool{ .limits = .{ .host_bytes = 512 * 1024 * 1024 } };
         defer std.debug.assert(std.meta.eql(host_budget.snapshot(), media_admission.Resources{}));
@@ -355,7 +355,7 @@ fn embedScoped(a: std.mem.Allocator, session: Session, tokenizer: Tokenizer, gro
         try std.math.add(usize, (if (has_video) @as(usize, 1536) else 768) * 1024 * 1024, device_bytes)
     else
         512 * 1024 * 1024;
-    var permit = admitWithVisionCacheReclaim(session, .{ .batch = 1, .sequence = 8192, .input_bytes = input_bytes, .host_preprocess_bytes = 512 * 1024 * 1024, .workspace_bytes = workspace, .output_bytes = 8192 * 768 * @sizeOf(f32) }, effective) catch |err| return if (options.video_ahead != null and speculationPressure(err)) error.SpeculativeVideoAdmissionDenied else err;
+    var permit = admitWithVisionCacheReclaim(session, .{ .batch = 1, .sequence = 8192, .input_bytes = input_bytes, .host_preprocess_bytes = 512 * 1024 * 1024, .workspace_bytes = workspace, .output_bytes = 8192 * 768 * @sizeOf(f32) }, effective) catch |err| return if (options.video_ahead != null and videoSpeculationPressure(err)) error.SpeculativeVideoAdmissionDenied else err;
     defer permit.deinit();
     // Video parts execute sequentially; their transient preparation shares use
     // a maximum, while projected tokens stay in the model workspace.
@@ -389,7 +389,7 @@ fn embedScoped(a: std.mem.Allocator, session: Session, tokenizer: Tokenizer, gro
     var managed = try factory.getManagedComputeBackend(session, a, null, control);
     defer managed.deinit();
     const cb = &managed.backend;
-    const prepared = prepareGroupWithBudget(a, cb, tokenizer, group, options, effective, &video_budget, prefetched, cache) catch |err| return if (options.video_ahead != null and speculationPressure(err)) error.SpeculativeVideoAdmissionDenied else err;
+    const prepared = prepareGroupWithBudget(a, cb, tokenizer, group, options, effective, &video_budget, prefetched, cache) catch |err| return if (options.video_ahead != null and videoSpeculationPressure(err)) error.SpeculativeVideoAdmissionDenied else err;
     defer prepared.deinit(a);
     // Projection consumption has joined the current decoder. A new producer
     // may now run while this call executes the language backbone.

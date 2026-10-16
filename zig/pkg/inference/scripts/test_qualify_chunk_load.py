@@ -16,10 +16,14 @@
 
 """Fault qualification for acknowledged coverage across admission retries."""
 
+import io
+import json
 import unittest
+import urllib.error
 from unittest.mock import patch
 
 import qualify_chunk_load as load
+import qualify_media_chunks as quality
 
 
 def reply(start, stop, error=None, plan="plan"):
@@ -115,6 +119,80 @@ class AdmissionRetryTests(unittest.TestCase):
             with self.assertRaisesRegex(AssertionError, "retry budget exhausted"):
                 load.complete_request("local", {}, lambda _: None)
         self.assertEqual(request.call_count, 65)
+
+
+class PreResponseAdmissionTests(unittest.TestCase):
+    @staticmethod
+    def busy(retryable=True):
+        return urllib.error.HTTPError(
+            "http://local/ai/v1/embed",
+            503,
+            "busy",
+            {},
+            io.BytesIO(
+                json.dumps({"retryable": retryable, "retry_after_ms": 250}).encode()
+            ),
+        )
+
+    def test_retries_explicit_admission_with_the_same_immutable_request(self):
+        response = io.BytesIO(b"{}")
+        with (
+            patch.object(
+                quality.urllib.request, "urlopen", side_effect=[self.busy(), response]
+            ) as opened,
+            patch.object(quality.time, "sleep") as sleep,
+        ):
+            self.assertIs(
+                response,
+                quality.post("http://local", "embed", {"model_identity": "pinned"}),
+            )
+            self.assertEqual(opened.call_count, 2)
+            self.assertIs(
+                opened.call_args_list[0].args[0], opened.call_args_list[1].args[0]
+            )
+            sleep.assert_called_once_with(0.25)
+
+    def test_permanent_errors_fail_without_retrying(self):
+        with (
+            patch.object(
+                quality.urllib.request, "urlopen", side_effect=self.busy(False)
+            ) as opened,
+            patch.object(quality.time, "sleep") as sleep,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "HTTP 503"):
+                quality.post("http://local", "embed", {})
+            self.assertEqual(opened.call_count, 1)
+            sleep.assert_not_called()
+
+    def test_non_retryable_http_error_is_terminal_across_chunk_resumption(self):
+        with (
+            patch.object(
+                load,
+                "chunk_response",
+                side_effect=quality.HttpError("chunk: HTTP 503: permanent", False),
+            ) as request,
+            patch.object(load.time, "sleep") as sleep,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "permanent"):
+                load.complete_request(
+                    "http://local", {}, lambda _: self.fail("retried permanent error")
+                )
+            self.assertEqual(request.call_count, 1)
+            sleep.assert_not_called()
+
+    def test_retry_budget_is_bounded(self):
+        with (
+            patch.object(
+                quality.urllib.request,
+                "urlopen",
+                side_effect=[self.busy() for _ in range(4)],
+            ) as opened,
+            patch.object(quality.time, "sleep") as sleep,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "HTTP 503"):
+                quality.post("http://local", "embed", {})
+            self.assertEqual(opened.call_count, 4)
+            self.assertEqual(sleep.call_count, 3)
 
 
 if __name__ == "__main__":

@@ -38,6 +38,7 @@ import urllib.parse
 import urllib.request
 from pathlib import Path
 
+from chunk_qualification_common import complete_request as complete_chunks
 from qualify_media_chunks import chunk_response, fixtures, media, owned_server, post
 
 
@@ -93,66 +94,7 @@ def request_for(args, name):
 
 
 def complete_request(url, body, on_retry):
-    # Retry only explicit admission failures. A terminal coverage record
-    # tells us exactly which acknowledged ordinals to preserve on resume.
-    retryable = {
-        "ResourceTemporarilyUnavailable",
-        "ConcurrencyUnavailable",
-        "InferenceAdmissionQueueFull",
-        "SharedAdmissionExceeded",
-        "MemoryBudgetExceeded",
-    }
-    request = dict(body)
-    acknowledged = []
-    context = None
-    first_ordinal = None
-    deadline = time.monotonic() + 180
-    for attempt in range(65):
-        result = None
-        try:
-            result = chunk_response(url, request)
-        except RuntimeError as error:
-            if not any(status in str(error) for status in ("HTTP 503:", "HTTP 429:")):
-                raise
-            code = "HTTP_ADMISSION"
-        else:
-            identity = tuple(
-                result[key]
-                for key in (
-                    "source_fingerprint",
-                    "plan_id",
-                    "model_identity",
-                    "model_revision",
-                )
-            )
-            if context is None:
-                context = identity
-                first_ordinal = result["start_ordinal"]
-            assert identity == context, "retry changed immutable execution context"
-            assert result["start_ordinal"] == first_ordinal + len(acknowledged)
-            for index, item in enumerate(
-                result["data"], first_ordinal + len(acknowledged)
-            ):
-                assert item["descriptor"]["ordinal"] == index
-                assert not item.get("error")
-            acknowledged.extend(result["data"])
-            assert result["covered_through_ordinal"] == first_ordinal + len(
-                acknowledged
-            )
-            error = result.get("error")
-            if not error:
-                result["data"] = acknowledged
-                result["start_ordinal"] = first_ordinal
-                return result
-            code = error["code"]
-            if code not in retryable or not result.get("next_continuation"):
-                raise AssertionError(result)
-            request["continuation"] = result["next_continuation"]
-        if attempt == 64 or time.monotonic() >= deadline:
-            raise AssertionError(f"admission retry budget exhausted: {code}")
-        on_retry(code)
-        time.sleep(min(1.0, 0.02 * 2 ** min(attempt, 6)))
-    raise AssertionError("unreachable retry loop")
+    return complete_chunks(url, body, chunk_response, on_retry)
 
 
 def qualify(args):

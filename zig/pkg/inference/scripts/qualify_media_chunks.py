@@ -46,6 +46,8 @@ import urllib.request
 import wave
 import zlib
 
+from chunk_qualification_common import HttpError, complete_request
+
 ROOT = Path(__file__).resolve().parents[4]
 FIXTURES = ROOT / "zig/pkg/inference/src/testdata"
 
@@ -119,12 +121,39 @@ def post(url: str, route: str, body: dict):
         data=json.dumps(body).encode(),
         headers={"Content-Type": "application/json"},
     )
-    try:
-        return urllib.request.urlopen(request, timeout=1800)
-    except urllib.error.HTTPError as error:
-        raise RuntimeError(
-            f"{route}: HTTP {error.code}: {error.read(16384).decode(errors='replace')}"
-        ) from error
+    # Admission can remain busy briefly after a completed response while its
+    # worker releases leases. Retry only explicit pre-response admission errors;
+    # streaming coverage and transport failures retain their terminal semantics.
+    for attempt in range(4):
+        try:
+            return urllib.request.urlopen(request, timeout=1800)
+        except urllib.error.HTTPError as error:
+            detail = error.read(16384).decode(errors="replace")
+            error.close()
+            try:
+                reply = json.loads(detail)
+            except ValueError:
+                reply = None
+            if (
+                attempt < 3
+                and error.code in (429, 503)
+                and isinstance(reply, dict)
+                and reply.get("retryable") is True
+            ):
+                delay = reply.get("retry_after_ms", 1000)
+                if (
+                    isinstance(delay, (int, float))
+                    and math.isfinite(delay)
+                    and 0 <= delay <= 10000
+                ):
+                    time.sleep(delay / 1000)
+                    continue
+            raise HttpError(
+                f"{route}: HTTP {error.code}: {detail}",
+                error.code in (429, 503)
+                and isinstance(reply, dict)
+                and reply.get("retryable") is True,
+            ) from error
 
 
 def chunk_response(url: str, body: dict):
@@ -303,7 +332,7 @@ def qualify(args):
                 "include_content": True,
                 "stream": args.stream,
             }
-            result = chunk_response(args.url, body)
+            result = complete_request(args.url, body, chunk_response, lambda _: None)
             elapsed = time.perf_counter() - started
             after = telemetry(args.url) if args.telemetry else {}
             assert result["model_revision"] == revision, (

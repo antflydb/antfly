@@ -595,7 +595,7 @@ pub const Runner = struct {
             const next = self.next orelse return;
             self.next = null; // At most one wave, even for a multi-part executor.
             self.runner.prepareVideoSlot(self.source, next) catch |err| {
-                if (err == error.SharedAdmissionExceeded or err == error.OutOfMemory) return;
+                if (@import("embedding_gemma2.zig").videoSpeculationPressure(err)) return;
                 next.failure = err;
                 return;
             };
@@ -603,7 +603,7 @@ pub const Runner = struct {
             next.ahead = start(self.runner.executor.context, next.payload, &self.runner.pool) catch |err| {
                 // Speculation must never deny a request which fits serially.
                 // Malformed input is reported when this window is reached.
-                if (err != error.SharedAdmissionExceeded and err != error.OutOfMemory and err != error.MemoryBudgetExceeded and err != error.InferenceAdmissionQueueFull and err != error.ConcurrencyUnavailable) next.failure = err;
+                if (!@import("embedding_gemma2.zig").videoSpeculationPressure(err)) next.failure = err;
                 return;
             };
         }
@@ -1001,7 +1001,7 @@ test "model aware media immutable MP4 windows bind metadata without reading or c
     try std.testing.expectEqual(source_reads, source.reads);
 }
 
-test "model aware media video schedules only one next window after preparation" {
+test "model aware media video yields speculative pressure and schedules only one next window" {
     const a = std.testing.allocator;
     const Scheduled = struct {
         output: Qualification = .{},
@@ -1010,7 +1010,7 @@ test "model aware media video schedules only one next window after preparation" 
             const self: *@This() = @ptrCast(@alignCast(raw));
             try std.testing.expect(payload == .video);
             self.starts += 1;
-            return null;
+            return error.ResourceTemporarilyUnavailable;
         }
         fn embed(raw: *anyopaque, allocator: std.mem.Allocator, payload: Payload) !Output {
             if (payload.video.prepared) |hook| try hook.ready(hook.context);
