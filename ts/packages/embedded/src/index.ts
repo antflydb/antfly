@@ -95,6 +95,7 @@ export type {
   CompactReport,
   InferenceOptions,
   InferenceStatus,
+  MemoryAdmissionStats,
   OpenOptions,
   PendingWorkStatus,
   PullProgress,

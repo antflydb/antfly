@@ -4948,18 +4948,25 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
         .max_rss = @as(usize, if (target.result.os.tag == .macos) 18 else 7) * 1024 * 1024 * 1024,
     });
+    const inference_host_test_step = b.step("antfly-inference-host-test", "Run inference host ABI, transport and preload conversion regressions");
     inline for (.{
         test_imports.runtime.inference_bridge,
         test_imports.runtime.inference_provider_failure,
         test_imports.runtime.inference_worker_wire,
     }) |module| {
-        lib_standalone_runtime_test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = module })).step);
+        const run = b.addRunArtifact(b.addTest(.{ .root_module = module }));
+        lib_standalone_runtime_test_step.dependOn(&run.step);
+        inference_host_test_step.dependOn(&run.step);
     }
     const inference_host_tests = b.addTest(.{
         .root_module = test_imports.runtime.inference_host,
         .filters = &.{
             "local generate message conversion preserves tool history and admission",
             "inference worker",
+            "standalone inference host placement",
+            "native call policy is scoped",
+            "memory admission diagnostics retain",
+            "session manager load clones preserve",
             "standalone numeric result ABI",
             "standalone raster embedding control",
             "encoded reader ABI enforces resolved model capabilities",
@@ -4975,8 +4982,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     });
     const run_inference_host_tests = b.addRunArtifact(inference_host_tests);
     lib_standalone_runtime_test_step.dependOn(&run_inference_host_tests.step);
-    b.step("antfly-inference-host-test", "Run inference host ABI and preload conversion regressions")
-        .dependOn(&run_inference_host_tests.step);
+    inference_host_test_step.dependOn(&run_inference_host_tests.step);
     // Keep the complete API worker fixture out of the inference-heavy runtime
     // object. Compile this narrow integration slice independently so adding
     // restore coverage does not inflate every standalone runtime test build.
@@ -5584,6 +5590,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     chaos_test_step.dependOn(storage_vopr_step);
 
     const graph_metric_unit_filters = [_][]const u8{
+        "graph committed intents survive canceled durability fences",
         "graph.query.",
         "index maintenance VOPR regression exact replay",
         // This bounded smoke shares the storage compilation with its unit coverage.
@@ -5995,6 +6002,14 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const lake_storage_tests = b.addTest(.{ .root_module = db_test_mod, .filters = &.{"db external lake"}, .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple } });
     b.step("lake-storage-test", "Run native owner lake read-only and restart contracts").dependOn(&addFilteredTestRunArtifact(b, lake_storage_tests).step);
     const db_test_step = b.step("antfly-storage-db-test", "Run storage/db owner tests using the shared unit artifacts");
+    const graph_producer_tests = b.addTest(.{
+        .root_module = db_test_mod,
+        .filters = &.{ "inline resolver replacement replays graph producers without staged resolvers across reopen", "inline resolver replacement producer pages bound physical records bytes and deadlines", "inline resolver replacement preserves shared explicit and upstream producers", "capi resolver replacement retry budget resets only after durable progress" },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("antfly-graph-replacement-producer-test", "Verify replacement producer replay, bounded pages and upstream dependencies")
+        .dependOn(&addFilteredTestRunArtifact(b, graph_producer_tests).step);
+
     const v02_upgrade_tests = b.addTest(.{
         .root_module = db_test_mod,
         .filters = &.{ "schema v02", "schema format-only", "schema epochs", "portable backup", "portable AFB2", "native v02", "native generation manifest", "db v02", "same-version publication", "db restore repair does not complete before regenerated chunk embeddings" },
