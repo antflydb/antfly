@@ -566,7 +566,7 @@ const ParallelScan = struct {
             return null;
         }
         const scheduler = @import("parallel_scheduler.zig").global();
-        const workspace_budget = scheduler.workspaceBudget(source.context.limits.retained_bytes / 2);
+        const workspace_budget = scheduler.cpuWorkspaceBudget(source.context.limits.retained_bytes / 2);
         const fanout = @max(1, scheduler.fanout(children.len, workspace_budget, 4 * 1024 * 1024));
         if (!batch_mode and fanout < 2) {
             for (children) |child| child.close(child.ptr);
@@ -2000,6 +2000,37 @@ test "external lake rolling ordered delivery preserves batches errors and satura
         try std.testing.expectEqual(@as(usize, 1), fixture.closed);
         for (fixture.children) |child| try std.testing.expectEqual(@as(usize, 1), child.closed);
     };
+}
+
+test "SQL ordered producers leave scheduler workspace for concurrent IO" {
+    const a = std.testing.allocator;
+    var fixture: OrderedColumns = .{};
+    var backend = Fixture.backend(undefined);
+    var vtable = backend.vtable.*;
+    vtable.open_scan = OrderedColumns.open;
+    vtable.checkpoint = struct {
+        fn check(_: *anyopaque) !void {}
+    }.check;
+    backend.ptr = &fixture;
+    backend.vtable = &vtable;
+    backend.execution_io = std.testing.io;
+    var compiled = try compiler.compile(a, "SELECT n FROM docs", .{});
+    defer compiled.deinit();
+    const stream = (try Stream.open(a, backend, &compiled, &.{}, .{})).?;
+    defer stream.close();
+    // Construction admits both ordered producers; each blocks at its bounded
+    // delivery credit until the consumer pulls. Check actual scheduler leases.
+    const pipeline = (try ParallelScan.start(stream)).?;
+    stream.parallel = pipeline;
+    stream.parallel_checked = true;
+    const scheduler = @import("parallel_scheduler.zig").global();
+    var io_task = scheduler.submitIo(std.testing.io, 16 * 1024 * 1024, struct {
+        fn run() void {}
+    }.run, .{}) orelse return error.TestExpectedEqual;
+    io_task.await(std.testing.io);
+    var page = try stream.next(137);
+    defer page.deinit();
+    try std.testing.expectEqual(@as(usize, 137), page.output.rows.len);
 }
 
 test "SQL ordered parallel scan evaluates complete pipelines with bounded delivery" {

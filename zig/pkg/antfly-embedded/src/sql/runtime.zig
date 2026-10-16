@@ -37,6 +37,8 @@ pub const Limits = struct {
     /// Native execution batches are independent of response/decision pages.
     execution_batch_rows: u32 = 4096,
     page_bytes: usize = 256 * 1024,
+    /// Native scans charge execution-sized logical row batches plus empty
+    /// nonterminal pulls. Worker and row-group fragmentation do not add credit.
     scan_pages: usize = 65_536,
     spill_bytes: u64 = 1024 * 1024 * 1024,
     spill_root: []const u8 = "/tmp",

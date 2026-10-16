@@ -1361,3 +1361,24 @@ serial traversal. Prepared syntax remains immutable, and spilled selection
 clipping, ranking, errors, and read-budget reconciliation retain one owner.
 Worker memory/admission failures use the required serial path. Cloud retention
 qualification on real providers remains deferred.
+
+
+### Logical scan credits and typed final aggregation
+
+Native aggregates charge positive rows in statement-sized logical batches,
+independently of worker memory, row-group/file fragmentation and output delivery.
+Empty nonterminal pulls spend a credit; terminal EOF does not. Serial and parallel
+reducers share this policy and continue enforcing the statement row limit.
+
+Integer, boolean and text MIN/MAX participate in exact parallel reduction.
+Fixed-width final group states merge by column in admitted batches of up to 64,
+with one packed key matrix and no scalar reducer snapshots. Exact NUMERIC and
+variable-width winners merge directly after per-group memory admission. Spilling
+keeps the durable partial format and bounded reusable per-partial scratch.
+Small nested spill reducers size hash partition fan-out from workspace, leaving
+room for merge runs within the existing shared file ceiling. Sorted skew
+fallbacks place logical runs in the existing reusable anonymous extent store,
+retaining one descriptor per sort.
+Floating/dynamic extrema retain source-order execution until representative ties
+have a defined parallel contract. Ordered producers reserve shared I/O workspace
+using the same scheduling policy as aggregates, retaining bounded caller fallback.

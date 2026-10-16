@@ -5596,13 +5596,15 @@ def test_published_parquet_skewed_files_share_row_groups_and_stream_in_order(tmp
                 "POST",
                 "/sql",
                 {
-                    "statement": "SELECT amount % 5 AS bucket, SUM(amount), COUNT(*) FROM skew_scan GROUP BY amount % 5 ORDER BY bucket"
+                    "statement": "SELECT amount % 5 AS bucket, SUM(amount), COUNT(*), MIN(amount), MAX(amount) FROM skew_scan GROUP BY amount % 5 ORDER BY bucket"
                 },
             )["rows"] == [
                 [
                     str(bucket),
                     str(sum(expected[bucket::5])),
                     str(len(expected[bucket::5])),
+                    str(min(expected[bucket::5])),
+                    str(max(expected[bucket::5])),
                 ]
                 for bucket in range(5)
             ]

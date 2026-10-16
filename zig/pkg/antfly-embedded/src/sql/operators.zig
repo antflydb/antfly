@@ -551,6 +551,14 @@ pub const AggregateSpec = struct { kind: Aggregate.Kind, input_type: ?ast.Column
 /// This is not primitive SIMD eligibility: NUMERIC has its own flat lane.
 pub fn exactMergeable(spec: AggregateSpec) bool {
     if (spec.distinct) return false;
+    // These extrema have a unique representation for equal values. Floating
+    // signed zero, heterogeneous numbers and dynamic types retain source order.
+    if (spec.kind == .min or spec.kind == .max) return switch (spec.input_type orelse .json) {
+        .integer => spec.input_element == null or spec.input_element == .int16 or spec.input_element == .int32 or spec.input_element == .int64,
+        .boolean => spec.input_element == null or spec.input_element == .boolean,
+        .string => spec.input_element == null or spec.input_element == .text,
+        else => false,
+    };
     return spec.kind == .count or spec.kind == .bool_and or spec.kind == .bool_or or
         (spec.kind == .sum and spec.input_type == .integer) or
         ((spec.kind == .sum or spec.kind == .avg) and spec.input_type == .number and spec.input_element == .numeric);
@@ -1247,29 +1255,67 @@ pub const Grouped = struct {
             self.rows_seen = try std.math.add(u64, prior_rows, source.rows_seen);
             return;
         }
+        var spill_scratch = std.heap.ArenaAllocator.init(self.backing);
+        defer spill_scratch.deinit();
         const states = try self.backing.alloc(Aggregate, self.specs.len);
         defer self.backing.free(states);
         const empty = try self.backing.alloc(Datum, self.specs.len);
         defer self.backing.free(empty);
         @memset(empty, .{});
-        for (source.groups.items, 0..) |group, index| {
-            _ = arena.reset(.free_all);
-            const keys = try source.key_columns.row(arena.allocator(), index);
-            const ordinal = std.math.add(u64, ordinal_base, group.ordinal) catch return error.SqlNumericOutOfRange;
-            for (source.state_columns, states) |*column, *state| state.* = try column.snapshot(arena.allocator(), index);
-            self.key_count = keys.len;
-            if (self.external == null and self.limits.spill != null) {
-                const bytes = try self.numericStateGrowth(keys, states, null);
-                if (!try self.canRetainAdditional(keys, empty, bytes)) try self.startSpill();
+        var begin: usize = 0;
+        while (begin < source.groups.items.len) {
+            _ = arena.reset(.retain_capacity);
+            const a = arena.allocator();
+            const count = @min(64, source.groups.items.len - begin);
+            // Fixed-width partials admit a whole batch before changing groups.
+            // Variable-width and exponent-gap states use precise per-group
+            // admission and merge borrowed typed state directly.
+            var fixed = self.external == null;
+            for (source.state_columns) |column| switch (column.values) {
+                .counts, .integers, .booleans => {},
+                else => fixed = false,
+            };
+            const rows = try a.alloc([]const Datum, count);
+            const width = source.key_columns.columns.len;
+            const cells = try a.alloc(Datum, count * width);
+            var needed: usize = count *| (4096 + self.specs.len *| @sizeOf(Aggregate) *| 2);
+            for (rows, begin..) |*keys, index| {
+                const offset = (index - begin) * width;
+                keys.* = cells[offset..][0..width];
+                for (cells[offset..][0..width], 0..) |*cell, column| cell.* = try source.key_columns.cell(a, index, column);
+                needed +|= (try self.key_columns.appendBytes(keys.*)) *| 4;
             }
-            if (self.external) |external| {
-                try external.partial(keys, states, ordinal);
-            } else {
-                const previous = self.groups.items.len;
-                const slot = try self.resolveGroup(keys);
-                self.groups.items[slot].ordinal = if (slot >= previous) ordinal else @min(self.groups.items[slot].ordinal, ordinal);
-                for (self.state_columns, states) |*column, state| try column.mergeExact(self.budget.allocator(), slot, state);
+            if (fixed and self.budget.live <= self.budget.limit / 2 and needed <= self.budget.limit -| self.budget.live) {
+                var ids: [64]usize = undefined;
+                for (rows, ids[0..count], begin..) |keys, *id, index| {
+                    self.key_count = keys.len;
+                    const previous = self.groups.items.len;
+                    id.* = try self.resolveGroup(keys);
+                    const ordinal = std.math.add(u64, ordinal_base, source.groups.items[index].ordinal) catch return error.SqlNumericOutOfRange;
+                    self.groups.items[id.*].ordinal = if (id.* >= previous) ordinal else @min(self.groups.items[id.*].ordinal, ordinal);
+                }
+                for (self.state_columns, source.state_columns) |*column, *from| try column.mergeBatch(self.budget.allocator(), ids[0..count], from, begin);
+            } else for (rows, begin..) |keys, index| {
+                const ordinal = std.math.add(u64, ordinal_base, source.groups.items[index].ordinal) catch return error.SqlNumericOutOfRange;
+                self.key_count = keys.len;
+                if (self.external == null and self.limits.spill != null) {
+                    const slot = try self.findGroup(keys);
+                    var bytes: usize = 0;
+                    for (self.state_columns, source.state_columns) |*column, *from| bytes +|= try column.mergeGrowth(slot, from, index);
+                    if (!try self.canRetainAdditional(keys, empty, bytes)) try self.startSpill();
+                }
+                if (self.external) |external| {
+                    _ = spill_scratch.reset(.retain_capacity);
+                    for (source.state_columns, states) |*column, *state| state.* = try column.snapshot(spill_scratch.allocator(), index);
+                    try external.partial(keys, states, ordinal);
+                } else {
+                    const previous = self.groups.items.len;
+                    const slot = try self.resolveGroup(keys);
+                    self.groups.items[slot].ordinal = if (slot >= previous) ordinal else @min(self.groups.items[slot].ordinal, ordinal);
+                    for (self.state_columns, source.state_columns) |*column, *from| try column.mergeBatch(self.budget.allocator(), &.{slot}, from, index);
+                }
             }
+            begin += count;
         }
         self.rows_seen = std.math.add(u64, self.rows_seen, source.rows_seen) catch return error.SqlNumericOutOfRange;
     }
@@ -2633,5 +2679,37 @@ test "external lake SQL identified group columns separate source ordinals from i
             count += 1;
         }
         try std.testing.expectEqual(@as(usize, 2), count);
+    }
+}
+
+test "SQL typed grouped partial batches preserve overlapping groups null extrema and ordinals" {
+    const a = std.testing.allocator;
+    const specs = [_]AggregateSpec{ .{ .kind = .count }, .{ .kind = .sum, .input_type = .integer }, .{ .kind = .min, .input_type = .integer }, .{ .kind = .max, .input_type = .integer } };
+    const merged = try Grouped.create(a, &specs, .{});
+    defer merged.deinit();
+    const reference = try Grouped.create(a, &specs, .{});
+    defer reference.deinit();
+    for (0..3) |worker_index| {
+        const worker = try Grouped.create(a, &specs, .{});
+        defer worker.deinit();
+        for (0..257) |index| {
+            const key = Datum.json(.{ .integer = @intCast(index) });
+            const value: Datum = if (index % 17 == 0) .{} else Datum.json(.{ .integer = @as(i64, @intCast(worker_index)) - @as(i64, @intCast(index)) });
+            try worker.add(&.{key}, &.{ value, value, value, value });
+            try reference.add(&.{key}, &.{ value, value, value, value });
+        }
+        try merged.mergeExact(worker, @intCast(worker_index * 257));
+    }
+    try std.testing.expectEqual(reference.rows_seen, merged.rows_seen);
+    try std.testing.expectEqual(reference.groups.items.len, merged.groups.items.len);
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    for (0..257) |index| {
+        _ = arena.reset(.retain_capacity);
+        const actual = try merged.resultAt(arena.allocator(), index);
+        const expected = try reference.resultAt(arena.allocator(), index);
+        try std.testing.expectEqualDeep(expected.keys, actual.keys);
+        try std.testing.expectEqualDeep(expected.aggregates, actual.aggregates);
+        try std.testing.expectEqual(expected.ordinal, actual.ordinal);
     }
 }

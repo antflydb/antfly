@@ -294,6 +294,89 @@ pub const Column = struct {
             else => for (ids, 0..) |id, index| try self.update(a, id, try batch.cell(a, index, 0)),
         }
     }
+    /// Merge compact partial vectors directly after resolving destination IDs.
+    /// Typed states need no Aggregate snapshots, cloned reducers or OwnedRows.
+    pub fn mergeBatch(self: *Column, a: A, ids: []const usize, source: *const Column, begin: usize) !void {
+        if (!std.meta.eql(self.spec, source.spec)) return error.InvalidSqlBackendResponse;
+        if (std.meta.activeTag(self.values) != std.meta.activeTag(source.values)) {
+            if (self.values != .dynamic) try self.promote(a);
+            var arena = std.heap.ArenaAllocator.init(a);
+            defer arena.deinit();
+            for (ids, begin..) |id, index| {
+                _ = arena.reset(.retain_capacity);
+                try @import("aggregate_partial.zig").merge(&self.values.dynamic.items[id], try source.snapshot(arena.allocator(), index));
+            }
+            return;
+        }
+        switch (self.values) {
+            .counts => |*target| for (ids, begin..) |id, index| {
+                target.items[id] = try mergedCount(target.items[id], source.values.counts.items[index]);
+            },
+            .exact => |*target| for (ids, begin..) |id, index| {
+                try target.items[id].merge(source.values.exact.items[index].state);
+            },
+            .integers => |*target| for (ids, begin..) |id, index| {
+                const from = source.values.integers.items[index];
+                const to = &target.items[id];
+                const count = try mergedCount(to.count, from.count);
+                if (self.spec.kind == .sum) {
+                    to.sum = std.math.add(i128, to.sum, from.sum) catch return error.SqlNumericOutOfRange;
+                } else if (from.count != 0 and (to.count == 0 or (if (self.spec.kind == .min) from.selected < to.selected else from.selected > to.selected))) {
+                    to.selected = from.selected;
+                }
+                to.count = count;
+            },
+            .booleans => |*target| for (ids, begin..) |id, index| {
+                const from = source.values.booleans.items[index];
+                const to = &target.items[id];
+                const count = try mergedCount(to.count, from.count);
+                if (from.count != 0) to.value = if (to.count == 0) from.value else if (self.spec.kind == .bool_and or self.spec.kind == .min) to.value and from.value else to.value or from.value;
+                to.count = count;
+            },
+            .bytes => |*target| for (ids, begin..) |id, index| {
+                const from = source.values.bytes.items[index];
+                const to = &target.items[id];
+                const count = try mergedCount(to.count, from.count);
+                if (from.count != 0 and (to.count == 0 or std.mem.order(u8, from.value.?, to.value.?) == (if (self.spec.kind == .min) std.math.Order.lt else .gt))) {
+                    const bytes = try a.dupe(u8, from.value.?);
+                    if (to.value) |old| a.free(old);
+                    to.value = bytes;
+                }
+                to.count = count;
+            },
+            .dynamic => |*target| for (ids, begin..) |id, index| {
+                try @import("aggregate_partial.zig").merge(&target.items[id], source.values.dynamic.items[index]);
+            },
+            .numbers => {
+                var arena = std.heap.ArenaAllocator.init(a);
+                defer arena.deinit();
+                for (ids, begin..) |id, index| {
+                    _ = arena.reset(.retain_capacity);
+                    try self.mergeExact(a, id, try source.snapshot(arena.allocator(), index));
+                }
+            },
+        }
+    }
+    fn mergedCount(left: u64, right: u64) !u64 {
+        const count = std.math.add(u64, left, right) catch return error.SqlNumericOutOfRange;
+        if (count > std.math.maxInt(i64)) return error.SqlNumericOutOfRange;
+        return count;
+    }
+    pub fn mergeGrowth(self: *const Column, index: ?usize, source: *const Column, from: usize) !usize {
+        switch (source.values) {
+            .exact => |values| {
+                const state = values.items[from].state;
+                return self.numericGrowth(index, state.weight, state.buckets.items.len);
+            },
+            .dynamic => |values| {
+                if (values.items[from].numeric) |reducer| return self.numericGrowth(index, reducer.state.weight, reducer.state.buckets.items.len);
+                if (values.items[from].selected) |selected| return (try operators.datumBytes(selected.row.values[0])) *| 4;
+            },
+            .bytes => |values| return if (values.items[from].value) |bytes| bytes.len +| 64 else 0,
+            else => {},
+        }
+        return 0;
+    }
     pub fn mergeExact(self: *Column, a: A, index: usize, state: operators.Aggregate) !void {
         if (state.kind != self.spec.kind or state.input_type != self.spec.input_type or state.input_element != self.spec.input_element or state.distinct != self.spec.distinct) return error.InvalidSqlBackendResponse;
         if (self.values == .exact) {
@@ -385,4 +468,50 @@ test "SQL typed aggregate vectors match scalar states for nulls mixed numerics a
             try std.testing.expectEqualDeep(try reference.finish(), try column.finish(0));
         }
     };
+}
+
+test "SQL typed partial merge batches allocate no primitive snapshots and own strings" {
+    const a = std.testing.allocator;
+    for ([_]operators.AggregateSpec{
+        .{ .kind = .count },                            .{ .kind = .sum, .input_type = .integer },
+        .{ .kind = .min, .input_type = .integer },      .{ .kind = .max, .input_type = .integer },
+        .{ .kind = .min, .input_type = .boolean },      .{ .kind = .max, .input_type = .boolean },
+        .{ .kind = .bool_and, .input_type = .boolean }, .{ .kind = .bool_or, .input_type = .boolean },
+    }) |spec| {
+        try std.testing.expect(operators.exactMergeable(spec));
+        var source = Column.init(spec);
+        defer source.clear(a);
+        var target = Column.init(spec);
+        defer target.clear(a);
+        var reference = try operators.Aggregate.init(a, spec.kind, spec.input_type);
+        defer reference.deinit();
+        try target.append(a);
+        for (0..129) |index| {
+            try source.append(a);
+            const value: Datum = if (index % 7 == 0) .{} else if (spec.input_type == .boolean) Datum.json(.{ .bool = index % 3 == 0 }) else Datum.json(.{ .integer = @as(i64, @intCast(index)) - 64 });
+            try source.update(a, index, value);
+            try reference.update(value);
+        }
+        var none = std.heap.FixedBufferAllocator.init(&.{});
+        const ids: [129]usize = @splat(0);
+        try target.mergeBatch(none.allocator(), &ids, &source, 0);
+        try std.testing.expectEqualDeep(try reference.finish(), try target.finish(0));
+    }
+    for ([_]operators.Aggregate.Kind{ .min, .max }) |kind| {
+        var source = Column.init(.{ .kind = kind, .input_type = .string });
+        errdefer source.clear(a);
+        var target = Column.init(source.spec);
+        defer target.clear(a);
+        try target.append(a);
+        for ([_][]const u8{ "zebra", "apple", "apple" }, 0..) |text, index| {
+            try source.append(a);
+            try source.update(a, index, Datum.json(.{ .string = text }));
+        }
+        try target.mergeBatch(a, &.{ 0, 0, 0 }, &source, 0);
+        source.clear(a);
+        try std.testing.expectEqualStrings(if (kind == .min) "apple" else "zebra", (try target.finish(0)).value.string);
+    }
+    try std.testing.expect(!operators.exactMergeable(.{ .kind = .min, .input_type = .number }));
+    try std.testing.expect(operators.exactMergeable(.{ .kind = .min, .input_type = .integer, .input_element = .int32 }));
+    try std.testing.expect(operators.exactMergeable(.{ .kind = .max, .input_type = .string, .input_element = .text }));
 }

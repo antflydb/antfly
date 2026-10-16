@@ -4993,3 +4993,62 @@ Parquet/Iceberg E2Es passed in one run (608.00 seconds), with the production dis
 guard enabled. Generated error identities, formatting, whitespace, source
 licenses, and the 2,065-file Apache boundary passed. Real-provider retention and
 representative archive-scale latency/RSS qualification remain deferred.
+
+
+## Logical aggregate credits and typed final reduction
+
+Native serial and parallel aggregate scans share statement-level logical credits:
+positive rows consume `ceil(total_rows / statement_execution_rows)` units,
+nonterminal empty pulls consume one unit each, and terminal EOF consumes none.
+The statement chooses the credit size before worker workspace changes physical
+pull sizes. File boundaries, Parquet row-group boundaries, worker fan-out and
+response delivery size cannot multiply positive-row charges. The row ceiling
+still applies independently. Backend row-page and materialized-partial quotas
+retain their existing contracts. This matches native ordered delivery's logical
+work policy; it does not increase configured limits.
+
+Parallel exact reduction includes MIN/MAX for integer widths, booleans and text.
+Their equal values have the same representation, so local extrema can merge in
+any lane order while keeping SQL null handling. Floating extrema, dynamic values
+and other types retain ordered execution: signed-zero representatives and mixed
+numeric representations require a stronger tie contract before parallel use.
+
+Final in-memory reduction packs up to 64 group keys into one scratch matrix,
+resolves destination IDs once, and merges fixed-width partial vectors by column.
+Count, wide integer sum, boolean and integer extrema merging allocate no reducer
+snapshots. NUMERIC merges the borrowed exact accumulator directly, avoiding its
+previous per-group clone. Variable-width states use precise per-group admission;
+exponent gaps spill before allocation and string extrema copy only a replacement
+winner into destination ownership. Durable spill encoding remains the boundary
+for disk partials, with one reusable per-partial scratch arena rather than
+retaining a batch of cloned states. Group ordinals and overflow checks survive
+both batched and spill paths. Small spill reducers also size their active hash
+partition count from workspace (two to eight), preventing nested join reducers
+from retaining eight files each and exhausting merge-run headroom. The shared
+64-file ceiling remains enforced. Sorted skew fallbacks reuse the existing
+anonymous extent store, keeping one descriptor for all logical merge runs
+instead of retaining a separate file for every run.
+
+Ordered producers now use the same CPU workspace policy as aggregate workers,
+reserving half of the shared temporary-work allowance (up to the I/O ceiling)
+for navigation and prefetch. Required caller fallback remains available under
+scheduler saturation. A regression holds actual ordered producer tasks while
+admitting a concurrent 16 MiB I/O task; primitive partial merges are also checked
+with a zero-capacity allocator. Real Parquet regressions cover serial/parallel
+quota equivalence, mixed extrema and a cold-restart grouped MIN/MAX flow.
+
+Merged main `9dd098d773` retains its explicitly pinned runtime error IDs 674 and
+675; the draft branch's conflicting decision-limit detail is assigned 676.
+Main's inference lifecycle changes and corresponding boundary tests are retained.
+Live-provider retention and representative archive-scale latency/RSS measurement
+remain deferred.
+
+
+Qualification on merged main `9dd098d773`: the final Debug CLI built; all 498
+native lake tests (185 shared-engine and 313 server), 22 focused SQL regressions,
+and 31 runtime ABI tests passed. Native suites reported zero failures or leaks.
+All 50 real Parquet/Iceberg E2Es passed in one run (614.96 seconds), including
+the extended grouped extrema cold-restart flow, with production disk safeguards
+enabled. Generated error parity, Zig/Python formatting and lint, whitespace,
+source licenses, and the 2,066-file Apache boundary passed. Archive-scale
+latency/RSS benchmarks and real-provider retention qualification remain deferred.

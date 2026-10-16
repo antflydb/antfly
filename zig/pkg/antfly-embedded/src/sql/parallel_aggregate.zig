@@ -36,8 +36,7 @@ const Work = struct {
     cursor: catalog.Cursor,
     workspace: usize,
     ready: *std.Io.Event,
-    visited: *std.atomic.Value(usize),
-    pages: *std.atomic.Value(usize),
+    quota: *@import("native_scan_quota.zig").Quota,
     fn run(self: Work) anyerror!*Result {
         defer if (self.cursor.finish_partition) |finish| finish(self.cursor.ptr);
         try self.ready.wait(self.context.backend.execution_io.?);
@@ -63,9 +62,7 @@ const Work = struct {
             // Terminal EOF proves exhaustion and spends no logical page credit.
             // Empty nonterminal responses still count, bounding broken cursors.
             if (page.selection.len == 0 and page.after == null) break;
-            const visited = self.visited.fetchAdd(page.selection.len, .monotonic);
-            if (page.selection.len > context.limits.scan_rows -| visited) return error.SqlProgramLimitExceeded;
-            if (self.pages.fetchAdd(1, .monotonic) >= context.limits.scan_pages) return error.SqlProgramLimitExceeded;
+            try self.quota.admit(page.selection.len, page.after == null);
             @import("aggregate_runtime.zig").addColumns(context, self.bound, local, arena.allocator(), page) catch |err| return switch (err) {
                 error.OutOfMemory, error.SqlProgramLimitExceeded => error.ParallelAggregateMemoryExceeded,
                 else => err,
@@ -115,8 +112,7 @@ pub fn execute(context: runtime.Context, bound: *const binding.Bound, grouped: *
         };
         for (locals) |local| if (local) |value| value.deinit();
     }
-    var visited: std.atomic.Value(usize) = .init(0);
-    var pages: std.atomic.Value(usize) = .init(0);
+    var quota: @import("native_scan_quota.zig").Quota = .{ .capacity = context.limits.executionRows(), .row_limit = context.limits.scan_rows, .page_limit = context.limits.scan_pages };
     var worker_context = context;
     worker_context.alloc = a;
     var failure: ?anyerror = null;
@@ -126,7 +122,7 @@ pub fn execute(context: runtime.Context, bound: *const binding.Bound, grouped: *
     var work: [4]Work = undefined;
     const workspace = budget / cursors.len;
     for (cursors, 0..) |cursor, index| {
-        work[index] = .{ .context = worker_context, .bound = bound, .cursor = cursor, .workspace = workspace, .ready = &ready, .visited = &visited, .pages = &pages };
+        work[index] = .{ .context = worker_context, .bound = bound, .cursor = cursor, .workspace = workspace, .ready = &ready, .quota = &quota };
         if (index != 0) tasks[index] = scheduler.submit(io, workspace, Work.run, .{work[index]});
     }
     ready.set(io);

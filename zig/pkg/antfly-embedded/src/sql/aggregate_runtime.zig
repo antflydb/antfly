@@ -380,6 +380,7 @@ pub fn execute(context: anytype, statement: ast.Select) !@import("runtime.zig").
         defer if (after) |key| context.alloc.free(key);
         var pages: usize = 0;
         var visited: usize = 0;
+        var native_quota: @import("native_scan_quota.zig").Quota = .{ .capacity = context.limits.executionRows(), .row_limit = context.limits.scan_rows, .page_limit = context.limits.scan_pages };
         var aggregate_loaded = if (!predicates.empty) try loadMaterialized(context, bound, &grouped, table) else false;
         collector.grouped = grouped;
         const count_only = bound.group_count == 0 and bound.input.predicate == null and predicates.terms.items.len == 0 and predicates.primary_key == null and for (bound.specs, bound.inputs, bound.filters) |spec, input, filter| {
@@ -392,14 +393,11 @@ pub fn execute(context: anytype, statement: ast.Select) !@import("runtime.zig").
         const parallel = bound.ordered.len == 0 and !external and !predicates.empty and !aggregate_loaded and try @import("parallel_aggregate.zig").execute(context, bound, grouped, &scan, table, .{ .fields = fields[0..field_count], .primary_key = predicates.primary_key, .conditions = predicates.terms.items, .limit = context.limits.executionRows() });
         while (!predicates.empty and !aggregate_loaded and !parallel) {
             try context.checkpoint();
-            pages += 1;
-            if (pages > context.limits.scan_pages) return error.SqlProgramLimitExceeded;
             var arena = std.heap.ArenaAllocator.init(context.alloc);
             defer arena.deinit();
             if (!external) if (try scan.columns(context, arena.allocator(), table, .{ .fields = fields[0..field_count], .primary_key = predicates.primary_key, .conditions = predicates.terms.items, .after = after, .limit = context.limits.executionRows() })) |column_page| {
                 if (column_page.selection.len > context.limits.executionRows()) return error.InvalidSqlBackendResponse;
-                if (column_page.selection.len > context.limits.scan_rows -| visited) return error.SqlProgramLimitExceeded;
-                visited += column_page.selection.len;
+                try native_quota.admit(column_page.selection.len, column_page.after == null);
                 try addColumns(context, bound, &collector, arena.allocator(), column_page);
                 const next = column_page.after orelse break;
                 if (!scan.retained(context)) return error.SqlStatementSnapshotRequired;
@@ -411,6 +409,8 @@ pub fn execute(context: anytype, statement: ast.Select) !@import("runtime.zig").
             };
             const page = try scan.page(context, arena.allocator(), table, .{ .fields = fields[0..field_count], .primary_key = predicates.primary_key, .conditions = predicates.terms.items, .after = after, .limit = context.limits.page_rows });
             defer page.deinit();
+            pages += 1;
+            if (pages > context.limits.scan_pages) return error.SqlProgramLimitExceeded;
             if (page.rows.len > context.limits.page_rows) return error.InvalidSqlBackendResponse;
             if (visited + page.rows.len > context.limits.scan_rows) return error.SqlProgramLimitExceeded;
             if (external) {

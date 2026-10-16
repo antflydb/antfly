@@ -69,6 +69,7 @@ pub const Grouped = struct {
     output_count: usize = 0,
     partitioned: bool = false,
     partitions: [8]?spill.Sequential = @splat(null),
+    partition_count: usize,
     partition_index: usize = 0,
     local: ?*operators.Grouped = null,
     fallback: ?*Grouped = null,
@@ -84,7 +85,7 @@ pub const Grouped = struct {
         _ = a;
         const orders = try backing.alloc(operators.Order, key_count);
         @memset(orders, .{});
-        return .{ .a = backing, .sort = spill.Sort.init(backing, manager, orders, bytes / 4), .specs = specs, .state_arena = std.heap.ArenaAllocator.init(backing), .read_arena = std.heap.ArenaAllocator.init(backing), .bytes = bytes, .partitioned = bytes >= 64 * 1024 and for (specs) |spec| {
+        return .{ .a = backing, .sort = spill.Sort.init(backing, manager, orders, bytes / 4), .specs = specs, .state_arena = std.heap.ArenaAllocator.init(backing), .read_arena = std.heap.ArenaAllocator.init(backing), .bytes = bytes, .partition_count = std.math.clamp(bytes / (512 * 1024), 2, 8), .partitioned = bytes >= 64 * 1024 and for (specs) |spec| {
             if (!operators.exactMergeable(spec)) break false;
         } else true };
     }
@@ -152,7 +153,9 @@ pub const Grouped = struct {
             std.mem.writeInt(u64, bytes[1..9], value, .little);
             hash.update(&bytes);
         }
-        const index = hash.final() % self.partitions.len;
+        // Small reducers must not each retain eight files or launch tiny
+        // nested reducers. Size useful hash fan-out from their own workspace.
+        const index = hash.final() % self.partition_count;
         if (self.partitions[index] == null) {
             self.partitions[index] = try spill.Sequential.init(self.sort.manager, @min(4096, self.bytes / 128));
             self.partitions[index].?.buffer_bytes = 512;
@@ -180,7 +183,7 @@ pub const Grouped = struct {
         return null;
     }
     fn startReductions(self: *Grouped, exact: bool) !void {
-        if (self.reduction_lanes == 0) self.reduction_lanes = @import("parallel_scheduler.zig").global().fanout(self.partitions.len, self.bytes, 256 * 1024);
+        if (self.reduction_lanes == 0) self.reduction_lanes = @import("parallel_scheduler.zig").global().fanout(self.partition_count, self.bytes, 256 * 1024);
         const workspace = self.bytes / self.reduction_lanes;
         for (self.reductions[0..self.reduction_lanes]) |*slot| {
             if (slot.* != null) continue;
@@ -293,6 +296,10 @@ pub const Grouped = struct {
                         fallback.* = try Grouped.init(self.a, self.sort.manager, self.specs, self.sort.orders.len, self.bytes);
                         fallback.partitioned = false;
                         fallback.sort.parallel_runs = self.parallel;
+                        // Logical sorted runs share reusable extents in one
+                        // anonymous file, preserving descriptor headroom for
+                        // other live partitions and their merge outputs.
+                        fallback.sort.shared_runs = true;
                         errdefer fallback.deinit();
                         try self.local.?.exportPartial(fallback);
                         self.local.?.deinit();

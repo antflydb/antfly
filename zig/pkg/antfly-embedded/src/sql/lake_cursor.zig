@@ -1619,6 +1619,7 @@ test "lake SQL shared row group tasks and exact parallel reducers match serial g
         "SELECT SUM(amount), COUNT(*) FROM events",
         "SELECT amount % 7 AS bucket, SUM(amount::NUMERIC + '0.10'::NUMERIC), AVG(amount::NUMERIC + '0.10'::NUMERIC) FROM events GROUP BY amount % 7 ORDER BY bucket",
         "SELECT SUM(amount::NUMERIC), AVG(amount::NUMERIC), COUNT(*) FROM events",
+        "SELECT amount % 7 AS bucket, MIN(amount), MAX(amount), MIN(amount::TEXT), MAX(amount::TEXT), MIN(amount > 100), MAX(amount > 100), COUNT(*) FROM events GROUP BY amount % 7 ORDER BY bucket",
         "SELECT amount % 7 AS bucket, COUNT(*) AS n FROM events GROUP BY amount % 7 LIMIT 3",
     }) |sql| {
         var compiled = try compiler.compile(a, sql, .{});
@@ -1631,6 +1632,19 @@ test "lake SQL shared row group tasks and exact parallel reducers match serial g
         defer parallel.deinit();
         try std.testing.expectEqualDeep(serial.output.rows, parallel.output.rows);
         try std.testing.expectEqualDeep(serial.output.sql_nulls, parallel.output.sql_nulls);
+    }
+    // Worker memory changes physical pull sizes, never logical scan credits.
+    var quota_query = try compiler.compile(a, "SELECT SUM(amount), COUNT(*), MIN(amount), MAX(amount) FROM events", .{});
+    defer quota_query.deinit();
+    for ([_]bool{ false, true }) |parallel| {
+        var quota_backend = fixture.backend();
+        if (parallel) quota_backend.execution_io = std.testing.io;
+        var output = try runtime.execute(a, quota_backend, &quota_query, &.{}, .{ .scan_pages = 2, .scan_rows = 8192 });
+        defer output.deinit();
+        try std.testing.expectEqualStrings("8192", output.output.rows[0][1].string);
+        try std.testing.expectEqualStrings("0", output.output.rows[0][2].string);
+        try std.testing.expectEqualStrings("2047", output.output.rows[0][3].string);
+        try std.testing.expectError(error.SqlProgramLimitExceeded, runtime.execute(a, quota_backend, &quota_query, &.{}, .{ .scan_pages = 1, .scan_rows = 8192 }));
     }
     // High-cardinality local reducers spill and merge under shard budgets.
     var high = try compiler.compile(a, "SELECT amount, SUM(amount) FROM events GROUP BY amount ORDER BY amount LIMIT 3", .{});
@@ -2099,11 +2113,11 @@ test "lake SQL paged publication scans retain one file and split independent ord
             const backend: catalog.Backend = .{ .ptr = &fixture, .vtable = &.{ .resolve = Backend.resolve, .scan = Backend.scan, .open_scan = Backend.openScan, .mutate = Backend.mutate, .checkpoint = Backend.checkpoint }, .execution_io = if (parallel) std.testing.io else null };
             // Ten real data pages fit exactly. Worker EOF responses spend no
             // extra page credit and cannot conceal an eleventh data page.
-            var output = try @import("runtime.zig").execute(a, backend, &compiled, &.{}, .{ .scan_pages = 10, .scan_rows = 30 });
+            var output = try @import("runtime.zig").execute(a, backend, &compiled, &.{}, .{ .scan_pages = 1, .scan_rows = 30 });
             defer output.deinit();
             try std.testing.expectEqualStrings("60", output.output.rows[0][0].string);
             try std.testing.expectEqualStrings("30", output.output.rows[0][1].string);
-            try std.testing.expectError(error.SqlProgramLimitExceeded, @import("runtime.zig").execute(a, backend, &compiled, &.{}, .{ .scan_pages = 9, .scan_rows = 30 }));
+            try std.testing.expectError(error.SqlProgramLimitExceeded, @import("runtime.zig").execute(a, backend, &compiled, &.{}, .{ .scan_pages = 1, .scan_rows = 29 }));
         }
     }
     {
