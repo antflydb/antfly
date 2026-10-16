@@ -9135,6 +9135,141 @@ test "relational index publication native reporter CAS is durable atomic and can
     try std.testing.expectEqual(@as(usize, 0), tables.len);
 }
 
+test "relational index publication native restart observation is read only and isolates report namespaces" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/native-restart-observation", .{tmp.sub_path});
+    defer a.free(path);
+    const group = group_ids.main_metadata_group_id;
+    const signing = @import("antfly_local_sources").storage_db_root_signing_identity;
+    const physical_path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/physical-owner", .{tmp.sub_path});
+    defer a.free(physical_path);
+    const root = try signing.loadOrCreate(a, std.testing.io, physical_path);
+    const request = try (standalone_native_owner.Registration{ .identity = .{ .metadata_incarnation = @splat('1'), .node_id = 2, .store_id = 3, .root_incarnation = root.root_incarnation, .public_key = root.public_key }, .reporter_incarnation = 5, .expected_reporter_incarnation = 4, .signature = undefined }).sign(root);
+    const state: RaftApplyStore.BaselineState = .{
+        .active = .{ .incarnation = 4, .sequence = 2 },
+        .garbage = .{ .incarnation = 4, .sequence = 1 },
+        .gc_page = 1,
+        .gc_fragment = 1,
+        .gc_fragment_end = 2,
+        .upload = .{
+            .cursor = .{ .reporter_incarnation = 4, .sequence = 3, .digest = @splat(7) },
+            .chunk_count = 2,
+            .total_bytes = 64,
+            .fragment_count = 1,
+            .fragment_received = 8,
+            .fragment_total = 16,
+            .fragment_group_id = 888,
+            .fragment_digest = @splat(8),
+            .expected_header = @splat(1),
+            .admission_cursor = null,
+            .report_header_digest = @splat(2),
+        },
+    };
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    const baseline_key = try RaftApplyStore.baselineKey(scratch, group, 3);
+    const state_bytes = try std.json.Stringify.valueAlloc(scratch, state, .{});
+    const active: RaftApplyStore.ReportAddress = .{ .store_id = 3, .generation = state.active };
+    const pending: RaftApplyStore.ReportAddress = .{ .store_id = 3, .generation = .{ .incarnation = 4, .sequence = 3 } };
+    const membership_key = try RaftApplyStore.reportMembershipKey(scratch, group, active);
+    const fragment_key = try pending.key(scratch, group, "fragment", 0);
+    var observed: standalone_native_owner.RestartObservation = undefined;
+    {
+        var store = try RaftApplyStore.init(a, .{ .root_dir = path });
+        defer store.deinit();
+        try store.applyStandaloneCommand(group, .{ .initialize_metadata_incarnation = request.identity.metadata_incarnation });
+        try store.updateStandaloneCatalog(group, try store.standaloneRevision(), .{ .auxiliary_json = "{}" });
+        try std.testing.expectError(error.TableTopologyProtocolUpgradeRequired, store.observeStandaloneNativeReporter(group, request));
+        const activation = try std.json.Stringify.valueAlloc(scratch, topology_protocol.Activation{ .version = topology_protocol.store_root_enrollment_version, .incarnation = request.identity.metadata_incarnation, .member_count = 1, .membership_fingerprint = @splat(7) }, .{});
+        try store.applyStandaloneCommand(group, .{ .activate_topology_protocol = activation });
+        try std.testing.expectError(error.StoreRootEnrollmentChanged, store.observeStandaloneNativeReporter(group, request));
+        try store.updateStandaloneCatalog(group, try store.standaloneRevision(), .{ .native_owner = request.binding() });
+        var first = request;
+        first.expected_reporter_incarnation = null;
+        first = try first.sign(root);
+        const empty = try store.observeStandaloneNativeReporter(group, first);
+        try std.testing.expect(empty.header_digest == null and !empty.root_enrolled and !empty.reporter_matches);
+        try std.testing.expect((try store.readStore(a, group, 3, false)) == null);
+        try store.applyStandaloneCommand(group, .{ .register_store = .{ .store_id = 3, .node_id = 2, .reporter_incarnation = 4, .replica_root_incarnation = root.root_incarnation, .replica_root_public_key = root.public_key } });
+        {
+            var txn = try store.store.beginWriteTxn();
+            errdefer txn.abort();
+            try txn.put(baseline_key, state_bytes);
+            // A read-only restart cut must not expand either report inventory
+            // or a partial upload. Poison values make accidental decoding fail.
+            try txn.put(membership_key, "not-a-report-directory");
+            try txn.put(fragment_key, "preserve-incomplete-upload");
+            try txn.put("unrelated:user:row", "preserve-user-data");
+            try txn.commit();
+        }
+        const revision = try store.standaloneRevisionState();
+        observed = try store.observeStandaloneNativeReporter(group, request);
+        try std.testing.expectEqual(revision.revision, observed.revision);
+        try std.testing.expect(!observed.reporter_matches);
+        try std.testing.expect(!observed.root_enrolled and !observed.replication_pending);
+        try std.testing.expectEqualDeep(state.active, observed.active);
+        try std.testing.expectEqualDeep(state.upload.?.cursor, observed.pending.?);
+        try std.testing.expectEqualDeep(state.garbage, observed.retired);
+        try std.testing.expectEqual(@as(usize, 1), observed.gc_page);
+        try std.testing.expectEqualSlices(u8, &try request.message(), &observed.request_digest);
+        var wrong = request;
+        wrong.expected_reporter_incarnation = 6;
+        wrong = try wrong.sign(root);
+        try std.testing.expectError(error.GenerationPublicationChanged, store.observeStandaloneNativeReporter(group, wrong));
+        wrong = request;
+        wrong.identity.metadata_incarnation = @splat('2');
+        wrong = try wrong.sign(root);
+        try std.testing.expectError(error.StoreRootEnrollmentChanged, store.observeStandaloneNativeReporter(group, wrong));
+        for (0..7) |fault| {
+            var invalid = state;
+            switch (fault) {
+                0 => invalid.garbage = invalid.active,
+                1 => invalid.upload.?.cursor.sequence = invalid.active.sequence,
+                2 => invalid.upload.?.cursor.sequence = invalid.garbage.?.sequence,
+                3 => invalid.active.sequence = 0,
+                4 => invalid.gc_fragment = invalid.gc_fragment_end + 1,
+                5 => invalid.garbage = null,
+                6 => invalid.upload.?.next_chunk = invalid.upload.?.chunk_count + 1,
+                else => unreachable,
+            }
+            try std.testing.expectError(error.InvalidCatalogRecord, invalid.validateRestartObservation());
+            const invalid_bytes = try std.json.Stringify.valueAlloc(scratch, invalid, .{});
+            {
+                var txn = try store.store.beginWriteTxn();
+                errdefer txn.abort();
+                try txn.put(baseline_key, invalid_bytes);
+                try txn.commit();
+            }
+            try std.testing.expectError(error.InvalidCatalogRecord, store.observeStandaloneNativeReporter(group, request));
+            var read = try store.store.beginReadTxn();
+            defer read.abort();
+            try std.testing.expectEqualStrings(invalid_bytes, try read.get(baseline_key));
+            try std.testing.expectEqualStrings("preserve-incomplete-upload", try read.get(fragment_key));
+        }
+        {
+            var txn = try store.store.beginWriteTxn();
+            errdefer txn.abort();
+            try txn.put(baseline_key, state_bytes);
+            try txn.commit();
+        }
+        try std.testing.expectEqualDeep(revision, try store.standaloneRevisionState());
+    }
+    var reopened = try RaftApplyStore.init(a, .{ .root_dir = path });
+    defer reopened.deinit();
+    try std.testing.expectEqualDeep(root, try signing.load(a, std.testing.io, physical_path));
+    try std.testing.expectEqualDeep(observed, try reopened.observeStandaloneNativeReporter(group, request));
+    var read = try reopened.store.beginReadTxn();
+    defer read.abort();
+    try std.testing.expectEqualStrings(state_bytes, try read.get(baseline_key));
+    try std.testing.expectEqualStrings("not-a-report-directory", try read.get(membership_key));
+    try std.testing.expectEqualStrings("preserve-incomplete-upload", try read.get(fragment_key));
+    try std.testing.expectEqualStrings("preserve-user-data", try read.get("unrelated:user:row"));
+    try std.testing.expect(try reopened.nativeIndexSigningViewTxn(&read, group, request.identity.metadata_incarnation) == null);
+}
+
 test "native initial support finalization requires current bound root and durable owner progress" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -15452,7 +15587,9 @@ pub const RaftApplyStore = struct {
         return self.updateStandaloneCatalog(group_id, expected_revision, .{ .replace = true, .tables = tables, .ranges = ranges, .auxiliary_json = auxiliary_json });
     }
 
-    fn registerStandaloneNativeOwnerTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group_id: u64, request: standalone_native_owner.Registration) !void {
+    /// Constant-size preimage check shared by read-only restart observation and
+    /// apply. Returned headers never include report membership or components.
+    fn checkStandaloneNativeOwnerTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group_id: u64, request: standalone_native_owner.Registration) !?metadata.StoreRecord {
         try request.validate();
         const activation = try self.requireTopologyActivationTxn(txn, group_id, topology_protocol.store_root_enrollment_version);
         if (activation.version < topology_protocol.store_root_enrollment_version) return error.TableTopologyProtocolUpgradeRequired;
@@ -15462,7 +15599,7 @@ pub const RaftApplyStore = struct {
         if (!binding.eql(request.binding()) or !std.mem.eql(u8, &activation.incarnation, &request.identity.metadata_incarnation))
             return error.StoreRootEnrollmentChanged;
         const current = try self.loadStoreHeaderTxn(txn, group_id, request.identity.store_id);
-        defer if (current) |record| metadata_table_manager.freeStore(self.alloc, record);
+        errdefer if (current) |record| metadata_table_manager.freeStore(self.alloc, record);
         if (current) |record| {
             if (record.store_id != request.identity.store_id or record.node_id != request.identity.node_id or
                 record.replica_root_incarnation != request.identity.root_incarnation or
@@ -15472,11 +15609,55 @@ pub const RaftApplyStore = struct {
             // requires the signed preimage and cannot steal a newer process.
             if (record.reporter_incarnation == request.reporter_incarnation) {
                 if (!std.mem.eql(u8, &record.replica_root_public_key, &request.identity.public_key)) return error.StoreRootEnrollmentChanged;
-                return;
+                return current;
             }
             if (request.expected_reporter_incarnation == null or request.expected_reporter_incarnation.? != record.reporter_incarnation)
                 return error.GenerationPublicationChanged;
         } else if (request.expected_reporter_incarnation != null) return error.GenerationPublicationChanged;
+        return current;
+    }
+
+    /// Observe restart obligations without staging a command or walking old
+    /// report membership. This does not authorize reporter turnover: the old
+    /// registration writer still needs bounded namespace retirement and an
+    /// exclusive physical-owner startup lease before automatic activation.
+    pub fn observeStandaloneNativeReporter(self: *RaftApplyStore, group_id: u64, request: standalone_native_owner.Registration) !standalone_native_owner.RestartObservation {
+        var txn = try self.store.beginReadTxn();
+        defer txn.abort();
+        const current = try self.checkStandaloneNativeOwnerTxn(&txn, group_id, request);
+        defer if (current) |record| metadata_table_manager.freeStore(self.alloc, record);
+        const state = try baselineStateTxn(self.alloc, &txn, group_id, request.identity.store_id);
+        try state.validateRestartObservation();
+        const root_enrolled = enrolled: {
+            self.requireStoreRootEnrollmentTxn(&txn, group_id, request.identity) catch |err| switch (err) {
+                error.StoreRootEnrollmentChanged => break :enrolled false,
+                else => return err,
+            };
+            break :enrolled true;
+        };
+        const raw_revision = try txn.get(standalone_revision_key);
+        if (raw_revision.len != 8) return error.InvalidStandaloneCatalog;
+        return .{
+            .revision = std.mem.readInt(u64, raw_revision[0..8], .little),
+            .request_digest = try request.message(),
+            .header_digest = if (current) |record| try reportHeaderDigest(self.alloc, record) else null,
+            .baseline_digest = try store_report_baseline.reportDigest(state),
+            .reporter_matches = if (current) |record| record.reporter_incarnation == request.reporter_incarnation else false,
+            .root_enrolled = root_enrolled,
+            .replication_pending = try stagingGet(&txn, metadata_hot_standby.outbox_key) != null,
+            .active = state.active,
+            .pending = if (state.upload) |upload| upload.cursor else null,
+            .retired = state.garbage,
+            .gc_page = state.gc_page,
+            .gc_fragment = state.gc_fragment,
+            .gc_fragment_end = state.gc_fragment_end,
+        };
+    }
+
+    fn registerStandaloneNativeOwnerTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group_id: u64, request: standalone_native_owner.Registration) !void {
+        const current = try self.checkStandaloneNativeOwnerTxn(txn, group_id, request);
+        defer if (current) |record| metadata_table_manager.freeStore(self.alloc, record);
+        if (current) |record| if (record.reporter_incarnation == request.reporter_incarnation) return;
         var replacement: metadata.StoreRecord = current orelse .{ .store_id = request.identity.store_id, .node_id = request.identity.node_id };
         replacement.reporter_incarnation = request.reporter_incarnation;
         replacement.replica_root_incarnation = request.identity.root_incarnation;
@@ -21616,6 +21797,32 @@ pub const RaftApplyStore = struct {
         gc_page: usize = 0,
         gc_fragment: u32 = 0,
         gc_fragment_end: u32 = 0,
+
+        fn validateRestartObservation(self: @This()) !void {
+            // All sequence-zero addresses map to the legacy namespace. Reject
+            // noncanonical spellings rather than overlooking physical aliases.
+            try validateGeneration(self.active);
+            if (self.gc_fragment > self.gc_fragment_end or self.gc_fragment_end > store_report_baseline.max_chunks)
+                return error.InvalidCatalogRecord;
+            if (self.garbage) |retired| {
+                try validateGeneration(retired);
+                if (std.meta.eql(retired, self.active)) return error.InvalidCatalogRecord;
+            } else if (self.gc_page != 0 or self.gc_fragment != 0 or self.gc_fragment_end != 0) return error.InvalidCatalogRecord;
+            if (self.upload) |upload| {
+                const pending: store_report_baseline.Generation = .{ .incarnation = upload.cursor.reporter_incarnation, .sequence = upload.cursor.sequence };
+                try validateGeneration(pending);
+                if (pending.sequence == 0 or std.meta.eql(pending, self.active) or
+                    (self.garbage != null and std.meta.eql(pending, self.garbage.?)) or
+                    upload.chunk_count == 0 or upload.chunk_count > store_report_baseline.max_chunks or
+                    upload.next_chunk > upload.chunk_count or upload.total_bytes == 0 or
+                    upload.total_bytes > store_report_baseline.max_inventory_bytes or upload.received_bytes > upload.total_bytes)
+                    return error.InvalidCatalogRecord;
+            }
+        }
+
+        fn validateGeneration(value: store_report_baseline.Generation) !void {
+            if ((value.incarnation == 0) != (value.sequence == 0)) return error.InvalidCatalogRecord;
+        }
     };
     fn baselinePrefixForGroup(buf: []u8, group_id: u64) ![]const u8 {
         return std.fmt.bufPrint(buf, "\x00\x00__metadata__:store_report_baseline:{d}:", .{group_id});

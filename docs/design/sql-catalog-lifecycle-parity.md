@@ -8834,3 +8834,37 @@ the apply transaction leaves the job head unchanged for either stale guard.
 Formatting, license, Apache, inventory, control-catalog and whitespace checks pass.
 No new original-case credit or complete wire/distributed rollback claim is made;
 the original inventory remains 483 implemented / 862 unresolved.
+
+### Read-only native restart obligations
+
+Tracing actual startup confirms that standalone's public store projection is
+synthetic and DataServer's registration/report publisher returns early without
+remote metadata. Durable native index admission requires a real current store
+reporter, physical-root signing identity and explicit root enrollment; the public
+listing cannot supply that evidence. Automatic startup activation remains off.
+
+The metadata owner now exposes a read-only restart observation sharing apply's
+signed identity, native binding, decoder-floor and reporter-CAS preimage checks.
+One read snapshot captures the standalone revision, request/header/baseline
+commitments, enrollment and outbox status, active generation, pending upload
+cursor and retired-generation GC cursors. It does not enumerate report members,
+decode upload fragments, stage commands, replace a reporter or enroll a root.
+Noncanonical legacy addresses, active/pending/retired aliases and invalid cursors
+fail closed. This observation is not a lease, admission grant or GC instruction.
+
+Debug qualification passed 60/60 build steps in
+`/private/tmp/antfly-native-restart-observation-final-debug.log`: 70 publication
+tests and one decoder-barrier test, without failures, skips or leaks. The new
+fixture signs with an actual persisted physical-root key, reopens metadata and
+the root, and preserves deliberately undecodable report membership, incomplete
+upload bytes and an unrelated user sentinel. Seven invalid durable state cuts
+reject through the storage read path without repairing or deleting their bytes.
+The signed foreign-incarnation/stale-reporter cases reject without revision
+changes. Inventory, license and compilation-boundary checks pass.
+
+This is bounded-access source evidence, not a cardinality/latency benchmark or
+full real-owner SQL qualification. The exclusive startup lease, coordinated new
+generation format, bounded reporter turnover/upload retirement, actual source
+reporting and end-to-end SQL build/rollback/restart gates remain unfinished. The
+previous safety restriction on production retirement is unchanged. No original
+case disposition changes: 483 implemented / 862 unresolved.

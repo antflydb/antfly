@@ -33,7 +33,7 @@ pub const Registration = struct {
         return .{ .metadata_incarnation = self.identity.metadata_incarnation, .node_id = self.identity.node_id, .store_id = self.identity.store_id, .root_incarnation = self.identity.root_incarnation };
     }
 
-    fn message(self: Registration) ![32]u8 {
+    pub fn message(self: Registration) ![32]u8 {
         if (self.reporter_incarnation == 0) return error.InvalidStandaloneNativeOwner;
         var hash = std.crypto.hash.Blake3.init(.{});
         hash.update("antfly/standalone-native-reporter/v1");
@@ -62,6 +62,25 @@ pub const Registration = struct {
     pub fn validate(self: Registration) !void {
         signing.verify(self.identity.public_key, &try self.message(), self.signature) catch return error.InvalidStandaloneNativeOwner;
     }
+};
+
+/// Read-only restart evidence, not a registration grant or a GC instruction.
+/// Every field belongs to one metadata snapshot. Admission must recheck the
+/// signed preimage and its own decoder/physical-owner lease requirements.
+pub const RestartObservation = struct {
+    revision: u64,
+    request_digest: [32]u8,
+    header_digest: ?[32]u8,
+    baseline_digest: [32]u8,
+    reporter_matches: bool,
+    root_enrolled: bool,
+    replication_pending: bool,
+    active: @import("store_report_baseline.zig").Generation,
+    pending: ?@import("store_report_update.zig").Cursor,
+    retired: ?@import("store_report_baseline.zig").Generation,
+    gc_page: usize,
+    gc_fragment: u32,
+    gc_fragment_end: u32,
 };
 
 pub const Binding = struct {
