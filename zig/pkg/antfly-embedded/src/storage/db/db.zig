@@ -28008,6 +28008,10 @@ pub const DB = struct {
         return repair_id;
     }
 
+    fn graphReplacementCutoverBudgetNs(activation_attempts: u32) u64 {
+        return (if (activation_attempts >= 8) @as(u64, 1000) else 100) * std.time.ns_per_ms;
+    }
+
     const PreparedGraphReplacement = struct {
         manager: *index_manager_mod.IndexManager,
         sequence: u64,
@@ -28025,8 +28029,7 @@ pub const DB = struct {
             // ordinals retain completed work when either budget expires. A
             // slow storage operation may overrun a quantum, but no loop may
             // hold write admission until an arbitrarily large tail is empty.
-            const pause_ms: u64 = if (candidate.activation_attempts >= 8) 1000 else 100;
-            const deadline = @min(db.graphReplacementWorkNow() +| pause_ms * std.time.ns_per_ms, candidate.deadline_ns orelse std.math.maxInt(u64));
+            const deadline = @min(db.graphReplacementWorkNow() +| graphReplacementCutoverBudgetNs(candidate.activation_attempts), candidate.deadline_ns orelse std.math.maxInt(u64));
             // Freeze writes only for a bounded progress window. Even a tail
             // larger than 1024 can advance its durable checkpoint; it never
             // throws completed work away waiting for an initially small gap.
@@ -28337,10 +28340,12 @@ pub const DB = struct {
     const GraphReplacementIdentity = struct { name: []const u8, generation: u64 };
 
     fn advanceGraphReplacementUntil(self: *DB, deadline: ?u64) !bool {
-        return self.advanceGraphReplacementForIdentityUntil(deadline, null, false);
+        return self.advanceGraphReplacementForIdentityUntil(deadline, null, .manual);
     }
 
-    fn advanceGraphReplacementForIdentityUntil(self: *DB, deadline: ?u64, identity: ?GraphReplacementIdentity, bounded_replay: bool) !bool {
+    const GraphReplacementDrive = enum { manual, detached, cutover };
+
+    fn advanceGraphReplacementForIdentityUntil(self: *DB, deadline: ?u64, identity: ?GraphReplacementIdentity, drive: GraphReplacementDrive) !bool {
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return false;
         if (deadline) |end| if (self.graphReplacementWorkNow() >= end) return self.hasPendingGraphReplacements();
         if (!self.graph_replacement_mutex.tryLock()) return self.hasPendingGraphReplacements();
@@ -28370,7 +28375,13 @@ pub const DB = struct {
                 try self.core.index_manager.saveGraphReplacementBuild(self.core.store, saved);
             }
             if (saved.retry_after_ns > retry_now) continue;
-            return self.advanceGraphReplacementOnce(deadline, saved, bounded_replay) catch |err| {
+            // The native cutover shares the tail's finite escalation policy.
+            // Select its budget from this already-loaded durable reservation.
+            const work_deadline = if (drive == .cutover)
+                self.graphReplacementWorkNow() +| graphReplacementCutoverBudgetNs(saved.activation_attempts)
+            else
+                deadline;
+            return self.advanceGraphReplacementOnce(work_deadline, saved, drive == .detached) catch |err| {
                 if (err == error.Canceled or err == error.Cancelled or err == error.EnrichmentWaitCanceled) {
                     // A stale detached snapshot yields without failing the job
                     // or consuming its retry budget. Interrupting this owner
@@ -28784,7 +28795,7 @@ pub const DB = struct {
             // corpus builds. Recheck its generation under scheduler ownership
             // so cancellation/name reuse cannot redirect this quantum.
             try self.driveManualGraphReplacementReplay(pending.producer_replay_target, deadline);
-            _ = try self.advanceGraphReplacementForIdentityUntil(deadline, .{ .name = name, .generation = generation }, false);
+            _ = try self.advanceGraphReplacementForIdentityUntil(deadline, .{ .name = name, .generation = generation }, .manual);
             // The control IO also exists for manual/inline runtimes. Never
             // spin when there is no independent background IO runtime.
             try self.core.index_manager.checkpointIo().sleep(.fromMilliseconds(1), .awake);
@@ -32879,7 +32890,7 @@ pub const DB = struct {
     /// publication fence. Producer replay runs in the separate detached turn.
     pub fn finishBackgroundGraphReplacement(self: *DB, name: []const u8, generation: u64) !bool {
         if (comptime storage_engine.enabled) return storage_engine.call("finishBackgroundGraphReplacement", .{ self, name, generation });
-        return self.advanceGraphReplacementForIdentityUntil(self.graphReplacementWorkNow() +| 100 * std.time.ns_per_ms, .{ .name = name, .generation = generation }, false);
+        return self.advanceGraphReplacementForIdentityUntil(null, .{ .name = name, .generation = generation }, .cutover);
     }
 
     /// Detached Lite turns alternate replay with generation-scoped shadow
@@ -32893,7 +32904,7 @@ pub const DB = struct {
                 if (self.resolution_runtime == null) try self.initResolutionRuntime();
                 if (self.promotion_runtime == null) try self.initPromotionRuntime();
             }
-            return self.advanceGraphReplacementForIdentityUntil(null, null, true);
+            return self.advanceGraphReplacementForIdentityUntil(null, null, .detached);
         }
         const before = self.core.nextDerivedSequence();
         try self.runUntilIdleWithReplayDrainOptions(.{
@@ -70689,8 +70700,10 @@ test "db query capture retains settled terminal repair debt without acknowledgin
     try std.testing.expectError(error.EnrichmentWorkerFailed, db.captureQueryCut(request, .none));
     runtime.worker_failed = false;
     runtime.retrying = true;
+    runtime.next_retry_at_ms = runtime.clock.nowRealtimeMs() + 60_000;
     try std.testing.expectError(error.EnrichmentRetryInProgress, db.captureQueryCut(request, .none));
     runtime.retrying = false;
+    runtime.next_retry_at_ms = 0;
 
     var retained = try db.openQueryCut(request, .none);
     defer retained.close();
@@ -138309,7 +138322,7 @@ test "capi resolver escalated deadline bounds tail work and releases queued writ
     DB.test_graph_replacement_tail_batch = Check.batch;
     defer DB.test_graph_replacement_tail_batch = null;
     defer if (Check.thread) |worker| worker.join();
-    try std.testing.expect(try db.advanceGraphReplacement());
+    try std.testing.expect(try db.finishBackgroundGraphReplacement("new", job.generation));
     const io = db.core.index_manager.checkpointIo();
     try Check.done.waitTimeout(io, .{ .duration = .{ .raw = .fromMilliseconds(1500), .clock = .awake } });
     Check.thread.?.join();
@@ -139554,7 +139567,7 @@ test "inline resolver replacement named scheduler rejects a reused reservation g
     const current = try db.replaceGraphIndex("old", cfg);
     try std.testing.expect(current != previous);
     // Model reuse between a waiter's observation and scheduler admission.
-    try std.testing.expect(try db.advanceGraphReplacementForIdentityUntil(null, .{ .name = "new", .generation = previous }, false));
+    try std.testing.expect(try db.advanceGraphReplacementForIdentityUntil(null, .{ .name = "new", .generation = previous }, .manual));
     try std.testing.expect(db.indexGeneration("new") == null);
     const jobs = try db.graphReplacementStatusAlloc(a);
     defer jobs.deinit();

@@ -587,6 +587,7 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
         "capi get edges json does not double free a non-empty edge slice",
         "capi native text queries",
         "capi native replacement wait",
+        "capi native resolver maintenance retries",
         "capi Lite models_dir loads a real extractor",
         "capi Lite promotion resolves ANN",
         "capi Lite promotion retains writer admission",
