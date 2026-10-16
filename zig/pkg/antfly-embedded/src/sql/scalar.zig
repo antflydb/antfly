@@ -4087,16 +4087,14 @@ const Evaluator = struct {
 
     fn jsonText(self: *Evaluator, value: Json) ![]const u8 {
         _ = try self.validateJson(value, 0);
-        var writer: std.Io.Writer.Allocating = .init(self.alloc);
-        errdefer writer.deinit();
-        // The execution allocator also carries the statement-wide hard cap.
-        // Count before producing output so a large JSON subtree cannot evade
-        // this scalar's independent output bound.
-        var counter: std.Io.Writer.Discarding = .init(&.{});
-        try std.json.Stringify.value(value, .{}, &counter.writer);
-        try self.charge(std.math.cast(usize, counter.count) orelse return error.SqlProgramLimitExceeded);
-        std.json.Stringify.value(value, .{}, &writer.writer) catch return error.OutOfMemory;
-        return writer.toOwnedSlice();
+        // SQL casts/path text use PostgreSQL JSONB display, not compact API
+        // JSON serialization. Reuse the exact-output, cooperatively budgeted
+        // formatter rather than serializing/reparsing the typed DOM.
+        var work = self.workBudget();
+        const text = try @import("jsonb_text.zig").format(self.alloc, value, self.limits.output_bytes -| self.bytes, &work);
+        errdefer self.alloc.free(text);
+        try self.charge(text.len);
+        return text;
     }
 
     fn validateJson(self: *Evaluator, value: Json, depth: usize) anyerror!usize {
@@ -6093,6 +6091,27 @@ test "SQL Unicode text hot loop reuses bounded output scratch" {
     try std.testing.expectEqual(@as(usize, 12550000), checksum);
     try std.testing.expect(arena.queryCapacity() <= 8192);
     std.debug.print("SQL Unicode text: rows=50000 scratch_bytes={d} elapsed_ns={d}\n", .{ arena.queryCapacity(), std.Io.Clock.now(.awake, std.testing.io).nanoseconds - started });
+}
+
+test "SQL JSONB casts and path text share canonical display and NULL provenance" {
+    const cases = [_]struct { sql: []const u8, text: ?[]const u8 }{
+        .{ .sql = "CAST('{\"zz\":1.2300e2,\"a\":[true,null]}'::jsonb AS text)", .text = "{\"a\": [true, null], \"zz\": 123.00}" },
+        .{ .sql = "'{\"a\":{\"zz\":1.2300e2,\"b\":2}}'::jsonb ->> 'a'", .text = "{\"b\": 2, \"zz\": 123.00}" },
+        .{ .sql = "CAST('\"text\"'::jsonb AS text)", .text = "\"text\"" },
+        .{ .sql = "CAST('null'::jsonb AS text)", .text = "null" },
+        .{ .sql = "CAST(NULL::jsonb AS text)", .text = null },
+    };
+    for (cases) |case| {
+        var compiled = try @import("compiler.zig").compileScalar(std.testing.allocator, case.sql, .{});
+        defer compiled.deinit();
+        var program = try bind(std.testing.allocator, compiled.expression, &.{}, &.{}, .{});
+        defer program.deinit();
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        const value = try program.evaluate(arena.allocator(), &.{}, &.{}, .{});
+        try std.testing.expectEqual(case.text == null, value.sql_null);
+        if (case.text) |text| try std.testing.expectEqualStrings(text, value.value.string);
+    }
 }
 
 test "SQL typed JSON construction and path extraction preserve scalar and NULL provenance" {

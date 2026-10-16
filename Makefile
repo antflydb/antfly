@@ -199,7 +199,7 @@ operator-docker-build: ## Build the antfly-operator Docker image.
 # SQL Extraction Audits (intentionally outside default build/test gates)
 # ====================================================================================
 
-.PHONY: sql-parity-inventory-check sql-parity-evidence-check sql-parity-release-check sql-catalog-lifecycle-oracle-check sql-default-lifecycle-oracle-check
+.PHONY: sql-parity-inventory-check sql-parity-evidence-check sql-parity-release-check sql-catalog-lifecycle-oracle-check sql-default-lifecycle-oracle-check sql-table-creation-oracle-check
 
 sql-parity-inventory-check: ## Audit SQL parity inventory.
 	python3 scripts/check_sql_parity_inventory.py
@@ -215,3 +215,6 @@ sql-catalog-lifecycle-oracle-check: ## Check PostgreSQL catalog lifecycle contra
 
 sql-default-lifecycle-oracle-check: ## Check exact PostgreSQL default DDL and future mutation contracts.
 	uv run --no-project --with 'psycopg[binary]==3.3.6' python -m unittest discover -s scripts -p test_sql_default_lifecycle.py
+
+sql-table-creation-oracle-check: ## Check PostgreSQL generated/default CREATE and complete mutation postimages.
+	uv run --no-project --with 'psycopg[binary]==3.3.6' python -m unittest discover -s scripts -p test_sql_table_creation_lifecycle.py

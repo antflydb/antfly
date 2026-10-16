@@ -9684,3 +9684,35 @@ asynchronous Raft projection race is fixed in the shared service path.
 GC was previewed, not run globally. Three obsolete owned failed-run executables
 were verified unused and removed (about 1.3 GiB); source and test data remain
 intact, and those executables are rebuildable. Unrelated edits remain unstaged.
+
+### JSONB text boundary and public CREATE qualification in progress
+
+SQL JSONB-to-text casts and nested `->>` results now reuse the native
+PostgreSQL JSONB display formatter, rather than the compact API JSON serializer.
+The shared formatter preserves numeric display scale, PostgreSQL object-key
+ordering and delimiters, and distinguishes JSON null text from SQL NULL. It
+allocates the exact output once without serializing and reparsing a DOM, and
+retains the evaluator's input, depth, work, cancellation and output admission.
+API JSON serialization and semantic content hashing are unchanged.
+
+The scalar regression checks scaled exponent numbers, nested objects, scalar
+strings, JSON null and SQL NULL. A separate runtime regression verifies exact
+JSONB number tokens at mutation preparation and commit callbacks. Focused Debug
+gates pass in `/private/tmp/antfly-sql-jsonb-cast-focused-debug.log` and
+`/private/tmp/antfly-sql-jsonb-insert-boundary-debug.log`. The full SQL Debug gate
+passes 1,102 tests with four existing opt-in skips and no failures or leaks in
+`/private/tmp/antfly-sql-jsonb-full-debug.log` (21/21 build steps).
+
+`scripts/test_sql_table_creation_lifecycle.py`, available through
+`make sql-table-creation-oracle-check`, independently verifies JSONB text
+semantics and original sql-0671/sql-0675 CREATE, complete INSERT RETURNING and
+future mutation postimages against PostgreSQL 18.6 (server version 180006).
+Public native CREATE qualification remains incomplete: the mounted campaign
+passes generated INSERT RETURNING assertions, but subsequent SELECT loses
+numeric display scale and reports a changed generated extraction. The failure
+is retained in
+`/private/tmp/antfly-sql-table-creation-returning-native-debug.log`; a committed
+primary assertion is being added to distinguish commit from readback loss.
+Neither original is newly qualified. Counts remain 529 implemented / 132
+rejected / 113 superseded / 812 unresolved. No distributed activation or lost
+response recovery completion is claimed by these scalar/contract tests.

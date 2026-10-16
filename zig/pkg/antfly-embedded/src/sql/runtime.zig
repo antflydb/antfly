@@ -2697,6 +2697,32 @@ const TestBackend = struct {
     }
 };
 
+test "SQL INSERT hands exact JSONB display tokens to mutation preparation" {
+    const Provider = struct {
+        fn resolve(_: *anyopaque, _: std.mem.Allocator, _: ast.Name, _: catalog.Action) !catalog.Table {
+            return .{ .id = 19, .physical_name = "table:stable", .schema_version = 7, .columns = &.{
+                .{ .name = "payload", .path = "payload", .type = .json, .element_type = .jsonb },
+            } };
+        }
+        fn prepare(_: *anyopaque, _: std.mem.Allocator, _: catalog.Table, mutations: []const catalog.Mutation) ![]const catalog.Mutation {
+            const payload = mutations[0].row.?.object.get("payload").?;
+            try std.testing.expectEqualStrings("1.2300e2", payload.object.get("source").?.number_string);
+            return mutations;
+        }
+        fn mutate(_: *anyopaque, _: std.mem.Allocator, _: std.mem.Allocator, _: catalog.Table, mutations: []const catalog.Mutation) !catalog.MutationOutcome {
+            try std.testing.expectEqualStrings("1.2300e2", mutations[0].row.?.object.get("payload").?.object.get("source").?.number_string);
+            return .committed;
+        }
+    };
+    var provider: TestBackend = .{};
+    const backend: catalog.Backend = .{ .ptr = &provider, .vtable = &.{ .resolve = Provider.resolve, .scan = TestBackend.scan, .mutate = Provider.mutate, .mutate_prepared = Provider.mutate, .prepare_mutations = Provider.prepare, .checkpoint = TestBackend.checkpoint } };
+    var compiled = try compiler.compile(std.testing.allocator, "INSERT INTO things (_id,payload) VALUES ('one','{\"source\":1.2300e2}'::jsonb)", .{});
+    defer compiled.deinit();
+    var result = try execute(std.testing.allocator, backend, &compiled, &.{}, .{});
+    defer result.deinit();
+    try std.testing.expectEqual(@as(usize, 1), result.output.rows_affected);
+}
+
 test "SQL commit serialization is released before the statement result" {
     const Provider = struct {
         fn mutate(_: *anyopaque, alloc: std.mem.Allocator, _: std.mem.Allocator, _: catalog.Table, mutations: []const catalog.Mutation) !catalog.MutationOutcome {
