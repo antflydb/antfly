@@ -1338,7 +1338,9 @@ jobs:
     name: zig-full / build-cache / ${{ matrix.shard }}
     needs: [admission, changes]
     runs-on: arc-antfly-heavy
-    timeout-minutes: 40
+    # The production ownership audit includes seven incremental source
+    # mutations: measured cold/read/write phases alone take 35 minutes.
+    timeout-minutes: ${{ matrix.shard == 'storage-ownership' && 90 || 40 }}
     strategy:
       fail-fast: false
       matrix:

@@ -130,6 +130,12 @@ pub fn addWithStorageOwner(b: *std.Build, module: *std.Build.Module, providers: 
         // Traverse imports without caching Module.getGraph: composition owners
         // still add build-info imports after this helper returns.
         addLinks(b, run, module, &visited, &libraries);
+        if (storage_owner) |owner| {
+            // The owner is already force-loaded above. Its imported native
+            // dependencies still belong to this final dynamic image.
+            libraries.put(owner, {}) catch @panic("OOM");
+            addLinks(b, run, owner.root_module, &visited, &libraries);
+        }
         for (providers) |provider| {
             if (!(libraries.getOrPut(provider) catch @panic("OOM")).found_existing) {
                 run.addFileArg(provider.getEmittedBin());
@@ -280,6 +286,23 @@ pub fn addStorageProbe(b: *std.Build, module: *std.Build.Module, name: []const u
     object.entry = .enabled;
     object.bundle_compiler_rt = false;
     object.bundle_ubsan_rt = false;
+    const image = nativeExecutableLink(b, object, name);
+    const link = image.link;
+    var modules: std.AutoHashMap(*std.Build.Module, void) = .init(b.allocator);
+    var libraries: std.AutoHashMap(*std.Build.Step.Compile, void) = .init(b.allocator);
+    addLinks(b, link, module, &modules, &libraries);
+    const run = std.Build.Step.Run.create(b, name);
+    run.addFileArg(image.binary);
+    return run;
+}
+
+pub const NativeExecutable = struct {
+    link: *std.Build.Step.Run,
+    binary: std.Build.LazyPath,
+};
+
+pub fn nativeExecutableLink(b: *std.Build, object: *std.Build.Step.Compile, name: []const u8) NativeExecutable {
+    const target = object.root_module.resolved_target.?.result;
     const link = b.addSystemCommand(&.{"python3"});
     link.addFileArg(b.path("tools/native_executable_link.py"));
     const deployment = target.os.version_range.semver.min;
@@ -290,12 +313,17 @@ pub fn addStorageProbe(b: *std.Build, module: *std.Build.Module, name: []const u
     link.addArg("--output");
     const binary = link.addOutputFileArg(name);
     link.addArg("--");
+    return .{ .link = link, .binary = binary };
+}
+
+pub fn addNativeExecutableLinks(b: *std.Build, image: NativeExecutable, object: *std.Build.Step.Compile, module: *std.Build.Module) void {
     var modules: std.AutoHashMap(*std.Build.Module, void) = .init(b.allocator);
     var libraries: std.AutoHashMap(*std.Build.Step.Compile, void) = .init(b.allocator);
-    addLinks(b, link, module, &modules, &libraries);
-    const run = std.Build.Step.Run.create(b, name);
-    run.addFileArg(binary);
-    return run;
+    // The entry object is already the --object argument. Its imported modules
+    // can still contribute frameworks and provider archives.
+    libraries.put(object, {}) catch @panic("OOM");
+    addLinks(b, image.link, object.root_module, &modules, &libraries);
+    addLinks(b, image.link, module, &modules, &libraries);
 }
 
 pub fn setStripRecursively(module: *std.Build.Module, visited: *std.AutoHashMap(*std.Build.Module, void)) void {

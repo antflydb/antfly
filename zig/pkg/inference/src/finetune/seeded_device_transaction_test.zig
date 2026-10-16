@@ -40,6 +40,11 @@ const Fake = struct {
 
     fn init(a: Allocator) Fake {
         var result = Fake{ .allocator = a };
+        // Optional capabilities must be absent unless this fake implements
+        // them. New backend hooks must never become undefined callbacks.
+        inline for (@typeInfo(ops.ComputeBackend.VTable).@"struct".field_names) |name| {
+            if (@typeInfo(@FieldType(ops.ComputeBackend.VTable, name)) == .optional) @field(result.vtable, name) = null;
+        }
         result.vtable.backendKind = backendKind;
         result.vtable.freeTensor = free;
         result.vtable.residentTrainingPrimitive = primitive;

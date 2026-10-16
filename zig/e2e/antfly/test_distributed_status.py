@@ -643,21 +643,32 @@ def test_non_host_api_reports_remote_index_status_from_metadata_heartbeat(
             assert response.status_code == 202, response.text
             return {"baseline": baseline, "report": report}
 
-        admitted = wait_until(admit_reference, timeout_s=15, interval_s=0.1)
+        admitted: dict[str, Any] | None = None
+
+        def committed_reference() -> dict[str, Any] | None:
+            nonlocal admitted
+            current = raw_store()
+            if admitted is not None:
+                report = admitted["report"]
+                identity = ("reporter_incarnation", "status_generation")
+                if all(current.get(key) == report.get(key) for key in identity):
+                    return (
+                        current
+                        if current["available_bytes"] == report["available_bytes"]
+                        else None
+                    )
+                # HTTP 202 acknowledges admission. A full report already in
+                # flight at SIGSTOP can commit afterward, making the sparse
+                # reference obsolete at apply. Rebase only when its persisted
+                # authority changes; do not repeatedly enqueue pending work.
+            admitted = admit_reference()
+            return None
+
+        current = wait_until(committed_reference, timeout_s=15, interval_s=0.1)
+        assert current is not None, split_status_cluster.debug_logs()
         assert admitted is not None
         report = admitted["report"]
         baseline = admitted["baseline"]
-
-        def committed_reference() -> dict[str, Any] | None:
-            current = raw_store()
-            return (
-                current
-                if current["available_bytes"] == report["available_bytes"]
-                else None
-            )
-
-        current = wait_until(committed_reference, timeout_s=15, interval_s=0.1)
-        assert current is not None
         assert current["runtime_statuses"] == baseline["runtime_statuses"]
         assert current["group_statuses"] == report["group_statuses"]
         for invalid in (

@@ -525,12 +525,10 @@ def main() -> None:
             )
 
         for label, relative, rebuilt, cached in cases:
-            # The final contract mutation rebuilds more production artifacts
-            # than any other case. Give it a fresh cache before that peak. An
-            # earlier rollover also keeps a long mutation series below the PVC.
-            if label == "storage contract" or shutil.disk_usage(work).free < 12 * (
-                1 << 30
-            ):
+            # Keep the measured warm cache across mutations. A second cold
+            # build adds a full production compile without testing another
+            # ownership property. Roll over only under real disk pressure.
+            if shutil.disk_usage(work).free < 12 * (1 << 30):
                 restart_cache(label)
             path = own(root, source_owner_path(relative))
             # Keep earlier edits in this private overlay. Restoring one would

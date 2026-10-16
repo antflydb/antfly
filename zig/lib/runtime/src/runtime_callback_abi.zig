@@ -25,7 +25,7 @@ const std = @import("std");
 const error_abi = @import("runtime_error_abi.zig");
 const native_abi = @import("runtime_native_abi.zig");
 
-test "boundary dispatcher preserves graph and SQL read readiness across runtime units" {
+test "boundary dispatcher preserves readiness and storage contention across runtime units" {
     const VTable = struct {
         query: *const fn (*const anyerror) anyerror!u64,
     };
@@ -44,7 +44,7 @@ test "boundary dispatcher preserves graph and SQL read readiness across runtime 
             return TestBoundary.local_dispatch(contract, callback, args, output);
         }
     };
-    for ([_]anyerror{ error.MetricNotReady, error.MetricStale, error.SqlStatementReadUnavailable }) |err| {
+    for ([_]anyerror{ error.MetricNotReady, error.MetricStale, error.FileBusy, error.WouldBlock, error.SqlStatementReadUnavailable }) |err| {
         try std.testing.expectError(err, TestBoundary.call("query", &Callbacks.foreignDispatch, &Callbacks.query, .{&err}));
     }
 }

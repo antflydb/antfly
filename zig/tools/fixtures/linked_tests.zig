@@ -18,6 +18,7 @@ const linked = @import("pkg/antfly/build/linked_tests.zig");
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
+    const native_link = b.option(bool, "native-link", "Use the native archive test linker") orelse false;
     const filters = @import("build_test_filters.zig").select(b.allocator, buildArguments(b) orelse &.{}, &.{"fixture"});
     const error_logs = b.createModule(.{
         .root_source_file = b.path("pkg/antfly-embedded/src/test_error_logs.zig"),
@@ -40,6 +41,7 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
     });
     consumer_module.addImport("antfly_test_error_logs", error_logs);
+    if (native_link) @import("antfly_platform").addMacosSdkPaths(b, consumer_module, target);
     consumer_module.addCSourceFile(.{ .file = b.path("consumer.c"), .flags = &.{} });
     const consumer = linked.add(b, .{
         .name = "fixture-consumer",
@@ -91,6 +93,7 @@ pub fn build(b: *std.Build) void {
         @import("build_support/antfly/test_support.zig").configureTestRun(child);
         concurrent.dependOn(&child.step);
     }
+    if (native_link) linked.finalizeNativeLinks(b);
 }
 
 fn buildArguments(b: *std.Build) ?[]const []const u8 {

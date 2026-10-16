@@ -175,7 +175,13 @@ class BuildMemoryAccounting(unittest.TestCase):
 
 
 class BuildFailureEvidence(unittest.TestCase):
-    def test_contract_rollover_discards_both_caches_and_keeps_mutations(self):
+    def test_contract_reuses_both_caches_when_disk_has_headroom(self):
+        self.exercise_contract_cache(low_disk=False)
+
+    def test_disk_pressure_rollover_discards_both_caches_and_keeps_mutations(self):
+        self.exercise_contract_cache(low_disk=True)
+
+    def exercise_contract_cache(self, *, low_disk):
         expected = (
             ("cold", set()),
             ("warm", set()),
@@ -188,8 +194,14 @@ class BuildFailureEvidence(unittest.TestCase):
             ("physical local query", {"antfly-storage-kernel"}),
             ("owner integration test", {"storage-owner-tests"}),
             ("consumer test root", {"api-table-read-tests"}),
-            ("storage contract cold", set()),
-            ("storage contract warm", set()),
+            *(
+                (
+                    ("storage contract cold", set()),
+                    ("storage contract warm", set()),
+                )
+                if low_disk
+                else ()
+            ),
             (
                 "storage contract",
                 {
@@ -226,6 +238,9 @@ class BuildFailureEvidence(unittest.TestCase):
                     b"storage compilation ownership regression",
                     (cwd / "pkg/antfly/src/api/table_reads.zig").read_bytes(),
                 )
+            if label == "storage contract" and not low_disk:
+                self.assertTrue((local_cache / "marker").is_file())
+                self.assertTrue((global_cache / "marker").is_file())
             local_cache.mkdir(exist_ok=True)
             (local_cache / "marker").touch()
             (global_cache / "marker").touch()
@@ -266,13 +281,13 @@ class BuildFailureEvidence(unittest.TestCase):
                 mock.patch.object(
                     measurement, "measured_build", side_effect=fake_build
                 ),
-                # This case exercises the explicit contract rollover. Host disk
-                # pressure has its own runtime trigger and must not change the
-                # mocked sequence of builds.
+                # Trigger disk pressure only before the final mutation.
                 mock.patch.object(
                     measurement.shutil,
                     "disk_usage",
-                    return_value=mock.Mock(free=64 << 30),
+                    side_effect=lambda *_: mock.Mock(
+                        free=(8 if low_disk and len(seen) == 8 else 64) << 30
+                    ),
                 ),
             ):
                 measurement.main()
