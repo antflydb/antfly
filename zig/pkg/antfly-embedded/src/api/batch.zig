@@ -553,15 +553,19 @@ pub fn parseBatchRequest(alloc: std.mem.Allocator, body: []const u8) !OwnedBatch
 }
 
 pub fn parseInternalBatchRequest(alloc: std.mem.Allocator, body: []const u8) !OwnedBatchRequest {
-    return try parseBatchRequestWithOptions(alloc, body, .{
-        // Row/transform numbers belong to the schema, not the transport.
-        // Parsing decimal integer spellings as f64 here irreversibly rounds
-        // values before the storage owner's exact typed-row preparation.
-        .parse_numbers = false,
-        .allocate = .alloc_always,
-        .max_value_len = public_limits.max_json_value_len,
-    }, true);
+    return try parseBatchRequestWithOptions(alloc, body, internal_json_options, true);
 }
+
+/// Shared by private envelope owners before parseInternalBatchValue. Keep
+/// exact tokens and the same input admission as the private text parser.
+pub const internal_json_options: std.json.ParseOptions = .{
+    // Row/transform numbers belong to the schema, not the transport.
+    // Parsing decimal integer spellings as f64 here irreversibly rounds
+    // values before the storage owner's exact typed-row preparation.
+    .parse_numbers = false,
+    .allocate = .alloc_always,
+    .max_value_len = public_limits.max_json_value_len,
+};
 
 test "distributed txn batch transport preserves exact row and transform number tokens" {
     const alloc = std.testing.allocator;
@@ -613,12 +617,24 @@ fn parseBatchRequestWithOptions(
         else => return error.InvalidBatchRequest,
     };
     defer parsed.deinit();
-    const versioned = parsed.value == .array;
+    return parseBatchValue(alloc, parsed.value, allow_internal);
+}
+
+/// Internal transport owners may reuse their already parsed envelope. Numeric
+/// tokens must have been parsed losslessly (parse_numbers=false). The returned
+/// request owns its data independently of the borrowed tree, just as the text
+/// ingress parser owns it independently of its temporary parse arena.
+pub fn parseInternalBatchValue(alloc: std.mem.Allocator, value: std.json.Value) !OwnedBatchRequest {
+    return parseBatchValue(alloc, value, true);
+}
+
+fn parseBatchValue(alloc: std.mem.Allocator, input_value: std.json.Value, allow_internal: bool) !OwnedBatchRequest {
+    const versioned = input_value == .array;
     const root_value = if (versioned) blk: {
-        const entries = parsed.value.array.items;
+        const entries = input_value.array.items;
         if (!allow_internal or entries.len != 2 or entries[0] != .string or !std.mem.eql(u8, entries[0].string, "row-semantics-batch-v1")) return error.InvalidBatchRequest;
         break :blk entries[1];
-    } else parsed.value;
+    } else input_value;
     if (root_value != .object) return error.InvalidBatchRequest;
     const root = root_value.object;
     if (!allow_internal and (root.get("_graph_writes") != null or root.get("_graph_deletes") != null))
@@ -2325,7 +2341,10 @@ fn parseTransformOps(alloc: std.mem.Allocator, value: std.json.Value) ![]db_mod.
         db_mod.transform.validateDocumentTransform(alloc, .{
             .key = "",
             .operations = @constCast((&[_]db_mod.types.TransformOp{parsed_op})[0..]),
-        }) catch return error.InvalidBatchRequest;
+        }) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => return error.InvalidBatchRequest,
+        };
         ops[initialized] = parsed_op;
         initialized += 1;
     }

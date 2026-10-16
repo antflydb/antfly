@@ -9716,3 +9716,39 @@ primary assertion is being added to distinguish commit from readback loss.
 Neither original is newly qualified. Counts remain 529 implemented / 132
 rejected / 113 superseded / 812 unresolved. No distributed activation or lost
 response recovery completion is claimed by these scalar/contract tests.
+
+The committed-primary probe isolated the remaining display loss to the Raft
+batch envelope: its outer DOM parser converted numbers before the already
+lossless inner batch parser ran. The envelope now uses the shared private input
+options and decodes the parsed batch directly, eliminating a whole-batch
+serialize/reparse and its temporary allocations. Public/private ingress retain
+the same validation and ownership implementation. Protocol barriers continue to
+require strict bounded integer tokens. Allocation fault injection additionally
+found and fixed allocator failures being reported as generic writer failure in
+the envelope encoder and as invalid user input in transform validation.
+
+All 15 selected Raft batch/protocol regressions pass, including scaled/wide/tiny
+JSONB numbers, exact transform values, freeing the envelope before consuming the
+owned request, every allocation failure, owner descriptors, binary ranges,
+split/merge/artifact/graph payloads and strict barriers. The mounted generated
+and casted-default campaign also passes ordinary and RETURNING writes, exact
+committed primary values and the complete restart lifecycle. Three additional
+fresh-owner Debug soaks pass in
+`/private/tmp/antfly-sql-table-creation-soak-current-{1,2,3}-debug.log`; their
+executable predates only the transform allocation-error classification fix.
+The matching PostgreSQL oracle passes in
+`/private/tmp/antfly-sql-table-creation-ordinary-returning-oracle.log`.
+
+Qualification is still withheld: the final combined gate in
+`/private/tmp/antfly-sql-table-creation-raft-allocation-debug.log` passes all
+transport/fault regressions and the prior default lifecycle, but reproduces a
+startup catalog-publication timeout before either original CREATE. Diagnostics
+show ready constraint-name reconciliation, matching source epoch and no serving
+root. Proof preparation currently fences its cached scan by the global applied
+index, so unrelated metadata churn can discard bounded progress. Investigate
+that scheduling/fencing interaction next. Do not extend the deadline, accept a
+partial root, manually activate coverage, or reuse an old proof based solely on
+semantic source equality. The existing exact applied-cut, source/job/root and
+capability checks must be retained or replaced by equally strong durable
+proof-input/namespace fencing with explicit adoption. Neither original receives
+new coverage credit until the complete gate is reliable.

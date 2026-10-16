@@ -191,6 +191,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "raft batch round trips binary initial owner range",
         "raft protocol barrier is fail closed for legacy batch parsers",
         "raft protocol barrier rejects unsupported future versions",
+        "raft protocol barrier rejects noninteger and out of range tokens",
         "raft proposal materializes a default batch timestamp exactly once",
         "online merge admission distinguishes unsupported peers and fences leader authority",
         "distributed online merge admission declines both owners and direct source proposals",
