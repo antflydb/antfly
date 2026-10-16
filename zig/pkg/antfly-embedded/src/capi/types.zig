@@ -395,6 +395,8 @@ fn classifyError(err: anyerror) ErrorCode {
         error.ResolverAlreadyExists,
         error.ResolverArtifactAlreadyExists,
         error.ResolverLabelRoutingConflict,
+        error.ResolverReplacementOwnershipConflict,
+        error.ResolverReplacementRequiresFreshArtifacts,
         error.ResolverSourceArtifactImmutable,
         error.ResolverArtifactImmutable,
         error.InvalidResolverConfig,

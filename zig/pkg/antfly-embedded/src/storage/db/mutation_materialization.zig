@@ -8949,6 +8949,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             store: *docstore_mod.DocStore,
             index_manager: *index_manager_mod.IndexManager,
             doc_key: []const u8,
+            index_name: []const u8,
             source_artifact_name: []const u8,
         ) !?[]u8 {
             var arena = std.heap.ArenaAllocator.init(alloc);
@@ -8958,7 +8959,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             var resolver_targets_artifact = false;
 
             for (index_manager.resolvers.items) |*cfg| {
-                if (!std.mem.eql(u8, cfg.source_artifact, source_artifact_name)) continue;
+                if (!cfg.visibleToGraph(index_name) or !std.mem.eql(u8, cfg.source_artifact, source_artifact_name)) continue;
                 resolver_targets_artifact = true;
                 const res_key = try internal_keys.resolutionArtifactKeyAlloc(a, doc_key, cfg.resolution_artifact);
                 const raw = store.get(a, res_key) catch |err| switch (err) {
@@ -9477,7 +9478,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                             }
                             for (index_manager.graphArtifactSources(index_ref.name)) |source| {
                                 if (source.mention_edge_type.len == 0) continue;
-                                if (resolverConfigForResolution(index_manager, source.artifact_name, parsed.artifact_name) != null) return .relevant;
+                                if (resolverConfigForResolution(index_manager, index_ref.name, source.artifact_name, parsed.artifact_name) != null) return .relevant;
                             }
                             if (resolverConfigForResolutionArtifact(index_manager, parsed.artifact_name) != null) continue;
                             return .missing_dependency;
@@ -9636,7 +9637,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                             }
                             for (index_manager.graphArtifactSources(index_ref.name)) |source| {
                                 if (source.mention_edge_type.len == 0) continue;
-                                if (resolverConfigForResolution(index_manager, source.artifact_name, parsed.artifact_name) != null) return .relevant;
+                                if (resolverConfigForResolution(index_manager, index_ref.name, source.artifact_name, parsed.artifact_name) != null) return .relevant;
                             }
                             if (resolverConfigForResolutionArtifact(index_manager, parsed.artifact_name) != null) continue;
                             return .missing_dependency;
@@ -9694,7 +9695,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
 
             var parsed_artifact = try std.json.parseFromSlice(std.json.Value, alloc, raw, .{ .parse_numbers = false });
             defer parsed_artifact.deinit();
-            const endpoint_resolutions = try graphEndpointResolutionsJsonAlloc(alloc, store, index_manager, artifact_ref.document_id, source.artifact_name);
+            const endpoint_resolutions = try graphEndpointResolutionsJsonAlloc(alloc, store, index_manager, artifact_ref.document_id, index_name, source.artifact_name);
             defer if (endpoint_resolutions) |value| alloc.free(value);
             if (endpoint_resolutions) |res_raw| try injectGraphEndpointResolutions(&parsed_artifact, res_raw);
             const raw_doc = try storeDocumentValueForGraphSource(
@@ -9839,7 +9840,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             }
             for (changed_artifact_keys) |key| {
                 if (!internal_keys.isResolutionArtifactKey(key)) continue;
-                if (try resolutionOwningAssetArtifactKeyAlloc(alloc, index_manager, key)) |asset| {
+                if (try resolutionOwningAssetArtifactKeyAlloc(alloc, index_manager, index_name, key)) |asset| {
                     const entry = resolved_assets.getOrPut(alloc, asset) catch |err| {
                         alloc.free(asset);
                         return err;
@@ -9898,7 +9899,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                         if (options.repair_ctx) |ctx| ctx.relational_base_rows else false,
                     );
                     defer if (raw_doc) |doc_value| alloc.free(doc_value);
-                    const endpoint_resolutions = try graphEndpointResolutionsJsonAlloc(alloc, store, index_manager, artifact_ref.document_id, source.artifact_name);
+                    const endpoint_resolutions = try graphEndpointResolutionsJsonAlloc(alloc, store, index_manager, artifact_ref.document_id, index_name, source.artifact_name);
                     defer if (endpoint_resolutions) |res_raw| alloc.free(res_raw);
                     const graph_writes = graphWritesFromArtifactValueAlloc(
                         alloc,
@@ -10072,7 +10073,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 }
             }
 
-            const cfg = resolverConfigForResolution(index_manager, source.artifact_name, parsed_key.artifact_name) orelse {
+            const cfg = resolverConfigForResolution(index_manager, index_name, source.artifact_name, parsed_key.artifact_name) orelse {
                 // A multi-source graph pairs every changed resolution key with every
                 // mention-edge source. A resolution artifact owned by a different
                 // source's resolver (e.g. label-routed autoschema layouts with one
@@ -11560,7 +11561,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             }
 
             for (index_manager.resolvers.items) |cfg| {
-                if (!std.mem.eql(u8, cfg.source_artifact, source.artifact_name)) continue;
+                if (!cfg.visibleToGraph(index_name) or !std.mem.eql(u8, cfg.source_artifact, source.artifact_name)) continue;
 
                 const state_name = try mentionGraphStateNameAlloc(alloc, source.artifact_name, cfg.resolution_artifact);
                 defer alloc.free(state_name);
@@ -11580,22 +11581,25 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
         pub fn resolutionOwningAssetArtifactKeyAlloc(
             alloc: Allocator,
             index_manager: *index_manager_mod.IndexManager,
+            index_name: []const u8,
             resolution_key: []const u8,
         ) !?[]u8 {
             const parsed_key = (try internal_keys.parseResolutionArtifactKeyAlloc(alloc, resolution_key)) orelse return null;
             defer alloc.free(parsed_key.doc_key);
             defer alloc.free(parsed_key.artifact_name);
             const cfg = resolverConfigForResolutionArtifact(index_manager, parsed_key.artifact_name) orelse return null;
+            if (!cfg.visibleToGraph(index_name)) return null;
             return try internal_keys.artifactNamedPrefixAlloc(alloc, parsed_key.doc_key, "asset", cfg.source_artifact);
         }
 
         pub fn resolverConfigForResolution(
             index_manager: *index_manager_mod.IndexManager,
+            index_name: []const u8,
             source_artifact: []const u8,
             resolution_artifact: []const u8,
         ) ?*const index_manager_mod.ResolverConfig {
             for (index_manager.resolvers.items) |*cfg| {
-                if (std.mem.eql(u8, cfg.source_artifact, source_artifact) and
+                if (cfg.visibleToGraph(index_name) and std.mem.eql(u8, cfg.source_artifact, source_artifact) and
                     std.mem.eql(u8, cfg.resolution_artifact, resolution_artifact))
                 {
                     return cfg;
@@ -11609,6 +11613,9 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             resolution_artifact: []const u8,
         ) ?*const index_manager_mod.ResolverConfig {
             for (index_manager.resolvers.items) |*cfg| {
+                if (std.mem.eql(u8, cfg.resolution_artifact, resolution_artifact)) return cfg;
+            }
+            for (index_manager.retired_resolvers.items) |*cfg| {
                 if (std.mem.eql(u8, cfg.resolution_artifact, resolution_artifact)) return cfg;
             }
             return null;
