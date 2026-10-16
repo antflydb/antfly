@@ -1378,3 +1378,40 @@ def test_child_permanent_epoch_survives_root_temporary_fence(tmp_path, storage):
     with _open_graph_test(path, options) as db:
         # Permanent aggregation is durable, even before opening the child.
         assert db.capabilities()["minimum_reader_version"] == 3
+
+
+def test_native_child_replacement_replays_generated_artifacts_beside_idle_root(tmp_path):
+    options = antfly_embedded.OpenOptions(
+        storage=antfly_embedded.Storage.LITE,
+        profile=antfly_embedded.Profile.NATIVE,
+        generated_enrichment_replay=True,
+    )
+    with antfly_embedded.create_with_options(tmp_path / "child-replacement.aflite", options) as db:
+        db.create_table("child", {})
+        with db.open_table("child") as table:
+            table.add_index({"name": "old", "type": "graph", "edge_types": [{"name": "R", "field": "links"}]})
+            table.batch_json(
+                {
+                    "inserts": {
+                        "claim": {"links": ["old"], "kg": {"entities": [{"id": "a", "text": "Ada", "label": "person"}]}}
+                    }
+                }
+            )
+            table.run_until_idle()
+            replacement = _resolver_graph("new", "people", destination="child")
+            replacement["replaces"] = "old"
+            try:
+                table.add_index(dict(replacement, wait={"timeout_ms": 0}))
+            except antfly_embedded.BusyError:
+                pass
+            deadline = time.monotonic() + 20
+            while time.monotonic() < deadline:
+                names = {index["name"] for index in table.list_indexes()}
+                if "new" in names and "old" not in names:
+                    break
+                time.sleep(0.02)
+            else:
+                pytest.fail(f"child replacement starved producer replay: {table.pending_work_stats()}")
+            assert [
+                base64.b64decode(edge["target_b64"]).decode() for edge in table.edges("new", "claim", "mentions", 0)
+            ] == ["entity/ada"]

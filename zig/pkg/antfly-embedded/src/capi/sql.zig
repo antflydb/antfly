@@ -538,7 +538,7 @@ pub fn Adapter(comptime native: type) type {
             return owned;
         }
 
-        fn waitSearchIndexes(self: *Self, alloc: std.mem.Allocator, req: types.SearchRequest, deadline_ns: u64) !u64 {
+        pub fn waitSearchIndexes(self: *Self, alloc: std.mem.Allocator, req: types.SearchRequest, deadline_ns: u64) !u64 {
             var names: std.ArrayList([]const u8) = .empty;
             defer names.deinit(alloc);
             const append = struct {
@@ -552,10 +552,38 @@ pub fn Adapter(comptime native: type) type {
             for (req.full_text_queries) |query| try append(alloc, &names, query.index_name);
             for (req.dense_queries) |query| try append(alloc, &names, query.index_name);
             for (req.sparse_queries) |query| try append(alloc, &names, query.index_name);
-            for (req.graph_queries) |query| try append(alloc, &names, query.name);
-            if (req.full_text_queries.len == 0 and req.primary_text_index_name == null and req.index_name == null and
-                (req.full_text != null or (req.dense == null and req.sparse == null and req.dense_queries.len == 0 and req.sparse_queries.len == 0 and req.graph_queries.len == 0)))
-                try append(alloc, &names, native.public_api.tables.default_full_text_index_name);
+            for (req.graph_queries) |query| try append(alloc, &names, query.query.index_name);
+            const implicit_text = req.dense == null and req.sparse == null and req.dense_queries.len == 0 and req.sparse_queries.len == 0 and req.graph_queries.len == 0;
+            if (req.filter_text != null or req.exclusion_text != null or req.filter_query_json.len != 0 or req.exclusion_query_json.len != 0 or (req.full_text_queries.len == 0 and (req.full_text != null or implicit_text))) {
+                // Resolve from the owning engine's catalog. Archive consumers
+                // do not own its physical text-index handles. Match execution's
+                // primary -> singleton selector -> sole/default text fallback.
+                // Structured filters can also read this text snapshot.
+                const indexes = try self.db.listIndexes(alloc);
+                defer types.freeIndexConfigs(alloc, indexes);
+                var primary: ?[]const u8 = null;
+                var singleton: ?[]const u8 = null;
+                var default: ?[]const u8 = null;
+                var sole: ?[]const u8 = null;
+                var count: usize = 0;
+                for (indexes) |index| if (index.kind == .full_text) {
+                    count += 1;
+                    sole = index.name;
+                    if (req.primary_text_index_name) |name| if (std.mem.eql(u8, name, index.name)) {
+                        primary = index.name;
+                    };
+                    if (req.index_name) |name| if (std.mem.eql(u8, name, index.name)) {
+                        singleton = index.name;
+                    };
+                    if (std.mem.eql(u8, index.name, native.public_api.tables.default_full_text_index_name)) default = index.name;
+                };
+                if (primary orelse singleton orelse (if (count == 1) sole else default)) |name| {
+                    try append(alloc, &names, name);
+                    // Names borrowed from the catalog must remain live until
+                    // the executor has consumed the visibility request.
+                    return self.db.waitForCurrentIndexTargets(names.items, deadline_ns);
+                }
+            }
             return self.db.waitForCurrentIndexTargets(names.items, deadline_ns);
         }
 

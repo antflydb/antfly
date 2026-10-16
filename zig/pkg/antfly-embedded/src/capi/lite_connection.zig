@@ -457,6 +457,9 @@ fn releaseGate(gate: *PathGate) void {
 // Compatible connections borrow one persistent generation and one maintenance
 // worker. SQL sessions, cursor IDs, and child handles remain connection-local.
 pub const Owner = struct {
+    const MaintenanceKey = struct { table_id: u64, incarnation: u128 };
+    const MaintenanceSchedule = struct { shadow_next: bool = true, live: bool = true };
+
     path: []const u8,
     options: api.LiteResolvedOpenOptions,
     owned_ttl_owner_id: ?[]u8 = null,
@@ -465,7 +468,9 @@ pub const Owner = struct {
     worker: ?std.Thread = null,
     stopping: std.atomic.Value(bool) = .init(false),
     maintenance_pending: bool = false,
-    maintenance_shadow_next: bool = true,
+    // Owner lifetime, rather than DB-runtime lifetime: snapshot refreshes must
+    // not reset a table's replay/construction alternation.
+    maintenance_schedules: std.AutoHashMapUnmanaged(MaintenanceKey, MaintenanceSchedule) = .empty,
     next_ttl_ns: i96 = 0,
     wake: std.Io.Event = .unset,
     current: ?*h.Handle = null,
@@ -801,6 +806,20 @@ pub const Owner = struct {
                 if (hasPendingGeneratedEnrichment(&table.*.db)) self.maintenance_pending = true;
             }
         }
+        // Prune dropped/recreated namespaces without retaining names or old
+        // runtimes. IDs never repeat; the root incarnation also fences file
+        // replacement. This remains bounded by the current table catalog.
+        var schedules = self.maintenance_schedules.valueIterator();
+        while (schedules.next()) |schedule| schedule.live = false;
+        if (self.maintenance_schedules.getPtr(.{ .table_id = foreground.db.core.identity_namespace.table_id, .incarnation = foreground.db.root_incarnation })) |schedule| schedule.live = true;
+        var live_tables = foreground.embedded_tables.valueIterator();
+        while (live_tables.next()) |table| {
+            if (self.maintenance_schedules.getPtr(.{ .table_id = table.*.db.core.identity_namespace.table_id, .incarnation = table.*.db.root_incarnation })) |schedule| schedule.live = true;
+        }
+        var stale = self.maintenance_schedules.iterator();
+        while (stale.next()) |entry| if (!entry.value_ptr.live) {
+            self.maintenance_schedules.removeByPtr(entry.key_ptr);
+        };
         const count = foreground.embedded_tables.count() + 1;
         const ordinal = self.maintenance_table_cursor % count;
         var database = &foreground.db;
@@ -810,6 +829,12 @@ pub const Owner = struct {
             for (0..ordinal) |_| selected = tables.next().?.*;
             database = &selected.?.db;
         }
+        const schedule_entry = try self.maintenance_schedules.getOrPut(alloc, .{
+            .table_id = database.core.identity_namespace.table_id,
+            .incarnation = database.root_incarnation,
+        });
+        if (!schedule_entry.found_existing) schedule_entry.value_ptr.* = .{};
+        const schedule = schedule_entry.value_ptr;
         self.maintenance_table_cursor = (ordinal + 1) % count;
         // TTL is a short publication for the selected table, never a drain of
         // every namespace under one file lease.
@@ -826,7 +851,7 @@ pub const Owner = struct {
         defer turn_arena.deinit();
         const turn_alloc = turn_arena.allocator();
         var shadow_scopes: std.ArrayList(ShadowScope) = .empty;
-        if (run_database and self.maintenance_shadow_next) {
+        if (run_database and schedule.shadow_next) {
             const jobs = try database.graphReplacementStatusAlloc(turn_alloc);
             defer jobs.deinit();
             for (jobs.value) |job| if (job.phase == .catching_up) {
@@ -834,7 +859,7 @@ pub const Owner = struct {
                 // coordinator under this short owner/path fence, so its tail
                 // target and catalog swap exclude foreground appends together.
                 _ = try database.finishBackgroundGraphReplacement(job.name, job.generation);
-                self.maintenance_shadow_next = false;
+                schedule.shadow_next = false;
                 self.notifyMutation();
                 return true;
             };
@@ -846,7 +871,7 @@ pub const Owner = struct {
                 });
             };
         }
-        self.maintenance_shadow_next = shadow_scopes.items.len == 0;
+        schedule.shadow_next = shadow_scopes.items.len == 0;
         // Native maintenance owns independent catalog/provider state. Opening
         // only its selected namespace avoids rebuilding every foreground table
         // merely because inference or segment construction is still running.
@@ -983,6 +1008,7 @@ pub const Owner = struct {
         }
         self.retired.deinit(alloc);
         self.connections.deinit(alloc);
+        self.maintenance_schedules.deinit(alloc);
         if (self.owned_ttl_owner_id) |id| alloc.free(id);
         alloc.destroy(self);
     }

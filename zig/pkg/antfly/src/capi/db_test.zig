@@ -6139,3 +6139,66 @@ test "capi SQL idle native maintenance avoids runtime construction and resumes w
     try std.testing.expectEqual(@as(usize, 1), result.hits.len);
     try std.testing.expectEqualStrings("doc", result.hits[0].id);
 }
+
+test "capi SQL visibility waits for physical graph indexes and normalized vector text filters" {
+    const a = std.testing.allocator;
+    for ([_]enum { graph_alias, vector_filter, vector_exclusion, structured_filter, structured_exclusion }{ .graph_alias, .vector_filter, .vector_exclusion, .structured_filter, .structured_exclusion }) |mode| {
+        var directory = try TestDirectory.init("capi-search-visibility");
+        defer directory.cleanup();
+        var database = try db_mod.DB.open(a, directory.path(), .{ .executor = .{ .backend = .manual }, .start_optional_runtimes = false });
+        defer database.close();
+        try database.addIndex(.{ .name = "custom_text", .kind = .full_text, .config_json = "{}" });
+        try database.addIndex(.{ .name = "semantic", .kind = .dense_vector, .config_json = "{\"field\":\"embedding\",\"dims\":2}" });
+        try database.addIndex(.{ .name = "knowledge", .kind = .graph, .config_json = "{\"edge_types\":[{\"name\":\"R\",\"field\":\"links\"}]}" });
+        try database.batch(.{ .writes = &.{.{ .key = "doc", .value = "{\"body\":\"fresh\",\"embedding\":[1,0],\"links\":[\"target\"]}" }}, .sync_level = .write });
+        const target = database.core.nextDerivedSequence();
+        // A ready vector worker must not mask the independent text debt.
+        try database.runDerivedUntilTargets(target, &.{"semantic"});
+        var adapter = @import("antfly_local_sources").capi_sql.Adapter(antfly){ .db = &database, .table_name = "rows" };
+        var request: db_mod.types.SearchRequest = .{};
+        const graph = [_]db_mod.types.NamedGraphQuery{.{ .name = "neighbors", .query = .{
+            .query_type = .traverse,
+            .index_name = "knowledge",
+            .start_nodes = .{ .keys = &.{"doc"} },
+        } }};
+        if (mode == .graph_alias) {
+            request.graph_queries = &graph;
+        } else {
+            request.index_name = "semantic";
+            request.dense = .{ .vector = &.{ 1, 0 }, .k = 10 };
+            // This is the normalized vector request: full_text is absent.
+            switch (mode) {
+                .vector_filter => request.filter_text = .{ .match = .{ .field = "body", .text = "fresh" } },
+                .vector_exclusion => request.exclusion_text = .{ .match = .{ .field = "body", .text = "fresh" } },
+                .structured_filter => request.filter_query_json = "{\"term\":{\"path\":\"body\",\"value\":\"fresh\"}}",
+                .structured_exclusion => request.exclusion_query_json = "{\"term\":{\"path\":\"body\",\"value\":\"fresh\"}}",
+                .graph_alias => unreachable,
+            }
+        }
+        const expected = if (mode == .graph_alias) "knowledge" else "custom_text";
+        {
+            const debt = try database.listDerivedReplayDebt(a);
+            defer {
+                for (debt) |*item| item.deinit(a);
+                a.free(debt);
+            }
+            var lagging = false;
+            for (debt) |item| if (std.mem.eql(u8, expected, item.index_name)) {
+                lagging = item.applied_sequence < target;
+            };
+            try std.testing.expect(lagging);
+        }
+        const clock = database.backend_runtime.monotonicClock();
+        _ = try adapter.waitSearchIndexes(a, request, clock.nowRealtimeNs() + 5 * std.time.ns_per_s);
+        const debt = try database.listDerivedReplayDebt(a);
+        defer {
+            for (debt) |*item| item.deinit(a);
+            a.free(debt);
+        }
+        var ready = false;
+        for (debt) |item| if (std.mem.eql(u8, expected, item.index_name)) {
+            ready = item.applied_sequence >= target;
+        };
+        try std.testing.expect(ready);
+    }
+}
