@@ -80,8 +80,10 @@ const platform_time = @import("antfly_platform").time;
 //        count, compact-metadata length, and skip length; single-block terms
 //        also omit redundant impact count and range-ID length fields
 //
-// Writers emit v39. The production reader accepts v23, the exact format shipped
-// by origin/main when this migration began, v38, and v39. Versions v24-v37 are
+//   v40: shortened dictionary fences, requiring forward-only prefix pruning.
+//
+// Writers emit v40. The production reader accepts v23, the exact format shipped
+// by origin/main when this migration began, v38, v39, and v40. Versions v24-v37 are
 // development-only experiments on this branch and are deliberately not part of
 // the compatibility contract.
 
@@ -101,7 +103,13 @@ const wire_version_vertical_bp128: u8 = 35;
 const wire_version_payload_aligned_impacts: u8 = 36;
 const wire_version_compact_postings_header: u8 = 38;
 const wire_version_streaming_blocks: u8 = 39;
-const wire_version_current: u8 = wire_version_streaming_blocks;
+const wire_version_short_term_fences: u8 = 40;
+const wire_version_current: u8 = wire_version_short_term_fences;
+
+fn supportedWireVersion(version: u8) bool {
+    return version == wire_version_legacy or version == wire_version_compact_postings_header or
+        version == wire_version_streaming_blocks or version == wire_version_short_term_fences;
+}
 const streamed_record_size: usize = 32;
 const v7_header_size: usize = 4 + 1 + 4 + 8 + 4 + 4 + 4 + 4; // 33 bytes
 const postings_chunk_meta_header_size: usize = 4;
@@ -567,7 +575,7 @@ fn termBlockCeilingAlloc(alloc: Allocator, last: []const u8, next: ?[]const u8) 
     return alloc.dupe(u8, last);
 }
 
-fn encodeBlockedTermDictionary(alloc: Allocator, entries: []const TermDictEntry) ![]u8 {
+fn encodeBlockedTermDictionary(alloc: Allocator, entries: []const TermDictEntry, version: u8) ![]u8 {
     var block_data = std.ArrayListUnmanaged(u8).empty;
     defer block_data.deinit(alloc);
     var index_records = std.ArrayListUnmanaged(u8).empty;
@@ -593,7 +601,10 @@ fn encodeBlockedTermDictionary(alloc: Allocator, entries: []const TermDictEntry)
         const end = chooseTermBlockEnd(entries.len, i);
         const first_term = entries[i].term;
         const last_term = entries[end - 1].term;
-        const ceiling_term = try termBlockCeilingAlloc(alloc, last_term, if (end < entries.len) entries[end].term else null);
+        const ceiling_term = if (version >= wire_version_short_term_fences)
+            try termBlockCeilingAlloc(alloc, last_term, if (end < entries.len) entries[end].term else null)
+        else
+            try alloc.dupe(u8, last_term);
         defer alloc.free(ceiling_term);
         const prefix_len = commonPrefixLen(first_term, last_term);
         const prefix = first_term[0..prefix_len];
@@ -669,14 +680,16 @@ const StreamingTermDictionaryBuilder = struct {
     block_count: u32 = 0,
     block_fst_builder: fst.Builder,
     finalized_blocks: bool = false,
+    version: u8,
 
-    fn init(alloc: Allocator) !StreamingTermDictionaryBuilder {
-        return initWithHint(alloc, 65_536);
+    fn init(alloc: Allocator, version: u8) !StreamingTermDictionaryBuilder {
+        return initWithHint(alloc, 65_536, version);
     }
 
-    fn initWithHint(alloc: Allocator, terms: usize) !StreamingTermDictionaryBuilder {
+    fn initWithHint(alloc: Allocator, terms: usize, version: u8) !StreamingTermDictionaryBuilder {
         return .{
             .alloc = alloc,
+            .version = version,
             // Initial runs know their vocabulary. Small fields must not pay
             // for the maximum registry used by unknown-size large merges.
             .block_fst_builder = try fst.Builder.init(alloc, .{
@@ -719,7 +732,10 @@ const StreamingTermDictionaryBuilder = struct {
         if (self.pending_count == 0) return;
         const first_term = self.pendingTerm(self.pending_entries[0]);
         const last_term = self.pendingTerm(self.pending_entries[self.pending_count - 1]);
-        const ceiling_term = try termBlockCeilingAlloc(self.alloc, last_term, next);
+        const ceiling_term = if (self.version >= wire_version_short_term_fences)
+            try termBlockCeilingAlloc(self.alloc, last_term, next)
+        else
+            try self.alloc.dupe(u8, last_term);
         defer self.alloc.free(ceiling_term);
         const prefix_len = commonPrefixLen(first_term, last_term);
         const prefix = first_term[0..prefix_len];
@@ -1055,7 +1071,7 @@ pub const InvertedIndexBuilder = struct {
         const start = sink.len();
         const empty_header: [v7_header_size]u8 = @splat(0);
         try sink.appendSlice(&empty_header);
-        var dictionary = try StreamingTermDictionaryBuilder.initWithHint(alloc, term_count);
+        var dictionary = try StreamingTermDictionaryBuilder.initWithHint(alloc, term_count, self.config.wireVersion());
         defer dictionary.deinit();
         var scratch = PostingSerializeScratch{};
         defer scratch.deinit(alloc);
@@ -1171,7 +1187,7 @@ pub const InvertedIndexBuilder = struct {
         if (profile_timings) profile.?.postings_serialize_ns +|= platform_time.monotonicNs() - postings_start_ns;
 
         const term_dict_start_ns = if (profile_timings) platform_time.monotonicNs() else 0;
-        const term_dict_data = try encodeBlockedTermDictionary(scratch_alloc, dict_entries);
+        const term_dict_data = try encodeBlockedTermDictionary(scratch_alloc, dict_entries, self.config.wireVersion());
         defer scratch_alloc.free(term_dict_data);
         if (profile_timings) profile.?.term_dict_ns +|= platform_time.monotonicNs() - term_dict_start_ns;
 
@@ -2272,7 +2288,7 @@ pub const InvertedIndexReader = struct {
         if (data.len < v7_header_size) return error.InvalidData;
         if (!std.mem.eql(u8, data[0..4], "INVT")) return error.InvalidMagic;
         const version = data[4];
-        if (version != wire_version_legacy and version != wire_version_compact_postings_header and version != wire_version_current) return error.UnsupportedVersion;
+        if (!supportedWireVersion(version)) return error.UnsupportedVersion;
 
         const doc_count = std.mem.readInt(u32, data[5..9], .little);
         const total_field_len = std.mem.readInt(u64, data[9..17], .little);
@@ -6113,7 +6129,7 @@ fn writeMappedInvertedSection(
     defer if (!stream_norms) alloc.free(merged_norms);
     if (!stream_norms) @memset(merged_norms, 0);
     const serialize_scratch = &workspace.compact_scratch;
-    var dict_builder = try StreamingTermDictionaryBuilder.init(alloc);
+    var dict_builder = try StreamingTermDictionaryBuilder.init(alloc, config.wireVersion());
     defer dict_builder.deinit();
     var merged_term = std.ArrayListUnmanaged(u8).empty;
     defer merged_term.deinit(alloc);
@@ -7381,7 +7397,7 @@ test "v23 term dictionary front coding shrinks block payload" {
         try entries.append(alloc, .{ .term = term, .value = @intCast(i + 1) });
     }
 
-    const dict = try encodeBlockedTermDictionary(alloc, entries.items);
+    const dict = try encodeBlockedTermDictionary(alloc, entries.items, wire_version_current);
     defer alloc.free(dict);
 
     const block_data_len = std.mem.readInt(u32, dict[8..12], .little);
@@ -9112,7 +9128,7 @@ pub const RangeInvertedIndexReader = struct {
         try view.readInto(0, &header);
         if (!std.mem.eql(u8, header[0..4], "INVT")) return error.InvalidMagic;
         const version = header[4];
-        if (version != wire_version_legacy and version != wire_version_compact_postings_header and version != wire_version_current) return error.UnsupportedVersion;
+        if (!supportedWireVersion(version)) return error.UnsupportedVersion;
         const dict_length = std.mem.readInt(u32, header[21..25], .little);
         const bloom_length = std.mem.readInt(u32, header[25..29], .little);
         const norms_length = std.mem.readInt(u32, header[29..33], .little);
@@ -11310,11 +11326,64 @@ test "blocked term fences bound FST construction for oversized searchable terms"
         try std.testing.expectEqualStrings(term, (try iter.next()).?.term);
         try std.testing.expect(try iter.next() == null);
         // The existing non-streaming encoder must use the same small fences.
-        const dictionary = try encodeBlockedTermDictionary(budget.allocator(), &.{.{ .term = term, .value = 0 }});
+        const dictionary = try encodeBlockedTermDictionary(budget.allocator(), &.{.{ .term = term, .value = 0 }}, wire_version_current);
         defer budget.allocator().free(dictionary);
         try std.testing.expect(dictionary.len < term.len + 1024);
     }
     try std.testing.expectEqual(@as(u64, 0), manager.sliceStats(.full_text_build_working_set).used_bytes);
+}
+
+test "short dictionary fences require v40 while exact v38 and v39 sections remain readable" {
+    const a = std.testing.allocator;
+    var builder = InvertedIndexBuilder.init(a, .{});
+    defer builder.deinit();
+    try builder.addDocument(0, &.{.{ .term = "alpha", .freq = 1 }});
+    const encoded = try builder.build();
+    defer a.free(encoded);
+    // A pre-v40 reader rejects this section before it can seek its new fence.
+    try std.testing.expectEqual(@as(u8, 40), encoded[4]);
+    var current = try InvertedIndexReader.init(a, encoded);
+    try std.testing.expectEqualStrings("b", try current.termBlockCeiling(0));
+    var streamed = MergeMemorySink{ .alloc = a };
+    defer streamed.deinit();
+    try builder.writeToSink(a, &streamed);
+    try std.testing.expectEqual(@as(u8, 40), streamed.output.items[4]);
+
+    // Reconstruct genuine old dictionary semantics, not a relabeled v40 fence.
+    // The single inline posting's address/layout is unchanged across v38-v40.
+    for ([_]u8{ 38, 39 }) |version| {
+        const dictionary = try encodeBlockedTermDictionary(a, &.{.{ .term = "alpha", .value = fstValEncode1Hit(0, 0) }}, version);
+        defer a.free(dictionary);
+        const old_dict_len = std.mem.readInt(u32, encoded[21..25], .little);
+        const prefix_len = encoded.len - old_dict_len;
+        const legacy = try a.alloc(u8, prefix_len + dictionary.len);
+        defer a.free(legacy);
+        @memcpy(legacy[0..prefix_len], encoded[0..prefix_len]);
+        @memcpy(legacy[prefix_len..], dictionary);
+        legacy[4] = version;
+        std.mem.writeInt(u32, legacy[21..25], @intCast(dictionary.len), .little);
+        var reader = try InvertedIndexReader.init(a, legacy);
+        try std.testing.expectEqualStrings("alpha", try reader.termBlockCeiling(0));
+        try std.testing.expect(reader.lookup("alpha") != null);
+        const view = try @import("../segment_source.zig").View.init(.{ .contiguous = legacy }, 0, legacy.len);
+        _ = try RangeInvertedIndexReader.init(a, view, 4096);
+    }
+    var streaming_legacy = try StreamingTermDictionaryBuilder.init(a, 39);
+    defer streaming_legacy.deinit();
+    try streaming_legacy.add("alpha", fstValEncode1Hit(0, 0));
+    var sink = MergeMemorySink{ .alloc = a };
+    defer sink.deinit();
+    _ = try streaming_legacy.finishIntoSink(&sink);
+    const dict = sink.output.items;
+    // Both old-layout encoder paths must retain the exact last term.
+    const expected = try encodeBlockedTermDictionary(a, &.{.{ .term = "alpha", .value = fstValEncode1Hit(0, 0) }}, 39);
+    defer a.free(expected);
+    try std.testing.expectEqualSlices(u8, expected, dict);
+    const future = try a.dupe(u8, encoded);
+    defer a.free(future);
+    future[4] = 41;
+    try std.testing.expectError(error.UnsupportedVersion, InvertedIndexReader.init(a, future));
+    try std.testing.expectError(error.UnsupportedVersion, RangeInvertedIndexReader.init(a, try @import("../segment_source.zig").View.init(.{ .contiguous = future }, 0, future.len), 4096));
 }
 
 test "short term block ceilings preserve ordering and automaton pruning progress" {
