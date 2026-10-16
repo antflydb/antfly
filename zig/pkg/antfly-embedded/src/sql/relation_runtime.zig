@@ -719,10 +719,54 @@ fn Engine(comptime Context: type) type {
         static_rows: std.AutoHashMapUnmanaged(*const binding.Node, *Replay) = .empty,
         static_hashes: std.AutoHashMapUnmanaged(*const binding.Node, *operators.HashJoin) = .empty,
         static_memberships: std.AutoHashMapUnmanaged(*const binding.Node, *operators.TupleMembership) = .empty,
-        recursions: [32]?*Worklist = @splat(null),
+        recursions: [32]?*Recursion = @splat(null),
         recursion_scopes: [32]?usize = @splat(null),
         outer_values: [32]?[]const Datum = @splat(null),
         outer_replays: [32]std.AutoHashMapUnmanaged(*const binding.Node, *Replay) = @splat(.empty),
+
+        const Recursion = struct {
+            node: *const binding.Node,
+            worklist: Worklist,
+            scratch: std.heap.ArenaAllocator,
+            iterator: ?*Iterator = null,
+            phase: enum { seed, step } = .seed,
+            advancing: bool = false,
+            failure: ?anyerror = null,
+
+            fn stop(self: *Recursion) void {
+                const iterator = self.iterator;
+                self.iterator = null;
+                if (iterator) |owned| owned.deinit();
+            }
+
+            fn advance(self: *Recursion, engine: *Self, index: usize) anyerror!void {
+                const plan = self.node.operation.recursive;
+                while (index >= self.worklist.rows.items.len and !self.worklist.complete) {
+                    try engine.checkpoint();
+                    if (self.iterator == null) {
+                        self.iterator = if (self.phase == .seed)
+                            try Iterator.create(engine, plan.seed)
+                        else
+                            try Iterator.createRecursive(engine, plan.step, plan.id);
+                        self.iterator.?.markPrefixProducer();
+                    }
+                    _ = self.scratch.reset(.{ .retain_with_limit = 16 * 1024 });
+                    const a = self.scratch.allocator();
+                    if (try self.iterator.?.nextDemand(a, 1)) |values| {
+                        const normalized = try normalize(a, self.node.columns, values);
+                        try self.worklist.append(engine, normalized, engine.context.limits.scan_rows);
+                        continue;
+                    }
+                    self.stop();
+                    // Freeze each complete delta before opening its recursive
+                    // step. Newly yielded rows cannot feed that same step.
+                    self.worklist.begin = if (self.phase == .seed) 0 else self.worklist.end;
+                    self.worklist.end = self.worklist.rows.items.len;
+                    self.phase = .step;
+                    self.worklist.complete = self.worklist.begin == self.worklist.end;
+                }
+            }
+        };
 
         pub fn checkpoint(self: *Self) !void {
             try self.context.checkpoint();
@@ -731,10 +775,13 @@ fn Engine(comptime Context: type) type {
         }
 
         pub fn deinit(self: *Self) void {
+            // Suspended recursive steps can retain cached replay readers.
+            for (0..self.recursions.len) |id| if (self.recursions[id]) |state| state.stop();
             // Lazy producers can retain readers of other cached inputs. Join
             // every producer before destroying any of those shared owners.
             var producers = self.static_rows.valueIterator();
             while (producers.next()) |replay| replay.*.closeProducer();
+            for (0..self.outer_replays.len) |id| self.closeOuterProducers(id);
             for (0..self.outer_replays.len) |id| {
                 self.clearOuter(id);
                 self.outer_replays[id].deinit(self.context.alloc);
@@ -749,37 +796,56 @@ fn Engine(comptime Context: type) type {
             self.cache_arena.deinit();
         }
 
+        fn closeOuterProducers(self: *Self, id: usize) void {
+            var entries = self.outer_replays[id].valueIterator();
+            while (entries.next()) |replay| replay.*.closeProducer();
+        }
+
         fn clearOuter(self: *Self, id: usize) void {
+            // Stop recursive steps first so they release replay readers, but
+            // retain worklist rows until every scoped consumer has closed.
+            for (self.recursion_scopes, 0..) |scope, recursion_id| if (scope == id) {
+                if (self.recursions[recursion_id]) |state| state.stop();
+            };
+            // Scoped materializations can borrow one another. Retire every
+            // producer before freeing any replay or its captured outer values.
+            self.closeOuterProducers(id);
+            for (self.recursion_scopes, 0..) |scope, recursion_id| if (scope == id) self.closeRecursion(recursion_id);
             var entries = self.outer_replays[id].valueIterator();
             while (entries.next()) |replay| replay.*.deinit();
             self.outer_replays[id].clearRetainingCapacity();
-            for (self.recursion_scopes, 0..) |scope, recursion_id| if (scope == id) self.closeRecursion(recursion_id);
             self.outer_values[id] = null;
         }
 
         fn closeRecursion(self: *Self, id: usize) void {
-            if (self.recursions[id]) |worklist| {
-                worklist.deinit();
-                self.context.alloc.destroy(worklist);
+            if (self.recursions[id]) |state| {
+                // Relinquish ownership before nested iterator cleanup can
+                // retire another lexical scope or revisit this slot.
                 self.recursions[id] = null;
                 self.recursion_scopes[id] = null;
+                state.stop();
+                state.worklist.deinit();
+                state.scratch.deinit();
+                self.context.alloc.destroy(state);
             }
         }
 
         fn prefixRows(self: *Self, node: *const binding.Node) anyerror!*Replay {
-            if (outerMask(node) != 0) return self.staticRows(node);
-            if (self.static_rows.get(node)) |rows| return rows;
+            const mask = outerMask(node);
+            const outer_id: usize = if (mask != 0) 31 - @clz(mask) else 0;
+            const cache = if (mask != 0) &self.outer_replays[outer_id] else &self.static_rows;
+            if (cache.get(node)) |rows| return rows;
             const memory_bytes = if (self.context.spill != null) self.context.limits.retained_bytes / 16 else self.context.limits.retained_bytes;
             const replay = try Replay.create(self.context.alloc, node.columns.len, memory_bytes, self.context.spill);
             errdefer replay.deinit();
-            const iterator = try Iterator.createContext(self, node, null, false);
+            const iterator = try Iterator.createContext(self, node, null, mask != 0);
             iterator.markPrefixProducer();
             // attachProducer transfers iterator ownership only on success.
             replay.attachProducer(.{ .ptr = iterator, .pull = prefixPull, .close = prefixClose }, self.context.limits.scan_rows) catch |err| {
                 iterator.deinit();
                 return err;
             };
-            try self.static_rows.put(self.cache_arena.allocator(), node, replay);
+            try cache.put(if (mask != 0) self.context.alloc else self.cache_arena.allocator(), node, replay);
             return replay;
         }
         fn prefixPull(raw: *anyopaque, a: Allocator) anyerror!?[]const Datum {
@@ -793,67 +859,27 @@ fn Engine(comptime Context: type) type {
             iterator.deinit();
         }
 
-        fn staticRows(self: *Self, node: *const binding.Node) anyerror!*Replay {
-            const mask = outerMask(node);
-            const outer_id: usize = if (mask != 0) 31 - @clz(mask) else 0;
-            const cache = if (mask != 0) &self.outer_replays[outer_id] else &self.static_rows;
-            if (cache.get(node)) |rows| return rows;
-            // Reserve room for consuming operators when spill is available;
-            // memory-only backends retain their full statement admission.
-            const memory_bytes = if (self.context.spill != null) self.context.limits.retained_bytes / 16 else self.context.limits.retained_bytes;
-            const replay = try Replay.create(self.context.alloc, node.columns.len, memory_bytes, self.context.spill);
-            errdefer replay.deinit();
-            const iterator = try Iterator.createContext(self, node, null, mask != 0);
-            defer iterator.deinit();
-            var scratch = std.heap.ArenaAllocator.init(self.context.alloc);
-            defer scratch.deinit();
-            while (try iterator.next(scratch.allocator())) |values| {
-                if (replay.count >= self.context.limits.scan_rows) return error.SqlProgramLimitExceeded;
-                try replay.append(values);
-                _ = scratch.reset(.free_all);
-            }
-            try replay.finish();
-            try cache.put(if (mask != 0) self.context.alloc else self.cache_arena.allocator(), node, replay);
-            return replay;
-        }
-
-        fn recursive(self: *Self, node: *const binding.Node) anyerror!*Worklist {
+        fn recursive(self: *Self, node: *const binding.Node, index: usize) anyerror!*Worklist {
             const plan = node.operation.recursive;
-            if (self.recursions[plan.id]) |state| {
-                if (!state.complete) return error.UnsupportedSqlShape;
-                return state;
-            }
-            const state = try self.context.alloc.create(Worklist);
-            state.* = .init(self.context.alloc, plan.all);
-            self.recursions[plan.id] = state;
-            const mask = outerMask(node);
-            self.recursion_scopes[plan.id] = if (mask != 0) 31 - @clz(mask) else null;
-            var scratch = std.heap.ArenaAllocator.init(self.context.alloc);
-            defer scratch.deinit();
-            {
-                const seed = try Iterator.create(self, plan.seed);
-                defer seed.deinit();
-                while (try seed.next(scratch.allocator())) |values| {
-                    const normalized = try normalize(scratch.allocator(), node.columns, values);
-                    try state.append(self, normalized, self.context.limits.scan_rows);
-                    _ = scratch.reset(.free_all);
-                }
-            }
-            state.end = state.rows.items.len;
-            while (state.begin != state.end) {
-                try self.checkpoint();
-                const step = try Iterator.createRecursive(self, plan.step, plan.id);
-                defer step.deinit();
-                while (try step.next(scratch.allocator())) |values| {
-                    const normalized = try normalize(scratch.allocator(), node.columns, values);
-                    try state.append(self, normalized, self.context.limits.scan_rows);
-                    _ = scratch.reset(.free_all);
-                }
-                state.begin = state.end;
-                state.end = state.rows.items.len;
-            }
-            state.complete = true;
-            return state;
+            const state = self.recursions[plan.id] orelse blk: {
+                const created = try self.context.alloc.create(Recursion);
+                created.* = .{ .node = node, .worklist = .init(self.context.alloc, plan.all), .scratch = .init(self.context.alloc) };
+                self.recursions[plan.id] = created;
+                const mask = outerMask(node);
+                self.recursion_scopes[plan.id] = if (mask != 0) 31 - @clz(mask) else null;
+                break :blk created;
+            };
+            if (index < state.worklist.rows.items.len or state.worklist.complete) return &state.worklist;
+            if (state.failure) |err| return err;
+            if (state.advancing) return error.UnsupportedSqlShape;
+            state.advancing = true;
+            defer state.advancing = false;
+            state.advance(self, index) catch |err| {
+                state.failure = err;
+                state.stop();
+                return err;
+            };
+            return &state.worklist;
         }
 
         fn normalize(alloc: Allocator, columns: []const binding.Column, values: []const Datum) ![]const Datum {
@@ -988,7 +1014,7 @@ fn Engine(comptime Context: type) type {
                 self.* = .{ .engine = engine, .node = node, .arena = .init(alloc), .scratch = .init(alloc), .probe_arena = .init(alloc), .recursive_id = recursive_id, .apply_mode = apply_mode };
                 errdefer self.deinit();
                 if (recursive_id) |id| if (node.replay_policy != .streaming and !dependsOn(node, id)) {
-                    self.cached_reader = try (try engine.staticRows(node)).openReader();
+                    self.cached_reader = try (try engine.prefixRows(node)).openReader();
                     return self;
                 };
                 // Repeatable expansion plans preserve demand through derived
@@ -999,11 +1025,14 @@ fn Engine(comptime Context: type) type {
                     return self;
                 }
                 switch (node.operation) {
-                    .materialized_ref => |source| self.cached_reader = try (try engine.staticRows(source)).openReader(),
+                    .materialized_ref => |source| self.cached_reader = try (try engine.prefixRows(source)).openReader(),
                     .join => |join| {
-                        // Always probe the delta and build the invariant side.
-                        // Keep output ordinals in the original SQL FROM order.
-                        self.flipped_join = if (join.membership != null) false else if (apply_mode and outerMask(node) != 0) outerMask(join.left) == 0 and outerMask(join.right) != 0 else if (recursive_id) |id| !dependsOn(join.left, id) and dependsOn(join.right, id) else engine.preferLeftBuild(join.left, join.right);
+                        // An outer-reference attachment is a proven singleton,
+                        // not an estimated small table. Keep it on the right
+                        // for direct streaming concatenation; ordinary recursive
+                        // joins still probe the delta and build invariant data.
+                        const outer_attachment = (join.kind == .inner or join.kind == .cross) and join.membership == null and join.condition == null and join.left_keys.len == 0 and join.right_keys.len == 0 and (join.left.operation == .outer_ref or join.right.operation == .outer_ref);
+                        self.flipped_join = if (outer_attachment) join.left.operation == .outer_ref else if (join.membership != null) false else if (apply_mode and outerMask(node) != 0) outerMask(join.left) == 0 and outerMask(join.right) != 0 else if (recursive_id) |id| !dependsOn(join.left, id) and dependsOn(join.right, id) else engine.preferLeftBuild(join.left, join.right);
                         self.left = try createContext(engine, if (self.flipped_join) join.right else join.left, recursive_id, apply_mode);
                         self.right = try createContext(engine, if (self.flipped_join) join.left else join.right, recursive_id, apply_mode);
                     },
@@ -1145,14 +1174,15 @@ fn Engine(comptime Context: type) type {
                     .unnest => |function| self.nextUnnest(alloc, function),
                     .materialized_ref => unreachable,
                     .recursive => blk: {
-                        const state = try self.engine.recursive(self.node);
+                        const state = try self.engine.recursive(self.node, self.output_index);
                         if (self.output_index == state.rows.items.len) break :blk null;
                         const values = state.rows.items[self.output_index].values;
                         self.output_index += 1;
                         break :blk values;
                     },
                     .recursive_ref => |id| blk: {
-                        const state = self.engine.recursions[id] orelse return error.InvalidSqlBackendResponse;
+                        const owner = self.engine.recursions[id] orelse return error.InvalidSqlBackendResponse;
+                        const state = &owner.worklist;
                         if (state.begin + self.output_index == state.end) break :blk null;
                         const values = state.rows.items[state.begin + self.output_index].values;
                         self.output_index += 1;
@@ -1967,6 +1997,17 @@ fn Engine(comptime Context: type) type {
                 return output;
             }
             fn nextJoin(self: *Iterator, alloc: Allocator, join: @FieldType(@FieldType(binding.Node, "operation"), "join")) anyerror!?[]const Datum {
+                if ((join.kind == .inner or join.kind == .cross) and join.membership == null and join.condition == null and join.left_keys.len == 0 and join.right_keys.len == 0 and self.right.?.node.operation == .outer_ref) {
+                    if (!self.emitted) {
+                        self.left_values = try self.right.?.next(self.arena.allocator());
+                        self.emitted = true;
+                    }
+                    if (self.left_values == null) return null;
+                    const input = (try self.left.?.nextDemand(alloc, self.batch_demand orelse std.math.maxInt(usize))) orelse return null;
+                    const row = try self.combine(alloc, input, self.left_values);
+                    for (@constCast(row)) |*cell| cell.* = try operators.cloneDatum(alloc, cell.*);
+                    return row;
+                }
                 if (join.membership != null) return self.nextMembership(alloc, join);
                 const kind = if (self.flipped_join) switch (join.kind) {
                     .right => .left,

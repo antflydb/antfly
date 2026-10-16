@@ -3051,6 +3051,77 @@ test "SQL CTE aliases feed hash joins and grouped projection without stringifyin
     try std.testing.expectEqual(@as(usize, 1), backend.statement_closes);
 }
 
+test "SQL set and VALUES preserve PostgreSQL integer literal builtin widths" {
+    const Case = struct { sql: []const u8, width: @import("array_value.zig").ElementType, rows: usize = 2 };
+    for ([_]Case{
+        .{ .sql = "SELECT n FROM (VALUES (1),(2),(NULL)) v(n)", .width = .int32, .rows = 3 },
+        .{ .sql = "SELECT n FROM (VALUES (1),(2147483648)) v(n)", .width = .int64 },
+        .{ .sql = "SELECT n FROM (VALUES (1),(9223372036854775807)) v(n)", .width = .int64 },
+        .{ .sql = "SELECT 1 AS n UNION ALL SELECT 2", .width = .int32 },
+        .{ .sql = "SELECT 1::smallint AS n UNION ALL SELECT 2::smallint", .width = .int16 },
+        .{ .sql = "SELECT 1::smallint AS n UNION ALL SELECT 2", .width = .int32 },
+        .{ .sql = "SELECT 1 AS n UNION ALL SELECT 2147483648", .width = .int64 },
+        .{ .sql = "SELECT NULL AS n UNION ALL SELECT 1", .width = .int32 },
+    }) |case| {
+        var backend: TestBackend = .{};
+        var compiled = try compiler.compile(std.testing.allocator, case.sql, .{});
+        defer compiled.deinit();
+        var result = try execute(std.testing.allocator, backend.coordinated(), &compiled, &.{}, .{});
+        defer result.deinit();
+        try std.testing.expectEqual(case.rows, result.output.rows.len);
+        try std.testing.expectEqual(@as(usize, 1), result.output.columns.len);
+        try std.testing.expectEqualStrings("n", result.output.columns[0].name);
+        try std.testing.expectEqual(ast.ColumnType.integer, result.output.columns[0].type);
+        try std.testing.expectEqual(@as(?@import("array_value.zig").ElementType, case.width), result.output.columns[0].element_type);
+    }
+}
+
+test "SQL materialized prefix replay preserves LIMIT errors through nested CTE owners" {
+    for ([_][]const u8{
+        "WITH q AS MATERIALIZED (SELECT 10 / (1-id) AS v FROM things) SELECT v FROM q LIMIT 1",
+        "WITH q AS MATERIALIZED (SELECT 10 / (1-id) AS v FROM things), nested AS MATERIALIZED (SELECT v FROM q) SELECT v FROM nested LIMIT 1",
+    }) |sql| {
+        var backend: TestBackend = .{ .row_count = 4096, .group_every = 1 };
+        var compiled = try compiler.compile(std.testing.allocator, sql, .{});
+        defer compiled.deinit();
+        var result = try execute(std.testing.allocator, backend.coordinated(), &compiled, &.{}, .{ .page_rows = 16, .scan_pages = 1 });
+        defer result.deinit();
+        try std.testing.expectEqual(@as(usize, 1), result.output.rows.len);
+        try std.testing.expectEqualStrings("10", result.output.rows[0][0].string);
+        try std.testing.expectEqual(@as(usize, 1), backend.pages);
+        try std.testing.expectEqual(@as(usize, 1), backend.statement_opens);
+        try std.testing.expectEqual(backend.statement_opens, backend.statement_closes);
+    }
+    var backend: TestBackend = .{ .row_count = 4096, .group_every = 1 };
+    var compiled = try compiler.compile(std.testing.allocator, "WITH q AS MATERIALIZED (SELECT 10 / (1-id) AS v FROM things) SELECT v FROM q LIMIT 2", .{});
+    defer compiled.deinit();
+    try std.testing.expectError(error.SqlDivisionByZero, execute(std.testing.allocator, backend.coordinated(), &compiled, &.{}, .{ .page_rows = 16, .scan_pages = 1 }));
+    try std.testing.expectEqual(backend.statement_opens, backend.statement_closes);
+}
+
+test "SQL scoped materialized prefix replay retires outer epochs without draining invariant storage" {
+    const Check = struct {
+        fn run(a: std.mem.Allocator, compiled: *const compiler.Compiled) !void {
+            var backend: TestBackend = .{ .row_count = 4096, .group_every = 1 };
+            defer std.debug.assert(backend.statement_opens == backend.statement_closes);
+            // The final relation has two rows, while the invariant native
+            // producer supplies only its first row once across both epochs.
+            var result = try execute(a, backend.coordinated(), compiled, &.{}, .{ .page_rows = 16, .scan_pages = 1, .scan_rows = 2 });
+            defer result.deinit();
+            try std.testing.expectEqual(@as(usize, 2), result.output.rows.len);
+            for (result.output.rows, [_][]const u8{ "1", "2" }) |row, expected| {
+                try std.testing.expectEqualStrings(expected, row[0].string);
+                try std.testing.expectEqualStrings(expected, row[1].string);
+            }
+            try std.testing.expectEqual(@as(usize, 1), backend.pages);
+            try std.testing.expectEqual(@as(usize, 1), backend.statement_opens);
+        }
+    };
+    var compiled = try compiler.compile(std.testing.allocator, "SELECT p.n, q.v FROM (VALUES (1),(2)) p(n) CROSS JOIN LATERAL (WITH c AS MATERIALIZED (SELECT id+p.n AS v FROM things), nested AS MATERIALIZED (SELECT v FROM c) SELECT v FROM nested LIMIT 1) q", .{});
+    defer compiled.deinit();
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Check.run, .{&compiled});
+}
+
 test "SQL CTE materialization shares one bounded producer while inline hints retain independent scans" {
     // sql-1221, sql-1258, sql-1262: the mounted cases establish exact SQL
     // output; this producer-work test establishes the hint execution policy.

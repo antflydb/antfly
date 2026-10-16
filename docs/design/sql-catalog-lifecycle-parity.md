@@ -9239,3 +9239,65 @@ original joins and 17 supplemental array-expansion contracts. The fresh owned
 PostgreSQL 18.6 prefix/error witness is recorded in
 `/private/tmp/antfly-sql-prefix-replay-postgres.log`. License, Apache boundary and
 inventory checks pass. These work/lifetime tests are not throughput benchmarks.
+
+### Shared materialization and resumable recursive frontiers
+
+Relation-runtime statement/scoped materialized replay owners now use the same
+prefix producer as invariant Apply inputs. The eager `staticRows` drain is
+removed. Correlated producers are pinned to their highest referenced outer
+epoch; scope retirement stops every producer before freeing replay records or
+outer values. Nested materializations retain independent readers over the same
+captured source, not repeated physical scans.
+
+The first scoped regression exposed another blocking shape: the binder attaches
+one known outer row through keyless CROSS JOIN nodes. A proven outer-reference
+singleton now streams typed concatenation instead of building a hash table over
+the physical side. This optimization requires a keyless, condition-free inner
+or CROSS join with an actual outer-reference node. Outer joins, membership,
+predicated joins and estimated cardinalities do not receive that shortcut.
+The two-epoch regression admits only two relation rows and one physical page
+over a 4096-row source, and checks fresh correlated values and allocation faults.
+
+Recursive worklists now retain their seed/step iterator and resume at the
+requested output frontier. Each recursive step sees a frozen complete delta;
+newly emitted rows cannot feed that same step. UNION duplicate elimination and
+UNION ALL multiplicities retain their existing semantics. Multiple consumers
+share accumulated owned results without restarting seed or step evaluation.
+LIMIT can abandon an otherwise unbounded recursive read; blocking sorts and
+complete mutation-source consumers still request the required full input.
+Suspended iterators are closed before cached readers, worklists and outer
+epochs are retired. Failures are sticky and all current row/work/memory limits
+remain in force. Worklist/visited rows still use admitted resident storage;
+externalizing that storage and broader recursive coercion/grammar qualification
+remain separate work, not claimed here.
+
+Strict output-type assertions found a shared binder bug: VALUES/set inference
+discarded concrete integer literal identities and widened int4 to int8. It now
+uses the existing scalar literal resolver, keeping NULL/string unknown-type
+selection separate. Narrow, wide, smallint and mixed integer cases have native
+and PostgreSQL descriptor checks; correlated recursive seed widths are checked
+too. No original case dispositions change.
+
+The repeatable owned PostgreSQL gate is
+`python -m unittest discover -s scripts -p test_sql_replay_prefix.py -v`
+(with the scripts environment and psycopg installed). Its supplemental cases
+check complete values, labels and OIDs for literal/set widths, materialized
+prefixes, correlated epoch changes, recursive prefixes, DISTINCT cycles,
+blocking finite ordering and combined materialized/recursive scope retirement,
+plus deferred division-by-zero SQLSTATE 22012. These controlled heap/VALUES
+witnesses are not an ordering guarantee for arbitrary unordered SQL plans.
+
+Validation: the full Debug SQL gate passed 850 core tests and 229 extracted SQL
+tests (three existing opt-in skips, zero failures/leaks) in
+`/private/tmp/antfly-sql-materialized-recursive-full-final-debug.log`. The final
+cleanup-order tightening was subsequently verified by 27 affected tests in
+`/private/tmp/antfly-sql-materialized-recursive-cleanup-debug.log` and all five
+LATERAL tests in
+`/private/tmp/antfly-sql-materialized-recursive-lateral-cleanup-debug.log`.
+Mounted native read/mutation, original-join and array-expansion regressions passed
+three tests and 80/80 build steps after that change in
+`/private/tmp/antfly-sql-materialized-recursive-public-cleanup-debug.log`.
+The checked-in PostgreSQL oracle passes against owned PostgreSQL 18.6;
+`/private/tmp/antfly-sql-replay-prefix-oracle-test.log` records the final source.
+Ruff, formatting, license, Apache boundary and original-inventory checks pass.
+No throughput speedup or additional original-case closure is claimed.

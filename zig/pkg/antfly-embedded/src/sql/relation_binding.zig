@@ -678,11 +678,10 @@ const Builder = struct {
         if (expression_.* == .literal) switch (expression_.literal) {
             .null => return .{},
             .string => return .{ .nullable = false },
-            .integer => return .{ .kind = .integer, .nullable = false },
-            .number => return .{ .kind = .number, .nullable = false },
-            .numeric => return .{ .kind = .number, .element_type = .numeric, .nullable = false },
-            .boolean => return .{ .kind = .boolean, .nullable = false },
-            .parameter => {},
+            // Concrete literals use the shared scalar identity resolver.
+            // Dropping their width here silently widened VALUES/UNION int4
+            // columns to int8, including correlated recursive seed columns.
+            else => {},
         };
         return scalar.inferOutputWithInvocation(self.alloc, expression_, columns, self.parameters, self.backend.parameter_invocation);
     }
