@@ -121,40 +121,18 @@ test "get index response timeout bounds the complete HTTP request" {
     defer client.deinit();
     try client.setBearer("test-token");
 
-    var timed_out = std.atomic.Value(bool).init(false);
-    var unexpected = std.atomic.Value(bool).init(false);
-    var succeeded = std.atomic.Value(bool).init(false);
-    var group = std.Io.Group.init;
-    const ClientTask = struct {
-        fn run(
-            _: std.Io,
-            c: *AntflyClient,
-            timeout: *std.atomic.Value(bool),
-            other_error: *std.atomic.Value(bool),
-            success: *std.atomic.Value(bool),
-        ) std.Io.Cancelable!void {
-            var resp = c.getIndexResponseWithTimeout("docs", "dense", 50) catch |err| {
-                if (err == error.Timeout) {
-                    timeout.store(true, .release);
-                } else {
-                    other_error.store(true, .release);
-                }
-                return;
-            };
-            defer resp.deinit();
-            success.store(true, .release);
-        }
+    var serving = try io.concurrent(httpx.TestServer.handleOne, .{&server});
+    defer serving.cancel(io) catch {};
+    try std.testing.expectError(error.Timeout, client.getIndexResponseWithTimeout("docs", "dense", 50));
+    // The deadline may expire before connect or before any request bytes reach
+    // the server. Join its cancellation after observing the client outcome;
+    // never wait indefinitely in accept or race a worker's publication flag.
+    serving.cancel(io) catch |err| switch (err) {
+        error.Canceled, error.EmptyRequest, error.MalformedRequest, error.SendFailed => {},
+        // Authentication/path assertions remain failures even during timeout.
+        else => return err,
     };
-    try group.concurrent(io, ClientTask.run, .{ io, &client, &timed_out, &unexpected, &succeeded });
-    server.handleOne() catch |err| {
-        // A timed-out client may close before the delayed response is written.
-        // Preserve request assertion failures, which happen before the delay.
-        if (!timed_out.load(.acquire)) return err;
-    };
-    try group.await(io);
-    try std.testing.expect(timed_out.load(.acquire));
-    try std.testing.expect(!unexpected.load(.acquire));
-    try std.testing.expect(!succeeded.load(.acquire));
+    try std.testing.expect(server.route_hits[0] <= 1);
 }
 
 test "SQL prepared client forbids replay and preserves exact owner identity" {
@@ -241,38 +219,18 @@ test "list indexes response timeout bounds readiness preflight" {
     defer client.deinit();
     try client.setBearer("test-token");
 
-    var timed_out = std.atomic.Value(bool).init(false);
-    var unexpected = std.atomic.Value(bool).init(false);
-    var succeeded = std.atomic.Value(bool).init(false);
-    var group = std.Io.Group.init;
-    const ClientTask = struct {
-        fn run(
-            _: std.Io,
-            c: *AntflyClient,
-            timeout: *std.atomic.Value(bool),
-            other_error: *std.atomic.Value(bool),
-            success: *std.atomic.Value(bool),
-        ) std.Io.Cancelable!void {
-            var resp = c.listIndexesResponseWithTimeout("docs", 50) catch |err| {
-                if (err == error.Timeout) {
-                    timeout.store(true, .release);
-                } else {
-                    other_error.store(true, .release);
-                }
-                return;
-            };
-            defer resp.deinit();
-            success.store(true, .release);
-        }
+    var serving = try io.concurrent(httpx.TestServer.handleOne, .{&server});
+    defer serving.cancel(io) catch {};
+    try std.testing.expectError(error.Timeout, client.listIndexesResponseWithTimeout("docs", 50));
+    // The deadline may expire before connect or before any request bytes reach
+    // the server. Join its cancellation after observing the client outcome;
+    // never wait indefinitely in accept or race a worker's publication flag.
+    serving.cancel(io) catch |err| switch (err) {
+        error.Canceled, error.EmptyRequest, error.MalformedRequest, error.SendFailed => {},
+        // Authentication/path assertions remain failures even during timeout.
+        else => return err,
     };
-    try group.concurrent(io, ClientTask.run, .{ io, &client, &timed_out, &unexpected, &succeeded });
-    server.handleOne() catch |err| {
-        if (!timed_out.load(.acquire)) return err;
-    };
-    try group.await(io);
-    try std.testing.expect(timed_out.load(.acquire));
-    try std.testing.expect(!unexpected.load(.acquire));
-    try std.testing.expect(!succeeded.load(.acquire));
+    try std.testing.expect(server.route_hits[0] <= 1);
 }
 
 test "personal connections polling accommodates slow status and explicit deadlines" {
