@@ -4668,6 +4668,7 @@ test "store-root enrollment status is a body-bound admin read and preserves abse
 fn catalogResponseLimit(input: @import("../system_catalog/server_call.zig").Call) ?usize {
     const publication = @import("relational_index_publication.zig");
     return switch (input) {
+        .relational_index_prepare => publication.PrepareCut.max_wire_bytes,
         .relational_index_begin, .relational_index_admission_status => publication.AdmissionStatus.max_wire_bytes,
         .relational_index_publish_decide, .relational_index_publish_status => publication.DecisionStatus.max_wire_bytes,
         .relational_index_cancel, .relational_index_cancel_status => publication.CancellationStatus.max_wire_bytes,
@@ -4695,6 +4696,7 @@ test "relational index publication ACK client binds read grants and never retrie
             try authority.verify("index-ack-secret", "index-ack", if (call.value.requiresAdministrativeGrant()) .admin else .read, request.body, @intCast(@divFloor(platform_time.realtimeNs(), std.time.ns_per_s)), request.header(authority.header_name) orelse return error.TestUnexpectedResult);
             const mutation = call.value.isMutation();
             try std.testing.expect(call.value.isRelationalIndexOwnerCall());
+            if (call.value == .relational_index_prepare) try std.testing.expectEqual(@as(?usize, publication.PrepareCut.max_wire_bytes), request.max_response_bytes);
             if (call.value == .relational_index_begin or call.value == .relational_index_admission_status) try std.testing.expectEqual(@as(?usize, publication.AdmissionStatus.max_wire_bytes), request.max_response_bytes);
             if (call.value == .relational_index_source_accept_status or call.value == .relational_index_source_accept or call.value == .relational_index_source_complete) try std.testing.expectEqual(@as(?usize, 16 * 1024), request.max_response_bytes);
             if (call.value == .relational_index_publish_status or call.value == .relational_index_publish_decide) try std.testing.expectEqual(@as(?usize, publication.DecisionStatus.max_wire_bytes), request.max_response_bytes);
@@ -4810,6 +4812,8 @@ test "relational index publication ACK client binds read grants and never retrie
     try std.testing.expectEqual(begin_calls_before, executor.calls);
     const begin_reply = try client.forwardSystemCatalogControlled("http://metadata.invalid", begin_call, .{ .remaining_ms = 25, .forwards_remaining = 2, .campaign_allowed = true }, true, null);
     defer alloc.free(begin_reply);
+    const prepare_reply = try client.readSystemCatalog("http://metadata.invalid", .{ .relational_index_prepare = .{ .guard = beginning.begin.plan.table_guard, .index_name = beginning.begin.plan.index_name } }, 25, null);
+    defer prepare_reply.deinit(alloc);
     executor.status = 409;
     executor.body = "MetadataReplicationPending";
     executor.outcome = routes.Routes.raft_mutation_outcome_not_proposed;

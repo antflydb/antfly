@@ -373,6 +373,15 @@ pub fn fkGenerationPublicationSourceDecisionJson(svc: anytype, alloc: std.mem.Al
     return store.fkGenerationPublicationSourceDecisionJson(alloc, svc.metadata_group_id, request);
 }
 
+pub fn prepareRelationalIndexPublication(svc: anytype, alloc: std.mem.Allocator, context: operation.RequestContext, request: @import("../metadata/relational_index_publication.zig").PrepareRequest) ![]u8 {
+    if (!context.setting_admin or !context.index_publication_authority) return error.Forbidden;
+    try context.ensureActive();
+    try request.validate();
+    try svc.ensureLinearizableReadWithContext(context);
+    const store = svc.projectedStore() orelse return error.MissingMetadataStore;
+    return store.relationalIndexPrepareCutJson(alloc, svc.metadata_group_id, request);
+}
+
 pub fn beginRelationalIndexPublication(svc: anytype, alloc: std.mem.Allocator, context: operation.RequestContext, request: @import("../metadata/relational_index_publication.zig").BeginRequest) ![]u8 {
     const publication = @import("../metadata/relational_index_publication.zig");
     if (!context.setting_admin or !context.index_publication_authority) return error.Forbidden;
@@ -1161,6 +1170,7 @@ pub fn call(svc: anytype, alloc: std.mem.Allocator, context: operation.RequestCo
         .fk_generation_publication_work => |after_child_table_id| fkGenerationPublicationWorkJson(svc, alloc, context, after_child_table_id),
         .fk_generation_publication_decision => |request| fkGenerationPublicationDecisionJson(svc, alloc, context, request),
         .fk_generation_publication_source_decision => |request| fkGenerationPublicationSourceDecisionJson(svc, alloc, context, request),
+        .relational_index_prepare => |request| prepareRelationalIndexPublication(svc, alloc, context, request),
         .relational_index_begin => |request| beginRelationalIndexPublication(svc, alloc, context, request),
         .relational_index_admission_status => |request| relationalIndexAdmissionStatusJson(svc, alloc, context, request),
         .relational_index_owner_decision => |request| relationalIndexOwnerDecisionJson(svc, alloc, context, request),

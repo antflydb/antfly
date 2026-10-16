@@ -1949,6 +1949,10 @@ pub fn metadataApplyStoreProjection(
                     const value = handle.store.relationalIndexOwnerDecisionJson(a, group_id, input) catch |err| break :blk storageOwnerStatusFromError(err);
                     break :blk metadataProjectionJson(alloc, out_json, value);
                 },
+                .relational_index_prepare => |input| {
+                    const value = handle.store.relationalIndexPrepareCutJson(a, group_id, input) catch |err| break :blk storageOwnerStatusFromError(err);
+                    break :blk metadataProjectionJson(alloc, out_json, value);
+                },
                 .relational_index_admission_status => |input| {
                     const value = handle.store.relationalIndexAdmissionStatusJson(a, group_id, input) catch |err| break :blk storageOwnerStatusFromError(err);
                     break :blk metadataProjectionJson(alloc, out_json, value);

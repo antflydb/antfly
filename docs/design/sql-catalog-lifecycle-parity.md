@@ -8601,3 +8601,28 @@ one proposal, and withholding confirmation while replication is pending. Direct
 durable admission and compiled storage projection are qualified separately;
 this is not a complete public or hosted online-index execution test. All static
 checks pass; original inventory remains 483 implemented / 862 unresolved.
+
+### Trusted table-scoped index preparation
+
+The shared catalog read now captures only the authorized table and its bounded,
+indexed owner cohort in one snapshot. Metadata selects native receipt authority;
+unmounted hosted/Raft execution is rejected, and pending root enrollment or
+replication remains a retryable preparation precondition. The owned builder
+addresses captured groups with read-index reads, checks namespace/catalog/epoch
+identity, preserves the actual predecessor catalog (including burned canceled
+allocations), and reuses one scratch arena between owner observations. It clones
+the retained table, ranges and logical guard and prepares the immutable candidate
+and exact recovery identity before submission. Neither cut nor preparation grants
+execution or changes catalog state; durable begin independently rechecks admission.
+
+The final frozen-source Debug gate passed 117/117 steps in
+`/private/tmp/antfly-index-plan-builder-final-debug.log`: 62 metadata, four ACK
+transport, one decoder-barrier, four standalone coordinator and one compiled
+metadata-owner tests, without failures or leaks. Coverage includes an actual
+native metadata preparation cut, readiness/conflict/outbox checks, no revision
+advance, compiled projection and administrator-bound transport, plus a synthetic
+owner reader proving burned allocations are retained and owner drift rejected.
+No latency benchmark or complete public execution is claimed. Static checks pass;
+the new file's initial license-header formatting mismatch was corrected. Public
+SQL/REST recovery receipts and activation, replacement-root adoption and hosted
+execution remain unfinished. Original inventory is still 483 / 862.

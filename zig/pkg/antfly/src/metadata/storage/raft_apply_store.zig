@@ -6592,6 +6592,69 @@ pub const OwnerAckTestFixture = if (@import("builtin").is_test) struct {
     }
 } else struct {};
 
+test "relational index publication preparation captures only the authorized native table cohort" {
+    const a = std.testing.allocator;
+    const group = group_ids.main_metadata_group_id;
+    const incarnation = "11111111111111111111111111111111".*;
+    const seed: [32]u8 = @splat(9);
+    const pair = try std.crypto.sign.Ed25519.KeyPair.generateDeterministic(seed);
+    const identity: store_root_enrollment.Identity = .{ .metadata_incarnation = incarnation, .node_id = 2, .store_id = 3, .root_incarnation = 7, .public_key = pair.public_key.toBytes() };
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/prepare-index", .{tmp.sub_path});
+    defer a.free(path);
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    var plan = try index_publication.testing.plan(arena.allocator());
+    var store = try RaftApplyStore.init(a, .{ .root_dir = path });
+    defer store.deinit();
+    try store.applyStandaloneCommand(group, .{ .initialize_metadata_incarnation = incarnation });
+    try store.updateStandaloneCatalog(group, try store.standaloneRevision(), .{ .auxiliary_json = "{\"epoch\":1,\"tables\":[],\"ranges\":[]}" });
+    try store.applyStandaloneCommand(group, .{ .upsert_table = plan.before });
+    try store.applyStandaloneCommand(group, .{ .upsert_range = plan.owners[0].range });
+    try store.applyStandaloneCommand(group, .{ .register_node = .{ .node_id = 2, .role = "data", .lifecycle = metadata_table_manager.node_lifecycle_active } });
+    try store.applyStandaloneCommand(group, .{ .register_store = .{ .store_id = 3, .node_id = 2, .reporter_incarnation = 4, .replica_root_incarnation = 7, .replica_root_public_key = identity.public_key, .schema_reader = .current, .live = true, .role = "data" } });
+    const activation = try std.json.Stringify.valueAlloc(a, topology_protocol.Activation{ .version = topology_protocol.index_publication_head_version, .incarnation = incarnation, .member_count = 3, .membership_fingerprint = @splat(7) }, .{});
+    defer a.free(activation);
+    try store.applyStandaloneCommand(group, .{ .activate_topology_protocol = activation });
+    try adoptRelationWriterForTest(&store, a, group);
+    _ = try publishLiveRelationRootWithCoverageForTest(&store, a, group, .constraint_names);
+    {
+        var read = try store.store.beginReadTxn();
+        defer read.abort();
+        var live = (try relation_reconciliation.LiveStore(docstore.DocStore.Txn).open(&read, group)).?;
+        plan.table_guard = .{ .target = .{ .name = plan.before.name }, .logical_table = plan.before.name, .owner = (try live.getClaim(.{ .namespace_id = plan.namespace_id, .name = plan.before.name })).?, .incarnation = live.root.epoch.incarnation };
+    }
+    const request: index_publication.PrepareRequest = .{ .guard = plan.table_guard, .index_name = plan.index_name };
+    try std.testing.expectError(error.UnsupportedNativeIndexOwner, store.relationalIndexPrepareCutJson(a, group, request));
+    try store.updateStandaloneCatalog(group, try store.standaloneRevision(), .{ .native_owner = .{ .metadata_incarnation = incarnation, .node_id = 2, .store_id = 3, .root_incarnation = 7 } });
+    try std.testing.expectError(error.CatalogPublicationProofPending, store.relationalIndexPrepareCutJson(a, group, request));
+    const enrollment = try std.json.Stringify.valueAlloc(a, try store_root_enrollment.Request.sign(identity, seed), .{});
+    defer a.free(enrollment);
+    try store.applyStandaloneCommand(group, .{ .apply_store_root_enrollment = enrollment });
+    const revision = try store.standaloneRevision();
+    const bytes = try store.relationalIndexPrepareCutJson(a, group, request);
+    defer a.free(bytes);
+    var cut = try std.json.parseFromSlice(index_publication.PrepareCut, a, bytes, .{ .allocate = .alloc_always });
+    defer cut.deinit();
+    try cut.value.requireRequest(a, request);
+    try std.testing.expectEqual(index_progress.Authority.native, cut.value.authority);
+    try std.testing.expectEqual(@as(usize, 1), cut.value.ranges.len);
+    try std.testing.expect(metadata_table_manager.rangeRecordsEqual(plan.owners[0].range, cut.value.ranges[0]));
+    try std.testing.expect(metadata_table_manager.tableDefinitionsEqual(plan.before, cut.value.before));
+    try std.testing.expect(cut.value.expected_head == null);
+    try std.testing.expectEqual(revision, try store.standaloneRevision());
+    try store.store.put(RaftApplyStore.metadata_hot_standby.outbox_key, "pending-test-effect");
+    try std.testing.expectError(error.MetadataReplicationPending, store.relationalIndexPrepareCutJson(a, group, request));
+    try store.store.delete(RaftApplyStore.metadata_hot_standby.outbox_key);
+    var foreign = request;
+    foreign.guard.owner.schema_digest[0] ^= 1;
+    try std.testing.expectError(error.CatalogGenerationChanged, store.relationalIndexPrepareCutJson(a, group, foreign));
+    try store.applyStandaloneCommand(group, .{ .upsert_table = .{ .table_id = 999, .name = plan.index_name, .schema_json = "{}" } });
+    try std.testing.expectError(error.CatalogAlreadyExists, store.relationalIndexPrepareCutJson(a, group, request));
+    try verifyRelationRecoveryForTest(&store, a, group);
+}
+
 test "relational index publication admission reserves names atomically and survives recovery with fault verification" {
     const a = std.testing.allocator;
     const group = group_ids.main_metadata_group_id;
@@ -18858,6 +18921,52 @@ pub const RaftApplyStore = struct {
         try self.writePreparedTableRecordTxn(txn, group_id, try tableKeyForGroup(&buf, group_id, decision.table_id), value.table);
         try txn.put(try index_publication.headKey(&buf, group_id, decision.table_id), &try value.head.encode());
         try txn.delete(try index_publication.activeKey(&buf, group_id, decision.table_id));
+    }
+
+    pub fn relationalIndexPrepareCutJson(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, request: index_publication.PrepareRequest) ![]u8 {
+        try request.validate();
+        var arena = std.heap.ArenaAllocator.init(self.alloc);
+        defer arena.deinit();
+        const a = arena.allocator();
+        var txn = try self.beginIndexedReportRead(group_id);
+        defer txn.abort();
+        _ = try self.standbyRelationActivationTxn(&txn, group_id, topology_protocol.index_publication_head_version);
+        if (!try relationWriterEnabledTxn(&txn, group_id)) return error.CatalogOccupancyNotReady;
+        if (try stagingGet(&txn, metadata_hot_standby.outbox_key) != null) return error.MetadataReplicationPending;
+        var buf: [192]u8 = undefined;
+        const before = try decodeTableRecord(a, txn.get(try tableKeyForGroup(&buf, group_id, request.guard.owner.table_id)) catch |err| switch (err) {
+            error.NotFound => return error.CatalogGenerationChanged,
+            else => return err,
+        });
+        try self.validateRelationMutationTxn(&txn, group_id, request.guard, before, before);
+        var live = (try relation_reconciliation.LiveStore(docstore.DocStore.Txn).open(&txn, group_id)) orelse return error.CatalogPublicationProofPending;
+        if (live.root.coverage != .constraint_names) return error.CatalogOccupancyNotReady;
+        const namespace_id = (try resolveSystemCatalogNamespaceTxn(a, &txn, group_id, request.guard.target.database, request.guard.target.namespace)) orelse return error.CatalogGenerationChanged;
+        if (try live.nameOccupied(namespace_id, request.index_name, true)) return error.CatalogAlreadyExists;
+        if (try @import("../table_lifecycle_lock.zig").read(&txn, group_id, before.table_id) != null) return error.GenerationPublicationChanged;
+        if (!try self.policyTopologyMutationAllowedTxn(&txn, group_id, before.table_id)) return error.RowPolicyUnsupported;
+        const incarnation = (try decodeMetadataIncarnationRecord(try txn.get(try metadataIncarnationKeyForGroup(&buf, group_id)))).incarnation;
+        // Authority is selected by the metadata owner, never by a public index
+        // option or a caller-supplied placement/report description.
+        if (try stagingGet(&txn, try standalone_native_owner.key(&buf, group_id)) == null) return error.UnsupportedNativeIndexOwner;
+        _ = (try self.nativeIndexSigningViewTxn(&txn, group_id, incarnation)) orelse return error.CatalogPublicationProofPending;
+        const ids = try self.indexedTableRangeIdsBoundedTxn(a, &txn, group_id, before.table_id, index_progress.max_owners);
+        if (ids.len == 0) return error.GenerationPublicationChanged;
+        const ranges = try a.alloc(metadata.RangeRecord, ids.len);
+        for (ids, ranges) |id, *range| range.* = try decodeRangeRecord(a, try txn.get(try rangeKeyForGroup(&buf, group_id, id)));
+        metadata_table_manager.sortKeyspaceRanges(metadata.RangeRecord, ranges);
+        try self.validateFkGenerationTableTxn(&txn, group_id, before, ranges);
+        var expected_head: ?[index_progress.Head.encoded_len]u8 = null;
+        if (try stagingGet(&txn, try index_publication.headKey(&buf, group_id, before.table_id))) |bytes| {
+            const head = try index_progress.Head.decode(bytes);
+            if (head.phase != .published and head.phase != .canceled) return error.GenerationPublicationChanged;
+            try index_publication.requireActivePointer(&txn, group_id, head);
+            _ = try index_publication.verifyJob(self.alloc, &txn, group_id, before.table_id);
+            expected_head = try head.encode();
+        }
+        const cut: index_publication.PrepareCut = .{ .metadata_incarnation = incarnation, .namespace_id = namespace_id, .table_guard = request.guard, .before = before, .ranges = ranges, .authority = .native, .expected_head = expected_head };
+        try cut.requireRequest(a, request);
+        return cut.encode(alloc);
     }
 
     /// Uses a pinned indexed read; neither stages job rows nor installs a

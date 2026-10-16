@@ -1371,6 +1371,70 @@ pub const BeginRequest = struct {
     }
 };
 
+/// Trusted ingress supplies logical intent, never topology or receipt authority.
+pub const PrepareRequest = struct {
+    guard: domain.RelationMutationGuard,
+    index_name: []const u8,
+
+    pub fn validate(self: @This()) !void {
+        try self.guard.validate();
+        if (self.guard.owner.kind != .table or self.guard.constraint_name_admission != null or
+            !std.mem.eql(u8, self.guard.target.name, self.guard.logical_table)) return error.InvalidCatalogMutation;
+        try (names.Key{ .namespace_id = 1, .name = self.index_name }).validate();
+    }
+};
+
+/// One metadata snapshot, scoped to one authorized table. This is preparation
+/// evidence, not a durable reservation, owner receipt or root-adoption grant.
+pub const PrepareCut = struct {
+    pub const max_wire_bytes = max_bytes;
+    metadata_incarnation: [32]u8,
+    namespace_id: u64,
+    table_guard: domain.RelationMutationGuard,
+    before: records.TableRecord,
+    ranges: []const records.RangeRecord,
+    authority: progress.Authority,
+    expected_head: ?[progress.Head.encoded_len]u8 = null,
+
+    pub fn requireRequest(self: @This(), alloc: Allocator, request: PrepareRequest) !void {
+        try request.validate();
+        try self.table_guard.validate();
+        const expected = request.guard;
+        const actual = self.table_guard;
+        if (self.namespace_id == 0 or !local.metadata_incarnation.isValid(self.metadata_incarnation) or
+            !actual.owner.eql(expected.owner) or !std.mem.eql(u8, &actual.incarnation, &expected.incarnation) or
+            !std.mem.eql(u8, actual.target.database, expected.target.database) or
+            !std.mem.eql(u8, actual.target.namespace, expected.target.namespace) or
+            !std.mem.eql(u8, actual.target.name, expected.target.name) or
+            !std.mem.eql(u8, actual.logical_table, expected.logical_table) or actual.constraint_name_admission != null or
+            self.before.table_id != expected.owner.table_id or self.before.name.len == 0 or
+            !std.mem.eql(u8, &digest(self.before.schema_json), &expected.owner.schema_digest)) return error.CatalogGenerationChanged;
+        // Hosted/Raft execution is not mounted yet. Never admit its jobs as a
+        // native alias merely because a peer can decode the same plan format.
+        if (self.authority != .native) return error.UnsupportedNativeIndexOwner;
+        var relation_incarnation: [16]u8 = undefined;
+        _ = std.fmt.hexToBytes(&relation_incarnation, &self.metadata_incarnation) catch return error.InvalidMetadataIncarnation;
+        if (!std.mem.eql(u8, &relation_incarnation, &actual.incarnation)) return error.CatalogGenerationChanged;
+        if (self.ranges.len == 0 or self.ranges.len > progress.max_owners) return error.InvalidGenerationPublication;
+        var groups: std.AutoHashMapUnmanaged(u64, void) = .empty;
+        defer groups.deinit(alloc);
+        for (self.ranges) |range| {
+            if (range.table_id != self.before.table_id or range.group_id == 0 or
+                (try groups.getOrPut(alloc, range.group_id)).found_existing) return error.GenerationPublicationChanged;
+        }
+        try manager.validateCompleteKeyspaceRanges(self.ranges);
+        if (self.expected_head) |bytes| {
+            const head = try progress.Head.decode(&bytes);
+            if (head.table_id != self.before.table_id or (head.phase != .published and head.phase != .canceled))
+                return error.GenerationPublicationChanged;
+        }
+    }
+
+    pub fn encode(self: @This(), alloc: Allocator) ![]u8 {
+        return @constCast(try encodeBounded(alloc, self));
+    }
+};
+
 /// Namespace readers need definitions, not owner receipt arrays. Allocate the
 /// projected strings independently: a subsequent transactional point read may
 /// invalidate a borrowed store value.

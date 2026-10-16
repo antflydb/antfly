@@ -78,6 +78,7 @@ pub const Call = union(enum) {
     fk_generation_publication_work: u64,
     fk_generation_publication_decision: @import("../metadata/fk_generation_publication.zig").DecisionRequest,
     fk_generation_publication_source_decision: @import("../metadata/fk_generation_publication.zig").SourceDecisionRequest,
+    relational_index_prepare: @import("../metadata/relational_index_publication.zig").PrepareRequest,
     relational_index_begin: @import("../metadata/relational_index_publication.zig").BeginRequest,
     relational_index_admission_status: @import("../metadata/relational_index_publication.zig").AdmissionRequest,
     relational_index_owner_decision: @import("../metadata/relational_index_publication.zig").OwnerRequest,
@@ -125,7 +126,7 @@ pub const Call = union(enum) {
 
     pub fn requiresAdministrativeGrant(self: @This()) bool {
         return switch (self) {
-            .relation_replace, .relation_schema_mutate, .constraint_name_prepare, .constraint_name_check, .relational_index_begin => true,
+            .relation_replace, .relation_schema_mutate, .constraint_name_prepare, .constraint_name_check, .relational_index_prepare, .relational_index_begin => true,
             .lake_index_lifecycle_mutate, .setting_mutate, .policy_definition_mutate, .policy_publication_mutate, .policy_publication_begin, .fk_generation_publication_begin, .fk_generation_publication_mutate, .fk_initial_create_begin, .fk_initial_create_mutate, .store_root_enroll, .store_root_enrollment_status => true,
             else => false,
         };
@@ -171,11 +172,11 @@ pub const Call = union(enum) {
 
     pub fn isMutation(self: @This()) bool {
         return self == .mutate or self == .fk_initial_retirement_ack or self == .relational_index_owner_ack or self == .relational_index_publish_decide or self == .relational_index_cancel or self == .relational_index_source_accept or self == .relational_index_source_complete or
-            (self != .store_root_enrollment_status and self != .constraint_name_prepare and self != .constraint_name_check and self.requiresAdministrativeGrant());
+            (self != .store_root_enrollment_status and self != .constraint_name_prepare and self != .constraint_name_check and self != .relational_index_prepare and self.requiresAdministrativeGrant());
     }
 
     pub fn isRelationalIndexOwnerCall(self: @This()) bool {
-        return self == .relational_index_begin or self == .relational_index_admission_status or self == .relational_index_owner_decision or self == .relational_index_owner_ack or self == .relational_index_owner_ack_status or self == .relational_index_publish_decide or self == .relational_index_publish_status or self == .relational_index_cancel or self == .relational_index_cancel_status or self == .relational_index_source_accept or self == .relational_index_source_accept_status or self == .relational_index_source_complete;
+        return self == .relational_index_prepare or self == .relational_index_begin or self == .relational_index_admission_status or self == .relational_index_owner_decision or self == .relational_index_owner_ack or self == .relational_index_owner_ack_status or self == .relational_index_publish_decide or self == .relational_index_publish_status or self == .relational_index_cancel or self == .relational_index_cancel_status or self == .relational_index_source_accept or self == .relational_index_source_accept_status or self == .relational_index_source_complete;
     }
 };
 
@@ -196,6 +197,10 @@ test "relational index publication ACK calls require body bound authority and di
     }
     const admission: Call = .{ .relational_index_admission_status = undefined };
     const beginning: Call = .{ .relational_index_begin = undefined };
+    const preparation: Call = .{ .relational_index_prepare = undefined };
+    try std.testing.expect(!preparation.isMutation());
+    try std.testing.expect(preparation.requiresAdministrativeGrant());
+    try std.testing.expect(preparation.isRelationalIndexOwnerCall());
     try std.testing.expect(beginning.isMutation());
     try std.testing.expect(beginning.requiresAdministrativeGrant());
     try std.testing.expect(beginning.isRelationalIndexOwnerCall());
