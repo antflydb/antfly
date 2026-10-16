@@ -3412,6 +3412,48 @@ test "SQL UNNEST demand admission and allocation failures never materialize expa
     try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Check.run, .{&compiled});
 }
 
+test "SQL captured prefix replay defers later errors without reopening physical storage" {
+    const sql = "SELECT p.n, q.v FROM (VALUES (1)) p(n) CROSS JOIN LATERAL (SELECT 10 / (1-id) AS v FROM things) q LIMIT 1";
+    var compiled = try compiler.compile(std.testing.allocator, sql, .{});
+    defer compiled.deinit();
+    var backend: TestBackend = .{ .row_count = 4096, .group_every = 1 };
+    var result = try execute(std.testing.allocator, backend.coordinated(), &compiled, &.{}, .{ .page_rows = 16, .scan_pages = 1 });
+    defer result.deinit();
+    try std.testing.expectEqual(@as(usize, 1), result.output.rows.len);
+    try std.testing.expectEqualStrings("10", result.output.rows[0][1].string);
+    try std.testing.expectEqual(@as(usize, 1), backend.pages);
+    try std.testing.expectEqual(@as(usize, 1), backend.statement_opens);
+    try std.testing.expectEqual(backend.statement_opens, backend.statement_closes);
+
+    backend = .{ .row_count = 4096, .group_every = 1 };
+    var second = try compiler.compile(std.testing.allocator, "SELECT p.n, q.v FROM (VALUES (1)) p(n) CROSS JOIN LATERAL (SELECT 10 / (1-id) AS v FROM things) q LIMIT 2", .{});
+    defer second.deinit();
+    try std.testing.expectError(error.SqlDivisionByZero, execute(std.testing.allocator, backend.coordinated(), &second, &.{}, .{ .page_rows = 16, .scan_pages = 1 }));
+    try std.testing.expectEqual(@as(usize, 1), backend.pages);
+    try std.testing.expectEqual(backend.statement_opens, backend.statement_closes);
+}
+
+test "SQL captured prefix replay shares one captured iterator across lateral consumers and allocation faults" {
+    const Check = struct {
+        fn run(a: std.mem.Allocator, compiled: *const compiler.Compiled) !void {
+            var backend: TestBackend = .{ .row_count = 2, .group_every = 1 };
+            defer std.debug.assert(backend.statement_opens == backend.statement_closes);
+            var result = try execute(a, backend.coordinated(), compiled, &.{}, .{ .page_rows = 16 });
+            defer result.deinit();
+            try std.testing.expectEqual(@as(usize, 4), result.output.rows.len);
+            for (result.output.rows, [_][]const u8{ "1", "1", "2", "2" }, [_][]const u8{ "0", "1", "0", "1" }) |row, parent, value| {
+                try std.testing.expectEqualStrings(parent, row[0].string);
+                try std.testing.expectEqualStrings(value, row[1].string);
+            }
+            try std.testing.expectEqual(@as(usize, 1), backend.pages);
+            try std.testing.expectEqual(@as(usize, 1), backend.statement_opens);
+        }
+    };
+    var compiled = try compiler.compile(std.testing.allocator, "SELECT p.n, q.v FROM (VALUES (1),(2)) p(n) CROSS JOIN LATERAL (SELECT id AS v FROM things) q", .{});
+    defer compiled.deinit();
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Check.run, .{&compiled});
+}
+
 test "SQL expansion replay policy distinguishes restartable wrappers from capture and volatility" {
     for ([_]struct { sql: []const u8, expected: @import("relation_binding.zig").Node.ReplayPolicy }{
         .{ .sql = "SELECT q.v FROM things d CROSS JOIN LATERAL (SELECT v FROM unnest(ARRAY[1,2]) t(v)) q", .expected = .streaming },

@@ -830,6 +830,7 @@ pub const Sequential = struct {
     file: File,
     size: u64 = 0,
     readers: usize = 0,
+    prefix_readers: usize = 0,
     block_bytes: usize,
     buffer_bytes: ?usize = null,
     write_arena: std.heap.ArenaAllocator,
@@ -853,6 +854,16 @@ pub const Sequential = struct {
     }
     pub fn append(self: *Sequential, row: Row, link: u64) !u64 {
         if (self.readers != 0) return error.InvalidSqlSpill;
+        return self.appendInternal(row, link);
+    }
+    /// Serialized append-only replay may extend the unpublished tail while
+    /// independent prefix readers retain their own decoded blocks. Ordinary
+    /// sealed-run readers still prohibit writes. This is not concurrent I/O.
+    pub fn appendPrefix(self: *Sequential, row: Row, link: u64) !u64 {
+        if (self.readers != self.prefix_readers) return error.InvalidSqlSpill;
+        return self.appendInternal(row, link);
+    }
+    fn appendInternal(self: *Sequential, row: Row, link: u64) !u64 {
         if (link != none) return error.InvalidSqlSpill;
         try self.file.manager.check();
         var bytes: usize = @sizeOf(Row);
@@ -1173,6 +1184,8 @@ pub const Sequential = struct {
     /// reader must not move after its first read (JSON arrays retain its arena).
     pub const ReplayReader = struct {
         source: *Sequential,
+        prefix: bool = false,
+        prefix_offset: u64 = 0,
         read_arena: std.heap.ArenaAllocator,
         read_rows: []const Row = &.{},
         read_single: [1]Row = undefined,
@@ -1181,12 +1194,39 @@ pub const Sequential = struct {
         read_offset: u64 = 0,
 
         pub fn readBorrowed(self: *ReplayReader, offset: u64) !Decoded {
+            if (self.prefix) return error.InvalidSqlSpill;
             return readState(self, &self.source.file, self.source.size, offset);
+        }
+
+        /// The pending tail borrows the writer and expires on any append.
+        /// Callers retaining a row across producer advancement must clone it.
+        /// Flushed blocks retain the ordinary independent-reader lifetime.
+        pub fn readPrefixBorrowed(self: *ReplayReader, offset: u64) !Decoded {
+            if (!self.prefix or offset >= self.source.size) return error.InvalidSqlSpill;
+            try self.source.file.manager.check();
+            const flushed = self.source.size - self.source.pending.items.len;
+            if (offset >= flushed) return .{ .row = self.source.pending.items[@intCast(offset - flushed)], .next = none, .matched = false, .following = offset + 1 };
+            if (offset < self.prefix_offset) {
+                self.prefix_offset = 0;
+                self.read_first = 0;
+                self.read_offset = 0;
+                self.read_rows = &.{};
+                self.read_single_offset = null;
+            }
+            // A row previously served from the pending tail may now be in a
+            // flushed block. Catch up sequentially, without a per-row index.
+            while (self.prefix_offset <= offset) {
+                const value = try readState(self, &self.source.file, flushed, self.prefix_offset);
+                self.prefix_offset += 1;
+                if (self.prefix_offset == offset + 1) return value;
+            }
+            unreachable;
         }
 
         pub fn deinit(self: *ReplayReader) void {
             self.read_arena.deinit();
             self.source.readers -= 1;
+            if (self.prefix) self.source.prefix_readers -= 1;
             self.* = undefined;
         }
     };
@@ -1195,6 +1235,12 @@ pub const Sequential = struct {
         try self.seal();
         self.readers += 1;
         return .{ .source = self, .read_arena = .init(self.file.manager.allocator()) };
+    }
+
+    pub fn openPrefixReader(self: *Sequential) !ReplayReader {
+        self.readers += 1;
+        self.prefix_readers += 1;
+        return .{ .source = self, .prefix = true, .read_arena = .init(self.file.manager.allocator()) };
     }
 
     fn readState(self: anytype, file: *File, size: u64, offset: u64) !Decoded {

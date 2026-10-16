@@ -9194,3 +9194,48 @@ PostgreSQL 18.6 experiment in
 `/private/tmp/antfly-sql-view-definition-postgres.log` confirmed partial output
 alias lists, exact integer/array/NUMERIC descriptors, duplicate output rejection
 and excess-alias rejection. It did not qualify stored-view execution or RLS.
+
+### Captured Apply prefix replay
+
+Invariant captured inputs under Apply now retain one suspended iterator instead
+of draining it before opening the first reader. A reader at the frontier pulls
+one new row, appends an owned replay image and advances. Other readers consume
+that image without reopening physical storage or repeating producer effects.
+EOF closes the producer once; a producer error is sticky at its frontier.
+Abandonment closes suspended iterators before destroying their cached inputs.
+
+The replay owner retains a reusable producer scratch arena. Growing memory
+replay can promote to one typed sequential spill run while readers remain live.
+Readers own delivered prefix rows across another reader's advancement and
+promotion. Pending writer rows are read without flushing one physical record
+per pull; readers catch up through subsequently flushed blocks in linear order,
+without a per-row offset directory. Sealed replays retain their borrowed-row
+fast path. Prefix append/read is explicitly serialized, not a concurrent-file
+interface. Spill corruption, quota, cancellation and allocation checks remain
+fail-closed; storage failures never authorize producer restart or RAM fallback.
+
+Projection demand is separated from physical page admission: one-row evaluation
+does not turn captured scans into one-row I/O. A 4096-row test source delivers a
+LIMIT 1 prefix after one physical page without evaluating a later division by
+zero, but LIMIT 2 reports that error. Its single-parent PostgreSQL witness avoids
+unordered join-orientation ambiguity. A separate multi-parent test verifies one
+captured iterator and replayed rows, with exhaustive allocation-failure cleanup.
+Independent readers also cross pending-tail flushes and memory/spill promotion.
+
+This activates prefix replay for the invariant Apply cache. Explicit
+materialization and recursion-specific caches still use their existing eager
+owners; migrating those requires their own lifecycle and fault qualification.
+Persisted views remain gated on durable attribute identities, dependency
+admission and current owner/RLS delegation. No original case dispositions change.
+
+Validation: `/private/tmp/antfly-sql-prefix-replay-full-debug.log` passed the
+complete Debug SQL gate (847 core tests, 227 extracted SQL tests, three existing
+opt-in skips, zero failures/leaks). The focused prefix/expansion gate passed 14
+tests in `/private/tmp/antfly-sql-prefix-replay-runtime-debug.log`; the full gate
+was run after the final pending-tail checkpoint change. Mounted native
+HTTP regressions passed 80/80 build steps in
+`/private/tmp/antfly-sql-prefix-replay-public-debug.log`, checking all 22 qualified
+original joins and 17 supplemental array-expansion contracts. The fresh owned
+PostgreSQL 18.6 prefix/error witness is recorded in
+`/private/tmp/antfly-sql-prefix-replay-postgres.log`. License, Apache boundary and
+inventory checks pass. These work/lifetime tests are not throughput benchmarks.

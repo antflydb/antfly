@@ -731,6 +731,10 @@ fn Engine(comptime Context: type) type {
         }
 
         pub fn deinit(self: *Self) void {
+            // Lazy producers can retain readers of other cached inputs. Join
+            // every producer before destroying any of those shared owners.
+            var producers = self.static_rows.valueIterator();
+            while (producers.next()) |replay| replay.*.closeProducer();
             for (0..self.outer_replays.len) |id| {
                 self.clearOuter(id);
                 self.outer_replays[id].deinit(self.context.alloc);
@@ -760,6 +764,33 @@ fn Engine(comptime Context: type) type {
                 self.recursions[id] = null;
                 self.recursion_scopes[id] = null;
             }
+        }
+
+        fn prefixRows(self: *Self, node: *const binding.Node) anyerror!*Replay {
+            if (outerMask(node) != 0) return self.staticRows(node);
+            if (self.static_rows.get(node)) |rows| return rows;
+            const memory_bytes = if (self.context.spill != null) self.context.limits.retained_bytes / 16 else self.context.limits.retained_bytes;
+            const replay = try Replay.create(self.context.alloc, node.columns.len, memory_bytes, self.context.spill);
+            errdefer replay.deinit();
+            const iterator = try Iterator.createContext(self, node, null, false);
+            iterator.markPrefixProducer();
+            // attachProducer transfers iterator ownership only on success.
+            replay.attachProducer(.{ .ptr = iterator, .pull = prefixPull, .close = prefixClose }, self.context.limits.scan_rows) catch |err| {
+                iterator.deinit();
+                return err;
+            };
+            try self.static_rows.put(self.cache_arena.allocator(), node, replay);
+            return replay;
+        }
+        fn prefixPull(raw: *anyopaque, a: Allocator) anyerror!?[]const Datum {
+            const iterator: *Iterator = @ptrCast(@alignCast(raw));
+            // Projection demand is one row; physical cursors retain their
+            // existing page admission and are never reopened for a reader.
+            return iterator.nextDemand(a, 1);
+        }
+        fn prefixClose(raw: *anyopaque) void {
+            const iterator: *Iterator = @ptrCast(@alignCast(raw));
+            iterator.deinit();
         }
 
         fn staticRows(self: *Self, node: *const binding.Node) anyerror!*Replay {
@@ -927,6 +958,7 @@ fn Engine(comptime Context: type) type {
             recursive_id: ?usize = null,
             apply_mode: bool = false,
             batch_demand: ?usize = null,
+            prefix_producer: bool = false,
             cached_reader: ?*Replay.Reader = null,
             borrowed_hash: bool = false,
             flipped_join: bool = false,
@@ -937,6 +969,12 @@ fn Engine(comptime Context: type) type {
             sample_arena: ?std.heap.ArenaAllocator = null,
 
             const SetEntry = struct { values: []const Datum, count: usize, next: ?usize };
+
+            fn markPrefixProducer(self: *Iterator) void {
+                self.prefix_producer = true;
+                if (self.left) |left| left.markPrefixProducer();
+                if (self.right) |right| right.markPrefixProducer();
+            }
 
             fn create(engine: *Self, node: *const binding.Node) anyerror!*Iterator {
                 return createRecursive(engine, node, null);
@@ -957,7 +995,7 @@ fn Engine(comptime Context: type) type {
                 // boundaries. Captured and volatile producers retain replay;
                 // restarting those could lose rows or repeat external effects.
                 if (apply_mode and node.replay_policy != .streaming and outerMask(node) == 0 and (recursive_id == null or !dependsOn(node, recursive_id.?))) {
-                    self.cached_reader = try (try engine.staticRows(node)).openReader();
+                    self.cached_reader = try (try engine.prefixRows(node)).openReader();
                     return self;
                 }
                 switch (node.operation) {
@@ -1178,7 +1216,7 @@ fn Engine(comptime Context: type) type {
                                 _ = self.arena.reset(.free_all);
                                 self.pages += 1;
                                 if (self.pages > self.engine.context.limits.scan_pages) return error.SqlProgramLimitExceeded;
-                                const wanted: u32 = @intCast(@min(self.batch_demand orelse std.math.maxInt(usize), @min(self.engine.context.limits.executionRows(), @max(@as(usize, 1), self.engine.context.limits.retained_bytes / (16 * 1024 + self.node.columns.len * @sizeOf(Datum) * 16)))));
+                                const wanted: u32 = @intCast(@min(if (self.prefix_producer) std.math.maxInt(usize) else self.batch_demand orelse std.math.maxInt(usize), @min(self.engine.context.limits.executionRows(), @max(@as(usize, 1), self.engine.context.limits.retained_bytes / (16 * 1024 + self.node.columns.len * @sizeOf(Datum) * 16)))));
                                 self.column_page = try pull(cursor.ptr, self.arena.allocator(), wanted);
                                 try self.column_page.?.validate();
                                 if (self.column_page.?.selection.len > wanted) return error.InvalidSqlBackendResponse;
@@ -1206,7 +1244,7 @@ fn Engine(comptime Context: type) type {
                             _ = self.arena.reset(.free_all);
                             self.pages += 1;
                             if (self.pages > self.engine.context.limits.scan_pages) return error.SqlProgramLimitExceeded;
-                            const wanted = @min(self.batch_demand orelse std.math.maxInt(usize), @min(self.engine.context.limits.page_rows, @max(@as(usize, 1), self.engine.context.limits.retained_bytes / (16 * 1024 + self.node.columns.len * @sizeOf(Datum) * 16))));
+                            const wanted = @min(if (self.prefix_producer) std.math.maxInt(usize) else self.batch_demand orelse std.math.maxInt(usize), @min(self.engine.context.limits.page_rows, @max(@as(usize, 1), self.engine.context.limits.retained_bytes / (16 * 1024 + self.node.columns.len * @sizeOf(Datum) * 16))));
                             self.page = try cursor.next(cursor.ptr, self.arena.allocator(), @intCast(wanted));
                             if (self.page.?.rows.len > wanted) return error.InvalidSqlBackendResponse;
                             self.page_index = 0;
@@ -1331,6 +1369,7 @@ fn Engine(comptime Context: type) type {
                             }
                         }
                         self.right = try createContext(self.engine, apply.right, self.recursive_id, true);
+                        if (self.prefix_producer) self.right.?.markPrefixProducer();
                     }
                     _ = self.scratch.reset(.free_all);
                     if (try self.right.?.nextDemand(self.scratch.allocator(), self.batch_demand orelse std.math.maxInt(usize))) |right| {
@@ -1592,6 +1631,7 @@ fn Engine(comptime Context: type) type {
                             if (source.type != target.type) self.values_leaf_coerce = true;
                         }
                         self.values_leaf = try createContext(self.engine, leaf, self.recursive_id, self.apply_mode);
+                        if (self.prefix_producer) self.values_leaf.?.markPrefixProducer();
                     }
                     if (try self.values_leaf.?.next(alloc)) |values| {
                         if (values.len != self.node.columns.len) return error.InvalidSqlBackendResponse;
