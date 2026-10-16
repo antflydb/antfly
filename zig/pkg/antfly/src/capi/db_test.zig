@@ -3614,6 +3614,7 @@ test "capi lite open options validate and configure ttl cleanup" {
         antfly.platform_clock.Clock.real().sleepMs(10);
     }
     defer freeRawBuffer(stats.ptr, stats.len);
+    if (attempts == 200) std.debug.print("\nTTL cleanup did not converge: {s}\n", .{stats.ptr.?[0..stats.len]});
     try std.testing.expect(attempts < 200);
 }
 
@@ -6131,6 +6132,95 @@ test "capi native replacement wait observes its background owner without rebuild
     try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_add_index_json(handle, .fromSlice(
         \\{"name":"new","type":"graph","replaces":"old","wait":{"timeout_ms":0},"edge_types":[{"name":"R","field":"links"}]}
     )));
+}
+
+test "capi native idle maintenance discovers resolver debt after producer checkpoint" {
+    try testNativeIdleResolverDebt(false);
+}
+
+test "capi native idle maintenance discovers persisted enrichment target beyond journal" {
+    try testNativeIdleResolverDebt(true);
+}
+
+fn testNativeIdleResolverDebt(notified_tail: bool) !void {
+    if (builtin.single_threaded or builtin.os.tag == .freestanding) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var directory = try TestDirectory.init("native-resolver-durable-debt");
+    defer directory.cleanup();
+    const path = try tempTestAflitePath(a, directory.path(), "database");
+    defer a.free(path);
+    defer cleanupTestFile(path);
+    var options: capi.OpenOptions = .{};
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_open_options_init(&options));
+    options.storage_kind = capi.storage_kind_lite;
+    options.profile = capi.profile_native;
+    options.flags |= capi.open_flag_generated_enrichment_replay;
+    var handle: ?*anyopaque = null;
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_create_with_options(path, &options, &handle));
+    defer antfly_db_close(handle);
+    const Pause = struct {
+        fn run(db_handle: ?*anyopaque) !std.meta.Child(@FieldType(shared.Handle, "maintenance_owner")) {
+            const guard = public.enterHandle(db_handle, .exclusive).?;
+            const owner = guard.connection.?.owner;
+            guard.leave();
+            owner.stopping.store(true, .release);
+            owner.wake.set(shared.handleLockIo());
+            owner.worker.?.join();
+            owner.worker = null;
+            owner.stopping.store(false, .release);
+            return owner;
+        }
+    };
+    var owner = try Pause.run(handle);
+    {
+        const guard = public.enterHandle(handle, .exclusive).?;
+        defer guard.leave();
+        const database = &guard.handle.db;
+        try database.addIndex(.{ .name = "kg", .kind = .graph, .config_json =
+            \\{"source":{"artifact":"extraction","path":"$.relations[*]","format":"extraction_relation","mention_edge_type":"about"},"artifact":{"name":"extraction","kind":"asset","source":{"type":"field","value":"payload"},"content_type":"application/json"},"edge_types":[{"name":"about"}]}
+        });
+        _ = try database.upsertResolverWithResultOptions(.{
+            .name = "concepts",
+            .table = "default",
+            .source_artifact = "extraction",
+            .resolution_artifact = "resolution",
+            .key_template = "entity/{{ uslug _entity.text }}",
+            .promote = false,
+            .inline_managed = true,
+        }, .{ .drain_backfill = false });
+        const document = try std.json.Stringify.valueAlloc(a, .{ .payload = "{\"entities\":[{\"id\":\"a\",\"text\":\"Antfly\",\"label\":\"technology\"}],\"relations\":[]}" }, .{});
+        defer a.free(document);
+        try database.batch(.{ .writes = &.{.{ .key = "seed", .value = document }}, .sync_level = .write });
+        // Simulate a process/turn boundary after the producer checkpoint but
+        // before resolver replay. Durable work must not depend on a wake flag.
+        for (0..8) |_| {
+            const target = database.core.nextDerivedSequence();
+            try database.runEnrichmentUntil(target);
+            if (database.core.nextDerivedSequence() == target) break;
+        }
+        const stats = database.pendingWorkStats();
+        try std.testing.expect(stats.enrichment.applied_sequence >= database.core.nextDerivedSequence());
+        try std.testing.expect(stats.resolution.catch_up_required);
+        if (notified_tail) {
+            const target = database.core.nextDerivedSequence() + 1;
+            database.enrichment_runtime.?.notifySequence(target);
+            try db_mod.enrichment_state.saveRuntimeStatus(database.core.store, "generated", .{ .target_sequence = target });
+        }
+        owner.maintenance_pending = false;
+        owner.maintenance_round_pending = false;
+    }
+    // A fresh owner must rediscover the debt without any process-local wake.
+    antfly_db_close(handle);
+    handle = null;
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_open_with_options(path, &options, &handle));
+    owner = try Pause.run(handle);
+    for (0..64) |_| if (!try owner.maintenanceTurnForTest()) break;
+    const guard = public.enterHandle(handle, .read).?;
+    defer guard.leave();
+    const stats = guard.handle.db.pendingWorkStats();
+    try std.testing.expect(stats.enrichment.applied_sequence >= stats.enrichment.target_sequence);
+    try std.testing.expect(!stats.resolution.catch_up_required);
+    try std.testing.expect(!stats.promotion.catch_up_required);
 }
 
 test "capi native resolver maintenance retries transient inference and survives reopen" {

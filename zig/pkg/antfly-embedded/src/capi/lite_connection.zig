@@ -458,7 +458,28 @@ fn releaseGate(gate: *PathGate) void {
 // worker. SQL sessions, cursor IDs, and child handles remain connection-local.
 pub const Owner = struct {
     const MaintenanceKey = struct { table_id: u64, incarnation: u128 };
-    const MaintenanceSchedule = struct { shadow_next: bool = true, live: bool = true };
+    const MaintenanceSchedule = struct {
+        shadow_next: bool = true,
+        live: bool = true,
+        ttl: h.db_mod.types.TTLCleanupStats = .{},
+    };
+    const ttl_counter_fields = .{ "acquisition_count", "runs", "scanned_timestamps", "deleted_docs", "scanned_graph_candidates", "expired_graph_sources", "expired_graph_artifacts", "error_count", "lease_acquire_failures", "lost_leases" };
+
+    fn recordTtlTurn(total: *h.db_mod.types.TTLCleanupStats, before: h.db_mod.types.TTLCleanupStats, after: h.db_mod.types.TTLCleanupStats) void {
+        inline for (ttl_counter_fields) |field| @field(total, field) +|= @field(after, field) -| @field(before, field);
+        total.last_run_ns = @max(total.last_run_ns, after.last_run_ns);
+        total.last_acquired_ms = @max(total.last_acquired_ms, after.last_acquired_ms);
+    }
+
+    /// Native TTL is driven under this owner's gate. Count completed turns at
+    /// that lifetime, rather than losing them when a serving DB view refreshes.
+    /// Configuration and current lease state still come from the live runtime.
+    pub fn overlayTtlStats(self: *Owner, database: *h.db_mod.DB, stats: *h.db_mod.types.TTLCleanupStats) void {
+        const schedule = self.maintenance_schedules.get(.{ .table_id = database.core.identity_namespace.table_id, .incarnation = database.root_incarnation }) orelse return;
+        inline for (ttl_counter_fields) |field| @field(stats, field) = @max(@field(stats, field), @field(schedule.ttl, field));
+        stats.last_run_ns = @max(stats.last_run_ns, schedule.ttl.last_run_ns);
+        stats.last_acquired_ms = @max(stats.last_acquired_ms, schedule.ttl.last_acquired_ms);
+    }
 
     path: []const u8,
     options: api.LiteResolvedOpenOptions,
@@ -623,11 +644,35 @@ pub const Owner = struct {
         self.wake.set(h.handleLockIo());
     }
 
-    fn hasPendingGeneratedEnrichment(database: *h.db_mod.DB) bool {
+    fn hasPendingReplay(database: *h.db_mod.DB) !bool {
         if (database.hasPendingGraphReplacements()) return true;
-        const runtime = database.enrichment_runtime orelse return false;
-        return database.core.hasGeneratedEnrichmentTargets() and
-            runtime.stats().applied_sequence < database.core.nextEnrichmentSequence();
+        const target = database.core.nextDerivedSequence();
+        const state = h.db_mod.enrichment_state;
+        if (database.enrichment_runtime) |runtime| {
+            const stats = runtime.stats();
+            // Durable retry/notification targets also need reconciliation.
+            // The runtime may know a newer target than this view's cached
+            // journal watermark; ignoring it strands debt across reopen.
+            if (stats.retrying or stats.applied_sequence < @max(target, stats.target_sequence)) return true;
+        } else if (database.core.hasGeneratedEnrichmentTargets()) {
+            const applied = try state.loadAppliedSequence(alloc, database.core.store, "generated");
+            const status = try state.loadRuntimeStatus(alloc, database.core.store, "generated");
+            if (status.retrying or applied < @max(target, status.target_sequence)) return true;
+        }
+        // Producer completion does not prove resolver/promotion completion.
+        // Foreground native views need not own these runtimes, so inspect the
+        // two durable watermarks instead of constructing providers on idle polls.
+        if (database.core.index_manager.resolvers.items.len != 0) {
+            if (database.resolution_runtime) |runtime| {
+                const stats = runtime.stats();
+                if (stats.applied_sequence < @max(target, stats.target_sequence)) return true;
+            } else if (try state.loadAppliedSequence(alloc, database.core.store, "resolution") < target) return true;
+            if (database.promotion_runtime) |runtime| {
+                const stats = runtime.stats();
+                if (stats.applied_sequence < @max(target, stats.target_sequence)) return true;
+            } else if (try state.loadAppliedSequence(alloc, database.core.store, "promotion") < target) return true;
+        }
+        return false;
     }
 
     fn lookupEmbedding(ptr: *anyopaque, a: std.mem.Allocator, key: [32]u8) !?[]f32 {
@@ -849,10 +894,10 @@ pub const Owner = struct {
         try @import("sql_ddl.zig").recover(foreground);
         try @import("tables.zig").loadAvailable(foreground);
         if (self.options.open_mode == .writer) {
-            if (hasPendingGeneratedEnrichment(&foreground.db)) self.maintenance_pending = true;
+            if (try hasPendingReplay(&foreground.db)) self.maintenance_pending = true;
             var tables = foreground.embedded_tables.valueIterator();
             while (tables.next()) |table| {
-                if (hasPendingGeneratedEnrichment(&table.*.db)) self.maintenance_pending = true;
+                if (try hasPendingReplay(&table.*.db)) self.maintenance_pending = true;
             }
         }
         // Prune dropped/recreated namespaces without retaining names or old
@@ -889,7 +934,11 @@ pub const Owner = struct {
         // every namespace under one file lease.
         const now = std.Io.Clock.awake.now(io).nanoseconds;
         if (now >= self.next_ttl_ns) {
-            if (database.ttl_runtime) |ttl| try ttl.runOnce();
+            if (database.ttl_runtime) |ttl| {
+                const before = ttl.stats();
+                defer recordTtlTurn(&schedule.ttl, before, ttl.stats());
+                try ttl.runOnce();
+            }
             if (self.maintenance_table_cursor == 0) {
                 const config = self.options.ttl_cleanup orelse h.db_mod.ttl_runtime.Config{};
                 self.next_ttl_ns = now + @as(i96, config.interval_ms) * std.time.ns_per_ms;
