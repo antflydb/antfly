@@ -164,3 +164,55 @@ test "AVC header field duration overflow rejects without leaking" {
     reader.packets[1].pts = std.math.maxInt(i64) - 1;
     try std.testing.expectError(error.TimestampOverflow, pictures.planning(a, &reader, .{}, null));
 }
+
+test "AVC header range planning skips entropy and reuses configuration prefixes" {
+    const a = std.testing.allocator;
+    const Provider = struct {
+        bytes: []const u8,
+        fn readAt(raw: *anyopaque, offset: u64, dest: []u8, control: media.source.Control) !usize {
+            try control.check();
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            @memcpy(dest, self.bytes[@intCast(offset)..][0..dest.len]);
+            return dest.len;
+        }
+    };
+    var provider = Provider{ .bytes = @embedFile("testdata/h264-mbaff-pcm-10-2.mp4") };
+    var source = media.source.Source{ .allocator = a, .identity = "range", .storage = .{ .range = .{ .context = &provider, .length = provider.bytes.len, .read_at = Provider.readAt } } };
+    var reader = try media.mp4.Reader.init(a, &source, .{});
+    defer reader.deinit();
+    const before = source.total_bytes;
+    var planned = try pictures.planning(a, &reader, .{}, null);
+    defer planned.deinit();
+    var coded: usize = 0;
+    for (reader.packets) |packet| coded += packet.size;
+    try std.testing.expect(source.total_bytes - before < coded / 2);
+    provider.bytes = @embedFile("testdata/h264-dynamic-geometry.mp4");
+    var dynamic_source = media.source.Source{ .allocator = a, .identity = "dynamic-range", .storage = .{ .range = .{ .context = &provider, .length = provider.bytes.len, .read_at = Provider.readAt } } };
+    var dynamic_reader = try media.mp4.Reader.init(a, &dynamic_source, .{});
+    defer dynamic_reader.deinit();
+    const registry = try @import("src/h264_dynamic.zig").Session.initPlanning(a, &dynamic_reader, .{});
+    defer registry.deinit();
+    const scanned = dynamic_source.total_bytes;
+    var indexed = try pictures.planning(a, &dynamic_reader, .{}, registry);
+    defer indexed.deinit();
+    try std.testing.expectEqual(scanned, dynamic_source.total_bytes);
+    try std.testing.expect(indexed.pictures.len > 0);
+}
+
+test "AVC header cache pressure preserves long clip configuration scanning" {
+    const a = std.testing.allocator;
+    const bytes = @embedFile("testdata/h264-mbaff-pcm-10-2.mp4");
+    var source = media.source.Source{ .allocator = a, .identity = "long-metadata", .storage = .{ .borrowed = bytes } };
+    var reader = try media.mp4.Reader.init(a, &source, .{});
+    defer reader.deinit();
+    const repeated = try a.alloc(media.mp4.Packet, 1024);
+    @memset(repeated, reader.packets[0]);
+    a.free(reader.packets);
+    reader.packets = repeated;
+    const registry = try @import("src/h264_dynamic.zig").Session.initPlanning(a, &reader, .{ .max_parameter_packets = repeated.len, .max_parameter_bytes = 32 * 1024 });
+    defer registry.deinit();
+    try std.testing.expectEqual(repeated.len, registry.packet_configs.len);
+    try std.testing.expect(!registry.cache_headers);
+    try std.testing.expectEqual(@as(usize, 0), registry.header_packets.items.len);
+    try std.testing.expectEqual(@as(usize, 0), registry.header_budget.live);
+}

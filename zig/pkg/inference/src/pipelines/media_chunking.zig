@@ -28,9 +28,9 @@ pub const Payload = union(enum) {
     text: []const u8,
     raster: image.BorrowedRasterAttachment,
     pcm: audio.PcmAudio,
-    video: struct { webm: ?@import("embedding_gemma2_video.zig").WebmInput = null, bytes: []const u8, reader: ?*const media.mp4.Reader = null, policy: video.sampling.TimestampPolicy, source_timestamps: bool = false, selection: ?*const @import("embedding_gemma2_video.zig").ReaderSelection = null, packet_base: usize = 0, ahead: ?*@import("embedding_gemma2.zig").VideoAhead = null, prepared: ?@import("embedding_gemma2.zig").VideoPreparedHook = null },
+    video: struct { webm: ?@import("embedding_gemma2_video.zig").WebmInput = null, bytes: []const u8, reader: ?*const media.mp4.Reader = null, policy: video.sampling.TimestampPolicy, source_timestamps: bool = false, selection: ?*const @import("embedding_gemma2_video.zig").ReaderSelection = null, packet_base: usize = 0, plan: ?*const @import("embedding_gemma2_video.zig").Plan = null, ahead: ?*@import("embedding_gemma2.zig").VideoAhead = null, prepared: ?@import("embedding_gemma2.zig").VideoPreparedHook = null },
 };
-pub const Preflight = struct { input_tokens: usize, picture_count: ?u32 = null, selected_pictures: ?[]const u64 = null, picture_basis: ?planning.PictureBasis = null };
+pub const Preflight = struct { video_plan: ?@import("embedding_gemma2_video.zig").Plan = null, input_tokens: usize, picture_count: ?u32 = null, selected_pictures: ?[]const u64 = null, picture_basis: ?planning.PictureBasis = null };
 pub const Output = struct { vector: []f32, input_tokens: usize };
 pub const EmbeddingContext = struct { model: []const u8, model_identity: [64]u8, model_revision: [64]u8, task_type: []const u8 };
 pub const Executor = struct {
@@ -42,6 +42,7 @@ pub const Executor = struct {
     count_overlap: ?*const fn (*anyopaque, []const u8) anyerror!usize = null,
     audio_tokens: ?*const fn (*anyopaque, usize, u32) anyerror!usize = null,
     embed: *const fn (*anyopaque, std.mem.Allocator, Payload) anyerror!Output,
+    embed_video_batch: ?*const fn (*anyopaque, std.mem.Allocator, []const Payload) anyerror![]Output = null,
     start_video: ?*const fn (*anyopaque, Payload, *media.admission.Pool) anyerror!?*@import("embedding_gemma2.zig").VideoAhead = null,
 };
 pub const Limits = @import("media_chunk_limits.zig").Limits;
@@ -134,6 +135,14 @@ pub const Runner = struct {
     /// Returns false after an explicit output cap. Every accepted item advances
     /// the continuation only after its consumer acknowledges successful delivery.
     fn emit(self: *Runner, shape: planning.Descriptor, payload: Payload, mime: []const u8) !bool {
+        return self.emitReady(shape, payload, mime, null, null);
+    }
+    /// Consumes ready even when the sink stops or rejects publication.
+    fn emitReady(self: *Runner, shape: planning.Descriptor, payload: Payload, mime: []const u8, ready: ?Output, measured_ready: ?Preflight) !bool {
+        var selected_pictures: ?[]const u64 = if (measured_ready) |measured| measured.selected_pictures else null;
+        defer if (selected_pictures) |pictures| self.allocator.free(pictures);
+        var result: ?Output = ready;
+        defer if (result) |value| self.allocator.free(value.vector);
         const ordinal = self.ordinal;
         self.ordinal = try std.math.add(u64, ordinal, 1);
         if (ordinal < self.summary.start_ordinal) return true;
@@ -152,10 +161,8 @@ pub const Runner = struct {
             descriptor.coordinates.page_box = self.page_box;
             descriptor.coordinates.page_rotation = self.page_rotation;
         }
-        var selected_pictures: ?[]const u64 = null;
-        defer if (selected_pictures) |pictures| self.allocator.free(pictures);
         if (self.executor.preflight) |preflight| {
-            const measured = try preflight(self.executor.context, payload);
+            const measured = measured_ready orelse try preflight(self.executor.context, payload);
             selected_pictures = measured.selected_pictures;
             descriptor.coordinates.selected_pictures = measured.selected_pictures;
             descriptor.coordinates.picture_basis = measured.picture_basis;
@@ -166,10 +173,8 @@ pub const Runner = struct {
         try descriptor.coordinates.validate();
         var id: [85]u8 = undefined;
         var item = Item{ .identity = self.summary.identity, .context = if (self.executor.describe) |describe| describe(self.executor.context) else null, .descriptor = descriptor, .id = self.summary.identity.cursor(ordinal, &id), .mime_type = mime };
-        var result: ?Output = null;
-        defer if (result) |value| self.allocator.free(value.vector);
         if (self.request.execute) {
-            result = self.executor.embed(self.executor.context, self.allocator, payload) catch |err| blk: {
+            if (ready == null) result = self.executor.embed(self.executor.context, self.allocator, payload) catch |err| blk: {
                 // A busy provider is admission pressure, including after an
                 // acknowledged prefix. Never publish it as a failed chunk or
                 // lose the cursor needed to resume that exact ordinal.
@@ -570,8 +575,11 @@ pub const Runner = struct {
         ahead: ?*@import("embedding_gemma2.zig").VideoAhead = null,
         initialized: bool = false,
         failure: ?anyerror = null,
+        measured: ?Preflight = null,
+        measured_allocator: ?std.mem.Allocator = null,
         fn deinit(self: *@This()) void {
             if (self.ahead) |ahead| ahead.deinit();
+            if (self.measured) |measured| if (measured.selected_pictures) |pictures| self.measured_allocator.?.free(pictures);
             if (self.window) |*window| window.deinit();
             self.* = .{};
         }
@@ -598,10 +606,22 @@ pub const Runner = struct {
         } else slot.payload = .{ .video = .{ .bytes = source.bytes, .reader = source.reader, .webm = source.webm, .policy = policy } };
         slot.initialized = true;
     }
+    fn cacheVideoPreflight(self: *Runner, slot: *VideoSlot) !void {
+        if (slot.measured != null) return;
+        if (self.executor.preflight) |preflight| {
+            const measured = try preflight(self.executor.context, slot.payload);
+            errdefer if (measured.selected_pictures) |pictures| self.allocator.free(pictures);
+            if (measured.input_tokens > try self.executor.model.capacity()) return error.ChunkUnitTooLarge;
+            slot.measured = measured;
+            slot.measured_allocator = self.allocator;
+        }
+    }
     const VideoSchedule = struct {
         runner: *Runner,
         source: VideoSource,
         next: ?*VideoSlot,
+        second: ?*VideoSlot = null,
+        cache_preflight: bool = false,
         work: ?*VideoSlot = null,
         thread: ?std.Thread = null,
         fn join(self: *@This()) void {
@@ -622,11 +642,27 @@ pub const Runner = struct {
         }
         fn perform(self: *@This()) void {
             const next = self.work orelse return;
-            self.runner.prepareVideoSlot(self.source, next) catch |err| {
+            if (!next.initialized) self.runner.prepareVideoSlot(self.source, next) catch |err| {
                 if (@import("embedding_gemma2.zig").videoSpeculationPressure(err)) return;
                 next.failure = err;
                 return;
             };
+            if (self.cache_preflight) {
+                self.runner.cacheVideoPreflight(next) catch |err| {
+                    if (!@import("embedding_gemma2.zig").videoSpeculationPressure(err)) next.failure = err;
+                    return;
+                };
+                if (self.second) |second| {
+                    if (!second.initialized) self.runner.prepareVideoSlot(self.source, second) catch |err| {
+                        if (!@import("embedding_gemma2.zig").videoSpeculationPressure(err)) second.failure = err;
+                        return;
+                    };
+                    self.runner.cacheVideoPreflight(second) catch |err| {
+                        if (!@import("embedding_gemma2.zig").videoSpeculationPressure(err)) second.failure = err;
+                        return;
+                    };
+                }
+            }
             const start = self.runner.executor.start_video orelse return;
             next.ahead = start(self.runner.executor.context, next.payload, &self.runner.pool) catch |err| {
                 // Speculation must never deny a request which fits serially.
@@ -636,10 +672,122 @@ pub const Runner = struct {
             };
         }
     };
+    fn videoBatches(self: *Runner, source: VideoSource, cursor: *planning.Temporal) !void {
+        // Two current windows plus two metadata slots and one pixel wave ahead. Slots
+        // never move: reader/selection pointers and producer leases stay valid.
+        var slots = [_]VideoSlot{ .{}, .{}, .{}, .{} };
+        defer for (&slots) |*slot| slot.deinit();
+        var known: [4]bool = @splat(false);
+        var active: usize = 0;
+        while (true) {
+            try self.control.check();
+            if (self.request.max_chunks != 0 and self.summary.emitted >= self.request.max_chunks) {
+                self.stopped = cursor.offset_ns < cursor.end_ns or known[active];
+                return;
+            }
+            var count: usize = 0;
+            while (count < 2 and (self.request.max_chunks == 0 or self.summary.emitted + count < self.request.max_chunks)) {
+                const index = (active + count) % slots.len;
+                const slot = &slots[index];
+                if (!known[index]) {
+                    slot.shape = (try cursor.next()) orelse break;
+                    known[index] = true;
+                }
+                if (self.ordinal < self.summary.start_ordinal) {
+                    self.ordinal = try std.math.add(u64, self.ordinal, 1);
+                    known[index] = false;
+                    continue;
+                }
+                if (slot.failure) |err| return err;
+                if (!slot.initialized) self.prepareVideoSlot(source, slot) catch |err| {
+                    if (count == 0 or !@import("embedding_gemma2.zig").videoSpeculationPressure(err)) return err;
+                    break;
+                };
+                slot.payload.video.ahead = slot.ahead;
+                try self.cacheVideoPreflight(slot);
+                if (slot.measured) |*measured| if (measured.video_plan) |*plan| {
+                    slot.payload.video.plan = plan;
+                };
+                count += 1;
+            }
+            if (count == 0) return;
+            const following = (active + count) % slots.len;
+            if (!known[following] and (self.request.max_chunks == 0 or self.summary.emitted + count < self.request.max_chunks)) {
+                if (try cursor.next()) |shape| {
+                    slots[following].shape = shape;
+                    known[following] = true;
+                }
+            }
+            const second = (following + 1) % slots.len;
+            if (!known[second] and (self.request.max_chunks == 0 or self.summary.emitted + count + 1 < self.request.max_chunks)) {
+                if (try cursor.next()) |shape| {
+                    slots[second].shape = shape;
+                    known[second] = true;
+                }
+            }
+            var schedule = VideoSchedule{ .runner = self, .source = source, .next = if (known[following]) &slots[following] else null, .second = if (known[second]) &slots[second] else null, .cache_preflight = true };
+            defer schedule.join();
+            if (self.executor.start_video != null) slots[(active + count - 1) % slots.len].payload.video.prepared = .{ .context = &schedule, .ready = VideoSchedule.ready };
+            var payloads: [2]Payload = undefined;
+            for (payloads[0..count], 0..) |*payload, i| payload.* = slots[(active + i) % slots.len].payload;
+            const outputs: ?[]Output = if (count > 1) self.executor.embed_video_batch.?(self.executor.context, self.allocator, payloads[0..count]) catch |err| blk: {
+                if (!@import("embedding_gemma2.zig").videoSpeculationPressure(err) and err != error.BatchIncompatible and (!self.request.allow_partial or abort(err))) return err;
+                // Compatibility rejection precedes projection and leaves
+                // the current producer usable by independent execution.
+                if (err == error.BatchIncompatible) break :blk null;
+                schedule.join();
+                // A following producer cannot remain active while an earlier
+                // dependency span is replayed against the shared source/codec.
+                if (slots[following].ahead) |ahead| {
+                    ahead.deinit();
+                    slots[following].ahead = null;
+                    slots[following].payload.video.ahead = null;
+                }
+                // A failed batch may have consumed preparation. Join/drain each
+                // old producer before replaying individual windows.
+                for (0..count) |i| {
+                    const slot = &slots[(active + i) % slots.len];
+                    if (slot.ahead) |ahead| ahead.deinit();
+                    slot.ahead = null;
+                    slot.payload.video.ahead = null;
+                }
+                break :blk null;
+            } else null;
+            var between = VideoSchedule{ .runner = self, .source = source, .next = if (outputs == null and count > 1) &slots[(active + 1) % slots.len] else null, .cache_preflight = true };
+            defer between.join();
+            if (outputs == null and count > 1 and self.executor.start_video != null) slots[active].payload.video.prepared = .{ .context = &between, .ready = VideoSchedule.ready };
+            var consumed: usize = 0;
+            defer if (outputs) |values| {
+                for (values[consumed..]) |value| self.allocator.free(value.vector);
+                self.allocator.free(values);
+            };
+            if (outputs) |values| if (values.len != count) return error.InvalidEmbeddingOutput;
+            for (0..count) |i| {
+                if (i != 0) between.join();
+                const slot = &slots[(active + i) % slots.len];
+                if (slot.failure) |err| return err;
+                slot.payload.video.ahead = slot.ahead;
+                const ready = if (outputs) |values| values[i] else null;
+                if (outputs != null) consumed += 1;
+                const measured = slot.measured;
+                slot.measured = null;
+                slot.payload.video.plan = null;
+                if (!try self.emitReady(slot.shape, slot.payload, self.request.input.binary.mime_type, ready, measured)) return;
+            }
+            schedule.join();
+            for (0..count) |i| {
+                const index = (active + i) % slots.len;
+                slots[index].deinit();
+                known[index] = false;
+            }
+            active = following;
+        }
+    }
     fn videoWindows(self: *Runner, bytes: []const u8, reader: ?*const media.mp4.Reader, duration: i128, origin: i64, timescale: u32, owner: ?*@import("media_chunking_video.zig").Owner, webm: ?@import("embedding_gemma2_video.zig").WebmInput) !void {
         const source = VideoSource{ .bytes = bytes, .reader = reader, .origin = origin, .timescale = timescale, .owner = owner, .webm = webm };
         const end = std.math.cast(i64, duration) orelse return error.TimestampOverflow;
         var cursor = planning.Temporal{ .kind = .video, .end_ns = end, .policy = self.request.policy, .model = self.executor.model, .picture_tokens = 142 };
+        if (self.request.execute and self.executor.embed_video_batch != null) return self.videoBatches(source, &cursor);
         var slots = [_]VideoSlot{ .{}, .{} };
         defer for (&slots) |*slot| slot.deinit();
         var active: usize = 0;
@@ -1114,4 +1262,90 @@ test "model aware media busy provider preserves acknowledged prefix even with pa
         try std.testing.expectEqual(media.admission.Resources{}, runner.pool.snapshot());
     }
     try std.testing.expect(abort(error.QueueFull));
+}
+
+test "model aware media video backbone cohorts preserve acknowledgements and pressure fallback" {
+    const Fake = struct {
+        batched: usize = 0,
+        serial: usize = 0,
+        preflights: usize = 0,
+        seen: [3]bool = @splat(false),
+        accepted: usize = 0,
+        deny: bool = false,
+        fail_sink: bool = false,
+        fn count(_: *anyopaque, _: []const u8) !usize {
+            return 1;
+        }
+        fn preflight(raw: *anyopaque, payload: Payload) !Preflight {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const index: usize = @intCast(@divTrunc(payload.video.policy.start_ns, std.time.ns_per_s));
+            try std.testing.expect(!self.seen[index]);
+            self.seen[index] = true;
+            self.preflights += 1;
+            return .{ .input_tokens = 144 };
+        }
+        fn start(_: *anyopaque, _: Payload, _: *media.admission.Pool) !?*@import("embedding_gemma2.zig").VideoAhead {
+            return null;
+        }
+        fn output(a: std.mem.Allocator, payload: Payload) !Output {
+            const vector = try a.alloc(f32, 1);
+            vector[0] = @floatFromInt(payload.video.policy.start_ns);
+            return .{ .vector = vector, .input_tokens = 144 };
+        }
+        fn embed(raw: *anyopaque, a: std.mem.Allocator, payload: Payload) !Output {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.serial += 1;
+            if (payload.video.prepared) |hook| try hook.ready(hook.context);
+            return output(a, payload);
+        }
+        fn batch(raw: *anyopaque, a: std.mem.Allocator, payloads: []const Payload) ![]Output {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.batched += 1;
+            if (self.deny) return error.ResourceTemporarilyUnavailable;
+            if (payloads[payloads.len - 1].video.prepared) |hook| try hook.ready(hook.context);
+            const values = try a.alloc(Output, payloads.len);
+            errdefer a.free(values);
+            var initialized: usize = 0;
+            errdefer for (values[0..initialized]) |value| a.free(value.vector);
+            for (values, payloads) |*value, payload| {
+                value.* = try output(a, payload);
+                initialized += 1;
+            }
+            return values;
+        }
+        fn accept(raw: *anyopaque, item: Item) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.fail_sink and self.accepted == 1) return error.ConsumerFailure;
+            try std.testing.expectEqual(@as(u64, @intCast(self.accepted)), item.descriptor.ordinal);
+            try std.testing.expectEqual(@as(f32, @floatFromInt(self.accepted * std.time.ns_per_s)), item.embedding.?[0]);
+            self.accepted += 1;
+        }
+    };
+    const a = std.testing.allocator;
+    for ([_]bool{ false, true }) |deny| {
+        var fake = Fake{ .deny = deny };
+        const executor = Executor{ .context = &fake, .model = .{ .planning_identity = "test-video-batch", .context_tokens = 8192 }, .count_text = Fake.count, .preflight = Fake.preflight, .start_video = Fake.start, .embed = Fake.embed, .embed_video_batch = Fake.batch };
+        var runner = try Runner.init(a, .{ .input = .{ .binary = .{ .mime_type = "video/mp4", .data = &.{} } }, .policy = .{ .window_ns = std.time.ns_per_s, .step_ns = std.time.ns_per_s } }, executor, .{}, .{ .context = &fake, .accept = Fake.accept });
+        try runner.videoWindows(&.{}, null, 3 * std.time.ns_per_s, 0, 1, null, null);
+        try std.testing.expectEqual(@as(usize, 3), runner.summary.emitted);
+        try std.testing.expectEqual(@as(usize, 3), fake.preflights);
+        try std.testing.expectEqual(@as(usize, 1), fake.batched);
+        try std.testing.expectEqual(@as(usize, if (deny) 3 else 1), fake.serial);
+        try std.testing.expectEqual(media.admission.Resources{}, runner.pool.snapshot());
+    }
+    var fake = Fake{ .fail_sink = true };
+    const executor = Executor{ .context = &fake, .model = .{ .planning_identity = "test-video-batch", .context_tokens = 8192 }, .count_text = Fake.count, .preflight = Fake.preflight, .start_video = Fake.start, .embed = Fake.embed, .embed_video_batch = Fake.batch };
+    var runner = try Runner.init(a, .{ .input = .{ .binary = .{ .mime_type = "video/mp4", .data = &.{} } }, .policy = .{ .window_ns = std.time.ns_per_s, .step_ns = std.time.ns_per_s } }, executor, .{}, .{ .context = &fake, .accept = Fake.accept });
+    try std.testing.expectError(error.ConsumerFailure, runner.videoWindows(&.{}, null, 3 * std.time.ns_per_s, 0, 1, null, null));
+    try std.testing.expectEqual(@as(u64, 1), runner.summary.next_ordinal);
+    var cursor: [85]u8 = undefined;
+    var request = runner.request;
+    request.continuation = runner.summary.identity.cursor(1, &cursor);
+    fake.fail_sink = false;
+    fake.seen = @splat(false);
+    runner = try Runner.init(a, request, executor, .{}, .{ .context = &fake, .accept = Fake.accept });
+    try runner.videoWindows(&.{}, null, 3 * std.time.ns_per_s, 0, 1, null, null);
+    try std.testing.expectEqual(@as(usize, 3), fake.accepted);
+    try std.testing.expectEqual(@as(u64, 3), runner.summary.next_ordinal);
+    try std.testing.expectEqual(media.admission.Resources{}, runner.pool.snapshot());
 }

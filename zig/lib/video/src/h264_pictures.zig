@@ -369,8 +369,9 @@ fn discard(_: *anyopaque, _: usize, _: *const h264.Frame) !void {}
 /// when selected dependency spans are decoded. Live ingestion keeps the strict
 /// reconstruction index because publication requires completed pictures.
 pub fn planning(a: std.mem.Allocator, reader: *media.mp4.Reader, options: Options, registry: ?*dynamic.Session) !Index {
-    const owned = if (registry == null and reader.track.inband_parameter_sets) try dynamic.Session.init(a, reader, options.decode) else null;
+    const owned = if (registry == null and reader.track.inband_parameter_sets) try dynamic.Session.initPlanning(a, reader, options.decode) else null;
     defer if (owned) |owner| owner.deinit();
+    defer if (registry orelse owned) |owner| owner.releasePlanningHeaders();
     var result = try @import("h264_headers.zig").planning(a, reader, options, registry orelse owned);
     errdefer result.deinit();
     try result.reservation.resize(.{ .host_bytes = result.pictures.len * @sizeOf(h264.Picture) });

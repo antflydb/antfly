@@ -251,8 +251,12 @@ then prefers smaller allocations unless a larger cohort improves measured
 throughput by more than five percent. Paired minima exclude isolated cold setup
 or scheduling stalls, and smoothed periodic probes adapt to sustained contention.
 Calibration never overrides admission or waits for work. Metal concatenation uses
-one destination and linear row copies. Gemma 2 vision owns at most two layers per
-Metal command frame, retaining activation leases until completion/cancellation.
+one destination and linear row copies; image geometry cohorts and audio projections
+use the same linear assembly rule. Gemma 2 vision calibrates one- versus two-layer
+Metal command frames separately for each geometry and frame-batch size, retaining
+activation leases until completion/cancellation. Cold starts and timing ties retain
+the qualified deeper grouping; shallower frames require a measured improvement
+over five percent.
 Scratch estimates include both layers; large image geometries retain single-layer
 frames to preserve their existing memory envelope. External frame ownership is
 preserved.
@@ -304,6 +308,32 @@ language backbone, after projection consumption has joined the current decoder.
 Lookahead has independent host/device admission, bounded queues, serial retry on
 resource pressure, and joined cleanup on early stop or cancellation. It does not
 share language KV state between independently contextualized embeddings.
+
+Native unmasked vision attention uses tiled F32 streaming softmax, including
+parallel head execution when an Io worker context is available. Empty masks mean
+all keys are valid; they do not force a quadratic score-matrix allocation.
+
+The chunk endpoint groups up to two already available, compatible video windows
+for one backbone forward. The native batch API accepts up to four. Each window
+keeps its own positions, key mask and normalized output; no contextual state is
+shared. Cohorts exceeding 2048 estimated tokens per row or 25% padding execute
+independently. Metal cohorts also preserve the singleton frame/PLE fusion regime
+at the existing 128/512-row boundaries; crossing a faster kernel regime is not
+assumed to improve throughput. Independent fallback retains between-window
+preparation overlap and consumes a still-valid prefetched producer.
+Projection/decode stays ordered for retained codec continuations.
+One following window can prepare during the batched backbone. Batch admission
+pressure drains consumed producers and retries individual windows, while output
+ordinals advance only after each sink acknowledgement. Cancellation and sink
+failure release computed but unpublished vectors and join the next worker.
+
+Finite AVC planning reads bounded NAL prefixes, skips entropy by original NAL
+length, and reads complete bounded SPS/PPS syntax. Configuration discovery caches
+prefixes for picture assembly in a separate admitted metadata budget. Cache
+pressure discards that optional cache and continues sparse reads; it does not
+reduce the parameter-set budget or impose a new clip-length limit. Planning
+releases cached prefixes afterward. Decoder submission always uses original
+coded packets, never the synthetic prefix buffers.
 
 ## Verification
 

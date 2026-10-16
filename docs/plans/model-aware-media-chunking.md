@@ -278,13 +278,31 @@ partitions and configuration epochs without whole-clip pixel reconstruction;
 entropy/reference validation remains in selected dependency decoding and live
 publication. Cohort calibration uses completed backend/geometry measurements and
 bounded exploration within admission, rather than assuming the largest fitting
-batch wins. Metal vision frames group at most two layers and charge their retained
-temporaries. Owned live windows fill one final snapshot allocation, and sequential
+batch wins. Metal vision calibrates layer grouping separately for each geometry
+and frame-batch size within its admitted one/two-layer envelope. Owned live windows fill one final snapshot allocation, and sequential
 spools use admitted geometric growth with no full-input copy at EOF.
 Busy provider queues normalize to retryable capacity errors at chunk execution;
 responses preserve the acknowledged prefix and an exact continuation, including
 with partial-result delivery enabled. Speculative preparation yields on that
 pressure instead of making a successful serial request fail.
+
+Video windows can share one masked backbone execution: the endpoint groups two
+already available windows and the native API accepts at most four. Cohorts are
+bounded by estimated row length (2048), padding (25%) and shared admission. Metal
+also preserves the singleton frame/PLE regime at its 128/512-row boundaries.
+Rejected cohorts keep individual execution and preparation overlap; a compatible
+prefetched producer is consumed rather than discarded. Each window retains independent positions and normalized pooling. Decode/projection
+stays ordered, and one following preparation wave may overlap the backbone.
+Capacity or padding rejection falls back to independent execution after draining
+consumed producers. Computed rows are acknowledged individually; sink failure
+never advances past the last acknowledged ordinal.
+
+Native unmasked vision uses tiled F32 streaming attention instead of a serial
+quadratic score matrix. Image/audio projection assembly allocates its destination
+once and copies each cohort into final row offsets. Finite AVC configuration and
+picture planning share bounded sparse NAL prefixes; decoder entropy validation
+still consumes original coded ranges. The optional prefix cache has its own
+admitted ceiling and yields to sparse rereads on long clips.
 
 
 Database chunk artifacts store the `_chunk` reconstruction descriptor; vectors

@@ -11743,7 +11743,7 @@ pub const Node = struct {
                         const plan = if (movie.ahead) |ahead| ahead.plan else try @import("../pipelines/embedding_gemma2_video.zig").inspectConfiguredPlan(adapter.a, movie.bytes, movie.reader, adapter.control, .{ .sampling = if (movie.source_timestamps) .{ .source_timestamps = movie.policy } else .{ .timestamps = movie.policy }, .selection = movie.selection, .webm = movie.webm }, if (adapter.model) |model| model.session.backend() == .metal else false);
                         var indexes = plan.picture_indexes;
                         for (indexes[0..plan.pictures]) |*index| index.* = try std.math.add(u64, index.*, movie.packet_base);
-                        break :blk .{ .input_tokens = plan.sequence_tokens, .picture_count = @intCast(plan.pictures), .selected_pictures = try adapter.a.dupe(u64, indexes[0..plan.pictures]), .picture_basis = if (movie.webm != null) .logical else if (movie.reader != null or movie.bytes.len < 4 or !std.mem.eql(u8, movie.bytes[0..4], "\x1a\x45\xdf\xa3")) .packet_assembly else .logical };
+                        break :blk .{ .video_plan = plan, .input_tokens = plan.sequence_tokens, .picture_count = @intCast(plan.pictures), .selected_pictures = try adapter.a.dupe(u64, indexes[0..plan.pictures]), .picture_basis = if (movie.webm != null) .logical else if (movie.reader != null or movie.bytes.len < 4 or !std.mem.eql(u8, movie.bytes[0..4], "\x1a\x45\xdf\xa3")) .packet_assembly else .logical };
                     },
                     .text => unreachable,
                 };
@@ -11759,6 +11759,35 @@ pub const Node = struct {
                     continuation.session = adapter.model.?.session;
                 };
                 return grouped.VideoAhead.start(adapter.model.?.session, .{ .bytes = movie.bytes, .reader = movie.reader, .sampling = if (movie.source_timestamps) .{ .source_timestamps = movie.policy } else .{ .timestamps = movie.policy }, .selection = movie.selection, .webm = movie.webm }, adapter.control, adapter.cache, pool, .{});
+            }
+            fn embedVideoBatch(raw: *anyopaque, out: std.mem.Allocator, payloads: []const chunks.Payload) ![]chunks.Output {
+                const adapter: *@This() = @ptrCast(@alignCast(raw));
+                if (adapter.manifest.embedding_style != .embedding_gemma2 or payloads.len > 4) return error.BatchIncompatible;
+                // The public mode describes arbitrary mixed groups; this route
+                // is separately qualified for independent video windows only.
+                if (payloads.len > adapter.contract.batch.max_items) return error.BatchIncompatible;
+                try adapter.model.?.verifyEmbeddingIdentity();
+                var movies: [4]grouped.VideoBatchItem = undefined;
+                for (payloads, movies[0..payloads.len]) |payload, *movie| {
+                    if (payload != .video) return error.InvalidInputShape;
+                    const value = payload.video;
+                    if (value.selection) |selection| if (selection.continuation) |continuation| {
+                        continuation.session = adapter.model.?.session;
+                    };
+                    if (value.webm) |webm| if (webm.apple_continuation) |continuation| {
+                        continuation.session = adapter.model.?.session;
+                    };
+                    movie.* = .{ .plan = value.plan, .ahead = value.ahead, .movie = .{ .bytes = value.bytes, .reader = value.reader, .sampling = if (value.source_timestamps) .{ .source_timestamps = value.policy } else .{ .timestamps = value.policy }, .selection = value.selection, .webm = value.webm } };
+                }
+                const result = try grouped.embedVideos(out, adapter.model.?.session, adapter.tokenizer, movies[0..payloads.len], .{ .task_type = @tagName(adapter.task), .dimensions = adapter.dimensions, .video_prepared = payloads[payloads.len - 1].video.prepared }, adapter.model.?.embeddingExecutionLock(), adapter.control, adapter.cache);
+                defer out.free(result.vectors);
+                defer out.free(result.input_tokens);
+                errdefer for (result.vectors) |vector| out.free(vector);
+                try adapter.model.?.verifyEmbeddingIdentity();
+                try adapter.control.check();
+                const values = try out.alloc(chunks.Output, payloads.len);
+                for (values, result.vectors, result.input_tokens) |*value, vector, tokens| value.* = .{ .vector = vector, .input_tokens = tokens };
+                return values;
             }
             fn embed(raw: *anyopaque, out: std.mem.Allocator, payload: chunks.Payload) !chunks.Output {
                 const adapter: *@This() = @ptrCast(@alignCast(raw));
@@ -11849,7 +11878,7 @@ pub const Node = struct {
         // is separate from per-window model scratch and buffered result ownership.
         var source_permit = try self.model_manager.admitHostPreflight(request.native_transport_bytes);
         defer source_permit.release();
-        var runner = try chunks.Runner.init(bounded_source.allocator(), request, .{ .context = &adapter, .model = .{ .planning_identity = planning_identity, .context_tokens = capacity, .max_text_bytes = contract.batch.max_text_bytes_per_item orelse 16 * 1024 * 1024, .min_audio_ns = if (manifest.embedding_style == .embedding_gemma2) 11 * std.time.ns_per_ms else 0 }, .describe = Adapter.describe, .count_text = Adapter.count, .count_overlap = Adapter.overlap, .audio_tokens = Adapter.audioTokens, .preflight = Adapter.preflight, .embed = Adapter.embed, .start_video = Adapter.startVideo }, control, sink);
+        var runner = try chunks.Runner.init(bounded_source.allocator(), request, .{ .context = &adapter, .model = .{ .planning_identity = planning_identity, .context_tokens = capacity, .max_text_bytes = contract.batch.max_text_bytes_per_item orelse 16 * 1024 * 1024, .min_audio_ns = if (manifest.embedding_style == .embedding_gemma2) 11 * std.time.ns_per_ms else 0 }, .describe = Adapter.describe, .count_text = Adapter.count, .count_overlap = Adapter.overlap, .audio_tokens = Adapter.audioTokens, .preflight = Adapter.preflight, .embed = Adapter.embed, .embed_video_batch = if (manifest.embedding_style == .embedding_gemma2) Adapter.embedVideoBatch else null, .start_video = Adapter.startVideo }, control, sink);
         var failure: ?anyerror = null;
         const summary = runner.run() catch |err| blk: {
             failure = if (err == error.OutOfMemory and bounded_source.denied) error.ChunkWorkingBudgetExceeded else if (err == error.OutOfMemory) admitted_source.admission_error orelse err else err;

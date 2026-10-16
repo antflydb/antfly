@@ -1718,11 +1718,17 @@ fn encodePreparedImagesResidentWithWeights(cb: *const ComputeBackend, a: std.mem
     try options.validate();
     if (prepared.len == 0 or prepared.len > 8) return error.InvalidImageBatch;
     // Joining heterogeneous cohorts must never invoke the download fallback.
-    if (cb.vtable.concatRows2D == null) return error.ResidentImageOperationUnavailable;
+    if (!cb.supportsCopyRows2D()) return error.ResidentImageOperationUnavailable;
     const lengths = try a.alloc(usize, prepared.len);
     errdefer a.free(lengths);
-    var tensor: ?CT = null;
-    errdefer if (tensor) |t| cb.free(t);
+    var total: usize = 0;
+    for (prepared, lengths) |item, *length| {
+        try validatePreparedImage(cfg, item);
+        length.* = item.geometry.tokenCount();
+        total = try std.math.add(usize, total, length.*);
+    }
+    const tensor = (try cb.allocUninitF32Shape(&.{ std.math.cast(i32, total) orelse return error.InvalidImageBatch, @intCast(cfg.text_hidden) })) orelse return error.ResidentImageOperationUnavailable;
+    errdefer cb.free(tensor);
     var rows: usize = 0;
     var offset: usize = 0;
     var batches: usize = 0;
@@ -1732,19 +1738,14 @@ fn encodePreparedImagesResidentWithWeights(cb: *const ComputeBackend, a: std.mem
         const count = try imageBatchCount(cfg, prepared[offset..], options);
         const result = try encodePreparedImageBatchResident(cb, a, weights, cfg, prepared[offset..][0..count]);
         const added = count * result.tokens;
-        if (tensor) |old_tensor| {
-            defer cb.free(result.embeddings);
-            const joined = try cb.concatRows2D(a, old_tensor, result.embeddings, rows, added, cfg.text_hidden);
-            cb.free(old_tensor);
-            tensor = joined;
-        } else tensor = result.embeddings;
-        @memset(lengths[offset..][0..count], result.tokens);
+        defer cb.free(result.embeddings);
+        if (!try cb.copyRows2D(a, tensor, rows, result.embeddings, 0, added, cfg.text_hidden)) return error.ResidentImageOperationUnavailable;
         rows += added;
         offset += count;
         batches += 1;
         maximum = @max(maximum, count);
     }
-    return .{ .allocator = a, .backend = cb, .embeddings = tensor.?, .tokens_per_image = lengths, .hidden_size = cfg.text_hidden, .batches_executed = batches, .max_batch_executed = maximum };
+    return .{ .allocator = a, .backend = cb, .embeddings = tensor, .tokens_per_image = lengths, .hidden_size = cfg.text_hidden, .batches_executed = batches, .max_batch_executed = maximum };
 }
 
 pub fn encodePreparedEmbeddingGemma2ImagesResident(cb: *const ComputeBackend, a: std.mem.Allocator, prepared: []const PreparedImage, options: ImageBatchOptions) !ResidentProjectedImages {
@@ -1846,19 +1847,22 @@ fn encodePositionedBatchResident(cb: *const ComputeBackend, allocator: std.mem.A
 
     // Group only our own frames. External frame owners keep their lifetime
     // boundary; stage diagnostics keep their synchronized per-layer behavior.
-    const grouped = cb.kind() == .metal and try visionLayerGroup(cfg, geometry.grid_x * geometry.grid_y) == 2 and
+    const can_group = cb.kind() == .metal and cfg.embedding_gemma2_f32_attention and
         !platform.env.getenvBool("TERMITE_METAL_DISABLE_GEMMA4_VISION_FRAMES") and
         platform.env.getenv("ANTFLY_EMBEDDINGGEMMA2_STAGES") == null and
         !cb.decoderRuntimeHasActiveFrame();
+    const policy = @import("../pipelines/media_batch_policy.zig");
+    const group = if (can_group) policy.layerCapacity(@intCast(geometry.width), @intCast(geometry.height), batch, try visionLayerGroup(cfg, geometry.grid_x * geometry.grid_y)) else 1;
+    const started = platform.time.monotonicNs();
     var frame = false;
     defer if (frame) cb.decoderRuntimeCancelFrame() catch {};
     for (0..cfg.block_count) |layer| {
         try cb.checkExecutionControl();
-        if (grouped and !frame) frame = try cb.decoderRuntimeBeginFrame();
+        if (can_group and !frame) frame = try cb.decoderRuntimeBeginFrame();
         const next = try encoderBlockBatch(cb, allocator, store, cfg, hidden, geometry, layer, batch);
         cb.free(hidden);
         hidden = next;
-        if (frame and ((layer + 1) % 2 == 0 or layer + 1 == cfg.block_count)) {
+        if (frame and ((layer + 1) % group == 0 or layer + 1 == cfg.block_count)) {
             try cb.decoderRuntimeSubmitAndWaitFrame();
             frame = false;
             if (store.gguf == null) try @import("../ops/metal_compute.zig").MetalCompute.releaseEmbeddingGemma2ActivationViews(cb);
@@ -1870,6 +1874,7 @@ fn encodePositionedBatchResident(cb: *const ComputeBackend, allocator: std.mem.A
         }
     }
 
+    if (can_group) policy.layerCompleted(@intCast(geometry.width), @intCast(geometry.height), batch, group, cfg.block_count, platform.time.monotonicNs() - started);
     const pooled_ct = try averagePoolSpatialBatchTensor(cb, allocator, hidden, cfg, geometry, batch);
     defer cb.free(pooled_ct);
     cb.free(hidden);

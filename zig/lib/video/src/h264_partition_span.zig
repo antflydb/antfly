@@ -29,6 +29,12 @@ pub const Span = struct {
     extra_read_bytes: u64 = 0,
     partitioned: bool = false,
     pub fn init(allocator: std.mem.Allocator, reader: *media.mp4.Reader, first: usize, dependency_start: usize, initial: []const u8, options: h264.Options) !Span {
+        return initMode(allocator, reader, first, dependency_start, initial, options, false, null);
+    }
+    pub fn initHeaders(allocator: std.mem.Allocator, reader: *media.mp4.Reader, first: usize, initial: []const u8, options: h264.Options, cached: ?[]const []u8) !Span {
+        return initMode(allocator, reader, first, first, initial, options, true, cached);
+    }
+    fn initMode(allocator: std.mem.Allocator, reader: *media.mp4.Reader, first: usize, dependency_start: usize, initial: []const u8, options: h264.Options, headers: bool, cached: ?[]const []u8) !Span {
         var self = Span{ .allocator = allocator, .bytes = initial, .last = first };
         errdefer self.deinit();
         const flags = try kinds(initial, reader.track.nal_length_bytes);
@@ -37,15 +43,25 @@ pub const Span = struct {
         self.reservation = if (reader.input.admission_pool) |pool| try pool.acquire(.{ .host_bytes = @sizeOf(usize) }) else media.admission.Token{};
         try self.members.ensureTotalCapacityPrecise(allocator, 1);
         self.members.appendAssumeCapacity(first);
+        var coded_bytes: usize = reader.packets[first].size;
         var next = first + 1;
         while (next < reader.packets.len and next - dependency_start < options.max_dependency_packets) : (next += 1) {
             try reader.input.control.check();
             if (reader.packets[next].size > options.max_packet_bytes) return error.ResourceLimitExceeded;
-            var lease = try reader.readPacket(next);
+            var owned: ?[]u8 = null;
+            defer if (owned) |bytes| allocator.free(bytes);
+            const bytes_before = reader.input.total_bytes;
+            var lease = if (headers) blk: {
+                const bytes = if (cached) |packets| packets[next] else try @import("h264_prefix.zig").packet(allocator, reader, next, options.max_packet_bytes);
+                if (cached == null) owned = bytes;
+                break :blk media.source.Lease{ .bytes = bytes, .source = null };
+            } else try reader.readPacket(next);
             defer lease.deinit();
-            self.extra_read_bytes += lease.bytes.len;
+            self.extra_read_bytes += reader.input.total_bytes - bytes_before;
             const part = try kinds(lease.bytes, reader.track.nal_length_bytes);
             if (part.a or part.other_picture or part.config) break;
+            coded_bytes = try std.math.add(usize, coded_bytes, reader.packets[next].size);
+            if (coded_bytes > options.max_packet_bytes) return error.ResourceLimitExceeded;
             const previous = if (self.storage.items.len == 0) initial.len else self.storage.items.len;
             const length = try std.math.add(usize, previous, lease.bytes.len);
             if (length > options.max_packet_bytes) return error.ResourceLimitExceeded;

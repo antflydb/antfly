@@ -430,7 +430,7 @@ pub fn flashAttentionHostWithIo(
     const expected = std.math.mul(usize, std.math.mul(usize, batch, seq_len) catch return error.InvalidAttentionShape, H) catch return error.InvalidAttentionShape;
     if (Q.len != expected or K.len != expected or V.len != expected) return error.InvalidAttentionShape;
     const mask_expected = std.math.mul(usize, batch, seq_len) catch return error.InvalidAttentionShape;
-    if (mask.len < mask_expected) return error.InvalidAttentionShape;
+    if (mask.len != 0 and mask.len < mask_expected) return error.InvalidAttentionShape;
     const scale: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(head_dim)));
     const seq_sq = std.math.mul(usize, seq_len, seq_len) catch return error.InvalidAttentionShape;
     const bias_shared_len = std.math.mul(usize, num_heads, seq_sq) catch return error.InvalidAttentionShape;
@@ -586,7 +586,7 @@ const FlashHeadWork = struct {
                     // no positional masking; only the -inf masked-out keys.
                     for (0..cur_bkv) |ki_local| {
                         const ki = kv_start + ki_local;
-                        if (mask[mask_base + ki] == 0) {
+                        if (mask.len != 0 and mask[mask_base + ki] == 0) {
                             for (0..cur_bq) |qi_local| {
                                 score_tile[qi_local * cur_bkv + ki_local] = -std.math.inf(f32);
                             }
@@ -2960,4 +2960,24 @@ test "flash attention cancellation drains parallel lanes and permits exact retry
     const expected = try flashAttentionHost(a, input, input, input, null, mask, 1, 513, 4, 16);
     defer a.free(expected);
     try std.testing.expectEqualSlices(f32, expected, retry);
+}
+
+test "flash attention unmasked tiles match explicit all-valid masks" {
+    const a = std.testing.allocator;
+    const batch = 2;
+    const heads = 3;
+    const seq = 257;
+    const dim = 17;
+    const input = try a.alloc(f32, batch * heads * seq * dim);
+    defer a.free(input);
+    for (input, 0..) |*x, i| x.* = @as(f32, @floatFromInt(i % 31)) / 31;
+    const mask = try a.alloc(i64, batch * seq);
+    defer a.free(mask);
+    @memset(mask, 1);
+    const expected = try flashAttentionHostWithIo(a, std.testing.io, input, input, input, null, mask, batch, seq, heads, dim);
+    defer a.free(expected);
+    const actual = try flashAttentionHostWithIo(a, std.testing.io, input, input, input, null, &.{}, batch, seq, heads, dim);
+    defer a.free(actual);
+    try std.testing.expectEqualSlices(f32, expected, actual);
+    try std.testing.expectError(error.InvalidAttentionShape, flashAttentionHostWithIo(a, std.testing.io, input, input, input, null, mask[0..seq], batch, seq, heads, dim));
 }

@@ -93,7 +93,7 @@ pub const Owner = struct {
     pub fn init(a: std.mem.Allocator, reader: *media.mp4.Reader, pool: *media.admission.Pool, limits: @import("media_chunk_limits.zig").Limits) !Owner {
         if (reader.packets.len == 0) return error.EmptyVideo;
         if (reader.input.identity.len == 0) return error.InvalidVideoReaderSelection;
-        const registry = if (reader.track.inband_parameter_sets) try video.h264_dynamic.Session.init(a, reader, .{ .max_parameter_packets = reader.packets.len }) else null;
+        const registry = if (reader.track.inband_parameter_sets) try video.h264_dynamic.Session.initPlanning(a, reader, .{ .max_parameter_packets = reader.packets.len }) else null;
         errdefer if (registry) |owner| owner.deinit();
         var logical: ?video.h264_pictures.Index = null;
         errdefer if (logical) |*index| index.deinit();

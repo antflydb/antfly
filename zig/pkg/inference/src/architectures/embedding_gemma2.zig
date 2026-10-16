@@ -692,6 +692,29 @@ pub fn forwardCT(cb: *const ComputeBackend, allocator: std.mem.Allocator, cfg: C
 }
 
 /// Already scaled hard-token embeddings with unscaled projected media tokens.
+fn metalFrameRows() usize {
+    return if (@import("antfly_platform").env.getenvBool("ANTFLY_EMBEDDINGGEMMA2_DISABLE_MEDIUM_METAL_FRAME")) 128 else 512;
+}
+/// Preserve a singleton's fused frame/PLE regime when forming independent rows.
+/// Longer rows already use bounded per-layer execution and can batch normally.
+pub fn metalBatchCapacity(sequence: usize, maximum: usize) usize {
+    return metalBatchCapacityWithFrame(sequence, maximum, metalFrameRows());
+}
+fn metalBatchCapacityWithFrame(sequence: usize, maximum: usize, frame_rows: usize) usize {
+    if (sequence == 0) return 0;
+    const boundary: usize = if (sequence <= frame_rows) frame_rows else if (sequence <= 512) 512 else return maximum;
+    return @min(maximum, boundary / sequence);
+}
+
+test "embeddinggemma2 video cohorts preserve Metal frame and PLE fusion boundaries" {
+    try std.testing.expectEqual(@as(usize, 2), metalBatchCapacityWithFrame(256, 4, 512));
+    try std.testing.expectEqual(@as(usize, 1), metalBatchCapacityWithFrame(257, 4, 512));
+    try std.testing.expectEqual(@as(usize, 1), metalBatchCapacityWithFrame(386, 4, 512));
+    try std.testing.expectEqual(@as(usize, 4), metalBatchCapacityWithFrame(513, 4, 512));
+    try std.testing.expectEqual(@as(usize, 1), metalBatchCapacityWithFrame(128, 4, 128));
+    try std.testing.expectEqual(@as(usize, 3), metalBatchCapacityWithFrame(129, 4, 128));
+}
+
 pub fn forwardEmbeddingsCT(cb: *const ComputeBackend, allocator: std.mem.Allocator, cfg: Config, embeddings: CT, mask: []const i64, batch: usize, seq: usize) !CT {
     if (cb.kind() != .native and cb.kind() != .metal and cb.kind() != .wasm) return error.UnsupportedEmbeddingGemma2Backend;
     if (cb.kind() == .metal and cb.decoderRuntimeHasActiveFrame()) return error.EmbeddingGemma2ExternalFrame;
@@ -712,8 +735,7 @@ pub fn forwardEmbeddingsCT(cb: *const ComputeBackend, allocator: std.mem.Allocat
     var frame_batch: LayerFrameBatch = .{};
     defer frame_batch.deinit(cb);
     var shared_frame = false;
-    const medium_frame_disabled = @import("antfly_platform").env.getenvBool("ANTFLY_EMBEDDINGGEMMA2_DISABLE_MEDIUM_METAL_FRAME");
-    const frame_max_rows: usize = if (medium_frame_disabled) 128 else 512;
+    const frame_max_rows = metalFrameRows();
     if (cb.kind() == .metal and rows <= frame_max_rows and cfg.num_hidden_layers <= frame_batch.slices.len) {
         shared_frame = try cb.decoderRuntimeBeginFrame();
         if (!shared_frame) return error.EmbeddingGemma2OperationUnavailable;

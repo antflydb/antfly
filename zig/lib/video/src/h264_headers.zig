@@ -35,47 +35,7 @@ const Header = struct {
 };
 // Decode only the consumed RBSP prefix. Entropy bytes are neither copied nor
 // interpreted during planning; the actual decoder validates their full syntax.
-const Bits = struct {
-    bytes: []const u8,
-    cursor: usize = 1,
-    zeros: u2 = 0,
-    byte: u8 = 0,
-    remaining: u4 = 0,
-    fn read(self: *Bits, count: usize) !u32 {
-        var out: u32 = 0;
-        for (0..count) |_| {
-            if (self.remaining == 0) {
-                if (self.cursor >= self.bytes.len) return error.MalformedVideoPacket;
-                var byte = self.bytes[self.cursor];
-                self.cursor += 1;
-                if (self.zeros == 2 and byte == 3) {
-                    if (self.cursor >= self.bytes.len or self.bytes[self.cursor] > 3) return error.MalformedVideoPacket;
-                    byte = self.bytes[self.cursor];
-                    self.cursor += 1;
-                    self.zeros = 0;
-                } else if (self.zeros == 2 and byte <= 2) return error.MalformedVideoPacket;
-                self.zeros = if (byte == 0) @min(@as(u2, 2), self.zeros + 1) else 0;
-                self.byte = byte;
-                self.remaining = 8;
-            }
-            self.remaining -= 1;
-            out = (out << 1) | ((self.byte >> @as(u3, @intCast(self.remaining))) & 1);
-        }
-        return out;
-    }
-    fn ue(self: *Bits) !u32 {
-        var zeros: u5 = 0;
-        while (try self.read(1) == 0) {
-            if (zeros == 30) return error.MalformedVideoPacket;
-            zeros += 1;
-        }
-        return (@as(u32, 1) << zeros) - 1 + try self.read(zeros);
-    }
-    fn se(self: *Bits) !i32 {
-        const n = try self.ue();
-        return if (n & 1 != 0) @intCast((n + 1) / 2) else -@as(i32, @intCast(n / 2));
-    }
-};
+const Bits = @import("h264_prefix.zig").Bits;
 fn header(nal: []const u8, cfg: h264.Config) !Header {
     var bits = Bits{ .bytes = nal };
     const first = try bits.ue();
@@ -121,6 +81,13 @@ pub fn planning(a: std.mem.Allocator, reader: *media.mp4.Reader, options: option
     const bound = try std.math.mul(usize, capacity, @sizeOf(Row) + @sizeOf(h264.Picture) + 256);
     var reservation = if (reader.input.admission_pool) |pool| try pool.acquire(.{ .host_bytes = bound }) else media.admission.Token{};
     errdefer reservation.deinit();
+    // Header/coalescing temporaries have a separate fixed admitted ceiling;
+    // sparse reads must not hide uncharged ownership behind source leases.
+    var temporary_reservation = if (reader.input.admission_pool) |pool| try pool.acquire(.{ .host_bytes = options.decode.max_parameter_bytes }) else media.admission.Token{};
+    defer temporary_reservation.deinit();
+    var temporary = @import("decode_budget.zig").Budget{ .backing = a, .limit = options.decode.max_parameter_bytes };
+    defer std.debug.assert(temporary.live == 0);
+    const scratch = temporary.allocator();
     const rows = try a.alloc(Row, capacity);
     defer a.free(rows);
     var lookup: std.AutoHashMap(u64, usize) = .init(a);
@@ -140,11 +107,14 @@ pub fn planning(a: std.mem.Allocator, reader: *media.mp4.Reader, options: option
             }
         }
         if (reader.packets[packet_index].size > options.decode.max_packet_bytes) return error.ResourceLimitExceeded;
-        var lease = try reader.readPacket(packet_index);
-        defer lease.deinit();
-        var span = try @import("h264_partition_span.zig").Span.init(a, reader, packet_index, packet_index, lease.bytes, options.decode);
+        const cached = if (registry) |owner| (if (owner.header_packets.items.len == reader.packets.len) owner.header_packets.items else null) else null;
+        const bytes_before = reader.input.total_bytes;
+        const bytes = if (cached) |packets| packets[packet_index] else try @import("h264_prefix.zig").packet(scratch, reader, packet_index, options.decode.max_packet_bytes);
+        defer if (cached == null) scratch.free(bytes);
+        const initial_reads = reader.input.total_bytes - bytes_before;
+        var span = try @import("h264_partition_span.zig").Span.initHeaders(scratch, reader, packet_index, bytes, options.decode, cached);
         defer span.deinit();
-        payload += lease.bytes.len + span.extra_read_bytes;
+        payload += initial_reads + span.extra_read_bytes;
         try @import("avc.zig").validatePortablePacket(span.bytes, reader.track.nal_length_bytes);
         var at: usize = 0;
         var packet_row: ?usize = null;

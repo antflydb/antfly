@@ -19,7 +19,7 @@ const std = @import("std");
 const widths = [_]usize{ 1, 2, 4, 8 };
 const Cost = struct { samples: u32 = 0, nanos_per_frame: u64 = 0, pending: u64 = 0 };
 const Entry = struct {
-    key: u64 = 0,
+    key: u128 = 0,
     costs: [4]Cost = @splat(.{}),
     decisions: u64 = 0,
     fn choose(self: *Entry, cap: usize) usize {
@@ -36,6 +36,27 @@ const Entry = struct {
         var best: usize = 0;
         for (1..candidates) |i| {
             // Prefer the smaller allocation unless throughput improves >5%.
+            if (@as(u128, self.costs[i].nanos_per_frame) * 105 < @as(u128, self.costs[best].nanos_per_frame) * 100) best = i;
+        }
+        return widths[best];
+    }
+    fn chooseDepth(self: *Entry, cap: usize) usize {
+        self.decisions +%= 1;
+        var candidates: usize = 0;
+        for (widths) |width| {
+            if (width > cap) break;
+            candidates += 1;
+        }
+        // Preserve the qualified grouping on cold starts. Splitting frames
+        // increases provider/command overhead; prefer deeper groups on ties.
+        var remaining = candidates;
+        while (remaining > 0) {
+            remaining -= 1;
+            if (self.costs[remaining].samples < 2) return widths[remaining];
+        }
+        if (self.decisions % 32 == 0) return widths[@intCast((self.decisions / 32) % candidates)];
+        var best = candidates - 1;
+        for (0..candidates) |i| {
             if (@as(u128, self.costs[i].nanos_per_frame) * 105 < @as(u128, self.costs[best].nanos_per_frame) * 100) best = i;
         }
         return widths[best];
@@ -58,8 +79,8 @@ const Entry = struct {
 var mutex: std.atomic.Mutex = .unlocked;
 var entries: [64]Entry = @splat(.{});
 var eviction: usize = 0;
-fn entry(metal: bool, width: u32, height: u32) *Entry {
-    const key = (@as(u64, width) << 32) | (@as(u64, height) << 1) | @intFromBool(metal);
+fn entry(metal: bool, width: u32, height: u32, batch: usize) *Entry {
+    const key = (@as(u128, width) << 64) | (@as(u128, height) << 32) | (@as(u128, batch) << 1) | @intFromBool(metal);
     for (&entries) |*item| if (item.key == key) return item;
     const item = &entries[eviction];
     eviction = (eviction + 1) % entries.len;
@@ -70,12 +91,12 @@ pub fn capacity(metal: bool, width: u32, height: u32, maximum: usize) usize {
     std.debug.assert(maximum >= 1);
     while (!mutex.tryLock()) std.atomic.spinLoopHint();
     defer mutex.unlock();
-    return entry(metal, width, height).choose(@min(maximum, 8));
+    return entry(metal, width, height, 0).choose(@min(maximum, 8));
 }
 pub fn completed(metal: bool, width: u32, height: u32, count: usize, elapsed: u64) void {
     while (!mutex.tryLock()) std.atomic.spinLoopHint();
     defer mutex.unlock();
-    entry(metal, width, height).observe(count, elapsed);
+    entry(metal, width, height, 0).observe(count, elapsed);
 }
 test "embeddinggemma2 video batch policy learns completed throughput within admission" {
     var cpu = Entry{};
@@ -104,4 +125,41 @@ test "embeddinggemma2 video batch calibration separates cold setup from warm cos
     // Sustained changes eventually replace the initial warm estimate.
     for (0..32) |_| policy.observe(1, 10_000);
     try std.testing.expect(policy.choose(8) > 1);
+}
+
+/// Separate observations for each frame cohort: increasing batch size changes
+/// command amortization and scratch pressure, so layer depth is never global.
+pub fn layerCapacity(width: u32, height: u32, batch: usize, maximum: usize) usize {
+    while (!mutex.tryLock()) std.atomic.spinLoopHint();
+    defer mutex.unlock();
+    return entry(true, width, height, batch).chooseDepth(@min(maximum, 8));
+}
+pub fn layerCompleted(width: u32, height: u32, batch: usize, group: usize, layers: usize, elapsed: u64) void {
+    while (!mutex.tryLock()) std.atomic.spinLoopHint();
+    defer mutex.unlock();
+    entry(true, width, height, batch).observe(group, @intCast(@as(u128, elapsed) * group / @max(layers, 1)));
+}
+
+test "embeddinggemma2 video layer policy is independent for every frame batch" {
+    for (0..2) |_| {
+        layerCompleted(99, 77, 1, 1, 8, 800);
+        layerCompleted(99, 77, 1, 2, 8, 400);
+        layerCompleted(99, 77, 4, 1, 8, 400);
+        layerCompleted(99, 77, 4, 2, 8, 800);
+    }
+    try std.testing.expectEqual(@as(usize, 2), layerCapacity(99, 77, 1, 2));
+    try std.testing.expectEqual(@as(usize, 1), layerCapacity(99, 77, 4, 2));
+    try std.testing.expectEqual(@as(usize, 1), layerCapacity(99, 77, 1, 1));
+}
+
+test "embeddinggemma2 video depth calibration preserves qualified grouping on cold starts and ties" {
+    var policy = Entry{};
+    try std.testing.expectEqual(@as(usize, 2), policy.chooseDepth(2));
+    for (0..2) |_| {
+        policy.observe(1, 100);
+        policy.observe(2, 202);
+    }
+    try std.testing.expectEqual(@as(usize, 2), policy.chooseDepth(2));
+    for (0..32) |_| policy.observe(1, 50);
+    try std.testing.expectEqual(@as(usize, 1), policy.chooseDepth(2));
 }

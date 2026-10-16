@@ -4921,6 +4921,8 @@ pub const vtable_impl = ComputeBackend.VTable{
     .linearLoRA = &linearLoRAOp,
     .splitLastDim3 = &splitLastDim3Op,
     .reshape2D = null,
+    .allocUninitF32Shape = &allocUninitF32ShapeOp,
+    .copyRows2D = &copyRows2DOp,
     .concatRows2D = &concatRows2DOp,
     .sliceRows2D = &sliceRows2DOp,
     .mulMatId = &mulMatIdOp,
@@ -7620,12 +7622,11 @@ fn sdpaOp(ctx: *anyopaque, q_ct: CT, k_ct: CT, v_ct: CT, mask: []const i64, attn
     // (1.13x at seq=32, 1.4x at seq=1500), so we apply it broadly.  Bench at
     // scratch/bench_thresholds.zig if you change this threshold.  Floor is
     // seq>=32 to leave room for sequences too short to amortize the
-    // streaming-softmax book-keeping (untested below 32).  Disabled when mask
-    // is fewer than batch*seq entries because the inputs would need synthetic
-    // per-batch masks that the materialized path currently silently
-    // broadcasts; safer to keep that case on the legacy path.
+    // streaming-softmax book-keeping (untested below 32). Empty masks mean
+    // every key is valid; avoid synthesizing a mask or falling through to the
+    // quadratic, serial implementation used for unsupported legacy layouts.
     const flash_eligible = effective_seq_len >= 32 and
-        mask.len >= effective_batch * effective_seq_len and
+        (mask.len == 0 or mask.len >= effective_batch * effective_seq_len) and
         (bias == null or bias.?.len == bias_seq_len or bias.?.len == bias_shared_len or bias.?.len == bias_batched_len);
     if (flash_eligible) {
         const flash_output = try linalg.flashAttentionHostWithIo(
@@ -41481,6 +41482,38 @@ test "Florence native row gather preserves row identity and independent storage"
     }));
 }
 
+fn allocUninitF32ShapeOp(ctx: *anyopaque, shape: []const i32) anyerror!?CT {
+    const self: *NativeCompute = @ptrCast(@alignCast(ctx));
+    if (shape.len == 0 or shape.len > 8) return error.InvalidTensorShape;
+    var logical: [8]i64 = undefined;
+    var count: usize = 1;
+    for (shape, logical[0..shape.len]) |dim, *dest| {
+        if (dim < 0) return error.InvalidTensorShape;
+        dest.* = dim;
+        count = try std.math.mul(usize, count, @intCast(dim));
+    }
+    const data = try self.allocator.alloc(f32, count);
+    const tensor = try self.makeOwnedBuf(data);
+    errdefer freeTensor(self, tensor);
+    return self.withLogicalShape(tensor, logical[0..shape.len]);
+}
+fn copyRows2DOp(ctx: *anyopaque, dst: CT, dst_row: usize, src: CT, src_row: usize, rows: usize, cols: usize) anyerror!bool {
+    _ = ctx;
+    const target = toBuf(dst);
+    // Never mutate immutable weight storage, strided views or shared aliases.
+    if (!target.owned or target.source_tensor != null or target.view_strides != null or target.weight_handle_name != null or
+        (target.shared_data_refcount != null and target.shared_data_refcount.?.* != 1)) return error.InvalidTensorShape;
+    const source = try getDataChecked(src);
+    const begin = try std.math.mul(usize, dst_row, cols);
+    const from = try std.math.mul(usize, src_row, cols);
+    const count = try std.math.mul(usize, rows, cols);
+    if (cols == 0 or target.data.len % cols != 0 or source.len % cols != 0 or begin > target.data.len or count > target.data.len - begin or from > source.len or count > source.len - from) return error.InvalidTensorShape;
+    const output = target.data[begin..][0..count];
+    const input = source[from..][0..count];
+    if (@intFromPtr(output.ptr) > @intFromPtr(input.ptr)) std.mem.copyBackwards(f32, output, input) else std.mem.copyForwards(f32, output, input);
+    return true;
+}
+
 fn concatRows2DOp(ctx: *anyopaque, a: CT, b: CT, rows_a: usize, rows_b: usize, cols: usize) anyerror!CT {
     const self: *NativeCompute = @ptrCast(@alignCast(ctx));
     const a_data = getData(a);
@@ -52525,4 +52558,42 @@ test "native embedding rows preserve shape through Gemma PLE arithmetic and laye
     defer cb.free(layer);
     try std.testing.expectEqualSlices(i64, &.{ 2, 2 }, tensorStoredShape(layer).?);
     try std.testing.expectEqualSlices(f32, &.{ 7.5, 8.5, 4, 5 }, getData(layer));
+}
+
+test "embeddinggemma2 video native unmasked tiled attention keeps batch and head identity" {
+    const a = std.testing.allocator;
+    var store = WeightStore{ .allocator = a, .resident_weights = .{}, .lazy_weights = .{} };
+    var compute = NativeCompute.init(a, &store, null);
+    defer compute.deinit();
+    const cb = ComputeBackend{ .ptr = &compute, .vtable = &vtable_impl };
+    const seq = 65;
+    const heads = 3;
+    const dim = 7;
+    var qk: [2 * heads * seq * dim]f32 = @splat(0);
+    var values: [qk.len]f32 = undefined;
+    for (&values, 0..) |*v, i| v.* = @floatFromInt(1 + i / (seq * dim));
+    const q = try compute.makeBuf(&qk, false);
+    defer freeTensor(&compute, q);
+    const v = try compute.makeBuf(&values, false);
+    defer freeTensor(&compute, v);
+    const result = try cb.scaledDotProductAttentionEmbeddingGemma2Vision(q, q, v, 2, seq, heads, dim);
+    defer freeTensor(&compute, result);
+    for (getData(result), values) |got, want| try std.testing.expectApproxEqAbs(want, got, 1e-5);
+}
+
+test "embeddinggemma2 video native row assembly checks ownership bounds and overlapping copies" {
+    const a = std.testing.allocator;
+    var store = WeightStore{ .allocator = a, .resident_weights = .{}, .lazy_weights = .{} };
+    var compute = NativeCompute.init(a, &store, null);
+    defer compute.deinit();
+    const cb = compute.computeBackend();
+    const tensor = try cb.fromFloat32Shape(&.{ 1, 2, 3, 4, 5, 6 }, &.{ 3, 2 });
+    defer cb.free(tensor);
+    try std.testing.expect(try cb.copyRows2D(a, tensor, 1, tensor, 0, 2, 2));
+    try std.testing.expectEqualSlices(f32, &.{ 1, 2, 1, 2, 3, 4 }, getData(tensor));
+    try std.testing.expectError(error.InvalidTensorShape, cb.copyRows2D(a, tensor, 3, tensor, 0, 1, 2));
+    var borrowed = [_]f32{ 1, 2 };
+    const immutable = try compute.makeBuf(&borrowed, false);
+    defer cb.free(immutable);
+    try std.testing.expectError(error.InvalidTensorShape, cb.copyRows2D(a, immutable, 0, tensor, 0, 1, 2));
 }

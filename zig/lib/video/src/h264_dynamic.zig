@@ -106,19 +106,28 @@ pub const Session = struct {
     entries: std.ArrayList(Entry) = .empty,
     epochs: std.ArrayList(Epoch) = .empty,
     packet_configs: []usize = &.{},
+    header_budget: Budget,
+    header_packets: std.ArrayList([]u8) = .empty,
+    cache_headers: bool = false,
     probe_packets: usize = 0,
     probe_bytes: u64 = 0,
     active: ?usize = null,
     valid: bool = true,
     history: std.ArrayList(Parameter) = .empty,
     pub fn init(allocator: std.mem.Allocator, reader: *media.mp4.Reader, options: h264.Options) !*Session {
+        return initCached(allocator, reader, options, false);
+    }
+    pub fn initPlanning(allocator: std.mem.Allocator, reader: *media.mp4.Reader, options: h264.Options) !*Session {
+        return initCached(allocator, reader, options, true);
+    }
+    fn initCached(allocator: std.mem.Allocator, reader: *media.mp4.Reader, options: h264.Options, cache_headers: bool) !*Session {
         if (reader.track.codec != .avc) return error.UnsupportedVideoCodec;
         if (reader.packets.len > options.max_parameter_packets) return error.ResourceLimitExceeded;
         const self = try allocator.create(Session);
-        self.* = .{ .backing = allocator, .budget = .{ .backing = allocator, .limit = options.max_parameter_bytes }, .reader = reader, .length_bytes = reader.track.nal_length_bytes, .options = options };
+        self.* = .{ .backing = allocator, .budget = .{ .backing = allocator, .limit = options.max_parameter_bytes }, .header_budget = .{ .backing = allocator, .limit = options.max_parameter_bytes }, .reader = reader, .length_bytes = reader.track.nal_length_bytes, .options = options, .cache_headers = cache_headers };
         errdefer self.deinit();
-        self.reservation = if (reader.input.admission_pool) |pool| try pool.acquire(.{ .host_bytes = try std.math.add(usize, options.max_parameter_bytes, @sizeOf(Session)) }) else media.admission.Token{};
-        self.scan() catch |err| return if (err == error.OutOfMemory and self.budget.denied) error.ResourceLimitExceeded else err;
+        self.reservation = if (reader.input.admission_pool) |pool| try pool.acquire(.{ .host_bytes = try std.math.add(usize, try std.math.mul(usize, options.max_parameter_bytes, 2), @sizeOf(Session)) }) else media.admission.Token{};
+        self.scan() catch |err| return if (err == error.OutOfMemory and (self.budget.denied or self.header_budget.denied)) error.ResourceLimitExceeded else err;
         return self;
     }
     pub fn deinit(self: *Session) void {
@@ -132,10 +141,18 @@ pub const Session = struct {
         for (self.history.items) |parameter| allocator.free(parameter.bytes);
         self.history.deinit(allocator);
         allocator.free(self.packet_configs);
+        self.releasePlanningHeaders();
         var reservation = self.reservation;
         const backing = self.backing;
         backing.destroy(self);
         reservation.deinit();
+    }
+    pub fn releasePlanningHeaders(self: *Session) void {
+        const a = self.header_budget.allocator();
+        for (self.header_packets.items) |bytes| a.free(bytes);
+        self.header_packets.deinit(a);
+        self.header_packets = .empty;
+        self.cache_headers = false;
     }
     fn install(self: *Session, nal: []const u8, at: ?usize) !void {
         if (nal.len > std.math.maxInt(u16)) return error.ResourceLimitExceeded;
@@ -211,10 +228,31 @@ pub const Session = struct {
         for (begin..self.reader.packets.len) |i| {
             const packet = self.reader.packets[i];
             if (packet.size > self.options.max_packet_bytes) return error.ResourceLimitExceeded;
-            var lease = try self.reader.readPacket(i);
-            defer lease.deinit();
+            const bytes_before = self.reader.input.total_bytes;
+            const header_allocator = self.header_budget.allocator();
+            const prefix = @import("h264_prefix.zig").packet(header_allocator, self.reader, i, self.options.max_packet_bytes) catch |err| retry: {
+                // Cache pressure must never narrow the parameter/profile limit
+                // or make a long clip fail. Discard the optional cache, then
+                // continue sparse reads with one bounded packet in flight.
+                if (err != error.OutOfMemory or !self.header_budget.denied or self.header_packets.items.len == 0) return err;
+                self.releasePlanningHeaders();
+                self.header_budget.denied = false;
+                break :retry try @import("h264_prefix.zig").packet(header_allocator, self.reader, i, self.options.max_packet_bytes);
+            };
+            var retained = false;
+            defer if (!retained) header_allocator.free(prefix);
+            if (self.cache_headers) {
+                if (self.header_packets.append(header_allocator, prefix)) |_| {
+                    retained = true;
+                } else |err| {
+                    if (err != error.OutOfMemory or !self.header_budget.denied) return err;
+                    self.releasePlanningHeaders();
+                    self.header_budget.denied = false;
+                }
+            }
+            const lease = .{ .bytes = prefix };
             self.probe_packets += 1;
-            self.probe_bytes += lease.bytes.len;
+            self.probe_bytes += self.reader.input.total_bytes - bytes_before;
             try @import("avc.zig").validatePortablePacket(lease.bytes, self.reader.track.nal_length_bytes);
             var cursor: usize = 0;
             var selected: ?usize = null;
@@ -228,8 +266,7 @@ pub const Session = struct {
                 switch (nal[0] & 31) {
                     7, 8 => try self.install(nal, i),
                     1, 2, 5 => {
-                        var bits = try Bits.initSlice(allocator, nal, self.reader.input.control, true);
-                        defer bits.deinit();
+                        var bits = @import("h264_prefix.zig").Bits{ .bytes = nal };
                         _ = try bits.ue();
                         const slice_type = try bits.ue();
                         const index = try self.entry(try bits.ue());

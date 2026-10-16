@@ -213,6 +213,18 @@ planning runs in that wave as well, rather than delaying the current backbone.
 The planning worker is joined before its slot, source or request is released. Admission pressure falls
 back to serial execution; cancellation joins workers before releasing sources.
 
+Finite AVC metadata scans fetch NAL lengths and bounded header prefixes instead
+of entire compressed packets. Prefix buffers are planning metadata, not decodable
+media. A bounded optional cache shares the configuration pass with picture
+assembly; long clips fall back to sparse header reads when the cache fills.
+Original source ranges remain authoritative for decoder validation and playback.
+
+The inference consumer may retain two current immutable windows for a masked
+backbone batch plus one next-window preparation wave. All readers and selections
+stay in stable slots until completed execution and worker join. Independent
+window identity, sample selection, output ordering and continuation semantics
+remain unchanged by batching.
+
 ## Verification
 
 From the repository root, with its pinned Zig toolchain:
