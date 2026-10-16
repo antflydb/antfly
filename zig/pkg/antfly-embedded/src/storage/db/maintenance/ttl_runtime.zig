@@ -276,7 +276,10 @@ const PlatformTtlRuntime = struct {
         if (workDeferred(self)) return;
         const now_ns = self.config.clock.nowRealtimeNs();
         if (!ensureLease(self, now_ns)) return;
-        const summary = try collectAndDelete(self, now_ns);
+        const summary = collectAndDelete(self, now_ns) catch |err| {
+            recordRun(self, now_ns, .{}, true);
+            return err;
+        };
         recordRun(self, now_ns, summary, false);
     }
 

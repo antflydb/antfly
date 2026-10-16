@@ -6194,14 +6194,18 @@ test "capi native replacement wait observes its background owner without rebuild
 }
 
 test "capi native idle maintenance discovers resolver debt after producer checkpoint" {
-    try testNativeIdleResolverDebt(false);
+    try testNativeIdleResolverDebt(false, false);
 }
 
 test "capi native idle maintenance discovers persisted enrichment target beyond journal" {
-    try testNativeIdleResolverDebt(true);
+    try testNativeIdleResolverDebt(true, false);
 }
 
-fn testNativeIdleResolverDebt(notified_tail: bool) !void {
+test "capi native idle maintenance continues resolver replay after TTL failure" {
+    try testNativeIdleResolverDebt(false, true);
+}
+
+fn testNativeIdleResolverDebt(notified_tail: bool, ttl_failure: bool) !void {
     if (builtin.single_threaded or builtin.os.tag == .freestanding) return error.SkipZigTest;
     const a = std.testing.allocator;
     var directory = try TestDirectory.init("native-resolver-durable-debt");
@@ -6214,6 +6218,12 @@ fn testNativeIdleResolverDebt(notified_tail: bool) !void {
     options.storage_kind = capi.storage_kind_lite;
     options.profile = capi.profile_native;
     options.flags |= capi.open_flag_generated_enrichment_replay;
+    if (ttl_failure) {
+        options.flags |= capi.open_flag_ttl_cleanup;
+        options.ttl_cleanup_enabled = true;
+        options.ttl_cleanup_lease_owned = true;
+        options.ttl_cleanup_grace_period_ns = 0;
+    }
     var handle: ?*anyopaque = null;
     try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_create_with_options(path, &options, &handle));
     defer antfly_db_close(handle);
@@ -6265,6 +6275,14 @@ fn testNativeIdleResolverDebt(notified_tail: bool) !void {
             database.enrichment_runtime.?.notifySequence(target);
             try db_mod.enrichment_state.saveRuntimeStatus(database.core.store, "generated", .{ .target_sequence = target });
         }
+        if (ttl_failure) {
+            // A bad independent expiry page must remain visible without
+            // preventing resolver/promotion replay from advancing.
+            const keys = @import("antfly_local_sources").storage_internal_keys;
+            const bad_key = try std.mem.concat(a, u8, &.{ &keys.graph_edge_expiration_index_prefix, &[_]u8{ 0, 0, 0, 0, 0, 0, 0, 1 }, "bad" });
+            defer a.free(bad_key);
+            try database.core.store.putBatch(&.{.{ .key = bad_key, .value = "bad" }}, &.{});
+        }
         owner.maintenance_pending = false;
         owner.maintenance_round_pending = false;
     }
@@ -6273,13 +6291,28 @@ fn testNativeIdleResolverDebt(notified_tail: bool) !void {
     handle = null;
     try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_open_with_options(path, &options, &handle));
     owner = try Pause.run(handle);
-    for (0..64) |_| if (!try owner.maintenanceTurnForTest()) break;
+    var ttl_failures: usize = 0;
+    for (0..64) |_| {
+        const pending = owner.maintenanceTurnForTest() catch |err| {
+            if (!ttl_failure or err != error.InvalidGraphTtlCandidate) return err;
+            ttl_failures += 1;
+            continue;
+        };
+        if (!pending) break;
+    }
+    if (ttl_failure) try std.testing.expectEqual(@as(usize, 1), ttl_failures);
     const guard = public.enterHandle(handle, .read).?;
     defer guard.leave();
     const stats = guard.handle.db.pendingWorkStats();
     try std.testing.expect(stats.enrichment.applied_sequence >= stats.enrichment.target_sequence);
     try std.testing.expect(!stats.resolution.catch_up_required);
     try std.testing.expect(!stats.promotion.catch_up_required);
+    if (ttl_failure) {
+        var ttl = guard.handle.db.ttl_runtime.?.stats();
+        owner.overlayTtlStats(&guard.handle.db, &ttl);
+        try std.testing.expect(ttl.error_count > 0);
+        try std.testing.expect(owner.publication_stats.maintenance_errors > 0);
+    }
 }
 
 test "capi native resolver maintenance retries transient inference and survives reopen" {

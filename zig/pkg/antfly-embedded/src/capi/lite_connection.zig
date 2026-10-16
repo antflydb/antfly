@@ -462,6 +462,7 @@ pub const Owner = struct {
         shadow_next: bool = true,
         live: bool = true,
         ttl: h.db_mod.types.TTLCleanupStats = .{},
+        last_ttl_error: ?anyerror = null,
     };
     const ttl_counter_fields = .{ "acquisition_count", "runs", "scanned_timestamps", "deleted_docs", "scanned_graph_candidates", "expired_graph_sources", "expired_graph_artifacts", "error_count", "lease_acquire_failures", "lost_leases" };
 
@@ -934,14 +935,25 @@ pub const Owner = struct {
         // every namespace under one file lease.
         const now = std.Io.Clock.awake.now(io).nanoseconds;
         if (now >= self.next_ttl_ns) {
+            // A failed last-table pass still completes this TTL scheduling
+            // round. Propagate its error and let the next capture reconcile
+            // authority, but do not run the same failing cleanup before every
+            // producer/resolver turn until it permanently starves replay.
+            defer if (self.maintenance_table_cursor == 0) {
+                const config = self.options.ttl_cleanup orelse h.db_mod.ttl_runtime.Config{};
+                self.next_ttl_ns = now + @as(i96, config.interval_ms) * std.time.ns_per_ms;
+            };
             if (database.ttl_runtime) |ttl| {
                 const before = ttl.stats();
                 defer recordTtlTurn(&schedule.ttl, before, ttl.stats());
-                try ttl.runOnce();
-            }
-            if (self.maintenance_table_cursor == 0) {
-                const config = self.options.ttl_cleanup orelse h.db_mod.ttl_runtime.Config{};
-                self.next_ttl_ns = now + @as(i96, config.interval_ms) * std.time.ns_per_ms;
+                ttl.runOnce() catch |err| {
+                    self.publication_stats.maintenance_errors +|= 1;
+                    self.publication_stats.last_maintenance_error = @errorName(err);
+                    if (schedule.last_ttl_error == null or schedule.last_ttl_error.? != @as(anyerror, err)) std.log.warn("native Lite TTL cleanup deferred table={s} err={s}", .{ if (selected) |table| table.name else "default", @errorName(err) });
+                    schedule.last_ttl_error = err;
+                    return err;
+                };
+                schedule.last_ttl_error = null;
             }
         }
         const run_database = self.maintenance_pending;
