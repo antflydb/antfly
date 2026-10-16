@@ -373,6 +373,52 @@ pub fn fkGenerationPublicationSourceDecisionJson(svc: anytype, alloc: std.mem.Al
     return store.fkGenerationPublicationSourceDecisionJson(alloc, svc.metadata_group_id, request);
 }
 
+pub fn relationalIndexAdmissionStatusJson(svc: anytype, alloc: std.mem.Allocator, context: operation.RequestContext, request: @import("../metadata/relational_index_publication.zig").AdmissionRequest) ![]u8 {
+    if (!context.index_publication_authority) return error.Forbidden;
+    try context.ensureActive();
+    try request.validate();
+    try svc.ensureLinearizableReadWithContext(context);
+    const store = svc.projectedStore() orelse return error.MissingMetadataStore;
+    return store.relationalIndexAdmissionStatusJson(alloc, svc.metadata_group_id, request);
+}
+
+test "relational index publication admission status requires authority and a linearizable cut" {
+    const publication = @import("../metadata/relational_index_publication.zig");
+    const Mock = struct {
+        metadata_group_id: u64 = 13,
+        reads: usize = 0,
+        store: Store = .{},
+        const Store = struct {
+            calls: usize = 0,
+            pub fn relationalIndexAdmissionStatusJson(self: *@This(), alloc: std.mem.Allocator, group: u64, request: publication.AdmissionRequest) ![]u8 {
+                try std.testing.expectEqual(@as(u64, 13), group);
+                try request.validate();
+                self.calls += 1;
+                return alloc.dupe(u8, "{}");
+            }
+        };
+        pub fn ensureLinearizableReadWithContext(self: *@This(), context: operation.RequestContext) !void {
+            try context.ensureActive();
+            self.reads += 1;
+        }
+        pub fn projectedStore(self: *@This()) ?*Store {
+            return &self.store;
+        }
+    };
+    var svc: Mock = .{};
+    const request: publication.AdmissionRequest = .{ .table_id = 17, .id = @splat(1), .plan_digest = @splat(2), .metadata_incarnation = @splat(3) };
+    try std.testing.expectError(error.Forbidden, relationalIndexAdmissionStatusJson(&svc, std.testing.allocator, .{}, request));
+    var invalid = request;
+    invalid.table_id = 0;
+    try std.testing.expectError(error.InvalidGenerationPublication, relationalIndexAdmissionStatusJson(&svc, std.testing.allocator, .{ .index_publication_authority = true }, invalid));
+    try std.testing.expectEqual(@as(usize, 0), svc.reads);
+    try std.testing.expectEqual(@as(usize, 0), svc.store.calls);
+    const bytes = try relationalIndexAdmissionStatusJson(&svc, std.testing.allocator, .{ .index_publication_authority = true }, request);
+    defer std.testing.allocator.free(bytes);
+    try std.testing.expectEqual(@as(usize, 1), svc.reads);
+    try std.testing.expectEqual(@as(usize, 1), svc.store.calls);
+}
+
 pub fn relationalIndexOwnerAckStatusJson(svc: anytype, alloc: std.mem.Allocator, context: operation.RequestContext, request: @import("../metadata/relational_index_publication.zig").Ack) ![]u8 {
     if (!context.index_publication_authority) return error.Forbidden;
     try context.ensureActive();
@@ -994,6 +1040,7 @@ pub fn call(svc: anytype, alloc: std.mem.Allocator, context: operation.RequestCo
         .fk_generation_publication_work => |after_child_table_id| fkGenerationPublicationWorkJson(svc, alloc, context, after_child_table_id),
         .fk_generation_publication_decision => |request| fkGenerationPublicationDecisionJson(svc, alloc, context, request),
         .fk_generation_publication_source_decision => |request| fkGenerationPublicationSourceDecisionJson(svc, alloc, context, request),
+        .relational_index_admission_status => |request| relationalIndexAdmissionStatusJson(svc, alloc, context, request),
         .relational_index_owner_decision => |request| relationalIndexOwnerDecisionJson(svc, alloc, context, request),
         .relational_index_owner_ack => |request| acknowledgeRelationalIndexOwner(svc, alloc, context, request),
         .relational_index_owner_ack_status => |request| relationalIndexOwnerAckStatusJson(svc, alloc, context, request),

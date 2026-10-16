@@ -2663,6 +2663,10 @@ const LocalStandaloneMetadata = struct {
                 if (!(parsed.value.isCanceled(request) catch return error.MetadataMutationOutcomeUnknown)) return error.MetadataMutationOutcomeUnknown;
                 return observed;
             },
+            .relational_index_admission_status => |request| {
+                const store = self.lifecycle_store orelse return error.UnsupportedOperation;
+                return store.relationalIndexAdmissionStatusJson(alloc, group_ids.main_metadata_group_id, request);
+            },
             .relational_index_publish_status => |request| {
                 const store = self.lifecycle_store orelse return error.UnsupportedOperation;
                 return store.relationalIndexPublicationDecisionStatusJson(alloc, group_ids.main_metadata_group_id, request);

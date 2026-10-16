@@ -8501,3 +8501,33 @@ inventory integrity checks pass. Independent durable metadata verification
 remains covered by the metadata lane.
 Replacement-root adoption, hosted/Raft execution and public online-index admission
 remain unfinished. No original SQL case credit or complete SQL activation is claimed.
+
+### Exact online-index admission observation
+
+The coordinator now has a compact admission-status read through the shared
+system-catalog envelope, metadata owner and standalone facade. Its request binds
+the table, job ID, immutable plan digest and metadata incarnation. The read uses
+one storage snapshot and a constant number of point reads, not schema decoding
+or a cohort/catalog scan. It checks the active-pointer invariant and withholds
+confirmation while a metadata outbox obligation remains. A different retained
+job is a changed observation, never successful admission of the requested job.
+Absence is an observation at this cut, not proof that an earlier proposal cannot
+still commit; callers must not replay uncertain admission based on absence.
+
+The read requires the existing body-bound index-publication authority and has a
+2 KiB response cap. The typed metadata client validates the transport incarnation
+against the request and independently validates the returned body. It grants no
+physical execution permission. Public SQL/REST admission still needs the trusted
+plan producer and recovery-receipt integration; this read does not activate
+`CONCURRENTLY` or earn original SQL case credit.
+
+The final frozen-source Debug gate passed 117/117 build steps in
+`/private/tmp/antfly-index-admission-status-final-debug-2.log`: 59 metadata,
+four ACK transport, four standalone coordinator, three real leased-adapter and
+one decoder-barrier tests, without failures or leaks. Evidence includes absent
+and admitted observations, recovery after reopening storage, substituted plan
+and incarnation rejection, service authority ordering, bounded body-bound reads,
+and foreign transport identity rejection. An intermediate transport test exposed
+the generic reader's lack of request-incarnation comparison; the typed client
+now performs that comparison instead of weakening the test. Original inventory
+remains 483 implemented / 862 unresolved.

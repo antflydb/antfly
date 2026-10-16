@@ -42,6 +42,70 @@ pub const Id = progress.Id;
 pub const Digest = progress.Digest;
 /// A decision selects only the already admitted immutable successor. It cannot
 /// introduce a different schema, owner cohort or validation receipt.
+/// Exact immutable admission identity. A job ID alone cannot resolve a lost
+/// reply: the caller must retain the plan commitment and catalog incarnation.
+pub const AdmissionRequest = struct {
+    table_id: u64,
+    id: Id,
+    plan_digest: Digest,
+    metadata_incarnation: [32]u8,
+
+    pub fn validate(self: @This()) !void {
+        if (self.table_id == 0 or std.mem.allEqual(u8, &self.id, 0) or
+            std.mem.allEqual(u8, &self.plan_digest, 0) or std.mem.allEqual(u8, &self.metadata_incarnation, 0))
+            return error.InvalidGenerationPublication;
+    }
+};
+
+/// Compact observation, not permission to execute an owner operation. Absence
+/// is only an observation at this read cut, never authority to retry a mutation
+/// whose original proposal may still be in flight.
+pub const AdmissionStatus = struct {
+    pub const max_wire_bytes = 2048;
+    metadata_incarnation: [32]u8,
+    head: ?progress.Head = null,
+    replication_pending: bool = false,
+
+    pub fn isAdmitted(self: @This(), request: AdmissionRequest) !bool {
+        try request.validate();
+        if (!std.mem.eql(u8, &self.metadata_incarnation, &request.metadata_incarnation))
+            return error.GenerationPublicationChanged;
+        const head = self.head orelse return false;
+        try head.validate();
+        if (head.table_id != request.table_id or !std.mem.eql(u8, &head.plan_id, &request.id) or
+            !std.mem.eql(u8, &head.plan_digest, &request.plan_digest)) return error.GenerationPublicationChanged;
+        return !self.replication_pending;
+    }
+};
+
+test "relational index publication admission status binds the immutable plan and incarnation" {
+    const request: AdmissionRequest = .{ .table_id = 17, .id = @splat(1), .plan_digest = @splat(2), .metadata_incarnation = @splat(3) };
+    var status: AdmissionStatus = .{ .metadata_incarnation = request.metadata_incarnation };
+    try std.testing.expect(!try status.isAdmitted(request));
+    status.head = .{ .table_id = request.table_id, .plan_id = request.id, .plan_digest = request.plan_digest, .candidate_digest = @splat(4), .reservation_digest = @splat(5), .owner_count = 1 };
+    try std.testing.expect(try status.isAdmitted(request));
+    status.replication_pending = true;
+    try std.testing.expect(!try status.isAdmitted(request));
+    status.replication_pending = false;
+    var changed = request;
+    changed.plan_digest[0] ^= 1;
+    try std.testing.expectError(error.GenerationPublicationChanged, status.isAdmitted(changed));
+    changed = request;
+    changed.id[0] ^= 1;
+    try std.testing.expectError(error.GenerationPublicationChanged, status.isAdmitted(changed));
+    changed = request;
+    changed.metadata_incarnation[0] ^= 1;
+    try std.testing.expectError(error.GenerationPublicationChanged, status.isAdmitted(changed));
+    changed = request;
+    changed.table_id += 1;
+    try std.testing.expectError(error.GenerationPublicationChanged, status.isAdmitted(changed));
+    changed.table_id = 0;
+    try std.testing.expectError(error.InvalidGenerationPublication, status.isAdmitted(changed));
+    const bytes = try std.json.Stringify.valueAlloc(std.testing.allocator, status, .{});
+    defer std.testing.allocator.free(bytes);
+    try std.testing.expect(bytes.len <= AdmissionStatus.max_wire_bytes);
+}
+
 pub const DecidePublish = struct {
     table_id: u64,
     id: Id,

@@ -6693,7 +6693,33 @@ test "relational index publication admission reserves names atomically and survi
         var decoded = (try decodeTransitionCommand(a, encoded)).?;
         defer decoded.deinit(a);
         try std.testing.expectEqualSlices(u8, begin, decoded.begin_relational_index_publication);
+        var prepared_admission = try plan.prepare(a);
+        defer prepared_admission.deinit();
+        const admission: index_publication.AdmissionRequest = .{ .table_id = plan.before.table_id, .id = plan.id, .plan_digest = prepared_admission.head.plan_digest, .metadata_incarnation = identity };
+        {
+            const bytes = try store.relationalIndexAdmissionStatusJson(a, group, admission);
+            defer a.free(bytes);
+            var status = try std.json.parseFromSlice(index_publication.AdmissionStatus, a, bytes, .{});
+            defer status.deinit();
+            try std.testing.expect(!try status.value.isAdmitted(admission));
+            try std.testing.expect(status.value.head == null);
+        }
         try store.applyStandaloneCommand(group, decoded);
+        {
+            const bytes = try store.relationalIndexAdmissionStatusJson(a, group, admission);
+            defer a.free(bytes);
+            var status = try std.json.parseFromSlice(index_publication.AdmissionStatus, a, bytes, .{});
+            defer status.deinit();
+            try std.testing.expect(try status.value.isAdmitted(admission));
+            try std.testing.expectEqual(@as(u64, 1), status.value.head.?.revision);
+            try std.testing.expect(bytes.len <= index_publication.AdmissionStatus.max_wire_bytes);
+            var substituted = admission;
+            substituted.plan_digest[0] ^= 1;
+            try std.testing.expectError(error.GenerationPublicationChanged, store.relationalIndexAdmissionStatusJson(a, group, substituted));
+            substituted = admission;
+            substituted.metadata_incarnation[0] ^= 1;
+            try std.testing.expectError(error.GenerationPublicationChanged, store.relationalIndexAdmissionStatusJson(a, group, substituted));
+        }
         try std.testing.expectError(error.GenerationPublicationChanged, store.applyStandaloneCommand(group, decoded));
         {
             var txn = try store.store.beginWriteTxn();
@@ -6726,6 +6752,12 @@ test "relational index publication admission reserves names atomically and survi
             defer read.abort();
             const head = try index_publication.verifyJob(a, &read, group, plan.before.table_id);
             try std.testing.expectEqual(index_progress.Phase.fencing, head.phase);
+            const admission: index_publication.AdmissionRequest = .{ .table_id = head.table_id, .id = head.plan_id, .plan_digest = head.plan_digest, .metadata_incarnation = identity };
+            const observed = try store.relationalIndexAdmissionStatusJson(a, group, admission);
+            defer a.free(observed);
+            var status = try std.json.parseFromSlice(index_publication.AdmissionStatus, a, observed, .{});
+            defer status.deinit();
+            try std.testing.expect(try status.value.isAdmitted(admission));
             var live = (try relation_reconciliation.LiveStore(docstore.DocStore.Txn).open(&read, group)).?;
             try std.testing.expectEqual(null, try live.getClaim(.{ .namespace_id = plan.namespace_id, .name = plan.index_name }));
             const reserved = (try live.getEntry(.{ .namespace_id = plan.namespace_id, .name = plan.index_name })).?;
@@ -18643,6 +18675,27 @@ pub const RaftApplyStore = struct {
         defer txn.abort();
         var prepared = try self.prepareRelationalIndexPublicationDecisionTxn(&txn, group_id, decision);
         defer if (prepared) |*value| value.deinit(self.alloc);
+    }
+
+    pub fn relationalIndexAdmissionStatusJson(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, request: index_publication.AdmissionRequest) ![]u8 {
+        try request.validate();
+        var txn = try self.store.beginReadTxn();
+        defer txn.abort();
+        _ = try self.standbyRelationActivationTxn(&txn, group_id, topology_protocol.index_publication_head_version);
+        var buf: [192]u8 = undefined;
+        const incarnation = (try decodeMetadataIncarnationRecord(try txn.get(try metadataIncarnationKeyForGroup(&buf, group_id)))).incarnation;
+        const raw = try stagingGet(&txn, try index_publication.headKey(&buf, group_id, request.table_id));
+        const head: ?index_progress.Head = if (raw) |bytes| index_progress.Head.decode(bytes) catch return error.InvalidCatalogRecord else null;
+        if (head) |value| {
+            try index_publication.requireActivePointer(&txn, group_id, value);
+        } else {
+            // A partially retained job is corruption, not evidence of absence.
+            if (try stagingGet(&txn, try index_publication.activeKey(&buf, group_id, request.table_id)) != null or
+                try stagingGet(&txn, try index_publication.planKey(&buf, group_id, request.table_id)) != null) return error.InvalidCatalogRecord;
+        }
+        const status: index_publication.AdmissionStatus = .{ .metadata_incarnation = incarnation, .head = head, .replication_pending = try stagingGet(&txn, metadata_hot_standby.outbox_key) != null };
+        _ = try status.isAdmitted(request);
+        return std.json.Stringify.valueAlloc(alloc, status, .{});
     }
 
     pub fn relationalIndexPublicationDecisionStatusJson(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, request: index_publication.DecidePublish) ![]u8 {

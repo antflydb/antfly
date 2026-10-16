@@ -78,6 +78,7 @@ pub const Call = union(enum) {
     fk_generation_publication_work: u64,
     fk_generation_publication_decision: @import("../metadata/fk_generation_publication.zig").DecisionRequest,
     fk_generation_publication_source_decision: @import("../metadata/fk_generation_publication.zig").SourceDecisionRequest,
+    relational_index_admission_status: @import("../metadata/relational_index_publication.zig").AdmissionRequest,
     relational_index_owner_decision: @import("../metadata/relational_index_publication.zig").OwnerRequest,
     relational_index_owner_ack: @import("../metadata/relational_index_publication.zig").Ack,
     relational_index_owner_ack_status: @import("../metadata/relational_index_publication.zig").Ack,
@@ -145,6 +146,7 @@ pub const Call = union(enum) {
             .fk_generation_publication_work,
             .fk_generation_publication_decision,
             .fk_generation_publication_source_decision,
+            .relational_index_admission_status,
             .relational_index_owner_decision,
             .relational_index_owner_ack,
             .relational_index_owner_ack_status,
@@ -172,7 +174,7 @@ pub const Call = union(enum) {
     }
 
     pub fn isRelationalIndexOwnerCall(self: @This()) bool {
-        return self == .relational_index_owner_decision or self == .relational_index_owner_ack or self == .relational_index_owner_ack_status or self == .relational_index_publish_decide or self == .relational_index_publish_status or self == .relational_index_cancel or self == .relational_index_cancel_status or self == .relational_index_source_accept or self == .relational_index_source_accept_status or self == .relational_index_source_complete;
+        return self == .relational_index_admission_status or self == .relational_index_owner_decision or self == .relational_index_owner_ack or self == .relational_index_owner_ack_status or self == .relational_index_publish_decide or self == .relational_index_publish_status or self == .relational_index_cancel or self == .relational_index_cancel_status or self == .relational_index_source_accept or self == .relational_index_source_accept_status or self == .relational_index_source_complete;
     }
 };
 
@@ -191,6 +193,10 @@ test "relational index publication ACK calls require body bound authority and di
     for ([_]anyerror{ error.IndexOwnerReceiptChanged, error.InvalidIndexOwnerReceipt, error.MetadataMutationOutcomeUnknown }) |err| {
         try std.testing.expectError(err, Boundary.call("submit", &Callbacks.foreign, &Callbacks.submit, .{&err}));
     }
+    const admission: Call = .{ .relational_index_admission_status = undefined };
+    try std.testing.expect(!admission.isMutation());
+    try std.testing.expect(admission.requiresSettingAuthorityReadGrant());
+    try std.testing.expect(admission.isRelationalIndexOwnerCall());
     const ack: Call = .{ .relational_index_owner_ack = undefined };
     const status: Call = .{ .relational_index_owner_ack_status = undefined };
     const accept: Call = .{ .relational_index_source_accept = undefined };

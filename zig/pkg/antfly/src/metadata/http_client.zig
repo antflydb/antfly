@@ -1192,6 +1192,19 @@ pub const MetadataHttpClient = struct {
         return parsed.value;
     }
 
+    pub fn relationalIndexAdmissionStatus(self: *MetadataHttpClient, base_uri: []const u8, request: @import("relational_index_publication.zig").AdmissionRequest, remaining_ms: u32, cancellation: ?*const http_common.RequestCancellation) !@import("relational_index_publication.zig").AdmissionStatus {
+        const publication = @import("relational_index_publication.zig");
+        try request.validate();
+        const observed = try self.readSystemCatalog(base_uri, .{ .relational_index_admission_status = request }, remaining_ms, cancellation);
+        defer observed.deinit(self.alloc);
+        if (!std.mem.eql(u8, &observed.metadata_incarnation, &request.metadata_incarnation)) return error.MetadataIncarnationMismatch;
+        if (observed.body.len == 0 or observed.body.len > publication.AdmissionStatus.max_wire_bytes) return error.InvalidCatalogRecord;
+        var parsed = try std.json.parseFromSlice(publication.AdmissionStatus, self.alloc, observed.body, .{});
+        defer parsed.deinit();
+        _ = try parsed.value.isAdmitted(request);
+        return parsed.value;
+    }
+
     pub fn relationalIndexOwnerAckStatus(self: *MetadataHttpClient, base_uri: []const u8, request: @import("relational_index_publication.zig").Ack, remaining_ms: u32, cancellation: ?*const http_common.RequestCancellation) !@import("relational_index_publication.zig").AckStatus {
         const publication = @import("relational_index_publication.zig");
         try request.validate();
@@ -4655,6 +4668,7 @@ test "store-root enrollment status is a body-bound admin read and preserves abse
 fn catalogResponseLimit(input: @import("../system_catalog/server_call.zig").Call) ?usize {
     const publication = @import("relational_index_publication.zig");
     return switch (input) {
+        .relational_index_admission_status => publication.AdmissionStatus.max_wire_bytes,
         .relational_index_publish_decide, .relational_index_publish_status => publication.DecisionStatus.max_wire_bytes,
         .relational_index_cancel, .relational_index_cancel_status => publication.CancellationStatus.max_wire_bytes,
         .relational_index_source_accept, .relational_index_source_accept_status, .relational_index_source_complete => 16 * 1024,
@@ -4681,6 +4695,7 @@ test "relational index publication ACK client binds read grants and never retrie
             defer call.deinit();
             const mutation = call.value.isMutation();
             try std.testing.expect(call.value.isRelationalIndexOwnerCall());
+            if (call.value == .relational_index_admission_status) try std.testing.expectEqual(@as(?usize, publication.AdmissionStatus.max_wire_bytes), request.max_response_bytes);
             if (call.value == .relational_index_source_accept_status or call.value == .relational_index_source_accept or call.value == .relational_index_source_complete) try std.testing.expectEqual(@as(?usize, 16 * 1024), request.max_response_bytes);
             if (call.value == .relational_index_publish_status or call.value == .relational_index_publish_decide) try std.testing.expectEqual(@as(?usize, publication.DecisionStatus.max_wire_bytes), request.max_response_bytes);
             if (call.value == .relational_index_cancel_status or call.value == .relational_index_cancel) try std.testing.expectEqual(@as(?usize, publication.CancellationStatus.max_wire_bytes), request.max_response_bytes);
@@ -4759,6 +4774,7 @@ test "relational index publication ACK client binds read grants and never retrie
     try std.testing.expectError(error.Cancelled, client.forwardSystemCatalogControlled("http://metadata.invalid", .{ .relational_index_source_accept = undefined }, .{ .remaining_ms = 25, .forwards_remaining = 2, .campaign_allowed = true }, false, &canceled));
     try std.testing.expectError(error.Cancelled, client.forwardSystemCatalogControlled("http://metadata.invalid", .{ .relational_index_publish_decide = undefined }, .{ .remaining_ms = 25, .forwards_remaining = 2, .campaign_allowed = true }, false, &canceled));
     try std.testing.expectError(error.Cancelled, client.readSystemCatalog("http://metadata.invalid", .{ .relational_index_publish_status = undefined }, 25, &canceled));
+    try std.testing.expectError(error.Cancelled, client.readSystemCatalog("http://metadata.invalid", .{ .relational_index_admission_status = undefined }, 25, &canceled));
     try std.testing.expectError(error.Cancelled, client.readSystemCatalog("http://metadata.invalid", .{ .relational_index_cancel_status = undefined }, 25, &canceled));
     try std.testing.expectError(error.Cancelled, client.forwardSystemCatalogControlled("http://metadata.invalid", .{ .relational_index_cancel = undefined }, .{ .remaining_ms = 25, .forwards_remaining = 2, .campaign_allowed = true }, false, &canceled));
     try std.testing.expectEqual(before, executor.calls);
@@ -4766,6 +4782,16 @@ test "relational index publication ACK client binds read grants and never retrie
     executor.outcome = routes.Routes.raft_mutation_outcome_committed;
     executor.body = "{}";
     const decision: publication.DecidePublish = .{ .table_id = request.table_id, .id = request.signed.receipt.owner.plan_id, .expected_revision = 1 };
+    const admission: publication.AdmissionRequest = .{ .table_id = decision.table_id, .id = decision.id, .plan_digest = request.signed.receipt.owner.plan_digest, .metadata_incarnation = @splat('1') };
+    const admission_bytes = try std.json.Stringify.valueAlloc(alloc, publication.AdmissionStatus{ .metadata_incarnation = admission.metadata_incarnation }, .{});
+    defer alloc.free(admission_bytes);
+    executor.body = admission_bytes;
+    const admission_status = try client.relationalIndexAdmissionStatus("http://metadata.invalid", admission, 25, null);
+    try std.testing.expect(!try admission_status.isAdmitted(admission));
+    executor.wrong_cluster = true;
+    try std.testing.expectError(error.MetadataIncarnationMismatch, client.relationalIndexAdmissionStatus("http://metadata.invalid", admission, 25, null));
+    executor.wrong_cluster = false;
+    executor.body = "{}";
     const decision_status = try client.readSystemCatalog("http://metadata.invalid", .{ .relational_index_publish_status = decision }, 25, null);
     defer decision_status.deinit(alloc);
     const decision_reply = try client.forwardSystemCatalogControlled("http://metadata.invalid", .{ .relational_index_publish_decide = decision }, .{ .remaining_ms = 25, .forwards_remaining = 2, .campaign_allowed = true }, false, null);
