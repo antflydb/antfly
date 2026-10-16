@@ -21,7 +21,8 @@ const A = std.mem.Allocator;
 
 fn writeJoined(a: A, value: *const arrays.Value, delimiter: []const u8, null_text: ?[]const u8, writer: *std.Io.Writer, byte_limit: usize, work: *arrays.Budget) !void {
     var emitted = false;
-    for (value.elements) |cell| {
+    for (0..value.cardinality()) |array_cell_0| {
+        const cell = value.flatCell(array_cell_0);
         try work.consume(1);
         if (cell.sql_null and null_text == null) continue;
         if (emitted) {

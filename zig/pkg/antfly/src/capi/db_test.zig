@@ -1951,6 +1951,33 @@ test "capi SQL array mutations retain native cells and returning provenance" {
     }
 }
 
+test "capi SQL relational search highlight values own captured text and match public JSON" {
+    const a = std.testing.allocator;
+    const sql = @import("antfly_local_sources").capi_sql;
+    var source = std.heap.ArenaAllocator.init(a);
+    var source_live = true;
+    defer if (source_live) source.deinit();
+    const input = source.allocator();
+    const spans = try input.dupe(db_mod.types.HighlightSpan, &.{.{ .start = 1, .end = 3 }});
+    const fragments = try input.alloc(db_mod.types.HighlightFragment, 2);
+    fragments[0] = .{ .text = try input.dupe(u8, "éclair"), .offset = 7, .spans = spans };
+    fragments[1] = .{ .text = try input.dupe(u8, "array"), .offset = 12, .item = 2, .spans = spans };
+    const fields = try input.alloc(db_mod.types.HighlightedField, 1);
+    fields[0] = .{ .field = try input.dupe(u8, "body"), .fragments = fragments };
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const expected_value = try antfly.public_api.query.highlightsJsonValue(arena.allocator(), fields);
+    const expected = try std.json.Stringify.valueAlloc(a, expected_value.?, .{});
+    defer a.free(expected);
+    const value = (try sql.highlightsValueLeaky(arena.allocator(), fields)).?;
+    source.deinit();
+    source_live = false;
+    const actual = try std.json.Stringify.valueAlloc(a, value, .{});
+    defer a.free(actual);
+    try std.testing.expectEqualStrings(expected, actual);
+    try std.testing.expect(value.object.get("body").?.array.items[0].object.get("item") == null);
+}
+
 test "capi SQL relational search preserves typed nulls and exact JSON numbers" {
     const alloc = std.testing.allocator;
     var directory = try TestDirectory.init("capi-sql-search-typed");
@@ -1958,36 +1985,68 @@ test "capi SQL relational search preserves typed nulls and exact JSON numbers" {
     var database = try db_mod.DB.open(alloc, directory.path(), .{ .start_optional_runtimes = false, .start_index_workers = false });
     defer database.close();
     try database.setSchemaJson(alloc,
-        \\{"version":1,"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"body":{"type":"string"},"payload":{"type":"json","nullable":true}},"additionalProperties":false}}}}
+        \\{"version":1,"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"body":{"type":"string"},"payload":{"type":"json","nullable":true},"a":{"type":["sql_array","null"],"x-antfly-sql-type":"int64"},"n":{"type":["number","null"],"x-antfly-sql-type":"numeric"}},"additionalProperties":false}}}}
     );
     try database.addIndex(.{ .name = "ft_v1", .kind = .full_text, .config_json = "{}" });
     const sql = @import("antfly_local_sources").capi_sql;
     var adapter = sql.Adapter(antfly){ .db = &database, .table_name = "rows" };
     var inserted = try sql.compiler.compile(alloc,
-        \\INSERT INTO rows(_id,body,payload) VALUES ('a','alpha',NULL),('b','alpha',CAST('null' AS JSONB)),('c','alpha',CAST('{"amount":9007199254740993.0,"fraction":0.123456789012345678901}' AS JSONB))
+        \\INSERT INTO rows(_id,body,payload,a,n) VALUES ('a','alpha',NULL,ARRAY[9007199254740993::bigint,NULL::bigint],1.2300::numeric),('b','alpha',CAST('null' AS JSONB),NULL,NULL),('c','alpha',CAST('{"amount":9007199254740993.0,"fraction":0.123456789012345678901}' AS JSONB),ARRAY[-7::bigint],9007199254740993.1200::numeric)
     , .{});
     defer inserted.deinit();
     var mutation = try sql.runtime.execute(alloc, adapter.backend(), &inserted, &.{}, .{});
     defer mutation.deinit();
     try database.runUntilIdle();
-    var scanned = try sql.compiler.compile(alloc, "SELECT _id,payload,payload IS NULL,payload->>'amount',payload->>'fraction' FROM rows ORDER BY _id", .{});
+    var scanned = try sql.compiler.compile(alloc, "SELECT _id,payload,payload IS NULL,payload->>'amount',payload->>'fraction',a,cardinality(a),n FROM rows ORDER BY _id", .{});
     defer scanned.deinit();
-    var baseline = try sql.runtime.execute(alloc, adapter.backend(), &scanned, &.{}, .{});
+    var baseline = try sql.runtime.execute(alloc, adapter.backend(), &scanned, &.{}, .{ .page_rows = 1 });
     defer baseline.deinit();
-    var searched = try sql.compiler.compile(alloc, "SELECT _id,payload,payload IS NULL,payload->>'amount',payload->>'fraction' FROM antfly_search('rows','body:alpha') ORDER BY _id", .{});
+    var searched = try sql.compiler.compile(alloc, "SELECT _id,payload,payload IS NULL,payload->>'amount',payload->>'fraction',a,cardinality(a),n FROM antfly_search('rows','body:alpha') ORDER BY _id", .{});
     defer searched.deinit();
-    var hits = try sql.runtime.execute(alloc, adapter.backend(), &searched, &.{}, .{});
-    defer hits.deinit();
-    try std.testing.expectEqual(@as(usize, 3), hits.output.rows.len);
-    const expected = try std.json.Stringify.valueAlloc(alloc, .{ .rows = baseline.output.rows, .nulls = baseline.output.sql_nulls }, .{});
-    defer alloc.free(expected);
-    const actual = try std.json.Stringify.valueAlloc(alloc, .{ .rows = hits.output.rows, .nulls = hits.output.sql_nulls }, .{});
-    defer alloc.free(actual);
-    try std.testing.expectEqualStrings(expected, actual);
-    try std.testing.expect(hits.output.rows[0][2].bool);
-    try std.testing.expect(!hits.output.rows[1][2].bool);
-    try std.testing.expectEqualStrings("9007199254740993", hits.output.rows[2][3].string);
-    try std.testing.expectEqualStrings("0.123456789012345678901", hits.output.rows[2][4].string);
+    for ([_]u32{ 1, 256 }) |page_rows| {
+        var hits = try sql.runtime.execute(alloc, adapter.backend(), &searched, &.{}, .{ .page_rows = page_rows });
+        defer hits.deinit();
+        try std.testing.expectEqual(@as(usize, 3), hits.output.rows.len);
+        const expected = try std.json.Stringify.valueAlloc(alloc, .{ .rows = baseline.output.rows, .nulls = baseline.output.sql_nulls }, .{});
+        defer alloc.free(expected);
+        const actual = try std.json.Stringify.valueAlloc(alloc, .{ .rows = hits.output.rows, .nulls = hits.output.sql_nulls }, .{});
+        defer alloc.free(actual);
+        try std.testing.expectEqualStrings(expected, actual);
+        try std.testing.expect(hits.output.rows[0][2].bool);
+        try std.testing.expect(!hits.output.rows[1][2].bool);
+        try std.testing.expect(hits.output.rows[0][5] == .object);
+        try std.testing.expectEqualStrings("2", hits.output.rows[0][6].string);
+        try std.testing.expectEqualStrings("9007199254740993.1200", hits.output.rows[2][7].string);
+        try std.testing.expectEqualStrings("9007199254740993", hits.output.rows[2][3].string);
+        try std.testing.expectEqualStrings("0.123456789012345678901", hits.output.rows[2][4].string);
+    }
+    // A delivered ranked page owns its identities, layouts and values after
+    // both the ranked cursor and its primary snapshot have been released.
+    var region = std.heap.ArenaAllocator.init(alloc);
+    defer region.deinit();
+    const a = region.allocator();
+    const backend = adapter.backend();
+    const relation = searched.statement.select.source.?.table;
+    const table = try backend.vtable.resolve(backend.ptr, a, relation.name, .read);
+    const request: @import("antfly_local_sources").sql_catalog.Scan.Search = .{ .expression = relation.search.?.*, .request_text = "body:alpha" };
+    const statement = try backend.vtable.open_statement.?(backend.ptr, alloc, &.{.{ .table = table, .request = .{ .fields = &.{ "a", "n", "payload" }, .search = &request, .limit = 1 } }});
+    var live = true;
+    defer if (live) statement.close(statement.ptr);
+    const cursor = statement.cursors[0];
+    const page = try cursor.next(cursor.ptr, alloc, 1);
+    defer page.deinit();
+    try std.testing.expectEqual(@as(usize, 1), page.rows.len);
+    const expected_id = try a.dupe(u8, page.rows[0].id);
+    const before = try page.rows[0].cell("a");
+    const expected_first: ?i64 = if (before.array) |array| array.flatCell(0).value.integer else null;
+    statement.close(statement.ptr);
+    live = false;
+    try std.testing.expectEqualStrings(expected_id, page.rows[0].id);
+    const after = try page.rows[0].cell("a");
+    if (expected_first) |value| {
+        try std.testing.expect(after.array.?.stored != null);
+        try std.testing.expectEqual(value, after.array.?.flatCell(0).value.integer);
+    } else try std.testing.expect(after.sql_null);
 }
 
 test "capi SQL uses native typed snapshots and atomic mutations" {

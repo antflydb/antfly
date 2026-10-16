@@ -218,9 +218,9 @@ pub const Collector = struct {
                 const array_result = if (plan.direct) |program| program.output_type.kind == .array else false;
                 const start = requests.items.len;
                 if (direct.array) |array| {
-                    if (array.elements.len > self.manager.array_limits.elements -| array_targets) return error.SqlProgramLimitExceeded;
-                    array_targets += array.elements.len;
-                    for (array.elements) |element| try requests.append(a, try request(plan.kind, element));
+                    if (array.cardinality() > self.manager.array_limits.elements -| array_targets) return error.SqlProgramLimitExceeded;
+                    array_targets += array.cardinality();
+                    for (0..array.cardinality()) |index| try requests.append(a, try request(plan.kind, array.flatCell(index)));
                 } else try requests.append(a, try request(plan.kind, direct));
                 try slots.append(a, .{ .aggregate = plan.aggregate_index, .start = start, .len = requests.items.len - start, .array = direct.array, .array_result = array_result });
             }
