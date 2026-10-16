@@ -564,6 +564,22 @@ retain streaming projection to bound activation storage; native packed FFNs
 consume interleaved gate/up rows directly with portable SIMD workers. Dense
 native GEMM output skips redundant zero initialization when beta is zero.
 
+Flat text arrays tokenize once and share length-sorted encoder calls, with at
+most four items, 8192 padded rows and 25% padding overhead. Results scatter to
+input order; admission pressure drains and splits a cohort before retrying.
+Explicit alternate pooling/projection configurations retain their own contract.
+Metal grouped GEMM tiles stop at disjoint item ranges and compute only each
+tile's visible key envelope; score storage uses that envelope's stride. CPU
+portable grouped attention shares packed K/V across bounded head workers, with
+sequential inner GEMMs. BLAS retains its own worker scheduler.
+Backbone head preparation reads packed projections directly and combines head
+RMSNorm, split-half RoPE and row gathering/compact-KV expansion. Gather indices,
+window ranges and aligned device visibility metadata are prepared once per
+forward call and retained until completion/cancellation. Vision FFNs share
+admitted packed gate/up weights and consume them directly on CPU/Metal without
+slice buffers. Image/video position lookups preserve typed table storage and
+gather the required rows instead of copying the full 60 MiB F32 position table.
+
 Embedding-only calls apply the final token RMSNorm, masked-mean pool hidden
 rows, then project once per item. Token-output callers retain the original
 per-token projection. The final bias-free linear commutes with masked mean;

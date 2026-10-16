@@ -297,12 +297,17 @@ const Visibility = struct {
     positions: []i32,
     key_positions: []i32,
     gather: []i64,
+    device_gather: ?CT = null,
+    global_metadata: ?CT = null,
+    window_metadata: ?CT = null,
+    windowed: ?[]u32 = null,
     allocator: std.mem.Allocator,
     fn deinit(self: Visibility) void {
         self.allocator.free(self.ranges);
         self.allocator.free(self.positions);
         self.allocator.free(self.key_positions);
         self.allocator.free(self.gather);
+        if (self.windowed) |ranges| self.allocator.free(ranges);
     }
 };
 
@@ -341,6 +346,18 @@ fn visibility(allocator: std.mem.Allocator, mask: []const i64, batch: usize, seq
         }
     }
     return .{ .ranges = ranges, .positions = positions, .key_positions = key_positions, .gather = gather, .allocator = allocator };
+}
+
+fn visibilityMetadata(cb: *const ComputeBackend, a: std.mem.Allocator, vis: Visibility, ranges: []const u32) !?CT {
+    const query_at = std.mem.alignForward(usize, ranges.len, 64);
+    const key_at = std.mem.alignForward(usize, query_at + vis.positions.len, 64);
+    const words = try a.alloc(i32, key_at + vis.key_positions.len);
+    defer a.free(words);
+    @memset(words, 0);
+    for (ranges, words[0..ranges.len]) |value, *dest| dest.* = @intCast(value);
+    @memcpy(words[query_at..][0..vis.positions.len], vis.positions);
+    @memcpy(words[key_at..], vis.key_positions);
+    return cb.fromInt32Shape(words, &.{@intCast(words.len)});
 }
 
 // Keys are position-sorted within each item's range. Restrict the work itself,
@@ -408,24 +425,26 @@ fn attention(cb: *const ComputeBackend, allocator: std.mem.Allocator, cfg: Confi
     const d = cfg.headDim(layer);
     const kv = cfg.kvHeads(layer);
     const heads = cfg.num_attention_heads;
-    const lengths = try allocator.alloc(usize, batch);
-    defer allocator.free(lengths);
-    @memset(lengths, seq);
-    const offsets = try allocator.alloc(usize, batch);
-    defer allocator.free(offsets);
-    @memset(offsets, 0);
-    const grouped = (cb.kind() == .native or (cb.kind() == .metal and rows >= 128)) and cb.vtable.segmentAttentionGrouped != null and !@import("antfly_platform").env.getenvBool("ANTFLY_EMBEDDINGGEMMA2_DISABLE_GROUPED_ATTENTION");
-    var identity = grouped and vis.gather.len == rows;
-    if (identity) for (vis.gather, 0..) |row, i| {
+    var row_identity = vis.gather.len == rows;
+    if (row_identity) for (vis.gather, 0..) |row, i| {
         if (row != i) {
-            identity = false;
+            row_identity = false;
             break;
         }
     };
+    const fused = cb.vtable.embeddingHeadPrepare != null and (row_identity or vis.device_gather != null);
+    const lengths = try allocator.alloc(usize, if (fused) 0 else batch);
+    defer allocator.free(lengths);
+    @memset(lengths, seq);
+    const offsets = try allocator.alloc(usize, if (fused) 0 else batch);
+    defer allocator.free(offsets);
+    @memset(offsets, 0);
+    const grouped = (cb.kind() == .native or (cb.kind() == .metal and rows >= 128)) and cb.vtable.segmentAttentionGrouped != null and !@import("antfly_platform").env.getenvBool("ANTFLY_EMBEDDINGGEMMA2_DISABLE_GROUPED_ATTENTION");
+    const identity = grouped and row_identity;
     const gathered_heads = if (grouped) kv else heads;
-    const ids = try allocator.alloc(i64, vis.gather.len * gathered_heads);
+    const ids = try allocator.alloc(i64, if (fused) 0 else vis.gather.len * gathered_heads);
     defer allocator.free(ids);
-    for (vis.gather, 0..) |row, i| for (0..gathered_heads) |head| {
+    if (!fused) for (vis.gather, 0..) |row, i| for (0..gathered_heads) |head| {
         ids[i * gathered_heads + head] = row * @as(i64, @intCast(kv)) + @as(i64, @intCast(if (grouped) head else head / (heads / kv)));
     };
     // Release each projection's producer temporaries before building the next.
@@ -439,6 +458,29 @@ fn attention(cb: *const ComputeBackend, allocator: std.mem.Allocator, cfg: Confi
     }, &.{ heads * d, kv * d, kv * d }, rows, cfg.hidden_size) else null;
     defer if (packed_rows) |tensor| cb.free(tensor);
     const q = blk: {
+        if (fused) {
+            const source = packed_rows orelse try linear(cb, layer, "self_attn.q_proj.weight", input, rows, cfg.hidden_size, heads * d);
+            defer if (packed_rows == null) cb.free(source);
+            const norm_weight = try weight(cb, layer, "self_attn.q_norm.weight");
+            defer cb.free(norm_weight);
+            break :blk try cb.vtable.embeddingHeadPrepare.?(cb.ptr, source, norm_weight, null, .{
+                .source_rows = @intCast(rows),
+                .rows = @intCast(rows),
+                .source_heads = @intCast(heads),
+                .heads = @intCast(heads),
+                .dim = @intCast(d),
+                .sequence = @intCast(seq),
+                .stride = @intCast(if (packed_rows != null) (heads + 2 * kv) * d else heads * d),
+                .start = 0,
+                .rotate = 1,
+                .gather = 0,
+                .weighted = 1,
+                .eps = cfg.rms_norm_eps,
+                .theta = cfg.theta(layer),
+                .scale = if (grouped) 1 else @sqrt(@as(f32, @floatFromInt(d))),
+            });
+        }
+
         var raw: ?CT = if (packed_rows) |tensor| try cb.sliceLastDim(tensor, 0, heads * d) else try linear(cb, layer, "self_attn.q_proj.weight", input, rows, cfg.hidden_size, heads * d);
         defer if (raw) |value| cb.free(value);
         var shaped: ?CT = try reshapeLastUse(cb, &raw, rows * heads, d);
@@ -453,6 +495,29 @@ fn attention(cb: *const ComputeBackend, allocator: std.mem.Allocator, cfg: Confi
     };
     defer cb.free(q);
     const kg = blk: {
+        if (fused) {
+            const source = packed_rows orelse try linear(cb, layer, "self_attn.k_proj.weight", input, rows, cfg.hidden_size, kv * d);
+            defer if (packed_rows == null) cb.free(source);
+            const norm_weight = try weight(cb, layer, "self_attn.k_norm.weight");
+            defer cb.free(norm_weight);
+            break :blk try cb.vtable.embeddingHeadPrepare.?(cb.ptr, source, norm_weight, if (row_identity) null else vis.device_gather, .{
+                .source_rows = @intCast(rows),
+                .rows = @intCast(vis.gather.len),
+                .source_heads = @intCast(kv),
+                .heads = @intCast(gathered_heads),
+                .dim = @intCast(d),
+                .sequence = @intCast(seq),
+                .stride = @intCast(if (packed_rows != null) (heads + 2 * kv) * d else kv * d),
+                .start = @intCast(if (packed_rows != null) heads * d else 0),
+                .rotate = 1,
+                .gather = @intFromBool(!row_identity),
+                .weighted = 1,
+                .eps = cfg.rms_norm_eps,
+                .theta = cfg.theta(layer),
+                .scale = 1,
+            });
+        }
+
         var raw: ?CT = if (packed_rows) |tensor| try cb.sliceLastDim(tensor, heads * d, (heads + kv) * d) else try linear(cb, layer, "self_attn.k_proj.weight", input, rows, cfg.hidden_size, kv * d);
         defer if (raw) |value| cb.free(value);
         var shaped: ?CT = try reshapeLastUse(cb, &raw, rows * kv, d);
@@ -466,6 +531,27 @@ fn attention(cb: *const ComputeBackend, allocator: std.mem.Allocator, cfg: Confi
     };
     defer cb.free(kg);
     const vg = blk: {
+        if (fused) {
+            const source = packed_rows orelse try linear(cb, layer, "self_attn.v_proj.weight", input, rows, cfg.hidden_size, kv * d);
+            defer if (packed_rows == null) cb.free(source);
+            break :blk try cb.vtable.embeddingHeadPrepare.?(cb.ptr, source, null, if (row_identity) null else vis.device_gather, .{
+                .source_rows = @intCast(rows),
+                .rows = @intCast(vis.gather.len),
+                .source_heads = @intCast(kv),
+                .heads = @intCast(gathered_heads),
+                .dim = @intCast(d),
+                .sequence = @intCast(seq),
+                .stride = @intCast(if (packed_rows != null) (heads + 2 * kv) * d else kv * d),
+                .start = @intCast(if (packed_rows != null) (heads + kv) * d else 0),
+                .rotate = 0,
+                .gather = @intFromBool(!row_identity),
+                .weighted = 0,
+                .eps = cfg.rms_norm_eps,
+                .theta = cfg.theta(layer),
+                .scale = 1,
+            });
+        }
+
         var raw: ?CT = if (packed_rows) |tensor| try cb.sliceLastDim(tensor, (heads + kv) * d, (heads + 2 * kv) * d) else try linear(cb, layer, "self_attn.v_proj.weight", input, rows, cfg.hidden_size, kv * d);
         defer if (raw) |value| cb.free(value);
         var shaped: ?CT = try reshapeLastUse(cb, &raw, rows * kv, d);
@@ -483,14 +569,14 @@ fn attention(cb: *const ComputeBackend, allocator: std.mem.Allocator, cfg: Confi
         break :blk try cb.embeddingLookup(gathered, ids, ids.len, d);
     };
     defer cb.free(vg);
-    const restricted = if (cfg.window(layer) != std.math.maxInt(u32)) try windowedRanges(allocator, vis, cfg.window(layer)) else null;
-    defer if (restricted) |ranges| allocator.free(ranges);
+    const restricted = if (cfg.window(layer) != std.math.maxInt(u32)) vis.windowed orelse try windowedRanges(allocator, vis, cfg.window(layer)) else null;
+    defer if (vis.windowed == null) if (restricted) |ranges| allocator.free(ranges);
     // windowedRanges already applies the exact position window, including
     // padding holes and batch isolation. Avoid repeating it for every score.
     const request = ops.SegmentAttention{ .ranges = restricted orelse vis.ranges, .query_positions = vis.positions, .key_positions = vis.key_positions, .window = std.math.maxInt(u32), .queries = rows, .keys = vis.gather.len, .num_heads = heads, .head_dim = d };
     const result = blk: {
         if (grouped) {
-            const grouped_request = ops.SegmentAttentionGrouped{ .visibility = request, .num_kv_heads = kv, .score_scale = 1.0, .control = cb.execution_control };
+            const grouped_request = ops.SegmentAttentionGrouped{ .visibility = request, .metadata = if (restricted != null) vis.window_metadata else vis.global_metadata, .num_kv_heads = kv, .score_scale = 1.0, .control = cb.execution_control };
             try cb.checkExecutionControl();
             if (try cb.vtable.segmentAttentionGrouped.?(cb.ptr, q, kg, vg, &grouped_request)) |result| break :blk result;
             // Unsupported device capability declines to the existing device
@@ -763,8 +849,25 @@ fn forwardEmbeddingsImpl(cb: *const ComputeBackend, allocator: std.mem.Allocator
     if (batch == 0 or seq == 0 or seq > max_tokens) return error.InvalidEmbeddingInputLength;
     const rows = std.math.mul(usize, batch, seq) catch return error.InvalidEmbeddingInputLength;
     if (mask.len != rows) return error.InvalidEmbeddingInputLength;
-    const vis = try visibility(allocator, mask, batch, seq);
+    var vis = try visibility(allocator, mask, batch, seq);
     defer vis.deinit();
+    vis.windowed = try windowedRanges(allocator, vis, cfg.sliding_window);
+    if (cb.vtable.embeddingHeadPrepare != null) {
+        const ids = try allocator.alloc(i32, vis.gather.len);
+        defer allocator.free(ids);
+        for (vis.gather, ids) |id, *dest| dest.* = @intCast(id);
+        vis.device_gather = (try cb.fromInt32Shape(ids, &.{@intCast(ids.len)})) orelse return error.EmbeddingGemma2OperationUnavailable;
+    }
+    defer if (vis.device_gather) |tensor| cb.free(tensor);
+    if (cb.kind() == .metal and rows >= 128) {
+        vis.global_metadata = try visibilityMetadata(cb, allocator, vis, vis.ranges);
+        vis.window_metadata = visibilityMetadata(cb, allocator, vis, vis.windowed.?) catch |err| {
+            if (vis.global_metadata) |tensor| cb.free(tensor);
+            return err;
+        };
+    }
+    defer if (vis.global_metadata) |tensor| cb.free(tensor);
+    defer if (vis.window_metadata) |tensor| cb.free(tensor);
     // Native BF16 weights are widened on acquisition. Keep this shared
     // projection alive through all layers instead of widening its entire
     // 24-layer matrix again for each layer's row slice.
@@ -1318,4 +1421,114 @@ test "embeddinggemma2 native pooled projection preserves masked token reference 
 }
 test "embeddinggemma2 Metal pooled projection stays resident across dimensions and independent items" {
     try @import("../ops/media_residency_test.zig").onMetal(@import("../ops/media_residency_test.zig").noWeights, checkPooledProjection);
+}
+
+fn checkPreparedHeadFusion(cb: ComputeBackend, _: ComputeBackend) !void {
+    const a = std.testing.allocator;
+    const op = cb.vtable.embeddingHeadPrepare orelse return error.SkipZigTest;
+    var data: [6 * 64]f32 = undefined;
+    var weights: [8]f32 = undefined;
+    for (&data, 0..) |*v, i| v.* = @sin(@as(f32, @floatFromInt(i)) * 0.17);
+    for (&weights, 0..) |*v, i| v.* = 0.7 + @as(f32, @floatFromInt(i)) * 0.1;
+    @memset(data[64..128], std.math.nan(f32));
+    @memset(data[256..320], std.math.nan(f32));
+    const input = try cb.fromFloat32Shape(&data, &.{ 6, 64 });
+    defer cb.free(input);
+    const weight_tensor = try cb.fromFloat32Shape(&weights, &.{8});
+    defer cb.free(weight_tensor);
+    const ids = [_]i32{ 0, 2, 3, 5 };
+    const gather = (try cb.fromInt32Shape(&ids, &.{4})).?;
+    defer cb.free(gather);
+    for ([_]u32{ 2, 4 }) |heads| for ([_]bool{ false, true }) |rotate| {
+        const p = ops.EmbeddingHeadParams{ .source_rows = 6, .rows = 4, .source_heads = 2, .heads = heads, .dim = 8, .sequence = 3, .stride = 64, .start = 7, .rotate = @intFromBool(rotate), .gather = 1, .weighted = @intFromBool(rotate), .eps = 1e-6, .theta = 10000, .scale = 0.75 };
+        var frame = if (cb.kind() == .metal) try cb.decoderRuntimeBeginFrame() else false;
+        defer if (frame) cb.decoderRuntimeCancelFrame() catch {};
+        const transfers = @import("../ops/media_residency_test.zig").Transfers.snapshot(cb);
+        const result = try op(cb.ptr, input, if (rotate) weight_tensor else null, gather, p);
+        defer cb.free(result);
+        if (frame) {
+            try cb.decoderRuntimeSubmitAndWaitFrame();
+            frame = false;
+        }
+        try transfers.expectUnchanged(cb);
+        const actual = try cb.toFloat32(result, a);
+        defer a.free(actual);
+        for (ids, 0..) |src_row, row| for (0..heads) |h| {
+            const source = data[@as(usize, @intCast(src_row)) * 64 + 7 + h / (heads / 2) * 8 ..][0..8];
+            var squares: f64 = 0;
+            for (source) |value| squares += @as(f64, value) * value;
+            const inv: f32 = @floatCast(1 / @sqrt(squares / 8 + 1e-6));
+            for (0..8) |d| {
+                var value = source[d] * inv;
+                if (rotate) {
+                    const left = d % 4;
+                    const angle = @as(f32, @floatFromInt(@mod(src_row, 3))) / std.math.pow(f32, p.theta, @as(f32, @floatFromInt(2 * left)) / 8);
+                    const x = source[left] * inv * weights[left];
+                    const y = source[left + 4] * inv * weights[left + 4];
+                    value = if (d < 4) x * @cos(angle) - y * @sin(angle) else x * @sin(angle) + y * @cos(angle);
+                }
+                try std.testing.expectApproxEqAbs(value * p.scale, actual[(row * heads + h) * 8 + d], 2e-6);
+            }
+        };
+    };
+}
+test "embeddinggemma2 native fused heads preserve strided slices masks rotary and compact expansion" {
+    try @import("../ops/media_residency_test.zig").onNative(@import("../ops/media_residency_test.zig").noWeights, checkPreparedHeadFusion);
+}
+test "embeddinggemma2 Metal fused heads preserve strided slices masks rotary without downloads" {
+    try @import("../ops/media_residency_test.zig").onMetal(@import("../ops/media_residency_test.zig").noWeights, checkPreparedHeadFusion);
+}
+
+fn checkGroupedRangeTiles(cb: ComputeBackend, reference: ComputeBackend) !void {
+    if (cb.kind() != .metal) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const count = 140;
+    for ([_]usize{ 256, 512 }) |dim| {
+        const heads = 4;
+        const kv = 1;
+        const q_data = try a.alloc(f32, count * heads * dim);
+        defer a.free(q_data);
+        const k_data = try a.alloc(f32, count * kv * dim);
+        defer a.free(k_data);
+        for (q_data, 0..) |*value, i| value.* = @sin(@as(f32, @floatFromInt(i)) * 0.17) * 0.1;
+        for (k_data, 0..) |*value, i| value.* = @cos(@as(f32, @floatFromInt(i)) * 0.13) * 0.1;
+        var ranges: [count * 6]u32 = @splat(0);
+        var positions: [count]i32 = undefined;
+        for (0..count) |i| {
+            ranges[i * 6] = @intCast(i / 35 * 35);
+            ranges[i * 6 + 1] = @intCast((i / 35 + 1) * 35);
+            positions[i] = @intCast(i % 35);
+        }
+        @memset(ranges[0..6], 0);
+        ranges[6..12].* = .{ 0, 3, 8, 19, 22, 35 };
+        const metadata = (try visibilityMetadata(&cb, a, .{ .ranges = &ranges, .positions = &positions, .key_positions = &positions, .gather = &.{}, .allocator = a }, &ranges)).?;
+        defer cb.free(metadata);
+        const request = ops.SegmentAttentionGrouped{ .visibility = .{ .ranges = &ranges, .query_positions = &positions, .key_positions = &positions, .queries = count, .keys = count, .num_heads = heads, .head_dim = dim, .window = 17 }, .metadata = metadata, .num_kv_heads = kv, .score_scale = 1 };
+        const q = try cb.fromFloat32Shape(q_data, &.{ count * heads, @intCast(dim) });
+        defer cb.free(q);
+        const k = try cb.fromFloat32Shape(k_data, &.{ count * kv, @intCast(dim) });
+        defer cb.free(k);
+        const rq = try reference.fromFloat32Shape(q_data, &.{ count * heads, @intCast(dim) });
+        defer reference.free(rq);
+        const rk = try reference.fromFloat32Shape(k_data, &.{ count * kv, @intCast(dim) });
+        defer reference.free(rk);
+        const expected = (try reference.vtable.segmentAttentionGrouped.?(reference.ptr, rq, rk, rk, &request)).?;
+        defer reference.free(expected);
+        var frame = try cb.decoderRuntimeBeginFrame();
+        defer if (frame) cb.decoderRuntimeCancelFrame() catch {};
+        const transfers = @import("../ops/media_residency_test.zig").Transfers.snapshot(cb);
+        const actual = (try cb.vtable.segmentAttentionGrouped.?(cb.ptr, q, k, k, &request)).?;
+        defer cb.free(actual);
+        try cb.decoderRuntimeSubmitAndWaitFrame();
+        frame = false;
+        try transfers.expectUnchanged(cb);
+        const x = try reference.toFloat32(expected, a);
+        defer a.free(x);
+        const y = try cb.toFloat32(actual, a);
+        defer a.free(y);
+        for (x, y) |xx, yy| try std.testing.expectApproxEqAbs(xx, yy, 1e-6);
+    }
+}
+test "embeddinggemma2 Metal disjoint grouped GEMM tiles preserve holes empty queries and window tails" {
+    try @import("../ops/media_residency_test.zig").onMetal(@import("../ops/media_residency_test.zig").noWeights, checkGroupedRangeTiles);
 }

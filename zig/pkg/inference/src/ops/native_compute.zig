@@ -3970,6 +3970,7 @@ fn convertTensorRowsToF32(
 fn shouldBorrowEmbeddingTensor(name: []const u8) bool {
     return std.mem.eql(u8, name, "model.embed_tokens.weight") or
         std.mem.eql(u8, name, "language_model.embed_tokens.weight") or
+        std.mem.eql(u8, name, "vision_tower.patch_embedder.position_embedding_table") or
         std.mem.eql(u8, name, "wte.weight");
 }
 
@@ -5040,6 +5041,7 @@ pub const vtable_impl = ComputeBackend.VTable{
     .rope = &ropeOp,
     .mrope = &mropeOp,
     .visionRope = &visionRopeOp,
+    .embeddingHeadPrepare = &embeddingHeadPrepareOp,
     .visionNormRope = &visionNormRopeOp,
     .ropePerItem = &ropePerItemOp,
     .gqaCausalAttention = &gqaCausalAttentionOp,
@@ -6135,11 +6137,12 @@ fn embeddingLookup(ctx: *anyopaque, weight: CT, ids: []const i64, total: usize, 
             try quant_codec.dequantizeRow(storage.tensor_type, storage.raw_bytes, dim, idx, out[i * dim .. (i + 1) * dim]);
         }
     } else if (weight_buf.source_tensor) |tensor| {
-        if (tensor.shape.len != 2) return error.InvalidTensorShape;
-        if (tensor.shape[0] <= 0 or tensor.shape[1] <= 0) return error.InvalidTensorShape;
-        const rows: usize = @intCast(tensor.shape[0]);
-        const cols: usize = @intCast(tensor.shape[1]);
-        if (cols != dim) return error.InvalidTensorShape;
+        if (dim == 0 or tensor.shape.len < 2 or tensor.shape[tensor.shape.len - 1] != dim) return error.InvalidTensorShape;
+        var rows: usize = 1;
+        for (tensor.shape[0 .. tensor.shape.len - 1]) |extent| {
+            if (extent <= 0) return error.InvalidTensorShape;
+            rows = try std.math.mul(usize, rows, @intCast(extent));
+        }
         switch (tensor.dtype) {
             .f32 => {
                 if (tensor.asFloat32IfAligned()) |src| {
@@ -35941,6 +35944,47 @@ fn reshape2dOp(ctx: *anyopaque, input: CT, rows: usize, cols: usize) anyerror!CT
     return try aliasDenseBufWithShape(self, input, &.{ @intCast(rows), @intCast(cols) });
 }
 
+fn embeddingHeadPrepareOp(ctx: *anyopaque, input: CT, weight: ?CT, gather: ?CT, p: ops.EmbeddingHeadParams) anyerror!CT {
+    const self: *NativeCompute = @ptrCast(@alignCast(ctx));
+    try p.validate();
+    if ((p.gather != 0) != (gather != null) or (p.weighted != 0) != (weight != null)) return error.InvalidTensorShape;
+    const source = try getDataChecked(input);
+    if (source.len != @as(usize, p.source_rows) * p.stride) return error.InvalidTensorShape;
+    const ids = if (gather) |g| try getDataChecked(g) else null;
+    if (ids) |values| if (values.len != p.rows) return error.InvalidTensorShape;
+    const weights = if (weight) |w| try getDataChecked(w) else null;
+    if (weights) |values| if (values.len != p.dim) return error.InvalidTensorShape;
+    const out = try self.allocator.alloc(f32, @as(usize, p.rows) * p.heads * p.dim);
+    var owns_raw = true;
+    errdefer if (owns_raw) self.allocator.free(out);
+    const positions = try self.allocator.alloc(usize, if (p.rotate != 0) @as(usize, p.rows) * p.heads else 0);
+    defer self.allocator.free(positions);
+    for (0..p.rows) |row| {
+        if (self.io) |io| try io.checkCancel();
+        const src_row = if (ids) |values| blk: {
+            const value = values[row];
+            if (!std.math.isFinite(value) or value < 0 or value >= @as(f32, @floatFromInt(p.source_rows)) or @trunc(value) != value) return error.InvalidTensorShape;
+            break :blk @as(usize, @intFromFloat(value));
+        } else row;
+        if (src_row >= p.source_rows) return error.InvalidTensorShape;
+        for (0..p.heads) |h| {
+            const src = src_row * p.stride + p.start + h / (p.heads / p.source_heads) * p.dim;
+            @memcpy(out[(row * p.heads + h) * p.dim ..][0..p.dim], source[src..][0..p.dim]);
+            if (p.rotate != 0) positions[row * p.heads + h] = src_row % p.sequence;
+        }
+    }
+    const ones: [512]f32 = @splat(1);
+    activations_mod.rmsNorm(out, weights orelse ones[0..p.dim], p.dim, p.eps);
+    if (p.rotate != 0) linalg.ropeCore(out, positions, p.dim, p.dim, p.theta, 1, false);
+    if (p.scale != 1) for (out) |*value| {
+        value.* *= p.scale;
+    };
+    const tensor = try self.makeBuf(out, true);
+    owns_raw = false;
+    errdefer freeTensor(self, tensor);
+    return self.withLogicalShape(tensor, &.{ @intCast(p.rows * p.heads), @intCast(p.dim) });
+}
+
 fn rmsNormOp(ctx: *anyopaque, input: CT, weight: CT, dim: usize, eps: f32) anyerror!CT {
     const self: *NativeCompute = @ptrCast(@alignCast(ctx));
     defer maybeDiscardMappedWeightAfterUse(self, weight);
@@ -41671,6 +41715,17 @@ fn segmentAttentionGroupedOp(ctx: *anyopaque, q: CT, k: CT, v: CT, request: *con
 }
 fn groupedAttentionForSession(comptime Gemm: type, self: *NativeCompute, q: CT, k: CT, v: CT, request: *const ops.SegmentAttentionGrouped) ![]f32 {
     const r = request.visibility;
+    // Portable head workers own parallelism. BLAS keeps its own GEMM scheduler.
+    const scratch = (r.queries * r.num_heads * r.head_dim * 3 + r.keys * request.num_kv_heads * r.head_dim * 2 + r.num_heads * 128 * 512) * @sizeOf(f32);
+    if (!native.useBlas() and self.io != null and r.queries >= 128 and r.num_heads <= 4 and scratch <= request.workspace_limit_bytes) {
+        const Portable = struct {
+            pub const query_block = 128;
+            pub const key_block = 512;
+            pub const sgemmSync = linalg.sgemmSequential;
+            pub const sgemmTransBSync = linalg.sgemmTransBSequential;
+        };
+        return linalg.segmentAttentionGroupedHostWithGemmParallelIo(Portable, self.allocator, self.io.?, try getDataChecked(q), try getDataChecked(k), try getDataChecked(v), r.ranges, r.query_positions, r.key_positions, r.window, r.queries, r.keys, r.num_heads, request.num_kv_heads, r.head_dim, request.score_scale);
+    }
     return linalg.segmentAttentionGroupedHostWithGemmIo(Gemm, self.allocator, self.io, try getDataChecked(q), try getDataChecked(k), try getDataChecked(v), r.ranges, r.query_positions, r.key_positions, r.window, r.queries, r.keys, r.num_heads, request.num_kv_heads, r.head_dim, request.score_scale);
 }
 
@@ -53283,4 +53338,119 @@ test "embeddinggemma2 sliced projection rows survive reshape producer release an
         }
     };
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Case.run, .{});
+}
+
+test "embeddinggemma2 typed position lookup flattens axes without full F32 mirrors and survives OOM" {
+    const Case = struct {
+        fn run(a: std.mem.Allocator) !void {
+            var bits = [_]u16{ 0x3f80, 0x4000, 0x4040, 0x4080, 0x40a0, 0x40c0, 0x40e0, 0x4100 };
+            const name = "vision_tower.patch_embedder.position_embedding_table";
+            var store = WeightStore{ .allocator = a, .resident_weights = .{}, .lazy_weights = .{} };
+            defer store.resident_weights.deinit(a);
+            try store.resident_weights.put(a, name, .{ .tensor = .{ .data = std.mem.sliceAsBytes(&bits), .shape = &.{ 2, 2, 2 }, .dtype = .bf16, .name = name, .allocator = a, .owns_data = false, .owns_shape = false } });
+            var compute = NativeCompute.init(a, &store, null);
+            defer compute.deinit();
+            compute.cache_embeddinggemma2_bf16_weights = true;
+            const cb = compute.computeBackend();
+            const table = try cb.getEmbeddingWeight(name);
+            defer cb.free(table);
+            try std.testing.expectEqual(@as(usize, 0), toBuf(table).data.len);
+            const rows = try cb.embeddingLookup(table, &.{ 3, 0, 2 }, 3, 2);
+            defer cb.free(rows);
+            try std.testing.expectEqualSlices(f32, &.{ 7, 8, 1, 2, 5, 6 }, try getDataChecked(rows));
+            try std.testing.expectEqual(@as(usize, 0), store.embeddinggemma2_f32_cache.count());
+            const invalid = cb.embeddingLookup(table, &.{4}, 1, 2) catch |err| switch (err) {
+                error.InvalidTensorShape => return,
+                else => return err,
+            };
+            cb.free(invalid);
+            return error.TestUnexpectedResult;
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Case.run, .{});
+}
+
+test "embeddinggemma2 fused head preparation drains OOM invalid shape cancellation and retry" {
+    const Case = struct {
+        fn run(a: std.mem.Allocator, io: std.Io) !void {
+            var store = WeightStore{ .allocator = a, .resident_weights = .{}, .lazy_weights = .{} };
+            var compute = NativeCompute.init(a, &store, null);
+            compute.io = io;
+            defer compute.deinit();
+            const cb = compute.computeBackend();
+            const input = try cb.fromFloat32Shape(&.{ 1, 2, 3, 4, 4, 3, 2, 1 }, &.{ 2, 4 });
+            defer cb.free(input);
+            const ids = (try cb.fromInt32Shape(&.{ 1, 0 }, &.{2})).?;
+            defer cb.free(ids);
+            const p = ops.EmbeddingHeadParams{ .source_rows = 2, .rows = 2, .source_heads = 1, .heads = 1, .dim = 4, .sequence = 2, .stride = 4, .start = 0, .rotate = 1, .gather = 1, .weighted = 0, .eps = 1e-6, .theta = 10000, .scale = 1 };
+            var bad = p;
+            bad.stride = 1;
+            try std.testing.expectError(error.InvalidTensorShape, embeddingHeadPrepareOp(&compute, input, null, ids, bad));
+            const result = try embeddingHeadPrepareOp(&compute, input, null, ids, p);
+            defer cb.free(result);
+            for (try getDataChecked(result)) |value| try std.testing.expect(std.math.isFinite(value));
+        }
+        fn cancel(_: ?*anyopaque) std.Io.Cancelable!void {
+            return error.Canceled;
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Case.run, .{std.testing.io});
+    var table = std.testing.io.vtable.*;
+    table.checkCancel = Case.cancel;
+    var io = std.testing.io;
+    io.vtable = &table;
+    try std.testing.expectError(error.Canceled, Case.run(std.testing.allocator, io));
+    try Case.run(std.testing.allocator, std.testing.io);
+}
+
+test "embeddinggemma2 grouped portable shared KV scheduling benchmark" {
+    if (!platform.env.getenvBool("ANTFLY_BENCH_GROUPED_ATTENTION")) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const Portable = struct {
+        pub const query_block = 128;
+        pub const key_block = 512;
+        pub const sgemmSync = linalg.sgemmSequential;
+        pub const sgemmTransBSync = linalg.sgemmTransBSequential;
+    };
+    for ([_][3]usize{ .{ 128, 256, 2 }, .{ 512, 256, 2 }, .{ 2048, 512, 1 } }) |shape| {
+        const rows = shape[0];
+        const dim = shape[1];
+        const kv = shape[2];
+        const q = try a.alloc(f32, rows * 4 * dim);
+        defer a.free(q);
+        const k = try a.alloc(f32, rows * kv * dim);
+        defer a.free(k);
+        for (q, 0..) |*value, i| value.* = @sin(@as(f32, @floatFromInt(i)) * 0.17) * 0.1;
+        for (k, 0..) |*value, i| value.* = @cos(@as(f32, @floatFromInt(i)) * 0.13) * 0.1;
+        const ranges = try a.alloc(u32, rows * 6);
+        defer a.free(ranges);
+        @memset(ranges, 0);
+        const positions = try a.alloc(i32, rows);
+        defer a.free(positions);
+        for (positions, 0..) |*position, row| {
+            position.* = @intCast(row);
+            ranges[row * 6] = @intCast(if (dim == 512) 0 else row -| 512);
+            ranges[row * 6 + 1] = @intCast(if (dim == 512) rows else @min(rows, row + 513));
+        }
+        var serial_ns: u64 = 0;
+        var workers_ns: u64 = 0;
+        for (0..4) |sample| {
+            const start = platform.time.monotonicNs();
+            const serial = if (rows >= 256 and (rows <= 512 or dim == 512))
+                try linalg.segmentAttentionGroupedHostWithGemmIo(native.EmbeddingGemma2SegmentAttentionGemm(1024), a, std.testing.io, q, k, k, ranges, positions, positions, std.math.maxInt(u32), rows, rows, 4, kv, dim, 1)
+            else
+                try linalg.segmentAttentionGroupedHostWithGemmIo(native.SegmentAttentionGemm, a, std.testing.io, q, k, k, ranges, positions, positions, std.math.maxInt(u32), rows, rows, 4, kv, dim, 1);
+            defer a.free(serial);
+            const middle = platform.time.monotonicNs();
+            const workers = try linalg.segmentAttentionGroupedHostWithGemmParallelIo(Portable, a, std.testing.io, q, k, k, ranges, positions, positions, std.math.maxInt(u32), rows, rows, 4, kv, dim, 1);
+            defer a.free(workers);
+            const end = platform.time.monotonicNs();
+            for (serial, workers) |x, y| try std.testing.expectApproxEqAbs(x, y, 1e-6);
+            if (sample != 0) {
+                serial_ns += middle - start;
+                workers_ns += end - middle;
+            }
+        }
+        std.debug.print("grouped-portable rows={d} dim={d} kv={d} serial_ns={d} workers_ns={d}\n", .{ rows, dim, kv, serial_ns / 3, workers_ns / 3 });
+    }
 }

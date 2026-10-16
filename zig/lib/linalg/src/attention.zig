@@ -760,6 +760,10 @@ pub fn segmentAttentionGroupedHostWithGemmIo(comptime Gemm: type, allocator: std
     return segmentAttentionHostWithGemmImpl(Gemm, allocator, io, false, Q, K, V, ranges, query_positions, key_positions, window, queries, keys, num_heads, head_dim, num_kv_heads, score_scale);
 }
 
+pub fn segmentAttentionGroupedHostWithGemmParallelIo(comptime Gemm: type, allocator: std.mem.Allocator, io: std.Io, Q: []const f32, K: []const f32, V: []const f32, ranges: []const u32, query_positions: []const i32, key_positions: []const i32, window: u32, queries: usize, keys: usize, num_heads: usize, num_kv_heads: usize, head_dim: usize, score_scale: f32) ![]f32 {
+    return segmentAttentionHostWithGemmImpl(Gemm, allocator, io, true, Q, K, V, ranges, query_positions, key_positions, window, queries, keys, num_heads, head_dim, num_kv_heads, score_scale);
+}
+
 fn segmentAttentionHostWithGemmImpl(
     comptime Gemm: type,
     allocator: std.mem.Allocator,
@@ -799,7 +803,8 @@ fn segmentAttentionHostWithGemmImpl(
     errdefer allocator.free(output);
     const qhs = try allocator.alloc(f32, queries * head_dim * lanes);
     defer allocator.free(qhs);
-    const khs = try allocator.alloc(f32, keys * head_dim * lanes);
+    const kv_lanes = if (parallel and io != null) num_kv_heads else 1;
+    const khs = try allocator.alloc(f32, keys * head_dim * kv_lanes);
     defer allocator.free(khs);
     const vhs = try allocator.alloc(f32, khs.len);
     defer allocator.free(vhs);
@@ -814,8 +819,18 @@ fn segmentAttentionHostWithGemmImpl(
         defer allocator.free(heads);
         const jobs = try allocator.alloc(pool.Job, num_heads);
         defer allocator.free(jobs);
+        // Pack each KV head once, then all query-head workers borrow it read-only.
+        for (0..num_kv_heads) |kh| {
+            try handle.checkCancel();
+            for (0..keys) |row| {
+                const dst = (kh * keys + row) * head_dim;
+                const src = row * KH + kh * head_dim;
+                @memcpy(khs[dst..][0..head_dim], K[src..][0..head_dim]);
+                @memcpy(vhs[dst..][0..head_dim], V[src..][0..head_dim]);
+            }
+        }
         for (heads, jobs, 0..) |*ctx, *job, h| {
-            ctx.* = .{ .io = io, .Q = Q, .K = K, .V = V, .ranges = ranges, .query_positions = query_positions, .key_positions = key_positions, .window = window, .queries = queries, .keys = keys, .head_dim = head_dim, .H = H, .KH = KH, .kv_h = h / (num_heads / num_kv_heads), .h = h, .scale = scale, .output = output, .qh = qhs[h * queries * head_dim ..][0 .. queries * head_dim], .kh = khs[h * keys * head_dim ..][0 .. keys * head_dim], .vh = vhs[h * keys * head_dim ..][0 .. keys * head_dim], .oh = ohs[h * queries * head_dim ..][0 .. queries * head_dim], .score_tile = scores[h * block_q * block_kv ..][0 .. block_q * block_kv] };
+            ctx.* = .{ .pack_kv = false, .io = io, .Q = Q, .K = K, .V = V, .ranges = ranges, .query_positions = query_positions, .key_positions = key_positions, .window = window, .queries = queries, .keys = keys, .head_dim = head_dim, .H = H, .KH = KH, .kv_h = h / (num_heads / num_kv_heads), .h = h, .scale = scale, .output = output, .qh = qhs[h * queries * head_dim ..][0 .. queries * head_dim], .kh = khs[(h / (num_heads / num_kv_heads)) * keys * head_dim ..][0 .. keys * head_dim], .vh = vhs[(h / (num_heads / num_kv_heads)) * keys * head_dim ..][0 .. keys * head_dim], .oh = ohs[h * queries * head_dim ..][0 .. queries * head_dim], .score_tile = scores[h * block_q * block_kv ..][0 .. block_q * block_kv] };
             job.* = .{ .fn_ptr = Head.run, .ctx = ctx };
         }
         try pool.dispatchJobsIo(handle, jobs);
@@ -3197,6 +3212,9 @@ test "embeddinggemma2 compact grouped attention preserves independent visibility
         ranges[6..12].* = .{ 0, 3, 8, 19, 22, seq };
         const compact = try segmentAttentionGroupedHostWithGemmIo(SegmentParallelTestGemm, a, std.testing.io, &q, k[0 .. batch * seq * kv * dim], v[0 .. batch * seq * kv * dim], &ranges, &positions, &positions, std.math.maxInt(u32), batch * seq, batch * seq, heads, kv, dim, 1 / @sqrt(@as(f32, dim)));
         defer a.free(compact);
+        const workers = try segmentAttentionGroupedHostWithGemmParallelIo(SegmentParallelTestGemm, a, std.testing.io, &q, k[0 .. batch * seq * kv * dim], v[0 .. batch * seq * kv * dim], &ranges, &positions, &positions, std.math.maxInt(u32), batch * seq, batch * seq, heads, kv, dim, 1 / @sqrt(@as(f32, dim)));
+        defer a.free(workers);
+        try std.testing.expectEqualSlices(f32, compact, workers);
         const expanded = try segmentAttentionHost(a, &q, &expanded_k, &expanded_v, &ranges, &positions, &positions, std.math.maxInt(u32), batch * seq, batch * seq, heads, dim);
         defer a.free(expanded);
         for (compact, expanded) |x, y| try std.testing.expectApproxEqAbs(x, y, 1e-6);
@@ -3324,6 +3342,34 @@ test "embeddinggemma2 portable dense scratch ownership survives allocation failu
             const output = try denseAttentionPortableHostWithIo(a, io, &input, &input, &input, 1, 3, 2, 3);
             defer a.free(output);
             for (output) |value| try std.testing.expectApproxEqAbs(@as(f32, 0.25), value, 1e-6);
+        }
+        fn cancel(_: ?*anyopaque) std.Io.Cancelable!void {
+            return error.Canceled;
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Case.run, .{std.testing.io});
+    var table = std.testing.io.vtable.*;
+    table.checkCancel = Case.cancel;
+    var io = std.testing.io;
+    io.vtable = &table;
+    try std.testing.expectError(error.Canceled, Case.run(std.testing.allocator, io));
+    try Case.run(std.testing.allocator, std.testing.io);
+}
+
+test "embeddinggemma2 grouped shared KV workers drain allocation failure and cancellation" {
+    const Case = struct {
+        fn run(a: std.mem.Allocator, io: std.Io) !void {
+            const q: [3 * 4 * 3]f32 = @splat(0.25);
+            const k: [3 * 3]f32 = @splat(0.25);
+            var ranges: [18]u32 = @splat(0);
+            for (0..3) |i| {
+                ranges[i * 6] = 0;
+                ranges[i * 6 + 1] = 3;
+            }
+            const positions = [_]i32{ 0, 1, 2 };
+            const result = try segmentAttentionGroupedHostWithGemmParallelIo(SegmentParallelTestGemm, a, io, &q, &k, &k, &ranges, &positions, &positions, std.math.maxInt(u32), 3, 3, 4, 1, 3, 1);
+            defer a.free(result);
+            for (result) |value| try std.testing.expectApproxEqAbs(@as(f32, 0.25), value, 1e-6);
         }
         fn cancel(_: ?*anyopaque) std.Io.Cancelable!void {
             return error.Canceled;

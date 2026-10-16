@@ -89,6 +89,8 @@ pub const SegmentAttention = struct {
 /// contract: a declined request uses the caller's existing expanded-head path.
 pub const SegmentAttentionGrouped = struct {
     visibility: SegmentAttention,
+    /// Request-owned i32 ranges/positions in the aligned device layout.
+    metadata: ?CT = null,
     num_kv_heads: usize,
     score_scale: f32,
     workspace_limit_bytes: usize = 256 * 1024 * 1024,
@@ -715,6 +717,28 @@ pub const DecoderRuntimeActivationKind = backend_contracts.DecoderRuntimeActivat
 /// query is scaled per head dim (`q_dim_scales`, `[head_dim]`) and keys by
 /// `k_scale`, logits are tanh-capped and masked keys take `invalid_value`.
 /// `valid` is a `[rows]` 0/1 float mask.
+/// Fused strided projection extraction, head RMSNorm, split-half RoPE and
+/// optional row gather/compact-KV expansion. Indices are request-owned i32.
+pub const EmbeddingHeadParams = extern struct {
+    source_rows: u32,
+    rows: u32,
+    source_heads: u32,
+    heads: u32,
+    dim: u32,
+    sequence: u32,
+    stride: u32,
+    start: u32,
+    rotate: u32,
+    gather: u32,
+    weighted: u32,
+    eps: f32,
+    theta: f32,
+    scale: f32,
+    pub fn validate(self: EmbeddingHeadParams) !void {
+        if (self.source_rows == 0 or self.rows == 0 or self.source_heads == 0 or self.heads == 0 or self.heads % self.source_heads != 0 or self.dim == 0 or self.dim > 512 or self.dim % 2 != 0 or self.sequence == 0 or self.rotate > 1 or self.gather > 1 or self.weighted > 1 or !std.math.isFinite(self.scale) or !std.math.isFinite(self.theta) or self.theta <= 0 or !std.math.isFinite(self.eps) or self.eps <= 0 or @as(usize, self.start) + @as(usize, self.source_heads) * self.dim > self.stride or (self.gather == 0 and self.rows > self.source_rows)) return error.InvalidTensorShape;
+    }
+};
+
 pub const VisionNormRopeParams = extern struct {
     rows: u32,
     hidden: u32,
@@ -2559,6 +2583,7 @@ pub const ComputeBackend = struct {
 
         /// Qwen3-VL vision RoPE. `positions` is axis-major [height][width].
         /// Each axis owns half of the rotary frequencies in every head.
+        embeddingHeadPrepare: ?*const fn (ctx: *anyopaque, input: CT, weight: ?CT, gather: ?CT, params: EmbeddingHeadParams) anyerror!CT = null,
         visionNormRope: ?*const fn (ctx: *anyopaque, input: CT, weight: CT, params: VisionNormRopeParams) anyerror!?CT = null,
         visionRope: ?*const fn (ctx: *anyopaque, input: CT, token_count: usize, head_dim: usize, theta: f32, positions: []const u32) anyerror!?CT = null,
 

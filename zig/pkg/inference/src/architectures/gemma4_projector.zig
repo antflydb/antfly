@@ -3639,7 +3639,18 @@ fn addPositionEmbeddingsInPlace(
     patch_embeddings: []f32,
     geometry: Geometry,
 ) !void {
-    _ = allocator;
+    if (store.gguf == null and cfg.embedding_gemma2_f32_attention) {
+        const table = try store.cb.getEmbeddingWeight("vision_tower.patch_embedder.position_embedding_table");
+        defer store.cb.free(table);
+        const source = try store.cb.fromFloat32Shape(patch_embeddings, &.{ @intCast(geometry.batches * geometry.grid_x * geometry.grid_y), @intCast(cfg.vision_hidden) });
+        defer store.cb.free(source);
+        const positioned = try addPositionEmbeddingsDevice(store.cb, allocator, source, table, cfg.vision_hidden, geometry);
+        defer store.cb.free(positioned);
+        const data = try store.cb.toFloat32(positioned, allocator);
+        defer allocator.free(data);
+        @memcpy(patch_embeddings, data);
+        return;
+    }
     var pos = try store.tensorF32("v.position_embd.weight");
     defer pos.deinit();
     const hidden_first = pos.shape.len == 3 and
@@ -4067,6 +4078,25 @@ fn feedForward(
     layer: usize,
     buf: *[128]u8,
 ) !CT {
+    if (cfg.embedding_gemma2_f32_attention and store.gguf == null) {
+        var names: [2][128]u8 = undefined;
+        if (try cb.linearPackedNamed(input, &.{
+            try std.fmt.bufPrint(&names[0], "vision_tower.encoder.layers.{d}.mlp.gate_proj.linear.weight", .{layer}),
+            try std.fmt.bufPrint(&names[1], "vision_tower.encoder.layers.{d}.mlp.up_proj.linear.weight", .{layer}),
+        }, &.{ cfg.intermediate_size, cfg.intermediate_size }, total, cfg.vision_hidden)) |packed_rows| {
+            defer cb.free(packed_rows);
+            const product = blk: {
+                if (cb.vtable.packedGeluMultiply) |op| if (try op(cb.ptr, packed_rows, total, cfg.intermediate_size)) |result| break :blk result;
+                const gate = try cb.sliceLastDim(packed_rows, 0, cfg.intermediate_size);
+                defer cb.free(gate);
+                const up = try cb.sliceLastDim(packed_rows, cfg.intermediate_size, cfg.intermediate_size * 2);
+                defer cb.free(up);
+                break :blk (try cb.activationMultiply(gate, up, .gelu)) orelse return error.UnsupportedResidentGemma4Vision;
+            };
+            defer cb.free(product);
+            return linearNoBiasMaybeClipped(cb, allocator, store, product, try fmt(buf, "v.blk.{d}.ffn_down", .{layer}), total, cfg.intermediate_size, cfg.vision_hidden);
+        }
+    }
     const gate = try linearNoBiasMaybeClipped(cb, allocator, store, input, try fmt(buf, "v.blk.{d}.ffn_gate", .{layer}), total, cfg.vision_hidden, cfg.intermediate_size);
     defer cb.free(gate);
 
@@ -4107,6 +4137,13 @@ fn addPositionEmbeddingsTensor(cb: *const ComputeBackend, allocator: std.mem.All
 }
 
 fn addPositionEmbeddingsBatchTensor(cb: *const ComputeBackend, allocator: std.mem.Allocator, store: *ProjectorWeights, cfg: Config, input: CT, geometry: Geometry, batch: usize) !CT {
+    if (cb.kind() == .metal and store.gguf == null and cfg.embedding_gemma2_f32_attention) {
+        const table = try store.weightCt("v.position_embd.weight");
+        defer cb.free(table);
+        var batched = geometry;
+        batched.batches = batch;
+        return addPositionEmbeddingsDevice(cb, allocator, input, table, cfg.vision_hidden, batched);
+    }
     const stride = geometry.grid_x * geometry.grid_y * cfg.vision_hidden;
     const positions = try allocator.alloc(f32, batch * stride);
     defer allocator.free(positions);

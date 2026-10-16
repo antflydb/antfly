@@ -133,6 +133,13 @@ def server(args, serial):
         "ANTFLY_GEMMA4_DISABLE_AUDIO_BROKER",
     ):
         env[flag] = "1" if serial else "0"
+    trace_dir = args.output.with_suffix(
+        ".serial.traces" if serial else ".cohort.traces"
+    )
+    trace_dir = trace_dir / str(time.time_ns())
+    trace_dir.mkdir(parents=True, exist_ok=True)
+    args.active_trace_dir = trace_dir
+    env["ANTFLY_EMBED_TRACE_DIR"] = str(trace_dir.resolve())
     with log_path.open("w") as log:
         process = subprocess.Popen(
             [
@@ -221,6 +228,15 @@ def qualify(args):
     )
     args.output.parent.mkdir(parents=True, exist_ok=True)
     compare.publish(args.output, report)
+    flat_texts = [
+        "Explain this event. " * 128,
+        "A red bicycle.",
+        "Describe this scene. " * 64,
+        "A blue car.",
+        "A green train.",
+        "A yellow bus.",
+    ]
+    flat_reference = []
     with server(args, True) as url:
         expected = {}
         identity = None
@@ -233,7 +249,31 @@ def qualify(args):
                 if result["model_identity"] != identity:
                     raise AssertionError("serial generation changed")
                 expected[name].append(vectors(result)[0])
+        for value in flat_texts:
+            with chunks.post(
+                url,
+                "embed",
+                {"model": args.model_dir.name, "input": [value], "dimensions": 128},
+            ) as response:
+                result = json.load(response)
+            if result["model_identity"] != identity:
+                raise AssertionError("flat text generation changed")
+            flat_reference.append(vectors(result)[0])
     with server(args, False) as url:
+        with chunks.post(
+            url,
+            "embed",
+            {"model": args.model_dir.name, "input": flat_texts, "dimensions": 128},
+        ) as response:
+            result = json.load(response)
+        if result["model_identity"] != identity:
+            raise AssertionError("flat text cohort generation changed")
+        actual = vectors(result)
+        if len(actual) != len(flat_reference):
+            raise AssertionError("flat text batch lost output rows")
+        report["flat_text"] = [
+            compare.assert_agreement(v, r, 1e-5) for v, r in zip(actual, flat_reference)
+        ]
         for name, batch in groups.items():
             samples = []
             for _ in range(args.iterations):
@@ -282,6 +322,24 @@ def qualify(args):
         compare.assert_agreement(successful[0], expected["mixed"][0], 1e-5)
         compare.assert_agreement(successful[2], expected["mixed"][1], 1e-5)
         report["mixed_partial_errors"] = len(result["errors"])
+    flat_traces = [
+        json.loads(path.read_text())
+        for path in args.active_trace_dir.glob("embed-*.json")
+    ]
+    shapes = [
+        shape
+        for trace in flat_traces
+        if trace.get("success") and trace.get("input") == flat_texts
+        for shape in trace["shapes"]
+    ]
+    if (
+        not shapes
+        or max(shape["items"] for shape in shapes) <= 1
+        or sum(shape["items"] for shape in shapes) != len(flat_texts)
+        or any(shape["padded_tokens"] > 8192 for shape in shapes)
+    ):
+        raise AssertionError("no bounded physical flat-text batching observed")
+    report["flat_text_encoder_shapes"] = shapes
     text = args.output.with_suffix(".cohort.log").read_text()
     trace = re.findall(r"gemma4-(group|audio)-cohort items=(\d+) execution=(\w+)", text)
     for expected_kind in ("group", "audio"):

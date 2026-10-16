@@ -3733,7 +3733,8 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
 
     fn nativeDenseLinearBytesForRuntime(self: *MetalCompute, name: []const u8, tensor: *const tensor_mod.Tensor) !?NativeDenseBytes {
         _ = self;
-        const eligible = (tensor.dtype == .bf16 or tensor.dtype == .f16) and tensor.shape.len == 2;
+        const position_table = std.mem.eql(u8, name, "vision_tower.patch_embedder.position_embedding_table") and tensor.shape.len == 3 and tensor.shape[0] == 2;
+        const eligible = (tensor.dtype == .bf16 or tensor.dtype == .f16) and (tensor.shape.len == 2 or position_table);
         if (getenvBool("TERMITE_METAL_TRACE_DENSE_LINEAR_PREPARE") and (eligible or tensor.shape.len == 2)) {
             std.debug.print(
                 "metal_dense_native_candidate: name={s} dtype={s} rank={d} bytes={d} eligible={}\n",
@@ -13624,7 +13625,8 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         defer v.deinit();
         var control = GroupedAttentionControl{ .control = request.control orelse .{} };
         try control.control.check();
-        const output = (metal_runtime.decoderRuntimeSegmentAttentionGroupedF32Device(self.provider_impl, q, k, v, request.*, &control, groupedAttentionCheck) catch |err| return control.failure orelse err) orelse return null;
+        const metadata = if (request.metadata) |tensor| try self.residentTrainingTensor(tensor, .i32, .{}) else null;
+        const output = (metal_runtime.decoderRuntimeSegmentAttentionGroupedF32Device(self.provider_impl, q, k, v, request.*, metadata, &control, groupedAttentionCheck) catch |err| return control.failure orelse err) orelse return null;
         return try self.ctFromOwnedMetalTensor(output);
     }
 
@@ -17156,6 +17158,25 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             .positions = positions,
             .sections = sections,
         })) orelse return null;
+        return self.ctFromOwnedMetalTensor(result);
+    }
+
+    fn embeddingHeadPrepareOp(ctx: *anyopaque, input: CT, weight: ?CT, gather: ?CT, p: ops.EmbeddingHeadParams) anyerror!CT {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        try p.validate();
+        if ((p.gather != 0) != (gather != null) or (p.weighted != 0) != (weight != null) or bufElemCount(toBuf(input)) != @as(usize, p.source_rows) * p.stride or (weight != null and bufElemCount(toBuf(weight.?)) != p.dim)) return error.InvalidTensorShape;
+        var x = try self.ownedDeviceMetalTensorFromCt(input);
+        defer x.deinit();
+        var w = if (weight) |tensor| try self.ownedDeviceMetalTensorFromCt(tensor) else try x.retainedCopy();
+        defer w.deinit();
+        var g = if (gather) |tensor| try self.residentTrainingTensor(tensor, .i32, .{}) else try x.retainedCopy();
+        // residentTrainingTensor borrows the source; retainedCopy owns the dummy.
+        defer if (gather == null) g.deinit();
+        if (gather) |tensor| {
+            const bounds = toBuf(tensor).resident_index_bounds orelse return error.InvalidTensorShape;
+            if (bounds.minimum < 0 or bounds.maximum >= p.source_rows or g.elemCount() != p.rows) return error.InvalidTensorShape;
+        }
+        const result = try metal_runtime.decoderRuntimeEmbeddingHeadPrepare(self.provider_impl, x, w, g, p);
         return self.ctFromOwnedMetalTensor(result);
     }
 
@@ -24455,6 +24476,15 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         var view = try tensor.retainedView(offset, bytes, shape);
         errdefer view.deinit();
         return self.ctFromOwnedMetalTensor(view);
+    }
+
+    fn packedGeluMultiplyOp(ctx: *anyopaque, input: CT, rows: usize, width: usize) anyerror!?CT {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        if (rows == 0 or width == 0 or bufElemCount(toBuf(input)) != rows * width * 2) return error.InvalidTensorShape;
+        var x = try self.ownedDeviceMetalTensorFromCt(input);
+        defer x.deinit();
+        const output = try metal_runtime.decoderRuntimePackedGeluMultiply(self.provider_impl, x, rows, width);
+        return try self.ctFromOwnedMetalTensor(output);
     }
 
     fn packedQkvRopeOp(ctx: *anyopaque, input: CT, positions: CT, hidden: usize, head_dim: usize, theta: f32) anyerror!?ops.SplitLastDim3Result {
@@ -33120,6 +33150,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         vt.rope = ropeOp;
         vt.mrope = mropeOp;
         vt.visionRope = visionRopeOp;
+        vt.embeddingHeadPrepare = embeddingHeadPrepareOp;
         vt.visionNormRope = visionNormRopeOp;
         vt.ropePerItem = ropePerItemOp;
         vt.gqaCausalAttention = gqaCausalAttentionOp;
@@ -33139,9 +33170,8 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         vt.runGatedDecoderBlock = runGatedDecoderBlockOp;
         vt.add = addOp;
         vt.multiply = multiplyOp;
-        // This native-only callback casts its context to NativeCompute. Metal
-        // keeps the bounded device slice/activation path for packed FFNs.
-        vt.packedGeluMultiply = null;
+        // Consume packed gate/up rows on device without separate slice buffers.
+        vt.packedGeluMultiply = packedGeluMultiplyOp;
         vt.activationMultiply = activationMultiplyOp;
         vt.debugTimingSnapshot = debugTimingSnapshotOp;
         vt.directFamilyTimingSnapshot = directFamilyTimingSnapshotOp;
@@ -43299,7 +43329,8 @@ test "embeddinggemma2 Metal variable packed snapshots preserve shared cache fram
             defer cb.decoderRuntimeCancelFrame() catch {};
             const result = (try cb.linearPackedNamed(input, &names, &widths, 1, 64)).?;
             defer cb.free(result);
-            try std.testing.expect(cb.vtable.packedGeluMultiply == null);
+            const packed_product = (try cb.vtable.packedGeluMultiply.?(cb.ptr, result, 1, 128)).?;
+            defer cb.free(packed_product);
             const gate = try cb.sliceLastDim(result, 0, 128);
             defer cb.free(gate);
             const up = try cb.sliceLastDim(result, 128, 256);
@@ -43314,6 +43345,9 @@ test "embeddinggemma2 Metal variable packed snapshots preserve shared cache fram
             const activated = try cb.toFloat32(product, a);
             defer a.free(activated);
             for (activated) |value| try std.testing.expectApproxEqAbs(@as(f32, 64), value, 1e-5);
+            const fused = try cb.toFloat32(packed_product, a);
+            defer a.free(fused);
+            try std.testing.expectEqualSlices(f32, activated, fused);
             try std.testing.expectEqual(@as(usize, 1), compute.provider_impl.embeddinggemma2_linear_cache.count());
         }
     }

@@ -249,6 +249,22 @@ group and normalizes compact vectors. Metal retains the batch through one final
 readback. Packed model-owned projections share existing bounded cache classes;
 audio packing preserves independently declared clipping bounds.
 
+Flat text arrays tokenize once and share length-sorted encoder calls, with at
+most four items, 8192 padded rows and 25% padding overhead. Results scatter to
+input order; admission pressure drains and splits a cohort before retrying.
+Explicit alternate pooling/projection configurations retain their own contract.
+Metal grouped GEMM tiles stop at disjoint item ranges and compute only each
+tile's visible key envelope; score storage uses that envelope's stride. CPU
+portable grouped attention shares packed K/V across bounded head workers, with
+sequential inner GEMMs. BLAS retains its own worker scheduler.
+Backbone head preparation reads packed projections directly and combines head
+RMSNorm, split-half RoPE and row gathering/compact-KV expansion. Gather indices,
+window ranges and aligned device visibility metadata are prepared once per
+forward call and retained until completion/cancellation. Vision FFNs share
+admitted packed gate/up weights and consume them directly on CPU/Metal without
+slice buffers. Image/video position lookups preserve typed table storage and
+gather the required rows instead of copying the full 60 MiB F32 position table.
+
 Descriptors, model identity, gaps and terminal coverage travel with the vectors.
 Overview sampling remains distinct from retrieval coverage; audio inclusion stays
 opt-in. See the design for source references, admission bounds and qualification.
