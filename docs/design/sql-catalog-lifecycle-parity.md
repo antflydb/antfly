@@ -9554,3 +9554,69 @@ Inventory and Apache-boundary audits pass in
 `/private/tmp/antfly-sql-integer-avg-inventory.log` and
 `/private/tmp/antfly-sql-integer-avg-apache.log`; staged license headers, scoped
 Python checks and Zig formatting also pass. Unrelated edits remain unstaged.
+
+### Captured ranked frontiers and demand-driven SQL projection
+
+The shared native search cursor now owns the ranked frontier and, for relational
+tables, the primary reader captured under the same statement fences. Iteration
+hydrates only the demanded page, checks captured primary membership even for
+ID-only reads, and retains SQL-null provenance separately from JSONB null. Page
+layouts, identities and selected values survive cursor closure. Failed page
+allocations or later-row failures do not advance the frontier. Cursor closure
+releases the primary snapshot, authorization lease and native result exactly
+once; no apply fence remains held during user iteration.
+
+Lite/C preparation narrows native stored-field projection to the physical fields
+SQL demands and disables unselected highlighting after validating the complete
+original request. Relational ranking no longer eagerly hydrates redundant JSON
+documents: its native reader projects typed values into the consumer page.
+Document ranking still captures projected source packets under the native lease;
+the cursor defers packet materialization and selected-cell ownership, not the
+underlying document capture. This is not yet a deferred document point-reader.
+Table identity, schema version and storage mode are revalidated during capture.
+Native page-owned relational payloads avoid a second selected-cell deep copy;
+borrowed document/vector payloads still receive owned copies.
+
+Four shared Debug regressions cover prefix demand, alias projection, exact
+NUMERIC scale, JSONB/SQL nulls, metadata-only iteration, ownership after close,
+atomic failed pages and exhaustive initialization/hydration allocation faults.
+The full Debug SQL gate passes 866 core and 234 extracted tests, with four opt-in
+skips, zero failures/leaks and 21/21 successful steps in
+`/private/tmp/antfly-sql-search-cursor-full-debug.log`. The focused gate including
+the opt-in benchmark passes all five tests in
+`/private/tmp/antfly-sql-search-cursor-owned-focused-debug.log`.
+
+The benchmark isolates hydration over a preallocated 10,000-hit frontier with
+512-byte selected text and two logical aliases. For demands of 1, 128 and 10,000
+rows, primary lookups are respectively 1, 128 and 10,000; peak owned bytes are
+6,844, 310,728 and 38,091,222. Ranking, I/O and frontier allocation are excluded:
+these measurements establish prefix-proportional hydration, not an end-to-end
+query speedup. The checked-in PostgreSQL projection oracle additionally verifies
+SQL NULL versus JSONB null and exact JSONB numeric display scale, including the
+retained `.0` in `9007199254740993.0`; it does not qualify search/ranking cases.
+
+This batch does not change original-case dispositions: 526 implemented / 132
+rejected / 113 superseded / 815 unresolved. The named Antfly search functions,
+graph node/path/metric row families, server/distributed search activation,
+index/model-generation preparation guards and stronger transaction-isolation
+search protections remain incomplete. Their implementation must reuse captured
+native search/primary cuts and typed runtime argument frames, not execute an
+ordinary query API followed by fresh primary lookups. The query-request parsing
+pipeline also remains multipass.
+
+The final native Debug CAPI gate passes all 20 selected SQL tests (3 local and
+17 server-owned), with zero skips/failures/leaks and 58/58 successful build steps
+in `/private/tmp/antfly-sql-search-cursor-native-owned-cache-debug.log`.
+It proves captured primary visibility after a real committed write, writer
+admission during cursor lifetime, page ownership after close, table identity
+and mode guards, document projections and exact relational null/number cells.
+A missing shared `libcompiler_rt.a` prevented the first final-refinement rerun
+from reaching compilation. The successful rerun used a worktree-owned global
+compiler cache via `ZIG_GLOBAL_CACHE_DIR`, without deleting or repairing shared
+cache entries. The temporary compiler cache was removed after validation.
+The PostgreSQL oracle, inventory and Apache-boundary audits pass in
+`/private/tmp/antfly-sql-search-cursor-final-oracle.log`,
+`/private/tmp/antfly-sql-search-cursor-inventory.log` and
+`/private/tmp/antfly-sql-search-cursor-final-apache.log`. Staged license headers,
+scoped Python checks, Zig formatting and diff whitespace checks also pass.
+Unrelated changes remain unstaged; this checkpoint is local and unpushed.

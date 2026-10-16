@@ -398,17 +398,19 @@ pub fn Adapter(comptime native: type) type {
             const deadline = std.Io.Clock.awake.now(io).addDuration(.fromSeconds(5));
             var search_arena = std.heap.ArenaAllocator.init(alloc);
             defer search_arena.deinit();
-            const prepared = try search_arena.allocator().alloc(?native.public_api.query.OwnedQueryRequest, requests.len);
+            const prepared = try search_arena.allocator().alloc(?PreparedSearch, requests.len);
             @memset(prepared, null);
             defer for (prepared) |*request| if (request.*) |*owned| owned.deinit(search_arena.allocator());
             for (requests, prepared) |request, *out| if (request.request.search) |search| {
                 var selected_adapter = try self.selected(request.table.physical_name);
-                out.* = try selected_adapter.prepareSearch(search_arena.allocator(), search);
+                if (selected_adapter.db.core.identity_namespace.table_id != request.table.id) return error.PreparedGenerationChanged;
+                out.* = try selected_adapter.prepareSearch(search_arena.allocator(), search, request.table, request.request.fields);
             };
             var owners: [64]*DB = undefined;
             var owner_count: usize = 0;
             for (requests) |request| {
                 const selected_adapter = try self.selected(request.table.physical_name);
+                if (selected_adapter.db.core.identity_namespace.table_id != request.table.id) return error.PreparedGenerationChanged;
                 const exists = for (owners[0..owner_count]) |db| {
                     if (db == selected_adapter.db) break true;
                 } else false;
@@ -443,7 +445,7 @@ pub fn Adapter(comptime native: type) type {
             for (requests, prepared, cursors) |request, *search, *cursor| {
                 if (search.*) |*owned| {
                     var selected_adapter = try self.selected(request.table.physical_name);
-                    cursor.* = try selected_adapter.openSearch(alloc, request.table, request.request, owned.req);
+                    cursor.* = try selected_adapter.openSearch(alloc, request.table, request.request, owned.*);
                 } else cursor.* = (try open(ptr, alloc, request.table, request.request)) orelse return error.SqlStatementSnapshotRequired;
                 initialized += 1;
             }
@@ -471,7 +473,17 @@ pub fn Adapter(comptime native: type) type {
             }
         };
 
-        fn prepareSearch(self: *Self, alloc: std.mem.Allocator, search: anytype) !native.public_api.query.OwnedQueryRequest {
+        const PreparedSearch = struct {
+            query: native.public_api.query.OwnedQueryRequest,
+            fields: []const []const u8,
+            highlights: bool,
+            fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+                self.query.deinit(alloc);
+                alloc.free(self.fields);
+            }
+        };
+
+        fn prepareSearch(self: *Self, alloc: std.mem.Allocator, search: anytype, table: catalog.Table, projection: []const []const u8) !PreparedSearch {
             if (self.transaction) |session| if (session.active) {
                 for (session.entries.items) |entry| if (std.mem.eql(u8, entry.table.physical_name, self.table_name)) return error.SqlSearchUncommittedWrites;
             };
@@ -486,81 +498,64 @@ pub fn Adapter(comptime native: type) type {
             var owned = native.public_api.query.parsePublicQueryRequest(alloc, .{ .ptr = &resolver, .vtable = &.{ .resolve_dense_query = SemanticResolver.resolveDense } }, self.table_name, canonical) catch |err| return if (native.public_api.query.isPublicQueryValidationError(err)) error.InvalidSqlParameters else err;
             errdefer owned.deinit(alloc);
             if (owned.req.limit == 0 or owned.req.limit > 10000) return error.SqlProgramLimitExceeded;
-            owned.req.include_stored = true;
-            owned.req.fields = &.{};
-            owned.req.include_all_fields = true;
-            return owned;
+            const fields = try dependencies.sql_search_cursor.storageFields(alloc, projection);
+            owned.req.include_stored = table.storage_mode == .document;
+            owned.req.fields = if (fields.len == 0) &.{"_id"} else fields;
+            owned.req.include_all_fields = false;
+            const highlights = for (projection) |field| {
+                if (std.mem.eql(u8, field, "_highlights")) break true;
+            } else false;
+            return .{ .query = owned, .fields = fields, .highlights = highlights };
         }
 
-        const SearchCursor = struct {
-            alloc: std.mem.Allocator,
-            arena: std.heap.ArenaAllocator,
-            rows: []catalog.Row,
-            position: usize = 0,
-            fn next(ptr: *anyopaque, alloc: std.mem.Allocator, limit: u32) !catalog.Page {
-                const self: *@This() = @ptrCast(@alignCast(ptr));
-                const end = @min(self.rows.len, self.position + limit);
-                const rows = self.rows[self.position..end];
-                self.position = end;
-                return .{ .rows = rows, .after = if (end < self.rows.len) try std.fmt.allocPrint(alloc, "{d}", .{end}) else null };
+        const SearchProvider = struct {
+            pub const Reader = DB.RelationalRows.Reader;
+            // lookupTypedRow's projectSqlTypedAlloc contract owns every
+            // selected payload in the supplied page allocator.
+            pub const typed_page_owned = true;
+            pub const Result = types.SearchResult;
+            pub const Lease = @FieldType(DB.QueryReadLease, "row_policy_lease");
+            pub fn hasSource(hit: types.SearchHit) bool {
+                return hit.source_value != null or hit.stored_data != null or hit.column_source != null;
             }
-            fn close(ptr: *anyopaque) void {
-                const self: *@This() = @ptrCast(@alignCast(ptr));
-                self.arena.deinit();
-                self.alloc.destroy(self);
+            pub fn document(arena: *std.heap.ArenaAllocator, hit: types.SearchHit) !std.json.Value {
+                if (hit.source_value) |value| return value;
+                if (hit.column_source) |source| return source.value(arena);
+                if (hit.stored_data) |data| return std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), data, .{ .parse_numbers = false });
+                return error.InvalidSqlBackendResponse;
+            }
+            pub fn highlights(a: std.mem.Allocator, hit: types.SearchHit) !?std.json.Value {
+                const value = (try native.public_api.query.highlightsJsonValue(a, hit.highlights)) orelse return null;
+                const encoded = try std.json.Stringify.valueAlloc(a, value, .{});
+                return try std.json.parseFromSliceLeaky(std.json.Value, a, encoded, .{ .parse_numbers = false });
             }
         };
+        const SearchCursor = dependencies.sql_search_cursor.Cursor(SearchProvider);
 
-        fn openSearch(self: *Self, alloc: std.mem.Allocator, table: catalog.Table, request: catalog.Scan, search: types.SearchRequest) !catalog.Cursor {
+        fn openSearch(self: *Self, alloc: std.mem.Allocator, table: catalog.Table, request: catalog.Scan, prepared: PreparedSearch) !catalog.Cursor {
             // Statement capture fences already exclude primary mutation on
             // every participating table. The native lease also fences search
-            // index/schema access while ranking and hydrating these hits.
+            // index/schema access while ranking and capturing the primary cut.
             var lease = try self.db.beginQueryReadLease();
             defer lease.release();
             var view = self.db.core.acquireSchemaView() orelse return error.PreparedGenerationChanged;
             defer view.release();
-            if (view.version() != table.schema_version) return error.PreparedGenerationChanged;
+            if (self.db.core.identity_namespace.table_id != table.id or view.version() != table.schema_version or
+                (view.storageMode() == .relational) != (table.storage_mode == .relational)) return error.PreparedGenerationChanged;
+            var search = prepared.query.req;
+            // Validation precedes capture, including unused presentation
+            // options. Do not compute highlights SQL never demands.
+            if (!prepared.highlights) search.highlight = null;
             var captured = try lease.search(alloc, search);
-            defer captured.result.deinit();
-            const cursor = try alloc.create(SearchCursor);
-            errdefer alloc.destroy(cursor);
-            var arena = std.heap.ArenaAllocator.init(alloc);
-            errdefer arena.deinit();
-            const a = arena.allocator();
-            const rows = try a.alloc(catalog.Row, captured.result.hits.len);
-            var fields: std.ArrayList([]const u8) = .empty;
-            for (request.fields) |field| if (!std.mem.eql(u8, field, "_id") and !std.mem.eql(u8, field, "score") and !std.mem.eql(u8, field, "_highlights")) {
-                try fields.append(a, field);
-            };
+            errdefer captured.result.deinit();
             var typed_reader: ?DB.RelationalRows.Reader = if (table.storage_mode == .relational)
-                try lease.relationalRows(alloc, fields.items, table.schema_version)
+                try lease.relationalRows(alloc, prepared.fields, table.schema_version)
             else
                 null;
-            defer if (typed_reader) |*reader| reader.deinit();
-            for (captured.result.hits, rows) |hit, *out| {
-                const typed = if (typed_reader) |*reader| (try reader.lookupTypedRow(a, hit.id)) orelse return error.SqlStatementReadUnavailable else null;
-                var document = if (typed) |row| row.typed orelse return error.InvalidSqlBackendResponse else if (hit.source_value) |value| try types.cloneJsonValue(a, value) else if (hit.stored_data) |data| try std.json.parseFromSliceLeaky(std.json.Value, a, data, .{ .parse_numbers = false }) else return error.InvalidSqlBackendResponse;
-                if (document != .object) return error.InvalidSqlBackendResponse;
-                try document.object.put(a, "score", if (hit.score) |score| .{ .float = score } else .null);
-                if (try native.public_api.query.highlightsJsonValue(a, hit.highlights)) |highlights| {
-                    const encoded = try std.json.Stringify.valueAlloc(a, highlights, .{});
-                    try document.object.put(a, "_highlights", try std.json.parseFromSliceLeaky(std.json.Value, a, encoded, .{ .parse_numbers = false }));
-                } else _ = document.object.swapRemove("_highlights");
-                if (typed) |row| {
-                    // Native typed cells are already projected and owned. Add
-                    // only search metadata, keeping their SQL-null bitmap.
-                    var projected: std.json.ObjectMap = .empty;
-                    const nulls = try a.alloc(bool, request.fields.len);
-                    for (request.fields) |field| {
-                        if (std.mem.eql(u8, field, "_id")) continue;
-                        try projected.put(a, field, document.object.get(field) orelse .null);
-                        nulls[projected.count() - 1] = if (std.mem.eql(u8, field, "score")) hit.score == null else if (std.mem.eql(u8, field, "_highlights")) !document.object.contains("_highlights") else if (document.object.getIndex(field)) |index| row.sql_nulls.?[index] else true;
-                    }
-                    out.* = .{ .id = row.key, .version = row.version, .value = .{ .object = projected }, .sql_nulls = nulls[0..projected.count()] };
-                } else out.* = try dependencies.sql_document_row.projectValue(a, table, hit.id, 0, document, request.fields);
-            }
-            cursor.* = .{ .alloc = alloc, .arena = arena, .rows = rows };
-            return .{ .ptr = cursor, .next = SearchCursor.next, .close = SearchCursor.close };
+            errdefer if (typed_reader) |*reader| reader.deinit();
+            var policy: ?SearchProvider.Lease = if (typed_reader == null) lease.row_policy_lease.clone() else null;
+            errdefer if (policy) |*held| held.release();
+            return (try SearchCursor.init(alloc, table, request.fields, captured.result, typed_reader, policy)).iface();
         }
 
         fn resolve(ptr: *anyopaque, alloc: std.mem.Allocator, name: ast.Name, action: catalog.Action) !catalog.Table {

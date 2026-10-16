@@ -2917,6 +2917,92 @@ test "capi SQL array mutations retain native cells and returning provenance" {
     }
 }
 
+test "capi SQL ranked cursor releases writers and hydrates the captured primary cut" {
+    const a = std.testing.allocator;
+    var directory = try TestDirectory.init("capi-sql-search-captured");
+    defer directory.cleanup();
+    var database = try db_mod.DB.open(a, directory.path(), .{ .start_optional_runtimes = false, .start_index_workers = false });
+    defer database.close();
+    try database.setSchemaJson(a,
+        \\{"version":1,"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"body":{"type":"string"},"payload":{"type":"json"}},"additionalProperties":false}}}}
+    );
+    try database.addIndex(.{ .name = "ft_v1", .kind = .full_text, .config_json = "{}" });
+    try database.batch(.{ .writes = &.{.{ .key = "a", .value = "{\"body\":\"alpha\",\"payload\":{\"state\":\"before\"}}" }}, .timestamp_ns = 42 });
+    try database.runUntilIdle();
+    const local = @import("antfly_local_sources");
+    const sql = local.capi_sql;
+    var adapter = sql.Adapter(antfly){ .db = &database, .table_name = "rows" };
+    const backend = adapter.backend();
+    var compiled = try sql.compiler.compile(a, "SELECT _id,payload FROM antfly_search('rows','body:alpha',100)", .{});
+    defer compiled.deinit();
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const binding = try local.sql_describe.bind(arena.allocator(), backend, &compiled, &.{});
+    const scans = try local.sql_relation_runtime.bindSearchScans(arena.allocator(), binding.relation.?.scans, &.{});
+    var replaced = scans[0];
+    replaced.table.id ^= 1;
+    try std.testing.expectError(error.PreparedGenerationChanged, backend.vtable.open_statement.?(backend.ptr, a, &.{replaced}));
+    replaced = scans[0];
+    replaced.table.storage_mode = .document;
+    try std.testing.expectError(error.PreparedGenerationChanged, backend.vtable.open_statement.?(backend.ptr, a, &.{replaced}));
+    const captured = try backend.vtable.open_statement.?(backend.ptr, a, scans);
+    var open = true;
+    defer if (open) captured.close(captured.ptr);
+    try std.testing.expectEqual(@as(usize, 1), captured.cursors.len);
+    // Prove writer admission without a blocking write on a leaked read fence.
+    try std.testing.expect(database.core.tryLockApplyExclusive());
+    database.core.unlockApplyExclusive();
+    try database.batch(.{ .writes = &.{.{ .key = "a", .value = "{\"body\":\"beta\",\"payload\":{\"state\":\"after\"}}" }}, .timestamp_ns = 43 });
+    var current = (try database.lookup(a, "a", .{})).?;
+    defer current.deinit(a);
+    try std.testing.expect(std.mem.indexOf(u8, current.json, "after") != null);
+    var page = try captured.cursors[0].next(captured.cursors[0].ptr, a, 1);
+    defer page.deinit();
+    try std.testing.expectEqual(@as(usize, 1), page.rows.len);
+    try std.testing.expectEqualStrings("before", (try page.rows[0].cell("payload")).value.object.get("state").?.string);
+    captured.close(captured.ptr);
+    open = false;
+    try std.testing.expectEqualStrings("a", page.rows[0].id);
+    try std.testing.expectEqualStrings("before", (try page.rows[0].cell("payload")).value.object.get("state").?.string);
+}
+
+test "capi SQL document ranked projections retain JSON null metadata and highlights" {
+    const a = std.testing.allocator;
+    var directory = try TestDirectory.init("capi-sql-search-document-projection");
+    defer directory.cleanup();
+    var database = try db_mod.DB.open(a, directory.path(), .{ .start_optional_runtimes = false, .start_index_workers = false });
+    defer database.close();
+    try database.setSchemaJson(a,
+        \\{"version":1,"storage_mode":"document","default_type":"doc","document_schemas":{"doc":{"schema":{"type":"object","properties":{"body":{"type":"text"},"payload":{"type":"object","nullable":true,"additionalProperties":true},"cold":{"type":"string"}},"additionalProperties":true}}}}
+    );
+    try database.addIndex(.{ .name = "ft_v1", .kind = .full_text, .config_json = "{}" });
+    try database.batch(.{ .writes = &.{.{ .key = "a", .value = "{\"body\":\"alpha\",\"payload\":null,\"cold\":\"unused\",\"_highlights\":null,\"score\":999}" }}, .timestamp_ns = 42 });
+    try database.runUntilIdle();
+    const sql = @import("antfly_local_sources").capi_sql;
+    var adapter = sql.Adapter(antfly){ .db = &database, .table_name = "docs" };
+    for ([_][]const u8{
+        "SELECT _id FROM antfly_search('docs','body:alpha')",
+        "SELECT _id FROM antfly_search('docs','{\"full_text_search\":{\"match\":{\"field\":\"body\",\"text\":\"alpha\"}},\"highlight\":{\"fields\":[\"body\"]}}')",
+    }) |statement| {
+        var compiled = try sql.compiler.compile(a, statement, .{});
+        defer compiled.deinit();
+        var result = try sql.runtime.execute(a, adapter.backend(), &compiled, &.{}, .{});
+        defer result.deinit();
+        try std.testing.expectEqual(@as(usize, 1), result.output.rows.len);
+        try std.testing.expectEqualStrings("a", result.output.rows[0][0].string);
+    }
+    var compiled = try sql.compiler.compile(a, "SELECT payload,payload IS NULL,_highlights IS NULL,score>0 FROM antfly_search('docs','body:alpha')", .{});
+    defer compiled.deinit();
+    var result = try sql.runtime.execute(a, adapter.backend(), &compiled, &.{}, .{});
+    defer result.deinit();
+    try std.testing.expectEqual(@as(usize, 1), result.output.rows.len);
+    try std.testing.expect(result.output.rows[0][0] == .null);
+    try std.testing.expect(!result.output.sql_nulls.?[0][0]);
+    try std.testing.expect(!result.output.rows[0][1].bool);
+    try std.testing.expect(result.output.rows[0][2].bool);
+    try std.testing.expect(result.output.rows[0][3].bool);
+}
+
 test "capi SQL relational search preserves typed nulls and exact JSON numbers" {
     const alloc = std.testing.allocator;
     var directory = try TestDirectory.init("capi-sql-search-typed");
@@ -2952,7 +3038,7 @@ test "capi SQL relational search preserves typed nulls and exact JSON numbers" {
     try std.testing.expectEqualStrings(expected, actual);
     try std.testing.expect(hits.output.rows[0][2].bool);
     try std.testing.expect(!hits.output.rows[1][2].bool);
-    try std.testing.expectEqualStrings("9007199254740993", hits.output.rows[2][3].string);
+    try std.testing.expectEqualStrings("9007199254740993.0", hits.output.rows[2][3].string);
     try std.testing.expectEqualStrings("0.123456789012345678901", hits.output.rows[2][4].string);
 }
 

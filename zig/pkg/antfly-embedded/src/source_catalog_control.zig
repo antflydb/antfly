@@ -182,6 +182,7 @@ pub const sql_conflict_predicate = @import("sql/conflict_predicate.zig");
 pub const sql_ddl_runtime = @import("sql/ddl_runtime.zig");
 pub const sql_describe = @import("sql/describe.zig");
 pub const sql_document_row = @import("sql/document_row.zig");
+pub const sql_search_cursor = @import("sql/search_cursor.zig");
 pub const sql_errors = @import("sql/errors.zig");
 pub const sql_joined_mutation = @import("sql/joined_mutation.zig");
 pub const sql_memory_budget = @import("sql/memory_budget.zig");

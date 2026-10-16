@@ -21,6 +21,7 @@ test {
     _ = @import("lateral_test.zig");
     _ = @import("merge_test.zig");
     _ = @import("antfly_local_sources").sql_aggregate_binding;
+    _ = @import("antfly_local_sources").sql_search_cursor;
     _ = @import("antfly_local_sources").sql_compiler;
     _ = @import("antfly_local_sources").sql_schema_ddl;
     _ = @import("antfly_local_sources").sql_scalar;
