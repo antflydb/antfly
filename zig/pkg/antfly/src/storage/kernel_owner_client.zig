@@ -585,9 +585,17 @@ pub const Owner = struct {
 
     /// Private terminal effect after metadata accepts the installed cohort.
     pub fn nativeIndexOwnerReleaseScopedJson(self: *Owner, table_name: []const u8, intent_json: []const u8, root_scope_json: []const u8, options: QueryOptions) !Response {
+        return self.nativeIndexOwnerTerminalScopedJson(table_name, .release, intent_json, root_scope_json, options);
+    }
+
+    pub fn nativeIndexOwnerCancellationReleaseScopedJson(self: *Owner, table_name: []const u8, intent_json: []const u8, root_scope_json: []const u8, options: QueryOptions) !Response {
+        return self.nativeIndexOwnerTerminalScopedJson(table_name, .cancel_release, intent_json, root_scope_json, options);
+    }
+
+    fn nativeIndexOwnerTerminalScopedJson(self: *Owner, table_name: []const u8, operation: abi.NativeIndexOwnerOperation, intent_json: []const u8, root_scope_json: []const u8, options: QueryOptions) !Response {
         var response: Response = .{};
         try statusToError(abi.antfly_storage_owner_native_index_control_json(self.handle, &.{
-            .operation = .release,
+            .operation = operation,
             .table_name = .fromSlice(table_name),
             .request_json = .fromSlice(intent_json),
             .manifest = .fromSlice(root_scope_json),

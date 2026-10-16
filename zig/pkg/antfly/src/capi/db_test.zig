@@ -2046,10 +2046,56 @@ test "storage owner native index raw admission and bounded controls preserve loc
     const recovered_state = try handle.db.nativeIndexOwnerCancellationState(identity);
     try recovered_state.validate(identity);
     try std.testing.expectEqualDeep(completed, recovered_state.completed);
-    var completion_read = try handle.db.core.store.beginReadTxn();
-    defer completion_read.abort();
-    try std.testing.expect((try local.storage_db_relational_integrity_topology.current(&completion_read)).?.eql(header.fence));
-    try std.testing.expect(try local.storage_db_relational_integrity_topology.completed(&completion_read) == null);
+    {
+        var completion_read = try handle.db.core.store.beginReadTxn();
+        defer completion_read.abort();
+        try std.testing.expect((try local.storage_db_relational_integrity_topology.current(&completion_read)).?.eql(header.fence));
+        try std.testing.expect(try local.storage_db_relational_integrity_topology.completed(&completion_read) == null);
+    }
+    const release_intent: @FieldType(completion_native.CancellationReleaseOutcome, "intent") = .{ .canceled = completed.?, .metadata_decision = @splat(9) };
+    const release_json = try std.json.Stringify.valueAlloc(a, release_intent, .{});
+    defer a.free(release_json);
+    request.operation = .cancel_release;
+    request.request_json = .fromSlice(release_json);
+    request.control = .{ .has_execution_deadline = 1, .execution_deadline_ns = 0 };
+    try std.testing.expectEqual(kernel_owner_abi.Status.deadline_exceeded, server_api.storageOwnerNativeIndexControlJson(id, &request, &response));
+    request.control = .{ .version = kernel_owner_abi.abi_version - 1 };
+    try std.testing.expectEqual(kernel_owner_abi.Status.invalid_argument, server_api.storageOwnerNativeIndexControlJson(id, &request, &response));
+    request.control = .{};
+    request.manifest = .{ .ptr = @ptrFromInt(1), .len = completion_native.AuditRoot.max_wire_bytes + 1 };
+    try std.testing.expectEqual(kernel_owner_abi.Status.invalid_argument, server_api.storageOwnerNativeIndexControlJson(id, &request, &response));
+    request.manifest = .fromSlice(completion_root_json);
+    {
+        var foreign_intent = release_intent;
+        foreign_intent.canceled.binding.fence.owner_group_id += 1;
+        const foreign_json = try std.json.Stringify.valueAlloc(a, foreign_intent, .{});
+        defer a.free(foreign_json);
+        var rejected = request;
+        rejected.request_json = .fromSlice(foreign_json);
+        try std.testing.expectEqual(kernel_owner_abi.Status.invalid_argument, server_api.storageOwnerNativeIndexControlJson(id, &rejected, &response));
+        var wrong_scope = completion_root;
+        wrong_scope.root_incarnation = if (wrong_scope.root_incarnation == 1) 2 else 1;
+        const wrong_json = try std.json.Stringify.valueAlloc(a, wrong_scope, .{});
+        defer a.free(wrong_json);
+        rejected = request;
+        rejected.manifest = .fromSlice(wrong_json);
+        try std.testing.expectEqual(kernel_owner_abi.Status.private_index_root_recovery_required, server_api.storageOwnerNativeIndexControlJson(id, &rejected, &response));
+    }
+    handle.db.local_execution.replication_write_gate = .{ .borrowed = .{ .ptr = &denied_context, .check_fn = Denied.check, .allows_background_work = false } };
+    try std.testing.expect(server_api.storageOwnerNativeIndexControlJson(id, &request, &response) != .ok);
+    try std.testing.expect(response.ptr == null);
+    handle.db.local_execution.replication_write_gate = null;
+    for (0..2) |attempt| {
+        try std.testing.expectEqual(kernel_owner_abi.Status.ok, server_api.storageOwnerNativeIndexControlJson(id, &request, &response));
+        const released_response = response;
+        defer freeRawBuffer(released_response.ptr, released_response.len);
+        var released = try std.json.parseFromSlice(completion_native.CancellationReleaseOutcome, a, released_response.slice(), .{ .ignore_unknown_fields = false });
+        defer released.deinit();
+        try released.value.validate();
+        try std.testing.expectEqual(attempt != 0, released.value.duplicate);
+        try std.testing.expectEqual(completed.?.position.sequence + 1, released.value.position.sequence);
+        try std.testing.expectEqual(.cancel_released, released.value.receipt.?.action);
+    }
 }
 
 test "storage owner open rejects prior ABI before reading expanded request fields" {

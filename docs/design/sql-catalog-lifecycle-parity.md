@@ -8369,3 +8369,46 @@ The leased ABI/root-generation pre-effect guard, mounted cancellation scheduling
 and public online-index admission still require integration; this private storage
 effect is not public activation or SQL credit. Original accounting remains
 483 implemented / 862 unresolved.
+
+### Leased cancellation-release boundary
+
+Private kernel ABI 92 adds cancellation release alongside published release in
+the same terminal dispatcher. The body is the accepted fixed cleanup intent;
+the host chooses the signing-root scope. Cancellation/deadline, group, scope,
+bounded-body and writer checks precede the effect, and the common response
+buffer is allocated before commit.
+
+The source adapter requires metadata's accepted cleanup root generation and
+compares it on the same applying lease before calling storage. A stale generation
+or signing-root incarnation cannot lift the fence and then rely on a later
+signature failure to reject its ACK. The returned outcome retains that applying
+generation rather than rereading routing after the effect.
+
+The receiving release step obtains fresh metadata permission and uses the
+accepted cleanup proof's generation. Completion and release share owned result,
+pending-replication and signing-failure handling. Release ACKs carry the terminal
+receipt, not a second cleanup witness; metadata reconstructs their evidence from
+its already accepted witness and immutable cohort barrier.
+
+The frozen-source Debug leased/native gate passed 88/88 build steps in
+`/private/tmp/antfly-index-cancel-release-leased-debug-2.log`: six raw ABI/status,
+three actual leased-adapter and 46 runtime-contract tests. The separate metadata
+regression gate passed 69/69 steps in
+`/private/tmp/antfly-index-cancel-release-receiver-metadata-debug.log`: 56 metadata,
+four ACK and one service tests. No failures or leaks were reported. The first
+compile exposed a missing prepared-type dispatcher branch, corrected before
+qualification; the failed run is not counted as evidence.
+
+Coverage includes invalid control versions, oversized scopes, cancellation and
+deadlines, foreign groups/signing roots, writer refusal, unchanged source cuts
+after stale-generation refusal, native terminal retries, fresh metadata grant
+validation and signed terminal receipt reconstruction. Completion/release share
+owned result handling; failed signing preserves the durable cut without an ACK.
+Formatting, diff, licensing, Apache boundary, control-catalog and original
+inventory integrity checks pass.
+
+Mounted private HTTP cancellation controls, bounded scheduler cleanup/release
+stages, replacement-root adoption and public online-index admission remain
+unfinished. Published release also needs the same pre-effect accepted-generation
+guard. No public activation or original SQL case credit is claimed; the inventory
+remains 483 implemented / 862 unresolved.

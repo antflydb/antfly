@@ -736,6 +736,51 @@ test "native index owner adapter executes fresh permission stages and recovers r
         try std.testing.expect(!signing_failure.completed.needsSigning());
         try std.testing.expectEqual(@as(?publication.Ack, null), try signing_failure.completed.ack());
         try std.testing.expectEqual(completed.outcome.value.position, signing_failure.completed.outcome.value.position);
+        const cleanup_progress = try progress.acknowledge(metadata.value.head, metadata.value.owner, metadata.value.head.revision, cleanup_ack.signed.receipt);
+        metadata.value.head = cleanup_progress.head;
+        metadata.value.owner = cleanup_progress.owner;
+        metadata.value.owner.attestations[@backingInt(progress.Action.canceled)] = try cleanup_ack.signed.commitment();
+        metadata.value.native_cancel_release = .{ .canceled = completed.outcome.value.record.?, .cleanup_proof = cleanup_ack.signed.proof, .decision_digest = try publication.cancellationReleaseDecisionDigest(metadata.value.metadata_group_id, metadata.value.metadata_incarnation, metadata.value.head) };
+        const release_intent = metadata.value.native_cancel_release.?.intent();
+        try std.testing.expectError(error.PrivateIndexRootRecoveryRequired, owners.applyNativeIndexOwnerCancellationReleaseAtRoot(alloc, group, plan.before.name, release_intent, 0, signing_root.root_incarnation, .{}));
+        try std.testing.expectError(error.PrivateIndexRootRecoveryRequired, owners.applyNativeIndexOwnerCancellationReleaseAtRoot(alloc, group, plan.before.name, release_intent, root_generation + 1, signing_root.root_incarnation, .{}));
+        try std.testing.expectError(error.PrivateIndexRootRecoveryRequired, owners.applyNativeIndexOwnerCancellationReleaseAtRoot(alloc, group, plan.before.name, release_intent, root_generation, other_root, .{}));
+        {
+            var unchanged = try owners.nativeIndexOwnerCancellationState(alloc, group, plan.before.name, owner_identity, .{});
+            defer unchanged.deinit();
+            try std.testing.expectEqualDeep(completed.outcome.value.record, unchanged.value.completed);
+            try std.testing.expectEqual(completed.outcome.value.position.sequence, unchanged.value.source.sequence);
+            try std.testing.expect(unchanged.value.binding != null);
+        }
+        var released = try owners.applyNativeIndexOwnerCancellationReleaseAtRoot(alloc, group, plan.before.name, release_intent, root_generation, signing_root.root_incarnation, .{});
+        defer released.deinit();
+        try std.testing.expectEqual(root_generation, released.root_generation);
+        try std.testing.expect(!released.outcome.value.duplicate and released.outcome.value.receipt != null);
+        try std.testing.expectEqual(.cancel_released, released.outcome.value.receipt.?.action);
+        try std.testing.expectEqual(completed.outcome.value.position.sequence + 1, released.outcome.value.position.sequence);
+        var release_retry = try owners.applyNativeIndexOwnerCancellationReleaseAtRoot(alloc, group, plan.before.name, release_intent, root_generation, signing_root.root_incarnation, .{});
+        defer release_retry.deinit();
+        try std.testing.expect(release_retry.outcome.value.duplicate);
+        try std.testing.expectEqualDeep(released.outcome.value.receipt, release_retry.outcome.value.receipt);
+        try std.testing.expectEqual(released.outcome.value.position, release_retry.outcome.value.position);
+        // A caller-chosen digest is not permission, even for a committed cut.
+        metadata.value.native_cancel_release.?.decision_digest[0] ^= 1;
+        try std.testing.expectError(error.InvalidCatalogRecord, execution.cancelReleaseStep(alloc, &owners, &metadata, plan.before.name, cancel_request, .{}));
+        metadata.value.native_cancel_release.?.decision_digest[0] ^= 1;
+        var receiving_release = try execution.cancelReleaseStep(alloc, &owners, &metadata, plan.before.name, cancel_request, .{});
+        defer receiving_release.deinit();
+        try std.testing.expect(receiving_release == .released and receiving_release.released.outcome.value.duplicate);
+        const terminal = &receiving_release.released;
+        try std.testing.expect(terminal.needsSigning());
+        try std.testing.expectEqual(@as(?publication.Ack, null), try terminal.ack());
+        terminal.pinned_root_generation += 1;
+        try std.testing.expectError(error.IndexOwnerReceiptChanged, terminal.signNative(signing_root, 2, 3, 4));
+        terminal.pinned_root_generation -= 1;
+        try terminal.signNative(signing_root, 2, 3, 4);
+        const release_ack = (try terminal.ack()).?;
+        try release_ack.validate();
+        try std.testing.expect(release_ack.cancellation == null);
+        try publication.requireNativeCancellationReleaseReceipt(metadata.value.metadata_group_id, metadata.value.metadata_incarnation, metadata.value.head, metadata.value.owner, try publication.StoredProof.decode(alloc, retained_proof.slice()), release_ack.signed);
         // A subsequent routing/root switch must not relabel the already
         // recovered receipt as belonging to the replacement physical root.
         root_generation += 1;

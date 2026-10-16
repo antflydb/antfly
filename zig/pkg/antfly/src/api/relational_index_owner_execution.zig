@@ -1043,43 +1043,48 @@ pub fn claimStep(alloc: std.mem.Allocator, source: anytype, metadata: anytype, t
     } };
 }
 
-pub const CancellationCompletionResult = struct {
-    root_generation: u64,
-    pinned_root_generation: u64,
-    expected_revision: u64,
-    metadata_incarnation: local.metadata_incarnation.MetadataClusterIncarnation,
-    signing: publication.NativeSigningView,
-    outcome: std.json.Parsed(native.CancellationCompletionOutcome),
-    signed_receipt: ?publication.SignedReceipt = null,
-    signing_failure: ?SigningFailure = null,
+pub const CancellationCompletionResult = CancellationCheckpointResult(false);
+pub const CancellationReleaseResult = CancellationCheckpointResult(true);
+fn CancellationCheckpointResult(comptime releasing: bool) type {
+    return struct {
+        root_generation: u64,
+        pinned_root_generation: u64,
+        expected_revision: u64,
+        metadata_incarnation: local.metadata_incarnation.MetadataClusterIncarnation,
+        signing: publication.NativeSigningView,
+        outcome: std.json.Parsed(if (releasing) native.CancellationReleaseOutcome else native.CancellationCompletionOutcome),
+        signed_receipt: ?publication.SignedReceipt = null,
+        signing_failure: ?SigningFailure = null,
 
-    pub fn needsSigning(self: *const @This()) bool {
-        return self.outcome.value.receipt != null and !self.outcome.value.replication_pending and self.outcome.value.error_name == null and self.signed_receipt == null and self.signing_failure == null;
-    }
-    pub fn signNative(self: *@This(), root: local.storage_db_root_signing_identity.State, node_id: u64, store_id: u64, reporter_incarnation: u64) !void {
-        if (!self.needsSigning()) return error.NativeIndexSigningUnavailable;
-        try self.outcome.value.validate();
-        try self.signing.validate(self.metadata_incarnation);
-        if (self.root_generation == 0 or self.root_generation != self.pinned_root_generation or
-            node_id != self.signing.identity.node_id or store_id != self.signing.identity.store_id or reporter_incarnation != self.signing.reporter_incarnation) return error.IndexOwnerReceiptChanged;
-        const receipt = self.outcome.value.receipt.?;
-        const proof = try (publication.RootProof{ .identity = self.signing.identity, .reporter_incarnation = reporter_incarnation, .authority = .{ .native = self.signing.binding_digest }, .root_generation = self.root_generation, .signature = undefined }).sign(root, try receipt.digest());
-        const signed: publication.SignedReceipt = .{ .receipt = receipt, .proof = proof };
-        try (publication.CancellationWitness{ .record = self.outcome.value.record orelse return error.InvalidPrivateIndexCancellation }).verifyFor(signed);
-        self.signed_receipt = signed;
-    }
-    pub fn signingFailed(self: *@This(), failure: SigningFailure) void {
-        if (self.signed_receipt == null) self.signing_failure = failure;
-    }
-    pub fn ack(self: *const @This()) !?publication.Ack {
-        const signed = self.signed_receipt orelse return null;
-        if (self.signing_failure != null or self.root_generation != self.pinned_root_generation or signed.proof.root_generation != self.root_generation) return error.IndexOwnerReceiptChanged;
-        try self.outcome.value.validate();
-        const result: publication.Ack = .{ .table_id = self.outcome.value.binding.fence.namespace.table_id, .expected_revision = self.expected_revision, .signed = signed, .cancellation = .{ .record = self.outcome.value.record orelse return error.InvalidPrivateIndexCancellation } };
-        try result.validate();
-        return result;
-    }
-};
+        pub fn needsSigning(self: *const @This()) bool {
+            return self.outcome.value.receipt != null and !self.outcome.value.replication_pending and self.outcome.value.error_name == null and self.signed_receipt == null and self.signing_failure == null;
+        }
+        pub fn signNative(self: *@This(), root: local.storage_db_root_signing_identity.State, node_id: u64, store_id: u64, reporter_incarnation: u64) !void {
+            if (!self.needsSigning()) return error.NativeIndexSigningUnavailable;
+            try self.outcome.value.validate();
+            try self.signing.validate(self.metadata_incarnation);
+            if (self.root_generation == 0 or self.root_generation != self.pinned_root_generation or
+                node_id != self.signing.identity.node_id or store_id != self.signing.identity.store_id or reporter_incarnation != self.signing.reporter_incarnation) return error.IndexOwnerReceiptChanged;
+            const receipt = self.outcome.value.receipt.?;
+            const proof = try (publication.RootProof{ .identity = self.signing.identity, .reporter_incarnation = reporter_incarnation, .authority = .{ .native = self.signing.binding_digest }, .root_generation = self.root_generation, .signature = undefined }).sign(root, try receipt.digest());
+            const signed: publication.SignedReceipt = .{ .receipt = receipt, .proof = proof };
+            if (releasing) try signed.verifySignature() else try (publication.CancellationWitness{ .record = self.outcome.value.record orelse return error.InvalidPrivateIndexCancellation }).verifyFor(signed);
+            self.signed_receipt = signed;
+        }
+        pub fn signingFailed(self: *@This(), failure: SigningFailure) void {
+            if (self.signed_receipt == null) self.signing_failure = failure;
+        }
+        pub fn ack(self: *const @This()) !?publication.Ack {
+            const signed = self.signed_receipt orelse return null;
+            if (self.signing_failure != null or self.root_generation != self.pinned_root_generation or signed.proof.root_generation != self.root_generation) return error.IndexOwnerReceiptChanged;
+            try self.outcome.value.validate();
+            const binding = if (releasing) self.outcome.value.intent.canceled.binding else self.outcome.value.binding;
+            const result: publication.Ack = .{ .table_id = binding.fence.namespace.table_id, .expected_revision = self.expected_revision, .signed = signed, .cancellation = if (releasing) null else .{ .record = self.outcome.value.record orelse return error.InvalidPrivateIndexCancellation } };
+            try result.validate();
+            return result;
+        }
+    };
+}
 
 pub const CancellationResult = union(enum) {
     /// Only metadata's full canceled receipt can acknowledge this owner.
@@ -1092,6 +1097,7 @@ pub const CancellationResult = union(enum) {
     gc: std.json.Parsed(native.CleanupMaintenanceOutcome),
     claim_gc: std.json.Parsed(native.ClaimCleanupMaintenanceOutcome),
     completed: CancellationCompletionResult,
+    released: CancellationReleaseResult,
     /// Local artifacts/claims only: cohort proof and epoch release are pending.
     retired,
 
@@ -1103,6 +1109,7 @@ pub const CancellationResult = union(enum) {
             .gc => |value| value.deinit(),
             .claim_gc => |value| value.deinit(),
             .completed => |value| value.outcome.deinit(),
+            .released => |value| value.outcome.deinit(),
         }
         self.* = undefined;
     }
@@ -1227,6 +1234,25 @@ pub fn cancelCompletionStep(alloc: std.mem.Allocator, source: anytype, metadata:
     if (!record.cleanup.intent.eql(try permission.value.nativeCancellationIntent()) or
         record.cleanup.claim_allocation != dispatch.native_claim_allocation) return error.PrivateIndexOwnerJobChanged;
     return .{ .completed = .{ .root_generation = rooted.root_generation, .pinned_root_generation = rooted.root_generation, .expected_revision = permission.value.head.revision, .metadata_incarnation = permission.value.metadata_incarnation, .signing = view, .outcome = rooted.outcome } };
+}
+
+/// Obtain fresh all-owner permission; the source checks its accepted generation
+/// on the applying lease before the terminal native effect can lift a fence.
+pub fn cancelReleaseStep(alloc: std.mem.Allocator, source: anytype, metadata: anytype, table_name: []const u8, request: CancellationRequest, context: operation.RequestContext) !CancellationResult {
+    try context.ensureActive();
+    const lookup: publication.OwnerRequest = .{ .table_id = request.table_id, .group_id = request.group_id, .id = request.id, .operation = .cancel_release };
+    try lookup.validate();
+    if (table_name.len == 0) return error.InvalidGenerationPublication;
+    var permission = try decision(alloc, metadata, lookup, context);
+    defer permission.deinit();
+    if (permission.value.disposition == .acknowledged) return .acknowledged;
+    try requireTable(permission.value, table_name);
+    const grant = permission.value.native_cancel_release orelse return error.InvalidCatalogRecord;
+    const view = permission.value.native_signing orelse return error.IndexOwnerReceiptChanged;
+    var rooted = try source.applyNativeIndexOwnerCancellationReleaseAtRoot(alloc, request.group_id, table_name, grant.intent(), grant.cleanup_proof.root_generation, view.identity.root_incarnation, context);
+    errdefer rooted.deinit();
+    if (rooted.root_generation != grant.cleanup_proof.root_generation) return error.IndexOwnerReceiptChanged;
+    return .{ .released = .{ .root_generation = rooted.root_generation, .pinned_root_generation = grant.cleanup_proof.root_generation, .expected_revision = permission.value.head.revision, .metadata_incarnation = permission.value.metadata_incarnation, .signing = view, .outcome = rooted.outcome } };
 }
 
 fn requireCancellationProgress(result: native.CleanupOutcome, expected: ?jobs.Binding, intent: native.Admission) !void {
