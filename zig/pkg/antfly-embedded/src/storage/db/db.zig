@@ -28593,10 +28593,10 @@ pub const DB = struct {
             var count: usize = 0;
             var visited: usize = 0;
             var source_bytes: usize = 0;
-            // Detached pages amortize native checkpoint/publication overhead;
-            // bound both document count and scanned bytes rather than growing
-            // working memory with large rows. Foreground waits keep short pages.
-            const document_limit: usize = if (bounded_replay) 64 else 32;
+            // Detached pages amortize reopening and durably checkpointing the
+            // private native graph. Keep the 1 MiB/100 ms scan caps for large
+            // rows; foreground waits retain their smaller document quantum.
+            const document_limit: usize = if (bounded_replay) 256 else 32;
             const build_deadline = @min(deadline orelse std.math.maxInt(u64), monotonicTimeNs() +| 100 * std.time.ns_per_ms);
             while (row) |kv| : (row = try cursor.next()) {
                 if (!std.mem.lessThan(u8, kv.key, source_upper)) {
@@ -137441,6 +137441,59 @@ test "capi resolver replacement builds while replay gates remain available" {
     defer graph_mod.GraphIndex.freeEdges(alloc, edges);
     try std.testing.expectEqual(@as(usize, 1), edges.len);
     try std.testing.expectEqualStrings("entity/ada", edges[0].target);
+}
+
+test "capi resolver background replacement source pages remain byte bounded" {
+    const a = std.testing.allocator;
+    var directory = try TestDirectory.init("replacement-source-byte-bound");
+    defer directory.cleanup();
+    var db = try DB.open(a, directory.path(), .{ .executor = .{ .backend = .manual }, .start_optional_runtimes = false });
+    defer db.close();
+    try db.addIndex(.{ .name = "old", .kind = .graph, .config_json = "{\"edge_types\":[{\"name\":\"R\",\"field\":\"links\"}]}" });
+    var scratch = std.heap.ArenaAllocator.init(a);
+    defer scratch.deinit();
+    const tmp = scratch.allocator();
+    var padding: [40 * 1024]u8 = undefined;
+    var prng = std.Random.DefaultPrng.init(0x6249);
+    const random = prng.random();
+    const alphabet = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-";
+    for (&padding) |*byte| byte.* = alphabet[random.int(u6)];
+    const value = try std.fmt.allocPrint(tmp, "{{\"links\":[\"before\"],\"next_links\":[\"after\"],\"padding\":\"{s}\"}}", .{padding});
+    var rows: [64]types.BatchWrite = undefined;
+    for (&rows, 0..) |*row, i| row.* = .{ .key = try std.fmt.allocPrint(tmp, "source:{d:0>4}", .{i}), .value = value };
+    try db.batch(.{ .writes = &rows });
+    try db.runUntilIdle();
+    // These rows fit the document-count quantum but exceed its byte budget.
+    // Prove the fixture's physical input size, including stored encodings.
+    {
+        var read = try db.core.store.beginReadTxn();
+        defer read.abort();
+        var bytes: usize = 0;
+        for (rows) |row| bytes += (try read.get(try internal_keys.documentKeyAlloc(tmp, row.key))).len;
+        try std.testing.expect(bytes > 1024 * 1024);
+    }
+    _ = try db.replaceGraphIndex("old", .{ .name = "new", .kind = .graph, .config_json = "{\"edge_types\":[{\"name\":\"R\",\"field\":\"next_links\"}]}" });
+    var observed = false;
+    for (0..8) |_| {
+        _ = try db.runBackgroundTurnWithCancellation(.none, true);
+        const jobs = try db.graphReplacementStatusAlloc(a);
+        defer jobs.deinit();
+        try std.testing.expectEqual(@as(usize, 1), jobs.value.len);
+        if (jobs.value[0].scanned != 0) {
+            try std.testing.expectEqual(.building, jobs.value[0].phase);
+            try std.testing.expect(jobs.value[0].resume_key_b64 != null);
+            try std.testing.expect(db.core.index_manager.get("old") != null);
+            try std.testing.expect(db.core.index_manager.get("new") == null);
+            observed = true;
+            break;
+        }
+    }
+    try std.testing.expect(observed);
+    try db.runUntilIdle();
+    const edges = try db.core.index_manager.graphIndex("new").?.index.getEdges(a, "source:0063", "R", .out);
+    defer graph_mod.GraphIndex.freeEdges(a, edges);
+    try std.testing.expectEqual(@as(usize, 1), edges.len);
+    try std.testing.expectEqualStrings("after", edges[0].target);
 }
 
 test "capi resolver replacement resumes checkpoints while writes continue" {
