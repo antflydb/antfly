@@ -132,7 +132,7 @@ fn run(a: Allocator, io: std.Io, args: Arguments) !void {
     const overall = Control{ .io = io, .deadline_ns = expires, .hard_cancellation = watchdog.boundary(), .ptr = &lifeline, .check_fn = Lifeline.check };
     var startup = overall;
     startup.deadline_ns = startup_expires;
-    var overall_guard = try overall.enterUninterruptible(.process_required);
+    var overall_guard = try overall.enterUninterruptible(.uninterruptible);
     defer overall_guard.deinit();
     var admission = memory.AdmissionController{};
     defer admission.deinit();
@@ -143,7 +143,7 @@ fn run(a: Allocator, io: std.Io, args: Arguments) !void {
     }, .{ .host_weight_bytes = amounts.mapped_weight_bytes, .host_scratch_bytes = amounts.host_total_bytes - amounts.mapped_weight_bytes, .backend_scratch_bytes = amounts.backend_total_bytes }, true);
     defer lease.release();
     {
-        var guard = try startup.enterUninterruptible(.process_required);
+        var guard = try startup.enterUninterruptible(.uninterruptible);
         defer guard.deinit();
         try contract.verifyArtifacts(setup, io, args.directory, envelope, startup);
     }
@@ -163,7 +163,7 @@ fn run(a: Allocator, io: std.Io, args: Arguments) !void {
 fn execute(a: Allocator, io: std.Io, args: Arguments, verified: *const contract.Verified, amounts: contract.Admission, admission: *memory.AdmissionController, loader: *contract.Owner, startup: Control, overall: Control, output: *Output) !void {
     const envelope = verified.envelope.value;
     const model_allocator = loader.allocator();
-    var startup_guard = try startup.enterUninterruptible(.process_required);
+    var startup_guard = try startup.enterUninterruptible(.uninterruptible);
     defer startup_guard.deinit();
     const session = if (args.backend == .metal) try factory.createMetalSession(model_allocator, args.directory) else try factory.createNativeSession(model_allocator, args.directory);
     defer session.close();
@@ -225,7 +225,7 @@ fn executeCase(owner: *contract.Owner, session: anytype, config: anytype, tokeni
     // Weight reservations are logical aliases of admitted resident/mapped
     // storage; allocator accounting separately bounds actual host ownership.
     var run_budget = memory.RunBudget.init(.{ .host_limit_bytes = try std.math.add(usize, amounts.mapped_weight_bytes, amounts.request_host_bytes), .backend_limit_bytes = amounts.device_context_bytes, .combined_limit_bytes = envelope.limits.combined_bytes });
-    var native_guard = if (envelope.backend == .native) try control.enterUninterruptible(.process_required) else inference.execution_control.UninterruptibleGuard{};
+    var native_guard = if (envelope.backend == .native) try control.enterUninterruptible(.uninterruptible) else inference.execution_control.UninterruptibleGuard{};
     defer native_guard.deinit();
     var managed = try factory.getManagedComputeBackend(session, a, &run_budget, control);
     defer managed.deinit();

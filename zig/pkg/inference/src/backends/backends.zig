@@ -101,20 +101,21 @@ pub const BackendType = enum {
 
     /// Strongest cancellation mechanism available once execution has crossed
     /// into the backend. GPU driver and PJRT calls have no portable per-call
-    /// abort primitive, so they may execute only in a supervised worker.
+    /// abort primitive. A supervised worker can enforce hard deadlines; embedded
+    /// runtimes explicitly accept waiting for these calls to return.
     pub fn executionInterruption(self: BackendType) Interruption {
         return switch (self) {
             .native, .wasm => .cooperative,
-            .metal, .cuda, .pjrt => .process_required,
+            .metal, .cuda, .pjrt => .uninterruptible,
         };
     }
 
-    /// Any model/session constructor which enters a device driver or native
-    /// runtime belongs to the replaceable worker.
+    /// Model/session constructors may enter a device driver or native runtime
+    /// which cannot observe cooperative cancellation.
     pub fn loadInterruption(self: BackendType) Interruption {
         return switch (self) {
             .native, .wasm => .cooperative,
-            .metal, .cuda, .pjrt => .process_required,
+            .metal, .cuda, .pjrt => .uninterruptible,
         };
     }
 
@@ -132,15 +133,15 @@ pub const BackendType = enum {
 pub const BackendRuntime = struct {
     backend: BackendType,
 
-    pub fn requiresProcessIsolation(self: BackendRuntime) bool {
-        return self.loadInterruption() == .process_required or
-            self.executionInterruption() == .process_required;
+    pub fn hasUninterruptibleCalls(self: BackendRuntime) bool {
+        return self.loadInterruption() == .uninterruptible or
+            self.executionInterruption() == .uninterruptible;
     }
 
     /// Placement must cover backends selected lazily after server startup.
-    pub fn availableRequiresProcessIsolation() bool {
+    pub fn availableHasUninterruptibleCalls() bool {
         inline for (std.meta.tags(BackendType)) |backend| {
-            if (backend.available() and (BackendRuntime{ .backend = backend }).requiresProcessIsolation()) return true;
+            if (backend.available() and (BackendRuntime{ .backend = backend }).hasUninterruptibleCalls()) return true;
         }
         return false;
     }
@@ -162,23 +163,23 @@ pub const BackendRuntime = struct {
 };
 
 test "backend runtime process placement covers loading and execution" {
-    try std.testing.expect(!(BackendRuntime{ .backend = .native }).requiresProcessIsolation());
-    try std.testing.expect(!(BackendRuntime{ .backend = .wasm }).requiresProcessIsolation());
+    try std.testing.expect(!(BackendRuntime{ .backend = .native }).hasUninterruptibleCalls());
+    try std.testing.expect(!(BackendRuntime{ .backend = .wasm }).hasUninterruptibleCalls());
     inline for (.{ BackendType.metal, BackendType.cuda, BackendType.pjrt }) |backend|
-        try std.testing.expect((BackendRuntime{ .backend = backend }).requiresProcessIsolation());
+        try std.testing.expect((BackendRuntime{ .backend = backend }).hasUninterruptibleCalls());
 }
 
 test "backend interruption policy isolates unabortable driver calls" {
     try std.testing.expectEqual(Interruption.cooperative, BackendType.native.executionInterruption());
-    try std.testing.expectEqual(Interruption.process_required, BackendType.metal.executionInterruption());
-    try std.testing.expectEqual(Interruption.process_required, BackendType.cuda.executionInterruption());
-    try std.testing.expectEqual(Interruption.process_required, BackendType.pjrt.executionInterruption());
+    try std.testing.expectEqual(Interruption.uninterruptible, BackendType.metal.executionInterruption());
+    try std.testing.expectEqual(Interruption.uninterruptible, BackendType.cuda.executionInterruption());
+    try std.testing.expectEqual(Interruption.uninterruptible, BackendType.pjrt.executionInterruption());
 }
 
 test "backend load policy isolates native runtime construction" {
     try std.testing.expectEqual(Interruption.cooperative, BackendType.native.loadInterruption());
-    try std.testing.expectEqual(Interruption.process_required, BackendType.metal.loadInterruption());
-    try std.testing.expectEqual(Interruption.process_required, BackendType.cuda.loadInterruption());
+    try std.testing.expectEqual(Interruption.uninterruptible, BackendType.metal.loadInterruption());
+    try std.testing.expectEqual(Interruption.uninterruptible, BackendType.cuda.loadInterruption());
 }
 
 test "embedded session policy fails before selecting an uninterruptible backend" {
@@ -186,7 +187,7 @@ test "embedded session policy fails before selecting an uninterruptible backend"
     var manager = SessionManager.init(std.testing.allocator);
     manager.required_backend = .metal;
     manager.required_backend_invalid = false;
-    manager.process_isolation_available = false;
+    manager.process_termination_available = false;
     try std.testing.expectError(
         error.ProcessIsolationRequired,
         manager.validateRequiredBackendPolicy(),
@@ -219,16 +220,17 @@ pub const SessionManager = struct {
     /// dispatch goes through the caller's thread pool (linalg.sgemm*Io).
     /// Null means backends use the process-wide futex pool inside lib/linalg.
     io: ?std.Io = null,
-    /// True for CLI tools and supervised inference workers. Server nodes set
-    /// this explicitly so embedded database runtimes cannot even load a
-    /// backend whose driver requires process-level recovery.
-    process_isolation_available: bool = true,
+    /// True for disposable CLI tools and supervised inference workers. An
+    /// embedded runtime keeps this false and explicitly accepts in-process
+    /// native calls through its local native_call_policy.
+    process_termination_available: bool = true,
+    native_call_policy: execution_control.NativeCallPolicy = .require_supervision,
 
     /// Backends whose execution can only be stopped by killing the process run
     /// in a supervised worker, or in-process when the host accepted that they
-    /// cannot be interrupted (see `execution_control.allowUninterruptibleInProcess`).
-    pub fn processRequiredBackendsAllowed(self: *const SessionManager) bool {
-        return self.process_isolation_available or execution_control.uninterruptibleInProcessAllowed();
+    /// cannot be interrupted (see `native_call_policy`).
+    pub fn uninterruptibleBackendsAllowed(self: *const SessionManager) bool {
+        return self.process_termination_available or self.native_call_policy == .in_process;
     }
 
     pub fn init(allocator: std.mem.Allocator) SessionManager {
@@ -275,7 +277,7 @@ pub const SessionManager = struct {
         if (!backend.available() or !backend.supportsDirectSessionLoad())
             return error.RequiredBackendUnavailable;
         const backend_runtime = try self.resolveBackendRuntime(backend);
-        if (!self.processRequiredBackendsAllowed() and backend_runtime.executionInterruption() == .process_required)
+        if (!self.uninterruptibleBackendsAllowed() and backend_runtime.executionInterruption() == .uninterruptible)
             return error.ProcessIsolationRequired;
     }
 
@@ -366,7 +368,7 @@ pub const SessionManager = struct {
                 first_err = first_err orelse err;
                 continue;
             };
-            if (!self.processRequiredBackendsAllowed() and backend_runtime.executionInterruption() == .process_required) {
+            if (!self.uninterruptibleBackendsAllowed() and backend_runtime.executionInterruption() == .uninterruptible) {
                 first_err = first_err orelse error.ProcessIsolationRequired;
                 continue;
             }

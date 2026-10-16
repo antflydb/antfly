@@ -463,6 +463,7 @@ pub const Owner = struct {
     path: []const u8,
     options: api.LiteResolvedOpenOptions,
     owned_ttl_owner_id: ?[]u8 = null,
+    owned_models_dir: ?[]u8 = null,
     gate: *PathGate,
     connections: std.ArrayList(*Connection) = .empty,
     worker: ?std.Thread = null,
@@ -527,7 +528,7 @@ pub const Owner = struct {
         var options = self.options;
         options.externally_locked = true;
         if (known_maintenance orelse self.current) |verified| options.allocator_verification_owner = &verified.owned_lite_backend.?.native_docstore.?.file;
-        const replacement = try api.openLiteHandleAllocWithRuntime(alloc, self.path, options, false, h.handleLockIo(), null);
+        const replacement = try api.openLiteHandleAllocWithSharedInference(alloc, self.path, options, false, h.handleLockIo(), null, self.current);
         errdefer h.closeHandle(replacement);
         if (self.current) |previous| {
             if (known_maintenance) |snapshot| {
@@ -657,7 +658,12 @@ pub const Owner = struct {
         if (self.stopping.load(.acquire)) return error.Canceled;
         self.publication_stats.attempts +|= 1;
         errdefer self.publication_stats.refused +|= 1;
-        if (scope != .reclamation) if (root.maintenance_publication) |p| if (p.index_inputs_changed) return error.EnrichmentWaitCanceled;
+        // A resolver publication can change index inputs before its replay
+        // watermark is saved. Fence subsequent immutable index work, while
+        // allowing primary transactions to read the rebased checkpoint and
+        // persist that completed progress. Otherwise replay repeats its own
+        // output forever without advancing its durable watermark.
+        if (scope == .index) if (root.maintenance_publication) |p| if (p.index_inputs_changed) return error.EnrichmentWaitCanceled;
         if (self.current) |current| if (needsOutcomeReconciliation(current)) return error.EnrichmentWaitCanceled;
         var lease = native.lockWriterPathWithIo(alloc, h.handleLockIo(), self.path) catch |err| switch (err) {
             error.FileBusy, error.WouldBlock => return error.EnrichmentWaitCanceled,
@@ -682,7 +688,10 @@ pub const Owner = struct {
             defer latest.close();
             if ((try latest.file.stat(latest.runtime())).inode != (try file.file.stat(file.runtime())).inode) return error.EnrichmentWaitCanceled;
             if (file.activeCheckpoint().index_catalog_root_page != latest.activeCheckpoint().index_catalog_root_page) {
-                if (!try publication.indexInputsUnchanged(file, &latest)) return error.EnrichmentWaitCanceled;
+                if (!try publication.indexInputsUnchanged(file, &latest)) {
+                    publication.index_inputs_changed = true;
+                    if (scope == .index) return error.EnrichmentWaitCanceled;
+                }
             }
             try root.owned_lite_backend.?.native_docstore.?.refreshIndexPublicationCheckpoint(latest.header);
             if (self.current) |current| try file.inheritAllocatorVerification(&current.owned_lite_backend.?.native_docstore.?.file);
@@ -702,7 +711,9 @@ pub const Owner = struct {
         if (root.maintenance_writer_references != 0) return;
         var lease = root.maintenance_writer_lease.?;
         root.maintenance_writer_lease = null;
-        self.notifyMutation();
+        // Admission alone is not a mutation. Reclamation probes also take
+        // this lease; waking replay here makes each idle turn schedule itself.
+        // Generated and replay publications notify at their commit boundary.
         lease.close();
         self.gate.mutex.unlock(h.handleLockIo());
     }
@@ -740,7 +751,7 @@ pub const Owner = struct {
         options.artifact_reader_fence = true;
         options.allocator_verification_owner = file;
         const snapshot = if (need_database) blk: {
-            const opened = try api.openLiteHandleAllocWithRuntime(alloc, self.path, options, false, h.handleLockIo(), null);
+            const opened = try api.openLiteHandleAllocWithSharedInference(alloc, self.path, options, false, h.handleLockIo(), null, foreground);
             if (comptime h.builtin.is_test) self.test_runtime_snapshot_opens += 1;
             break :blk opened;
         } else blk: {
@@ -777,6 +788,44 @@ pub const Owner = struct {
         }
         self.maintenance_snapshot = snapshot;
         return snapshot;
+    }
+
+    // An idle turn can publish allocator/lease cleanup after the serving
+    // checkpoint has left the retained slots. Its old page IDs are then unsafe
+    // to traverse. Instead adopt only this turn's fenced housekeeping result,
+    // while the serving handle and its entry header are still unchanged.
+    fn adoptIdleMaintenanceCheckpoint(self: *Owner, foreground: *h.Handle, entry_header: native.Header, maintenance: *NativeStore) !void {
+        if (self.current != foreground or foreground.maintenance_references != 0 or needsOutcomeReconciliation(foreground)) return;
+        const store = foreground.owned_lite_backend.?.native_docstore.?;
+        if (!std.meta.eql(store.file.header, entry_header)) return;
+        var lease = native.lockWriterPathWithIo(alloc, h.handleLockIo(), self.path) catch |err| switch (err) {
+            error.FileBusy, error.WouldBlock => return,
+            else => return err,
+        };
+        defer lease.close();
+        var probe = try native.NativeFile.openWithIo(alloc, h.handleLockIo(), self.path, .{ .read_only = true, .internal_reader = true });
+        defer probe.close();
+        if (!std.meta.eql(probe.header, maintenance.file.header) or
+            (try probe.file.stat(probe.runtime())).inode != (try store.file.file.stat(store.file.runtime())).inode or
+            (try probe.file.stat(probe.runtime())).inode != (try maintenance.file.file.stat(maintenance.file.runtime())).inode) return;
+        var before = store.file.activeCheckpoint();
+        var after = probe.activeCheckpoint();
+        before.commit_sequence = 0;
+        after.commit_sequence = 0;
+        before.free_map_root_page = 0;
+        after.free_map_root_page = 0;
+        before.page_count = 0;
+        after.page_count = 0;
+        before.catalog_root_page = 0;
+        after.catalog_root_page = 0;
+        // This turn ran no DB work. Reclamation admission never rebases over
+        // external commits, so only lease metadata and allocator state may
+        // differ. Primary, namespace and immutable index roots must all match.
+        if (!std.meta.eql(before, after) or store.file.header.page_size != probe.header.page_size or
+            store.file.header.packed_records != probe.header.packed_records or
+            store.file.header.indexed_reclamation != probe.header.indexed_reclamation) return;
+        try store.refreshIndexPublicationCheckpoint(probe.header);
+        try store.file.inheritAllocatorVerification(&maintenance.file);
     }
 
     /// Captures one table under the connection fence. The pinned runtime owns
@@ -895,6 +944,7 @@ pub const Owner = struct {
         root.maintenance_owner = self;
         root.maintenance_publication = &publication;
         const store = root.owned_lite_backend.?.native_docstore.?;
+        const foreground_header = foreground.owned_lite_backend.?.native_docstore.?.file.header;
         if (run_database) if (database.enrichment_runtime) |runtime| {
             if (self.embedding_memo == null) self.embedding_memo = memo_mod.QueryEmbeddingCache.init(alloc, io, .{ .max_bytes = embedding_memo_bytes, .ttl_ns = std.time.ns_per_min });
             runtime.dense_result_cache = .{ .ptr = self, .lookup = lookupEmbedding, .remember = rememberEmbedding };
@@ -956,10 +1006,17 @@ pub const Owner = struct {
             !std.meta.eql(self.current.?.owned_lite_backend.?.native_docstore.?.file.header, store.file.header)
         else
             self.current != root;
+        // Retaining the serving runtime does not hide physical progress. Run
+        // another bounded storage turn before declaring cleanup quiescent.
+        if (independent and !run_database) try self.adoptIdleMaintenanceCheckpoint(foreground, foreground_header, store);
         // A moved physical tip requires a prompt refresh, not another DB
         // replay pass. Reader leases/index housekeeping also move that tip;
         // treating them as enrichment debt makes idle runtime opens perpetual.
         // The next capture checks the durable journal for foreground work.
+        // A primary rebase may have fenced immutable index work without
+        // making the replay driver itself fail. Retry on a fresh snapshot
+        // even when its cached replay target looked complete this turn.
+        pending = pending or publication.index_inputs_changed;
         self.maintenance_round_pending = self.maintenance_round_pending or pending;
         if (self.maintenance_table_cursor == 0) {
             // Mutations arriving during the detached turn still wake the owner;
@@ -1010,6 +1067,7 @@ pub const Owner = struct {
         self.connections.deinit(alloc);
         self.maintenance_schedules.deinit(alloc);
         if (self.owned_ttl_owner_id) |id| alloc.free(id);
+        if (self.owned_models_dir) |directory| alloc.free(directory);
         alloc.destroy(self);
     }
 };
@@ -1025,6 +1083,12 @@ fn compatible(a: api.LiteResolvedOpenOptions, b: api.LiteResolvedOpenOptions) bo
         if (!std.mem.eql(u8, ttl.owner_id, other.owner_id)) return false;
         ttl.owner_id = "";
         right.ttl_cleanup.?.owner_id = "";
+    }
+    if (left.inference.models_dir) |directory| {
+        const other = right.inference.models_dir orelse return false;
+        if (!std.mem.eql(u8, directory, other)) return false;
+        left.inference.models_dir = null;
+        right.inference.models_dir = null;
     }
     return std.meta.eql(left, right);
 }
@@ -1185,6 +1249,12 @@ pub fn open(path: []const u8, options: api.LiteResolvedOpenOptions, create: bool
         resolved_options.ttl_cleanup.?.owner_id = ttl_owner_id.?;
     }
     defer if (ttl_owner_id) |id| alloc.free(id);
+    var models_dir: ?[]u8 = null;
+    if (options.inference.models_dir) |directory| {
+        models_dir = try alloc.dupe(u8, directory);
+        resolved_options.inference.models_dir = models_dir.?;
+    }
+    defer if (models_dir) |directory| alloc.free(directory);
     var initial: ?*h.Handle = null;
     errdefer if (initial) |root| {
         root.lease_snapshot = true;
@@ -1218,7 +1288,7 @@ pub fn open(path: []const u8, options: api.LiteResolvedOpenOptions, create: bool
     const owner = existing orelse try alloc.create(Owner);
     errdefer if (existing == null) alloc.destroy(owner);
     if (existing == null) {
-        owner.* = .{ .path = gate.path, .gate = gate, .options = resolved_options, .current = initial, .owned_ttl_owner_id = ttl_owner_id };
+        owner.* = .{ .path = gate.path, .gate = gate, .options = resolved_options, .current = initial, .owned_ttl_owner_id = ttl_owner_id, .owned_models_dir = models_dir };
     }
     try owner.connections.ensureUnusedCapacity(alloc, 1);
     errdefer if (existing == null) owner.connections.deinit(alloc);
@@ -1257,6 +1327,9 @@ pub fn open(path: []const u8, options: api.LiteResolvedOpenOptions, create: bool
         h.closeHandle(root);
     };
     initial = null;
-    if (existing == null) ttl_owner_id = null;
+    if (existing == null) {
+        ttl_owner_id = null;
+        models_dir = null;
+    }
     return wrapper;
 }
