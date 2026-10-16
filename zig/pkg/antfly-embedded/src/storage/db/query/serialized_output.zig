@@ -32,6 +32,21 @@ pub fn alloc(output: Allocator, exact: bool, emitter: anytype) ![]u8 {
         };
         return writer.toOwnedSlice();
     }
+    const Emitter = switch (@typeInfo(@TypeOf(emitter))) {
+        .pointer => |p| p.child,
+        else => @TypeOf(emitter),
+    };
+    if (@hasDecl(Emitter, "exactSize")) if (try emitter.exactSize()) |size| {
+        const result = try output.alloc(u8, size);
+        errdefer output.free(result);
+        var writer = std.Io.Writer.fixed(result);
+        emitter.write(&writer) catch |err| switch (err) {
+            error.WriteFailed => return error.OutputSizeChanged,
+            else => return err,
+        };
+        if (writer.end != result.len) return error.OutputSizeChanged;
+        return result;
+    };
     var buffer: [4096]u8 = undefined;
     var counter = std.Io.Writer.Discarding.init(&buffer);
     try emitter.write(&counter.writer);

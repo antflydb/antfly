@@ -1288,30 +1288,77 @@ pub const OrdinalRowView = struct {
     /// Capture only addressed cell descriptors, authenticating their bytes once
     /// before a sizing pass. Replay borrows this immutable descriptor snapshot.
     pub const ProjectionWriter = struct {
+        const PreparedCell = struct { value: ?Cell, array: ?*@import("../query/native_array.zig").Prepared = null };
         row: OrdinalRowView,
         scratch: Allocator,
         plan: OrdinalProjectionPlan,
-        inline_cells: [8]?Cell = undefined,
-        cells: ?[]?Cell = null,
+        inline_cells: [8]PreparedCell = undefined,
+        first_array: @import("../query/native_array.zig").Prepared = undefined,
+        cells: ?[]PreparedCell = null,
         pub fn deinit(self: *@This()) void {
-            if (self.cells) |cells| if (cells.len > self.inline_cells.len) self.scratch.free(cells);
+            if (self.cells) |cells| {
+                for (cells) |entry| if (entry.array) |array| if (array != &self.first_array) self.scratch.destroy(array);
+                if (cells.len > self.inline_cells.len) self.scratch.free(cells);
+            }
             self.cells = null;
         }
-        pub fn write(self: *@This(), writer: *std.Io.Writer) anyerror!void {
+        fn capture(self: *@This()) !void {
             if (self.plan.schema_version != self.row.table_schema.version) return error.RelationalRowSchemaMismatch;
             if (self.cells == null) {
-                const cells = if (self.plan.ordinals.len <= self.inline_cells.len) self.inline_cells[0..self.plan.ordinals.len] else try self.scratch.alloc(?Cell, self.plan.ordinals.len);
-                errdefer if (cells.len > self.inline_cells.len) self.scratch.free(cells);
-                for (self.plan.ordinals, cells) |ordinal, *cell| cell.* = try self.row.findCell(ordinal);
+                const cells = if (self.plan.ordinals.len <= self.inline_cells.len) self.inline_cells[0..self.plan.ordinals.len] else try self.scratch.alloc(PreparedCell, self.plan.ordinals.len);
+                @memset(cells, .{ .value = null });
+                errdefer {
+                    for (cells) |entry| if (entry.array) |array| if (array != &self.first_array) self.scratch.destroy(array);
+                    if (cells.len > self.inline_cells.len) self.scratch.free(cells);
+                }
+                var arrays: usize = 0;
+                for (self.plan.ordinals, cells) |ordinal, *cell| {
+                    cell.* = .{ .value = try self.row.findCell(ordinal) };
+                    if (cell.value) |value| if (!value.is_null) if (value.sql_array_element_type) |kind| {
+                        const prepared = if (arrays == 0) &self.first_array else try self.scratch.create(@import("../query/native_array.zig").Prepared);
+                        cell.array = prepared;
+                        prepared.* = try @import("../query/native_array.zig").Prepared.init(self.scratch, kind, value.value.bytes_val, true);
+                        arrays += 1;
+                    };
+                }
                 self.cells = cells;
             }
-            try writer.writeByte('{');
-            var comma = false;
-            for (self.cells.?) |maybe_cell| if (maybe_cell) |cell| {
-                try writeCellMember(self.scratch, writer, cell, comma);
+        }
+        pub fn exactSize(self: *@This()) !?usize {
+            try self.capture();
+            var any = false;
+            for (self.cells.?) |entry| if (entry.array != null) {
+                any = true;
+                break;
+            };
+            if (!any) return null;
+            var counter = std.Io.Writer.Discarding.init(&.{});
+            try self.emit(&counter.writer, true, false);
+            return std.math.cast(usize, counter.fullCount()) orelse error.OutOfMemory;
+        }
+        pub fn write(self: *@This(), writer: *std.Io.Writer) anyerror!void {
+            try self.capture();
+            try self.emit(writer, false, false);
+        }
+        pub fn writeFields(self: *@This(), writer: *std.Io.Writer) !void {
+            try self.capture();
+            try self.emit(writer, false, true);
+        }
+        fn emit(self: *@This(), writer: *std.Io.Writer, measuring: bool, fields: bool) !void {
+            if (!fields) try writer.writeByte('{');
+            var comma = fields;
+            for (self.cells.?) |*entry| if (entry.value) |cell| {
+                if (fields and std.mem.eql(u8, cell.path, "_id")) continue;
+                if (entry.array) |array| {
+                    if (comma) try writer.writeByte(',');
+                    try writeJsonString(writer, cell.path);
+                    try writer.writeByte(':');
+                    const size = try array.size(self.scratch, .whole);
+                    if (measuring) try writer.splatByteAll(' ', size) else try array.write(self.scratch, writer, .whole);
+                } else try writeCellMember(self.scratch, writer, cell, comma);
                 comma = true;
             };
-            try writer.writeByte('}');
+            if (!fields) try writer.writeByte('}');
         }
     };
 
@@ -2563,9 +2610,9 @@ pub fn writeCellValue(scratch: Allocator, writer: *std.Io.Writer, cell: Cell, mo
                 defer @import("../types.zig").deinitJsonValue(scratch, &value);
                 try std.json.Stringify.value(value, .{}, writer);
             } else if (cell.sql_array_element_type) |kind| {
-                var decoded = try @import("../../../sql/array_storage.zig").decode(scratch, kind, cell.value.bytes_val, .{});
-                defer decoded.deinit();
-                try @import("../../../sql/array_wire.zig").encode(decoded.value, writer, .{});
+                var prepared = try @import("../query/native_array.zig").Prepared.init(scratch, kind, cell.value.bytes_val, false);
+                _ = try prepared.size(scratch, .whole);
+                try prepared.write(scratch, writer, .whole);
             } else if (cell.is_dense_vector) {
                 if (mode == .physical) try validateDenseVectorBytes(cell.value.bytes_val) else if (cell.value.bytes_val.len % 4 != 0) return error.InvalidRelationalRow;
                 try writer.writeByte('[');

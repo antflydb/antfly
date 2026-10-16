@@ -361,9 +361,83 @@ pub const View = struct {
         root_excluded: []const []const u8 = &.{},
         ranges: ?*ValidatedRanges = null,
     };
+    /// Admission has already established syntax and unique keys for this exact
+    /// pinned source. Flat terminal selectors need not inspect trailing siblings
+    /// after every requested name is found. General/deep selectors retain the
+    /// validating traversal; partial navigation never claims a complete object.
+    fn canonicalPrefixFits(view: *const View, selector: *const Selector) bool {
+        // A tiny, allocation-free probe pays only when it can avoid a large
+        // tail. Truncated strings/numbers/containers simply select the ordinary
+        // parser, so whole large values do not pay for a speculative fast path.
+        const raw = view.root.raw;
+        if (raw.len <= 4096) return false;
+        var bytes: [512]u8 = undefined;
+        var fixed = std.heap.FixedBufferAllocator.init(&bytes);
+        const prefix = raw[0..@min(raw.len, 256)];
+        var scanner = std.json.Scanner.initCompleteInput(fixed.allocator(), prefix);
+        defer scanner.deinit();
+        if ((scanner.next() catch return false) != .object_begin) return false;
+        var found: usize = 0;
+        while (true) {
+            if ((scanner.peekNextTokenType() catch return false) != .string) return false;
+            const token = scanner.nextAllocMax(fixed.allocator(), .alloc_if_needed, prefix.len) catch return false;
+            const name = switch (token) {
+                .string, .allocated_string => |name| name,
+                else => return false,
+            };
+            const wanted = selector.fields.contains(name);
+            scanner.skipValue() catch return false;
+            if (scanner.cursor >= prefix.len) return false;
+            found += @intFromBool(wanted);
+            if (found == selector.fields.count()) return true;
+        }
+    }
+    fn prepareCanonicalTerminals(view: *View, selector: *const Selector) !bool {
+        if (view.root.kind() != '{' or !view.canCopyCanonical(view.root.raw) or selector.fields.count() == 0) return false;
+        var selected = selector.fields.iterator();
+        while (selected.next()) |entry| if (std.mem.eql(u8, entry.key_ptr.*, "*") or entry.value_ptr.*.fields.count() != 0) return false;
+        if (!view.canonicalPrefixFits(selector)) return false;
+        const raw = view.root.raw;
+        errdefer view.invalidatePreparation();
+        view.root.object_index = try ObjectIndex.selected(view.alloc, selector);
+        var selected_children: std.ArrayListUnmanaged(Child) = .empty;
+        try selected_children.ensureTotalCapacityPrecise(view.alloc, selector.fields.count());
+        var work = std.heap.ArenaAllocator.init(@import("antfly_platform").allocator.reclaimingScratch(view.alloc));
+        defer work.deinit();
+        var tokens = std.heap.ArenaAllocator.init(@import("antfly_platform").allocator.reclaimingScratch(view.alloc));
+        defer tokens.deinit();
+        var scanner = std.json.Scanner.initCompleteInput(work.allocator(), raw);
+        defer scanner.deinit();
+        _ = try scanner.next();
+        var found: usize = 0;
+        while (found < selector.fields.count() and try scanner.peekNextTokenType() != .object_end) {
+            if (!tokens.reset(.{ .retain_with_limit = 4096 })) return error.OutOfMemory;
+            const token = try scanner.nextAllocMax(tokens.allocator(), .alloc_if_needed, raw.len);
+            const name = switch (token) {
+                .string, .allocated_string => |name| name,
+                else => return error.SyntaxError,
+            };
+            const wanted = selector.fields.contains(name);
+            _ = try scanner.peekNextTokenType();
+            const value_start = scanner.cursor;
+            try scanner.skipValue();
+            if (wanted) {
+                const owned = view.root.object_index.canonicalName(name) orelse try view.alloc.dupe(u8, name);
+                try view.root.object_index.put(view.alloc, owned, selected_children.items.len);
+                selected_children.appendAssumeCapacity(.{ .node = .{ .raw = raw[value_start..scanner.cursor] } });
+                found += 1;
+            }
+        }
+        selected = selector.fields.iterator();
+        while (selected.next()) |entry| if (!view.root.object_index.contains(entry.key_ptr.*)) try view.root.object_index.put(view.alloc, try view.alloc.dupe(u8, entry.key_ptr.*), std.math.maxInt(usize));
+        view.root.children = try selected_children.toOwnedSlice(view.alloc);
+        view.root.markObjectComplete(false);
+        return true;
+    }
     pub fn prepareProjectionWithOptions(view: *View, selector: *const Selector, policy: DuplicatePolicy, root_mode: RootMode, options: PreparationOptions) !void {
         const raw = view.root.raw;
         view.validated_ranges = null;
+        if (policy == .visited and !options.retain_root_fields and options.root_excluded.len == 0 and try view.prepareCanonicalTerminals(selector)) return;
         if (options.ranges) |ranges| ranges.reserveFor(raw.len);
         errdefer {
             view.root.raw = raw;
@@ -1214,4 +1288,51 @@ test "public graph metric borrowed wire validated ranges publish only after comp
     view = View.init(alloc, "{\"items\":[{\"x\":[{\"m\":1}]}]}");
     try view.prepareProjectionWithOptions(selector, .all, .object_only, .{ .defer_fanout = true, .ranges = &ranges });
     try std.testing.expect(view.validated_ranges.?.proof.all_keys);
+}
+
+test "public graph metric borrowed wire canonical terminal preparation keeps missing fields and fallback isolation" {
+    const a = std.testing.allocator;
+    var selectors_arena = std.heap.ArenaAllocator.init(a);
+    defer selectors_arena.deinit();
+    const compile = @import("json_projection_plan.zig").compile;
+    const selected = try compile(selectors_arena.allocator(), &.{.{ .parts = &.{"keep"} }});
+    var raw_builder = std.Io.Writer.Allocating.init(a);
+    defer raw_builder.deinit();
+    try raw_builder.writer.writeAll("{\"keep\":100,\"other\":{\"x\":2},\"padding\":\"");
+    try raw_builder.writer.splatByteAll('x', 1024 * 1024);
+    try raw_builder.writer.writeAll("\"}");
+    const raw = raw_builder.written();
+    const Check = struct {
+        fn run(alloc: Allocator, selector: *const Selector, input: []const u8) !void {
+            var region = std.heap.ArenaAllocator.init(alloc);
+            defer region.deinit();
+            var view = View.init(region.allocator(), input);
+            view.canonical_source = input;
+            try std.testing.expect(view.canonicalPrefixFits(selector));
+            try view.prepareProjection(selector, .visited, .object_only);
+            try std.testing.expectEqualStrings("100", (try view.field(&view.root, "keep")).?.raw);
+            // Preparation is deliberately partial; later general lookup must
+            // still discover an unplanned original member.
+            try std.testing.expectEqualStrings("{\"x\":2}", (try view.field(&view.root, "other")).?.raw);
+        }
+    };
+    try Check.run(a, selected, raw);
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(a, Check.run, .{ selected, raw });
+    var region = std.heap.ArenaAllocator.init(a);
+    defer region.deinit();
+    const missing = try compile(region.allocator(), &.{.{ .parts = &.{"missing"} }});
+    var view = View.init(region.allocator(), raw);
+    view.canonical_source = raw;
+    try view.prepareProjection(missing, .visited, .object_only);
+    try std.testing.expect((try view.field(&view.root, "missing")) == null);
+    // A caller without native admission must validate trailing syntax/keys.
+    const invalid = "{\"keep\":100,\"other\":0,\"other\":1}";
+    var ordinary = View.init(region.allocator(), invalid);
+    try std.testing.expectError(error.DuplicateField, ordinary.prepareProjection(selected, .visited, .object_only));
+    const padding = try compile(region.allocator(), &.{.{ .parts = &.{"padding"} }});
+    var zero: @import("../../lite/test_allocator.zig").BudgetAllocator = .{ .backing = a, .limit = 0 };
+    var whole = View.init(zero.allocator(), raw);
+    whole.canonical_source = raw;
+    try std.testing.expect(!try whole.prepareCanonicalTerminals(padding));
+    try std.testing.expectEqual(@as(usize, 0), zero.alloc_attempts);
 }

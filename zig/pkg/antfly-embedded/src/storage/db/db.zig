@@ -39653,6 +39653,11 @@ pub const DB = struct {
         var fallback_opts = opts;
         if (columnar_progress.delivered != 0) fallback_opts.inclusive_from = false;
 
+        var stream_plan = if (visitor.borrow_documents and opts.include_documents and !projection_plan.special.all_artifacts and !projection_plan.special.all_chunks and !projection_plan.special.all_embeddings)
+            try @import("document_query.zig").SpanProjectionPlan.init(alloc, .{ .fields = opts.fields, .include_all_fields = opts.include_all_fields })
+        else
+            null;
+        defer if (stream_plan) |*plan| plan.deinit();
         const ScanState = struct {
             const max_resident_schema_plans = 32;
             const SchemaPlan = struct {
@@ -39680,6 +39685,7 @@ pub const DB = struct {
             now_ns: u64,
             filter: ?*db_query_graph.PreparedPatternFilter,
             direct_projection_fields: ?[]const []const u8,
+            stream_plan: ?*const @import("document_query.zig").SpanProjectionPlan,
             read_txn: *docstore_mod.DocStore.Txn,
             projection_context: *TransactionProjectionContext,
             values_authenticated: bool,
@@ -39869,14 +39875,20 @@ pub const DB = struct {
                 const needs_logical_value = !relational or semantic_hash == null or
                     (state.filter != null and ordinal_filter_match == null) or
                     (state.opts.include_documents and state.direct_projection_fields == null);
-                const logical_value = if (needs_logical_value)
+                // Scan callbacks pin their borrowed storage slices until they
+                // return. A synchronous plain-document producer can keep that
+                // borrow instead of copying the entire input before projection.
+                const borrow_plain = !relational and state.visitor.borrow_documents and state.stream_plan != null;
+                const logical_value: ?[]const u8 = if (needs_logical_value)
                     if (ordinal_row) |row|
                         try row.reconstructValueAlloc(state.alloc)
+                    else if (borrow_plain)
+                        stored_value
                     else
                         try state.alloc.dupe(u8, stored_value)
                 else
                     null;
-                defer if (logical_value) |value| state.alloc.free(value);
+                defer if (logical_value) |value| if (!borrow_plain) state.alloc.free(value);
 
                 if (state.filter) |filter| if (ordinal_filter_match == null)
                     if (!(try filter.matchesStored(state.alloc, raw_key, logical_value.?)))
@@ -39889,7 +39901,13 @@ pub const DB = struct {
                     else
                         try document_content_hash.hashJson(state.alloc, logical_value.?);
                 }
-                const projected = if (state.opts.include_documents)
+                var streamed: ?@import("query/streamed_projection.zig").Context = null;
+                if (state.visitor.borrow_documents and state.opts.include_documents) {
+                    if (ordinal_row) |row| {
+                        if (row_plan.?.projection) |plan| streamed = .{ .scratch = state.alloc, .value = .{ .row = .{ .plan = plan, .row = row } } };
+                    } else if (state.stream_plan) |plan| streamed = .{ .scratch = state.alloc, .value = .{ .document = .{ .plan = plan, .raw = logical_value.? } } };
+                }
+                const projected = if (state.opts.include_documents and streamed == null)
                     if (state.direct_projection_fields) |_|
                         if (ordinal_row) |row|
                             try row_plan.?.projection.?.project(state.alloc, row)
@@ -39906,6 +39924,9 @@ pub const DB = struct {
                 else
                     null;
                 defer if (projected) |document| state.alloc.free(document);
+                if (streamed == null and state.visitor.borrow_documents) if (projected) |json| {
+                    streamed = .{ .scratch = state.alloc, .value = .{ .json_fields = json } };
+                };
 
                 try state.visitor.visitEntry(.{
                     .id = raw_key,
@@ -39917,7 +39938,8 @@ pub const DB = struct {
                     else
                         std.hash.Wyhash.hash(0, logical_value.?),
                     .content_hash = content_hash,
-                    .document_json = projected,
+                    .document_json = if (streamed == null) projected else null,
+                    .document_stream = if (streamed) |*context| context.borrow() else null,
                 });
 
                 state.count += 1;
@@ -39936,6 +39958,7 @@ pub const DB = struct {
             .now_ns = scan_now_ns,
             .filter = if (prepared_filter) |*filter| filter else null,
             .direct_projection_fields = direct_projection_fields,
+            .stream_plan = if (stream_plan) |*plan| plan else null,
             .read_txn = &read_txn,
             .projection_context = &projection_context,
             .values_authenticated = self.core.store.valuesAreAuthenticated(),
@@ -67141,6 +67164,47 @@ test "relational columnar typed masks avoid vector expansion and eliminated colu
     try std.testing.expectEqualStrings("{\"embedding\":[1],\"payload\":[1,2]}", projected.documents[0].json);
     try std.testing.expectEqual(@as(u64, 0), projection_stats.values_materialized);
     try std.testing.expectEqual(@as(u64, 0), projection_stats.logical_slots_initialized);
+    const Stream = struct {
+        expected: []const types.ScanDocument,
+        count: usize = 0,
+        fail: bool = false,
+        fn visit(ptr: ?*anyopaque, entry: types.ScanVisitEntry) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr.?));
+            try std.testing.expect(entry.document_json == null);
+            const borrowed = entry.document_stream orelse return error.TestUnexpectedResult;
+            var writer = std.Io.Writer.Allocating.init(std.testing.allocator);
+            defer writer.deinit();
+            try borrowed.writeFields(&writer.writer);
+            const expected = self.expected[self.count];
+            try std.testing.expectEqualStrings(expected.id, entry.id);
+            if (expected.json.len == 2) try std.testing.expectEqual(@as(usize, 0), writer.written().len) else {
+                try std.testing.expectEqual(@as(u8, ','), writer.written()[0]);
+                try std.testing.expectEqualStrings(expected.json[1 .. expected.json.len - 1], writer.written()[1..]);
+            }
+            self.count += 1;
+            if (self.fail) return error.Canceled;
+        }
+    };
+    var stream: Stream = .{ .expected = projected.documents };
+    const streaming_opts: types.ScanOptions = .{ .include_documents = true, .include_all_fields = false, .fields = &.{ "embedding.0", "payload" } };
+    try db.scanVisit(alloc, "", "", streaming_opts, .{ .context = &stream, .visit = Stream.visit, .borrow_documents = true });
+    try std.testing.expectEqual(projected.documents.len, stream.count);
+    stream.count = 0;
+    stream.fail = true;
+    try std.testing.expectError(error.Canceled, db.scanVisit(alloc, "", "", streaming_opts, .{ .context = &stream, .visit = Stream.visit, .borrow_documents = true }));
+    try std.testing.expectEqual(@as(usize, 1), stream.count);
+    // Dirty owners must use the same borrowed contract through the primary
+    // fallback, with no stale page payload and no duplicate delivery.
+    try db.batch(.{ .writes = &.{.{ .key = "a", .value = "{\"n\":2,\"embedding\":[9],\"payload\":[4]}" }} });
+    var dirty = try db.scan(alloc, "", "", streaming_opts);
+    defer dirty.deinit(alloc);
+    stream = .{ .expected = dirty.documents };
+    var dirty_stats: types.ColumnarScanStats = .{};
+    var dirty_opts = streaming_opts;
+    dirty_opts.columnar_stats = &dirty_stats;
+    try db.scanVisit(alloc, "", "", dirty_opts, .{ .context = &stream, .visit = Stream.visit, .borrow_documents = true });
+    try std.testing.expectEqual(dirty.documents.len, stream.count);
+    try std.testing.expect(dirty_stats.primary_rows_read > 0);
 }
 
 test "relational columnar bounded compaction splits empty ranges and resumes canceled staging" {
@@ -139502,4 +139566,42 @@ test "inline resolver replacement isolates serving graph consumers and releases 
             }
         }
     }
+}
+
+test "public graph metric borrowed wire document scan producers preserve projection and cancellation" {
+    const a = std.testing.allocator;
+    var directory = try TestDirectory.init("db-stream-projection");
+    defer directory.cleanup();
+    var db = try DB.open(a, directory.path(), .{ .start_optional_runtimes = false });
+    defer db.close();
+    try db.batch(.{ .writes = &.{
+        .{ .key = "a", .value = "{\"title\":\"first\",\"unselected\":false}" },
+        .{ .key = "b", .value = "{\"title\":\"second\"}" },
+    } });
+    const Visitor = struct {
+        count: usize = 0,
+        fail: bool = false,
+        whole: bool = false,
+        fn visit(ptr: ?*anyopaque, entry: types.ScanVisitEntry) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr.?));
+            try std.testing.expect(entry.document_json == null);
+            const producer = entry.document_stream orelse return error.TestUnexpectedResult;
+            var writer = std.Io.Writer.Allocating.init(std.testing.allocator);
+            defer writer.deinit();
+            try producer.writeFields(&writer.writer);
+            try std.testing.expectEqualStrings(if (self.count == 0) (if (self.whole) ",\"title\":\"first\",\"unselected\":false" else ",\"title\":\"first\"") else ",\"title\":\"second\"", writer.written());
+            self.count += 1;
+            if (self.fail) return error.Canceled;
+        }
+    };
+    var visitor: Visitor = .{};
+    const opts: types.ScanOptions = .{ .include_documents = true, .include_all_fields = false, .fields = &.{"title"} };
+    try db.scanVisit(a, "", "", opts, .{ .context = &visitor, .visit = Visitor.visit, .borrow_documents = true });
+    try std.testing.expectEqual(@as(usize, 2), visitor.count);
+    visitor = .{ .whole = true };
+    try db.scanVisit(a, "", "", .{ .include_documents = true }, .{ .context = &visitor, .visit = Visitor.visit, .borrow_documents = true });
+    try std.testing.expectEqual(@as(usize, 2), visitor.count);
+    visitor = .{ .fail = true };
+    try std.testing.expectError(error.Canceled, db.scanVisit(a, "", "", opts, .{ .context = &visitor, .visit = Visitor.visit, .borrow_documents = true }));
+    try std.testing.expectEqual(@as(usize, 1), visitor.count);
 }

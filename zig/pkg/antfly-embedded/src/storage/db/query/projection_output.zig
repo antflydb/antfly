@@ -18,6 +18,7 @@ const Allocator = std.mem.Allocator;
 const Value = std.json.Value;
 const EmbeddingFields = @import("embedding_fields.zig").EmbeddingFields;
 const View = @import("json_view.zig").View;
+const native_array = @import("native_array.zig");
 const plan_mod = @import("json_projection_plan.zig");
 
 /// Owns independently reclaimable cursors, including primed selections which
@@ -192,6 +193,7 @@ pub const NativeCell = struct {
     column: *const @import("../../schema.zig").RelationalColumn,
     alloc: Allocator,
     cached: ?*const Value = null,
+    prepared_array: ?*native_array.Prepared = null,
     materialized_count: ?*u64 = null,
     fn kind(self: *const @This()) u8 {
         if (self.cell.is_null) return 0;
@@ -201,11 +203,28 @@ pub const NativeCell = struct {
             else => 0,
         };
     }
+    fn array(self: *@This()) !*native_array.Prepared {
+        if (self.prepared_array) |prepared| return prepared;
+        const prepared = try self.alloc.create(native_array.Prepared);
+        errdefer self.alloc.destroy(prepared);
+        prepared.* = try native_array.Prepared.init(self.alloc, self.column.sql_element_type orelse return error.InvalidRelationalRow, self.cell.value.bytes_val, true);
+        self.prepared_array = prepared;
+        return prepared;
+    }
     pub fn write(self: *@This(), scratch: Allocator, writer: *std.Io.Writer) !void {
+        return self.writeMode(scratch, writer, false);
+    }
+    pub fn writeMode(self: *@This(), scratch: Allocator, writer: *std.Io.Writer, measuring: bool) !void {
+        if (self.column.column_type == .sql_array and !self.cell.is_null) return self.writeArray(scratch, writer, .whole, measuring);
         if (self.cached) |value| return std.json.Stringify.value(value.*, .{}, writer);
         try @import("../algebraic/relational_row_codec.zig").writeCellValue(scratch, writer, self.cell, .logical);
     }
 
+    fn writeArray(self: *@This(), scratch: Allocator, writer: *std.Io.Writer, part: native_array.Part, measuring: bool) !void {
+        const prepared = try self.array();
+        const size = try prepared.size(scratch, part);
+        if (measuring) try writer.splatByteAll(' ', size) else try prepared.write(scratch, writer, part);
+    }
     fn logical(self: *@This()) !*const Value {
         if (self.cached == null) {
             const value = try self.alloc.create(Value);
@@ -222,6 +241,7 @@ pub const NativeCell = struct {
 /// containers become mutable only when an ordered selector needs to change one.
 /// Neither the view nor a loaded source is ever mutated by projection.
 pub const Source = union(enum) {
+    sql_array: struct { cell: *NativeCell, part: native_array.Part },
     native: *NativeCell,
     span: struct { view: *View, node: *View.Node },
     logical: *const Value,
@@ -232,6 +252,7 @@ pub const Source = union(enum) {
 
     fn kind(self: Source) u8 {
         return switch (self) {
+            .sql_array => '[',
             .native => |cell| cell.kind(),
             .embeddings, .embedding_stream => '{',
             .vector => '[',
@@ -246,7 +267,15 @@ pub const Source = union(enum) {
     }
     fn field(self: Source, alloc: Allocator, name: []const u8) !?Source {
         return switch (self) {
-            .native => |cell| if (cell.kind() == '{') (if ((try cell.logical()).object.getPtr(name)) |value| .{ .logical = value } else null) else null,
+            .sql_array => null,
+            .native => |cell| blk: {
+                if (cell.kind() != '{') break :blk null;
+                if (cell.column.column_type == .sql_array) {
+                    const part: native_array.Part = if (std.mem.eql(u8, name, "dimensions")) .dimensions else if (std.mem.eql(u8, name, "values")) .values else if (std.mem.eql(u8, name, "sql_nulls")) .sql_nulls else break :blk null;
+                    break :blk .{ .sql_array = .{ .cell = cell, .part = part } };
+                }
+                break :blk if ((try cell.logical()).object.getPtr(name)) |value| .{ .logical = value } else null;
+            },
             .embedding_stream => |stream| if (try stream.getField(alloc, name)) |v| .{ .vector = v } else null,
             .embeddings => |fields| if (fields.values.get(name)) |v| .{ .vector = v } else null,
             .vector, .component => null,
@@ -254,8 +283,35 @@ pub const Source = union(enum) {
             .logical => |v| if (v.* == .object) (if (v.object.getPtr(name)) |value| .{ .logical = value } else null) else null,
         };
     }
-    fn element(self: Source, index: usize) !?Source {
+    fn element(self: Source, alloc: Allocator, index: usize) !?Source {
         return switch (self) {
+            .sql_array => |source| blk: {
+                const array = try source.cell.array();
+                if (index >= array.length(source.part)) break :blk null;
+                if (source.part == .values and array.view.kind == .jsonb) {
+                    const cell = try array.view.cell(index);
+                    if (!cell.sql_null) {
+                        const view = try alloc.create(View);
+                        view.* = .init(alloc, cell.bytes);
+                        view.canonical_source = cell.bytes;
+                        break :blk .{ .span = .{ .view = view, .node = &view.root } };
+                    }
+                }
+                const value = try alloc.create(Value);
+                value.* = switch (source.part) {
+                    .whole => unreachable,
+                    .values => try array.value(alloc, index),
+                    .sql_nulls => .{ .bool = (try array.view.cell(index)).sql_null },
+                    .dimensions => dimension: {
+                        const d = try array.view.dimension(index);
+                        var object = std.json.ObjectMap.empty;
+                        try object.put(alloc, "length", .{ .integer = d.length });
+                        try object.put(alloc, "lower_bound", .{ .integer = d.lower });
+                        break :dimension .{ .object = object };
+                    },
+                };
+                break :blk .{ .logical = value };
+            },
             .native => |cell| blk: {
                 if (cell.kind() != '[' or index >= cell.cell.value.bytes_val.len / 4) break :blk null;
                 const bytes = cell.cell.value.bytes_val[index * 4 ..][0..4];
@@ -335,12 +391,16 @@ pub const Output = union(enum) {
     fn copyObject(a: Allocator, dst: *Object, source: Source) !void {
         switch (source) {
             .native => |cell| {
+                if (cell.column.column_type == .sql_array) {
+                    for ([_][]const u8{ "dimensions", "values", "sql_nulls" }) |name| try put(a, dst, name, .{ .borrowed = (try source.field(a, name)).? });
+                    return;
+                }
                 const value = try cell.logical();
                 for (value.object.keys(), value.object.values()) |name, *child| try put(a, dst, name, .{ .borrowed = .{ .logical = child } });
             },
             .embedding_stream => |stream| try copyObject(a, dst, .{ .embeddings = try stream.fields(a) }),
             .embeddings => |fields| for (fields.values.keys(), fields.values.values()) |name, vector| try put(a, dst, name, .{ .borrowed = .{ .vector = vector } }),
-            .vector, .component => unreachable,
+            .sql_array, .vector, .component => unreachable,
             .logical => |v| for (v.object.keys(), v.object.values()) |name, *value| {
                 try put(a, dst, name, .{ .borrowed = .{ .logical = value } });
             },
@@ -391,7 +451,7 @@ pub const Output = union(enum) {
             '[' => {
                 var result: std.ArrayListUnmanaged(Output) = .empty;
                 if (View.projectionIndex(path[0])) |index| {
-                    const item = (try source.element(index)) orelse return;
+                    const item = (try source.element(a, index)) orelse return;
                     if (path.len == 1) {
                         try result.append(a, .{ .borrowed = item });
                     } else if (item.kind() == '{') {
@@ -473,11 +533,35 @@ pub const Output = union(enum) {
         const Emission = struct {
             value: Output,
             context: *StreamContext,
+            pub fn exactSize(emission: @This()) !?usize {
+                if (!emission.value.hasNativeArray()) return null;
+                var counter = std.Io.Writer.Discarding.init(&.{});
+                emission.context.measuring = true;
+                defer emission.context.measuring = false;
+                try emission.value.write(emission.context, &counter.writer);
+                return std.math.cast(usize, counter.fullCount()) orelse error.OutOfMemory;
+            }
             pub fn write(emission: @This(), writer: *std.Io.Writer) anyerror!void {
                 try emission.value.write(emission.context, writer);
             }
         };
         return @import("serialized_output.zig").alloc(output, exact, Emission{ .value = self, .context = &context });
+    }
+
+    fn hasNativeArray(self: Output) bool {
+        return switch (self) {
+            .borrowed => |source| source == .sql_array or (source == .native and source.native.column.column_type == .sql_array),
+            .object => |object| blk: {
+                for (object.values()) |child| if (child.hasNativeArray()) break :blk true;
+                break :blk false;
+            },
+            .array => |array| blk: {
+                for (array.items) |child| if (child.hasNativeArray()) break :blk true;
+                break :blk false;
+            },
+            .overlay => |overlay| (Output{ .borrowed = overlay.base }).hasNativeArray() or (Output{ .object = overlay.changed }).hasNativeArray(),
+            .fanout => |fanout| fanout.source == .sql_array,
+        };
     }
 
     /// A transport with its own writer can stream the body without allocating
@@ -487,10 +571,23 @@ pub const Output = union(enum) {
         defer context.deinit();
         try self.write(&context, writer);
     }
+    /// Emit flat scan members while the source owner is pinned. The transport
+    /// owns the surrounding object and authoritative _id. Every member begins
+    /// with a comma; no intermediate JSON document is allocated.
+    pub fn writeFieldsTo(self: Output, scratch: Allocator, writer: *std.Io.Writer) !void {
+        if (self != .object) return error.InvalidProjectedDocumentJson;
+        var context = StreamContext.init(scratch);
+        defer context.deinit();
+        var count: usize = 1;
+        for (self.object.keys(), self.object.values()) |name, child| {
+            if (!std.mem.eql(u8, name, "_id")) try writeMember(&context, writer, &count, name, child);
+        }
+    }
     fn write(self: Output, context: *StreamContext, writer: *std.Io.Writer) anyerror!void {
         switch (self) {
             .borrowed => |source| switch (source) {
-                .native => |cell| try cell.write(context.work, writer),
+                .sql_array => |source_array| try source_array.cell.writeArray(context.work, writer, source_array.part, context.measuring),
+                .native => |cell| try cell.writeMode(context.work, writer, context.measuring),
                 .embedding_stream => |stream| try stream.write(writer),
                 .span => |s| if (s.view.canCopyCanonical(s.node.raw)) try writer.writeAll(s.node.raw) else try context.writeSpan(writer, s.node.raw, s.view.parse_numbers),
                 .logical => |v| try std.json.Stringify.value(v.*, .{}, writer),
@@ -582,10 +679,14 @@ pub const Output = union(enum) {
         try writer.writeByte('{');
         switch (overlay.base) {
             .native => |cell| {
-                const value = try cell.logical();
-                for (value.object.keys(), value.object.values()) |name, *child| try writeBaseMember(context, writer, overlay, emitted, &count, name, .{ .logical = child });
+                if (cell.column.column_type == .sql_array) {
+                    for ([_][]const u8{ "dimensions", "values", "sql_nulls" }) |name| try writeBaseMember(context, writer, overlay, emitted, &count, name, (try overlay.base.field(work, name)).?);
+                } else {
+                    const value = try cell.logical();
+                    for (value.object.keys(), value.object.values()) |name, *child| try writeBaseMember(context, writer, overlay, emitted, &count, name, .{ .logical = child });
+                }
             },
-            .vector, .component => unreachable,
+            .sql_array, .vector, .component => unreachable,
             .embedding_stream => |stream| {
                 if (stream.cached_complete) {
                     const fields = &stream.cached.?;
@@ -657,6 +758,7 @@ fn resetScratch(arena: *std.heap.ArenaAllocator) Allocator.Error!void {
 /// One bounded pool for all terminals in a response. No borrowed token or
 /// duplicate-key entry survives its container; completed depths are reusable.
 const StreamContext = struct {
+    measuring: bool = false,
     work: Allocator,
     scanners: std.heap.ArenaAllocator,
     keys: @import("antfly-json").ObjectKeyWorkspace(FrameState),
@@ -809,6 +911,10 @@ const FanoutRows = struct {
         self.scratch = null;
     }
     fn next(self: *FanoutRows) anyerror!?Output.Object {
+        if (self.source == .sql_array) {
+            const source = self.source.sql_array;
+            if (source.part == .sql_nulls or (source.part == .values and (try source.cell.array()).view.kind != .jsonb)) return null;
+        }
         if (self.source == .vector or (self.source == .native and self.source.native.kind() == '[')) return null;
         var retire_row = self.scratch != null;
         const slot = self.scratch orelse acquired: {
@@ -827,6 +933,12 @@ const FanoutRows = struct {
             retire_row = true;
             const a = slot.arena.allocator();
             const item: Source = switch (self.source) {
+                .sql_array => |source_array| blk: {
+                    if (self.index >= (try source_array.cell.array()).length(source_array.part)) return null;
+                    const item = (try self.source.element(a, self.index)).?;
+                    self.index += 1;
+                    break :blk item;
+                },
                 .native => unreachable,
                 .vector => return null,
                 .embeddings, .embedding_stream, .component => unreachable,

@@ -16598,6 +16598,38 @@ fn scanNdjsonWithConsistencyAlloc(
     return try visitor.out.toOwnedSlice(alloc);
 }
 
+/// Consume a row-local producer before the scan cursor can advance. The sink
+/// owns network backpressure; its exact failure survives both writer adapters.
+fn writeBorrowedScanLine(entry: db_mod.types.ScanVisitEntry, sink: ScanStreamSink, opts: db_mod.types.ScanOptions) !void {
+    const Guard = struct {
+        sink: ScanStreamSink,
+        opts: db_mod.types.ScanOptions,
+        fn start(_: ?*anyopaque) !void {}
+        fn send(ptr: ?*anyopaque, bytes: []const u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr.?));
+            if (self.opts.cancellation) |token| if (token.isCancelled()) return error.Canceled;
+            _ = try scanRemainingTimeoutMs(self.opts);
+            try self.sink.write(bytes);
+        }
+        fn emit(writer: *std.Io.Writer, row: db_mod.types.ScanVisitEntry) !void {
+            try writer.writeAll("{\"_id\":");
+            try std.json.Stringify.value(row.id, .{}, writer);
+            if (row.content_hash) |hash| {
+                try writer.writeAll(",\"_content_hash\":\"");
+                try writer.writeAll(&std.fmt.bytesToHex(hash, .lower));
+                try writer.writeByte('"');
+            }
+            try row.document_stream.?.writeFields(writer);
+            try writer.writeAll("}\n");
+        }
+    };
+    var guard: Guard = .{ .sink = sink, .opts = opts };
+    var output: ScanStreamSink.Writer = undefined;
+    output.init(.{ .context = &guard, .start_fn = Guard.start, .write_fn = Guard.send });
+    Guard.emit(&output.writer, entry) catch |err| return output.failure orelse err;
+    try output.finish();
+}
+
 fn scanNdjsonWithConsistencyToSink(
     alloc: std.mem.Allocator,
     reads: raft_mod.FeatureDBReads,
@@ -16621,9 +16653,10 @@ fn scanNdjsonWithConsistencyToSink(
         alloc: std.mem.Allocator,
         sink: ScanStreamSink,
         line: std.ArrayListUnmanaged(u8) = .empty,
-
+        opts: db_mod.types.ScanOptions,
         fn visit(raw_context: ?*anyopaque, entry: db_mod.types.ScanVisitEntry) anyerror!void {
             const visitor: *@This() = @ptrCast(@alignCast(raw_context orelse return error.InvalidArgument));
+            if (entry.document_stream != null) return writeBorrowedScanLine(entry, visitor.sink, visitor.opts);
             visitor.line.clearRetainingCapacity();
             if (entry.relational_schema_version) |version| {
                 try appendRelationalScanLine(visitor.alloc, &visitor.line, entry, version);
@@ -16638,13 +16671,14 @@ fn scanNdjsonWithConsistencyToSink(
         }
     };
 
-    var visitor = NdjsonVisitor{ .alloc = alloc, .sink = sink };
+    var visitor = NdjsonVisitor{ .alloc = alloc, .sink = sink, .opts = opts };
     defer visitor.line.deinit(alloc);
     try reads.reads.prepareScanWithConsistency(reads.group_id, from_key, to_key, opts, consistency);
     try sink.start();
     try db.scanVisit(alloc, from_key, to_key, opts, .{
         .context = &visitor,
         .visit = NdjsonVisitor.visit,
+        .borrow_documents = true,
     });
 }
 
@@ -35098,4 +35132,56 @@ test "native retained routing chooses one carrier after split merge and rejects 
     fixture.tables[0].table_id = 8;
     merged[0].table_id = 8;
     try std.testing.expectError(error.CatalogGenerationChanged, requestRoutedSpanSnapshot(a, source, "docs", "", "", .{ .search = req }, null));
+}
+
+test "public graph metric borrowed wire scan producer sink preserves bytes and failures across writer boundaries" {
+    const a = std.testing.allocator;
+    const Producer = struct {
+        large: bool = false,
+        fn write(ptr: ?*anyopaque, destination: db_mod.types.BorrowedScanDocument.WriterBorrow) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr.?));
+            var receiver = destination.receive();
+            const writer = receiver.writer();
+            try writer.writeAll(",\"title\":\"");
+            if (self.large) try writer.splatByteAll('x', 64 * 1024) else try writer.writeAll("alpha");
+            try writer.writeByte('"');
+            try receiver.finish();
+        }
+    };
+    const Capture = struct {
+        output: std.Io.Writer.Allocating,
+        fail: bool = false,
+        writes: usize = 0,
+        fn start(_: ?*anyopaque) !void {}
+        fn write(ptr: ?*anyopaque, bytes: []const u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr.?));
+            self.writes += 1;
+            if (self.fail) return error.DeadlineExceeded;
+            try self.output.writer.writeAll(bytes);
+        }
+        fn sink(self: *@This()) ScanStreamSink {
+            return .{ .context = self, .start_fn = start, .write_fn = write };
+        }
+    };
+    var producer: Producer = .{};
+    var capture: Capture = .{ .output = .init(a) };
+    defer capture.output.deinit();
+    var entry: db_mod.types.ScanVisitEntry = .{ .id = "server\"id", .hash = 0, .document_stream = .{ .context = &producer, .write_fields_fn = Producer.write } };
+    try writeBorrowedScanLine(entry, capture.sink(), .{});
+    try std.testing.expectEqualStrings("{\"_id\":\"server\\\"id\",\"title\":\"alpha\"}\n", capture.output.written());
+    capture.fail = true;
+    producer.large = true;
+    capture.writes = 0;
+    try std.testing.expectError(error.DeadlineExceeded, writeBorrowedScanLine(entry, capture.sink(), .{}));
+    try std.testing.expectEqual(@as(usize, 1), capture.writes);
+    const long_id = try a.alloc(u8, 8192);
+    defer a.free(long_id);
+    @memset(long_id, 'x');
+    entry.id = long_id;
+    capture.writes = 0;
+    try std.testing.expectError(error.DeadlineExceeded, writeBorrowedScanLine(entry, capture.sink(), .{}));
+    try std.testing.expectEqual(@as(usize, 1), capture.writes);
+    // An already expired request fails before forwarding buffered bytes.
+    capture.fail = false;
+    try std.testing.expectError(error.DeadlineExceeded, writeBorrowedScanLine(entry, capture.sink(), .{ .execution_deadline_ns = 1 }));
 }

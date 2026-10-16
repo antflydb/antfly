@@ -133,11 +133,38 @@ pub const Plan = struct {
         return self.projectSourcesPolicy(alloc, scratch, source, false);
     }
     pub fn projectSourcesPolicy(self: Plan, alloc: std.mem.Allocator, scratch: std.mem.Allocator, source: Sources, exact: bool) ![]u8 {
+        return (try self.projectSourcesInto(alloc, scratch, source, exact, null)).?;
+    }
+    pub fn writeSourcesFields(self: Plan, scratch: std.mem.Allocator, source: Sources, writer: *std.Io.Writer) !void {
+        _ = try self.projectSourcesInto(scratch, scratch, source, false, writer);
+    }
+    pub fn writeRowFields(self: Plan, scratch: std.mem.Allocator, row: codec.OrdinalRowView, writer: *std.Io.Writer) !void {
+        if (self.base.schema_version != row.table_schema.version) return error.RelationalRowSchemaMismatch;
+        if (self.paths.len == 0) {
+            var emitter: codec.OrdinalRowView.ProjectionWriter = .{ .row = row, .scratch = @import("antfly_platform").allocator.reclaimingScratch(scratch), .plan = self.base };
+            defer emitter.deinit();
+            return emitter.writeFields(writer);
+        }
+        var arena = std.heap.ArenaAllocator.init(@import("antfly_platform").allocator.reclaimingScratch(scratch));
+        defer arena.deinit();
+        const a = arena.allocator();
+        var sources: Sources = .empty;
+        for (self.base.ordinals) |ordinal| {
+            const cell = (try row.findCell(ordinal)) orelse continue;
+            try sources.put(a, row.table_schema.relational_columns[ordinal].name, try sourceForCell(a, &row.table_schema.relational_columns[ordinal], cell, true));
+        }
+        try self.writeSourcesFields(a, sources, writer);
+    }
+    fn projectSourcesInto(self: Plan, alloc: std.mem.Allocator, scratch: std.mem.Allocator, source: Sources, exact: bool, writer: ?*std.Io.Writer) !?[]u8 {
         const Projection = @import("projection_output.zig").Output;
-        if (self.paths.len == 0) return @import("serialized_output.zig").alloc(alloc, exact, SourceWriter{
-            .source = source,
-            .scratch = @import("antfly_platform").allocator.reclaimingScratch(scratch),
-        });
+        if (self.paths.len == 0) {
+            const emitter: SourceWriter = .{ .source = source, .scratch = @import("antfly_platform").allocator.reclaimingScratch(scratch) };
+            if (writer) |sink| {
+                try emitter.emit(sink, false, true);
+                return null;
+            }
+            return try @import("serialized_output.zig").alloc(alloc, exact, emitter);
+        }
         // Navigation belongs to this response, never to a retained page view.
         // Logical-only projections keep their existing allocator fast path.
         var navigation = std.heap.ArenaAllocator.init(@import("antfly_platform").allocator.reclaimingScratch(scratch));
@@ -187,24 +214,45 @@ pub const Plan = struct {
                 .logical => |*logical| try Projection.includePlanned(&projection_owner, &result, parts[0], .{ .logical = logical }, parts[1..], null),
             }
         }
-        return (Projection{ .object = result }).serializeWithPolicy(row_alloc, alloc, exact);
+        if (writer) |sink| {
+            try (Projection{ .object = result }).writeFieldsTo(row_alloc, sink);
+            return null;
+        }
+        return try (Projection{ .object = result }).serializeWithPolicy(row_alloc, alloc, exact);
     }
     const SourceWriter = struct {
         source: Sources,
         scratch: std.mem.Allocator,
+        pub fn exactSize(self: @This()) !?usize {
+            var found = false;
+            for (self.source.values()) |source| if (source == .native and source.native.column.column_type == .sql_array) {
+                found = true;
+                break;
+            };
+            if (!found) return null;
+            var counter = std.Io.Writer.Discarding.init(&.{});
+            try self.emit(&counter.writer, true, false);
+            return std.math.cast(usize, counter.fullCount()) orelse error.OutOfMemory;
+        }
         pub fn write(self: @This(), writer: *std.Io.Writer) anyerror!void {
-            try writer.writeByte('{');
-            for (self.source.keys(), self.source.values(), 0..) |name, value, i| {
-                if (i != 0) try writer.writeByte(',');
+            return self.emit(writer, false, false);
+        }
+        fn emit(self: @This(), writer: *std.Io.Writer, measuring: bool, fields: bool) !void {
+            if (!fields) try writer.writeByte('{');
+            var comma = fields;
+            for (self.source.keys(), self.source.values()) |name, value| {
+                if (fields and std.mem.eql(u8, name, "_id")) continue;
+                if (comma) try writer.writeByte(',');
+                comma = true;
                 try std.json.Stringify.value(name, .{}, writer);
                 try writer.writeByte(':');
                 switch (value) {
                     .logical => |logical| try std.json.Stringify.value(logical, .{}, writer),
                     .json => |view| try writer.writeAll(view.root.raw),
-                    .native => |native| try native.write(self.scratch, writer),
+                    .native => |native| try native.writeMode(self.scratch, writer, measuring),
                 }
             }
-            try writer.writeByte('}');
+            if (!fields) try writer.writeByte('}');
         }
     };
 };
@@ -663,7 +711,7 @@ test "public graph metric borrowed wire borrowed native composites preserve orde
         const bytes = try overlay.projectSources(a, legacy.allocator(), typed_sources);
         defer a.free(bytes);
         try std.testing.expectEqualStrings(expected, bytes);
-        try std.testing.expectEqual(@as(u64, 2), materialized);
+        try std.testing.expectEqual(@as(u64, 1), materialized);
     }
 }
 
@@ -695,6 +743,82 @@ test "public graph metric borrowed wire wide native writer snapshot releases met
             defer output.deinit();
             const bytes = try p.projectWithOutputPolicy(alloc, output.allocator(), input, false);
             try std.testing.expectEqualStrings(expected, bytes);
+        }
+    };
+    try Check.run(a, plan, row);
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(a, Check.run, .{ plan, row });
+}
+
+test "public graph metric borrowed wire flat SQL array indexed projection and streaming bound scratch" {
+    const a = std.testing.allocator;
+    const arrays = @import("../../../sql/array_value.zig");
+    const storage = @import("../../../sql/array_storage.zig");
+    const elements = try a.alloc(arrays.Element, 32768);
+    defer a.free(elements);
+    for (elements) |*element| element.* = arrays.Element.json(.{ .integer = 42 });
+    const value = try arrays.Value.init(.int64, &.{.{ .length = 32768, .lower = -2 }}, elements, .{});
+    const raw = try storage.encodeAlloc(a, value, .{});
+    defer a.free(raw);
+    const columns = [_]schema.RelationalColumn{.{ .name = "array", .path = "array", .column_type = .sql_array, .sql_element_type = .int64 }};
+    const table: schema.TableSchema = .{ .version = 1, .storage_mode = .relational, .relational_columns = &columns };
+    var layout = try codec.PhysicalLayout.init(a, table);
+    defer layout.deinit();
+    const bytes = try codec.serializeOrdinal(a, 1, &columns, &.{.{ .ordinal = 0, .path = "array", .value_type = .bytes_val, .sql_array_element_type = .int64, .value = .{ .bytes_val = raw } }}, @splat(0));
+    defer a.free(bytes);
+    const row = try codec.ordinalRowViewSelective(bytes, table, &layout);
+    const fields = [_][]const u8{ "array", "array.values.0", "array.dimensions.0.lower_bound", "array.sql_nulls.32767", "array.values.missing" };
+    for (fields) |field| {
+        var plan = try Plan.init(a, table, &layout, &.{field});
+        defer plan.deinit();
+        var no_resize: @import("../../lite/test_allocator.zig").NoResizeAllocator = .{ .backing = a };
+        var budget: @import("../../lite/test_allocator.zig").BudgetAllocator = .{ .backing = no_resize.allocator(), .limit = 16 * 1024 };
+        const exact = try plan.projectWithOutputPolicy(budget.allocator(), a, row, true);
+        defer a.free(exact);
+        const ordinary = try plan.projectWithOutputPolicy(budget.allocator(), a, row, false);
+        defer a.free(ordinary);
+        try std.testing.expectEqualStrings(ordinary, exact);
+        if (std.mem.eql(u8, field, "array.values.0")) try std.testing.expectEqualStrings("{\"array\":{\"values\":[\"42\"]}}", exact);
+        var stream = std.Io.Writer.Allocating.init(a);
+        defer stream.deinit();
+        try plan.writeRowFields(budget.allocator(), row, &stream.writer);
+        if (exact.len == 2) try std.testing.expectEqual(@as(usize, 0), stream.written().len) else {
+            try std.testing.expectEqual(@as(u8, ','), stream.written()[0]);
+            try std.testing.expectEqualStrings(exact[1 .. exact.len - 1], stream.written()[1..]);
+        }
+        try std.testing.expectEqual(@as(usize, 0), budget.live);
+        if (plan.paths.len == 0) try std.testing.expectEqual(@as(usize, 0), budget.alloc_calls);
+    }
+}
+
+test "public graph metric borrowed wire multiple prepared SQL arrays release sidecars on every failure" {
+    const a = std.testing.allocator;
+    const arrays = @import("../../../sql/array_value.zig");
+    const storage = @import("../../../sql/array_storage.zig");
+    const value = try arrays.Value.init(.int64, &.{.{ .length = 2 }}, &.{ arrays.Element.json(.{ .integer = 42 }), .{} }, .{});
+    const raw = try storage.encodeAlloc(a, value, .{});
+    defer a.free(raw);
+    const columns = [_]schema.RelationalColumn{
+        .{ .name = "a", .path = "a", .column_type = .sql_array, .sql_element_type = .int64 },
+        .{ .name = "b", .path = "b", .column_type = .sql_array, .sql_element_type = .int64 },
+    };
+    const table: schema.TableSchema = .{ .version = 1, .storage_mode = .relational, .relational_columns = &columns };
+    var layout = try codec.PhysicalLayout.init(a, table);
+    defer layout.deinit();
+    const bytes = try codec.serializeOrdinal(a, 1, &columns, &.{
+        .{ .ordinal = 0, .path = "a", .value_type = .bytes_val, .sql_array_element_type = .int64, .value = .{ .bytes_val = raw } },
+        .{ .ordinal = 1, .path = "b", .value_type = .bytes_val, .sql_array_element_type = .int64, .value = .{ .bytes_val = raw } },
+    }, @splat(0));
+    defer a.free(bytes);
+    const row = try codec.ordinalRowViewSelective(bytes, table, &layout);
+    var plan = try Plan.init(a, table, &layout, &.{ "a", "b" });
+    defer plan.deinit();
+    const Check = struct {
+        fn run(alloc: std.mem.Allocator, p: Plan, input: codec.OrdinalRowView) !void {
+            for ([_]bool{ false, true }) |exact| {
+                const result = try p.projectWithOutputPolicy(alloc, alloc, input, exact);
+                defer alloc.free(result);
+                try std.testing.expectEqualStrings("{\"a\":{\"dimensions\":[{\"length\":2,\"lower_bound\":1}],\"values\":[\"42\",null],\"sql_nulls\":[false,true]},\"b\":{\"dimensions\":[{\"length\":2,\"lower_bound\":1}],\"values\":[\"42\",null],\"sql_nulls\":[false,true]}}", result);
+            }
         }
     };
     try Check.run(a, plan, row);

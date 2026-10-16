@@ -115,7 +115,60 @@ pub fn lookupJsonWithSources(alloc: Allocator, output: Allocator, raw: []const u
     return lookupJsonWithSourcesPolicy(alloc, output, raw, plan, sources, false);
 }
 pub fn lookupJsonWithSourcesPolicy(alloc: Allocator, output: Allocator, raw: []const u8, plan: *const SpanProjectionPlan, sources: []const ProjectionSource, exact: bool) !types.LookupResult {
-    if (plan.passthrough and sources.len == 0) return .{ .json = try output.dupe(u8, raw) };
+    return lookupJsonDestination(alloc, output, raw, plan, sources, exact, null);
+}
+pub fn writeLookupFields(alloc: Allocator, writer: *std.Io.Writer, raw: []const u8, plan: *const SpanProjectionPlan) !void {
+    _ = try lookupJsonDestination(alloc, alloc, raw, plan, &.{}, false, writer);
+}
+/// Stream an admitted stored/projected object without retaining a second body.
+/// Keep the legacy number-normalization boundary when a literal _id forced a
+/// logical parse; otherwise preserve original value lexemes and escape spelling.
+pub fn writeRawScanFields(alloc: Allocator, writer: *std.Io.Writer, raw: []const u8) !void {
+    if (try writePassthroughFields(alloc, writer, raw)) return;
+    var plan = (try SpanProjectionPlan.init(alloc, .{})).?;
+    defer plan.deinit();
+    try writeLookupFields(alloc, writer, raw, &plan);
+}
+fn writePassthroughFields(alloc: Allocator, writer: *std.Io.Writer, raw: []const u8) !bool {
+    if (std.mem.indexOf(u8, raw, "\"_id\"") != null) return false;
+    const object = std.mem.trim(u8, raw, " \t\r\n");
+    if (object.len < 2 or object[0] != '{' or object[object.len - 1] != '}') return error.InvalidProjectedDocumentJson;
+    const fields = object[1 .. object.len - 1];
+    if (std.mem.trim(u8, fields, " \t\r\n").len == 0) return true;
+    if (std.mem.indexOfScalar(u8, object, '\\') == null) {
+        try writer.writeByte(',');
+        try writer.writeAll(fields);
+        return true;
+    }
+    // Escaped root names can spell _id without the literal token. Decode only
+    // keys and stream original member bytes, retaining no value-sized scratch.
+    const work = @import("antfly_platform").allocator.reclaimingScratch(alloc);
+    var scanner = std.json.Scanner.initCompleteInput(work, object);
+    defer scanner.deinit();
+    var keys = std.heap.ArenaAllocator.init(work);
+    defer keys.deinit();
+    _ = try scanner.next();
+    while (try scanner.peekNextTokenType() != .object_end) {
+        if (!keys.reset(.{ .retain_with_limit = 4096 })) return error.OutOfMemory;
+        const start = scanner.cursor;
+        const token = try scanner.nextAllocMax(keys.allocator(), .alloc_if_needed, object.len);
+        const name = switch (token) {
+            .string, .allocated_string => |key| key,
+            else => return error.SyntaxError,
+        };
+        try scanner.skipValue();
+        if (!std.mem.eql(u8, name, "_id")) {
+            try writer.writeByte(',');
+            try writer.writeAll(object[start..scanner.cursor]);
+        }
+    }
+    _ = try scanner.next();
+    if (try scanner.next() != .end_of_document) return error.SyntaxError;
+    return true;
+}
+fn lookupJsonDestination(alloc: Allocator, output: Allocator, raw: []const u8, plan: *const SpanProjectionPlan, sources: []const ProjectionSource, exact: bool, writer: ?*std.Io.Writer) !types.LookupResult {
+    if (writer == null and plan.passthrough and sources.len == 0) return .{ .json = try output.dupe(u8, raw) };
+    if (writer != null and plan.passthrough and sources.len == 0 and try writePassthroughFields(alloc, writer.?, raw)) return .{ .json = @constCast("") };
     var arena = std.heap.ArenaAllocator.init(@import("antfly_platform").allocator.reclaimingScratch(alloc));
     defer arena.deinit();
     const a = arena.allocator();
@@ -135,6 +188,10 @@ pub fn lookupJsonWithSourcesPolicy(alloc: Allocator, output: Allocator, raw: []c
     if (plan.include_all or plan.passthrough) {
         try Projection.includePreparedRootExcept(&projection_owner, &projected, &view, plan.excluded);
     } else for (plan.paths) |path| try Projection.includeRoot(&projection_owner, &projected, &view, path);
+    if (writer) |sink| {
+        try (Projection{ .object = projected }).writeFieldsTo(a, sink);
+        return .{ .json = @constCast("") };
+    }
     return .{ .json = try (Projection{ .object = projected }).serializeWithPolicy(a, output, exact) };
 }
 
@@ -981,4 +1038,19 @@ test "public graph metric borrowed wire exact policy keeps raw passthrough indep
     defer result.deinit(a);
     try std.testing.expectEqualStrings(raw, result.json);
     try std.testing.expectEqual(@as(usize, 0), refused.alloc_index);
+}
+
+test "public graph metric borrowed wire raw scan fields preserve lexemes and reserve decoded identity" {
+    const a = std.testing.allocator;
+    const inputs = [_][]const u8{
+        "{}",                               "{ }",                                  "  {\n}\t",                       "{\"n\":1e2}",
+        "{\"n\":1e2,\"text\":\"\\u0061\"}", "{\"\\u005fid\":\"stored\",\"n\":1e2}", "{\"_id\":\"stored\",\"n\":1e2}",
+    };
+    const expected = [_][]const u8{ "", "", "", ",\"n\":1e2", ",\"n\":1e2,\"text\":\"\\u0061\"", ",\"n\":1e2", ",\"n\":100" };
+    for (inputs, expected) |raw, want| {
+        var writer = std.Io.Writer.Allocating.init(a);
+        defer writer.deinit();
+        try writeRawScanFields(a, &writer.writer, raw);
+        try std.testing.expectEqualStrings(want, writer.written());
+    }
 }
