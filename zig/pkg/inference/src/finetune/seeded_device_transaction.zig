@@ -27,6 +27,9 @@ const Allocator = std.mem.Allocator;
 const CT = ops.CT;
 const mib = 1024 * 1024;
 const batch_capacity = 256;
+/// Finite validations and norms take every selected tensor in one call, so
+/// each costs one synchronization rather than one per 256 tensors.
+const validation_capacity = 4096;
 
 pub const Identity = struct { optimizer_step: u64, microbatch_step: u64 };
 pub const Group = struct {
@@ -54,6 +57,12 @@ pub const State = struct {
     pytorch_clip_order: ?[]const usize = null,
     slots: []const Slot,
     groups: []const Group,
+    /// Every committed weight, moment and accumulator was proven finite (and
+    /// every absent accumulator zero) by the transaction that published it.
+    /// prepare then validates only the incoming gradients and its own
+    /// results. Owners must clear this whenever device state is written by
+    /// anything else, such as an upload from host or a restore.
+    committed_finite: bool = false,
 };
 /// An omitted slot is absent (Python grad=None). An explicit zero participates
 /// in accumulation and AdamW, including weight decay and its parameter counter.
@@ -335,7 +344,7 @@ pub fn estimate(state: State, request: Request, limits: Limits) !Estimate {
         partials = try add(partials, partial);
         largest_partial = @max(largest_partial, partial);
     }
-    const norm_count = @min(batch_capacity, try mul(count, 5));
+    const norm_count = @min(validation_capacity, try mul(count, 5));
     const norm_partials = @min(try mul(partials, 5), try mul(largest_partial, norm_count));
     const validation_partial_bytes = try ops.resident_training.validationScratch(norm_count, @min(try mul(validation_chunks, 5), try mul(largest_validation_chunks, norm_count)));
     // A flags chunk covers 64K elements and costs four bytes, plus one final
@@ -355,7 +364,7 @@ pub fn estimate(state: State, request: Request, limits: Limits) !Estimate {
     // CUDA validation uses one zeroed 2048-byte launch descriptor on the stack,
     // within this same 256KiB fixed allowance, and allocates no host payloads.
     const clipping_metadata = if (state.pytorch_clip_order != null) try mul(count, @sizeOf(ops.resident_training.NormInput)) else 0;
-    const metadata_base = try add(@sizeOf(Pending), try add(256 * 1024, try add(try mul(count, @sizeOf(Replacement) + 4096), batch_capacity * (@sizeOf(ops.resident_training.NormInput) + @sizeOf(ops.TrainingAdamWBatchInput)))));
+    const metadata_base = try add(@sizeOf(Pending), try add(256 * 1024, try add(try mul(count, @sizeOf(Replacement) + 4096), validation_capacity * @sizeOf(ops.resident_training.NormInput) + batch_capacity * @sizeOf(ops.TrainingAdamWBatchInput))));
     const metadata = try add(metadata_base, clipping_metadata);
     const transfers = try add(try add(try mul(count, 144), if (count == 0) 0 else 64), if (count > 0 and state.pytorch_clip_order != null) @as(usize, 4) else 0);
     if (device > limits.max_device_bytes or metadata > limits.max_host_metadata_bytes or transfers > limits.max_scalar_transfer_bytes)
@@ -468,7 +477,7 @@ fn norm(pending: *Pending, values: []const ops.resident_training.NormInput, limi
     for (values) |value| count = try add(count, value.elem_count);
     const summary = try pending.backend.residentTrainingNorm(values, .{
         .primitive = limits.primitive,
-        .max_tensors = batch_capacity,
+        .max_tensors = validation_capacity,
         .max_total_elements = count,
         .max_partial_bytes = limits.max_norm_partial_bytes,
     });
@@ -485,7 +494,7 @@ fn validateValues(pending: *Pending, values: []const ops.resident_training.Valid
     for (values) |value| count = try add(count, value.elem_count);
     const summary = try pending.backend.residentTrainingValidate(values, .{
         .primitive = limits.primitive,
-        .max_tensors = batch_capacity,
+        .max_tensors = validation_capacity,
         .max_total_elements = count,
         .max_partial_bytes = limits.max_norm_partial_bytes,
     });
@@ -663,10 +672,23 @@ pub fn prepare(a: Allocator, cb: *const ops.ComputeBackend, state: State, reques
     const scratch = pending.budget.allocator();
     pending.replacements = try scratch.alloc(Replacement, admission.selected_slots);
     for (pending.replacements) |*replacement| replacement.* = .{ .slot = 0, .grad_accum = null, .adam_step = 0, .present = false };
-    const norms = try scratch.alloc(ops.resident_training.NormInput, batch_capacity);
+    const norms = try scratch.alloc(ops.resident_training.NormInput, validation_capacity);
     defer scratch.free(norms);
     const adam = try scratch.alloc(ops.TrainingAdamWBatchInput, batch_capacity);
     defer scratch.free(adam);
+    // Set by the out-of-place AdamW kernel if any new weight or moment is not
+    // finite; read once after the batch instead of validating every tensor.
+    var adam_flag: ?CT = null;
+    defer if (adam_flag) |flag| pending.backend.free(flag);
+    // Out-of-place accumulation and AdamW write the replacements directly,
+    // with no snapshot copies; the PyTorch parity profiles keep the general
+    // path. The norm of the new accumulators also proves every incoming
+    // gradient finite, so incoming tensors need no separate validation.
+    const fused = pending.backend.vtable.trainingAccumulateIntoManyF32 != null and
+        pending.backend.vtable.trainingAdamWIntoManyF32 != null and state.pytorch_clip_order == null and
+        for (state.groups) |group| {
+            if (group.pytorch_fused != null) break false;
+        } else true;
 
     // Complete physical shape/ownership checks for all participants before
     // allocating their replacement payloads or encoding optimizer work.
@@ -678,11 +700,11 @@ pub fn prepare(a: Allocator, cb: *const ops.ComputeBackend, state: State, reques
         const count = try elements(slot, limits);
         for ([_]CT{ slot.weight, slot.grad_accum, slot.m, slot.v }) |tensor| {
             try validateTensor(&pending.backend, tensor, shape, limits);
-            try appendValidation(pending, norms, &norm_used, tensor, count, limits);
+            if (!state.committed_finite) try appendValidation(pending, norms, &norm_used, tensor, count, limits);
         }
         if (incoming(request, i)) |gradient| if (gradient.value == .tensor) {
             try validateTensor(&pending.backend, gradient.value.tensor, shape, limits);
-            try appendValidation(pending, norms, &norm_used, gradient.value.tensor, count, limits);
+            if (!fused) try appendValidation(pending, norms, &norm_used, gradient.value.tensor, count, limits);
         };
         pending.replacements[selected_index] = .{ .slot = i, .grad_accum = null, .adam_step = slot.adam_step + @as(u32, @intFromBool(admission.optimizer_stepped)), .present = !admission.optimizer_stepped };
         selected_index += 1;
@@ -694,6 +716,7 @@ pub fn prepare(a: Allocator, cb: *const ops.ComputeBackend, state: State, reques
     // admitted scratch and retain all checks before allocating replacements.
     norm_used = 0;
     for (state.slots, 0..) |slot, i| {
+        if (state.committed_finite) break;
         if (!selected(state, request, i) or slot.present) continue;
         norms[norm_used] = .{ .tensor = slot.grad_accum, .elem_count = try elements(slot, limits) };
         norm_used += 1;
@@ -710,32 +733,48 @@ pub fn prepare(a: Allocator, cb: *const ops.ComputeBackend, state: State, reques
             divisor / @as(f32, @floatFromInt(nextAccumulation(state, request)))
         else
             1;
-        const divisor_tensor = try scalar(pending, divisor, limits);
-        defer pending.backend.free(divisor_tensor);
-        const renormalize_tensor = try scalar(pending, renormalize, limits);
-        defer pending.backend.free(renormalize_tensor);
-        const zero_tensor = try scalar(pending, 0, limits);
-        defer pending.backend.free(zero_tensor);
-        for (pending.replacements) |*replacement| {
+        if (fused) {
+            const inputs = try scratch.alloc(ops.TrainingAccumulateIntoInput, pending.replacements.len);
+            defer scratch.free(inputs);
+            const outputs = try scratch.alloc(CT, pending.replacements.len);
+            defer scratch.free(outputs);
+            for (pending.replacements, inputs) |replacement, *input| {
+                const slot = state.slots[replacement.slot];
+                const gradient: ?CT = if (incoming(request, replacement.slot)) |g| switch (g.value) {
+                    .tensor => |tensor| tensor,
+                    .zero => null,
+                } else null;
+                input.* = .{ .previous = if (slot.present) slot.grad_accum else null, .grad = gradient, .shape = slot.shape, .elem_count = try elements(slot, limits) };
+            }
+            try pending.backend.trainingAccumulateIntoManyF32(inputs, divisor, renormalize, outputs);
+            for (pending.replacements, outputs) |*replacement, output| replacement.grad_accum = output;
+        }
+        const divisor_tensor = if (fused) null else try scalar(pending, divisor, limits);
+        defer if (divisor_tensor) |tensor| pending.backend.free(tensor);
+        const renormalize_tensor = if (fused) null else try scalar(pending, renormalize, limits);
+        defer if (renormalize_tensor) |tensor| pending.backend.free(tensor);
+        const zero_tensor = if (fused) null else try scalar(pending, 0, limits);
+        defer if (zero_tensor) |tensor| pending.backend.free(tensor);
+        if (!fused) for (pending.replacements) |*replacement| {
             const slot = state.slots[replacement.slot];
             const shape = shapeOf(slot);
             replacement.grad_accum = if (slot.present)
                 try pending.backend.residentTrainingPrimitive(&.{ .snapshot = .{ .input = slot.grad_accum, .shape = slot.shape } }, limits.primitive)
             else
-                try zero(pending, shape, zero_tensor, limits);
+                try zero(pending, shape, zero_tensor.?, limits);
             if (incoming(request, replacement.slot)) |gradient| if (gradient.value == .tensor) {
-                const scaled = try binary(pending, .div, gradient.value.tensor, shape, divisor_tensor, scalar_shape, limits);
+                const scaled = try binary(pending, .div, gradient.value.tensor, shape, divisor_tensor.?, scalar_shape, limits);
                 defer pending.backend.free(scaled);
                 const next = try binary(pending, .add, replacement.grad_accum.?, shape, scaled, shape, limits);
                 pending.backend.free(replacement.grad_accum.?);
                 replacement.grad_accum = next;
             };
             if (renormalize != 1) {
-                const next = try binary(pending, .mul, replacement.grad_accum.?, shape, renormalize_tensor, scalar_shape, limits);
+                const next = try binary(pending, .mul, replacement.grad_accum.?, shape, renormalize_tensor.?, scalar_shape, limits);
                 pending.backend.free(replacement.grad_accum.?);
                 replacement.grad_accum = next;
             }
-        }
+        };
         if (state.pytorch_clip_order) |order| {
             // One reduction over all participating slots, in Python registration
             // order. Never partition this final reduction by optimizer group.
@@ -786,22 +825,62 @@ pub fn prepare(a: Allocator, cb: *const ops.ComputeBackend, state: State, reques
                 @floatCast(state.max_grad_norm / (pending.receipt.grad_norm + 1e-6))
             else
                 1;
-            const clip_tensor = try scalar(pending, clip, limits);
-            defer pending.backend.free(clip_tensor);
+            if (fused) adam_flag = try scalar(pending, 0, limits);
+            if (fused) for (state.groups, 0..) |group, group_id| {
+                // Clipping is AdamW's gradient scale: the same single multiply
+                // as the separate clip pass, without its buffer.
+                var used: usize = 0;
+                for (pending.replacements) |replacement| used += @intFromBool(state.slots[replacement.slot].group == group_id);
+                if (used == 0) continue;
+                const inputs = try scratch.alloc(ops.TrainingAdamWBatchInput, used);
+                defer scratch.free(inputs);
+                const shapes = try scratch.alloc([]const i32, used);
+                defer scratch.free(shapes);
+                const outputs = try scratch.alloc(ops.TrainingAdamWOutputs, used);
+                defer scratch.free(outputs);
+                const owners = try scratch.alloc(usize, used);
+                defer scratch.free(owners);
+                used = 0;
+                for (pending.replacements, 0..) |replacement, index| {
+                    const slot = state.slots[replacement.slot];
+                    if (slot.group != group_id) continue;
+                    const t: f32 = @floatFromInt(replacement.adam_step);
+                    inputs[used] = .{ .weight = slot.weight, .grad = replacement.grad_accum.?, .m = slot.m, .v = slot.v, .elem_count = try elements(slot, limits), .adam_step = replacement.adam_step, .bias_correction1 = 1 - std.math.pow(f32, group.optimizer.beta1, t), .bias_correction2 = 1 - std.math.pow(f32, group.optimizer.beta2, t) };
+                    shapes[used] = slot.shape;
+                    owners[used] = index;
+                    used += 1;
+                }
+                try pending.backend.checkExecutionControl();
+                try pending.backend.trainingAdamWIntoManyF32(inputs, shapes, .{
+                    .lr = group.schedule.lr(@intCast(state.identity.optimizer_step)),
+                    .beta1 = group.optimizer.beta1,
+                    .beta2 = group.optimizer.beta2,
+                    .eps = group.optimizer.eps,
+                    .weight_decay = group.optimizer.weight_decay,
+                    .grad_scale = clip,
+                }, outputs, adam_flag.?);
+                for (outputs, owners) |output, index| {
+                    pending.replacements[index].weight = output.weight;
+                    pending.replacements[index].m = output.m;
+                    pending.replacements[index].v = output.v;
+                }
+            };
+            const clip_tensor = if (fused) null else try scalar(pending, clip, limits);
+            defer if (clip_tensor) |tensor| pending.backend.free(tensor);
             // Snapshot every participating weight/moment before the first
             // mutating batch. No source-state CT is passed to AdamWMany.
-            for (pending.replacements) |*replacement| {
+            if (!fused) for (pending.replacements) |*replacement| {
                 const slot = state.slots[replacement.slot];
                 if (clip != 1) {
-                    const next = try binary(pending, .mul, replacement.grad_accum.?, shapeOf(slot), clip_tensor, scalar_shape, limits);
+                    const next = try binary(pending, .mul, replacement.grad_accum.?, shapeOf(slot), clip_tensor.?, scalar_shape, limits);
                     pending.backend.free(replacement.grad_accum.?);
                     replacement.grad_accum = next;
                 }
                 replacement.weight = try pending.backend.residentTrainingPrimitive(&.{ .snapshot = .{ .input = slot.weight, .shape = slot.shape } }, limits.primitive);
                 replacement.m = try pending.backend.residentTrainingPrimitive(&.{ .snapshot = .{ .input = slot.m, .shape = slot.shape } }, limits.primitive);
                 replacement.v = try pending.backend.residentTrainingPrimitive(&.{ .snapshot = .{ .input = slot.v, .shape = slot.shape } }, limits.primitive);
-            }
-            for (state.groups, 0..) |group, group_id| {
+            };
+            if (!fused) for (state.groups, 0..) |group, group_id| {
                 var used: usize = 0;
                 for (pending.replacements) |replacement| {
                     const slot = state.slots[replacement.slot];
@@ -815,29 +894,36 @@ pub fn prepare(a: Allocator, cb: *const ops.ComputeBackend, state: State, reques
                     }
                 }
                 try adamBatch(pending, adam[0..used], group, state.identity.optimizer_step);
-            }
-            norm_used = 0;
-            for (pending.replacements) |replacement| {
-                const count = try elements(state.slots[replacement.slot], limits);
-                for ([_]CT{ replacement.weight.?, replacement.m.?, replacement.v.? }) |tensor|
-                    try appendValidation(pending, norms, &norm_used, tensor, count, limits);
-            }
-            _ = try validateValues(pending, norms[0..norm_used], limits);
-            // AdamW's ABI clears its private gradient buffer. Prove this
-            // invariant before exposing it as the next accumulation buffer.
-            norm_used = 0;
-            for (pending.replacements) |replacement| {
-                norms[norm_used] = .{ .tensor = replacement.grad_accum.?, .elem_count = try elements(state.slots[replacement.slot], limits) };
-                norm_used += 1;
-                if (norm_used == norms.len) {
-                    if (!try validateValues(pending, norms, limits)) return error.InvalidDeviceOptimizerResult;
-                    norm_used = 0;
+            };
+            // The fused kernel flags non-finite results itself and clears the
+            // accumulator it consumes, so only the general path re-reads them.
+            if (!fused) {
+                norm_used = 0;
+                for (pending.replacements) |replacement| {
+                    const count = try elements(state.slots[replacement.slot], limits);
+                    for ([_]CT{ replacement.weight.?, replacement.m.?, replacement.v.? }) |tensor|
+                        try appendValidation(pending, norms, &norm_used, tensor, count, limits);
                 }
+                _ = try validateValues(pending, norms[0..norm_used], limits);
+                // AdamW's ABI clears its private gradient buffer. Prove this
+                // invariant before exposing it as the next accumulation buffer.
+                norm_used = 0;
+                for (pending.replacements) |replacement| {
+                    norms[norm_used] = .{ .tensor = replacement.grad_accum.?, .elem_count = try elements(state.slots[replacement.slot], limits) };
+                    norm_used += 1;
+                    if (norm_used == norms.len) {
+                        if (!try validateValues(pending, norms, limits)) return error.InvalidDeviceOptimizerResult;
+                        norm_used = 0;
+                    }
+                }
+                if (!try validateValues(pending, norms[0..norm_used], limits)) return error.InvalidDeviceOptimizerResult;
             }
-            if (!try validateValues(pending, norms[0..norm_used], limits)) return error.InvalidDeviceOptimizerResult;
         }
     }
     if (batched) try pending.backend.residentTrainingEndBatch(true);
+    // Read through the resident norm, the transaction's one scalar readback
+    // path: the flag's square is 0 unless AdamW set it.
+    if (adam_flag) |flag| if (try norm(pending, &.{.{ .tensor = flag, .elem_count = 1 }}, limits) != 0) return error.NonFiniteTrainingUpdate;
     if (pending.receipt.scalar_upload_bytes + pending.receipt.scalar_download_bytes > admission.scalar_transfer_upper_bound_bytes)
         return error.InvalidDeviceOptimizerResult;
     try pending.backend.checkExecutionControl();

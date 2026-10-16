@@ -7663,17 +7663,37 @@ const ModernBertTrainingAttentionParams = extern struct {
     window: u32,
     backward: u32,
     scale: f32,
-    reserved0: u32 = 0,
+    /// Attention-probability dropout (segment training attention's head
+    /// layers only; the ModernBERT trunk never sets this). `probability`
+    /// disables when `<= 0`; `seed` is `segment_training_attention.dropoutSeed`,
+    /// mixed with the flat (batch, head, query, key) index exactly like
+    /// `linalg.segmentAttentionDropoutKeep` so the device and host paths
+    /// agree bit for bit.
+    dropout_probability: f32 = 0,
+    dropout_seed: u64 = 0,
 };
 comptime {
-    if (@sizeOf(ModernBertTrainingAttentionParams) != 32) @compileError("ModernBERT training attention Metal ABI mismatch");
+    if (@sizeOf(ModernBertTrainingAttentionParams) != 40) @compileError("ModernBERT training attention Metal ABI mismatch");
+}
+
+/// The tiled kernels hold a block's K/V (or Q/dO) in simdgroup registers
+/// instead of rereading them per query, which matters at the 512-token rows
+/// Laya trains on; they only cover head_dim multiples of 8 up to 64
+/// (ModernBERT and head layers both use 64), and that's also the only shape
+/// the flash kernels' dropout mask is wired into. TERMITE_METAL_DISABLE_FLASH_TRAINING_ATTENTION
+/// forces the serial kernels back on for bisecting.
+pub fn modernBertFlashTrainingAttentionEligible(head_dim: u32) bool {
+    return head_dim % 8 == 0 and head_dim <= 64 and
+        !getenvFlagEnabled("TERMITE_METAL_DISABLE_FLASH_TRAINING_ATTENTION");
 }
 
 /// ModernBERT training attention over device-resident packed [Q;K;V] and an
 /// i32 control the caller has validated (disjoint in-row ranges). Returns the
 /// output rows, or packed [dQ;dK;dV] when `d_out` is given. Output and scratch
 /// share one allocation and the result views it, so the scratch outlives any
-/// command frame the dispatch was encoded into.
+/// command frame the dispatch was encoded into. `dropout_probability > 0`
+/// (segment training attention's head layers) requires the flash kernels;
+/// callers must have already checked `modernBertFlashTrainingAttentionEligible`.
 pub fn decoderRuntimeModernBertTrainingAttentionV1Device(
     self: anytype,
     qkv: MetalTensor,
@@ -7681,6 +7701,8 @@ pub fn decoderRuntimeModernBertTrainingAttentionV1Device(
     d_out: ?MetalTensor,
     attrs: modernbert_training_attention.Attrs,
     control: ?TrainingAttentionControl,
+    dropout_probability: f32,
+    dropout_seed: u64,
 ) !MetalTensor {
     if (!build_options.enable_metal) return error.UnsupportedModernBertTrainingAttentionProfile;
     try trainingAttentionCheck(control);
@@ -7700,6 +7722,7 @@ pub fn decoderRuntimeModernBertTrainingAttentionV1Device(
     const storage_shape = [_]i32{@intCast(total_bytes / @sizeOf(f32))};
     var storage = try MetalTensor.deviceAllocate(runtime, total_bytes, .private, &storage_shape);
     defer storage.deinit();
+    if (dropout_probability > 0 and !modernBertFlashTrainingAttentionEligible(attrs.head_dim)) return error.UnsupportedModernBertTrainingAttentionProfile;
     const params = ModernBertTrainingAttentionParams{
         .tokens = @intCast(tokens),
         .seq_len = attrs.seq_len,
@@ -7708,8 +7731,24 @@ pub fn decoderRuntimeModernBertTrainingAttentionV1Device(
         .window = attrs.window,
         .backward = @intFromBool(backward),
         .scale = 1 / @sqrt(@as(f32, @floatFromInt(attrs.head_dim))),
+        .dropout_probability = dropout_probability,
+        .dropout_seed = dropout_seed,
     };
-    const rc = termite_metal_decode_runtime_modernbert_training_attention_v1(
+    const flash_eligible = modernBertFlashTrainingAttentionEligible(attrs.head_dim);
+    const rc = if (flash_eligible) termite_metal_decode_runtime_modernbert_training_attention_flash_v1(
+        runtime,
+        qkv.deviceHandle(),
+        qkv.deviceByteOffset(),
+        control_tensor.deviceHandle(),
+        control_tensor.deviceByteOffset(),
+        if (d_out) |upstream| upstream.deviceHandle() else null,
+        if (d_out) |upstream| upstream.deviceByteOffset() else 0,
+        storage.deviceHandle(),
+        storage.deviceByteOffset(),
+        storage.deviceHandle(),
+        storage.deviceByteOffset() + output_bytes,
+        &params,
+    ) else termite_metal_decode_runtime_modernbert_training_attention_v1(
         runtime,
         qkv.deviceHandle(),
         qkv.deviceByteOffset(),
@@ -7727,6 +7766,7 @@ pub fn decoderRuntimeModernBertTrainingAttentionV1Device(
         0 => {},
         -1 => return error.InvalidModernBertTrainingAttentionShape,
         -2 => return error.UnsupportedModernBertTrainingAttentionProfile,
+        -3 => return error.UnsupportedModernBertTrainingAttentionProfile,
         -5 => return error.MetalEncoderAllocationFailed,
         else => return error.MetalModernBertTrainingAttentionFailed,
     }
@@ -8278,6 +8318,49 @@ pub fn decoderRuntimeDotGeneral2DF32DeviceInto(
     output_override: MetalTensor,
 ) !?MetalTensor {
     return decoderRuntimeDotGeneral2DF32DeviceImpl(self, lhs, rhs, m, n, k, rhs_contract_axis, output_override, null);
+}
+
+pub const Gemm = struct {
+    batch: usize = 1,
+    m: usize,
+    n: usize,
+    k: usize,
+    /// lhs is stored k x m (rhs n x k) per matrix.
+    transpose_left: bool = false,
+    transpose_right: bool = false,
+    alpha: f32 = 1,
+    /// Nonzero accumulates into the existing output.
+    beta: f32 = 0,
+};
+
+/// output = alpha * op(lhs) * op(rhs) + beta * output through MPS, for
+/// `batch` contiguous row-major f32 matrices. False when the runtime is
+/// unavailable or rejects the shapes.
+pub fn decoderRuntimeGemmF32Device(self: anytype, lhs: MetalTensor, rhs: MetalTensor, output: MetalTensor, gemm: Gemm) !bool {
+    const runtime = self.raw_decode_runtime orelse return false;
+    if (termite_metal_decode_runtime_ready(runtime) == 0) return false;
+    if (!lhs.isDevice() or !rhs.isDevice() or !output.isDevice()) return false;
+    const lhs_elems = std.math.mul(usize, gemm.batch, std.math.mul(usize, gemm.m, gemm.k) catch return false) catch return false;
+    const rhs_elems = std.math.mul(usize, gemm.batch, std.math.mul(usize, gemm.n, gemm.k) catch return false) catch return false;
+    const output_elems = std.math.mul(usize, gemm.batch, std.math.mul(usize, gemm.m, gemm.n) catch return false) catch return false;
+    if (lhs.elemCount() != lhs_elems or rhs.elemCount() != rhs_elems or output.elemCount() != output_elems) return false;
+    return termite_metal_decode_runtime_gemm_f32_device(
+        runtime,
+        lhs.deviceHandle(),
+        lhs.deviceByteOffset(),
+        rhs.deviceHandle(),
+        rhs.deviceByteOffset(),
+        output.deviceHandle(),
+        output.deviceByteOffset(),
+        gemm.batch,
+        gemm.m,
+        gemm.n,
+        gemm.k,
+        @intFromBool(gemm.transpose_left),
+        @intFromBool(gemm.transpose_right),
+        gemm.alpha,
+        gemm.beta,
+    ) == 0;
 }
 
 fn decoderRuntimeDotGeneral2DF32DeviceImpl(
@@ -9881,6 +9964,98 @@ pub fn decoderRuntimeTrainingAdamWManyF32(
         bias_correction1s.ptr,
         bias_correction2s.ptr,
         batch.len,
+        opts.lr,
+        opts.beta1,
+        opts.beta2,
+        opts.eps,
+        opts.weight_decay,
+        opts.grad_scale,
+    );
+    if (rc != 0) return error.MetalTrainingAdamWFailed;
+    return true;
+}
+
+fn trainingRef(tensor: MetalTensor, elem_count: usize) !TrainingRef {
+    if (!tensor.isDevice() or elem_count == 0 or elem_count > tensor.elemCount()) return error.InvalidTrainingTensor;
+    return .{ .handle = tensor.deviceHandle(), .offset = tensor.deviceByteOffset() };
+}
+
+pub const TrainingAccumulateInto = struct {
+    previous: ?MetalTensor,
+    grad: ?MetalTensor,
+    output: MetalTensor,
+    elem_count: usize,
+};
+
+/// output = (previous + grad / divisor) * renormalize per item, out of place.
+pub fn decoderRuntimeTrainingAccumulateIntoManyF32(self: anytype, batch: []const TrainingAccumulateInto, divisor: f32, renormalize: f32) !bool {
+    const runtime = self.raw_decode_runtime orelse return false;
+    if (termite_metal_decode_runtime_ready(runtime) == 0) return false;
+    if (batch.len == 0) return true;
+    const allocator = std.heap.page_allocator;
+    const refs = try allocator.alloc(TrainingRef, batch.len * 3);
+    defer allocator.free(refs);
+    const counts = try allocator.alloc(usize, batch.len);
+    defer allocator.free(counts);
+    for (batch, 0..) |item, i| {
+        refs[i] = if (item.previous) |previous| try trainingRef(previous, item.elem_count) else .{};
+        refs[batch.len + i] = if (item.grad) |grad| try trainingRef(grad, item.elem_count) else .{};
+        refs[2 * batch.len + i] = try trainingRef(item.output, item.elem_count);
+        counts[i] = item.elem_count;
+    }
+    const rc = termite_metal_decode_runtime_training_accumulate_into_many_f32(runtime, refs.ptr, refs[batch.len..].ptr, refs[2 * batch.len ..].ptr, counts.ptr, batch.len, divisor, renormalize);
+    if (rc != 0) return error.MetalTrainingAccumulateFailed;
+    return true;
+}
+
+pub const TrainingAdamWInto = struct {
+    weight: MetalTensor,
+    grad: MetalTensor,
+    m: MetalTensor,
+    v: MetalTensor,
+    weight_out: MetalTensor,
+    m_out: MetalTensor,
+    v_out: MetalTensor,
+    elem_count: usize,
+    bias_correction1: f32,
+    bias_correction2: f32,
+};
+
+/// AdamW reading weight/m/v and writing new buffers; grad is cleared, and
+/// `flag[0]` is set to 1 if any new value is not finite.
+pub fn decoderRuntimeTrainingAdamWIntoManyF32(self: anytype, batch: []const TrainingAdamWInto, flag: MetalTensor, opts: TrainingAdamWBatchOptions) !bool {
+    const runtime = self.raw_decode_runtime orelse return false;
+    if (termite_metal_decode_runtime_ready(runtime) == 0) return false;
+    if (batch.len == 0) return true;
+    const allocator = std.heap.page_allocator;
+    const refs = try allocator.alloc(TrainingRef, batch.len * 7);
+    defer allocator.free(refs);
+    const counts = try allocator.alloc(usize, batch.len);
+    defer allocator.free(counts);
+    const corrections = try allocator.alloc(f32, batch.len * 2);
+    defer allocator.free(corrections);
+    const n = batch.len;
+    for (batch, 0..) |item, i| {
+        for ([_]MetalTensor{ item.weight, item.grad, item.m, item.v, item.weight_out, item.m_out, item.v_out }, 0..) |tensor, k|
+            refs[k * n + i] = try trainingRef(tensor, item.elem_count);
+        counts[i] = item.elem_count;
+        corrections[i] = item.bias_correction1;
+        corrections[n + i] = item.bias_correction2;
+    }
+    const rc = termite_metal_decode_runtime_training_adamw_into_many_f32(
+        runtime,
+        refs.ptr,
+        refs[n..].ptr,
+        refs[2 * n ..].ptr,
+        refs[3 * n ..].ptr,
+        refs[4 * n ..].ptr,
+        refs[5 * n ..].ptr,
+        refs[6 * n ..].ptr,
+        try trainingRef(flag, 1),
+        counts.ptr,
+        corrections.ptr,
+        corrections[n..].ptr,
+        n,
         opts.lr,
         opts.beta1,
         opts.beta2,
@@ -19989,6 +20164,20 @@ pub extern fn termite_metal_decode_runtime_modernbert_training_attention_v1(
     scratch_offset: usize,
     params: *const ModernBertTrainingAttentionParams,
 ) c_int;
+pub extern fn termite_metal_decode_runtime_modernbert_training_attention_flash_v1(
+    runtime: ?*RawMetalDecodeRuntime,
+    qkv_handle: ?*anyopaque,
+    qkv_offset: usize,
+    control_handle: ?*anyopaque,
+    control_offset: usize,
+    dout_handle: ?*anyopaque,
+    dout_offset: usize,
+    output_handle: ?*anyopaque,
+    output_offset: usize,
+    scratch_handle: ?*anyopaque,
+    scratch_offset: usize,
+    params: *const ModernBertTrainingAttentionParams,
+) c_int;
 pub extern fn termite_metal_decode_runtime_sdpa_segments_f32_device(
     runtime: ?*RawMetalDecodeRuntime,
     q_handle: ?*anyopaque,
@@ -22462,6 +22651,55 @@ pub extern fn termite_metal_decode_runtime_training_adamw_many_f32(
     m_offsets: [*]const usize,
     v_handles: [*]const ?*anyopaque,
     v_offsets: [*]const usize,
+    elem_counts: [*]const usize,
+    bias_correction1s: [*]const f32,
+    bias_correction2s: [*]const f32,
+    input_count: usize,
+    lr: f32,
+    beta1: f32,
+    beta2: f32,
+    eps: f32,
+    weight_decay: f32,
+    grad_scale: f32,
+) c_int;
+pub extern fn termite_metal_decode_runtime_gemm_f32_device(
+    runtime: ?*RawMetalDecodeRuntime,
+    lhs: ?*const anyopaque,
+    lhs_offset: usize,
+    rhs: ?*const anyopaque,
+    rhs_offset: usize,
+    output: ?*anyopaque,
+    output_offset: usize,
+    batch: usize,
+    m: usize,
+    n: usize,
+    k: usize,
+    transpose_left: u32,
+    transpose_right: u32,
+    alpha: f32,
+    beta: f32,
+) c_int;
+pub const TrainingRef = extern struct { handle: ?*const anyopaque = null, offset: usize = 0 };
+pub extern fn termite_metal_decode_runtime_training_accumulate_into_many_f32(
+    runtime: ?*RawMetalDecodeRuntime,
+    previous: [*]const TrainingRef,
+    grad: [*]const TrainingRef,
+    output: [*]const TrainingRef,
+    elem_counts: [*]const usize,
+    input_count: usize,
+    divisor: f32,
+    renormalize: f32,
+) c_int;
+pub extern fn termite_metal_decode_runtime_training_adamw_into_many_f32(
+    runtime: ?*RawMetalDecodeRuntime,
+    weight: [*]const TrainingRef,
+    grad: [*]const TrainingRef,
+    m: [*]const TrainingRef,
+    v: [*]const TrainingRef,
+    weight_out: [*]const TrainingRef,
+    m_out: [*]const TrainingRef,
+    v_out: [*]const TrainingRef,
+    flag: TrainingRef,
     elem_counts: [*]const usize,
     bias_correction1s: [*]const f32,
     bias_correction2s: [*]const f32,

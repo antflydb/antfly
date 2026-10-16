@@ -333,6 +333,9 @@ var host_fallback_warned = [_]std.atomic.Value(bool){
     std.atomic.Value(bool).init(false),
     std.atomic.Value(bool).init(false),
     std.atomic.Value(bool).init(false),
+    std.atomic.Value(bool).init(false),
+    std.atomic.Value(bool).init(false),
+    std.atomic.Value(bool).init(false),
 };
 
 fn warnHostFallbackOnce(comptime index: usize, comptime what: []const u8) void {
@@ -1181,6 +1184,11 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
     boundary_linear_slots: std.AutoHashMapUnmanaged(DynamicLinearSlotKey, usize) = .empty,
     eager_quant_mirrors_preferred: bool = false,
     dynamic_layer_norm_slots: std.AutoHashMapUnmanaged(DynamicLayerNormSlotKey, usize) = .empty,
+    /// The last segment-attention control translated for the device kernels.
+    /// Every layer of a training step, forward and backward, shares one
+    /// control; matching it by content (never by identity) skips its
+    /// validation, translation and upload, which drained the frame each time.
+    segment_control_cache: ?SegmentControlCache = null,
     dynamic_rms_norm_slots: std.AutoHashMapUnmanaged(DynamicRmsNormSlotKey, usize) = .empty,
     next_dynamic_linear_slot: usize = metal_runtime.decoder_runtime_linear_slot_capacity,
     next_dynamic_layer_norm_slot: usize = metal_runtime.decoder_runtime_layer_norm_slot_capacity,
@@ -4525,7 +4533,14 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         storage.setDeviceWriteHook(metal_storage.deviceWriteHook());
     }
 
+    const SegmentControlCache = struct { raw: []i32, batch: u32, seq_len: u32, apply_dropout: bool, dropout_seed: u64, device: CT };
+
     pub fn deinit(self: *MetalCompute) void {
+        if (self.segment_control_cache) |cached| {
+            freeOp(self, cached.device);
+            self.allocator.free(cached.raw);
+            self.segment_control_cache = null;
+        }
         defer if (self.shared_provider_lease_io) |lock_io| {
             self.shared_provider_lease_io = null;
             unlockSharedMetalData(self.data, lock_io);
@@ -5224,6 +5239,87 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
     fn trainingAdamWManyF32Op(ctx: *anyopaque, inputs: []const ops.TrainingAdamWBatchInput, opts: ops.TrainingAdamWBatchOptions) anyerror!void {
         const self: *MetalCompute = @ptrCast(@alignCast(ctx));
         return self.trainingAdamWManyF32(inputs, opts);
+    }
+
+    /// A fresh, mutable resident f32 tensor, as a snapshot would produce.
+    fn residentFreshF32(self: *MetalCompute, shape: []const i32) !CT {
+        const runtime = self.provider_impl.raw_decode_runtime orelse return error.UnsupportedResidentTrainingPrimitive;
+        const count = try ops.resident_training.shapeElements(i32, shape, .{});
+        var output = try MetalTensor.deviceAllocateFresh(@ptrCast(runtime), count * 4, .private, shape);
+        errdefer output.deinit();
+        const result = try self.ctFromOwnedMetalTensor(output);
+        toBuf(result).mutable_state = true;
+        return result;
+    }
+
+    fn trainingAccumulateIntoManyF32Op(ctx: *anyopaque, inputs: []const ops.TrainingAccumulateIntoInput, divisor: f32, renormalize: f32, outputs: []CT) anyerror!void {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        if (self.residentExternalFrame()) return error.ResidentTrainingExternalFrame;
+        if (inputs.len == 0) return;
+        const batch = try self.allocator.alloc(metal_runtime.TrainingAccumulateInto, inputs.len);
+        defer self.allocator.free(batch);
+        var made: usize = 0;
+        errdefer for (outputs[0..made]) |output| self.computeBackend().free(output);
+        for (inputs, 0..) |input, i| {
+            outputs[i] = try self.residentFreshF32(input.shape);
+            made += 1;
+            const output = try self.residentTrainingTensor(outputs[i], .f32, .{});
+            if (output.elemCount() != input.elem_count) return error.InvalidResidentTrainingShape;
+            batch[i] = .{
+                .previous = if (input.previous) |tensor| try self.residentTrainingTensor(tensor, .f32, .{}) else null,
+                .grad = if (input.grad) |tensor| try self.residentTrainingTensor(tensor, .f32, .{}) else null,
+                .output = output,
+                .elem_count = input.elem_count,
+            };
+        }
+        if (!try metal_runtime.decoderRuntimeTrainingAccumulateIntoManyF32(self.provider_impl, batch, divisor, renormalize))
+            return error.UnsupportedResidentTrainingPrimitive;
+    }
+
+    fn trainingAdamWIntoManyF32Op(ctx: *anyopaque, inputs: []const ops.TrainingAdamWBatchInput, shapes: []const []const i32, opts: ops.TrainingAdamWBatchOptions, outputs: []ops.TrainingAdamWOutputs, flag: CT) anyerror!void {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        if (opts.pytorch_fused != null) return error.DeviceTrainingUnavailable;
+        if (self.residentExternalFrame()) return error.ResidentTrainingExternalFrame;
+        if (inputs.len == 0) return;
+        const batch = try self.allocator.alloc(metal_runtime.TrainingAdamWInto, inputs.len);
+        defer self.allocator.free(batch);
+        const cb = self.computeBackend();
+        var made: usize = 0;
+        errdefer for (outputs[0..made]) |output| {
+            cb.free(output.weight);
+            cb.free(output.m);
+            cb.free(output.v);
+        };
+        for (inputs, shapes, 0..) |input, shape, i| {
+            const weight = try self.residentFreshF32(shape);
+            errdefer cb.free(weight);
+            const m = try self.residentFreshF32(shape);
+            errdefer cb.free(m);
+            const v = try self.residentFreshF32(shape);
+            outputs[i] = .{ .weight = weight, .m = m, .v = v };
+            made += 1;
+            batch[i] = .{
+                .weight = try self.residentTrainingTensor(input.weight, .f32, .{}),
+                .grad = try self.residentTrainingTensor(input.grad, .f32, .{}),
+                .m = try self.residentTrainingTensor(input.m, .f32, .{}),
+                .v = try self.residentTrainingTensor(input.v, .f32, .{}),
+                .weight_out = try self.residentTrainingTensor(weight, .f32, .{}),
+                .m_out = try self.residentTrainingTensor(m, .f32, .{}),
+                .v_out = try self.residentTrainingTensor(v, .f32, .{}),
+                .elem_count = input.elem_count,
+                .bias_correction1 = input.bias_correction1,
+                .bias_correction2 = input.bias_correction2,
+            };
+        }
+        const flag_tensor = try self.residentTrainingTensor(flag, .f32, .{});
+        if (!try metal_runtime.decoderRuntimeTrainingAdamWIntoManyF32(self.provider_impl, batch, flag_tensor, .{
+            .lr = opts.lr,
+            .beta1 = opts.beta1,
+            .beta2 = opts.beta2,
+            .eps = opts.eps,
+            .weight_decay = opts.weight_decay,
+            .grad_scale = opts.grad_scale,
+        })) return error.MetalTrainingAdamWUnavailable;
     }
 
     fn trainingSumSquaresManyF32Op(ctx: *anyopaque, inputs: []const ops.TrainingSumSquaresInput) anyerror!f32 {
@@ -7303,7 +7399,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             },
             .fused_modernbert_training_attention_v1, .fused_modernbert_training_attention_backward_v1 => |attrs| {
                 const backward = instruction.op == .fused_modernbert_training_attention_backward_v1;
-                return self.modernBertTrainingAttention(tensors[0], inputs[1], if (backward) tensors[2] else null, attrs, control);
+                return self.modernBertTrainingAttention(tensors[0], inputs[1], if (backward) tensors[2] else null, attrs, control, 0, 0);
             },
             .reshape, .stop_gradient, .convert_dtype => return self.residentTrainingReshape(inputs[0], shape, limits.primitive, false),
             .gather => {
@@ -7473,20 +7569,32 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         return self.exportCtFromHostNative(&native_ctx, n_grad, null);
     }
 
-    /// Segment attention without active dropout is the ModernBERT training
-    /// attention (same visibility, window, scale and empty-row contract) with
-    /// row-relative ranges, so it runs on those device kernels. Returns null,
-    /// leaving the host bridge to run it, when dropout applies, the control
-    /// has no retained host copy, or its ranges overlap (the ModernBERT
-    /// kernels require disjoint ranges; the segment kernels do not).
+    /// Segment attention is the ModernBERT training attention (same
+    /// visibility, window, scale and empty-row contract) with row-relative
+    /// ranges and an optional attention-probability dropout mask, so it runs
+    /// on those device kernels. Dropout only has a device-side mask in the
+    /// flash kernels (`modernBertFlashTrainingAttentionEligible`); when it
+    /// applies and the shape is not flash-eligible this returns null and the
+    /// host bridge runs it instead. Also returns null when the control has
+    /// no retained host copy, or its ranges overlap (the ModernBERT kernels
+    /// require disjoint ranges; the segment kernels do not).
     fn segmentAttentionOnDevice(self: *MetalCompute, qkv_ct: CT, control_ct: CT, d_out_ct: ?CT, attrs: @import("ml").graph.SegmentTrainingAttentionAttrs, control: ?@import("../execution_control.zig").InferenceExecutionControl) !?CT {
         const segment = @import("segment_training_attention.zig");
         const modernbert = @import("modernbert_training_attention.zig");
         // The device kernels hold one head row per 128-lane threadgroup.
         if (!self.provider_impl.hasDecoderRuntime() or attrs.head_dim > 128) return null;
         const storage = toBuf(control_ct).resident_index_storage orelse return null;
+        if (self.segment_control_cache) |cached| if (cached.batch == attrs.batch and cached.seq_len == attrs.seq_len and
+            std.mem.eql(i32, cached.raw, storage.values))
+        {
+            const probability: f32 = if (cached.apply_dropout) attrs.dropout_probability else 0;
+            if (probability > 0 and !metal_runtime.modernBertFlashTrainingAttentionEligible(attrs.head_dim)) return null;
+            return try self.segmentAttentionWithControl(qkv_ct, cached.device, d_out_ct, attrs, control, probability, cached.dropout_seed);
+        };
         const view = try segment.validateControl(attrs, storage.values, .{ .control = control });
-        if (view.apply_dropout and attrs.dropout_probability > 0) return null;
+        const probability: f32 = if (view.apply_dropout) attrs.dropout_probability else 0;
+        if (probability > 0 and !metal_runtime.modernBertFlashTrainingAttentionEligible(attrs.head_dim)) return null;
+        const dropout_seed = segment.dropoutSeed(attrs, view.replay);
         const device_attrs: @import("ml").graph.ModernBertTrainingAttentionAttrs = .{
             .batch = attrs.batch,
             .seq_len = attrs.seq_len,
@@ -7508,12 +7616,29 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         };
         const shape = [_]i32{@intCast(tokens * 7)};
         const device_control = try self.residentTrainingUpload(i32, words, &shape, .{}, true);
-        defer freeOp(self, device_control);
+        errdefer freeOp(self, device_control);
+        const raw = try self.allocator.dupe(i32, storage.values);
+        if (self.segment_control_cache) |previous| {
+            freeOp(self, previous.device);
+            self.allocator.free(previous.raw);
+        }
+        self.segment_control_cache = .{ .raw = raw, .batch = attrs.batch, .seq_len = attrs.seq_len, .apply_dropout = view.apply_dropout, .dropout_seed = dropout_seed, .device = device_control };
+        return try self.segmentAttentionWithControl(qkv_ct, device_control, d_out_ct, attrs, control, probability, dropout_seed);
+    }
+
+    fn segmentAttentionWithControl(self: *MetalCompute, qkv_ct: CT, device_control: CT, d_out_ct: ?CT, attrs: @import("ml").graph.SegmentTrainingAttentionAttrs, control: ?@import("../execution_control.zig").InferenceExecutionControl, dropout_probability: f32, dropout_seed: u64) !CT {
+        const device_attrs: @import("ml").graph.ModernBertTrainingAttentionAttrs = .{
+            .batch = attrs.batch,
+            .seq_len = attrs.seq_len,
+            .num_heads = attrs.num_heads,
+            .head_dim = attrs.head_dim,
+            .window = attrs.window,
+        };
         var qkv = try self.ownedDeviceMetalTensorFromCt(qkv_ct);
         defer qkv.deinit();
         var d_out: ?MetalTensor = if (d_out_ct) |value| try self.ownedDeviceMetalTensorFromCt(value) else null;
         defer if (d_out) |*value| value.deinit();
-        return try self.modernBertTrainingAttention(qkv, device_control, d_out, device_attrs, control);
+        return try self.modernBertTrainingAttention(qkv, device_control, d_out, device_attrs, control, dropout_probability, dropout_seed);
     }
 
     /// ModernBERT training attention on device. The control's retained host
@@ -7521,13 +7646,16 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
     /// inside its row before a kernel reads it. Unlike the strict resident
     /// instructions this may join an active command frame (Laya's framed
     /// trainer); the output view keeps the kernel scratch alive.
-    fn modernBertTrainingAttention(self: *MetalCompute, qkv: MetalTensor, control_ct: CT, d_out: ?MetalTensor, attrs: @import("ml").graph.ModernBertTrainingAttentionAttrs, control: ?@import("../execution_control.zig").InferenceExecutionControl) !CT {
+    /// `dropout_probability > 0` is only ever nonzero from segment training
+    /// attention's head layers (`segmentAttentionWithControl`); the
+    /// ModernBERT trunk ops below always pass `0, 0`.
+    fn modernBertTrainingAttention(self: *MetalCompute, qkv: MetalTensor, control_ct: CT, d_out: ?MetalTensor, attrs: @import("ml").graph.ModernBertTrainingAttentionAttrs, control: ?@import("../execution_control.zig").InferenceExecutionControl, dropout_probability: f32, dropout_seed: u64) !CT {
         if (control) |active| try active.check();
         const control_buf = toBuf(control_ct);
         const storage = control_buf.resident_index_storage orelse return error.UnsupportedResidentTrainingIndexProof;
         _ = try @import("modernbert_training_attention.zig").validateControl(attrs, storage.values);
         const control_tensor = control_buf.metal_tensor orelse return error.ResidentTrainingRequiresDeviceTensor;
-        const output = try metal_runtime.decoderRuntimeModernBertTrainingAttentionV1Device(self.provider_impl, qkv, control_tensor, d_out, attrs, control);
+        const output = try metal_runtime.decoderRuntimeModernBertTrainingAttentionV1Device(self.provider_impl, qkv, control_tensor, d_out, attrs, control, dropout_probability, dropout_seed);
         return self.boundaryOwnedTensor(output);
     }
 
@@ -7535,7 +7663,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         const self: *MetalCompute = @ptrCast(@alignCast(ctx));
         var qkv = try self.ownedDeviceMetalTensorFromCt(qkv_ct);
         defer qkv.deinit();
-        return self.modernBertTrainingAttention(qkv, control_i32, null, attrs, control);
+        return self.modernBertTrainingAttention(qkv, control_i32, null, attrs, control, 0, 0);
     }
 
     fn modernBertTrainingAttentionBackwardV1Op(ctx: *anyopaque, qkv_ct: CT, control_i32: CT, d_out_ct: CT, attrs: @import("ml").graph.ModernBertTrainingAttentionAttrs, control: ?@import("../execution_control.zig").InferenceExecutionControl) anyerror!CT {
@@ -7544,7 +7672,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         defer qkv.deinit();
         var d_out = try self.ownedDeviceMetalTensorFromCt(d_out_ct);
         defer d_out.deinit();
-        return self.modernBertTrainingAttention(qkv, control_i32, d_out, attrs, control);
+        return self.modernBertTrainingAttention(qkv, control_i32, d_out, attrs, control, 0, 0);
     }
 
     fn residentTrainingPrimitiveOp(ctx: *anyopaque, request: *const ops.resident_training.Request, limits: ops.resident_training.Limits, control: ?@import("../execution_control.zig").InferenceExecutionControl) anyerror!CT {
@@ -14343,8 +14471,11 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         if (lhs_batch.len != 0 or rhs_batch.len != 0) return null;
         if (lhs_contracting.len != 1 or rhs_contracting.len != 1) return null;
         if (lhs_shape.len != 2 or rhs_shape.len != 2) return null;
-        if (lhs_contracting[0] != 1 or (rhs_contracting[0] != 0 and rhs_contracting[0] != 1)) return null;
+        if (lhs_contracting[0] > 1 or (rhs_contracting[0] != 0 and rhs_contracting[0] != 1)) return null;
         if (bufHasAnyQuantizedStorage(toBuf(lhs)) or bufHasAnyQuantizedStorage(toBuf(rhs))) return null;
+        // A contraction over the lhs rows (a weight gradient, dY^T X) runs as
+        // a transposed-left MPS GEMM instead of materializing the transpose.
+        if (lhs_contracting[0] == 0) return self.tryDeviceDotGeneral2DTransposedLeft(lhs, rhs, lhs_shape, rhs_shape, rhs_contracting[0]);
 
         const m_i64 = lhs_shape[0];
         const k_i64 = lhs_shape[1];
@@ -14391,6 +14522,34 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             return try self.ctFromOwnedMetalTensor(owned_tensor);
         }
         return null;
+    }
+
+    fn tryDeviceDotGeneral2DTransposedLeft(self: *MetalCompute, lhs: CT, rhs: CT, lhs_shape: []const i64, rhs_shape: []const i64, rhs_contracting: u8) !?CT {
+        if (lhs_shape[0] <= 0 or lhs_shape[1] <= 0 or rhs_shape[0] <= 0 or rhs_shape[1] <= 0) return null;
+        const k: usize = @intCast(lhs_shape[0]);
+        const m: usize = @intCast(lhs_shape[1]);
+        if (rhs_shape[rhs_contracting] != lhs_shape[0]) return null;
+        const n: usize = @intCast(rhs_shape[1 - @as(usize, rhs_contracting)]);
+        const runtime = self.provider_impl.raw_decode_runtime orelse return null;
+        var lhs_mt = try self.ownedDeviceMetalTensorFromCt(lhs);
+        defer lhs_mt.deinit();
+        var rhs_mt = try self.ownedDeviceMetalTensorFromCt(rhs);
+        defer rhs_mt.deinit();
+        if (!lhs_mt.isDevice() or !rhs_mt.isDevice() or lhs_mt.dtype != .f32 or rhs_mt.dtype != .f32) return null;
+        const out_shape = [_]i32{ @intCast(m), @intCast(n) };
+        var output = try MetalTensor.deviceAllocate(runtime, m * n * @sizeOf(f32), .private, &out_shape);
+        errdefer output.deinit();
+        if (!try metal_runtime.decoderRuntimeGemmF32Device(self.provider_impl, lhs_mt, rhs_mt, output, .{
+            .m = m,
+            .n = n,
+            .k = k,
+            .transpose_left = true,
+            .transpose_right = rhs_contracting == 1,
+        })) {
+            output.deinit();
+            return null;
+        }
+        return try self.ctFromOwnedMetalTensor(output);
     }
 
     fn tryDeviceDotGeneralBatched(
@@ -15514,7 +15673,14 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             bufHasAnyQuantizedStorage(gamma_buf) or
             bufHasAnyQuantizedStorage(beta_buf);
         const device_fast_path_enabled = !has_quantized and !disableRuntimeElementwise();
-        if (device_fast_path_enabled) {
+        // Training parameters change every step, and a freed buffer's address
+        // can be reused, so an identity-keyed slot could serve stale weights.
+        // Read them directly instead.
+        if (device_fast_path_enabled and (gamma_buf.mutable_state or beta_buf.mutable_state)) {
+            if (try self.layerNormDirect(input, gamma, beta, dim, eps)) |tensor| return tensor;
+            warnHostFallbackOnce(2, "layer norm");
+        }
+        if (device_fast_path_enabled and !gamma_buf.mutable_state and !beta_buf.mutable_state) {
             if (input_buf.metal_tensor) |*input_metal| {
                 if (input_metal.isDevice() and input_metal.ndim() == 2 and @as(usize, @intCast(input_metal.dim(1))) == dim and
                     bufElemCount(gamma_buf) == dim and bufElemCount(beta_buf) == dim)
@@ -15553,6 +15719,190 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         const shape_i32 = try self.i32ShapeFromI64(shape_i64);
         defer self.allocator.free(shape_i32);
         return denseBuf(self.allocator, output, true, shape_i32);
+    }
+
+    /// `input` as a device f32 tensor of exactly `count` elements. Pooled and
+    /// view buffers can be longer than their elements; boundary kernels need
+    /// exact lengths, so those are copied on the device. Null when the value
+    /// is not a device f32 tensor of `count` elements.
+    fn exactDeviceF32(self: *MetalCompute, input: CT, count: usize) !?MetalTensor {
+        var tensor = self.ownedDeviceMetalTensorFromCt(input) catch return null;
+        errdefer tensor.deinit();
+        if (!tensor.isDevice() or tensor.dtype != .f32 or tensor.elemCount() != count) {
+            tensor.deinit();
+            return null;
+        }
+        if (tensor.deviceByteLen() == count * 4) return tensor;
+        const runtime = self.provider_impl.raw_decode_runtime orelse {
+            tensor.deinit();
+            return null;
+        };
+        var copy = try MetalTensor.deviceAllocateFresh(@ptrCast(runtime), count * 4, .private, &.{@intCast(count)});
+        errdefer copy.deinit();
+        try tensor.copyInto(&copy);
+        tensor.deinit();
+        return copy;
+    }
+
+    /// Runs one boundary kernel on device-resident f32 operands into a new
+    /// `shape` tensor. Null when an operand is not device-resident f32.
+    fn boundaryKernelDevice(self: *MetalCompute, request: ops.gliner_boundary_device.Kernel, inputs: []const CT, shape: []const i32) !?CT {
+        const runtime = self.provider_impl.raw_decode_runtime orelse return null;
+        metal_runtime.requireGlinerBoundaryReady(runtime) catch return null;
+        const layout = request.layout() catch return null;
+        var tensors: [ops.gliner_boundary_device.max_inputs]MetalTensor = undefined;
+        var held: usize = 0;
+        defer for (tensors[0..held]) |*tensor| tensor.deinit();
+        var sources: [ops.gliner_boundary_device.max_inputs]?MetalTensor = @splat(null);
+        for (inputs, 0..) |input, i| {
+            tensors[i] = (try self.exactDeviceF32(input, layout.input_elements[i])) orelse return null;
+            held += 1;
+            sources[i] = tensors[i];
+        }
+        var output = try MetalTensor.deviceAllocate(runtime, layout.output_elements * @sizeOf(f32), .private, shape);
+        errdefer output.deinit();
+        if (!try metal_runtime.decoderRuntimeGlinerBoundaryIntoDevice(self.provider_impl, request, sources, output)) {
+            output.deinit();
+            return null;
+        }
+        return try self.ctFromOwnedMetalTensor(output);
+    }
+
+    fn dropoutMaskOp(ctx: *anyopaque, shape: []const i32, probability: f32, seed: u64) anyerror!CT {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        if (!(probability >= 0 and probability < 1)) return error.InvalidDropoutProbability;
+        var count: usize = 1;
+        for (shape) |dim| count *= @intCast(dim);
+        if (count > 0 and count <= std.math.maxInt(u32)) {
+            var request = ops.gliner_boundary_device.Kernel{ .kind = .dropout_mask };
+            request.dims[0] = @intCast(count);
+            request.dims[1] = @truncate(seed);
+            request.dims[2] = @truncate(seed >> 32);
+            request.dims[3] = ops.dropout_mask.threshold(probability);
+            request.scalars[0] = 1 / (1 - probability);
+            if (try self.boundaryKernelDevice(request, &.{}, shape)) |tensor| return tensor;
+        }
+        warnHostFallbackOnce(5, "dropout mask");
+        const values = try self.allocator.alloc(f32, count);
+        defer self.allocator.free(values);
+        try ops.dropout_mask.fill(values, probability, seed);
+        return fromFloat32ShapeOp(ctx, values, shape);
+    }
+
+    fn qkvRopeTableOp(ctx: *anyopaque, input: CT, cos: CT, sin: CT, width: usize, head_dim: usize, inverse: bool) anyerror!CT {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        const count = bufElemCount(toBuf(input));
+        if (width == 0 or count % (3 * width) != 0 or width > std.math.maxInt(u32)) return error.InvalidTensorShape;
+        const rows = count / (3 * width);
+        if (rows > std.math.maxInt(u32)) return error.InvalidTensorShape;
+        const forward_shape = [_]i32{ @intCast(3 * rows), @intCast(width) };
+        const inverse_shape = [_]i32{ @intCast(rows), @intCast(3 * width) };
+        const shape: []const i32 = if (inverse) &inverse_shape else &forward_shape;
+        var request = ops.gliner_boundary_device.Kernel{ .kind = .qkv_rope_table };
+        request.dims[0] = @intCast(rows);
+        request.dims[1] = @intCast(width);
+        request.dims[2] = @intCast(head_dim);
+        request.dims[3] = @intFromBool(inverse);
+        if (try self.boundaryKernelDevice(request, &.{ input, cos, sin }, shape)) |tensor| return tensor;
+        warnHostFallbackOnce(5, "qkv rope table");
+        const x = try toFloat32Op(ctx, input, self.allocator);
+        defer self.allocator.free(x);
+        const c = try toFloat32Op(ctx, cos, self.allocator);
+        defer self.allocator.free(c);
+        const s = try toFloat32Op(ctx, sin, self.allocator);
+        defer self.allocator.free(s);
+        const output = try self.allocator.alloc(f32, x.len);
+        errdefer self.allocator.free(output);
+        try ops.rope_table.applyQkv(output, x, c, s, width, head_dim, inverse);
+        return denseBuf(self.allocator, output, true, shape);
+    }
+
+    fn gegluOp(ctx: *anyopaque, input: CT, width: usize) anyerror!CT {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        const count = bufElemCount(toBuf(input));
+        if (width == 0 or count % (2 * width) != 0 or width > std.math.maxInt(u32)) return error.InvalidTensorShape;
+        const rows = count / (2 * width);
+        const shape = [_]i32{ @intCast(rows), @intCast(width) };
+        var request = ops.gliner_boundary_device.Kernel{ .kind = .laya_geglu };
+        request.dims[0] = @intCast(rows);
+        request.dims[1] = @intCast(width);
+        if (try self.boundaryKernelDevice(request, &.{input}, &shape)) |tensor| return tensor;
+        warnHostFallbackOnce(3, "geglu");
+        const x = try toFloat32Op(ctx, input, self.allocator);
+        defer self.allocator.free(x);
+        const output = try self.allocator.alloc(f32, x.len / 2);
+        errdefer self.allocator.free(output);
+        try ops.geglu.forward(output, x, width);
+        return denseBuf(self.allocator, output, true, &shape);
+    }
+
+    fn gegluBackwardOp(ctx: *anyopaque, input: CT, dout: CT, width: usize) anyerror!CT {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        const count = bufElemCount(toBuf(input));
+        if (width == 0 or count % (2 * width) != 0 or width > std.math.maxInt(u32)) return error.InvalidTensorShape;
+        const rows = count / (2 * width);
+        const shape = [_]i32{ @intCast(rows), @intCast(2 * width) };
+        var request = ops.gliner_boundary_device.Kernel{ .kind = .geglu_backward };
+        request.dims[0] = @intCast(rows);
+        request.dims[1] = @intCast(width);
+        if (try self.boundaryKernelDevice(request, &.{ input, dout }, &shape)) |tensor| return tensor;
+        warnHostFallbackOnce(4, "geglu backward");
+        const x = try toFloat32Op(ctx, input, self.allocator);
+        defer self.allocator.free(x);
+        const g = try toFloat32Op(ctx, dout, self.allocator);
+        defer self.allocator.free(g);
+        const output = try self.allocator.alloc(f32, x.len);
+        errdefer self.allocator.free(output);
+        try ops.geglu.backward(output, x, g, width);
+        return denseBuf(self.allocator, output, true, &shape);
+    }
+
+    fn ropeTableOp(ctx: *anyopaque, input: CT, cos: CT, sin: CT, width: usize, head_dim: usize, inverse: bool) anyerror!CT {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        if (try self.ropeTableDevice(input, cos, sin, width, head_dim, inverse)) |tensor| return tensor;
+        // Host fallback for operands that are not device-resident f32.
+        warnHostFallbackOnce(5, "rope table");
+        const x = try toFloat32Op(ctx, input, self.allocator);
+        defer self.allocator.free(x);
+        const c = try toFloat32Op(ctx, cos, self.allocator);
+        defer self.allocator.free(c);
+        const s = try toFloat32Op(ctx, sin, self.allocator);
+        defer self.allocator.free(s);
+        const output = try self.allocator.alloc(f32, x.len);
+        errdefer self.allocator.free(output);
+        try ops.rope_table.apply(output, x, c, s, width, head_dim, inverse);
+        const shape = [_]i32{ @intCast(x.len / width), @intCast(width) };
+        return denseBuf(self.allocator, output, true, &shape);
+    }
+
+    fn ropeTableDevice(self: *MetalCompute, input: CT, cos: CT, sin: CT, width: usize, head_dim: usize, inverse: bool) !?CT {
+        const count = bufElemCount(toBuf(input));
+        const rows = ops.rope_table.validate(count, bufElemCount(toBuf(cos)), width, head_dim) catch return null;
+        if (bufElemCount(toBuf(sin)) != bufElemCount(toBuf(cos)) or rows > std.math.maxInt(u32) or width > std.math.maxInt(u32)) return null;
+        var request = ops.gliner_boundary_device.Kernel{ .kind = .rope_table };
+        request.dims[0] = @intCast(rows);
+        request.dims[1] = @intCast(width);
+        request.dims[2] = @intCast(head_dim);
+        request.dims[3] = @intFromBool(inverse);
+        const shape = [_]i32{ @intCast(rows), @intCast(width) };
+        return self.boundaryKernelDevice(request, &.{ input, cos, sin }, &shape);
+    }
+
+    /// LayerNorm over rows of `dim`, reading gamma and beta from their own
+    /// buffers rather than a prepared slot. Null when the operands are not
+    /// device-resident f32 or the shape is outside the kernel's range.
+    fn layerNormDirect(self: *MetalCompute, input: CT, gamma: CT, beta: CT, dim: usize, eps: f32) !?CT {
+        if (dim == 0 or dim > 4096 or !(eps > 0)) return null;
+        const count = bufElemCount(toBuf(input));
+        if (count == 0 or count % dim != 0 or count / dim > std.math.maxInt(u32)) return null;
+        const logical = toBuf(input).logical_shape orelse return null;
+        const shape = try self.i32ShapeFromI64(logical);
+        defer self.allocator.free(shape);
+        var request = ops.gliner_boundary_device.Kernel{ .kind = .norm };
+        request.dims[0] = @intCast(count / dim);
+        request.dims[1] = @intCast(dim);
+        request.scalars[0] = eps;
+        return self.boundaryKernelDevice(request, &.{ input, gamma, beta }, shape);
     }
 
     fn addLayerNormOp(ctx: *anyopaque, a: CT, b: CT, gamma: CT, beta: CT, dim: usize, eps: f32) anyerror!?CT {
@@ -32431,6 +32781,8 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         vt.trainingZeroF32 = trainingZeroF32Op;
         vt.trainingAccumulateF32 = trainingAccumulateF32Op;
         vt.trainingAdamWManyF32 = trainingAdamWManyF32Op;
+        vt.trainingAccumulateIntoManyF32 = trainingAccumulateIntoManyF32Op;
+        vt.trainingAdamWIntoManyF32 = trainingAdamWIntoManyF32Op;
         vt.residentTrainingBeginBatch = residentTrainingBeginBatchOp;
         vt.residentTrainingEndBatch = residentTrainingEndBatchOp;
         vt.trainingSumSquaresManyF32 = trainingSumSquaresManyF32Op;
@@ -32555,7 +32907,15 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         vt.gemma4AudioLocalAttention = gemma4AudioLocalAttentionOp;
         vt.rmsNormAddTensor = rmsNormAddTensorOp;
         vt.layerNorm = layerNormOp;
+        // The inherited NativeCompute op would read a MetalCompute tensor as
+        // its own; the interpreter falls back to layerNorm without it.
+        vt.layerNormConsumeInput = null;
         vt.layerNormBackward = layerNormBackwardOp;
+        vt.ropeTable = ropeTableOp;
+        vt.qkvRopeTable = qkvRopeTableOp;
+        vt.dropoutMask = dropoutMaskOp;
+        vt.geglu = gegluOp;
+        vt.gegluBackward = gegluBackwardOp;
         vt.addLayerNorm = addLayerNormOp;
         vt.addLayerNormSum = addLayerNormSumOp;
         vt.ensureDeviceResident = ensureDeviceResidentOp;

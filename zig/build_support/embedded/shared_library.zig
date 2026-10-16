@@ -17,9 +17,7 @@
 const std = @import("std");
 
 /// Executor owners and provider archives must share the internal Zig callback ABI.
-pub fn llvmBackend(target: std.Target) ?bool {
-    return if (target.ofmt == .elf) true else null;
-}
+pub const llvmBackend = @import("source_owner.zig").llvmBackend;
 
 pub fn inferenceCompileMaxRss(os: std.Target.Os.Tag, shared: bool, measured_darwin: bool) u64 {
     const gib = 1024 * 1024 * 1024;
@@ -253,8 +251,7 @@ pub fn storageConsumerModule(b: *std.Build, original: *std.Build.Module) *std.Bu
 }
 fn cloneStorageConsumer(b: *std.Build, original: *std.Build.Module, copies: *std.AutoHashMap(*std.Build.Module, *std.Build.Module)) *std.Build.Module {
     if (copies.get(original)) |existing| return existing;
-    const copy = b.allocator.create(std.Build.Module) catch @panic("OOM");
-    copy.init(original.owner, .{ .existing = original });
+    const copy = @import("source_owner.zig").cloneModule(b, original);
     copy.import_table = .empty;
     copy.link_objects = .empty;
     copy.cached_graph = .{ .modules = &.{}, .names = &.{} };
@@ -274,7 +271,7 @@ fn cloneStorageConsumer(b: *std.Build, original: *std.Build.Module, copies: *std
 pub fn addStorageProbe(b: *std.Build, module: *std.Build.Module, name: []const u8) *std.Build.Step.Run {
     const target = module.resolved_target.?.result;
     if (target.os.tag != .macos) {
-        const executable = b.addExecutable(.{ .name = name, .root_module = module, .max_rss = 4 * 1024 * 1024 * 1024 });
+        const executable = b.addExecutable(.{ .name = name, .root_module = module, .use_llvm = llvmBackend(target), .max_rss = 4 * 1024 * 1024 * 1024 });
         return b.addRunArtifact(executable);
     }
     module.link_libc = true;

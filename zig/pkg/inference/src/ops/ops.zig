@@ -38,6 +38,9 @@ const ml = @import("ml");
 pub const CT = backend_contracts.CT;
 pub const gliner_boundary_device = @import("gliner_boundary_device_ops.zig");
 pub const resident_training = @import("resident_training_ops.zig");
+pub const rope_table = @import("rope_table.zig");
+pub const geglu = @import("geglu.zig");
+pub const dropout_mask = @import("dropout_mask.zig");
 pub const record_loss_math = @import("record_loss_math.zig");
 pub const elementwise_loss_math = @import("elementwise_loss_math.zig");
 pub const consistency_loss_math = @import("consistency_loss_math.zig");
@@ -259,6 +262,18 @@ pub const TrainingAdamWBatchInput = struct {
     bias_correction2: f32,
     adam_step: u32 = 0,
 };
+
+/// Out-of-place accumulation: output = (previous + grad / divisor) *
+/// renormalize. A null previous or grad omits that term.
+pub const TrainingAccumulateIntoInput = struct {
+    previous: ?CT,
+    grad: ?CT,
+    shape: []const i32,
+    elem_count: usize,
+};
+
+/// New weight and moment buffers produced by an out-of-place AdamW update.
+pub const TrainingAdamWOutputs = struct { weight: CT, m: CT, v: CT };
 
 pub const TrainingAdamWBatchOptions = struct {
     lr: f32,
@@ -2210,6 +2225,15 @@ pub const ComputeBackend = struct {
         /// = d_gamma, row `rows+1` = d_beta. Optional; backends without it fall
         /// back to the lowered (decomposed) backward.
         layerNormBackward: ?*const fn (ctx: *anyopaque, input: CT, gamma: CT, beta: CT, dy: CT, dim: usize, eps: f32) anyerror!CT = null,
+        /// `fused_rope_table`: x [rows, width] rotated by [rows*heads, head_dim/2] tables.
+        ropeTable: ?*const fn (ctx: *anyopaque, input: CT, cos: CT, sin: CT, width: usize, head_dim: usize, inverse: bool) anyerror!CT = null,
+        /// An inverted-dropout mask of `shape` filled from `seed` (ops/dropout_mask.zig).
+        dropoutMask: ?*const fn (ctx: *anyopaque, shape: []const i32, probability: f32, seed: u64) anyerror!CT = null,
+        /// `fused_qkv_rope_table`: `width` is one part's width (hidden size).
+        qkvRopeTable: ?*const fn (ctx: *anyopaque, input: CT, cos: CT, sin: CT, width: usize, head_dim: usize, inverse: bool) anyerror!CT = null,
+        /// `fused_geglu` [rows, 2*width] -> [rows, width] and its backward.
+        geglu: ?*const fn (ctx: *anyopaque, input: CT, width: usize) anyerror!CT = null,
+        gegluBackward: ?*const fn (ctx: *anyopaque, input: CT, dout: CT, width: usize) anyerror!CT = null,
 
         /// RMS normalization: x * rsqrt(mean(x^2) + eps) * weight. No bias, no mean subtraction.
         rmsNorm: *const fn (ctx: *anyopaque, input: CT, weight: CT, dim: usize, eps: f32) anyerror!CT,
@@ -2619,6 +2643,12 @@ pub const ComputeBackend = struct {
         trainingZeroF32: ?*const fn (ctx: *anyopaque, elem_count: usize, shape: []const i32) anyerror!CT = null,
         trainingAccumulateF32: ?*const fn (ctx: *anyopaque, accum: CT, grad: CT, elem_count: usize, scale: f32, first: bool) anyerror!void = null,
         trainingAdamWManyF32: ?*const fn (ctx: *anyopaque, inputs: []const TrainingAdamWBatchInput, opts: TrainingAdamWBatchOptions) anyerror!void = null,
+        /// Allocates one fresh output per input. On error no output is returned.
+        trainingAccumulateIntoManyF32: ?*const fn (ctx: *anyopaque, inputs: []const TrainingAccumulateIntoInput, divisor: f32, renormalize: f32, outputs: []CT) anyerror!void = null,
+        /// AdamW that only reads weight/m/v, writing fresh outputs (grad is
+        /// still cleared) and setting `flag` (an f32 scalar the caller zeroed)
+        /// to 1 if any output is not finite. On error no output is returned.
+        trainingAdamWIntoManyF32: ?*const fn (ctx: *anyopaque, inputs: []const TrainingAdamWBatchInput, shapes: []const []const i32, opts: TrainingAdamWBatchOptions, outputs: []TrainingAdamWOutputs, flag: CT) anyerror!void = null,
         trainingSumSquaresManyF32: ?*const fn (ctx: *anyopaque, inputs: []const TrainingSumSquaresInput) anyerror!f32 = null,
         trainingSynchronize: ?*const fn (ctx: *anyopaque) anyerror!void = null,
 
@@ -3845,6 +3875,31 @@ pub const ComputeBackend = struct {
         return null;
     }
 
+    pub fn ropeTable(self: *const ComputeBackend, input: CT, cos: CT, sin: CT, width: usize, head_dim: usize, inverse: bool) !CT {
+        const op = self.vtable.ropeTable orelse return error.UnsupportedPrimitiveOp;
+        return op(self.ptr, input, cos, sin, width, head_dim, inverse);
+    }
+
+    pub fn dropoutMask(self: *const ComputeBackend, shape: []const i32, probability: f32, seed: u64) !CT {
+        const op = self.vtable.dropoutMask orelse return error.UnsupportedPrimitiveOp;
+        return op(self.ptr, shape, probability, seed);
+    }
+
+    pub fn qkvRopeTable(self: *const ComputeBackend, input: CT, cos: CT, sin: CT, width: usize, head_dim: usize, inverse: bool) !CT {
+        const op = self.vtable.qkvRopeTable orelse return error.UnsupportedPrimitiveOp;
+        return op(self.ptr, input, cos, sin, width, head_dim, inverse);
+    }
+
+    pub fn geglu(self: *const ComputeBackend, input: CT, width: usize) !CT {
+        const op = self.vtable.geglu orelse return error.UnsupportedPrimitiveOp;
+        return op(self.ptr, input, width);
+    }
+
+    pub fn gegluBackward(self: *const ComputeBackend, input: CT, dout: CT, width: usize) !CT {
+        const op = self.vtable.gegluBackward orelse return error.UnsupportedPrimitiveOp;
+        return op(self.ptr, input, dout, width);
+    }
+
     pub fn layerNormBackward(self: *const ComputeBackend, input: CT, gamma: CT, beta: CT, dy: CT, dim: usize, eps: f32) !?CT {
         if (self.vtable.layerNormBackward) |f| return try f(self.ptr, input, gamma, beta, dy, dim, eps);
         return null;
@@ -4645,6 +4700,20 @@ pub const ComputeBackend = struct {
     pub fn trainingAccumulateF32(self: *const ComputeBackend, accum: CT, grad: CT, elem_count: usize, scale: f32, first: bool) !void {
         const op = self.vtable.trainingAccumulateF32 orelse return error.DeviceTrainingUnavailable;
         return op(self.ptr, accum, grad, elem_count, scale, first);
+    }
+
+    pub fn trainingAccumulateIntoManyF32(self: *const ComputeBackend, inputs: []const TrainingAccumulateIntoInput, divisor: f32, renormalize: f32, outputs: []CT) !void {
+        const op = self.vtable.trainingAccumulateIntoManyF32 orelse return error.DeviceTrainingUnavailable;
+        if (outputs.len != inputs.len) return error.InvalidTrainingGradient;
+        try self.checkExecutionControl();
+        return op(self.ptr, inputs, divisor, renormalize, outputs);
+    }
+
+    pub fn trainingAdamWIntoManyF32(self: *const ComputeBackend, inputs: []const TrainingAdamWBatchInput, shapes: []const []const i32, opts: TrainingAdamWBatchOptions, outputs: []TrainingAdamWOutputs, flag: CT) !void {
+        const op = self.vtable.trainingAdamWIntoManyF32 orelse return error.DeviceTrainingUnavailable;
+        if (outputs.len != inputs.len or shapes.len != inputs.len) return error.InvalidTrainingGradient;
+        try self.checkExecutionControl();
+        return op(self.ptr, inputs, shapes, opts, outputs, flag);
     }
 
     pub fn trainingAdamWManyF32(self: *const ComputeBackend, inputs: []const TrainingAdamWBatchInput, opts: TrainingAdamWBatchOptions) !void {

@@ -592,6 +592,8 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "storage.db.db.test.db schema-present infer_types opt-in recursively infers nested fields after reopen",
         "storage.db.db.test.db document _edges",
         "storage.db.db.test.db document _embeddings",
+        "db dense and sparse field-backed vector indexes strip vector fields and persist embedding artifacts",
+        "document mapper explicit null embeddings",
         "sort execution plan dimension names are stable for profiles",
         "sort cursor contract classifies arity separately from type",
         "json sort values reject non-replayable numeric values at API boundaries",
