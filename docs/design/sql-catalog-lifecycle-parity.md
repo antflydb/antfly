@@ -8654,3 +8654,36 @@ that frame from 7,934,592 to 5,179,024 bytes. No stack-budget increase or optimi
 build was used to make the final gate pass. Public recovery receipts, activation,
 replacement-root adoption and hosted execution remain unfinished. Inventory
 remains 483 implemented / 862 unresolved.
+
+### Generated public index-publication recovery contract
+
+The owned native plan now prepares a bounded, canonical recovery token before
+admission. It binds metadata incarnation, immutable table ID, publication ID and
+plan digest. Its versioned checksum detects corruption, not authorization; every
+status read still requires the current logical table guard and trusted ingress
+capabilities. The read checks cancellation/deadline before and after metadata IO
+and projects the bounded exact observation into generated OpenAPI types.
+
+Public states distinguish unknown admission, pending, published, failed and
+canceled. An unmirrored terminal observation remains admission_unknown. Published
+describes retained-job completion, not current query readiness after later schema
+changes. An absent job never authorizes automatic DDL replay. SQL DDL receipts
+now describe index recovery tokens and the existing FK publication identity in
+the same generated contract; SDK root exports include the public recovery types.
+
+This is the recovery contract and projection boundary, not activation of the
+public SQL/REST endpoint. Public admission/status wiring, replacement-root
+adoption and hosted execution remain unfinished. Original inventory remains
+483 implemented / 862 unresolved; no case credit is assigned to this milestone.
+
+Final frozen-source Debug qualification passed 142/142 build steps in
+`/private/tmp/antfly-index-public-recovery-final-debug.log`: 65 metadata/index,
+50 relation-store, four transport, four standalone, one compiled metadata-owner,
+three real owner-adapter and one decoder-barrier tests, without failures or
+leaks. The three added native tests cover canonical bounded tokens, damaged and
+truncated handles, authorization-before-IO, replaced table identities, uncertain
+replication, terminal outcome projection and generated DDL receipt compatibility.
+The focused Go recovery-contract test, 58 Python recovery/maintenance/SQL tests
+and TypeScript SDK typecheck pass after final generation and formatting.
+`make generate`, `make fmt`, inventory integrity, Apache boundary, license headers,
+control catalog and whitespace checks pass. No latency benchmark is claimed.

@@ -13253,7 +13253,9 @@ components:
       description: >
         Durable DDL declaration receipt. admission_unknown means admission has
 
-        not been confirmed; reconcile restore_job_id and idempotency_key without replaying DDL.
+        not been confirmed; retain the matching restore job, FK publication ID, or
+
+        index publication token and reconcile its status without replaying DDL.
 
         Pending or invalid means the declaration
 
@@ -13288,6 +13290,13 @@ components:
           type: string
           description: Durable retry identity for an admitted or uncertain schema rewrite. Retain it with
             restore_job_id when reconciling admission; do not replay the DDL.
+        fk_generation_publication_id:
+          type: string
+          pattern: ^[0-9a-f]{32}$
+          description: Immutable FK-generation publication identity. Retain it when admission is unknown
+            or activation remains pending; do not replay DDL.
+        index_publication_token:
+          $ref: '#/components/schemas/IndexPublicationToken'
     SQLDiagnostic:
       type: object
       additionalProperties: false
@@ -17411,6 +17420,8 @@ components:
         - status
         - shard_status
       properties:
+        publication:
+          $ref: '#/components/schemas/IndexPublicationStatus'
         shard_status:
           type: object
           additionalProperties:
@@ -25838,6 +25849,15 @@ components:
           type: integer
           minimum: -1000
           maximum: 1000
+    IndexPublicationToken:
+      type: string
+      minLength: 171
+      maxLength: 171
+      pattern: ^[A-Za-z0-9_-]{171}$
+      description: Opaque versioned recovery handle binding a metadata incarnation, immutable table identity,
+        publication ID and plan commitment. This is not authentication or permission to execute, cancel,
+        adopt a root or replay DDL. Retain it before admission and use current table authorization when
+        observing the publication.
     RerankerProvider:
       type: string
       enum:
@@ -30032,6 +30052,82 @@ components:
           graph: '#/components/schemas/CreatedGraphIndex'
           algebraic: '#/components/schemas/CreatedAlgebraicIndex'
           relational: '#/components/schemas/CreatedRelationalIndex'
+    IndexPublicationState:
+      type: string
+      enum:
+        - admission_unknown
+        - pending
+        - published
+        - failed
+        - canceled
+    IndexPublicationPhase:
+      type: string
+      enum:
+        - fencing
+        - reserving
+        - building
+        - installing
+        - releasing
+        - published
+        - canceling
+        - cancel_releasing
+        - canceled
+    IndexPublicationFailure:
+      type: string
+      enum:
+        - duplicate_key
+        - invalid_candidate
+        - requested
+    IndexPublicationStatus:
+      type: object
+      additionalProperties: false
+      required:
+        - index_type
+        - index_name
+        - publication_token
+        - table_id
+        - publication_id
+        - plan_digest
+        - metadata_incarnation
+        - state
+        - replication_pending
+      description: Exact observation of an online relational-index publication job, not a query-readiness
+        certificate. Published means this retained job completed; later schema/index changes may supersede
+        its artifacts. An absent or unmirrored job is admission_unknown, never permission to replay DDL.
+      properties:
+        index_type:
+          type: string
+          enum:
+            - relational
+        index_name:
+          type: string
+        publication_token:
+          $ref: '#/components/schemas/IndexPublicationToken'
+        table_id:
+          type: string
+          pattern: ^[0-9]+$
+        publication_id:
+          type: string
+          pattern: ^[0-9a-f]{32}$
+        plan_digest:
+          type: string
+          pattern: ^[0-9a-f]{64}$
+        metadata_incarnation:
+          type: string
+          pattern: ^[0-9a-f]{32}$
+        state:
+          $ref: '#/components/schemas/IndexPublicationState'
+        phase:
+          $ref: '#/components/schemas/IndexPublicationPhase'
+        failure:
+          $ref: '#/components/schemas/IndexPublicationFailure'
+        replication_pending:
+          type: boolean
+        owner_count:
+          type: integer
+          format: uint16
+          minimum: 1
+          maximum: 4096
     IndexReadinessState:
       type: string
       enum:

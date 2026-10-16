@@ -4921,7 +4921,8 @@ export interface components {
         SQLDDLReceiptState: "ready" | "pending" | "invalid" | "admission_unknown";
         /**
          * @description Durable DDL declaration receipt. admission_unknown means admission has
-         *     not been confirmed; reconcile restore_job_id and idempotency_key without replaying DDL.
+         *     not been confirmed; retain the matching restore job, FK publication ID, or
+         *     index publication token and reconcile its status without replaying DDL.
          *     Pending or invalid means the declaration
          *     committed but validation has not established an active constraint. Do not
          *     replay it. Inspect table constraint status using this immutable table
@@ -4940,6 +4941,9 @@ export interface components {
             restore_job_id?: string;
             /** @description Durable retry identity for an admitted or uncertain schema rewrite. Retain it with restore_job_id when reconciling admission; do not replay the DDL. */
             idempotency_key?: string;
+            /** @description Immutable FK-generation publication identity. Retain it when admission is unknown or activation remains pending; do not replay DDL. */
+            fk_generation_publication_id?: string;
+            index_publication_token?: components["schemas"]["IndexPublicationToken"];
         };
         SQLDiagnostic: {
             /** @description Five-character SQLSTATE error code. */
@@ -7407,6 +7411,7 @@ export interface components {
             buckets?: components["schemas"]["AggregationBucket"][];
         };
         IndexStatus: {
+            publication?: components["schemas"]["IndexPublicationStatus"];
             shard_status: {
                 [key: string]: components["schemas"]["IndexStats"];
             };
@@ -12635,6 +12640,8 @@ export interface components {
             precision: number;
             scale: number;
         };
+        /** @description Opaque versioned recovery handle binding a metadata incarnation, immutable table identity, publication ID and plan commitment. This is not authentication or permission to execute, cancel, adopt a root or replay DDL. Retain it before admission and use current table authorization when observing the publication. */
+        IndexPublicationToken: string;
         /**
          * @description The reranking provider to use.
          * @enum {string}
@@ -15033,6 +15040,29 @@ export interface components {
         };
         /** @description Discriminated normalized configuration returned after an index is created. */
         CreatedIndex: components["schemas"]["CreatedFullTextIndex"] | components["schemas"]["CreatedEmbeddingsIndex"] | components["schemas"]["CreatedGraphIndex"] | components["schemas"]["CreatedAlgebraicIndex"] | components["schemas"]["CreatedRelationalIndex"];
+        /** @enum {string} */
+        IndexPublicationState: "admission_unknown" | "pending" | "published" | "failed" | "canceled";
+        /** @enum {string} */
+        IndexPublicationPhase: "fencing" | "reserving" | "building" | "installing" | "releasing" | "published" | "canceling" | "cancel_releasing" | "canceled";
+        /** @enum {string} */
+        IndexPublicationFailure: "duplicate_key" | "invalid_candidate" | "requested";
+        /** @description Exact observation of an online relational-index publication job, not a query-readiness certificate. Published means this retained job completed; later schema/index changes may supersede its artifacts. An absent or unmirrored job is admission_unknown, never permission to replay DDL. */
+        IndexPublicationStatus: {
+            /** @enum {string} */
+            index_type: "relational";
+            index_name: string;
+            publication_token: components["schemas"]["IndexPublicationToken"];
+            table_id: string;
+            publication_id: string;
+            plan_digest: string;
+            metadata_incarnation: string;
+            state: components["schemas"]["IndexPublicationState"];
+            phase?: components["schemas"]["IndexPublicationPhase"];
+            failure?: components["schemas"]["IndexPublicationFailure"];
+            replication_pending: boolean;
+            /** Format: uint16 */
+            owner_count?: number;
+        };
         /**
          * @description Lifecycle state for the desired index incarnation. A failed desired repair may coexist with queryable=true when a separately proven serving incarnation remains available; clients must use the explicit milestone booleans.
          * @enum {string}

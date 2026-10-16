@@ -1793,7 +1793,8 @@ components:
       required: [database, namespace, table, table_id, schema_version, state]
       description: |
         Durable DDL declaration receipt. admission_unknown means admission has
-        not been confirmed; reconcile restore_job_id and idempotency_key without replaying DDL.
+        not been confirmed; retain the matching restore job, FK publication ID, or
+        index publication token and reconcile its status without replaying DDL.
         Pending or invalid means the declaration
         committed but validation has not established an active constraint. Do not
         replay it. Inspect table constraint status using this immutable table
@@ -1821,6 +1822,12 @@ components:
         idempotency_key:
           type: string
           description: Durable retry identity for an admitted or uncertain schema rewrite. Retain it with restore_job_id when reconciling admission; do not replay the DDL.
+        fk_generation_publication_id:
+          type: string
+          pattern: "^[0-9a-f]{32}$"
+          description: Immutable FK-generation publication identity. Retain it when admission is unknown or activation remains pending; do not replay DDL.
+        index_publication_token:
+          $ref: "indexes.yaml#/components/schemas/IndexPublicationToken"
     SQLDiagnostic:
       type: object
       additionalProperties: false
@@ -5114,6 +5121,8 @@ components:
         - status
         - shard_status
       properties:
+        publication:
+          $ref: "indexes.yaml#/components/schemas/IndexPublicationStatus"
         shard_status:
           type: object
           additionalProperties:

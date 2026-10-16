@@ -5989,12 +5989,14 @@ pub const IndexRuntimeCapabilities = struct {
 };
 
 pub const IndexStatus = struct {
+    publication: ?antfly_indexes_openapi.IndexPublicationStatus = null,
     shard_status: std.json.ArrayHashMap(antfly_indexes_openapi.IndexStats),
     config: antfly_indexes_openapi.CreatedIndex,
     status: antfly_indexes_openapi.IndexStats,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "publication", "publication", false },
         .{ "shard_status", "shard_status", false },
         .{ "config", "config", false },
         .{ "status", "status", false },
@@ -6010,6 +6012,13 @@ pub const IndexStatus = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        if (self.publication) |value| {
+            try jw.objectField("publication");
+            try jw.write(value);
+        } else if (jw.options.emit_null_optional_fields) {
+            try jw.objectField("publication");
+            try jw.write(@as(?u8, null));
+        }
         try jw.objectField("shard_status");
         try jw.write(self.shard_status);
         try jw.objectField("config");
@@ -13306,7 +13315,7 @@ pub const SQLConnectionResponse = struct {
     namespace: []const u8,
 };
 
-/// Durable DDL declaration receipt. admission_unknown means admission has not been confirmed; reconcile restore_job_id and idempotency_key without replaying DDL. Pending or invalid means the declaration committed but validation has not established an active constraint. Do not replay it. Inspect table constraint status using this immutable table identity and schema generation; a later generation supersedes this receipt.
+/// Durable DDL declaration receipt. admission_unknown means admission has not been confirmed; retain the matching restore job, FK publication ID, or index publication token and reconcile its status without replaying DDL. Pending or invalid means the declaration committed but validation has not established an active constraint. Do not replay it. Inspect table constraint status using this immutable table identity and schema generation; a later generation supersedes this receipt.
 pub const SQLDDLReceipt = struct {
     database: []const u8,
     namespace: []const u8,
@@ -13319,6 +13328,9 @@ pub const SQLDDLReceipt = struct {
     restore_job_id: ?[]const u8 = null,
     /// Durable retry identity for an admitted or uncertain schema rewrite. Retain it with restore_job_id when reconciling admission; do not replay the DDL.
     idempotency_key: ?[]const u8 = null,
+    /// Immutable FK-generation publication identity. Retain it when admission is unknown or activation remains pending; do not replay DDL.
+    fk_generation_publication_id: ?[]const u8 = null,
+    index_publication_token: ?antfly_indexes_openapi.IndexPublicationToken = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
@@ -13331,6 +13343,8 @@ pub const SQLDDLReceipt = struct {
         .{ "diagnostic", "diagnostic", true },
         .{ "restore_job_id", "restore_job_id", true },
         .{ "idempotency_key", "idempotency_key", true },
+        .{ "fk_generation_publication_id", "fk_generation_publication_id", true },
+        .{ "index_publication_token", "index_publication_token", false },
     };
 
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
@@ -13366,6 +13380,17 @@ pub const SQLDDLReceipt = struct {
         if (self.idempotency_key) |value| {
             try jw.objectField("idempotency_key");
             try jw.write(value);
+        }
+        if (self.fk_generation_publication_id) |value| {
+            try jw.objectField("fk_generation_publication_id");
+            try jw.write(value);
+        }
+        if (self.index_publication_token) |value| {
+            try jw.objectField("index_publication_token");
+            try jw.write(value);
+        } else if (jw.options.emit_null_optional_fields) {
+            try jw.objectField("index_publication_token");
+            try jw.write(@as(?u8, null));
         }
         try jw.endObject();
     }

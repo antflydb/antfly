@@ -750,7 +750,12 @@ from .index_mutation_conflict_error import IndexMutationConflictError
 from .index_mutation_conflict_error_error import IndexMutationConflictErrorError
 from .index_mutation_service_unavailable_error import IndexMutationServiceUnavailableError
 from .index_mutation_service_unavailable_error_error import IndexMutationServiceUnavailableErrorError
+from .index_publication_failure import IndexPublicationFailure
+from .index_publication_phase import IndexPublicationPhase
 from .index_publication_policy import IndexPublicationPolicy
+from .index_publication_state import IndexPublicationState
+from .index_publication_status import IndexPublicationStatus
+from .index_publication_status_index_type import IndexPublicationStatusIndexType
 from .index_readiness_reason import IndexReadinessReason
 from .index_readiness_state import IndexReadinessState
 from .index_readiness_status import IndexReadinessStatus
@@ -2252,7 +2257,12 @@ __all__ = (
     "IndexMutationConflictErrorError",
     "IndexMutationServiceUnavailableError",
     "IndexMutationServiceUnavailableErrorError",
+    "IndexPublicationFailure",
+    "IndexPublicationPhase",
     "IndexPublicationPolicy",
+    "IndexPublicationState",
+    "IndexPublicationStatus",
+    "IndexPublicationStatusIndexType",
     "IndexReadinessReason",
     "IndexReadinessState",
     "IndexReadinessStatus",

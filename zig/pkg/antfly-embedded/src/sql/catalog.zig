@@ -522,6 +522,7 @@ pub const DdlReceipt = struct {
     restore_job_id: ?[]const u8 = null,
     idempotency_key: ?[]const u8 = null,
     fk_generation_publication_id: ?[]const u8 = null,
+    index_publication_token: ?[]const u8 = null,
 };
 /// Scratch must reclaim individual allocations; result may be an arena. DDL
 /// implementations reserve durable receipts in result before admission and

@@ -28,6 +28,7 @@ pub const Owned = struct {
     request: publication.BeginRequest,
     prepared: publication.Prepared,
     observation: publication.AdmissionRequest,
+    recovery_token: [@import("index_publication_recovery.zig").Token.encoded_len]u8,
 
     pub fn deinit(self: *Owned) void {
         self.prepared.deinit();
@@ -125,7 +126,8 @@ pub fn build(reader: anytype, alloc: std.mem.Allocator, io: std.Io, context: ope
     var prepared = try begin.begin.plan.prepare(alloc);
     errdefer prepared.deinit();
     try context.ensureActive();
-    return .{ .arena = arena, .request = begin, .prepared = prepared, .observation = try begin.observation(&prepared) };
+    const observation = try begin.observation(&prepared);
+    return .{ .arena = arena, .request = begin, .prepared = prepared, .observation = observation, .recovery_token = try @import("index_publication_recovery.zig").Token.encode(observation) };
 }
 
 test "relational index publication plan builder owns actual burned catalog allocations and rejects owner drift" {
