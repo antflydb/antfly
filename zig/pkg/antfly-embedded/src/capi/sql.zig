@@ -597,11 +597,14 @@ pub fn Adapter(comptime native: type) type {
             arena: std.heap.ArenaAllocator,
             result: types.SearchResult,
             reader: ?DB.RelationalRows.Reader,
+            documents: ?DB.DocumentRows,
+            needs_document: bool,
             layout: catalog.Row.TypedLayout,
             projection: dependencies.sql_document_row.Projection,
             position: usize = 0,
             fn next(ptr: *anyopaque, alloc: std.mem.Allocator, limit: u32) !catalog.Page {
                 const self: *@This() = @ptrCast(@alignCast(ptr));
+                defer if (self.documents) |*documents| documents.releasePage();
                 if (limit == 0 or limit > 4096) return error.InvalidSqlLimit;
                 var page = std.heap.ArenaAllocator.init(alloc);
                 errdefer page.deinit();
@@ -647,7 +650,7 @@ pub fn Adapter(comptime native: type) type {
                     } else {
                         const hit = self.result.hits[self.position + produced];
                         if (!document_scratch.reset(.{ .retain_with_limit = 256 * 1024 })) return error.OutOfMemory;
-                        const source: dependencies.sql_document_row.Projection.SearchSource = if (hit.source_value) |value| .{ .value = value } else if (hit.stored_data) |data| .{ .bytes = data } else return error.InvalidSqlBackendResponse;
+                        const source: dependencies.sql_document_row.Projection.SearchSource = if (!self.needs_document) .{ .value = .{ .object = .empty } } else if (self.documents) |*documents| .{ .bytes = try documents.lookup(hit.id) } else if (hit.source_value) |value| .{ .value = value } else if (hit.stored_data) |data| .{ .bytes = data } else return error.InvalidSqlBackendResponse;
                         const highlights = if (highlight_slot != null) try highlightsValueLeaky(document_scratch.allocator(), hit.highlights) else null;
                         const out = &rows[produced];
                         out.* = try self.projection.projectSearch(a, document_scratch.allocator(), layout, hit.id, source, .{ .score = if (hit.score) |score| @as(f64, score) else null, .highlights = highlights });
@@ -664,6 +667,7 @@ pub fn Adapter(comptime native: type) type {
             fn close(ptr: *anyopaque) void {
                 const self: *@This() = @ptrCast(@alignCast(ptr));
                 if (self.reader) |*reader| reader.deinit();
+                if (self.documents) |*documents| documents.deinit();
                 self.result.deinit();
                 self.arena.deinit();
                 self.alloc.destroy(self);
@@ -680,11 +684,14 @@ pub fn Adapter(comptime native: type) type {
             defer view.release();
             if (view.version() != table.schema_version) return error.PreparedGenerationChanged;
             var ranked = search;
-            if (table.storage_mode == .relational and search.graph_queries.len == 0 and
-                search.highlight == null and !search.hasHitEvaluation() and search.return_mode == .parent and
+            const delayed_hydration = search.query != .graph and search.graph_queries.len == 0 and
+                search.graph_metric_queries.len == 0 and search.graph_metric_rerank == null and search.graph_query_transport == null and
+                search.hierarchy_children == null and search.highlight == null and !search.hasHitEvaluation() and search.return_mode == .parent and
                 !search.hierarchy_include_source and !search.hierarchy_include_unit and
-                !search.hierarchy_grouped_matches and search.aggregations_json.len == 0)
-                ranked.include_stored = false;
+                !search.hierarchy_grouped_matches and search.aggregations_json.len == 0;
+            if (delayed_hydration) ranked.include_stored = false;
+            var documents: ?DB.DocumentRows = if (delayed_hydration and table.storage_mode == .document) try lease.documentRows(alloc, table.schema_version) else null;
+            errdefer if (documents) |*reader| reader.deinit();
             var captured = try lease.search(alloc, ranked);
             errdefer captured.result.deinit();
             const cursor = try alloc.create(SearchCursor);
@@ -702,9 +709,16 @@ pub fn Adapter(comptime native: type) type {
             errdefer if (reader) |*value| value.deinit();
             const layout = try catalog.Row.TypedLayout.init(a, output_names.keys());
             const projection: dependencies.sql_document_row.Projection = if (reader == null) try dependencies.sql_document_row.Projection.initSearch(a, table, request.fields) else .{ .columns = &.{} };
+            const needs_document = for (projection.columns) |column| {
+                if (!std.mem.eql(u8, column.path, "score") and !std.mem.eql(u8, column.path, "_highlights")) break true;
+            } else false;
+            if (!needs_document) if (documents) |*document_reader| {
+                document_reader.deinit();
+                documents = null;
+            };
             // Finish allocating before moving the arena: a later allocation
             // could add a chunk that the cursor's earlier copy would not own.
-            cursor.* = .{ .alloc = alloc, .arena = arena, .result = captured.result, .reader = reader, .layout = layout, .projection = projection };
+            cursor.* = .{ .alloc = alloc, .arena = arena, .result = captured.result, .reader = reader, .documents = documents, .needs_document = needs_document, .layout = layout, .projection = projection };
             return .{ .ptr = cursor, .next = SearchCursor.next, .close = SearchCursor.close };
         }
 

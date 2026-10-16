@@ -798,6 +798,18 @@ fn relationalSnapshotDeinit(cut: *DB.RelationalStatementSnapshot) engine.Outcome
 fn statementFenceRelease(fence: *DB.StatementReadFence) engine.Outcome(void) {
     return .{ .value = fence.release() };
 }
+fn documentRowsUnderLease(lease: *const DB.QueryReadLease, alloc: Allocator, version: u32) engine.Outcome(DB.DocumentRows) {
+    return .{ .value = lease.documentRows(alloc, version) catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
+fn documentRowsLookup(reader: *DB.DocumentRows, key: []const u8) engine.Outcome([]const u8) {
+    return .{ .value = reader.lookup(key) catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
+fn documentRowsReleasePage(reader: *DB.DocumentRows) engine.Outcome(void) {
+    return .{ .value = reader.releasePage() };
+}
+fn documentRowsDeinit(reader: *DB.DocumentRows) engine.Outcome(void) {
+    return .{ .value = reader.deinit() };
+}
 fn relationalRowsUnderLease(lease: *const DB.QueryReadLease, alloc: Allocator, fields: []const []const u8, version: u32) engine.Outcome(@import("db/relational_rows.zig").Reader) {
     return .{ .value = lease.relationalRows(alloc, fields, version) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }

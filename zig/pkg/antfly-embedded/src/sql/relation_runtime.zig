@@ -1019,6 +1019,13 @@ fn Engine(comptime Context: type) type {
                     }
                     return err;
                 };
+                if (self.node.operation == .prepared_rows) return self.nextPreparedBatch(a, maximum) catch |err| {
+                    if (failure) |out| {
+                        out.* = err;
+                        return .{ .rows = &.{} };
+                    }
+                    return err;
+                };
                 if (self.join_view) |view| {
                     view.deinit();
                     self.join_view = null;
@@ -1090,6 +1097,49 @@ fn Engine(comptime Context: type) type {
                 }
                 return .{ .rows = rows.items };
             }
+            /// Prepared RETURNING inputs are immutable native cells. Map
+            /// ordinals and types lazily rather than cloning a row matrix at
+            /// the batch seam; retaining consumers still own their copies.
+            fn nextPreparedBatch(self: *Iterator, a: Allocator, maximum: usize) anyerror!@import("execution_batch.zig").Batch {
+                const Batch = @import("execution_batch.zig").Batch;
+                const names = self.node.operation.prepared_rows;
+                if (self.engine.context.returning_cursor) |cursor| {
+                    if (self.prepared_reader == null) self.prepared_reader = try cursor.openReplayReader();
+                    const source = try a.create(Batch);
+                    source.* = try self.prepared_reader.?.nextBatch(a, maximum);
+                    if (source.len() == 0) return .{ .rows = &.{} };
+                    const layout = self.engine.context.returning_layout orelse return error.InvalidSqlBackendResponse;
+                    const ordinals = try a.alloc(usize, names.len);
+                    const types = try a.alloc(scalar.Type, names.len);
+                    for (names, self.node.columns, ordinals, types) |name, column, *ordinal, *type_| {
+                        ordinal.* = layout.ordinals.get(name) orelse return error.InvalidSqlBackendResponse;
+                        if (ordinal.* >= source.width()) return error.InvalidSqlBackendResponse;
+                        type_.* = .{ .kind = column.type, .element_type = column.element_type, .numeric_modifier = column.numeric_modifier };
+                    }
+                    const selection = try a.alloc(usize, source.len());
+                    for (selection, 0..) |*index, lane| index.* = lane;
+                    self.output_index += source.len();
+                    return .{ .mapped = .{ .source = source, .ordinals = ordinals, .types = types, .selection = selection } };
+                }
+                const rows = self.engine.context.returning_rows;
+                const count = @min(maximum, rows.len - self.output_index);
+                if (count == 0) return .{ .rows = &.{} };
+                const View = struct {
+                    rows: []const catalog.Row,
+                    names: []const []const u8,
+                    columns: []const binding.Column,
+                    fn cell(raw: *anyopaque, alloc: Allocator, row: usize, column: usize) anyerror!Datum {
+                        const view: *@This() = @ptrCast(@alignCast(raw));
+                        const definition = view.columns[column];
+                        return describe.coerceDatum(alloc, try view.rows[row].cell(view.names[column]), definition.type, definition.element_type);
+                    }
+                };
+                const view = try a.create(View);
+                view.* = .{ .rows = rows[self.output_index..][0..count], .names = names, .columns = self.node.columns };
+                self.output_index += count;
+                return .{ .reader = .{ .ptr = view, .read = View.cell, .count = count, .width = names.len } };
+            }
+
             pub fn next(self: *Iterator, alloc: Allocator) anyerror!?[]const Datum {
                 try self.engine.checkpoint();
                 if (self.sampled) |sample| {
@@ -2246,5 +2296,67 @@ test "external lake native NUMERIC scan declarations survive exact hash joins" {
         defer result.deinit();
         try std.testing.expectEqual(@as(usize, 2), result.output.rows.len);
         for (result.output.rows) |row| try std.testing.expectEqualStrings("9007199254740993", if (row[0] == .number_string) row[0].number_string else row[0].string);
+    }
+}
+
+test "SQL prepared native batches avoid row matrices across memory and spill blocks" {
+    const Runtime = @import("runtime.zig");
+    const Capture = @import("result_cursor.zig").Cursor;
+    const Hook = struct {
+        fn check(_: *anyopaque) !void {}
+    };
+    const Mode = enum { rows, resident, disk };
+    const Fixture = struct {
+        fn run(a: Allocator, mode: Mode, large: bool) !void {
+            var dummy: u8 = 0;
+            const row_count: usize = if (large) 300 else 3;
+            const width: usize = if (large) 128 else 3;
+            var source = std.heap.ArenaAllocator.init(a);
+            defer source.deinit();
+            const sa = source.allocator();
+            const array = try @import("array_value.zig").Value.init(.int64, &.{.{ .length = 2, .lower = -3 }}, &.{ Datum.json(.{ .integer = 9007199254740993 }), .{} }, .{});
+            const layout = try catalog.Row.TypedLayout.init(sa, &.{"a"});
+            const rows = try sa.alloc(catalog.Row, row_count);
+            for (rows) |*row| row.* = .{ .id = "row", .version = 0, .value = .null, .typed_cells = .{ .layout = layout, .values = &.{Datum.typedArray(&array)} } };
+            var manager: @import("spill.zig").Manager = .{ .alloc = a, .io = std.testing.io, .context = &dummy, .checkpoint = Hook.check, .compression = .none, .async_writes = false };
+            defer manager.deinit();
+            const cursor: ?*Capture = if (mode == .rows) null else if (mode == .disk) try Capture.create(a, &manager, 1) else try Capture.createMemory(a, 1, 8 << 20);
+            defer if (cursor) |owner| owner.close();
+            if (cursor) |owner| for (rows) |_| try Capture.append(owner, &.{Datum.typedArray(&array)});
+            const columns = try sa.alloc(binding.Column, width);
+            const names = try sa.alloc([]const u8, width);
+            for (columns, names) |*column, *name| {
+                column.* = .{ .name = "a", .internal = "a", .qualifier = "", .type = .array, .element_type = .int64, .nullable = true };
+                name.* = "a";
+            }
+            const node: binding.Node = .{ .columns = columns, .operation = .{ .prepared_rows = names } };
+            var engine: Engine(Runtime.Context) = .{ .context = .{ .alloc = a, .arena = sa, .backend = .{ .ptr = &dummy, .vtable = &.{ .checkpoint = Hook.check, .resolve = undefined, .scan = undefined, .mutate = undefined } }, .binding = undefined, .parameters = &.{}, .limits = .{}, .returning_rows = rows, .returning_cursor = cursor, .returning_layout = layout }, .cursors = &.{}, .cache_arena = .init(a) };
+            defer engine.deinit();
+            const iterator = try Engine(Runtime.Context).Iterator.create(&engine, &node);
+            defer iterator.deinit();
+            var budget: @import("memory_budget.zig") = .{ .backing = a, .limit = 64 * 1024 };
+            var page = std.heap.ArenaAllocator.init(budget.allocator());
+            defer page.deinit();
+            try std.testing.expectEqual(@as(usize, 0), (try iterator.nextBatch(page.allocator(), 0, null)).len());
+            var count: usize = 0;
+            while (true) {
+                _ = page.reset(.free_all);
+                const batch = try iterator.nextBatch(page.allocator(), 17, null);
+                if (batch.len() == 0) break;
+                try std.testing.expect(batch != .rows);
+                var none = std.heap.FixedBufferAllocator.init(&.{});
+                const cell = try batch.cell(none.allocator(), batch.len() - 1, width - 1);
+                try std.testing.expectEqual(@as(i64, 9007199254740993), cell.array.?.flatCell(0).value.integer);
+                try std.testing.expect(cell.array.?.flatCell(1).sql_null);
+                try std.testing.expectEqual(@as(i32, -3), cell.array.?.dimensions[0].lower);
+                count += batch.len();
+            }
+            try std.testing.expectEqual(row_count, count);
+            if (large) std.debug.print("prepared native batch {s}: peak {d} bytes, former 17x128 descriptors alone {d} bytes\n", .{ @tagName(mode), budget.peak, 17 * 128 * @sizeOf(Datum) });
+        }
+    };
+    for ([_]Mode{ .rows, .resident, .disk }) |mode| {
+        try Fixture.run(std.testing.allocator, mode, true);
+        try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Fixture.run, .{ mode, false });
     }
 }

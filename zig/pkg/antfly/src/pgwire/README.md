@@ -302,12 +302,19 @@ Ranked document SQL prepares a literal root-member routing directory once per
 cursor. It copies selected payloads into final native cells and supplies score
 and highlights separately. Parsed hits are never cloned wholesale. Raw stored
 hits receive complete syntax and duplicate-key validation, including unselected
-subtrees, while only selected members acquire a temporary DOM. The captured
-search result still owns its original hit payloads until the cursor closes.
+subtrees, while only selected members acquire a temporary DOM. Eligible plain
+ranked searches capture primary storage and schema under the same apply fence
+as ranking, retain IDs/scores, and read source bytes only as pages demand them.
+Each document read retires the previous byte/decompression scope; selected cells
+own their page payloads, and page completion retires the last source scope. ID/score-only projections skip body reads. Highlight,
+graph, hierarchy, aggregation, and hit-evaluation requests keep their existing
+source-capture path.
 
 Retained-page encoding feeds the frozen v1/v2 block codecs one bounded column
 at a time. Cached relation replay passes borrowed compact batches directly to
-operators; scalar consumers use one reusable row of descriptors per reader.
+operators; prepared RETURNING inputs also pass native batches through a lazy
+ordinal/type mapping, including memory and spilled inputs. Scalar consumers use
+one reusable row of descriptors per reader.
 Batch payloads expire when their reader loads a different block; scalar adapter
 descriptors expire on that reader's next scalar read. Independent readers cannot
 retire one another's blocks. Retaining consumers copy at their ownership boundary.
@@ -318,6 +325,9 @@ these summaries; header/authentication-only views do not. Later consumers still
 charge their own work quotas and check cancellation. Text output retains its
 escaping/sizing pass. These summaries are process-local metadata, not a disk or
 wire-format change; NUMERIC, UUID, and JSONB arrays retain their existing codecs.
+Storage writes copy already admitted primitive/text frames directly instead of
+clearing and reconstructing them. Logical quota charges are unchanged, and byte
+copies retain cancellation checkpoints at bounded intervals.
 
 Run the paired microbenchmarks with the repository Zig toolchain:
 
@@ -327,9 +337,11 @@ zig build sql-native-projection-bench -Doptimize=ReleaseFast -j1
 
 The fixture compares a selected eight-byte field beside a 1 MiB unselected
 field (64 iterations), a 256-row/1,024-column encoding tile, a 32,768-element
-bigint array (64 admission/encoding iterations), and a 256-row/128-column spill
+bigint array (64 admission/encoding and canonical-copy iterations), and a 256-row/128-column spill
 block. Five paired samples alternate order after warming each path. Inputs,
 prebuilt immutable array metadata, and spill creation are excluded from the
-measured working sets. Array timing includes an actual fixed output buffer;
-column encoding compares complete output hashes. These are microbenchmarks,
+measured working sets. Binary array timing emits into a preallocated fixed
+buffer; canonical storage-copy timing includes its output allocation and keeps
+the same admission proof in the reconstruction baseline. Column encoding
+compares complete output hashes. These are microbenchmarks,
 not server RSS, throughput, or zero-cost claims.

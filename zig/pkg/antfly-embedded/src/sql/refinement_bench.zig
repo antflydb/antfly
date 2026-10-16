@@ -819,7 +819,7 @@ test "native pipeline refinements benchmark dictionary spill decoding" {
 }
 
 const ProjectionStats = struct { ns: i96, peak: usize, allocations: usize, checksum: u64 };
-const ProjectionCase = enum { document, columns, array, replay, replay_batch };
+const ProjectionCase = enum { document, columns, array, array_copy, replay, replay_batch };
 const ProjectionFixture = struct {
     projection: @import("document_row.zig").Projection,
     layout: @import("catalog.zig").Row.TypedLayout,
@@ -829,6 +829,23 @@ const ProjectionFixture = struct {
     replay: *spill.Sequential,
     counted: *CountingAllocator,
     budget: *@import("memory_budget.zig"),
+    // Frozen primitive preparation from before the canonical-copy shortcut.
+    // Both paths retain the same admission proof, so the comparison isolates
+    // reconstruction rather than also removing cached validation from baseline.
+    fn reconstructArray(a: std.mem.Allocator, input: @import("array_value.zig").Value) !@import("array_storage.zig").Prepared {
+        const arrays = @import("array_value.zig");
+        std.debug.assert(input.element_type == .int64);
+        var work: arrays.Budget = .{ .remaining = (arrays.Limits{}).work };
+        try work.consume(0);
+        const value = try input.validateWithBudget(.{}, &work);
+        var non_null: usize = 0;
+        for (0..value.cardinality()) |index| {
+            try work.consume(1);
+            non_null += @intFromBool(!value.flatCell(index).sql_null);
+        }
+        const layout = @import("array_storage.zig").layout;
+        return .{ .value = value, .allocator = a, .jsonb = &.{}, .encoded_size = try layout.encodedSectionSize(value.element_type, value.dimensions.len, value.cardinality(), non_null), .compact = layout.usesCompact(value.element_type, value.cardinality(), non_null), .work = work };
+    }
     fn measure(self: ProjectionFixture, case: ProjectionCase, direct: bool) !ProjectionStats {
         var counted: CountingAllocator = .{};
         var budget: @import("memory_budget.zig") = .{ .backing = counted.allocator(), .limit = 128 << 20 };
@@ -881,6 +898,19 @@ const ProjectionFixture = struct {
                     result.checksum += writer.end;
                 }
                 result.checksum +%= std.hash.Wyhash.hash(0, self.output);
+            },
+            .array_copy => {
+                const input = self.array;
+                const output = try budget.allocator().alloc(u8, input.stored.?.bytes.len);
+                defer budget.allocator().free(output);
+                for (0..64) |_| {
+                    var prepared = if (direct) try @import("array_storage.zig").Prepared.init(budget.allocator(), input, .{}) else try reconstructArray(budget.allocator(), input);
+                    defer prepared.deinit();
+                    try prepared.writeInto(output);
+                    std.mem.doNotOptimizeAway(output.ptr);
+                    result.checksum += output.len;
+                }
+                result.checksum +%= std.hash.Wyhash.hash(0, output);
             },
             .replay, .replay_batch => {
                 const base_live = self.budget.live;

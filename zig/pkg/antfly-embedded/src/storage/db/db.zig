@@ -40161,6 +40161,44 @@ pub const DB = struct {
         return try self.searchWithCapturedRequestAndExecutionContext(alloc, req, .{});
     }
 
+    /// Delayed document hydration over the exact primary generation captured
+    /// with ranking. Only the current document's byte scope stays pinned;
+    /// callers copy selected cells before the next lookup retires that scope.
+    pub const DocumentRows = struct {
+        db: *DB,
+        read: docstore_mod.DocStore.Txn,
+        schema: schema_registry_mod.SchemaView,
+        policy: row_policy_gate_mod.Gate.Lease,
+        window: DocumentPrimaryReadWindow,
+
+        pub fn lookup(self: *@This(), key: []const u8) ![]const u8 {
+            if (comptime storage_engine.enabled) return storage_engine.call("documentRowsLookup", .{ self, key });
+            self.window.retire();
+            const a = self.window.arena.allocator();
+            const physical = try encodeStoreLookupKeyWithPinnedSchemaAlloc(self.db, a, key, self.schema);
+            // Ranking already applied visibility/TTL at the captured cut.
+            // Never fall back to a fresh read if the captured row is absent.
+            return self.window.get(&self.read, physical, 0) catch |err| switch (err) {
+                error.NotFound => error.StorageReadTemporarilyUnavailable,
+                else => err,
+            };
+        }
+        /// Page cells already own their selected payloads. Retire the last
+        /// source scope before a portal suspends, keeping only the snapshot.
+        pub fn releasePage(self: *@This()) void {
+            if (comptime storage_engine.enabled) return storage_engine.call("documentRowsReleasePage", .{self}) catch @panic("incompatible storage owner");
+            self.window.retire();
+        }
+        pub fn deinit(self: *@This()) void {
+            if (comptime storage_engine.enabled) return storage_engine.call("documentRowsDeinit", .{self}) catch @panic("incompatible storage owner");
+            self.window.deinit();
+            self.read.abort();
+            self.schema.release();
+            self.policy.release();
+            self.* = undefined;
+        }
+    };
+
     /// Own one primary read generation across a local query's selection and
     /// aggregation collection. Acquire only after the Raft read barrier; never
     /// wait for another apply barrier while this lease excludes writers.
@@ -40180,6 +40218,16 @@ pub const DB = struct {
             }, currentTimeNs());
             reader.row_policy_lease = self.row_policy_lease.clone();
             return reader;
+        }
+
+        pub fn documentRows(self: *const QueryReadLease, alloc: Allocator, schema_version: u32) !DocumentRows {
+            if (comptime storage_engine.enabled) return storage_engine.call("documentRowsUnderLease", .{ self, alloc, schema_version });
+            var view = self.db.core.acquireSchemaView() orelse return error.PreparedGenerationChanged;
+            errdefer view.release();
+            if (view.storageMode() != .document or view.version() != schema_version) return error.PreparedGenerationChanged;
+            var read = try self.db.core.store.beginReadTxn();
+            errdefer read.abort();
+            return .{ .db = self.db, .read = read, .schema = view, .policy = self.row_policy_lease.clone(), .window = .init(alloc) };
         }
 
         pub fn search(self: QueryReadLease, alloc: Allocator, req: types.SearchRequest) !SearchWithDenseProfileResult {

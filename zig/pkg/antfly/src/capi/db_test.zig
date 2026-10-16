@@ -6724,4 +6724,61 @@ test "capi SQL document search projects native cells without copying unselected 
     try std.testing.expectEqualStrings("alpha", hits.output.rows[0][1].string);
     try std.testing.expectEqualStrings("9007199254740993", hits.output.rows[0][2].string);
     try std.testing.expect(!hits.output.sql_nulls.?[0][3]);
+    var metadata = try sql.compiler.compile(a, "SELECT _id,score FROM antfly_search('rows','body:alpha')", .{});
+    defer metadata.deinit();
+    var metadata_hits = try sql.runtime.execute(a, adapter.backend(), &metadata, &.{}, .{});
+    defer metadata_hits.deinit();
+    try std.testing.expectEqualStrings("a", metadata_hits.output.rows[0][0].string);
+    try std.testing.expect(!metadata_hits.output.sql_nulls.?[0][1]);
+    var count = try sql.compiler.compile(a, "SELECT count(*) FROM antfly_search('rows','body:alpha')", .{});
+    defer count.deinit();
+    var counted = try sql.runtime.execute(a, adapter.backend(), &count, &.{}, .{});
+    defer counted.deinit();
+    try std.testing.expectEqualStrings("1", counted.output.rows[0][0].string);
+}
+
+test "capi SQL document ranked hydration pins old primary bytes and retires each scope" {
+    const a = std.testing.allocator;
+    var directory = try TestDirectory.init("capi-sql-document-ranked-cut");
+    defer directory.cleanup();
+    var database = try db_mod.DB.open(a, directory.path(), .{ .start_optional_runtimes = false, .start_index_workers = false });
+    defer database.close();
+    try database.setSchemaJson(a,
+        \\{"version":1,"storage_mode":"document","default_type":"doc","document_schemas":{"doc":{"schema":{"type":"object","properties":{"body":{"type":"string"},"ignored":{"type":"string"}},"additionalProperties":false}}}}
+    );
+    try database.addIndex(.{ .name = "ft_v1", .kind = .full_text, .config_json = "{\"field\":\"body\"}" });
+    const ignored = try a.alloc(u8, 1024 * 1024);
+    defer a.free(ignored);
+    @memset(ignored, 'x');
+    const document = try std.fmt.allocPrint(a, "{{\"body\":\"alpha\",\"ignored\":\"{s}\"}}", .{ignored});
+    defer a.free(document);
+    try database.batch(.{ .writes = &.{ .{ .key = "a", .value = document }, .{ .key = "b", .value = document } } });
+    try database.runUntilIdle();
+    var budget: @import("antfly_local_sources").sql_memory_budget = .{ .backing = a, .limit = 8 * 1024 * 1024 };
+    var lease = try database.beginQueryReadLease();
+    var held = true;
+    defer if (held) lease.release();
+    var reader = try lease.documentRows(budget.allocator(), 1);
+    defer reader.deinit();
+    var ranked = (try lease.search(a, .{ .full_text = .{ .match_all = {} }, .limit = 2, .include_stored = false })).result;
+    defer ranked.deinit();
+    try std.testing.expectEqual(@as(usize, 2), ranked.hits.len);
+    for (ranked.hits) |hit| try std.testing.expect(hit.stored_data == null and hit.source_value == null);
+    lease.release();
+    held = false;
+    try database.batch(.{ .writes = &.{.{ .key = "a", .value = "{\"body\":\"changed\",\"ignored\":\"small\"}" }}, .deletes = &.{"b"} });
+    try database.runUntilIdle();
+    for (0..32) |index| {
+        const raw = try reader.lookup(if (index % 2 == 0) "a" else "b");
+        try std.testing.expectEqualSlices(u8, document, raw);
+    }
+    // The primary generation remains pinned, but body/decompression owners
+    // retire on every lookup rather than accumulating across the result set.
+    try std.testing.expect(budget.peak < 8 * 1024 * 1024);
+    reader.releasePage();
+    try std.testing.expectEqual(@as(usize, 0), budget.live);
+    try std.testing.expectEqualSlices(u8, document, try reader.lookup("b"));
+    reader.releasePage();
+    try std.testing.expectEqual(@as(usize, 0), budget.live);
+    std.debug.print("document ranked hydration: scoped peak {d} bytes across 32 MiB reads\n", .{budget.peak});
 }
