@@ -1266,3 +1266,75 @@ def test_sql_preparation_failure_aborts_session(require_native, aflite_path, api
             session.execute("INSERT INTO entries (_id,body) VALUES ('recovered','usable')")
             session.execute("COMMIT")
             assert db.sql("SELECT _id FROM entries ORDER BY _id")["rows"] == expected
+
+
+def test_sql_search_waits_for_graph_index_instead_of_result_alias(require_native, aflite_path):
+    with af.create_hosted(aflite_path) as db:
+        db.sql("CREATE TABLE notes (body TEXT, embedding JSONB, links JSONB)")
+        with db.open_table("notes") as table:
+            table.add_index({"name": "knowledge", "type": "graph", "edge_types": [{"name": "R", "field": "links"}]})
+            table.batch_json({"inserts": {"source": {"links": ["target"]}, "target": {}}, "sync_level": "write"})
+            before = table.pending_work_stats()
+            target = before["derived_target_sequence"]
+            assert (
+                next(item for item in before["index_replay_debt"] if item["index_name"] == "knowledge")[
+                    "applied_sequence"
+                ]
+                < target
+            )
+            request = {
+                "graph_queries": {
+                    "neighbors": {"index": "knowledge", "traverse": {"start": {"keys": ["source"]}, "max_depth": 1}}
+                }
+            }
+            db.sql("SELECT _id FROM antfly_search('notes',$1)", [json.dumps(request)])
+            after = table.pending_work_stats()
+            assert (
+                next(item for item in after["index_replay_debt"] if item["index_name"] == "knowledge")[
+                    "applied_sequence"
+                ]
+                >= target
+            )
+
+
+@pytest.mark.parametrize("operator", ["match", "match_phrase"])
+@pytest.mark.parametrize("clause,expected", [("filter", "fresh"), ("must_not", "other")])
+def test_sql_vector_search_waits_for_normalized_text_filters(require_native, aflite_path, clause, expected, operator):
+    with af.create_hosted(aflite_path) as db:
+        db.sql("CREATE TABLE notes (body TEXT, embedding JSONB)")
+        with db.open_table("notes") as table:
+            table.add_index(
+                {
+                    "name": "semantic",
+                    "kind": "dense_vector",
+                    "config_json": json.dumps({"field": "embedding", "dims": 2}),
+                }
+            )
+            table.batch_json(
+                {
+                    "inserts": {
+                        "fresh": {"body": "fresh", "embedding": [1, 0]},
+                        "other": {"body": "other", "embedding": [1, 0]},
+                    },
+                    "sync_level": "write",
+                }
+            )
+            before = table.pending_work_stats()
+            target = before["derived_target_sequence"]
+            text = next(item for item in before["index_replay_debt"] if item["kind"] == "full_text")
+            assert text["applied_sequence"] < target
+            request = {
+                "embeddings": {"semantic": [1, 0]},
+                "indexes": ["semantic"],
+                "query": {"bool": {clause: [{operator: "fresh", "field": "body"}]}},
+                "limit": 10,
+            }
+            result = db.sql("SELECT _id FROM antfly_search('notes',$1)", [json.dumps(request)])
+            assert result["rows"] == [[expected]]
+            after = table.pending_work_stats()
+            assert (
+                next(item for item in after["index_replay_debt"] if item["index_name"] == text["index_name"])[
+                    "applied_sequence"
+                ]
+                >= target
+            )
