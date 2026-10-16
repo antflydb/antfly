@@ -165,7 +165,7 @@ def main():
         parser.error(
             "qualification requires at least 20/5 samples, two warmups and 0..4 paging retries"
         )
-    root = Path(__file__).resolve().parents[2]
+    root = Path(__file__).resolve().parents[5]
     manifest = verify_source(args.source_manifest, root)
     binaries = {
         "baseline": args.baseline.resolve(),

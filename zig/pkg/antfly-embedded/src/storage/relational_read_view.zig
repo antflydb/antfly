@@ -28,22 +28,58 @@ pub const View = struct {
         version: u64,
         schema_version: u32,
         value: std.json.Value,
+        /// Complete native SQL cells, owned by the page arena.
+        typed_cells: ?@import("../sql/catalog.zig").Row.TypedCells = null,
         expected_content_digest: ?[32]u8 = null,
         document: ?std.json.Value = null,
         /// SQL NULL flags aligned with value.object insertion order. A JSON
         /// payload containing null has a false flag.
         sql_nulls: ?[]const bool = null,
+
+        /// Borrowed SQL view; payload lifetime is exactly the owning page.
+        /// Native and legacy providers share the same cell/null accessor.
+        pub fn sqlRow(self: Row) @import("../sql/catalog.zig").Row {
+            return .{ .id = self.id, .version = self.version, .value = self.value, .typed_cells = self.typed_cells, .sql_nulls = self.sql_nulls, .expected_content_digest = self.expected_content_digest, .document = self.document };
+        }
+
+        pub fn cell(self: Row, name: []const u8) !@import("../sql/catalog.zig").Row.Cell {
+            return self.sqlRow().cell(name);
+        }
     };
     pub const Page = struct {
         arena: std.heap.ArenaAllocator,
         rows: []const Row,
         after: ?[]const u8,
 
+        /// Leases pin immutable payloads through coordinated merges. The
+        /// original page and every output reference release independently.
+        lease: ?*Lease = null,
+        retained_pages: []Page = &.{},
+        const Lease = struct { alloc: std.mem.Allocator, refs: std.atomic.Value(usize), page: Page };
+        pub fn retain(self: *Page, alloc: std.mem.Allocator) !Page {
+            const lease = self.lease orelse blk: {
+                const owner = try alloc.create(Lease);
+                owner.* = .{ .alloc = alloc, .refs = .init(1), .page = self.* };
+                self.lease = owner;
+                break :blk owner;
+            };
+            _ = lease.refs.fetchAdd(1, .monotonic);
+            return self.*;
+        }
         pub fn deinit(self: *Page) void {
-            self.arena.deinit();
+            if (self.lease) |lease| {
+                if (lease.refs.fetchSub(1, .acq_rel) == 1) {
+                    lease.page.deinit();
+                    lease.alloc.destroy(lease);
+                }
+            } else {
+                for (self.retained_pages) |*page| page.deinit();
+                self.arena.deinit();
+            }
             self.* = undefined;
         }
     };
+
     pub const VTable = struct {
         range_proofs: ?*const fn (*anyopaque, std.mem.Allocator) anyerror![]@import("range_protection.zig").Proof = null,
         next: *const fn (*anyopaque, std.mem.Allocator, u32) anyerror!Page,

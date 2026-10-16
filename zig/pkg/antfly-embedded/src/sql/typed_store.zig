@@ -706,8 +706,8 @@ test "SQL typed array retained columns preserve bounds ownership and type separa
             const cell = try store.cell(a, 1, 0);
             try std.testing.expect(!cell.sql_null and cell.array != null);
             try std.testing.expectEqual(@as(i32, -2), cell.array.?.dimensions[0].lower);
-            try std.testing.expectEqualStrings("abc", cell.array.?.elements[0].value.string);
-            try std.testing.expect(cell.array.?.elements[1].sql_null);
+            try std.testing.expectEqualStrings("abc", cell.array.?.flatCell(0).value.string);
+            try std.testing.expect(cell.array.?.flatCell(1).sql_null);
             try std.testing.expect((try store.cell(a, 0, 0)).sql_null);
             const json_null = try store.cell(a, 2, 0);
             try std.testing.expect(!json_null.sql_null and json_null.array == null);
