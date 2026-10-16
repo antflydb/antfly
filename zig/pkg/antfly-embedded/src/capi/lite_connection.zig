@@ -71,6 +71,8 @@ fn catalogStamp(database: *h.db_mod.DB) ![32]u8 {
 
 // Completed producer bytes are delivered to the current runtime, rather than
 // replaying inference whenever an unrelated primary commit moves the file tip.
+pub const ShadowScope = struct { name: []const u8, generation: u64, prefix: []const u8 };
+
 pub const PreparedPublication = struct {
     owner: *Owner,
     name: []const u8,
@@ -78,6 +80,7 @@ pub const PreparedPublication = struct {
     incarnation: @FieldType(h.db_mod.DB, "root_incarnation"),
     catalog: [32]u8,
     index_prefix: []const u8,
+    shadow_scopes: []const ShadowScope = &.{},
     snapshot_root: *h.Handle,
     snapshot_database: *h.db_mod.DB,
     source_read: ?*SourceRead,
@@ -92,6 +95,16 @@ pub const PreparedPublication = struct {
         const database = try @import("tables.zig").get(root, self.name);
         if (database.root_incarnation != self.incarnation or !std.meta.eql(database.core.identity_namespace, self.identity) or
             !std.mem.eql(u8, &(try catalogStamp(database)), &self.catalog)) return error.EnrichmentSourceChanged;
+        if (self.shadow_scopes.len != 0) {
+            const jobs = try database.graphReplacementStatusAlloc(alloc);
+            defer jobs.deinit();
+            for (self.shadow_scopes) |scope| {
+                const matches = for (jobs.value) |job| {
+                    if (std.mem.eql(u8, job.name, scope.name) and job.generation == scope.generation and job.phase != .failed) break true;
+                } else false;
+                if (!matches) return error.EnrichmentSourceChanged;
+            }
+        }
         return database;
     }
 
@@ -149,6 +162,12 @@ pub const PreparedPublication = struct {
         }
     };
 
+    fn indexInputsUnchanged(self: *@This(), captured: *native.NativeFile, latest: *native.NativeFile) !bool {
+        if (self.shadow_scopes.len == 0) return captured.indexCatalogPrefixUnchanged(latest, self.index_prefix);
+        for (self.shadow_scopes) |scope| if (!try captured.indexCatalogPrefixUnchanged(latest, scope.prefix)) return false;
+        return true;
+    }
+
     fn refreshSnapshotCheckpoint(self: *@This()) void {
         const snapshot = self.snapshot_root.owned_lite_backend.?.native_docstore.?;
         // Opening the live coordinator can add immutable-reader leases.
@@ -162,12 +181,13 @@ pub const PreparedPublication = struct {
             const same_inode = live_stat != null and captured_stat != null and live_stat.?.inode == captured_stat.?.inode;
             if (same_inode) {
                 if (snapshot.file.activeCheckpoint().index_catalog_root_page != file.activeCheckpoint().index_catalog_root_page) {
-                    const unchanged = snapshot.file.indexCatalogPrefixUnchanged(file, self.index_prefix) catch false;
+                    const unchanged = self.indexInputsUnchanged(&snapshot.file, file) catch false;
                     if (!unchanged) self.index_inputs_changed = true;
                 }
                 snapshot.refreshIndexPublicationCheckpoint(file.header) catch {
                     self.index_inputs_changed = true;
                 };
+                if (self.owner.current) |live_root| snapshot.file.inheritAllocatorVerification(&live_root.owned_lite_backend.?.native_docstore.?.file) catch {};
             } else self.index_inputs_changed = true;
         } else self.index_inputs_changed = true;
     }
@@ -437,6 +457,9 @@ fn releaseGate(gate: *PathGate) void {
 // Compatible connections borrow one persistent generation and one maintenance
 // worker. SQL sessions, cursor IDs, and child handles remain connection-local.
 pub const Owner = struct {
+    const MaintenanceKey = struct { table_id: u64, incarnation: u128 };
+    const MaintenanceSchedule = struct { shadow_next: bool = true, live: bool = true };
+
     path: []const u8,
     options: api.LiteResolvedOpenOptions,
     owned_ttl_owner_id: ?[]u8 = null,
@@ -445,6 +468,9 @@ pub const Owner = struct {
     worker: ?std.Thread = null,
     stopping: std.atomic.Value(bool) = .init(false),
     maintenance_pending: bool = false,
+    // Owner lifetime, rather than DB-runtime lifetime: snapshot refreshes must
+    // not reset a table's replay/construction alternation.
+    maintenance_schedules: std.AutoHashMapUnmanaged(MaintenanceKey, MaintenanceSchedule) = .empty,
     next_ttl_ns: i96 = 0,
     wake: std.Io.Event = .unset,
     current: ?*h.Handle = null,
@@ -463,6 +489,8 @@ pub const Owner = struct {
         generated_refused: u64 = 0,
         replay_attempts: u64 = 0,
         replay_refused: u64 = 0,
+        maintenance_errors: u64 = 0,
+        last_maintenance_error: ?[]const u8 = null,
     } = .{},
     test_runtime_snapshot_opens: if (h.builtin.is_test) u64 else void = if (h.builtin.is_test) 0 else {},
     embedding_memo: ?memo_mod.QueryEmbeddingCache = null,
@@ -480,6 +508,16 @@ pub const Owner = struct {
             const file = &current.owned_lite_backend.?.native_docstore.?.file;
             const same_inode = (try probe.file.stat(probe.runtime())).inode == (try file.file.stat(file.runtime())).inode;
             if (current.maintenance_references == 0 and same_inode and std.meta.eql(probe.header, file.header)) return current;
+            if (current.maintenance_references == 0 and same_inode and !needsOutcomeReconciliation(current) and
+                try file.runtimeMetadataUnchanged(&probe) and try loadedIndexInputsUnchanged(current, file, &probe))
+            {
+                // Lease bookkeeping and unpublished shadow files do not change
+                // a serving runtime. Reopening it would publish another lease
+                // for every immutable input while foreground traffic waits.
+                try current.owned_lite_backend.?.native_docstore.?.refreshIndexPublicationCheckpoint(probe.header);
+                if (self.maintenance_snapshot) |snapshot| try file.inheritAllocatorVerification(&snapshot.owned_lite_backend.?.native_docstore.?.file);
+                return current;
+            }
             if (self.maintenance_snapshot) |snapshot| {
                 const captured = &snapshot.owned_lite_backend.?.native_docstore.?.file;
                 if (std.meta.eql(probe.header, captured.header) and
@@ -488,13 +526,16 @@ pub const Owner = struct {
         }
         var options = self.options;
         options.externally_locked = true;
+        if (known_maintenance orelse self.current) |verified| options.allocator_verification_owner = &verified.owned_lite_backend.?.native_docstore.?.file;
         const replacement = try api.openLiteHandleAllocWithRuntime(alloc, self.path, options, false, h.handleLockIo(), null);
         errdefer h.closeHandle(replacement);
         if (self.current) |previous| {
             if (known_maintenance) |snapshot| {
+                try replacement.owned_lite_backend.?.native_docstore.?.file.inheritAllocatorVerification(&snapshot.owned_lite_backend.?.native_docstore.?.file);
                 replacement.sql_commit_recovery_needed = previous.sql_commit_recovery_needed or snapshot.sql_commit_recovery_needed;
                 replacement.sql_ddl_recovery_needed = previous.sql_ddl_recovery_needed or snapshot.sql_ddl_recovery_needed;
             }
+            try replacement.owned_lite_backend.?.native_docstore.?.file.inheritAllocatorVerification(&previous.owned_lite_backend.?.native_docstore.?.file);
             inheritReclamationTelemetry(replacement.owned_lite_backend.?.native_docstore.?, previous.owned_lite_backend.?.native_docstore.?);
             try self.retired.append(alloc, previous);
             previous.lease_snapshot = true;
@@ -522,6 +563,28 @@ pub const Owner = struct {
         }
         self.collectRetired();
         return replacement;
+    }
+
+    fn loadedIndexInputsUnchanged(root: *h.Handle, before: *native.NativeFile, after: *native.NativeFile) !bool {
+        if (before.activeCheckpoint().index_catalog_root_page == after.activeCheckpoint().index_catalog_root_page) return true;
+        if (!try databaseIndexInputsUnchanged(&root.db, before, after)) return false;
+        var tables = root.embedded_tables.valueIterator();
+        while (tables.next()) |table| if (!try databaseIndexInputsUnchanged(&table.*.db, before, after)) return false;
+        return true;
+    }
+
+    fn databaseIndexInputsUnchanged(database: *h.db_mod.DB, before: *native.NativeFile, after: *native.NativeFile) !bool {
+        const indexes = try database.core.listIndexes(alloc);
+        defer {
+            for (indexes) |*index| index.deinit(alloc);
+            alloc.free(indexes);
+        }
+        for (indexes) |index| {
+            const prefix = try std.fmt.allocPrint(alloc, "{s}/indexes/{s}/", .{ database.core.index_manager.base_path, index.name });
+            defer alloc.free(prefix);
+            if (!try before.indexCatalogPrefixUnchanged(after, prefix)) return false;
+        }
+        return true;
     }
 
     pub fn collectRetired(self: *Owner) void {
@@ -619,9 +682,10 @@ pub const Owner = struct {
             defer latest.close();
             if ((try latest.file.stat(latest.runtime())).inode != (try file.file.stat(file.runtime())).inode) return error.EnrichmentWaitCanceled;
             if (file.activeCheckpoint().index_catalog_root_page != latest.activeCheckpoint().index_catalog_root_page) {
-                if (!try file.indexCatalogPrefixUnchanged(&latest, publication.index_prefix)) return error.EnrichmentWaitCanceled;
+                if (!try publication.indexInputsUnchanged(file, &latest)) return error.EnrichmentWaitCanceled;
             }
             try root.owned_lite_backend.?.native_docstore.?.refreshIndexPublicationCheckpoint(latest.header);
+            if (self.current) |current| try file.inheritAllocatorVerification(&current.owned_lite_backend.?.native_docstore.?.file);
             self.publication_stats.rebased +|= 1;
         }
         root.maintenance_writer_lease = lease;
@@ -674,6 +738,7 @@ pub const Owner = struct {
         var options = self.options;
         options.externally_locked = true;
         options.artifact_reader_fence = true;
+        options.allocator_verification_owner = file;
         const snapshot = if (need_database) blk: {
             const opened = try api.openLiteHandleAllocWithRuntime(alloc, self.path, options, false, h.handleLockIo(), null);
             if (comptime h.builtin.is_test) self.test_runtime_snapshot_opens += 1;
@@ -695,7 +760,9 @@ pub const Owner = struct {
         snapshot.sql_commit_recovery_needed = foreground.sql_commit_recovery_needed;
         snapshot.sql_ddl_recovery_needed = foreground.sql_ddl_recovery_needed;
         const store = snapshot.owned_lite_backend.?.native_docstore.?;
+        try store.file.inheritAllocatorVerification(file);
         if (self.maintenance_snapshot) |old| {
+            try store.file.inheritAllocatorVerification(&old.owned_lite_backend.?.native_docstore.?.file);
             // Policy scheduling and telemetry belong to this connection;
             // assessment caches and page roots belong to the new generation.
             store.maintenance_policy = old.owned_lite_backend.?.native_docstore.?.maintenance_policy;
@@ -739,6 +806,20 @@ pub const Owner = struct {
                 if (hasPendingGeneratedEnrichment(&table.*.db)) self.maintenance_pending = true;
             }
         }
+        // Prune dropped/recreated namespaces without retaining names or old
+        // runtimes. IDs never repeat; the root incarnation also fences file
+        // replacement. This remains bounded by the current table catalog.
+        var schedules = self.maintenance_schedules.valueIterator();
+        while (schedules.next()) |schedule| schedule.live = false;
+        if (self.maintenance_schedules.getPtr(.{ .table_id = foreground.db.core.identity_namespace.table_id, .incarnation = foreground.db.root_incarnation })) |schedule| schedule.live = true;
+        var live_tables = foreground.embedded_tables.valueIterator();
+        while (live_tables.next()) |table| {
+            if (self.maintenance_schedules.getPtr(.{ .table_id = table.*.db.core.identity_namespace.table_id, .incarnation = table.*.db.root_incarnation })) |schedule| schedule.live = true;
+        }
+        var stale = self.maintenance_schedules.iterator();
+        while (stale.next()) |entry| if (!entry.value_ptr.live) {
+            self.maintenance_schedules.removeByPtr(entry.key_ptr);
+        };
         const count = foreground.embedded_tables.count() + 1;
         const ordinal = self.maintenance_table_cursor % count;
         var database = &foreground.db;
@@ -748,6 +829,12 @@ pub const Owner = struct {
             for (0..ordinal) |_| selected = tables.next().?.*;
             database = &selected.?.db;
         }
+        const schedule_entry = try self.maintenance_schedules.getOrPut(alloc, .{
+            .table_id = database.core.identity_namespace.table_id,
+            .incarnation = database.root_incarnation,
+        });
+        if (!schedule_entry.found_existing) schedule_entry.value_ptr.* = .{};
+        const schedule = schedule_entry.value_ptr;
         self.maintenance_table_cursor = (ordinal + 1) % count;
         // TTL is a short publication for the selected table, never a drain of
         // every namespace under one file lease.
@@ -760,6 +847,31 @@ pub const Owner = struct {
             }
         }
         const run_database = self.maintenance_pending;
+        var turn_arena = std.heap.ArenaAllocator.init(alloc);
+        defer turn_arena.deinit();
+        const turn_alloc = turn_arena.allocator();
+        var shadow_scopes: std.ArrayList(ShadowScope) = .empty;
+        if (run_database and schedule.shadow_next) {
+            const jobs = try database.graphReplacementStatusAlloc(turn_alloc);
+            defer jobs.deinit();
+            for (jobs.value) |job| if (job.phase == .catching_up) {
+                // Construction remains detached. Cutover uses the live
+                // coordinator under this short owner/path fence, so its tail
+                // target and catalog swap exclude foreground appends together.
+                _ = try database.finishBackgroundGraphReplacement(job.name, job.generation);
+                schedule.shadow_next = false;
+                self.notifyMutation();
+                return true;
+            };
+            for (jobs.value) |job| if (job.phase == .building) {
+                try shadow_scopes.append(turn_alloc, .{
+                    .name = try turn_alloc.dupe(u8, job.name),
+                    .generation = job.generation,
+                    .prefix = try std.fmt.allocPrint(turn_alloc, "{s}/indexes/{s}/", .{ database.core.index_manager.base_path, job.name }),
+                });
+            };
+        }
+        schedule.shadow_next = shadow_scopes.items.len == 0;
         // Native maintenance owns independent catalog/provider state. Opening
         // only its selected namespace avoids rebuilding every foreground table
         // merely because inference or segment construction is still running.
@@ -778,7 +890,7 @@ pub const Owner = struct {
         defer alloc.free(index_prefix);
         var source_read = if (run_database) try database.core.store.runtime_store.beginRead() else null;
         defer if (source_read) |*read| read.abort();
-        var publication: PreparedPublication = .{ .owner = self, .name = publication_name, .identity = database.core.identity_namespace, .incarnation = database.root_incarnation, .catalog = if (run_database) try catalogStamp(database) else @splat(0), .index_prefix = index_prefix, .snapshot_root = root, .snapshot_database = database, .source_read = if (source_read) |*read| read else null, .relational_rows = if (database.enrichment_runtime) |runtime| runtime.config.relational_base_rows else false };
+        var publication: PreparedPublication = .{ .owner = self, .name = publication_name, .identity = database.core.identity_namespace, .incarnation = database.root_incarnation, .catalog = if (run_database) try catalogStamp(database) else @splat(0), .index_prefix = index_prefix, .shadow_scopes = shadow_scopes.items, .snapshot_root = root, .snapshot_database = database, .source_read = if (source_read) |*read| read else null, .relational_rows = if (database.enrichment_runtime) |runtime| runtime.config.relational_base_rows else false };
         root.maintenance_references += 1;
         root.maintenance_owner = self;
         root.maintenance_publication = &publication;
@@ -797,7 +909,15 @@ pub const Owner = struct {
 
         if (comptime h.builtin.is_test) if (self.test_after_capture) |hook| hook.notify(hook.ptr, root);
         const cancellation = h.db_mod.types.CancellationToken.fromAtomic(&self.stopping);
-        var pending = if (run_database) database.runBackgroundMaintenanceWithCancellation(cancellation) catch true else false;
+        var maintenance_error: ?anyerror = null;
+        // A shadow owns disjoint unpublished index inputs. Give it a bounded
+        // turn before replay, whose serving-index publication invalidates the
+        // broad capture. Unrelated serving writes may rebase this turn, while
+        // changes to any selected shadow generation still reject publication.
+        var pending = if (run_database) database.runBackgroundTurnWithCancellation(cancellation, shadow_scopes.items.len != 0) catch |err| blk: {
+            maintenance_error = err;
+            break :blk true;
+        } else false;
         if (run_database) if (database.enrichment_runtime) |runtime| {
             runtime.dense_result_cache = null;
             runtime.generated_publication = null;
@@ -820,6 +940,10 @@ pub const Owner = struct {
 
         self.gate.mutex.lockUncancelable(io);
         defer self.gate.mutex.unlock(io);
+        if (maintenance_error) |err| {
+            self.publication_stats.maintenance_errors +|= 1;
+            self.publication_stats.last_maintenance_error = @errorName(err);
+        } else self.publication_stats.last_maintenance_error = null;
         store.writer_admission = null;
         root.maintenance_owner = null;
         root.maintenance_references -= 1;
@@ -884,6 +1008,7 @@ pub const Owner = struct {
         }
         self.retired.deinit(alloc);
         self.connections.deinit(alloc);
+        self.maintenance_schedules.deinit(alloc);
         if (self.owned_ttl_owner_id) |id| alloc.free(id);
         alloc.destroy(self);
     }

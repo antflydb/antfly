@@ -1016,6 +1016,28 @@ test "capi lite merged indexes JSON discovers a standalone asset extractor and c
     try std.testing.expect(try local_write.indexesJsonNeedsAssetProducer(alloc, merged_json));
 }
 
+const EnrichmentDrainStats = struct {
+    enrichment: struct {
+        error_count: u64,
+        fatal_error_count: u64,
+        stalled: bool,
+        target_sequence: u64,
+        applied_sequence: u64,
+    },
+};
+
+fn enrichmentDrainStats(handle: ?*anyopaque) !EnrichmentDrainStats {
+    // Maintenance may replace and retire the resident Lite runtime. Inspect
+    // the current runtime through a guarded public call rather than retaining
+    // an internal Handle/DB pointer across mutations or run-until-idle.
+    var output: capi.Buffer = .{};
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_pending_work_stats_json(handle, &output));
+    defer freeRawBuffer(output.ptr, output.len);
+    var parsed = try std.json.parseFromSlice(EnrichmentDrainStats, std.testing.allocator, output.ptr.?[0..output.len], .{ .ignore_unknown_fields = true });
+    defer parsed.deinit();
+    return parsed.value;
+}
+
 test "capi lite run until idle drains a standalone chunk enrichment with no owning index" {
     // End-to-end reproduction of the same gap: before the fix, a standalone
     // `kind:"chunk"` catalog enrichment left `generated=false` in
@@ -1060,8 +1082,7 @@ test "capi lite run until idle drains a standalone chunk enrichment with no owni
 
     try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_run_until_idle(handle));
 
-    const owned_handle = asHandle(handle).?;
-    const drained = owned_handle.db.pendingWorkStats();
+    const drained = try enrichmentDrainStats(handle);
     try std.testing.expectEqual(@as(u64, 0), drained.enrichment.error_count);
     try std.testing.expectEqual(@as(u64, 0), drained.enrichment.fatal_error_count);
     try std.testing.expect(!drained.enrichment.stalled);
@@ -4468,8 +4489,7 @@ test "capi lite drains an antfly embedder with no api_url through the embedded i
     var handle: ?*anyopaque = null;
     try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_create_with_options(path, &options, &handle));
     defer antfly_db_close(handle);
-    const owned_handle = asHandle(handle).?;
-    try std.testing.expect(owned_handle.lite_inference_lifetime != null);
+    try std.testing.expect(asHandle(handle).?.lite_inference_lifetime != null);
 
     const index_json =
         \\{"name":"body_embedding","kind":"dense_vector","config_json":"{\"type\":\"embeddings\",\"embedder\":{\"provider\":\"antfly\",\"model\":\"Qwen/Qwen3-Embedding-0.6B-GGUF\"}}"}
@@ -4497,7 +4517,7 @@ test "capi lite drains an antfly embedder with no api_url through the embedded i
 
     try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_run_until_idle(handle));
 
-    const drained = owned_handle.db.pendingWorkStats();
+    const drained = try enrichmentDrainStats(handle);
     try std.testing.expectEqual(@as(u64, 0), drained.enrichment.error_count);
     try std.testing.expectEqual(@as(u64, 0), drained.enrichment.fatal_error_count);
     try std.testing.expect(!drained.enrichment.stalled);
@@ -5983,6 +6003,72 @@ test "capi SQL detached renewal releases the mutex and rejects changed tenure" {
     try Runtime.testDetachedLeaseRenewal();
 }
 
+test "capi SQL runtime refresh fences serving inputs while reusing lease and shadow bookkeeping" {
+    if (builtin.single_threaded or builtin.os.tag == .freestanding) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const io = shared.handleLockIo();
+    var directory = try TestDirectory.init("capi-runtime-reuse");
+    defer directory.cleanup();
+    const path = try tempTestAflitePath(a, directory.path(), "database");
+    defer a.free(path);
+    defer cleanupTestFile(path);
+    var options: capi.OpenOptions = .{};
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_open_options_init(&options));
+    options.storage_kind = capi.storage_kind_lite;
+    options.profile = capi.profile_native;
+    var handle: ?*anyopaque = null;
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_create_with_options(path, &options, &handle));
+    defer antfly_db_close(handle);
+    const owner = blk: {
+        const guard = public.enterHandle(handle, .exclusive).?;
+        defer guard.leave();
+        break :blk guard.connection.?.owner;
+    };
+    owner.stopping.store(true, .release);
+    owner.wake.set(io);
+    owner.worker.?.join();
+    owner.worker = null;
+    owner.stopping.store(false, .release);
+    owner.gate.mutex.lockUncancelable(io);
+    defer owner.gate.mutex.unlock(io);
+    var path_lease = try lite_backend.native.lockWriterPathWithIo(a, io, path);
+    defer path_lease.close();
+    for ([_]enum { lease_add, lease_delete, shadow, serving, metadata, primary, retired_checkpoint }{
+        .lease_add, .lease_delete, .shadow, .serving, .metadata, .primary, .retired_checkpoint,
+    }) |change| {
+        const before = owner.current.?;
+        {
+            var writer = try lite_backend.native.NativeFile.openWithIo(a, io, path, .{ .externally_locked = true });
+            defer writer.close();
+            switch (change) {
+                .lease_add => try writer.putCatalogRecord(lite_backend.native.NativeFile.artifact_lease_key_prefix ++ "refresh-probe", "lease"),
+                .lease_delete => try writer.putCatalogBatch(&.{.{ .key = lite_backend.native.NativeFile.artifact_lease_key_prefix ++ "refresh-probe", .is_delete = true }}),
+                .shadow, .serving => {
+                    const indexes = try before.db.core.listIndexes(a);
+                    defer {
+                        for (indexes) |*index| index.deinit(a);
+                        a.free(indexes);
+                    }
+                    const key = try std.fmt.allocPrint(a, "{s}/indexes/{s}/refresh-probe.bin", .{ before.db.core.index_manager.base_path, if (change == .shadow) "unpublished-shadow" else indexes[0].name });
+                    defer a.free(key);
+                    try writer.putIndexCatalogRecord(key, "physical input");
+                },
+                .metadata => try writer.putCatalogRecord("runtime-probe", "changed"),
+                .primary => try writer.putDocument("runtime-probe", "{}"),
+                .retired_checkpoint => {
+                    try writer.putCatalogRecord(lite_backend.native.NativeFile.artifact_lease_key_prefix ++ "evict-a", "lease");
+                    try writer.putCatalogRecord(lite_backend.native.NativeFile.artifact_lease_key_prefix ++ "evict-b", "lease");
+                },
+            }
+        }
+        const after = try owner.refresh();
+        if (change == .lease_add or change == .lease_delete or change == .shadow)
+            try std.testing.expectEqual(before, after)
+        else
+            try std.testing.expect(before != after);
+    }
+}
+
 test "capi SQL idle native maintenance avoids runtime construction and resumes work" {
     if (builtin.single_threaded or builtin.os.tag == .freestanding) return error.SkipZigTest;
     const a = std.testing.allocator;
@@ -6052,4 +6138,93 @@ test "capi SQL idle native maintenance avoids runtime construction and resumes w
     defer result.deinit();
     try std.testing.expectEqual(@as(usize, 1), result.hits.len);
     try std.testing.expectEqualStrings("doc", result.hits[0].id);
+}
+
+test "capi SQL visibility waits for physical graph indexes and normalized vector text filters" {
+    const a = std.testing.allocator;
+    for ([_]bool{ false, true }) |quarantined_default| {
+        for ([_]enum { graph_alias, vector_filter, vector_exclusion, structured_filter, structured_exclusion }{ .graph_alias, .vector_filter, .vector_exclusion, .structured_filter, .structured_exclusion }) |mode| {
+            var directory = try TestDirectory.init("capi-search-visibility");
+            defer directory.cleanup();
+            if (quarantined_default) {
+                {
+                    var setup = try db_mod.DB.open(a, directory.path(), .{ .executor = .{ .backend = .manual }, .start_optional_runtimes = false, .start_independent_maintenance = false });
+                    defer setup.close();
+                    try setup.addIndex(.{ .name = "full_text_index_v0", .kind = .full_text, .config_json = "{}" });
+                    try setup.addIndex(.{ .name = "custom_text", .kind = .full_text, .config_json = "{}" });
+                    try setup.batch(.{ .writes = &.{.{ .key = "doc", .value = "{\"body\":\"stale\"}" }}, .sync_level = .full_index });
+                }
+                // A persisted, unavailable default remains in the catalog. Only
+                // custom_text can actually serve text queries after reopen.
+                const broken = try std.fmt.allocPrint(a, "{s}/indexes/full_text_index_v0", .{directory.path()});
+                defer a.free(broken);
+                try std.Io.Dir.cwd().deleteTree(std.testing.io, broken);
+                try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = broken, .data = "broken index root" });
+            }
+            var database = try db_mod.DB.open(a, directory.path(), .{ .executor = .{ .backend = .manual }, .open_mode = if (quarantined_default) .writer_no_replay else .writer, .start_optional_runtimes = false, .start_independent_maintenance = false });
+            defer database.close();
+            if (!quarantined_default) try database.addIndex(.{ .name = "custom_text", .kind = .full_text, .config_json = "{}" });
+            if (quarantined_default) {
+                const indexes = try database.listIndexes(a);
+                defer db_mod.types.freeIndexConfigs(a, indexes);
+                try std.testing.expectEqual(@as(usize, 2), indexes.len);
+                const selected = (try database.resolvedFilterTextIndexNameAlloc(a, null, null)).?;
+                defer a.free(selected);
+                try std.testing.expectEqualStrings("custom_text", selected);
+                try std.testing.expectError(error.IndexUnavailable, database.resolvedFilterTextIndexNameAlloc(a, "full_text_index_v0", null));
+            }
+            try database.addIndex(.{ .name = "semantic", .kind = .dense_vector, .config_json = "{\"field\":\"embedding\",\"dims\":2}" });
+            try database.addIndex(.{ .name = "knowledge", .kind = .graph, .config_json = "{\"edge_types\":[{\"name\":\"R\",\"field\":\"links\"}]}" });
+            try database.batch(.{ .writes = &.{.{ .key = "doc", .value = "{\"body\":\"fresh\",\"embedding\":[1,0],\"links\":[\"target\"]}" }}, .sync_level = .write });
+            const target = database.core.nextDerivedSequence();
+            // A ready vector worker must not mask the independent text debt.
+            try database.runDerivedUntilTargets(target, &.{"semantic"});
+            var adapter = @import("antfly_local_sources").capi_sql.Adapter(antfly){ .db = &database, .table_name = "rows" };
+            var request: db_mod.types.SearchRequest = .{};
+            const graph = [_]db_mod.types.NamedGraphQuery{.{ .name = "neighbors", .query = .{
+                .query_type = .traverse,
+                .index_name = "knowledge",
+                .start_nodes = .{ .keys = &.{"doc"} },
+            } }};
+            if (mode == .graph_alias) {
+                request.graph_queries = &graph;
+            } else {
+                request.index_name = "semantic";
+                request.dense = .{ .vector = &.{ 1, 0 }, .k = 10 };
+                // This is the normalized vector request: full_text is absent.
+                switch (mode) {
+                    .vector_filter => request.filter_text = .{ .match = .{ .field = "body", .text = "fresh" } },
+                    .vector_exclusion => request.exclusion_text = .{ .match = .{ .field = "body", .text = "fresh" } },
+                    .structured_filter => request.filter_query_json = "{\"term\":{\"path\":\"body\",\"value\":\"fresh\"}}",
+                    .structured_exclusion => request.exclusion_query_json = "{\"term\":{\"path\":\"body\",\"value\":\"fresh\"}}",
+                    .graph_alias => unreachable,
+                }
+            }
+            const expected = if (mode == .graph_alias) "knowledge" else "custom_text";
+            {
+                const debt = try database.listDerivedReplayDebt(a);
+                defer {
+                    for (debt) |*item| item.deinit(a);
+                    a.free(debt);
+                }
+                var lagging = false;
+                for (debt) |item| if (std.mem.eql(u8, expected, item.index_name)) {
+                    lagging = item.applied_sequence < target;
+                };
+                try std.testing.expect(lagging);
+            }
+            const clock = database.backend_runtime.monotonicClock();
+            _ = try adapter.waitSearchIndexes(a, request, clock.nowRealtimeNs() + 5 * std.time.ns_per_s);
+            const debt = try database.listDerivedReplayDebt(a);
+            defer {
+                for (debt) |*item| item.deinit(a);
+                a.free(debt);
+            }
+            var ready = false;
+            for (debt) |item| if (std.mem.eql(u8, expected, item.index_name)) {
+                ready = item.applied_sequence >= target;
+            };
+            try std.testing.expect(ready);
+        }
+    }
 }
