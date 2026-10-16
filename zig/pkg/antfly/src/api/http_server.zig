@@ -2085,7 +2085,8 @@ pub const StatusSource = struct {
     pub fn systemCatalog(self: StatusSource, alloc: std.mem.Allocator, context: api_operation.RequestContext, input: @import("../system_catalog/server_call.zig").Call) ![]u8 {
         const callback = self.vtable.system_catalog orelse return error.UnsupportedOperation;
         return BoundaryAbi.call("system_catalog", self.boundary_dispatch, callback, .{ self.ptr, alloc, context, input }) catch |err| switch (err) {
-            error.MetadataIncarnationUnavailable, error.InvalidMetadataIncarnation, error.MetadataIncarnationMismatch => error.CatalogRoutingUnavailable,
+            error.MetadataIncarnationUnavailable, error.InvalidMetadataIncarnation => error.CatalogRoutingUnavailable,
+            error.MetadataIncarnationMismatch => if (input == .relational_index_status or input == .relational_index_admission_status) err else error.CatalogRoutingUnavailable,
             else => err,
         };
     }

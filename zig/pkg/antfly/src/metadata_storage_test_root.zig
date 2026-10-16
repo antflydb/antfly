@@ -30,6 +30,7 @@ test {
     _ = @import("api/relational_index_owner_execution.zig");
     _ = @import("api/relational_index_plan_builder.zig");
     _ = @import("api/index_publication_recovery.zig");
+    _ = @import("api/relational_index_admission.zig");
     _ = @import("api/relational_index_claim_delivery_test.zig");
     _ = @import("metadata/fk_initial_retirement_ack.zig");
     _ = @import("system_catalog/operations.zig");

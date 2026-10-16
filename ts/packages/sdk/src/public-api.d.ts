@@ -4968,13 +4968,15 @@ export interface components {
         /** @enum {string} */
         SQLDDLReceiptState: "ready" | "pending" | "invalid" | "admission_unknown";
         /**
-         * @description Durable DDL declaration receipt. admission_unknown means admission has
+         * @description Durable DDL operation receipt. admission_unknown means admission has
          *     not been confirmed; retain the matching restore job, FK publication ID, or
          *     index publication token and reconcile its status without replaying DDL.
-         *     Pending or invalid means the declaration
-         *     committed but validation has not established an active constraint. Do not
-         *     replay it. Inspect table constraint status using this immutable table
-         *     identity and schema generation; a later generation supersedes this receipt.
+         *     Pending means a durable operation was admitted, not necessarily that its
+         *     successor schema is published. Invalid means declaration validation failed.
+         *     Do not replay either. For an index build, observe the exact publication
+         *     token; otherwise inspect its restore job or table constraint status using
+         *     this immutable table identity and schema generation. A later generation
+         *     may supersede the completed operation.
          */
         SQLDDLReceipt: {
             database: string;

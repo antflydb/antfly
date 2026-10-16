@@ -527,7 +527,14 @@ pub const DdlReceipt = struct {
 /// Scratch must reclaim individual allocations; result may be an arena. DDL
 /// implementations reserve durable receipts in result before admission and
 /// release parsing/validation/plan memory through scratch before returning.
-pub const DdlAllocators = struct { result: std.mem.Allocator, scratch: std.mem.Allocator };
+pub const DdlAllocators = struct {
+    /// HTTP can return a pre-owned recovery receipt after bounded observation;
+    /// PostgreSQL wire waits for terminal completion within its request budget.
+    pub const Completion = enum { bounded, until_deadline };
+    result: std.mem.Allocator,
+    scratch: std.mem.Allocator,
+    completion: Completion = .bounded,
+};
 
 pub const DdlOutcome = struct { mutation_outcome: ?MutationOutcome = .committed, receipt: ?DdlReceipt = null };
 

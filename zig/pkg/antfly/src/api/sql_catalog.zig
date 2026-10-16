@@ -139,6 +139,34 @@ test "SQL catalog anonymous addition preserves its pinned owner and validates pr
     try std.testing.expectEqual(calls, source.calls);
 }
 
+fn beginIndex(server: *server_mod.ApiHttpServer, context: operation.RequestContext, allocators: catalog.DdlAllocators, target: domain.Target, guard: domain.RelationMutationGuard, index_name: []const u8, schema_json: []const u8) !catalog.DdlOutcome {
+    const reader = server.table_reads orelse return error.UnsupportedSqlExecution;
+    const io = server.sharedApiIo() orelse return error.UnsupportedSqlExecution;
+    // The caller already authorized this exact logical table. Preparation owns
+    // its real predecessor catalog and never grants a key-routed substitute.
+    var private = try context.platformDeadline();
+    private.setting_admin = true;
+    private.index_publication_authority = true;
+    var owned = @import("relational_index_plan_builder.zig").prepare(server.source, reader, allocators.scratch, io, private, .{ .guard = guard, .index_name = index_name }, schema_json) catch |err| switch (err) {
+        error.MetadataReplicationPending => return error.CatalogPublicationProofPending,
+        else => return err,
+    };
+    var transferred = false;
+    defer if (!transferred) owned.deinit();
+    const a = allocators.result;
+    var receipt = try newReceipt(a, target, owned.observation.table_id, try tables.schemaVersion(owned.request.begin.plan.after.schema_json));
+    errdefer {
+        a.free(receipt.database);
+        a.free(receipt.namespace);
+        a.free(receipt.table);
+        a.free(receipt.table_id);
+        if (receipt.index_publication_token) |token| a.free(token);
+    }
+    receipt.index_publication_token = try a.dupe(u8, &owned.recovery_token);
+    transferred = true;
+    return @import("relational_index_admission.zig").submitOwned(server.source, allocators.scratch, io, private, &owned, receipt, allocators.completion);
+}
+
 fn alterSchema(server: *server_mod.ApiHttpServer, identity: ?server_mod.AuthenticatedIdentity, context: operation.RequestContext, allocators: catalog.DdlAllocators, requested_target: domain.Target, ddl: @import("antfly_local_sources").sql_ast.CatalogDdl, admission: ?RelationAdmission, path: ?*const SearchPath) !catalog.DdlOutcome {
     const alloc = allocators.result;
     // Compiler labels are not public identities. Do not publish an anonymous
@@ -261,6 +289,7 @@ fn alterSchema(server: *server_mod.ApiHttpServer, identity: ?server_mod.Authenti
         return .{ .mutation_outcome = if (publication.state == .admission_unknown) null else .committed_pending, .receipt = receipt };
     }
     if (ddl.schema_change) |change| switch (change) {
+        .create_index => |index| if (index.unique) return beginIndex(server, context, allocators, target, guard, index.name, updated),
         .add_column => |column| if (!column.nullable or column.default_expression != null or column.generated_expression != null)
             return rewriteSchema(server, identity, context, alloc, target, table.name, table.table_id, native.version, updated, if (column.default_expression != null) &.{column.name} else &.{}, null),
         .add_unique => |constraint| if (constraint.primary)
@@ -292,7 +321,7 @@ fn alterSchema(server: *server_mod.ApiHttpServer, identity: ?server_mod.Authenti
     };
     if (receipt) |*value| {
         value.schema_version = version;
-        awaitActivation(server, context, alloc, table.name, value) catch {
+        awaitActivation(server, context, alloc, table.name, value, allocators.completion) catch {
             value.state = .pending;
             value.diagnostic = "The declaration committed; activation is still pending. Inspect the table constraint status before using the index; do not replay the DDL.";
         };
@@ -799,7 +828,7 @@ pub fn executeWithAllocators(server: *server_mod.ApiHttpServer, identity: ?serve
         const table_id = std.fmt.allocPrint(alloc, "{d}", .{resource_record.id}) catch return error.SqlMutationOutcomeUnknown;
         alloc.free(receipt.table_id);
         receipt.table_id = table_id;
-        awaitActivation(server, context, alloc, request.physical_name.?, receipt) catch {
+        awaitActivation(server, context, alloc, request.physical_name.?, receipt, allocators.completion) catch {
             receipt.state = .pending;
             receipt.diagnostic = "Table creation committed; constraints are still being validated. Inspect table constraint status; do not replay the DDL.";
         };
@@ -809,14 +838,14 @@ pub fn executeWithAllocators(server: *server_mod.ApiHttpServer, identity: ?serve
     return .{};
 }
 
-fn awaitActivation(server: *server_mod.ApiHttpServer, context: operation.RequestContext, alloc: std.mem.Allocator, physical: []const u8, receipt: *catalog.DdlReceipt) !void {
+fn awaitActivation(server: *server_mod.ApiHttpServer, context: operation.RequestContext, alloc: std.mem.Allocator, physical: []const u8, receipt: *catalog.DdlReceipt, completion: catalog.DdlAllocators.Completion) !void {
     const reader = server.table_reads orelse return error.ConstraintActivationPending;
     var bounded = context;
     const now = if (context.deadline_io) |borrow| blk: {
         var receiver = try borrow.receive();
         break :blk @as(u64, @intCast(@max(0, std.Io.Clock.now(.awake, receiver.io()).nanoseconds)));
     } else @import("antfly_platform").time.monotonicNs();
-    bounded.deadline_ns = @min(context.deadline_ns orelse std.math.maxInt(u64), now +| (2 * std.time.ns_per_s));
+    if (completion == .bounded) bounded.deadline_ns = @min(context.deadline_ns orelse std.math.maxInt(u64), now +| (2 * std.time.ns_per_s));
     while (true) {
         try bounded.ensureActive();
         const bytes = @import("relational_constraint_status.zig").collect(alloc, server.source, reader, physical, bounded) catch |err| switch (err) {
@@ -1125,18 +1154,16 @@ test "SQL catalog ALTER submits native schema CAS without client generations" {
     defer result_arena.deinit();
     var unique = try @import("antfly_local_sources").sql_compiler.compile(alloc, "CREATE UNIQUE INDEX unique_id ON items (id)", .{});
     defer unique.deinit();
-    const outcome = try execute(&server, null, .{}, "default", "public", result_arena.allocator(), .{ .catalog_ddl = unique.statement.catalog_ddl });
-    try std.testing.expectEqual(catalog.MutationOutcome.committed_pending, outcome.mutation_outcome);
-    try std.testing.expectEqual(.pending, outcome.receipt.?.state);
-    try std.testing.expectEqual(@as(u32, 8), outcome.receipt.?.schema_version);
-    try std.testing.expectEqualStrings("17", outcome.receipt.?.table_id);
-    try std.testing.expectEqual(@as(usize, 4), source.updates);
+    // This schema-CAS fixture has no data-owner reader or private build port.
+    // It cannot publish a regular UNIQUE declaration before validating rows.
+    try std.testing.expectError(error.UnsupportedSqlExecution, execute(&server, null, .{}, "default", "public", result_arena.allocator(), .{ .catalog_ddl = unique.statement.catalog_ddl }));
+    try std.testing.expectEqual(@as(usize, 3), source.updates);
     var check = try @import("antfly_local_sources").sql_compiler.compile(alloc, "ALTER TABLE items ADD CONSTRAINT positive CHECK (id > 0 AND id < 100)", .{});
     defer check.deinit();
     source.table_lookup = true;
     const checked = try execute(&server, null, .{}, "default", "public", result_arena.allocator(), .{ .catalog_ddl = check.statement.catalog_ddl });
     try std.testing.expectEqual(catalog.MutationOutcome.committed_pending, checked.mutation_outcome);
-    try std.testing.expectEqual(@as(usize, 5), source.updates);
+    try std.testing.expectEqual(@as(usize, 4), source.updates);
     for ([_][]const u8{
         "ALTER TABLE items ADD COLUMN n integer DEFAULT (2+3)",
         "ALTER TABLE items ADD COLUMN g bigint GENERATED ALWAYS AS (id+1) STORED",
@@ -1144,7 +1171,7 @@ test "SQL catalog ALTER submits native schema CAS without client generations" {
         var compiled = try @import("antfly_local_sources").sql_compiler.compile(alloc, sql, .{});
         defer compiled.deinit();
         try std.testing.expectError(error.SqlSchemaRewriteRequiresMetadataOwner, execute(&server, null, .{}, "default", "public", result_arena.allocator(), .{ .catalog_ddl = compiled.statement.catalog_ddl }));
-        try std.testing.expectEqual(@as(usize, 5), source.updates);
+        try std.testing.expectEqual(@as(usize, 4), source.updates);
     }
     var path: SearchPath = .{};
     var guarded_alter = try @import("antfly_local_sources").sql_compiler.compile(alloc, "ALTER TABLE items ADD COLUMN spare TEXT", .{});
@@ -1161,7 +1188,7 @@ test "SQL catalog ALTER submits native schema CAS without client generations" {
     source.mutation_failure = error.CatalogGenerationChanged;
     try std.testing.expectError(error.CatalogGenerationChanged, execute(&server, null, .{}, "default", "public", alloc, guarded_input));
     try std.testing.expectEqual(attempts + 1, source.mutation_attempts);
-    try std.testing.expectEqual(@as(usize, 5), source.updates);
+    try std.testing.expectEqual(@as(usize, 4), source.updates);
     source.mutation_failure = null;
     try path.append(try @import("../pgwire/search_path.zig").Namespace.init("public"));
     try path.append(try @import("../pgwire/search_path.zig").Namespace.init("tenant"));
@@ -1171,19 +1198,19 @@ test "SQL catalog ALTER submits native schema CAS without client generations" {
     defer scoped.deinit();
     const scoped_input: catalog.Ddl = .{ .catalog_ddl = scoped.statement.catalog_ddl };
     _ = try executeWithPath(&server, null, .{}, "default", "public", alloc, scoped_input, &path);
-    try std.testing.expectEqual(@as(usize, 6), source.updates);
+    try std.testing.expectEqual(@as(usize, 5), source.updates);
     source.index_exists = true;
     try std.testing.expectError(error.SqlIndexAlreadyExists, executeWithPath(&server, null, .{}, "default", "public", alloc, scoped_input, &path));
     var conditional_index = try @import("antfly_local_sources").sql_compiler.compile(alloc, "CREATE INDEX IF NOT EXISTS items_id ON items (id)", .{});
     defer conditional_index.deinit();
     _ = try executeWithPath(&server, null, .{}, "default", "public", alloc, .{ .catalog_ddl = conditional_index.statement.catalog_ddl }, &path);
-    try std.testing.expectEqual(@as(usize, 6), source.updates);
+    try std.testing.expectEqual(@as(usize, 5), source.updates);
     source.table_lookup = true;
     source.index_exists = false;
     const scoped_reads = source.resolutions;
     const scoped_check = try executeWithPath(&server, null, .{}, "default", "public", result_arena.allocator(), .{ .catalog_ddl = check.statement.catalog_ddl }, &path);
     try std.testing.expectEqual(scoped_reads + 1, source.resolutions);
-    try std.testing.expectEqual(@as(usize, 7), source.updates);
+    try std.testing.expectEqual(@as(usize, 6), source.updates);
     try std.testing.expectEqualStrings("tenant", scoped_check.receipt.?.namespace);
     const scoped_attempts = source.mutation_attempts;
     source.earlier_wrong_kind = true;
@@ -1203,7 +1230,115 @@ test "SQL catalog ALTER submits native schema CAS without client generations" {
     defer qualified_alter.deinit();
     _ = try executeWithPath(&server, null, .{}, "default", "tenant", alloc, .{ .catalog_ddl = qualified_alter.statement.catalog_ddl }, &empty_path);
     try std.testing.expectEqual(empty_reads + 1, source.resolutions);
-    try std.testing.expectEqual(@as(usize, 8), source.updates);
+    try std.testing.expectEqual(@as(usize, 7), source.updates);
+}
+
+test "SQL catalog regular UNIQUE admits an owned private build without publishing through schema CAS" {
+    const local = @import("antfly_local_sources");
+    const publication = @import("../metadata/relational_index_publication.zig");
+    const reads = local.api_table_read_source;
+    const consistency = local.storage_read_consistency.ReadConsistency;
+    const Source = struct {
+        plan: publication.Plan,
+        lost_reply: bool,
+        resolutions: usize = 0,
+        preparations: usize = 0,
+        begins: usize = 0,
+        observations: usize = 0,
+        owner_reads: usize = 0,
+        admitted: ?publication.AdmissionStatus = null,
+        fn status(_: *anyopaque) !@import("../metadata/api.zig").MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{} };
+        }
+        fn run(raw: *anyopaque, a: std.mem.Allocator, context: operation.RequestContext, call: @import("../system_catalog/server_call.zig").Call) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const plan = self.plan;
+            switch (call) {
+                .resolve_many => |request| {
+                    self.resolutions += 1;
+                    try std.testing.expectEqual(@as(usize, 2), request.relations.len);
+                    try std.testing.expectEqualStrings("items", request.relations[0].name);
+                    try std.testing.expectEqualStrings("email_idx", request.relations[1].name);
+                    return std.json.Stringify.valueAlloc(a, domain.ResolvedMany{ .revision = 9, .tables = &.{}, .relation_epoch = .{ .revision = 9, .incarnation = plan.table_guard.incarnation }, .relations = &.{ .{ .owner = plan.table_guard.owner, .logical_table = "items", .table = .{ .name = plan.before.name, .table_id = plan.before.table_id, .query_definition = .{ .table_id = plan.before.table_id, .schema_json = plan.before.schema_json, .read_schema_json = "", .indexes_json = "{}" } } }, null } }, .{});
+                },
+                .relational_index_prepare => |request| {
+                    try std.testing.expect(context.setting_admin and context.index_publication_authority);
+                    try std.testing.expectEqualStrings("email_idx", request.index_name);
+                    self.preparations += 1;
+                    return (publication.PrepareCut{ .metadata_incarnation = "01010101010101010101010101010101".*, .namespace_id = plan.namespace_id, .table_guard = plan.table_guard, .before = plan.before, .ranges = &.{plan.owners[0].range}, .authority = .native }).encode(a);
+                },
+                .relational_index_begin => |request| {
+                    try std.testing.expect(context.setting_admin and context.index_publication_authority);
+                    self.begins += 1;
+                    try std.testing.expectEqual(@as(usize, 1), self.begins);
+                    var prepared = try request.begin.plan.prepare(a);
+                    defer prepared.deinit();
+                    var head = prepared.head;
+                    head.phase = .published;
+                    head.revision = 10;
+                    head.completed_sources = 1;
+                    head.completion_revision = 3;
+                    head.counts = .{ 1, 1, 1, 1, 1, 0, 0 };
+                    self.admitted = .{ .metadata_incarnation = request.metadata_incarnation, .head = head };
+                    if (self.lost_reply) return error.MetadataMutationOutcomeUnknown;
+                    return std.json.Stringify.valueAlloc(a, self.admitted.?, .{});
+                },
+                .relational_index_admission_status => |request| {
+                    self.observations += 1;
+                    try std.testing.expect(try self.admitted.?.isAdmitted(request));
+                    return std.json.Stringify.valueAlloc(a, self.admitted.?, .{});
+                },
+                else => return error.UnexpectedIndexAdmissionOperation,
+            }
+        }
+        fn lookupGroup(raw: *anyopaque, a: std.mem.Allocator, group: u64, table: []const u8, _: []const u8, opts: local.storage_db_types.LookupOptions, gate: consistency) !?reads.LookupResponse {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try std.testing.expectEqual(@as(u64, 301), group);
+            try std.testing.expectEqualStrings("physical:101", table);
+            try std.testing.expectEqual(consistency.read_index, gate);
+            self.owner_reads += 1;
+            const bytes = if (opts.relational_integrity_catalog)
+                try std.json.Stringify.valueAlloc(a, .{ .catalog = self.plan.catalog_before_b64, .schema_version = @as(u32, 1), .table_id = "101" }, .{})
+            else
+                try std.json.Stringify.valueAlloc(a, .{ .namespace = self.plan.owners[0].namespace, .catalog_digest = self.plan.owners[0].catalog_digest, .next_epoch = @as(u64, 7), .catalog_checks_identity_supported = true }, .{});
+            return .{ .json = bytes, .version = 0 };
+        }
+        fn lookup(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8, _: local.storage_db_types.LookupOptions, _: consistency) !?reads.LookupResponse {
+            return error.UnexpectedUnroutedIndexRead;
+        }
+        fn scan(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8, _: []const u8, _: local.storage_db_types.ScanOptions, _: consistency) !?reads.ScanResponse {
+            return error.UnexpectedIndexScan;
+        }
+        fn query(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: local.storage_db_types.SearchRequest, _: consistency) !?local.api_query_response.QueryResponse {
+            return error.UnexpectedIndexQuery;
+        }
+    };
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const plan = try publication.testing.plan(arena.allocator());
+    var runtime = try local.storage_background_runtime.BackendRuntimeHandle.init(a, .{ .backend = .io_threaded });
+    defer runtime.deinit();
+    var compiled = try local.sql_compiler.compile(a, "CREATE UNIQUE INDEX email_idx ON items (email)", .{});
+    defer compiled.deinit();
+    for ([_]bool{ false, true }) |lost_reply| {
+        var source: Source = .{ .plan = plan, .lost_reply = lost_reply };
+        var server = server_mod.ApiHttpServer.init(a, .{ .backend_runtime = runtime.ptr() }, .{ .ptr = &source, .vtable = &.{ .status = Source.status, .system_catalog = Source.run, .supports_query_definitions = true } }, .{ .ptr = &source, .vtable = &.{ .lookup = Source.lookup, .lookup_group_local = Source.lookupGroup, .scan = Source.scan, .query = Source.query } }, null);
+        defer server.deinit();
+        var result_arena = std.heap.ArenaAllocator.init(a);
+        defer result_arena.deinit();
+        const result = try executeWithAllocators(&server, null, .{}, "default", "public", .{ .result = result_arena.allocator(), .scratch = a, .completion = .until_deadline }, .{ .catalog_ddl = compiled.statement.catalog_ddl }, null);
+        try std.testing.expectEqual(catalog.MutationOutcome.committed, result.mutation_outcome);
+        try std.testing.expectEqual(catalog.DdlReceipt.State.ready, result.receipt.?.state);
+        try std.testing.expectEqual(@as(u32, 2), result.receipt.?.schema_version);
+        const identity = try @import("index_publication_recovery.zig").Token.decode(result.receipt.?.index_publication_token.?);
+        try std.testing.expectEqual(@as(u64, 101), identity.table_id);
+        try std.testing.expectEqual(@as(usize, 1), source.resolutions);
+        try std.testing.expectEqual(@as(usize, 1), source.preparations);
+        try std.testing.expectEqual(@as(usize, 1), source.begins);
+        try std.testing.expectEqual(@as(usize, 2), source.owner_reads);
+        try std.testing.expectEqual(@as(usize, if (lost_reply) 1 else 0), source.observations);
+    }
 }
 
 test "SQL catalog DDL authorizes before lookup and handles atomic conditional outcomes" {

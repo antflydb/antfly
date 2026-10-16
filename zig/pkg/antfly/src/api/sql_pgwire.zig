@@ -1384,7 +1384,9 @@ const GuardedCatalog = struct {
         const prior = self.authority.identity.*;
         self.authority.identity.* = current;
         defer self.authority.identity.* = prior;
-        return dispatch_ddl(self.native.ptr, allocators, input);
+        var wire_allocators = allocators;
+        wire_allocators.completion = .until_deadline;
+        return dispatch_ddl(self.native.ptr, wire_allocators, input);
     }
 };
 
@@ -1591,6 +1593,10 @@ test "SQL pgwire credential snapshot observes policy revocation and password rot
             self.closes += 1;
         }
         fn checkpoint(_: *anyopaque) !void {}
+        fn ddl(_: *anyopaque, allocators: catalog.DdlAllocators, _: catalog.Ddl) !catalog.DdlOutcome {
+            try std.testing.expectEqual(catalog.DdlAllocators.Completion.until_deadline, allocators.completion);
+            return .{};
+        }
     };
     var native_cursor: NativeCursor = .{};
     var identity: ?http.AuthenticatedIdentity = admitted;
@@ -1633,12 +1639,13 @@ test "SQL pgwire credential snapshot observes policy revocation and password rot
     }
     const revision: ?u64 = 1;
     var guarded: GuardedCatalog = .{
-        .native = .{ .ptr = &native_cursor, .vtable = &.{ .resolve = undefined, .scan = undefined, .mutate = undefined, .open_scan = NativeCursor.open, .checkpoint = NativeCursor.checkpoint } },
+        .native = .{ .ptr = &native_cursor, .vtable = &.{ .resolve = undefined, .scan = undefined, .mutate = undefined, .open_scan = NativeCursor.open, .checkpoint = NativeCursor.checkpoint, .ddl = NativeCursor.ddl } },
         .authority = &authority,
         .revision = &revision,
         .expected_guard = null,
     };
     const backend = guarded.backend();
+    _ = try backend.vtable.ddl.?(backend.ptr, .{ .result = alloc, .scratch = alloc }, .{ .catalog_ddl = .{ .kind = .database, .action = .create, .name = .{ .table = "test" } } });
     const cursor = (try backend.vtable.open_scan.?(backend.ptr, alloc, .{ .id = 1, .physical_name = "docs", .schema_version = 1, .columns = &.{} }, .{ .fields = &.{}, .limit = 1 })).?;
     var cursor_closed = false;
     defer if (!cursor_closed) cursor.close(cursor.ptr);

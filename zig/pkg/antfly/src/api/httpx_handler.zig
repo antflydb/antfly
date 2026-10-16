@@ -10064,6 +10064,7 @@ test "public index publication recovery requires table admin and preserves exact
         database: []const u8 = "default",
         namespace: []const u8 = "public",
         replaced: bool = false,
+        wrong_incarnation: bool = false,
         fn status(_: *anyopaque) !metadata_api.MetadataStatus {
             return .{ .metadata_group_id = 77, .metrics = .{}, .projected_stores = 1 };
         }
@@ -10088,6 +10089,7 @@ test "public index publication recovery requires table admin and preserves exact
                     }, .{});
                 },
                 .relational_index_status => |request| {
+                    if (self.wrong_incarnation) return error.MetadataIncarnationMismatch;
                     try std.testing.expectEqualStrings("by/email", request.index_name);
                     try std.testing.expectEqualStrings("items/a", request.guard.logical_table);
                     return std.json.Stringify.valueAlloc(a, @import("../metadata/relational_index_publication.zig").AdmissionStatus{ .metadata_incarnation = @splat('1') }, .{});
@@ -10150,6 +10152,12 @@ test "public index publication recovery requires table admin and preserves exact
     defer replaced.deinit();
     try std.testing.expectEqual(@as(u16, 409), replaced.status.code);
     try std.testing.expectEqual(@as(usize, 5), source.calls);
+    source.replaced = false;
+    source.wrong_incarnation = true;
+    var foreign = try getWithRetry(&client, threaded.io(), scoped_url, &admin_headers, 20);
+    defer foreign.deinit();
+    try std.testing.expectEqual(@as(u16, 409), foreign.status.code);
+    try std.testing.expectEqual(@as(usize, 7), source.calls);
 }
 
 test "store-root enrollment requires cluster admin and forwards only valid possession proof" {

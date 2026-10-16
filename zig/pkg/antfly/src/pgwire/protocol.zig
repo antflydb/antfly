@@ -1614,7 +1614,7 @@ pub const Session = struct {
             defer bytes.deinit();
             const pending = std.mem.eql(u8, result.command_tag, "DDL PENDING");
             const unknown = pending and result.mutation_outcome == null;
-            try bytes.writer.writeAll(if (unknown) "SERROR\x00C40003\x00MDDL admission outcome is unknown; do not replay; inspect receipt\x00D" else if (pending) "SERROR\x00C55000\x00MDDL declaration committed but is not ready; do not replay; inspect receipt\x00D" else "SNOTICE\x00C01000\x00MDDL declaration committed; inspect receipt for validation readiness\x00D");
+            try bytes.writer.writeAll(if (unknown) "SERROR\x00C40003\x00MDDL admission outcome is unknown; do not replay; inspect receipt\x00D" else if (pending) "SERROR\x00C55000\x00MDDL operation was durably admitted but is not ready; do not replay; inspect receipt\x00D" else "SNOTICE\x00C01000\x00MDDL operation committed; inspect receipt for validation readiness\x00D");
             try bytes.writer.writeAll(receipt);
             try bytes.writer.writeAll("\x00\x00");
             try self.message(if (pending) 'E' else 'N', bytes.written());

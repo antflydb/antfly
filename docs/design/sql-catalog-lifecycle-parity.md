@@ -8725,3 +8725,68 @@ This activates public recovery reads, not SQL index admission or an end-to-end
 distributed build. Public DDL token producers, replacement-root adoption and
 hosted/Raft execution remain unfinished. No original-case disposition or latency
 benchmark claim changes: 483 implemented / 862 unresolved.
+
+### SQL regular UNIQUE admission and request-shaped completion
+
+Regular SQL `CREATE UNIQUE INDEX` now lowers to the owned private publication
+pipeline instead of first publishing the successor schema through ordinary CAS.
+The existing bounded namespace lookup and logical-table authorization are kept.
+Preparation reads actual captured owner catalogs; the result allocator owns the
+complete receipt and token before the single begin call. Backends without the
+required reader/runtime or publication capabilities reject before admission;
+there is no unsafe schema-first fallback or native alias for Raft execution.
+
+Lost internal begin replies, OOM while constructing acknowledgements, malformed responses and
+unmirrored observations reconcile only the exact immutable admission identity.
+They never repeat begin. Published terminal progress is required for SQL success.
+Duplicate validation becomes SQLSTATE 23505 only after canceled cleanup and fence
+release complete; pre-terminal cleanup remains pending. Definite replication
+headroom rejection is a retryable catalog-publication precondition, not a generic
+internal error or an ambiguous admitted write. The prepared schema/catalog/cohort
+is consumed before any recovery read or long wait; only fixed identity, an owned
+receipt and bounded observation buffers remain in the admission helper.
+
+`DdlAllocators` carries transport-shaped completion policy. Pgwire selects the
+request deadline; HTTP retains bounded observation and durable receipts. Existing
+constraint activation waits also honor this policy. Pending wire errors now say
+the operation was admitted, without falsely asserting a successor schema already
+committed. The [PostgreSQL 18 CREATE INDEX contract](https://www.postgresql.org/docs/18/sql-createindex.html)
+keeps regular write-fenced builds distinct from CONCURRENTLY; concurrent syntax
+is still rejected before preparation rather than routed through this build.
+
+Integration review also found the StatusSource adapter hiding exact publication
+incarnation conflicts behind routing errors. Exact index observations now retain
+the typed conflict through that adapter, with a mounted HTTP regression.
+
+This activates the native-capable SQL admission boundary, not complete distributed
+index qualification. Hosted/Raft execution, replacement-root adoption, automatic
+request-to-job cancellation, and real-owner original-case build/rollback/restart
+qualification remain unfinished. Rewrite and FK job completion still retain
+their explicit pending receipt paths. No original SQL case credit is claimed.
+Client-preowned operation identity or durable request lookup is also still needed
+when an entire public response is lost: a server-owned token is not proof that
+the client received it. The lost-reply tests here cover metadata admission replies,
+not that unresolved public transport boundary.
+
+Qualification: frozen Debug metadata gate passed 60/60 steps with 68 publication
+tests and one decoder barrier; the SQL/public gate passed 80/80 steps and four
+selected regressions. Logs are
+`/private/tmp/antfly-index-sql-admission-metadata-frozen-debug.log` and
+`/private/tmp/antfly-index-sql-admission-http-frozen-debug.log`.
+The admission test exercises 14 outcome modes, one begin only, exact recovery,
+cleanup-before-23505, and tracked ownership: polling starts with at most one
+bounded response buffer live, and all helper scratch is freed on return. A
+separate test covers forbidden, canceled-before-begin and mismatched-token paths
+with zero IO and no retained plan allocations. The SQL integration fixture uses
+synthetic metadata/read callbacks with real compiler/candidate preparation; it
+does not simulate a committed distributed build. It proves captured-group reads,
+no schema-CAS bypass, pre-owned returned tokens and lost-reply reconciliation.
+The public socket regression proves incarnation conflicts survive StatusSource.
+
+The Debug pgwire suite passed 117/117 tests; the isolated PostgreSQL 18 oracle
+passed all 16 lifecycle tests, including regular failed-build rollback. Initial
+attempts required local socket access and the oracle's isolated psycopg dependency.
+Generation, formatting, license, Apache, inventory, control-catalog and whitespace
+checks pass. Two obsolete owned cached HTTP test binaries were reclaimed; source
+and test data were preserved. No whole-request RSS or latency benchmark is
+claimed. Original inventory remains 483 implemented / 862 unresolved.
