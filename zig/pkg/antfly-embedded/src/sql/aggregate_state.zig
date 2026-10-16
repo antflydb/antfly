@@ -285,6 +285,9 @@ pub const Column = struct {
     /// exactly the same update order as the scalar path.
     pub fn updateEncoded(self: *Column, a: A, ids: []const usize, batch: @import("execution_batch.zig").Batch) !void {
         if (batch.width() != 1 or batch.len() != ids.len) return error.InvalidSqlBackendResponse;
+        if (batch == .reader) if (batch.reader.cohort) |cohort| {
+            return self.updateCohort(a, ids, cohort.source.*, cohort.positions);
+        };
         var scratch = std.heap.ArenaAllocator.init(a);
         defer scratch.deinit();
         if (try batch.physicalColumn(scratch.allocator(), 0)) |physical| if (try self.updatePhysical(a, ids, physical)) return;
@@ -304,6 +307,31 @@ pub const Column = struct {
                 }
             },
             else => for (ids, 0..) |id, index| try self.update(a, id, try batch.cell(scratch.allocator(), index, 0)),
+        }
+    }
+    pub fn updateCohort(self: *Column, a: A, ids: []const usize, source: @import("execution_batch.zig").Batch, positions: []const usize) !void {
+        if (source.len() != positions.len) return error.InvalidSqlBackendResponse;
+        var scratch = std.heap.ArenaAllocator.init(a);
+        defer scratch.deinit();
+        const physical = try source.physicalColumn(scratch.allocator(), 0);
+        var begin: usize = 0;
+        var selected_ids: [256]usize = undefined;
+        while (begin < positions.len) {
+            const length = @min(selected_ids.len, positions.len - begin);
+            for (positions[begin..][0..length], selected_ids[0..length]) |position, *id| {
+                if (position >= ids.len) return error.InvalidSqlBackendResponse;
+                id.* = ids[position];
+            }
+            if (physical) |native| {
+                var view = native;
+                view.selection = native.selection[begin..][0..length];
+                if (try self.updatePhysical(a, selected_ids[0..length], view)) {
+                    begin += length;
+                    continue;
+                }
+            }
+            for (selected_ids[0..length], 0..) |id, offset| try self.update(a, id, try source.cell(scratch.allocator(), begin + offset, 0));
+            begin += length;
         }
     }
     fn physicalValue(values: anytype, row: usize) switch (@typeInfo(@TypeOf(values))) {

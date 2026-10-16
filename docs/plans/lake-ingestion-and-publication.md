@@ -1532,8 +1532,9 @@ decode numeric wire lanes once into bounded typed buffers, preserving borrowed
 text and dictionary entries. Complex values retain their exact fallback.
 
 Aggregate FILTER expressions form lazy cohorts. Only surviving physical lanes
-evaluate aggregate inputs, then a SQL-NULL mask maps typed results back into the
-parent batch. Keys resolve once, unrelated unfiltered inputs stay native, and
+evaluate aggregate inputs. Sparse cohort positions gather group IDs directly
+into bounded native updates; scalar fallback observes SQL NULL elsewhere.
+Keys resolve once, unrelated unfiltered inputs stay native, and
 filtered-out division/coercion errors remain unevaluated. Ordered and DISTINCT
 consumers receive the same logical rows and null semantics as before. Compact
 computed dictionary entries retain their existing encoded dictionary path.
@@ -1550,9 +1551,11 @@ gap and a 2 MiB envelope target. At most four columns plan the current page plus
 one adjacent indexed page each. Filtered/pruning consumers defer future payloads,
 pruned current pages are not prefetched, and decoded hits skip encoded fetches.
 Each exact page cache entry pins a slice of the shared immutable response; its
-cache key retains source version and credential scope. Admission conservatively
-charges the full envelope per alias so partial admission/eviction cannot hide
-retained bytes. No cache lock covers provider I/O. Member flights let required
+cache key retains source version and credential scope. Workers check the
+persistent tier before coalescing only missing adjacent ranges. Cache admission
+charges shared backing once until its final resident alias leaves; pinned aliases
+remain resident and charged, while entry limits independently bound metadata.
+No cache lock covers disk or provider I/O. Member flights let required
 reads wait for an in-flight envelope, cancellation/close joins every owner, and
 shared admission can fall back to smaller individual page jobs. Dictionary and
 unindexed header discovery retain their bounded path. The real Parquet restart
@@ -1563,7 +1566,7 @@ Representative latency/RSS benchmarking and live cloud retention qualification
 remain deferred.
 
 
-Qualification after merging `origin/main` `ce578d9033` (2026-10-16): all 503
+Qualification at `512f16a3dd` after merging `origin/main` `ce578d9033` (2026-10-16): all 503
 full native lake tests (189 shared-engine and 314 server), 43 focused SQL
 tests, and 31 runtime ABI tests passed with zero native failures or leaks. All
 50 real Parquet/Iceberg E2Es passed against the final merged Debug CLI in
@@ -1573,3 +1576,23 @@ arrays, native parameter ownership, and leased array projections. Generated erro
 parity, Zig/Python formatting, Python lint, whitespace, license headers, and the
 Apache product boundary (2,073 source files) passed. The private error table
 includes the combined branch/main names; public runtime ABI values remain pinned.
+
+Native execution also carries primitive/dictionary projections across derived
+relations, pushes selections to producers before coercion, and updates aggregate
+FILTER cohorts using only accepted lanes. Group admission uses a bounded census
+of distinct semantic keys and dictionary-tuple reuse, retaining exact equality,
+source ordinals and existing spill fallback. These are internal performance and
+correctness refinements with no new configuration or SQL syntax.
+
+Qualification of the distinct-admission and typed-delivery refinements
+(2026-10-16): all 505 full native lake tests (191 shared-engine and 314 server),
+54 focused SQL tests and 31 runtime ABI tests passed with zero native failures or
+leaks. All 50 real Parquet/Iceberg E2Es passed against the final Debug CLI in
+618.60 seconds. The expanded Parquet restart case covers derived native
+projections feeding grouped FILTER aggregates. Selection/coercion regression,
+persistent-tier prefetch, shared-buffer pin/eviction accounting, distinct-key
+admission under a small quota, and lazy/error-prefix/allocation-failure behavior
+are covered. Zig/Python formatting, Python lint, whitespace, licenses and the
+Apache product boundary (2,073 source files) passed. Current `origin/main`
+`ce578d9033` is included. Archive-scale latency/RSS benchmarking and live-provider
+retention qualification remain deferred.

@@ -1178,6 +1178,76 @@ pub const Grouped = struct {
     /// Source identity lets disjoint key partitions retain columnar state
     /// without rehashing or losing first-occurrence ordinals after selection.
     pub const InputIdentity = struct { ordinals: []const u64, hashes: []const ?u64 };
+    const EncodedGroups = struct {
+        const Representative = struct { row: usize, hash: u64, existing: ?usize, next: ?usize, group: usize = 0 };
+        rows: []usize,
+        representatives: []Representative,
+        needed: usize,
+    };
+    /// A bounded census admits distinct new state rather than input rows.
+    /// Dictionary tuples are representation identities only; differing tuples
+    /// still meet semantic hashing and exact comparison (NaN, zero, SQL NULL).
+    fn encodedGroups(self: *Grouped, a: Allocator, keys: []const @import("execution_batch.zig").Batch, physical: []const ?@import("execution_batch.zig").PhysicalColumn, count: usize, hashes: []const ?u64) !?EncodedGroups {
+        const maximum = @min(@as(usize, 4096), @as(usize, 1024 * 1024) / @max(@as(usize, 1), keys.len * @sizeOf(u64)));
+        var heads: std.AutoHashMapUnmanaged(u64, usize) = .empty;
+        var tuples: std.StringHashMapUnmanaged(usize) = .empty;
+        var representatives: std.ArrayList(EncodedGroups.Representative) = .empty;
+        const rows = try a.alloc(usize, count);
+        const tuple = try a.alloc(u64, keys.len);
+        const cells = try a.alloc(Datum, keys.len);
+        var needed: usize = 4096;
+        for (rows, 0..) |*representative, row_index| {
+            var encoded = true;
+            for (keys, physical, tuple) |column, native, *id| {
+                const value = if (native) |view| view.dictionaryIdentity(row_index) else try column.dictionaryIdentity(row_index, 0);
+                if (value) |identity_| id.* = identity_ else {
+                    encoded = false;
+                    break;
+                }
+            }
+            const tuple_bytes = std.mem.sliceAsBytes(tuple);
+            if (encoded) if (tuples.get(tuple_bytes)) |previous| {
+                representative.* = previous;
+                continue;
+            };
+            for (keys, physical, cells) |column, native, *cell| cell.* = if (native) |view| try view.cell(row_index) else try column.cell(a, row_index, 0);
+            const hash = hashes[row_index] orelse return error.InvalidSqlBackendResponse;
+            var previous = heads.get(hash);
+            while (previous) |index| {
+                const candidate = representatives.items[index];
+                var equal_ = true;
+                for (keys, physical, cells) |column, native, cell| {
+                    const before = if (native) |view| try view.cell(candidate.row) else try column.cell(a, candidate.row, 0);
+                    if (try scalar.compareDatums(before, cell) != .eq) {
+                        equal_ = false;
+                        break;
+                    }
+                }
+                if (equal_) break;
+                previous = candidate.next;
+            }
+            if (previous) |index| {
+                representative.* = index;
+            } else {
+                if (representatives.items.len == maximum) return null;
+                var existing = self.heads.get(hash);
+                while (existing) |index| {
+                    self.hash_probes += 1;
+                    if (try self.key_columns.equal(a, index, cells, true)) break;
+                    existing = self.groups.items[index].next;
+                }
+                if (existing == null) {
+                    needed +|= 512 +| self.specs.len *| @sizeOf(Aggregate) *| 2;
+                    needed +|= (try self.key_columns.appendBytes(cells)) *| 4;
+                }
+                representative.* = representatives.items.len;
+                try representatives.append(a, .{ .row = row_index, .hash = hash, .existing = existing, .next = heads.get(hash) });
+                try heads.put(a, hash, representative.*);
+            }
+            if (encoded and tuples.count() < maximum) try tuples.put(a, try a.dupe(u8, tuple_bytes), representative.*);
+        }
+        return .{ .rows = rows, .representatives = representatives.items, .needed = needed };
+    }
     pub fn addEncodedColumnsIdentified(self: *Grouped, keys: []const @import("execution_batch.zig").Batch, inputs: []const @import("execution_batch.zig").Batch, count: usize, identity: ?InputIdentity) !void {
         const previous_ordinal = self.source_ordinal;
         defer self.source_ordinal = previous_ordinal;
@@ -1218,7 +1288,10 @@ pub const Grouped = struct {
             var growth: usize = 0;
             for (self.specs, inputs, physical_inputs) |spec, column, native| if (spec.kind == .min or spec.kind == .max) {
                 var maximum: usize = 0;
-                for (0..count) |index| maximum = @max(maximum, if (native) |view| try view.bytes(index) else try datumBytes(try column.cell(a, index, 0)));
+                if (column == .reader and column.reader.cohort != null) {
+                    const source = column.reader.cohort.?.source.*;
+                    for (0..source.len()) |index| maximum = @max(maximum, try datumBytes(try source.cell(a, index, 0)));
+                } else for (0..count) |index| maximum = @max(maximum, if (native) |view| try view.bytes(index) else try datumBytes(try column.cell(a, index, 0)));
                 growth +|= maximum *| 4;
             };
             if (try self.canRetainAdditional(&.{}, row_inputs, growth)) {
@@ -1227,39 +1300,61 @@ pub const Grouped = struct {
                 try self.ensureGlobalGroup();
                 var chunk = std.heap.ArenaAllocator.init(self.backing);
                 defer chunk.deinit();
-                var begin: usize = 0;
                 const ids: [256]usize = @splat(0);
                 var selected: [256]usize = undefined;
-                while (begin < count) {
-                    _ = chunk.reset(.retain_capacity);
-                    const length = @min(ids.len, count - begin);
-                    for (selected[0..length], 0..) |*row, offset| row.* = begin + offset;
-                    for (self.state_columns, inputs, physical_inputs) |*column, *values, native| {
+                for (self.state_columns, inputs, physical_inputs) |*column, original, original_native| {
+                    var values = original;
+                    var native = original_native;
+                    if (original == .reader) if (original.reader.cohort) |cohort| {
+                        values = cohort.source.*;
+                        native = try values.physicalColumn(a, 0);
+                    };
+                    var begin: usize = 0;
+                    while (begin < values.len()) {
+                        _ = chunk.reset(.retain_capacity);
+                        const length = @min(ids.len, values.len() - begin);
+                        for (selected[0..length], 0..) |*row, offset| row.* = begin + offset;
                         if (native) |physical| {
                             var view = physical;
                             view.selection = physical.selection[begin..][0..length];
-                            if (try column.updatePhysical(self.budget.allocator(), ids[0..length], view)) continue;
+                            if (try column.updatePhysical(self.budget.allocator(), ids[0..length], view)) {
+                                begin += length;
+                                continue;
+                            }
                         }
                         const view = try values.select(chunk.allocator(), selected[0..length]);
                         try column.updateEncoded(self.budget.allocator(), ids[0..length], view);
+                        begin += length;
                     }
-                    begin += length;
                 }
                 self.rows_seen = std.math.add(u64, self.rows_seen, count) catch return error.SqlNumericOutOfRange;
                 return;
             }
         }
-        var needed: usize = 4096 +| count *| (512 +| self.specs.len *| @sizeOf(Aggregate) *| 2);
-        for (keys, physical_keys) |column, native| for (0..count) |index| {
-            needed +|= (if (native) |view| try view.bytes(index) else try datumBytes(try column.cell(a, index, 0))) *| 4;
-        };
-        for (self.specs, inputs, physical_inputs) |spec, column, native| if (spec.kind == .min or spec.kind == .max) {
-            for (0..count) |index| needed +|= (if (native) |view| try view.bytes(index) else try datumBytes(try column.cell(a, index, 0))) *| 4;
-        };
-        var fast = self.external == null and needed <= self.budget.limit -| self.budget.live and self.budget.live <= self.budget.limit / 2;
+        var fast = self.external == null and self.budget.live <= self.budget.limit / 2;
         for (self.specs) |spec| if (spec.distinct or spec.kind == .pattern_set or spec.input_element == .numeric) {
             fast = false;
         };
+        const hashes = if (fast) (if (identity) |ids_| ids_.hashes else try @import("batch_hash.zig").encodedColumnsWithPhysical(a, keys, physical_keys, count, true)) else null;
+        const census = if (hashes) |values| try self.encodedGroups(a, keys, physical_keys, count, values) else null;
+        var needed = if (census) |groups_| groups_.needed else std.math.maxInt(usize);
+        if (census) |groups_| {
+            // Variable-width winners can grow once per distinct group. Reserve
+            // each group's largest candidate, including sparse FILTER cohorts.
+            const maxima = try a.alloc(usize, groups_.representatives.len);
+            for (self.specs, inputs, physical_inputs) |spec, column, native| if (spec.kind == .min or spec.kind == .max) {
+                @memset(maxima, 0);
+                if (column == .reader and column.reader.cohort != null) {
+                    const cohort = column.reader.cohort.?;
+                    for (cohort.positions, 0..) |position, index| {
+                        const group = groups_.rows[position];
+                        maxima[group] = @max(maxima[group], try datumBytes(try cohort.source.cell(a, index, 0)));
+                    }
+                } else for (groups_.rows, 0..) |group, index| maxima[group] = @max(maxima[group], if (native) |view| try view.bytes(index) else try datumBytes(try column.cell(a, index, 0)));
+                for (maxima) |bytes| needed +|= bytes *| 4;
+            };
+        }
+        fast = fast and census != null and needed <= self.budget.limit -| self.budget.live;
         if (!fast) {
             for (0..count) |index| {
                 for (keys, physical_keys, row_keys) |column, native, *cell| cell.* = if (native) |view| try view.cell(index) else try column.cell(a, index, 0);
@@ -1282,13 +1377,14 @@ pub const Grouped = struct {
             self.rows_seen = std.math.add(u64, self.rows_seen, count) catch return error.SqlNumericOutOfRange;
             return;
         }
-        const hashes = if (identity) |ids_| ids_.hashes else try @import("batch_hash.zig").encodedColumnsWithPhysical(a, keys, physical_keys, count, true);
-        for (ids, 0..) |*id, index| {
-            for (keys, physical_keys, row_keys) |column, native, *cell| cell.* = if (native) |view| try view.cell(index) else try column.cell(a, index, 0);
-            if (identity) |identity_| self.source_ordinal = identity_.ordinals[index];
-            id.* = try self.resolveGroupHashed(row_keys, hashes[index].?);
-            self.rows_seen = std.math.add(u64, self.rows_seen, 1) catch return error.SqlNumericOutOfRange;
+        const groups_ = census.?;
+        for (groups_.representatives) |*representative| {
+            for (keys, physical_keys, row_keys) |column, native, *cell| cell.* = if (native) |view| try view.cell(representative.row) else try column.cell(a, representative.row, 0);
+            self.source_ordinal = if (identity) |identity_| identity_.ordinals[representative.row] else previous_ordinal orelse (std.math.add(u64, self.rows_seen, representative.row) catch return error.SqlNumericOutOfRange);
+            representative.group = representative.existing orelse try self.appendGroup(row_keys, representative.hash);
         }
+        for (ids, groups_.rows) |*id, representative| id.* = groups_.representatives[representative].group;
+        self.rows_seen = std.math.add(u64, self.rows_seen, count) catch return error.SqlNumericOutOfRange;
         for (self.state_columns, inputs, physical_inputs) |*column, values, native| {
             if (native) |physical| if (try column.updatePhysical(self.budget.allocator(), ids, physical)) continue;
             try column.updateEncoded(self.budget.allocator(), ids, values);
@@ -2966,4 +3062,46 @@ test "SQL global encoded wide batches admit one group under a small budget" {
     try grouped.addEncodedColumns(&.{}, &inputs, indices.len);
     try std.testing.expectEqual(@as(usize, 0), grouped.hash_probes);
     for (grouped.state_columns) |column| try std.testing.expectEqual(@as(u64, indices.len), column.values.counts.items[0]);
+}
+
+test "SQL encoded grouping admits distinct dictionary tuples and sparse cohorts under a small quota" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    const Batch = @import("execution_batch.zig").Batch;
+    const count = 10000;
+    const indices = try scratch.alloc(u32, count);
+    for (indices, 0..) |*id, i| id.* = @intCast(i % 3);
+    // Two representations of one semantic key must resolve to one group.
+    const keys: Batch = .{ .dictionary = .{ .values = &.{ Datum.json(.{ .integer = 7 }), Datum.json(.{ .integer = 7 }), Datum.json(.{ .integer = 9 }) }, .indices = indices } };
+    const ones = try scratch.alloc(u32, count);
+    @memset(ones, 0);
+    const input: Batch = .{ .dictionary = .{ .values = &.{Datum.json(.{ .integer = 1 })}, .indices = ones } };
+    const positions = [_]usize{ 0, 2, 9999 };
+    const subset: Batch = .{ .dictionary = .{ .values = &.{Datum.json(.{ .integer = 11 })}, .indices = &.{ 0, 0, 0 } } };
+    const filtered = try subset.mask(scratch, &positions, count);
+    const grouped = try Grouped.create(a, &.{ .{ .kind = .count }, .{ .kind = .sum, .input_type = .integer } }, .{ .bytes = 64 * 1024, .groups = 2 });
+    defer grouped.deinit();
+    try grouped.addEncodedColumns(&.{keys}, &.{ input, filtered }, count);
+    try grouped.addEncodedColumns(&.{keys}, &.{ input, filtered }, count);
+    try std.testing.expectEqual(@as(usize, 2), grouped.groupCount());
+    try std.testing.expectEqual(@as(u64, 2 * count), grouped.rows_seen);
+    // One exact lookup per distinct key in the second batch, rather than rows.
+    try std.testing.expect(grouped.hash_probes <= 2);
+    try std.testing.expect(grouped.external == null);
+    const first = try grouped.resultAt(scratch, 0);
+    const second = try grouped.resultAt(scratch, 1);
+    try std.testing.expectEqual(@as(i64, 13334), first.aggregates[0].value.integer);
+    try std.testing.expectEqual(@as(i64, 44), first.aggregates[1].value.integer);
+    try std.testing.expectEqual(@as(u64, 0), first.ordinal);
+    try std.testing.expectEqual(@as(i64, 6666), second.aggregates[0].value.integer);
+    try std.testing.expectEqual(@as(i64, 22), second.aggregates[1].value.integer);
+    try std.testing.expectEqual(@as(u64, 2), second.ordinal);
+    const global = try Grouped.create(a, &.{ .{ .kind = .count }, .{ .kind = .sum, .input_type = .integer } }, .{ .bytes = 64 * 1024 });
+    defer global.deinit();
+    try global.addEncodedColumns(&.{}, &.{ filtered, filtered }, count);
+    const result = try global.resultAt(scratch, 0);
+    try std.testing.expectEqual(@as(i64, 3), result.aggregates[0].value.integer);
+    try std.testing.expectEqual(@as(i64, 33), result.aggregates[1].value.integer);
 }

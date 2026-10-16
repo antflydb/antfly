@@ -212,6 +212,9 @@ pub const Cache = struct {
     const Envelope = struct {
         bytes: []u8,
         refs: std.atomic.Value(usize) = .init(1),
+        // Guarded by Cache.mutex. One charge survives until the final alias
+        // leaves residency; pins keep their entries resident and charged.
+        residents: usize = 0,
         fn release(self: *Envelope) void {
             if (self.refs.fetchSub(1, .acq_rel) == 1) {
                 std.heap.page_allocator.free(self.bytes);
@@ -227,7 +230,7 @@ pub const Cache = struct {
         refs: usize = 0,
         envelope: ?*Envelope = null,
         fn charge(self: *const Entry) usize {
-            return if (self.envelope) |owner| owner.bytes.len else self.bytes.len;
+            return if (self.envelope) |owner| (if (owner.residents == 1) owner.bytes.len else 0) else self.bytes.len;
         }
         fn destroy(self: *Entry) void {
             if (self.envelope) |owner| owner.release() else self.cache.alloc.free(self.bytes);
@@ -700,8 +703,8 @@ pub const Cache = struct {
         return self.storeOwned(key, bytes, null);
     }
     fn storeOwned(self: *Cache, key: []const u8, bytes: []const u8, envelope: ?*Envelope) !void {
-        const charge = if (envelope) |owner| owner.bytes.len else bytes.len;
-        if (charge > self.max_bytes or self.max_entries == 0) return;
+        const capacity = if (envelope) |owner| owner.bytes.len else bytes.len;
+        if (capacity > self.max_bytes or self.max_entries == 0) return;
         const owned_key = try self.alloc.dupe(u8, key);
         defer self.alloc.free(owned_key);
         const owned_bytes = if (envelope != null) @constCast(bytes) else try self.alloc.dupe(u8, bytes);
@@ -715,7 +718,9 @@ pub const Cache = struct {
         if (self.entries.contains(key)) return;
         const lane = parquet.cacheLaneFromObjectRangeCacheKey(key);
         const protected = lane == .metadata or lane == .serving_sidecar;
-        while (self.entries.count() != 0 and (self.stats.stored_bytes > self.max_bytes - charge or self.entries.count() >= self.max_entries)) {
+        // Recompute after every eviction: evicting this owner's last alias
+        // makes the next admission responsible for the whole buffer again.
+        while (self.entries.count() != 0 and (self.stats.stored_bytes > self.max_bytes - (if (envelope) |owner| (if (owner.residents == 0) capacity else 0) else capacity) or self.entries.count() >= self.max_entries)) {
             var oldest: ?[]const u8 = null;
             var touched: u64 = std.math.maxInt(u64);
             for (0..2) |pass| {
@@ -735,6 +740,7 @@ pub const Cache = struct {
             const removed = self.entries.fetchRemove(oldest orelse return).?;
             self.stats.stored_bytes -= removed.value.charge();
             if (removed.value.protected) self.stats.protected_stored_bytes -= removed.value.charge();
+            if (removed.value.envelope) |owner| owner.residents -= 1;
             self.stats.evictions += 1;
             self.alloc.free(removed.key);
             removed.value.destroy();
@@ -744,7 +750,11 @@ pub const Cache = struct {
         self.tick +%= 1;
         item.* = .{ .cache = self, .bytes = owned_bytes, .touched = self.tick, .protected = protected, .envelope = envelope };
         try self.entries.put(self.alloc, map_key, item);
-        if (envelope) |owner| _ = owner.refs.fetchAdd(1, .monotonic);
+        const charge = if (envelope) |owner| (if (owner.residents == 0) capacity else 0) else capacity;
+        if (envelope) |owner| {
+            owner.residents += 1;
+            _ = owner.refs.fetchAdd(1, .monotonic);
+        }
         admitted = true;
         self.stats.stored_bytes += charge;
         if (protected) self.stats.protected_stored_bytes += charge;
@@ -913,21 +923,46 @@ pub const Reader = struct {
         worker.context.cancellation = token;
         worker.base.cancellation = token;
         if (work.members.len != 0) {
-            const owner = try std.heap.page_allocator.create(Cache.Envelope);
-            const bytes = worker.base.parquetReader().readPlannedAlloc(std.heap.page_allocator, read) catch |err| {
-                std.heap.page_allocator.destroy(owner);
-                return err;
-            };
-            owner.* = .{ .bytes = bytes };
-            defer owner.release();
-            try worker.context.ensureActive();
-            self.cache.recordRead(false, bytes.len);
+            var missing: [8]ranges.RangeRead = undefined;
+            var count: usize = 0;
             for (work.members) |member| {
+                try worker.context.ensureActive();
                 const key = try worker.rangeKey(work.arena.allocator(), member);
-                const begin: usize = @intCast(member.range.offset - read.range.offset);
-                const slice = bytes[begin..][0..@intCast(member.range.len)];
-                if (self.cache.persistentCache()) |disk| _ = disk.enqueueWrite(key, slice);
-                self.cache.storeOwned(key, slice, owner) catch {};
+                if (self.cache.pin(key)) |lease| {
+                    lease.release();
+                    continue;
+                }
+                if (self.cache.persistentCache()) |disk| if (try disk.readAlloc(std.heap.page_allocator, key, member.range.len)) |bytes| {
+                    defer std.heap.page_allocator.free(bytes);
+                    try worker.context.ensureActive();
+                    self.cache.recordRead(true, bytes.len);
+                    self.cache.store(key, bytes) catch {};
+                    continue;
+                };
+                missing[count] = member;
+                count += 1;
+            }
+            // Cached members split remote envelopes. Never download a cached
+            // page merely to bridge two missing pages or overread a pruned gap.
+            const envelopes = try ranges.coalescePhysicalReadsAlloc(work.arena.allocator(), missing[0..count], .{ .max_range_bytes = 2 * 1024 * 1024 });
+            for (envelopes) |envelope| {
+                const owner = try std.heap.page_allocator.create(Cache.Envelope);
+                const bytes = worker.base.parquetReader().readPlannedAlloc(std.heap.page_allocator, envelope) catch |err| {
+                    std.heap.page_allocator.destroy(owner);
+                    return err;
+                };
+                owner.* = .{ .bytes = bytes };
+                defer owner.release();
+                try worker.context.ensureActive();
+                self.cache.recordRead(false, bytes.len);
+                for (missing[0..count]) |member| {
+                    if (member.range.offset < envelope.range.offset or member.range.end() > envelope.range.end()) continue;
+                    const key = try worker.rangeKey(work.arena.allocator(), member);
+                    const begin: usize = @intCast(member.range.offset - envelope.range.offset);
+                    const slice = bytes[begin..][0..@intCast(member.range.len)];
+                    if (self.cache.persistentCache()) |disk| _ = disk.enqueueWrite(key, slice);
+                    self.cache.storeOwned(key, slice, owner) catch {};
+                }
             }
             return;
         }
@@ -2023,4 +2058,103 @@ test "external lake prefetch coalesces adjacent pages with shared bounded lease 
     try std.testing.expectEqual(@as(usize, 2), provider.calls.load(.acquire));
     try std.testing.expectEqual(@as(usize, 0), cache.flights.count());
     try std.testing.expectEqual(@as(usize, 0), scheduler.bytes);
+}
+
+test "external lake coalesced prefetch reuses persisted page entries after restart" {
+    const storage = @import("../../storage/object_storage.zig");
+    const a = std.testing.allocator;
+    var io_impl = std.Io.Threaded.init(a, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/coalesced-cache", .{tmp.sub_path});
+    defer a.free(root);
+    var memory = storage.MemoryObjectStorage.init(a);
+    defer memory.deinit();
+    var client = memory.client();
+    try client.makeBucket("bucket");
+    var put = try client.putObject("bucket", "pages", "abcdefgh", .{});
+    defer put.deinit(a);
+    const Provider = struct {
+        base: storage.ObjectStorage,
+        calls: std.atomic.Value(usize) = .init(0),
+        vtable: storage.ObjectStorage.VTable,
+        fn get(raw: *anyopaque, alloc: Allocator, bucket: []const u8, key: []const u8, options: storage.GetOptions) !storage.GetResult {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            _ = self.calls.fetchAdd(1, .monotonic);
+            var base = self.base;
+            base.allocator = alloc;
+            return base.getObject(bucket, key, options);
+        }
+    };
+    var provider: Provider = .{ .base = client, .vtable = client.vtable.* };
+    provider.vtable.get_object = Provider.get;
+    const base = ObjectReader.init(.{ .allocator = a, .ptr = &provider, .vtable = &provider.vtable });
+    const object: ranges.ObjectRef = .{ .bucket = "bucket", .key = "pages", .byte_len = 8, .version = .{ .etag = put.etag.? } };
+    const reads = [_]ranges.RangeRead{
+        .{ .object = object, .range = .{ .offset = 0, .len = 4 }, .purpose = .parquet_column_chunk },
+        .{ .object = object, .range = .{ .offset = 4, .len = 4 }, .purpose = .parquet_column_chunk },
+    };
+    {
+        var cache = Cache.init(a);
+        defer cache.deinit();
+        try cache.ensurePersistent(io, root, .{}, .{});
+        var reader: Reader = .{ .cache = &cache, .base = base, .scope = @splat(1), .context = .{ .io = io } };
+        defer reader.drain(true);
+        try reader.prefetch(&reads);
+        reader.drain(false);
+        try std.testing.expectEqual(@as(usize, 1), provider.calls.load(.acquire));
+    }
+    {
+        var cache = Cache.init(a);
+        defer cache.deinit();
+        try cache.ensurePersistent(io, root, .{}, .{});
+        var reader: Reader = .{ .cache = &cache, .base = base, .scope = @splat(1), .context = .{ .io = io } };
+        defer reader.drain(true);
+        // Prove both exact credential/version-qualified pages exist on disk,
+        // without populating RAM or decoded cache residency.
+        for (reads) |read| {
+            const key = try reader.rangeKey(a, read);
+            defer a.free(key);
+            const disk = cache.persistentCache().?;
+            const bytes = (try disk.readAlloc(a, key, read.range.len)).?;
+            defer a.free(bytes);
+            try std.testing.expectEqual(@as(usize, 4), bytes.len);
+        }
+        const before = provider.calls.load(.acquire);
+        try reader.prefetch(&reads);
+        reader.drain(false);
+        const after = provider.calls.load(.acquire);
+        std.debug.print("persisted adjacent pages: extra provider GETs={d}\n", .{after - before});
+        try std.testing.expectEqual(before, after);
+    }
+}
+
+test "external lake shared envelope charges once across alias eviction and pinned pressure" {
+    const a = std.testing.allocator;
+    var cache = Cache.initWithMemoryLimit(a, 8);
+    defer cache.deinit();
+    const owner = try std.heap.page_allocator.create(Cache.Envelope);
+    owner.* = .{ .bytes = try std.heap.page_allocator.dupe(u8, "abcdefgh") };
+    defer owner.release();
+    try cache.storeOwned("one", owner.bytes[0..4], owner);
+    try cache.storeOwned("two", owner.bytes[4..8], owner);
+    try std.testing.expectEqual(@as(usize, 8), cache.snapshot().stored_bytes);
+    try std.testing.expectEqual(@as(usize, 2), cache.entries.count());
+    const pinned = cache.pin("two").?;
+    try cache.store("pressure", "12345678");
+    // Evicting one alias cannot refund the still-pinned backing buffer.
+    try std.testing.expectEqual(@as(usize, 8), cache.snapshot().stored_bytes);
+    try std.testing.expectEqualStrings("efgh", pinned.bytes);
+    try std.testing.expect(!cache.entries.contains("pressure"));
+    pinned.release();
+    try cache.store("pressure", "12345678");
+    try std.testing.expectEqual(@as(usize, 8), cache.snapshot().stored_bytes);
+    try std.testing.expectEqual(@as(usize, 1), cache.entries.count());
+    try std.testing.expectEqual(@as(usize, 0), owner.residents);
+    // Re-admission after the last alias was evicted charges the full owner.
+    try cache.storeOwned("again", owner.bytes[0..4], owner);
+    try std.testing.expectEqual(@as(usize, 8), cache.snapshot().stored_bytes);
+    try std.testing.expectEqual(@as(usize, 1), owner.residents);
 }

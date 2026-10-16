@@ -2241,7 +2241,13 @@ test "lake SQL paged publication scans retain one file and split independent ord
             // Allocation sweeps require deterministic planning. Exercise the
             // concurrent path above and below with independent task allocators.
             const original = source.scanner.shared_reader.?;
+            // Every injected-failure attempt starts from the same cache state.
+            // A previous failed attempt may otherwise warm decoded pages and
+            // reduce the allocation count of the next attempt.
+            var isolated = @import("../serverless/query/lake_serving_cache.zig").Cache.init(std.testing.allocator);
+            defer isolated.deinit();
             var reader = original.*;
+            reader.cache = &isolated;
             reader.context.io = null;
             source.scanner.shared_reader = &reader;
             defer source.scanner.shared_reader = original;

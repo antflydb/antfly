@@ -1188,8 +1188,11 @@ fn computedPhysicalScenario(a: std.mem.Allocator) !void {
     try std.testing.expectEqual(@as(i64, 3), physical.vector.values.i64[0]);
     try std.testing.expect(physical.vector.nulls.isNull(1));
     const masked = try outputs[0].?.mask(scratch.allocator(), &.{ 1, 3, 4 }, 6);
-    const native = (try masked.physicalColumn(scratch.allocator(), 0)).?;
+    try std.testing.expect(try masked.physicalColumn(scratch.allocator(), 0) == null);
+    const cohort = masked.reader.cohort.?;
+    const native = (try cohort.source.physicalColumn(scratch.allocator(), 0)).?;
     try native.validate();
+    try std.testing.expectEqualSlices(usize, &.{ 1, 3, 4 }, cohort.positions);
     for (0..6) |index| try std.testing.expectEqual(index != 1 and index != 4, (try masked.cell(a, index, 0)).sql_null);
     var state = @import("aggregate_state.zig").Column.init(.{ .kind = .sum, .input_type = .integer });
     defer state.clear(a);

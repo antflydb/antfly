@@ -1349,6 +1349,48 @@ fn Engine(comptime Context: type) type {
                 }
                 return values;
             }
+            // Keep primitive projections encoded across CTE/subquery boundaries.
+            // Errors decline to the scalar prefix path below so LIMIT and lazy
+            // per-row failures keep their existing delivery contract.
+            fn queryEncodedColumns(self: *Iterator, a: Allocator, context: @TypeOf(self.engine.context), query: anytype, bound: *const @import("execution_batch.zig").Batch, input: *const @import("execution_batch.zig").Batch, selected: []const usize) !?@import("execution_batch.zig").Batch {
+                const Batch = @import("execution_batch.zig").Batch;
+                const columns = try a.alloc(Batch, self.query_fields.?.len);
+                const names = try a.alloc([]const u8, context.binding.scalars.columns.len);
+                for (names, context.binding.scalars.columns) |*name, definition| name.* = definition.name;
+                const identity = try a.alloc(usize, selected.len);
+                for (identity, 0..) |*index, i| index.* = i;
+                const stable_bound = try a.create(Batch);
+                stable_bound.* = bound.*;
+                const page: @import("catalog.zig").ColumnPage = .{ .native = .{ .values = stable_bound, .names = names }, .selection = identity };
+                var programs: std.ArrayList(*const scalar.Program) = .empty;
+                var slots: std.ArrayList(usize) = .empty;
+                for (self.query_fields.?, 0..) |field, column| {
+                    if (column < context.binding.scalars.projections.len and context.binding.scalars.projections[column] != null) {
+                        try programs.append(a, &context.binding.scalars.projections[column].?);
+                        try slots.append(a, column);
+                    } else {
+                        const ordinal = for (query.source.columns, 0..) |source, index| {
+                            if (std.mem.eql(u8, source.internal, field)) break index;
+                        } else return error.InvalidSqlBackendResponse;
+                        const source = try a.create(Batch);
+                        source.* = try input.select(a, selected);
+                        columns[column] = try source.project(a, ordinal);
+                    }
+                }
+                const outputs = try @import("vector_eval.zig").evaluateColumnsEncodedMany(a, programs.items, page, context.binding.scalars.columns, context.parameters, context.backend.execution_io);
+                for (outputs, slots.items) |output, slot| columns[slot] = output orelse return null;
+                for (columns, context.binding.columns) |*column, definition| {
+                    const source = try a.create(Batch);
+                    source.* = column.*;
+                    const types = try a.alloc(scalar.Type, 1);
+                    types[0] = .{ .kind = definition.type, .element_type = definition.element_type, .numeric_modifier = definition.numeric_modifier };
+                    column.* = .{ .mapped = .{ .source = source, .ordinals = &.{0}, .types = types, .selection = identity } };
+                    if (try column.physicalColumn(a, 0) == null) {
+                        column.* = (try column.dictionaryColumn(a, 0)) orelse return null;
+                    }
+                }
+                return try Batch.combine(a, columns, selected.len);
+            }
             fn nextQueryBatch(self: *Iterator, _: Allocator, maximum: usize, query: @FieldType(@FieldType(binding.Node, "operation"), "query"), failure: ?*?anyerror) anyerror!@import("execution_batch.zig").Batch {
                 const Batch = @import("execution_batch.zig").Batch;
                 var context = self.engine.context;
@@ -1419,6 +1461,18 @@ fn Engine(comptime Context: type) type {
                         continue;
                     }
                     bound.mapped.selection = selected.items;
+                    const encoded = self.queryEncodedColumns(a, context, query, &bound, input, selected.items) catch |err| switch (err) {
+                        error.SqlDivisionByZero, error.SqlNumericOutOfRange, error.SqlTypeMismatch, error.InvalidSqlDateTime, error.SqlCardinalityViolation => null,
+                        else => return err,
+                    };
+                    if (encoded) |output| {
+                        if (selected.items.len == self.query_remaining) upstream_error = null;
+                        if (upstream_error) |err| {
+                            if (failure) |out| out.* = err else return err;
+                        }
+                        self.query_remaining -= selected.items.len;
+                        return output;
+                    }
                     const output_errors = try a.alloc(?anyerror, selected.items.len);
                     @memset(output_errors, null);
                     const columns = try a.alloc([]const Datum, self.query_fields.?.len);
@@ -2238,5 +2292,58 @@ test "external lake native NUMERIC scan declarations survive exact hash joins" {
         defer result.deinit();
         try std.testing.expectEqual(@as(usize, 2), result.output.rows.len);
         for (result.output.rows) |row| try std.testing.expectEqualStrings("9007199254740993", if (row[0] == .number_string) row[0].number_string else row[0].string);
+    }
+}
+
+fn derivedEncodedScenario(a: Allocator) !void {
+    var backend: SetTestBackend = .{};
+    var compiled = try @import("compiler.zig").compile(a, "SELECT x,y FROM (SELECT a+1 AS x,b*2 AS y FROM (VALUES(1,3),(2,4),(3,5)) t(a,b)) d", .{});
+    defer compiled.deinit();
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const bound = try @import("describe.zig").bind(alloc, backend.backend(), &compiled, &.{});
+    const context: @import("runtime.zig").Context = .{ .alloc = a, .arena = alloc, .backend = backend.backend(), .binding = bound, .parameters = &.{}, .limits = .{} };
+    const cursor = try openCursor(context);
+    defer cursor.close(cursor.ptr);
+    const next = cursor.next_columns.?;
+    for (0..3) |i| {
+        const page = try next(cursor.ptr, alloc, 1);
+        try std.testing.expectEqual(@as(usize, 1), page.selection.len);
+        const batch = page.native.?.values.*;
+        const x = (try batch.physicalColumn(alloc, 0)).?;
+        const y = (try batch.physicalColumn(alloc, 1)).?;
+        try std.testing.expectEqual(@as(i64, @intCast(i + 2)), (try x.cell(0)).value.integer);
+        try std.testing.expectEqual(@as(i64, @intCast(2 * (i + 3))), (try y.cell(0)).value.integer);
+    }
+    try std.testing.expectEqual(@as(usize, 0), (try next(cursor.ptr, alloc, 1)).selection.len);
+}
+test "SQL derived primitive projections retain native payloads across pulls and allocation failures" {
+    try derivedEncodedScenario(std.testing.allocator);
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, derivedEncodedScenario, .{});
+}
+
+test "SQL derived encoded projections preserve lazy errors limits and sparse aggregates" {
+    const cases = [_]struct { sql: []const u8, expected: []const u8 }{
+        .{ .sql = "SELECT v FROM (SELECT 10/x AS v FROM (VALUES(2),(0)) t(x)) d LIMIT 1", .expected = "[[5]]" },
+        .{ .sql = "SELECT x,y FROM (SELECT a+1 AS x,b*2 AS y FROM (VALUES(1,3),(2,4),(3,5)) t(a,b)) d WHERE x>2", .expected = "[[3,8],[4,10]]" },
+        .{ .sql = "SELECT SUM(v) FILTER (WHERE v>2),SUM(1/0) FILTER (WHERE false) FROM (SELECT x+1 AS v FROM (VALUES(1),(2),(3)) t(x)) d", .expected = "[[7,null]]" },
+    };
+    for (cases) |case| {
+        var backend: SetTestBackend = .{};
+        var compiled = try @import("compiler.zig").compile(std.testing.allocator, case.sql, .{});
+        defer compiled.deinit();
+        var result = try @import("runtime.zig").execute(std.testing.allocator, backend.backend(), &compiled, &.{}, .{ .native_result = true });
+        defer result.deinit();
+        var expected = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, case.expected, .{});
+        defer expected.deinit();
+        const rows = result.output.native_rows.?;
+        try std.testing.expectEqual(expected.value.array.items.len, rows.len);
+        for (expected.value.array.items, rows) |wanted, actual| {
+            try std.testing.expectEqual(wanted.array.items.len, actual.len);
+            for (wanted.array.items, actual) |value, cell| {
+                if (value == .null) try std.testing.expect(cell.sql_null) else try std.testing.expectEqualDeep(value, cell.value);
+            }
+        }
     }
 }

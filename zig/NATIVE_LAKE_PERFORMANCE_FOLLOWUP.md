@@ -5202,8 +5202,9 @@ decode numeric wire lanes once into bounded typed buffers, preserving borrowed
 text and dictionary entries. Complex values retain their exact fallback.
 
 Aggregate FILTER expressions form lazy cohorts. Only surviving physical lanes
-evaluate aggregate inputs, then a SQL-NULL mask maps typed results back into the
-parent batch. Keys resolve once, unrelated unfiltered inputs stay native, and
+evaluate aggregate inputs. Sparse cohort positions gather group IDs directly
+into bounded native updates; scalar fallback observes SQL NULL elsewhere.
+Keys resolve once, unrelated unfiltered inputs stay native, and
 filtered-out division/coercion errors remain unevaluated. Ordered and DISTINCT
 consumers receive the same logical rows and null semantics as before. Compact
 computed dictionary entries retain their existing encoded dictionary path.
@@ -5220,9 +5221,11 @@ gap and a 2 MiB envelope target. At most four columns plan the current page plus
 one adjacent indexed page each. Filtered/pruning consumers defer future payloads,
 pruned current pages are not prefetched, and decoded hits skip encoded fetches.
 Each exact page cache entry pins a slice of the shared immutable response; its
-cache key retains source version and credential scope. Admission conservatively
-charges the full envelope per alias so partial admission/eviction cannot hide
-retained bytes. No cache lock covers provider I/O. Member flights let required
+cache key retains source version and credential scope. Workers resolve exact
+persistent-cache entries before coalescing only missing adjacent ranges.
+Admission charges a shared envelope once until its last resident alias leaves;
+pinned aliases remain resident and charged. Alias metadata remains independently
+bounded by the entry limit. No cache lock covers disk or provider I/O. Member flights let required
 reads wait for an in-flight envelope, cancellation/close joins every owner, and
 shared admission can fall back to smaller individual page jobs. Dictionary and
 unindexed header discovery retain their bounded path. The real Parquet restart
@@ -5233,7 +5236,7 @@ Representative latency/RSS benchmarking and live cloud retention qualification
 remain deferred.
 
 
-Qualification after merging `origin/main` `ce578d9033` (2026-10-16): all 503
+Qualification at `512f16a3dd` after merging `origin/main` `ce578d9033` (2026-10-16): all 503
 full native lake tests (189 shared-engine and 314 server), 43 focused SQL
 tests, and 31 runtime ABI tests passed with zero native failures or leaks. All
 50 real Parquet/Iceberg E2Es passed against the final merged Debug CLI in
@@ -5243,3 +5246,39 @@ arrays, native parameter ownership, and leased array projections. Generated erro
 parity, Zig/Python formatting, Python lint, whitespace, license headers, and the
 Apache product boundary (2,073 source files) passed. The private error table
 includes the combined branch/main names; public runtime ABI values remain pinned.
+
+### Distinct admission and typed relational delivery
+
+Nested mapped, selected, projected and native-column views push their final
+selection to raw producers before each coercion. Excluded narrow-integer and
+REAL errors remain lazy; normalized readers may expose the existing physical
+callback, while coercing readers implement the selection-aware callback.
+
+A bounded group census admits newly discovered semantic keys rather than every
+input row. Page-local dictionary tuples memoize resolved representatives, with
+semantic hashing and exact equality across differing tuple identities. The
+census caps representatives at 4,096 and tuple storage at 1 MiB, then keeps the
+ordered spill/scalar fallback. Variable-width winners reserve maximum candidate
+size per group; exact NUMERIC, DISTINCT and pattern state retain their existing
+specialized paths. Group quotas and source ordinals remain unchanged.
+
+Derived primitive projections carry native or compact dictionary batches through
+CTE/subquery adapters. Projection programs retain bound-query ownership and
+borrowed columns remain valid until the next producer pull. Unsupported values
+and expression errors use the existing scalar prefix delivery, preserving lazy
+errors, LIMIT and exact typed arrays/numerics. Sparse FILTER cohorts share their
+selected positions instead of allocating parent-width scatter buffers for each
+aggregate. These improvements add no new SQL or cache configuration surface.
+
+Qualification of the distinct-admission and typed-delivery refinements
+(2026-10-16): all 505 full native lake tests (191 shared-engine and 314 server),
+54 focused SQL tests and 31 runtime ABI tests passed with zero native failures or
+leaks. All 50 real Parquet/Iceberg E2Es passed against the final Debug CLI in
+618.60 seconds. The expanded Parquet restart case covers derived native
+projections feeding grouped FILTER aggregates. Selection/coercion regression,
+persistent-tier prefetch, shared-buffer pin/eviction accounting, distinct-key
+admission under a small quota, and lazy/error-prefix/allocation-failure behavior
+are covered. Zig/Python formatting, Python lint, whitespace, licenses and the
+Apache product boundary (2,073 source files) passed. Current `origin/main`
+`ce578d9033` is included. Archive-scale latency/RSS benchmarking and live-provider
+retention qualification remain deferred.

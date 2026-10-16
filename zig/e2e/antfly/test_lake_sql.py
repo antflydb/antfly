@@ -5637,6 +5637,23 @@ def test_published_parquet_skewed_files_share_row_groups_and_stream_in_order(tmp
                 ]
                 for bucket in range(5)
             ]
+            # Derived expressions retain typed columns through the relation
+            # adapter; selected FILTER cohorts reach aggregate kernels directly.
+            derived = call(
+                "POST",
+                "/sql",
+                {
+                    "statement": "SELECT bucket, SUM(v) FILTER (WHERE v % 3 = 1), COUNT(*) FROM (SELECT amount % 5 AS bucket, amount + 1 AS v FROM skew_scan) d GROUP BY bucket ORDER BY bucket"
+                },
+            )
+            assert derived["rows"] == [
+                [
+                    str(bucket),
+                    str(sum(i + 1 for i in expected[bucket::5] if i % 3 == 0)),
+                    str(len(expected[bucket::5])),
+                ]
+                for bucket in range(5)
+            ], derived
             # Thousands of partial groups use hash-owned final reduction. The
             # final typed batches must preserve exact totals across cold starts.
             assert call(

@@ -148,7 +148,7 @@ pub const Batch = union(enum) {
     /// Stable retained columns; ownership belongs to the enclosing lease.
     retained: struct { store: *const @import("typed_store.zig").Store, begin: usize = 0, count: usize },
     /// Operator-specific column access without constructing a row matrix.
-    reader: struct { ptr: *anyopaque, read: *const fn (*anyopaque, A, usize, usize) anyerror!scalar.Datum, free_owned: ?*const fn (*anyopaque, A) void = null, read_physical: ?*const fn (*anyopaque, A, usize) anyerror!?PhysicalColumn = null, read_dictionary: ?*const fn (*anyopaque, A, usize) anyerror!?Batch = null, read_identity: ?*const fn (*anyopaque, usize, usize) anyerror!?u64 = null, count: usize, width: usize },
+    reader: struct { ptr: *anyopaque, read: *const fn (*anyopaque, A, usize, usize) anyerror!scalar.Datum, free_owned: ?*const fn (*anyopaque, A) void = null, read_physical: ?*const fn (*anyopaque, A, usize) anyerror!?PhysicalColumn = null, read_physical_selected: ?*const fn (*anyopaque, A, usize, ?[]const usize) anyerror!?PhysicalColumn = null, cohort: ?struct { source: *const Batch, positions: []const usize } = null, read_dictionary: ?*const fn (*anyopaque, A, usize) anyerror!?Batch = null, read_identity: ?*const fn (*anyopaque, usize, usize) anyerror!?u64 = null, count: usize, width: usize },
     columns: struct { page: @import("catalog.zig").ColumnPage, definitions: []const scalar.Column },
     rows: []const []const scalar.Datum,
     vectors: struct { values: []const []const scalar.Datum, count: usize },
@@ -178,15 +178,15 @@ pub const Batch = union(enum) {
     /// A single borrowed column retains physical dictionary identities.
     pub fn project(self: *const Batch, a: A, column: usize) !Batch {
         if (column >= self.width()) return error.InvalidSqlBackendResponse;
-        const physical = try self.physicalColumn(a, column);
-        if (physical == null) if (try self.dictionaryColumn(a, column)) |encoded| return encoded;
         const View = struct {
             source: *const Batch,
             column: usize,
-            physical: ?PhysicalColumn,
-            fn physicalView(raw: *anyopaque, _: A, _: usize) !?PhysicalColumn {
+            fn physicalView(raw: *anyopaque, alloc: A, _: usize) !?PhysicalColumn {
+                return physicalSelected(raw, alloc, 0, null);
+            }
+            fn physicalSelected(raw: *anyopaque, alloc: A, _: usize, selection: ?[]const usize) !?PhysicalColumn {
                 const view: *@This() = @ptrCast(@alignCast(raw));
-                return view.physical;
+                return view.source.physicalColumnSelected(alloc, view.column, selection);
             }
             fn read(raw: *anyopaque, alloc: A, row_index: usize, _: usize) !scalar.Datum {
                 const view: *@This() = @ptrCast(@alignCast(raw));
@@ -202,76 +202,103 @@ pub const Batch = union(enum) {
             }
         };
         const view = try a.create(View);
-        view.* = .{ .source = self, .column = column, .physical = physical };
-        return .{ .reader = .{ .ptr = view, .read = View.read, .read_physical = View.physicalView, .read_dictionary = View.dictionary, .read_identity = View.identity, .count = self.len(), .width = 1 } };
+        view.* = .{ .source = self, .column = column };
+        return .{ .reader = .{ .ptr = view, .read = View.read, .read_physical = View.physicalView, .read_physical_selected = View.physicalSelected, .read_dictionary = View.dictionary, .read_identity = View.identity, .count = self.len(), .width = 1 } };
     }
-    /// Scatter a lazily evaluated FILTER cohort back into its parent batch.
-    /// Missing lanes are SQL NULL and never touch excluded source payloads.
+    /// Keep FILTER cohorts sparse. Aggregate consumers gather group IDs for
+    /// accepted lanes directly; scalar fallback observes SQL NULL elsewhere.
     pub fn mask(self: *const Batch, a: A, positions: []const usize, count: usize) !Batch {
         if (positions.len != self.len() or self.width() != 1) return error.InvalidSqlBackendResponse;
+        for (positions, 0..) |position, i| if (position >= count or (i != 0 and position <= positions[i - 1])) return error.InvalidSqlBackendResponse;
         const View = struct {
             source: *const Batch,
-            indices: []usize,
+            positions: []const usize,
             fn read(raw: *anyopaque, alloc: A, row_index: usize, _: usize) !scalar.Datum {
                 const view: *@This() = @ptrCast(@alignCast(raw));
-                const index = view.indices[row_index];
-                return if (index == std.math.maxInt(usize)) .{} else view.source.cell(alloc, index, 0);
-            }
-            fn physical(raw: *anyopaque, alloc: A, _: usize) !?PhysicalColumn {
-                const view: *@This() = @ptrCast(@alignCast(raw));
-                const source = (try view.source.physicalColumn(alloc, 0)) orelse return null;
-                try source.validate();
-                const rows = try alloc.alloc(usize, view.indices.len);
-                const nulls = try alloc.alloc(u8, rows.len);
-                for (rows, nulls, view.indices, 0..) |*row_index, *flag, index, i| {
-                    row_index.* = i;
-                    flag.* = @intFromBool(index == std.math.maxInt(usize) or source.vector.nulls.isNull(source.selection[index]));
+                var lo: usize = 0;
+                var hi = view.positions.len;
+                while (lo < hi) {
+                    const mid = lo + (hi - lo) / 2;
+                    if (view.positions[mid] < row_index) lo = mid + 1 else hi = mid;
                 }
-                const values: @import("../storage/rowsource/types.zig").ColumnValues = switch (source.vector.values) {
-                    inline .i64, .f64, .bool, .bytes => |v, tag| blk: {
-                        const result = try alloc.alloc(@typeInfo(@TypeOf(v)).pointer.child, rows.len);
-                        for (result, nulls, view.indices) |*value, flag, index| value.* = if (flag != 0) std.mem.zeroes(@TypeOf(value.*)) else v[source.selection[index]];
-                        break :blk @unionInit(@import("../storage/rowsource/types.zig").ColumnValues, @tagName(tag), result);
-                    },
-                    inline .dictionary_i64, .dictionary_f64, .dictionary_bytes => |v, tag| blk: {
-                        const indices = try alloc.alloc(u32, rows.len);
-                        for (indices, nulls, view.indices) |*id, flag, index| id.* = if (flag != 0) 0 else v.indices[source.selection[index]];
-                        break :blk @unionInit(@import("../storage/rowsource/types.zig").ColumnValues, @tagName(tag), .{ .values = v.values, .indices = indices });
-                    },
-                    else => return null,
-                };
-                return .{ .vector = .{ .name = "", .values = values, .nulls = .{ .bytes = nulls } }, .selection = rows, .kind = source.kind, .element = source.element };
+                return if (lo < view.positions.len and view.positions[lo] == row_index) view.source.cell(alloc, lo, 0) else .{};
             }
         };
-        const indices = try a.alloc(usize, count);
-        @memset(indices, std.math.maxInt(usize));
-        for (positions, 0..) |position, index| {
-            if (position >= count or indices[position] != std.math.maxInt(usize)) return error.InvalidSqlBackendResponse;
-            indices[position] = index;
-        }
         const view = try a.create(View);
-        view.* = .{ .source = self, .indices = indices };
-        return .{ .reader = .{ .ptr = view, .read = View.read, .read_physical = View.physical, .count = count, .width = 1 } };
+        view.* = .{ .source = self, .positions = positions };
+        return .{ .reader = .{ .ptr = view, .read = View.read, .count = count, .width = 1, .cohort = .{ .source = self, .positions = positions } } };
+    }
+    /// Borrow independent expression columns without a Datum row matrix.
+    pub fn combine(a: A, columns: []const Batch, count: usize) !Batch {
+        for (columns) |column| if (column.width() != 1 or column.len() != count) return error.InvalidSqlBackendResponse;
+        const View = struct {
+            columns: []const Batch,
+            fn read(raw: *anyopaque, alloc: A, row_index: usize, column: usize) !scalar.Datum {
+                const view: *@This() = @ptrCast(@alignCast(raw));
+                return view.columns[column].cell(alloc, row_index, 0);
+            }
+            fn physical(raw: *anyopaque, alloc: A, column: usize, selection: ?[]const usize) !?PhysicalColumn {
+                const view: *@This() = @ptrCast(@alignCast(raw));
+                return view.columns[column].physicalColumnSelected(alloc, 0, selection);
+            }
+            fn dictionary(raw: *anyopaque, alloc: A, column: usize) !?Batch {
+                const view: *@This() = @ptrCast(@alignCast(raw));
+                return view.columns[column].dictionaryColumn(alloc, 0);
+            }
+            fn identity(raw: *anyopaque, row_index: usize, column: usize) !?u64 {
+                const view: *@This() = @ptrCast(@alignCast(raw));
+                return view.columns[column].dictionaryIdentity(row_index, 0);
+            }
+        };
+        const view = try a.create(View);
+        view.* = .{ .columns = columns };
+        return .{ .reader = .{ .ptr = view, .read = View.read, .read_physical_selected = View.physical, .read_dictionary = View.dictionary, .read_identity = View.identity, .width = columns.len, .count = count } };
+    }
+    fn selectedRows(a: A, rows: []const usize, selection: ?[]const usize) ![]const usize {
+        const indices = selection orelse return rows;
+        const selected = try a.alloc(usize, indices.len);
+        errdefer a.free(selected);
+        for (indices, selected) |index, *row_index| {
+            if (index >= rows.len) return error.InvalidSqlBackendResponse;
+            row_index.* = rows[index];
+        }
+        return selected;
     }
     pub fn physicalColumn(self: Batch, a: A, column: usize) anyerror!?PhysicalColumn {
+        return self.physicalColumnSelected(a, column, null);
+    }
+    /// Push outer selections to the producer before any intermediate coercion.
+    /// A reader exposing only read_physical promises already normalized values;
+    /// coercing readers must implement read_physical_selected instead.
+    pub fn physicalColumnSelected(self: Batch, a: A, column: usize, selection: ?[]const usize) anyerror!?PhysicalColumn {
         if (column >= self.width()) return error.InvalidSqlBackendResponse;
-        // Empty derived producers may retain schema names without physical
-        // columns. There is no payload to borrow or normalize at EOF.
-        if (self.len() == 0) return null;
+        if (selection) |indices| for (indices) |index| {
+            if (index >= self.len()) return error.InvalidSqlBackendResponse;
+        };
+        if (self.len() == 0 or (selection != null and selection.?.len == 0)) return null;
         return switch (self) {
-            .reader => |v| if (v.read_physical) |read| try read(v.ptr, a, column) else null,
-            .retained => |v| try v.store.physicalColumn(a, column, v.begin, v.count),
+            .reader => |v| blk: {
+                if (v.read_physical_selected) |read| break :blk try read(v.ptr, a, column, selection);
+                const source = if (v.read_physical) |read| (try read(v.ptr, a, column)) orelse break :blk null else break :blk null;
+                break :blk if (selection) |indices| try source.select(a, indices) else source;
+            },
+            .retained => |v| blk: {
+                const source = (try v.store.physicalColumn(a, column, v.begin, v.count)) orelse break :blk null;
+                break :blk if (selection) |indices| try source.select(a, indices) else source;
+            },
             .mapped => |v| blk: {
                 if (v.ordinals[column] == std.math.maxInt(usize) or column >= v.types.len) break :blk null;
-                const source = (try v.source.physicalColumn(a, v.ordinals[column])) orelse break :blk null;
-                break :blk try (try source.select(a, v.selection)).coerce(a, v.types[column].kind orelse return null, v.types[column].element_type);
+                const selected = try selectedRows(a, v.selection, selection);
+                const source = (try v.source.physicalColumnSelected(a, v.ordinals[column], selected)) orelse break :blk null;
+                break :blk try source.coerce(a, v.types[column].kind orelse return null, v.types[column].element_type);
             },
             .columns => |v| blk: {
                 const definition = v.definitions[column];
+                const selected = try selectedRows(a, v.page.selection, selection);
                 if (v.page.native) |native| {
                     for (native.names, 0..) |name, ordinal| if (std.mem.eql(u8, name, definition.name)) {
-                        const source = (try native.values.physicalColumn(a, ordinal)) orelse break :blk null;
-                        break :blk try (try source.select(a, v.page.selection)).coerce(a, definition.type, definition.element_type);
+                        const source = (try native.values.physicalColumnSelected(a, ordinal, selected)) orelse break :blk null;
+                        break :blk try source.coerce(a, definition.type, definition.element_type);
                     };
                     break :blk null;
                 }
@@ -285,7 +312,7 @@ pub const Batch = union(enum) {
                     else => false,
                 };
                 if (!compatible) break :blk null;
-                break :blk try (PhysicalColumn{ .vector = vector, .selection = v.page.selection, .kind = definition.type, .element = definition.element_type }).coerce(a, definition.type, definition.element_type);
+                break :blk try (PhysicalColumn{ .vector = vector, .selection = selected, .kind = definition.type, .element = definition.element_type }).coerce(a, definition.type, definition.element_type);
             },
             else => null,
         };
@@ -360,9 +387,11 @@ pub const Batch = union(enum) {
                 return view.source.cell(alloc, view.selection[row_index], column);
             }
             fn physical(raw: *anyopaque, alloc: A, column: usize) !?PhysicalColumn {
+                return physicalSelected(raw, alloc, column, null);
+            }
+            fn physicalSelected(raw: *anyopaque, alloc: A, column: usize, outer_selection: ?[]const usize) !?PhysicalColumn {
                 const view: *@This() = @ptrCast(@alignCast(raw));
-                const source = (try view.source.physicalColumn(alloc, column)) orelse return null;
-                return try source.select(alloc, view.selection);
+                return view.source.physicalColumnSelected(alloc, column, try selectedRows(alloc, view.selection, outer_selection));
             }
             fn dictionary(raw: *anyopaque, alloc: A, column: usize) !?Batch {
                 const view: *@This() = @ptrCast(@alignCast(raw));
@@ -395,7 +424,7 @@ pub const Batch = union(enum) {
         for (selection) |index| if (index >= self.len()) return error.InvalidSqlBackendResponse;
         const view = try a.create(View);
         view.* = .{ .source = self, .selection = selection };
-        return .{ .reader = .{ .ptr = view, .count = selection.len, .width = self.width(), .read = View.read, .read_physical = View.physical, .read_dictionary = View.dictionary, .read_identity = View.identity } };
+        return .{ .reader = .{ .ptr = view, .count = selection.len, .width = self.width(), .read = View.read, .read_physical = View.physical, .read_physical_selected = View.physicalSelected, .read_dictionary = View.dictionary, .read_identity = View.identity } };
     }
     pub fn cell(self: Batch, a: A, index: usize, column: usize) anyerror!scalar.Datum {
         if (index >= self.len() or column >= self.width()) return error.InvalidSqlBackendResponse;
@@ -555,4 +584,26 @@ test "SQL physical narrow widths preserve selected coercion and REAL rounding" {
     var underflow = numbers;
     underflow.selection = &.{1};
     try std.testing.expectError(error.SqlNumericOutOfRange, underflow.coerce(ca, .number, .float32));
+}
+
+test "SQL physical views compose selections before coercion" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const definitions = [_]scalar.Column{.{ .name = "n", .type = .integer, .element_type = .int16 }};
+    const source: Batch = .{ .columns = .{ .definitions = &definitions, .page = .{
+        .batch = .{ .snapshot = .{ .table_id = "t", .snapshot_id = "s" }, .row_refs = &.{ .{ .relational_key = "a" }, .{ .relational_key = "b" } }, .columns = &.{.{ .name = "n", .values = .{ .i64 = &.{ 1, 32768 } } }} },
+        .selection = &.{ 0, 1 },
+    } } };
+    const views = [_]Batch{
+        .{ .mapped = .{ .source = &source, .ordinals = &.{0}, .types = &.{.{ .kind = .integer, .element_type = .int16 }}, .selection = &.{0} } },
+        try source.select(a, &.{0}),
+        .{ .columns = .{ .definitions = &definitions, .page = .{ .native = .{ .values = &source, .names = &.{"n"} }, .selection = &.{0} } } },
+    };
+    for (views) |view| {
+        try std.testing.expectEqual(@as(i64, 1), (try view.cell(a, 0, 0)).value.integer);
+        const physical = (try view.physicalColumn(a, 0)).?;
+        try physical.validate();
+        try std.testing.expectEqual(@as(i64, 1), (try physical.cell(0)).value.integer);
+    }
 }
