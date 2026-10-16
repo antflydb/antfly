@@ -9927,3 +9927,47 @@ Formatting, licensing, Apache-boundary and original-inventory audits pass.
 The positive expression-index lifecycle gate remains unfinished and must not be
 represented as green. No original dispositions change; unrelated work remains
 unstaged and no changes have been pushed.
+
+### Bound key language and immutable operator preparation
+
+Index-key lowering can now consume a selected instruction of an already-bound
+scalar program. It preserves the authoritative implicit casts and builtin
+domains instead of rebinding source SQL under a different expected type.
+Canonical names come from the caller's verified ordinal/type layout; this
+helper does not grant alias, table or schema authority. Topological instruction
+suffixes beyond the selected root are excluded from key-preparation budgets.
+Unrelated stable calls, parameters and deferred arithmetic errors are not
+demanded. Reachable parameters or mutable operations cannot become stored keys.
+
+Shared schema-expression preparation also constructs immutable operator
+parents directly over arena-owned children, copying only argument vectors and
+owned headers. It no longer serializes and reparses those complete child trees
+for each ordinary operator. Literal packets retain their owning conversion
+because they can borrow a program or temporary constant-folding region.
+Argument nodes are immutable after publication into a parent; wire serialization
+still emits the same tree. No schema/storage format or capability activation
+changes. The ownership regression closes the borrowed program before checking
+the retained JSONB literal and its exact `1.2300e2` token; physical
+canonicalization and JSONB display formatting are not conflated with ownership.
+
+The full Debug gate passes 1,108 tests with four existing opt-in skips, zero
+failures/leaks and 21/21 build steps in
+`/private/tmp/antfly-sql-bound-index-key-operator-full-debug.log`. It covers
+qualified names, bounds/type mismatches, comparison-domain casts, deferred
+errors, allocation faults, immutable planning and existing SQL execution.
+Mounted generated/default CREATE, exact Raft transport, publication/recovery,
+index nonadmission and cache gates pass all 60 selected tests with no skips,
+failures or leaks and 96/96 steps in
+`/private/tmp/antfly-sql-bound-index-key-mounted-debug.log`.
+
+The component benchmark verifies byte-identical serialization. Over 16 operator
+constructions, copied children allocate 552,516 bytes in 47 backing allocations;
+shared children allocate 335,296 bytes in 32 (about 39% and 32% less).
+The separate bound-versus-rebound key comparison saves only about 1.5% of
+allocated bytes for this small expression and uses the same backing-allocation
+count. Debug elapsed times do not establish a speedup, and neither benchmark
+includes ranking, I/O or end-to-end query execution. Broader indexed-read
+activation still requires retained typed key descriptors, predicate implication,
+prepared probe operands, coordinated snapshots/range proofs and a shared
+EXPLAIN/execution access plan. Raft index publication remains unfinished.
+No additional original cases are qualified: 531 implemented / 810 unresolved.

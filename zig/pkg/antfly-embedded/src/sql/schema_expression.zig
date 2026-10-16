@@ -66,6 +66,25 @@ fn promoteNumeric(alloc: std.mem.Allocator, value: Json, source: scalar.Type, ta
 }
 
 fn json(alloc: std.mem.Allocator, input: anytype) !Json {
+    // Operator arguments already belong to this preparation arena and become
+    // immutable once published into their parent. Copy the argument vector,
+    // not the complete child trees through a serialize/parse round trip.
+    // Literal payloads still take the owning path below; they may borrow a
+    // bound program or temporary constant-folding region.
+    if (comptime @hasField(@TypeOf(input), "op") and @hasField(@TypeOf(input), "args") and @typeInfo(@TypeOf(input)).@"struct".field_names.len == 2) {
+        var object: std.json.ObjectMap = .empty;
+        try object.ensureTotalCapacity(alloc, 2);
+        var args = std.json.Array.init(alloc);
+        try args.appendSlice(input.args);
+        inline for (@typeInfo(@TypeOf(input)).@"struct".field_names) |name| {
+            const value: Json = if (comptime std.mem.eql(u8, name, "op"))
+                .{ .string = try alloc.dupe(u8, input.op) }
+            else
+                .{ .array = args };
+            object.putAssumeCapacityNoClobber(try alloc.dupe(u8, name), value);
+        }
+        return .{ .object = object };
+    }
     return std.json.parseFromSliceLeaky(Json, alloc, try std.json.Stringify.valueAlloc(alloc, input, .{}), .{ .parse_numbers = false });
 }
 
@@ -143,7 +162,27 @@ fn lowerColumnsPolicy(alloc: std.mem.Allocator, columns: []const scalar.Column, 
     var program = try scalar.bindExpected(alloc, expression, columns, &.{}, expected, .{});
     defer program.deinit();
     if (program.parameter_types.len != 0) return error.InvalidSqlParameters;
-    var plan: ?@import("immutable_plan.zig") = if (immutable != null) try .initWithLimits(alloc, &program, limits) else null;
+    return lowerProgramPolicy(alloc, &program, columns, immutable, limits);
+}
+
+/// Lower a bound SQL subtree into the stored-index key language.
+/// Preserve its implicit casts and builtin domains; do not rebind
+/// source SQL or evaluate unrelated predicate operands. The caller supplies
+/// the same ordinal/type layout, with canonical column names if aliases were
+/// bound. The borrowed program and its preparation caches are never mutated.
+pub fn lowerIndexInstruction(alloc: std.mem.Allocator, program: *const scalar.Program, root: u32, columns: []const scalar.Column, limits: @import("immutable_plan.zig").Limits) !Lowered {
+    if (root >= program.instructions.len) return error.InvalidSqlProgram;
+    var selected = program.*;
+    selected.root = root;
+    // Bound instructions are topological. No dependency can occur after the
+    // selected root; unrelated predicate suffixes must not consume key budget.
+    selected.instructions = program.instructions[0 .. @as(usize, root) + 1];
+    selected.output_type = program.instructions[root].type;
+    return lowerProgramPolicy(alloc, &selected, columns, .index_key, limits);
+}
+
+fn lowerProgramPolicy(alloc: std.mem.Allocator, program: *const scalar.Program, columns: []const scalar.Column, immutable: ?ImmutableContext, limits: @import("immutable_plan.zig").Limits) !Lowered {
+    var plan: ?@import("immutable_plan.zig") = if (immutable != null) try .initWithLimits(alloc, program, limits) else null;
     defer if (plan) |*value| value.deinit();
     if (plan) |*value| if (value.nodes[program.root].volatility != .immutable) return switch (immutable.?) {
         .generation => error.SqlMutableGenerationExpression,
@@ -189,7 +228,11 @@ fn lowerColumnsPolicy(alloc: std.mem.Allocator, columns: []const scalar.Column, 
                 try json(alloc, .{ .op = "literal", .type = nativeType(kind, instruction.type.element_type), .sql_type = @tagName(instruction.type.element_type.?), .value = literal })
             else
                 try json(alloc, .{ .op = "literal", .type = nativeType(kind, instruction.type.element_type), .value = literal }),
-            .column => |ordinal| try promoteNumeric(alloc, try json(alloc, .{ .op = "column", .column = columns[ordinal].name }), .{ .kind = columns[ordinal].type, .element_type = columns[ordinal].element_type }, instruction.type),
+            .column => |ordinal| blk: {
+                if (ordinal >= columns.len or instruction.type.kind != columns[ordinal].type) return error.InvalidSqlProgram;
+                if (columns[ordinal].element_type) |identity| if (instruction.type.element_type != identity) return error.InvalidSqlProgram;
+                break :blk try promoteNumeric(alloc, try json(alloc, .{ .op = "column", .column = columns[ordinal].name }), .{ .kind = columns[ordinal].type, .element_type = columns[ordinal].element_type }, instruction.type);
+            },
             .parameter => return error.InvalidSqlParameters,
             .unary => |part| blk: {
                 if (part.op == .positive) break :blk values[part.operand];
@@ -405,6 +448,179 @@ fn lowerColumnsPolicy(alloc: std.mem.Allocator, columns: []const scalar.Column, 
         };
     }
     return .{ .expression = values[program.root], .type = program.output_type.kind orelse return error.SqlTypeMismatch, .element_type = program.output_type.element_type };
+}
+
+test "SQL index key lowering reuses bound instructions without demanding unrelated predicates" {
+    const compiler = @import("compiler.zig");
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const canonical = [_]scalar.Column{.{ .name = "email", .type = .string, .element_type = .text }};
+    for ([_][]const u8{
+        "lower(email)=$1 AND concat(email,$1)='x'",
+        "lower(email)=$1 AND 1/0=0",
+        "lower(q.email)=$1 AND 1/0=0",
+    }, 0..) |statement, position| {
+        var parsed = try compiler.compileScalar(a, statement, .{});
+        defer parsed.deinit();
+        var binding_columns = canonical;
+        if (position == 2) binding_columns[0].name = "q\x00email";
+        var program = try scalar.bindExpected(a, parsed.expression, &binding_columns, &.{.string}, .boolean, .{});
+        defer program.deinit();
+        const original_root = program.root;
+        const original_type = program.output_type;
+        const comparison = program.instructions[program.instructions[program.root].operation.binary.left].operation.binary;
+        const key = try lowerIndexInstruction(arena.allocator(), &program, comparison.left, &canonical, .{});
+        _ = try lowerIndexInstruction(arena.allocator(), &program, comparison.left, &canonical, .{ .nodes = @as(usize, comparison.left) + 1 });
+        const encoded = try std.json.Stringify.valueAlloc(arena.allocator(), key.expression, .{});
+        try std.testing.expectEqualStrings(
+            \\{"op":"lower_ascii","args":[{"op":"column","column":"email"}]}
+        , encoded);
+        try std.testing.expectEqual(ast.ColumnType.string, key.type);
+        try std.testing.expectEqual(@as(?@import("array_value.zig").ElementType, .text), key.element_type);
+        try std.testing.expectEqual(original_root, program.root);
+        try std.testing.expectEqualDeep(original_type, program.output_type);
+        try std.testing.expectError(error.InvalidSqlProgram, lowerIndexInstruction(arena.allocator(), &program, std.math.maxInt(u32), &canonical, .{}));
+        try std.testing.expectError(error.InvalidSqlProgram, lowerIndexInstruction(arena.allocator(), &program, comparison.left, &.{}, .{}));
+        try std.testing.expectError(error.InvalidSqlProgram, lowerIndexInstruction(arena.allocator(), &program, comparison.left, &.{.{ .name = "email", .type = .integer, .element_type = .int64 }}, .{}));
+        for (program.instructions, 0..) |instruction, index| if (instruction.operation == .parameter) {
+            try std.testing.expectError(error.InvalidSqlParameters, lowerIndexInstruction(arena.allocator(), &program, @intCast(index), &canonical, .{}));
+        };
+        if (position == 0) {
+            const stable = program.instructions[program.instructions[program.root].operation.binary.right].operation.binary.left;
+            try std.testing.expectError(error.SqlMutableIndexExpression, lowerIndexInstruction(arena.allocator(), &program, stable, &canonical, .{}));
+        }
+    }
+}
+
+test "SQL index key lowering preserves comparison coercions instead of matching a narrower domain" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const columns = [_]scalar.Column{.{ .name = "amount", .type = .number, .element_type = .numeric }};
+    var parsed = try @import("compiler.zig").compileScalar(a, "amount=CAST(1 AS DOUBLE PRECISION)", .{});
+    defer parsed.deinit();
+    var program = try scalar.bindExpected(a, parsed.expression, &columns, &.{}, .boolean, .{});
+    defer program.deinit();
+    const root = program.instructions[program.root].operation.binary.left;
+    const key = try lowerIndexInstruction(arena.allocator(), &program, root, &columns, .{});
+    try std.testing.expectEqual(@as(?@import("array_value.zig").ElementType, .float64), key.element_type);
+    try std.testing.expectEqualStrings("cast", key.expression.object.get("op").?.string);
+    try std.testing.expectEqualStrings("float64", key.expression.object.get("sql_type").?.string);
+    try std.testing.expectEqualStrings("amount", key.expression.object.get("args").?.array.items[0].object.get("column").?.string);
+}
+
+test "SQL index key lowering unwinds allocation failure without owning the borrowed program" {
+    const a = std.testing.allocator;
+    var parsed = try @import("compiler.zig").compileScalar(a, "replace(lower(email),'x','y')=$1", .{});
+    defer parsed.deinit();
+    const columns = [_]scalar.Column{.{ .name = "email", .type = .string, .element_type = .text }};
+    var program = try scalar.bindExpected(a, parsed.expression, &columns, &.{.string}, .boolean, .{});
+    defer program.deinit();
+    const original_root = program.root;
+    const original_type = program.output_type;
+    const T = struct {
+        fn run(alloc: std.mem.Allocator, borrowed: *const scalar.Program, layout: []const scalar.Column) !void {
+            var arena = std.heap.ArenaAllocator.init(alloc);
+            defer arena.deinit();
+            const root = borrowed.instructions[borrowed.root].operation.binary.left;
+            const key = try lowerIndexInstruction(arena.allocator(), borrowed, root, layout, .{});
+            try std.testing.expectEqualStrings("replace", key.expression.object.get("op").?.string);
+        }
+    };
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(a, T.run, .{ &program, &columns });
+    try std.testing.expectEqual(original_root, program.root);
+    try std.testing.expectEqualDeep(original_type, program.output_type);
+    try T.run(a, &program, &columns);
+}
+
+test "SQL index key lowering owns literal packets after the borrowed program closes" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const result = blk: {
+        var parsed = try @import("compiler.zig").compileScalar(a,
+            \\jsonb_extract_path_text(coalesce(metadata,'{"source":1.2300e2}'::jsonb),'source')=$1
+        , .{});
+        defer parsed.deinit();
+        const columns = [_]scalar.Column{.{ .name = "metadata", .type = .json, .element_type = .jsonb }};
+        var program = try scalar.bindExpected(a, parsed.expression, &columns, &.{.string}, .boolean, .{});
+        defer program.deinit();
+        break :blk try lowerIndexInstruction(arena.allocator(), &program, program.instructions[program.root].operation.binary.left, &columns, .{});
+    };
+    try std.testing.expectEqualStrings("jsonb_extract_path_text", result.expression.object.get("op").?.string);
+    const fallback = result.expression.object.get("args").?.array.items[0].object.get("args").?.array.items[1];
+    try std.testing.expectEqualStrings("literal", fallback.object.get("op").?.string);
+    // Preserve the owned logical token. Physical canonicalization and JSONB
+    // display formatting are separate boundaries, not an ownership repair.
+    try std.testing.expectEqualStrings("1.2300e2", fallback.object.get("value").?.object.get("source").?.number_string);
+    const encoded = try std.json.Stringify.valueAlloc(arena.allocator(), result.expression, .{});
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "1.2300e2") != null);
+}
+
+test "SQL index key lowering benchmark bounds candidate rebinding overhead" {
+    const a = std.testing.allocator;
+    const columns = [_]scalar.Column{.{ .name = "email", .type = .string, .element_type = .text }};
+    var key_ast = try @import("compiler.zig").compileScalar(a, "replace(lower(email),'old','new')", .{});
+    defer key_ast.deinit();
+    var predicate = try @import("compiler.zig").compileScalar(a, "replace(lower(email),'old','new')=$1", .{});
+    defer predicate.deinit();
+    var program = try scalar.bindExpected(a, predicate.expression, &columns, &.{.string}, .boolean, .{});
+    defer program.deinit();
+    const root = program.instructions[program.root].operation.binary.left;
+    const Stats = struct { allocations: usize, bytes: usize, elapsed_ns: i96 };
+    var stats: [2]Stats = undefined;
+    for (&stats, 0..) |*result, mode| {
+        var tracked = std.testing.FailingAllocator.init(a, .{});
+        const started = std.Io.Clock.now(.awake, std.testing.io).nanoseconds;
+        for (0..16) |_| {
+            var arena = std.heap.ArenaAllocator.init(tracked.allocator());
+            defer arena.deinit();
+            const key = if (mode == 0)
+                try lowerColumnsPolicy(arena.allocator(), &columns, key_ast.expression, null, .index_key, .{})
+            else
+                try lowerIndexInstruction(arena.allocator(), &program, root, &columns, .{});
+            try std.testing.expectEqualStrings("replace", key.expression.object.get("op").?.string);
+        }
+        result.* = .{ .allocations = tracked.allocations, .bytes = tracked.allocated_bytes, .elapsed_ns = std.Io.Clock.now(.awake, std.testing.io).nanoseconds - started };
+        try std.testing.expectEqual(tracked.allocated_bytes, tracked.freed_bytes);
+        std.debug.print("SQL index key preparation: reuse_bound={} keys=16 allocations={} allocated_bytes={} elapsed_ns={}\n", .{ mode != 0, result.allocations, result.bytes, result.elapsed_ns });
+    }
+    try std.testing.expect(stats[1].allocations <= stats[0].allocations);
+    try std.testing.expect(stats[1].bytes < stats[0].bytes);
+}
+
+test "SQL index key lowering benchmark shares immutable operator children without copying trees" {
+    const a = std.testing.allocator;
+    var expected: ?[]u8 = null;
+    defer if (expected) |bytes| a.free(bytes);
+    var allocated: [2]usize = undefined;
+    for (&allocated, 0..) |*bytes, mode| {
+        var tracked = std.testing.FailingAllocator.init(a, .{});
+        const started = std.Io.Clock.now(.awake, std.testing.io).nanoseconds;
+        for (0..16) |_| {
+            var arena = std.heap.ArenaAllocator.init(tracked.allocator());
+            defer arena.deinit();
+            const owned = arena.allocator();
+            var child = try json(owned, .{ .op = "column", .column = "email" });
+            for (0..6) |_| child = try json(owned, .{ .op = "lower_ascii", .args = &[_]Json{child} });
+            const input = .{ .op = "replace", .args = &[_]Json{
+                child,
+                try json(owned, .{ .op = "literal", .type = "string", .value = "old" }),
+                try json(owned, .{ .op = "literal", .type = "string", .value = "new" }),
+            } };
+            const parent = if (mode == 0)
+                try std.json.parseFromSliceLeaky(Json, owned, try std.json.Stringify.valueAlloc(owned, input, .{}), .{ .parse_numbers = false })
+            else
+                try json(owned, input);
+            const encoded = try std.json.Stringify.valueAlloc(owned, parent, .{});
+            if (expected) |value| try std.testing.expectEqualStrings(value, encoded) else expected = try a.dupe(u8, encoded);
+        }
+        bytes.* = tracked.allocated_bytes;
+        try std.testing.expectEqual(tracked.allocated_bytes, tracked.freed_bytes);
+        std.debug.print("SQL index operator construction: share_children={} operators=16 allocations={} allocated_bytes={} elapsed_ns={}\n", .{ mode != 0, tracked.allocations, bytes.*, std.Io.Clock.now(.awake, std.testing.io).nanoseconds - started });
+    }
+    try std.testing.expect(allocated[1] < allocated[0]);
 }
 
 /// DEFAULT retains arithmetic failures until write time. Stored generation
