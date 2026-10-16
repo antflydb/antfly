@@ -100,11 +100,75 @@ pub const Read = struct {
     graph: cypher.catalog.Graph,
     owners: []const *DB,
     leases: []DB.CypherReadLease,
-    snapshot: ?*cypher.snapshot.Materialized = null,
-    adapter: DB.CypherBackend = undefined,
     tables: []DB.CypherBackend.Table,
     root_lease: *DB.CypherReadLease,
     schemas: []const u32,
+    pinned: []PinnedDB = &.{},
+    pin_arena: ?std.heap.ArenaAllocator = null,
+    pinned_adapter: PinnedAdapter = undefined,
+    const PinnedDB = DB.CypherPinnedDatabase;
+    const PinnedAdapter = cypher.native.Adapter(PinnedDB, void, DB.CypherEdgeScanCursor);
+    pub fn pin(self: *Read, a: A, owners: []const *DB, fences: []const DB.StatementReadFence) !void {
+        self.pin_arena = std.heap.ArenaAllocator.init(a);
+        errdefer {
+            self.pin_arena.?.deinit();
+            self.pin_arena = null;
+        }
+        const owned = self.pin_arena.?.allocator();
+        const now = @import("antfly_platform").time.realtimeNs();
+        const pinned = try owned.alloc(PinnedDB, owners.len);
+        var initialized: usize = 0;
+        errdefer for (pinned[0..initialized]) |*entry| entry.cut.deinit();
+        for (owners, fences) |owner, *fence| {
+            const table = for (self.graph.labels) |label| {
+                if ((try @import("tables.zig").get(self.handle, label.table)) == owner) break label.table;
+            } else continue;
+            const entry = &pinned[initialized];
+            entry.* = .{ .source = owner, .core = owner.core, .cut = try owner.captureCypherPinnedSnapshot(owned, fence, self.graph, table) };
+            entry.cut.now = now;
+            initialized += 1;
+        }
+        for (self.graph.labels, self.tables) |label, *table| table.* = .{ .name = label.table, .db = try @import("tables.zig").get(self.handle, label.table) };
+        const tables = try owned.alloc(PinnedAdapter.Table, self.graph.labels.len);
+        for (self.graph.labels, tables) |label, *table| {
+            const source = try @import("tables.zig").get(self.handle, label.table);
+            const owner = for (pinned[0..initialized]) |*entry| {
+                if (entry.source == source) break entry;
+            } else return error.CatalogGenerationChanged;
+            table.* = .{ .name = label.table, .storage_name = try @import("tables.zig").storageName(self.handle, label.table), .db = owner };
+        }
+        self.pinned_adapter = .{ .tables = tables, .ttl_now_ns = now, .authority = .{ .ptr = self, .bind = bind, .checkpoint = checkpoint, .project = project, .project_relationship = projectRelationship } };
+        self.pinned = pinned[0..initialized];
+    }
+    pub fn unpin(self: *Read) void {
+        for (self.pinned) |*entry| entry.cut.deinit();
+        self.pinned = &.{};
+        if (self.pin_arena) |*arena| arena.deinit();
+        self.pin_arena = null;
+    }
+    pub fn pinnedBackend(self: *Read) cypher.backend.Backend {
+        return .{ .ptr = self, .vtable = &.{ .bind = pinnedBind, .checkpoint = checkpoint, .scan = pinnedScan, .get = pinnedGet, .expand = pinnedExpand, .set_work = pinnedWork, .normalize_node = normalize, .document_relationships = documentRelationships } };
+    }
+    fn pinnedBind(ptr: *anyopaque, a: A, graph: cypher.catalog.Graph) !void {
+        const backend = cast(ptr).pinned_adapter.backend();
+        try backend.vtable.bind(backend.ptr, a, graph);
+    }
+    fn pinnedWork(ptr: *anyopaque, work: ?cypher.backend.Work) void {
+        const backend = cast(ptr).pinned_adapter.backend();
+        backend.vtable.set_work.?(backend.ptr, work);
+    }
+    fn pinnedScan(ptr: *anyopaque, a: A, table: []const u8, after: ?[]const u8, limit: usize) !cypher.backend.Page(*const cypher.value.Node) {
+        const backend = cast(ptr).pinned_adapter.backend();
+        return backend.vtable.scan(backend.ptr, a, table, after, limit);
+    }
+    fn pinnedGet(ptr: *anyopaque, a: A, identity: cypher.value.Identity) !?*const cypher.value.Node {
+        const backend = cast(ptr).pinned_adapter.backend();
+        return backend.vtable.get(backend.ptr, a, identity);
+    }
+    fn pinnedExpand(ptr: *anyopaque, a: A, mapping: cypher.catalog.Relationship, identity: cypher.value.Identity, direction: cypher.ast.Direction, after: ?[]const u8, limit: usize) !cypher.backend.Page(*const cypher.value.Relationship) {
+        const backend = cast(ptr).pinned_adapter.backend();
+        return backend.vtable.expand(backend.ptr, a, mapping, identity, direction, after, limit);
+    }
     fn cast(ptr: *anyopaque) *Read {
         return @ptrCast(@alignCast(ptr));
     }
@@ -128,19 +192,6 @@ pub const Read = struct {
     pub fn validate(self: *Read) !void {
         try catalog.validateOwners(self.handle.alloc, self.handle, self.graph);
         try checkpoint(self);
-    }
-    pub fn materialize(self: *Read, backing: A, owners: []const *DB, fences: []const DB.StatementReadFence, limits: cypher.runtime.Limits) !void {
-        for (self.graph.labels, self.tables) |label, *table| {
-            const db = try @import("tables.zig").get(self.handle, label.table);
-            const index = for (owners, 0..) |owner, i| {
-                if (owner == db) break i;
-            } else return error.CatalogGenerationChanged;
-            if (index >= fences.len or fences[index].source != db) return error.CypherSnapshotRequired;
-            table.* = .{ .name = label.table, .storage_name = try @import("tables.zig").storageName(self.handle, label.table), .db = db, .capture_fence = &fences[index] };
-        }
-        self.adapter = .{ .tables = self.tables, .ttl_now_ns = @import("antfly_platform").time.realtimeNs(), .authority = .{ .ptr = self, .bind = Read.bind, .checkpoint = Read.checkpoint, .project = Read.project, .project_relationship = Read.projectRelationship } };
-        self.snapshot = try cypher.snapshot.Materialized.create(backing, self.adapter.backend(), self.graph, limits);
-        self.snapshot.?.postimages = .{ .ptr = self, .normalize = Read.normalize, .relationships = Read.documentRelationships };
     }
     fn normalize(ptr: *anyopaque, a: A, node: *const cypher.value.Node, defaults: bool) !*const cypher.value.Node {
         const self = cast(ptr);
@@ -232,8 +283,8 @@ pub fn execute(handle: *h.Handle, name: []const u8, json: []const u8, out: *h.ca
         if (std.Io.Clock.awake.now(io).nanoseconds >= deadline.nanoseconds) return error.CypherSnapshotNotReady;
         try io.sleep(.fromMilliseconds(1), .awake);
     }
-    try read.materialize(handle.alloc, owners.items, fences, request.limits);
-    defer read.snapshot.?.deinit();
+    try read.pin(a, owners.items, fences);
+    defer read.unpin();
     const guard_type = @import("sql_commit.zig").GraphGuard;
     const guards = try a.alloc(guard_type, if (writes) owners.items.len else 0);
     for (owners.items[0..guards.len], guards, schemas[0..guards.len]) |db, *guard, version| {
@@ -247,9 +298,9 @@ pub fn execute(handle: *h.Handle, name: []const u8, json: []const u8, out: *h.ca
     for (fences[0..held]) |*fence| fence.release();
     held = 0;
     var writer: @import("cypher_write.zig").Writer = .{ .read = &read, .guards = guards, .scope = scope, .request_id = request.write_request_id };
-    var overlay: cypher.transaction.Overlay = .{ .base = read.snapshot.?.backend(), .host = writer.host(), .max_entities = request.limits.intermediate_states, .max_anchors = request.limits.scanned_anchors, .max_edges = request.limits.explored_edges };
+    var overlay: cypher.transaction.Overlay = .{ .lazy = true, .retain_scan_preimages = true, .base = read.pinnedBackend(), .host = writer.host(), .max_entities = request.limits.intermediate_states, .max_anchors = request.limits.scanned_anchors, .max_edges = request.limits.explored_edges };
     writer.overlay = &overlay;
-    var result = try cypher.runtime.execute(handle.alloc, if (writes) overlay.backend() else read.snapshot.?.backend(), graph, &compiled, request.parameters, read.snapshot.?.remainingLimits(request.limits));
+    var result = try cypher.runtime.execute(handle.alloc, if (writes) overlay.backend() else read.pinnedBackend(), graph, &compiled, request.parameters, request.limits);
     defer result.deinit();
     if (writes) {
         var response = try std.json.parseFromSliceLeaky(std.json.Value, a, try std.json.Stringify.valueAlloc(a, result, .{}), .{});

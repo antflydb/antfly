@@ -97,7 +97,7 @@ pub const ReadSet = struct {
         self.* = undefined;
     }
     pub fn backend(self: *ReadSet) b.Backend {
-        return .{ .ptr = self, .vtable = &.{ .bind = bind, .checkpoint = checkpoint, .scan = scan, .get = get, .expand = expand, .search = search, .set_work = setWork } };
+        return .{ .ptr = self, .vtable = &.{ .bind = bind, .checkpoint = checkpoint, .scan = scan, .get = get, .get_many = getMany, .expand = expand, .search = search, .set_work = setWork } };
     }
     fn setWork(ptr: *anyopaque, work: ?b.Work) void {
         for (cast(ptr).snapshots) |snapshot| if (snapshot.backend.vtable.set_work) |configure| configure(snapshot.backend.ptr, work);
@@ -158,6 +158,35 @@ pub const ReadSet = struct {
                 if (result != null) return error.CypherOverlappingOwners;
                 result = node;
             }
+        }
+        try checkpoint(ptr);
+        return result;
+    }
+    fn getMany(ptr: *anyopaque, a: A, identities: []const v.Identity) ![]const ?*const v.Node {
+        const self = cast(ptr);
+        if (identities.len > 128) return error.CypherOwnerBudgetExceeded;
+        try checkpoint(ptr);
+        const result = try a.alloc(?*const v.Node, identities.len);
+        @memset(result, null);
+        for (self.targets, self.snapshots) |target, snapshot| {
+            var selected: std.ArrayList(v.Identity) = .empty;
+            var positions: std.ArrayList(usize) = .empty;
+            for (identities, 0..) |identity, index| if (std.mem.eql(u8, target.table, identity.table)) {
+                try selected.append(a, identity);
+                try positions.append(a, index);
+            };
+            if (selected.items.len == 0) continue;
+            const owner = snapshot.backend;
+            const nodes = if (owner.vtable.get_many) |batch| try batch(owner.ptr, a, selected.items) else blk: {
+                const fetched = try a.alloc(?*const v.Node, selected.items.len);
+                for (selected.items, fetched) |identity, *node| node.* = try owner.vtable.get(owner.ptr, a, identity);
+                break :blk fetched;
+            };
+            if (nodes.len != positions.items.len) return error.CypherInvalidBackendPage;
+            for (nodes, positions.items) |node, index| if (node) |value| {
+                if (result[index] != null) return error.CypherOverlappingOwners;
+                result[index] = value;
+            };
         }
         try checkpoint(ptr);
         return result;

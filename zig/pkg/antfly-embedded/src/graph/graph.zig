@@ -1421,6 +1421,14 @@ pub const GraphIndex = struct {
             self.reads.deinit();
             self.* = undefined;
         }
+        pub fn fork(self: *@This()) !@This() {
+            var result = self.*;
+            result.reads = .{};
+            errdefer result.deinit();
+            if (self.reads.outgoing) |*read| result.reads.outgoing = try read.forkRead();
+            if (self.reads.incoming) |*read| result.reads.incoming = try read.forkRead();
+            return result;
+        }
         pub fn getPage(self: *@This(), alloc: Allocator, key: []const u8, edge_types: []const []const u8, cursor: ?EdgeScanCursor, limits: EdgePageLimits, now_ns: u64, scanned_out: ?*usize) !EdgePage {
             return self.index.getEdgesByTypesPageInRead(alloc, key, edge_types, self.direction, cursor, limits, now_ns, scanned_out, &self.reads, true);
         }
@@ -8579,6 +8587,12 @@ pub const GraphIndex = struct {
         if (limits.max_owned_bytes == 0) return error.GraphExploredEdgeBytesBudgetExceeded;
         var context = try self.beginEdgeReadContextWithProof(direction);
         defer context.deinit();
+        return self.getCypherEdgesByTypesPageInRead(a, key, edge_types, direction, scan_cursor, limits, now_ns, &context);
+    }
+    /// Read every assertion page from the same captured ownership pair.
+    pub fn getCypherEdgesByTypesPageInRead(self: *GraphIndex, a: Allocator, key: []const u8, edge_types: []const []const u8, direction: EdgeDirection, scan_cursor: ?CypherEdgeScanCursor, limits: EdgePageLimits, now_ns: u64, context: *EdgeReadContext) !CypherEdgePage {
+        if (limits.max_edges == 0 or limits.max_scanned_rows == 0) return error.GraphExploredEdgesBudgetExceeded;
+        if (limits.max_owned_bytes == 0) return error.GraphExploredEdgeBytesBudgetExceeded;
         if (scan_cursor) |input| if (input.physical) |cursor| if (cursor.read_generation != null) try context.validateContinuation(cursor);
         var scratch = std.heap.ArenaAllocator.init(a);
         defer scratch.deinit();

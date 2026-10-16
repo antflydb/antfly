@@ -52,6 +52,7 @@ const Cursor = struct {
     root_lease: DB.CypherReadLease,
     child: catalog.Cursor = undefined,
     overlay: cypher.transaction.Overlay = undefined,
+    stage_arena: std.heap.ArenaAllocator,
     fn next(ptr: *anyopaque, a: A, limit: u32) !catalog.Page {
         const self: *Cursor = @ptrCast(@alignCast(ptr));
         try self.read.validate();
@@ -63,7 +64,8 @@ const Cursor = struct {
     fn close(ptr: *anyopaque) void {
         const self: *Cursor = @ptrCast(@alignCast(ptr));
         self.child.close(self.child.ptr);
-        self.read.snapshot.?.deinit();
+        self.stage_arena.deinit();
+        self.read.unpin();
         for (self.read.leases) |*lease| lease.release();
         self.root_lease.release();
         self.a.free(self.read.owners);
@@ -98,15 +100,16 @@ pub fn open(adapter: anytype, a: A, binding: catalog.graph_relation.Binding, req
     }
     const tables = try a.alloc(DB.CypherBackend.Table, binding.graph.labels.len);
     errdefer a.free(tables);
-    self.* = .{ .a = a, .root_lease = try handle.db.acquireCypherReadAuthority(a, "", "default"), .read = undefined };
+    self.* = .{ .a = a, .root_lease = try handle.db.acquireCypherReadAuthority(a, "", "default"), .read = undefined, .stage_arena = std.heap.ArenaAllocator.init(a) };
     errdefer self.root_lease.release();
+    errdefer self.stage_arena.deinit();
     self.read = .{ .handle = handle, .graph = binding.graph, .owners = saved_owners, .leases = leases, .tables = tables, .schemas = schemas, .root_lease = &self.root_lease };
-    try self.read.materialize(a, owners, fences, .{});
-    errdefer self.read.snapshot.?.deinit();
-    var provider = self.read.snapshot.?.backend();
+    try self.read.pin(a, owners, fences);
+    errdefer self.read.unpin();
+    var provider = self.read.pinnedBackend();
     if (adapter.transaction) |session| if (session.active) {
-        const stage_allocator = self.read.snapshot.?.arena.allocator();
-        self.overlay = .{ .base = provider, .host = .{ .ptr = self, .new_identity = unavailableIdentity, .commit = unavailableCommit } };
+        const stage_allocator = self.stage_arena.allocator();
+        self.overlay = .{ .lazy = true, .base = provider, .host = .{ .ptr = self, .new_identity = unavailableIdentity, .commit = unavailableCommit } };
         const staged = self.overlay.backend();
         try staged.vtable.bind(staged.ptr, stage_allocator, binding.graph);
         try staged.vtable.begin.?(staged.ptr);
@@ -140,6 +143,6 @@ pub fn open(adapter: anytype, a: A, binding: catalog.graph_relation.Binding, req
         if (index == 0 or index > adapter.graph_parameters.len) return error.InvalidSqlParameters;
         parameter.* = .{ .name = name, .value = try cypher.value.Value.fromJson(temporary.allocator(), adapter.graph_parameters[index - 1]) };
     }
-    self.child = try catalog.graph_relation.Cursor.open(a, binding, provider, parameters, request, self.read.snapshot.?.remainingLimits(.{}));
+    self.child = try catalog.graph_relation.Cursor.open(a, binding, provider, parameters, request, .{});
     return .{ .ptr = self, .next = Cursor.next, .close = Cursor.close, .estimated_rows = self.child.estimated_rows };
 }

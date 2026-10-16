@@ -23,11 +23,12 @@ const ast = @import("ast.zig");
 const catalog = @import("catalog.zig");
 const A = std.mem.Allocator;
 pub const Request = struct {
-    operation: enum { validate, scan, get, expand, search, observe, observe_ranges, normalize, project },
+    operation: enum { validate, scan, get, get_many, expand, search, observe, observe_ranges, normalize, project },
     graph_incarnation: u64,
     graph_revision: u64,
     table: []const u8 = "",
     identity: ?v.Identity = null,
+    identities: []const v.Identity = &.{},
     relationship: []const u8 = "",
     direction: ast.Direction = .out,
     after: ?[]const u8 = null,
@@ -52,7 +53,7 @@ pub const Client = struct {
     allowed_versions: []const Version = &.{},
     work: ?b.Work = null,
     pub fn backend(self: *Client) b.Backend {
-        return .{ .ptr = self, .vtable = &.{ .bind = bind, .checkpoint = checkpoint, .scan = scan, .get = get, .expand = expand, .search = search, .normalize_node = normalizeNode, .project_postimage = projectPostimage, .document_relationships = documentRelationships, .set_work = setWork } };
+        return .{ .ptr = self, .vtable = &.{ .bind = bind, .checkpoint = checkpoint, .scan = scan, .get = get, .get_many = getMany, .expand = expand, .search = search, .normalize_node = normalizeNode, .project_postimage = projectPostimage, .document_relationships = documentRelationships, .set_work = setWork } };
     }
     fn setWork(ptr: *anyopaque, work: ?b.Work) void {
         cast(ptr).work = work;
@@ -143,6 +144,23 @@ pub const Client = struct {
         if (value != .node or !value.node.identity.eql(identity)) return error.CypherInvalidBackendPage;
         return value.node;
     }
+    fn getMany(ptr: *anyopaque, a: A, identities: []const v.Identity) ![]const ?*const v.Node {
+        if (identities.len > 128) return error.CypherOwnerBudgetExceeded;
+        const self = cast(ptr);
+        const reply = try self.invoke(a, .{ .operation = .get_many, .graph_incarnation = self.incarnation, .graph_revision = self.revision, .identities = identities });
+        if (reply.values.len != identities.len) return error.CypherInvalidBackendPage;
+        const nodes = try a.alloc(?*const v.Node, identities.len);
+        for (reply.values, identities, nodes) |input, identity, *out| {
+            const value = try wire.transport(a, input);
+            if (value == .null) {
+                out.* = null;
+                continue;
+            }
+            if (value != .node or !value.node.identity.eql(identity)) return error.CypherInvalidBackendPage;
+            out.* = value.node;
+        }
+        return nodes;
+    }
     fn search(ptr: *anyopaque, a: A, table: []const u8, input: b.SearchInput) !b.SearchPage {
         const self = cast(ptr);
         const request = input.parameters;
@@ -220,6 +238,19 @@ pub const Owner = struct {
                 const identity = request.identity orelse return error.InvalidCypherWireValue;
                 if (!self.permitsTable(identity.table)) return error.Forbidden;
                 if (try self.backend.vtable.get(self.backend.ptr, scratch, identity)) |node| try values.append(scratch, .{ .value = .{ .node = node } });
+            },
+            .get_many => {
+                if (request.identities.len > 128) return error.CypherOwnerBudgetExceeded;
+                for (request.identities) |identity| if (!self.permitsTable(identity.table)) return error.Forbidden;
+                if (self.backend.vtable.get_many) |get_many| {
+                    const nodes = try get_many(self.backend.ptr, scratch, request.identities);
+                    if (nodes.len != request.identities.len) return error.CypherInvalidBackendPage;
+                    for (nodes) |node| try values.append(scratch, .{ .value = if (node) |item| .{ .node = item } else .null });
+                } else for (request.identities) |identity| {
+                    try meter.work().charge(meter.work().ptr, 1);
+                    const node = try self.backend.vtable.get(self.backend.ptr, scratch, identity);
+                    try values.append(scratch, .{ .value = if (node) |item| .{ .node = item } else .null });
+                }
             },
             .expand => {
                 const mapping = self.graph.relationship(request.relationship) orelse return error.UndefinedGraphRelationship;

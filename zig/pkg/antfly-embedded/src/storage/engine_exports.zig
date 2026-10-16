@@ -111,6 +111,19 @@ fn cypherFieldDerivedEdgeType(self: *const DB, index_name: []const u8, edge_type
     return .{ .value = self.cypherFieldDerivedEdgeType(index_name, edge_type) };
 }
 
+fn captureCypherPinnedSnapshot(self: *DB, alloc: Allocator, fence: *const DB.StatementReadFence, graph: @import("cypher").catalog.Graph, table: []const u8) engine.Outcome(DB.CypherPinnedSnapshot) {
+    return .{ .value = self.captureCypherPinnedSnapshot(alloc, fence, graph, table) catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
+fn scanCypherPinnedSnapshot(self: *DB, alloc: Allocator, cut: *DB.CypherPinnedSnapshot, from: []const u8, to: []const u8, opts: types.ScanOptions) engine.Outcome(types.ScanResult) {
+    return .{ .value = self.scanCypherPinnedSnapshot(alloc, cut, from, to, opts) catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
+fn graphEdgesForCypherPinnedSnapshot(self: *DB, alloc: Allocator, cut: *DB.CypherPinnedSnapshot, index: []const u8, key: []const u8, edge_types: []const []const u8, direction: graph_mod.EdgeDirection, cursor: ?graph_mod.CypherEdgeScanCursor, limits: graph_mod.EdgePageLimits) engine.Outcome(graph_mod.CypherEdgePage) {
+    return .{ .value = self.graphEdgesForCypherPinnedSnapshot(alloc, cut, index, key, edge_types, direction, cursor, limits) catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
+fn cypherPinnedSnapshotDeinit(cut: *DB.CypherPinnedSnapshot) engine.Outcome(void) {
+    cut.deinit();
+    return .{ .value = {} };
+}
 fn cypherGraphIndexIdentity(self: *const DB, alloc: Allocator, index_name: []const u8) engine.Outcome(?@import("cypher").catalog.IndexIdentity) {
     return .{ .value = self.cypherGraphIndexIdentity(alloc, index_name) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }

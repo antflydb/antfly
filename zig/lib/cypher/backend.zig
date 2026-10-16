@@ -17,6 +17,20 @@ const std = @import("std");
 const catalog = @import("catalog.zig");
 const v = @import("value.zig");
 const ast = @import("ast.zig");
+/// Temporary owner decoding shares quota/failure wrappers but can release its
+/// pages even when the execution allocator is a retaining arena.
+pub fn reclaimingAllocator(input: std.mem.Allocator) std.mem.Allocator {
+    var probe = std.heap.ArenaAllocator.init(input);
+    var current = input;
+    for (0..16) |_| {
+        if (current.vtable != probe.allocator().vtable) break;
+        const arena: *std.heap.ArenaAllocator = @ptrCast(@alignCast(current.ptr));
+        const next = arena.child_allocator;
+        if (next.ptr == current.ptr and next.vtable == current.vtable) break;
+        current = next;
+    }
+    return current;
+}
 pub fn Page(comptime T: type) type {
     return struct { items: []const T, next: ?[]const u8 = null, examined: ?usize = null };
 }
@@ -106,6 +120,9 @@ pub const Backend = struct {
         /// Authorized document lookup also serves nonvertex producers. The runtime
         /// applies graph membership before admitting traversal endpoints.
         get: *const fn (*anyopaque, std.mem.Allocator, v.Identity) anyerror!?*const v.Node,
+        /// Aligned, authorized lookups within the same retained cut. Calls are
+        /// bounded to 128 identities; null entries preserve hidden/missing rows.
+        get_many: ?*const fn (*anyopaque, std.mem.Allocator, []const v.Identity) anyerror![]const ?*const v.Node = null,
         /// Resolve the current statement postimage of a retained relationship
         /// alias. Mutable adapters provide this even without read projection.
         get_relationship: ?*const fn (*anyopaque, std.mem.Allocator, v.RelationshipIdentity) anyerror!?*const v.Relationship = null,

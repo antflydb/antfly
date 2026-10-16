@@ -148,14 +148,17 @@ pub fn Adapter(comptime DB: type, comptime GraphIndex: type, comptime EdgeScanCu
         }
         fn scan(ptr: *anyopaque, a: A, table: []const u8, cursor: ?[]const u8, limit: usize) !b.Page(*const v.Node) {
             const self = cast(ptr);
+            var scratch = std.heap.ArenaAllocator.init(b.reclaimingAllocator(a));
+            defer scratch.deinit();
+            const temporary = scratch.allocator();
             try checkpoint(ptr);
             const db = try self.selected(table);
-            const authorization = try self.readAuthorization(a, table);
+            const authorization = try self.readAuthorization(temporary, table);
             var found = if (comptime @hasDecl(DB, "cypherDocumentScanOptions"))
-                try db.scan(a, cursor orelse "", "", try db.cypherDocumentScanOptions(a, .{ .execution_deadline_ns = authorization.deadline_ns, .row_policy_principal_proof = authorization.proof, .row_policy_database = authorization.database, .inclusive_from = cursor == null, .include_documents = true, .limit = std.math.cast(u32, limit) orelse return error.InvalidArgument }))
+                try db.scan(temporary, cursor orelse "", "", try db.cypherDocumentScanOptions(temporary, .{ .execution_deadline_ns = authorization.deadline_ns, .row_policy_principal_proof = authorization.proof, .row_policy_database = authorization.database, .inclusive_from = cursor == null, .include_documents = true, .limit = std.math.cast(u32, limit) orelse return error.InvalidArgument }))
             else
-                try db.scan(a, cursor orelse "", "", .{ .execution_deadline_ns = authorization.deadline_ns, .row_policy_principal_proof = authorization.proof, .row_policy_database = authorization.database, .inclusive_from = cursor == null, .include_documents = true, .limit = std.math.cast(u32, limit) orelse return error.InvalidArgument });
-            defer found.deinit(a);
+                try db.scan(temporary, cursor orelse "", "", .{ .execution_deadline_ns = authorization.deadline_ns, .row_policy_principal_proof = authorization.proof, .row_policy_database = authorization.database, .inclusive_from = cursor == null, .include_documents = true, .limit = std.math.cast(u32, limit) orelse return error.InvalidArgument });
+            defer found.deinit(temporary);
             var nodes: std.ArrayList(*const v.Node) = .empty;
             for (found.documents) |document| if (try self.node(a, table, document.id, document.json)) |authorized| if (authorized.labels.len != 0) try nodes.append(a, authorized);
             const next = if (found.documents.len == limit) try a.dupe(u8, found.documents[found.documents.len - 1].id) else null;
@@ -164,14 +167,17 @@ pub fn Adapter(comptime DB: type, comptime GraphIndex: type, comptime EdgeScanCu
         }
         fn get(ptr: *anyopaque, a: A, identity: v.Identity) !?*const v.Node {
             const self = cast(ptr);
+            var scratch = std.heap.ArenaAllocator.init(b.reclaimingAllocator(a));
+            defer scratch.deinit();
+            const temporary = scratch.allocator();
             if (comptime @hasDecl(DB, "cypherDocumentKeyAllowed")) {
                 if (!DB.cypherDocumentKeyAllowed(identity.key)) return null;
             }
             try checkpoint(ptr);
             const db = try self.selected(identity.table);
-            const authorization = try self.readAuthorization(a, identity.table);
-            var document = (try db.getDocument(a, identity.key, .{ .row_policy_principal_proof = authorization.proof, .row_policy_database = authorization.database, .execution_deadline_ns = authorization.deadline_ns })) orelse return null;
-            defer document.deinit(a);
+            const authorization = try self.readAuthorization(temporary, identity.table);
+            var document = (try db.getDocument(temporary, identity.key, .{ .row_policy_principal_proof = authorization.proof, .row_policy_database = authorization.database, .execution_deadline_ns = authorization.deadline_ns })) orelse return null;
+            defer document.deinit(temporary);
             const result = try self.node(a, identity.table, identity.key, document.json);
             try checkpoint(ptr);
             return result;
@@ -182,6 +188,9 @@ pub fn Adapter(comptime DB: type, comptime GraphIndex: type, comptime EdgeScanCu
         }
         fn expand(ptr: *anyopaque, a: A, mapping: root.catalog.Relationship, identity: v.Identity, direction: root.ast.Direction, encoded: ?[]const u8, limit: usize) !b.Page(*const v.Relationship) {
             const self = cast(ptr);
+            var scratch = std.heap.ArenaAllocator.init(b.reclaimingAllocator(a));
+            defer scratch.deinit();
+            const temporary = scratch.allocator();
             try checkpoint(ptr);
             const graph = self.graph.?;
             const source_table = graph.label(mapping.source_label).?.table;
@@ -193,21 +202,21 @@ pub fn Adapter(comptime DB: type, comptime GraphIndex: type, comptime EdgeScanCu
             const outgoing_possible = direction != .in and std.mem.eql(u8, identity.table, source_table);
             if ((position.incoming and !incoming_possible) or (!position.incoming and !outgoing_possible)) return .{ .items = &.{} };
             const db = try self.selected(source_table);
-            const authorization = try self.readAuthorization(a, source_table);
+            const authorization = try self.readAuthorization(temporary, source_table);
             var page = captured: {
                 if (comptime @hasDecl(DB, "graphEdgesForCypherCapturePageAuthorizedAt")) {
                     for (self.tables) |table| if (table.db == db and std.mem.eql(u8, table.name, source_table)) {
-                        if (table.capture_fence) |fence| break :captured try db.graphEdgesForCypherCapturePageAuthorizedAt(fence, a, mapping.index, identity.key, &.{mapping.stored_type}, if (position.incoming) .in else .out, position.cursor, .{ .max_edges = limit, .max_owned_bytes = 4 << 20, .max_scanned_rows = 4096 }, self.ttl_now_ns, authorization.proof, authorization.database);
+                        if (table.capture_fence) |fence| break :captured try db.graphEdgesForCypherCapturePageAuthorizedAt(fence, temporary, mapping.index, identity.key, &.{mapping.stored_type}, if (position.incoming) .in else .out, position.cursor, .{ .max_edges = limit, .max_owned_bytes = 4 << 20, .max_scanned_rows = 4096 }, self.ttl_now_ns, authorization.proof, authorization.database);
                     };
                 }
                 break :captured if (comptime @hasDecl(DB, "graphEdgesForCypherPageAuthorizedAt"))
-                    try db.graphEdgesForCypherPageAuthorizedAt(a, mapping.index, identity.key, &.{mapping.stored_type}, if (position.incoming) .in else .out, position.cursor, .{ .max_edges = limit, .max_owned_bytes = 4 << 20, .max_scanned_rows = 4096 }, self.ttl_now_ns, authorization.proof, authorization.database)
+                    try db.graphEdgesForCypherPageAuthorizedAt(temporary, mapping.index, identity.key, &.{mapping.stored_type}, if (position.incoming) .in else .out, position.cursor, .{ .max_edges = limit, .max_owned_bytes = 4 << 20, .max_scanned_rows = 4096 }, self.ttl_now_ns, authorization.proof, authorization.database)
                 else blk: {
                     if (authorization.proof.len != 0) return error.CypherRowPolicyUnsupported;
-                    break :blk try db.graphEdgesForCypherPageAt(a, mapping.index, identity.key, &.{mapping.stored_type}, if (position.incoming) .in else .out, position.cursor, .{ .max_edges = limit, .max_owned_bytes = 4 << 20, .max_scanned_rows = 4096 }, self.ttl_now_ns);
+                    break :blk try db.graphEdgesForCypherPageAt(temporary, mapping.index, identity.key, &.{mapping.stored_type}, if (position.incoming) .in else .out, position.cursor, .{ .max_edges = limit, .max_owned_bytes = 4 << 20, .max_scanned_rows = 4096 }, self.ttl_now_ns);
                 };
             };
-            defer page.deinit(a);
+            defer page.deinit(temporary);
             var result: std.ArrayList(*const v.Relationship) = .empty;
             for (page.edges) |edge| {
                 const metadata = if (edge.metadata.len == 0) std.json.Value{ .object = .empty } else try std.json.parseFromSliceLeaky(std.json.Value, a, edge.metadata, .{ .parse_numbers = false });

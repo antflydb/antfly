@@ -14,7 +14,7 @@
 // limitations under the License.
 
 //! Portable single-source graph host used by the public Zig and WASM API.
-//! It shares catalog, materialization, mutation planning, schema normalization,
+//! It shares catalog, pinned storage cuts, mutation planning, schema normalization,
 //! native intents, and durable receipts with the native deployment.
 const std = @import("std");
 const cypher = @import("cypher");
@@ -43,18 +43,42 @@ pub fn Host(comptime DB: type) type {
             defer lease.release();
             return graph_catalog.execute(self, result_allocator, body);
         }
+        const PinnedAdapter = cypher.native.Adapter(DB.CypherPinnedDatabase, void, DB.CypherEdgeScanCursor);
         const Statement = struct {
             host: Self,
             graph: cypher.catalog.Graph,
             lease: DB.CypherReadLease,
             schema_version: u32,
             scope: *Scope,
-            snapshot: ?*cypher.snapshot.Materialized = null,
-            adapter: DB.CypherBackend = undefined,
-            tables: []DB.CypherBackend.Table,
+            pinned: DB.CypherPinnedDatabase = undefined,
+            adapter: PinnedAdapter = undefined,
+            tables: []PinnedAdapter.Table,
             overlay: ?*cypher.transaction.Overlay = null,
             proofs: []const tracking.Proof = &.{},
             next_entity: u64 = 0,
+            pub fn pinnedBackend(self: *Statement) cypher.backend.Backend {
+                return .{ .ptr = self, .vtable = &.{ .bind = pinnedBind, .checkpoint = checkpoint, .scan = pinnedScan, .get = pinnedGet, .expand = pinnedExpand, .set_work = pinnedWork, .normalize_node = normalize, .document_relationships = documentRelationships } };
+            }
+            fn pinnedBind(ptr: *anyopaque, a: A, graph: cypher.catalog.Graph) !void {
+                const backend = cast(ptr).adapter.backend();
+                try backend.vtable.bind(backend.ptr, a, graph);
+            }
+            fn pinnedWork(ptr: *anyopaque, work: ?cypher.backend.Work) void {
+                const backend = cast(ptr).adapter.backend();
+                backend.vtable.set_work.?(backend.ptr, work);
+            }
+            fn pinnedScan(ptr: *anyopaque, a: A, table: []const u8, after: ?[]const u8, limit: usize) !cypher.backend.Page(*const cypher.value.Node) {
+                const backend = cast(ptr).adapter.backend();
+                return backend.vtable.scan(backend.ptr, a, table, after, limit);
+            }
+            fn pinnedGet(ptr: *anyopaque, a: A, identity: cypher.value.Identity) !?*const cypher.value.Node {
+                const backend = cast(ptr).adapter.backend();
+                return backend.vtable.get(backend.ptr, a, identity);
+            }
+            fn pinnedExpand(ptr: *anyopaque, a: A, mapping: cypher.catalog.Relationship, identity: cypher.value.Identity, direction: cypher.ast.Direction, after: ?[]const u8, limit: usize) !cypher.backend.Page(*const cypher.value.Relationship) {
+                const backend = cast(ptr).adapter.backend();
+                return backend.vtable.expand(backend.ptr, a, mapping, identity, direction, after, limit);
+            }
             fn cast(ptr: *anyopaque) *Statement {
                 return @ptrCast(@alignCast(ptr));
             }
@@ -101,7 +125,7 @@ pub fn Host(comptime DB: type) type {
                 const writes = try a.alloc(types.TransactionWrite, plan.writes.items.len);
                 for (plan.writes.items, writes) |write, *out| out.* = .{ .key = write.key, .value = write.value };
                 const edges = try a.alloc(types.GraphEdgeWrite, plan.edges.items.len);
-                for (plan.edges.items, edges) |edge, *out| out.* = .{ .edge_id = edge.edge_id, .index_name = edge.index_name, .source = edge.source, .target = edge.target, .edge_type = edge.edge_type, .metadata_json = edge.metadata_json };
+                for (plan.edges.items, edges) |edge, *out| out.* = .{ .edge_id = edge.edge_id, .index_name = edge.index_name, .source = edge.source, .target = edge.target, .edge_type = edge.edge_type, .metadata_json = edge.metadata_json, .weight = edge.weight, .created_at = edge.created_at, .updated_at = edge.updated_at };
                 const removed = try a.alloc(types.GraphEdgeDelete, plan.removed_edges.items.len);
                 for (plan.removed_edges.items, removed) |edge, *out| out.* = .{ .edge_id = edge.edge_id, .index_name = edge.index_name, .source = edge.source, .target = edge.target, .edge_type = edge.edge_type };
                 const id = self.scope.transaction_id.?;
@@ -172,7 +196,7 @@ pub fn Host(comptime DB: type) type {
                 }
                 try self.root.batch(.{ .activate_range_tracking = true });
             }
-            const tables = try owned.alloc(DB.CypherBackend.Table, graph.labels.len);
+            const tables = try owned.alloc(PinnedAdapter.Table, graph.labels.len);
             var statement: Statement = .{ .host = self, .graph = graph, .lease = try self.root.acquireCypherReadAuthority(owned, "", "default"), .schema_version = if (self.root.core.schema) |schema| schema.version else 0, .scope = scope, .tables = tables };
             defer statement.lease.release();
             if (compiled.query.explain) {
@@ -186,11 +210,10 @@ pub fn Host(comptime DB: type) type {
             var fence = (try self.root.tryStatementReadFence()) orelse return error.CypherSnapshotNotReady;
             var fenced = true;
             defer if (fenced) fence.release();
-            for (graph.labels, statement.tables) |label, *table| table.* = .{ .name = label.table, .db = self.root, .capture_fence = &fence };
-            statement.adapter = .{ .tables = statement.tables, .ttl_now_ns = @import("antfly_platform").time.realtimeNs(), .authority = .{ .ptr = &statement, .bind = Statement.bind, .checkpoint = Statement.checkpoint, .project = Statement.project, .project_relationship = Statement.projectRelationship } };
-            statement.snapshot = try cypher.snapshot.Materialized.create(a, statement.adapter.backend(), graph, request.limits);
-            defer statement.snapshot.?.deinit();
-            statement.snapshot.?.postimages = .{ .ptr = &statement, .normalize = Statement.normalize, .relationships = Statement.documentRelationships };
+            statement.pinned = .{ .source = self.root, .core = self.root.core, .cut = try self.root.captureCypherPinnedSnapshot(owned, &fence, graph, self.table) };
+            defer statement.pinned.cut.deinit();
+            for (graph.labels, statement.tables) |label, *table| table.* = .{ .name = label.table, .db = &statement.pinned };
+            statement.adapter = .{ .tables = statement.tables, .ttl_now_ns = statement.pinned.cut.now, .authority = .{ .ptr = &statement, .bind = Statement.bind, .checkpoint = Statement.checkpoint, .project = Statement.project, .project_relationship = Statement.projectRelationship } };
             if (writes) {
                 var txn = try self.root.core.store.beginReadTxn();
                 defer txn.abort();
@@ -198,9 +221,9 @@ pub fn Host(comptime DB: type) type {
             }
             fence.release();
             fenced = false;
-            var overlay: cypher.transaction.Overlay = .{ .base = statement.snapshot.?.backend(), .host = .{ .ptr = &statement, .new_identity = Statement.newIdentity, .commit = Statement.commit }, .max_entities = request.limits.intermediate_states, .max_anchors = request.limits.scanned_anchors, .max_edges = request.limits.explored_edges };
+            var overlay: cypher.transaction.Overlay = .{ .lazy = true, .retain_scan_preimages = true, .base = statement.pinnedBackend(), .host = .{ .ptr = &statement, .new_identity = Statement.newIdentity, .commit = Statement.commit }, .max_entities = request.limits.intermediate_states, .max_anchors = request.limits.scanned_anchors, .max_edges = request.limits.explored_edges };
             statement.overlay = &overlay;
-            var result = try cypher.runtime.execute(a, if (writes) overlay.backend() else statement.snapshot.?.backend(), graph, &compiled, request.parameters, statement.snapshot.?.remainingLimits(request.limits));
+            var result = try cypher.runtime.execute(a, if (writes) overlay.backend() else statement.pinnedBackend(), graph, &compiled, request.parameters, request.limits);
             defer result.deinit();
             if (writes) {
                 var response = try std.json.parseFromSliceLeaky(std.json.Value, owned, try std.json.Stringify.valueAlloc(owned, result, .{}), .{});

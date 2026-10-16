@@ -11991,6 +11991,19 @@ pub fn searchTextQuery(
     try convertNativeDocIdsToTextDocNumsAlloc(alloc, effective_req, snapshot, &native_constraints);
     try normalizeNativeDocNumConstraintsAlloc(alloc, &native_constraints);
     const convert_constraints_ns = if (bench_query_profile) platform_time.monotonicNs() - convert_start_ns else 0;
+    const CandidatePredicate = struct {
+        snapshot: @TypeOf(snapshot),
+        predicate: types.NativeKeyPredicate,
+        fn allows(ptr: *anyopaque, doc: u32) !bool {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            var scratch = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+            defer scratch.deinit();
+            const key = (try self.snapshot.storedIdScoped(scratch.allocator(), doc)) orelse return false;
+            return self.predicate.allows(self.predicate.ptr, key);
+        }
+    };
+    var candidate_predicate: CandidatePredicate = .{ .snapshot = snapshot, .predicate = effective_req.native_key_predicate orelse undefined };
+    const doc_predicate: ?search_mod.DocNumPredicate = if (effective_req.native_key_predicate != null) .{ .ptr = &candidate_predicate, .allows = CandidatePredicate.allows } else null;
     const unresolved_stored_filters =
         (effective_req.filter_query_json.len > 0 and !native_constraints.filter_query_json_resolved) or
         (effective_req.exclusion_query_json.len > 0 and !native_constraints.exclusion_query_json_resolved);
@@ -12056,9 +12069,9 @@ pub fn searchTextQuery(
     const load_stored_in_search_engine = false;
     var field_sort_plan = SortExecutionPlan{ .kind = .none };
     if (requires_field_sort) field_sort_plan = try planTextNativeSortFields(effective_req, snapshot, text_source.runtime_schema);
-    if (requires_field_sort and executor.project_key != null and field_sort_plan.sorted_segment_executor_available)
+    if (doc_predicate == null and requires_field_sort and executor.project_key != null and field_sort_plan.sorted_segment_executor_available)
         field_sort_plan = docValuesCollectorPlanForSelectiveFilter(field_sort_plan);
-    if (requires_field_sort and executor.project_key == null and
+    if (doc_predicate == null and requires_field_sort and executor.project_key == null and
         field_sort_plan.sorted_segment_executor_available and
         !chunk_backed and
         !group_chunk_parents and
@@ -12142,7 +12155,7 @@ pub fn searchTextQuery(
             return out;
         }
     }
-    if (requires_field_sort and (executor.project_key == null or executor.native_count_visibility_exact) and
+    if (doc_predicate == null and requires_field_sort and (executor.project_key == null or executor.native_count_visibility_exact) and
         field_sort_plan.kind == .native_doc_values_top_n and
         !requestHasScoreSort(effective_req) and
         !chunk_backed and
@@ -12176,7 +12189,7 @@ pub fn searchTextQuery(
                 const selected = try arena_alloc.alloc(u32, out.hits.len);
                 for (out.hits, selected) |hit, *doc| doc.* = hit.native_text_doc_id orelse return error.InvalidData;
                 std.mem.sort(u32, selected, {}, std.sort.asc(u32));
-                var scored = try search_mod.execute(alloc, snapshot, .{ .query = search_query, .control = .{ .cancellation = effective_req.cancellation, .deadline_ns = effective_req.execution_deadline_ns }, .k = @intCast(selected.len), .include_stored = false, .filter_doc_nums = selected, .filter_doc_nums_positive = true, .distributed_text_stats = effective_req.distributed_text_stats });
+                var scored = try search_mod.execute(alloc, snapshot, .{ .doc_num_predicate = doc_predicate, .query = search_query, .control = .{ .cancellation = effective_req.cancellation, .deadline_ns = effective_req.execution_deadline_ns }, .k = @intCast(selected.len), .include_stored = false, .filter_doc_nums = selected, .filter_doc_nums_positive = true, .distributed_text_stats = effective_req.distributed_text_stats });
                 defer scored.deinit();
                 var scores: std.AutoHashMapUnmanaged(u32, f32) = .empty;
                 defer scores.deinit(alloc);
@@ -12264,6 +12277,7 @@ pub fn searchTextQuery(
             try search_mod.executeCountCandidatesWithControl(alloc, snapshot, search_query, .{ .cancellation = effective_req.cancellation, .deadline_ns = effective_req.execution_deadline_ns })
         else
             try search_mod.execute(alloc, snapshot, .{
+                .doc_num_predicate = doc_predicate,
                 .query = search_query,
                 .control = .{ .cancellation = effective_req.cancellation, .deadline_ns = effective_req.execution_deadline_ns },
                 .k = if (collect_window_candidates) candidate_limit else paging.limit,
@@ -12425,7 +12439,7 @@ pub fn searchTextQuery(
             out.total_hits = visible_candidate_count;
             out.total_hits_relation = .gte;
         }
-        if (requires_field_sort and !candidates_exhausted) {
+        if (doc_predicate == null and requires_field_sort and !candidates_exhausted) {
             logExactSortBudgetRejection(
                 "text",
                 .text_field_sort_candidate_window,
@@ -17756,6 +17770,8 @@ pub fn searchMatchAll(
     });
     defer native_constraints.deinit(alloc);
 
+    if (exec_req.native_key_predicate != null and planned_sort.kind == .sorted_segment_seek)
+        planned_sort = docValuesCollectorPlanForSelectiveFilter(planned_sort);
     const exact_sort_budget = lateVisibilityExactCandidateBudget();
     const unresolved_stored_filters =
         (exec_req.filter_query_json.len > 0 and !native_constraints.filter_query_json_resolved) or
@@ -18530,6 +18546,10 @@ const MatchAllCandidateCollectState = struct {
             self.alloc.free(raw_key);
             return;
         }
+        if (self.req.native_key_predicate) |predicate| if (!try predicate.allows(predicate.ptr, raw_key)) {
+            self.alloc.free(raw_key);
+            return;
+        };
 
         const ordinal = if (self.collector.lookup_doc_ordinal) |lookup|
             try lookup(self.collector.ctx, self.alloc, raw_key, self.req.identity_read_generation)

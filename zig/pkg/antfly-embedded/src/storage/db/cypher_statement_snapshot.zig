@@ -126,6 +126,42 @@ pub fn Snapshot(comptime DB: type) type {
             }
             return node;
         }
+        const SearchMembership = struct {
+            snapshot: *Self,
+            table: []const u8,
+            max_examined: usize,
+            examined: usize = 0,
+            mutex: std.atomic.Mutex = .unlocked,
+            cache: [128]Cache = @splat(.{}),
+            next: usize = 0,
+            const Cache = struct { key: ?[]u8 = null, allowed: bool = false };
+            fn deinit(self: *@This()) void {
+                for (self.cache) |entry| if (entry.key) |key| std.heap.page_allocator.free(key);
+            }
+            fn allows(ptr: *anyopaque, member: []const u8) !bool {
+                const self: *@This() = @ptrCast(@alignCast(ptr));
+                @import("antfly_platform").sync.lockYielding(&self.mutex);
+                defer self.mutex.unlock();
+                try checkpoint(self.snapshot);
+                var scratch = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+                defer scratch.deinit();
+                const a = scratch.allocator();
+                const ref = try @import("artifact_ids.zig").decodeArtifactRefAlloc(a, member);
+                const key = if (ref) |artifact| artifact.document_id else member;
+                for (self.cache) |entry| if (entry.key) |cached| if (std.mem.eql(u8, cached, key)) return entry.allowed;
+                if (self.examined >= self.max_examined) return error.CypherAnchorBudgetExceeded;
+                self.examined += 1;
+                const backend = self.snapshot.adapter.backend();
+                const node = try backend.vtable.get(backend.ptr, a, .{ .table = self.table, .key = key });
+                const allowed = if (node) |value| value.labels.len != 0 else false;
+                const entry = &self.cache[self.next];
+                if (entry.key) |old| std.heap.page_allocator.free(old);
+                entry.* = .{ .key = null, .allowed = allowed };
+                entry.key = try std.heap.page_allocator.dupe(u8, key);
+                self.next = (self.next + 1) % self.cache.len;
+                return allowed;
+            }
+        };
         fn search(ptr: *anyopaque, a: std.mem.Allocator, table: []const u8, input: cypher.backend.SearchInput) !cypher.backend.SearchPage {
             const self = cast(ptr);
             if (!std.mem.eql(u8, table, self.input.table)) return error.Forbidden;
@@ -153,36 +189,15 @@ pub fn Snapshot(comptime DB: type) type {
             var request = parsed.req;
             if (request.limit == 0 or request.limit > 1024 or request.offset != 0) return error.CypherInvalidSearchLimit;
             if (request.graph_queries.len != 0 or request.graph_metric_queries.len != 0 or request.graph_metric_rerank != null or request.reranker != null) return error.UnsupportedQueryRequest;
-            var allowed: std.ArrayList([]const u8) = .empty;
-            var cursor: ?[]const u8 = null;
-            var examined: usize = 0;
-            const budget = @min(input.max_examined, 65536);
-            while (true) {
-                try checkpoint(ptr);
-                // One extra row detects exhaustion without silently truncating
-                // the authorization domain used by native top-k selection.
-                const demand = @min(256, budget -| examined + 1);
-                var page = try self.db.scan(a, cursor orelse "", "", try self.db.cypherDocumentScanOptions(a, .{ .inclusive_from = cursor == null, .include_documents = true, .limit = @intCast(demand), .execution_deadline_ns = authorization.deadline_ns, .row_policy_principal_proof = authorization.proof, .row_policy_database = authorization.database, .filter_query_json = self.input.filter_query_json }));
-                defer page.deinit(a);
-                for (page.documents) |document| {
-                    examined += 1;
-                    if (examined > budget) return error.CypherAnchorBudgetExceeded;
-                    const node = (try self.adapter.node(a, table, document.id, document.json)) orelse continue;
-                    if (node.labels.len == 0) continue;
-                    var present = false;
-                    for (request.filter_doc_ids) |id| if (std.mem.eql(u8, id, document.id)) {
-                        present = true;
-                        break;
-                    };
-                    if (request.filter_doc_ids_positive and !present) continue;
-                    if (!request.filter_doc_ids_positive and present) continue;
-                    try allowed.append(a, try a.dupe(u8, document.id));
-                }
-                if (page.documents.len < demand) break;
-                cursor = try a.dupe(u8, page.documents[page.documents.len - 1].id);
-            }
-            request.filter_doc_ids = allowed.items;
-            request.filter_doc_ids_positive = true;
+            // Native collectors gate candidates before selecting top-k. An
+            // unrestricted table label needs no extra membership predicate.
+            const unrestricted = for (self.graph.labels) |label| {
+                if (std.mem.eql(u8, label.table, table) and label.predicate.len == 0) break true;
+            } else false;
+            var membership: SearchMembership = .{ .snapshot = self, .table = table, .max_examined = input.max_examined };
+            defer membership.deinit();
+            if (!unrestricted or self.input.filter_query_json.len != 0 or self.db.core.table_catalog.row_policy_phase == .active)
+                request.native_key_predicate = .{ .ptr = &membership, .allows = SearchMembership.allows };
             request.include_stored = false;
             var result = try self.db.searchCypherCut(a, request, authorization.proof, authorization.database);
             defer result.deinit();
@@ -197,6 +212,7 @@ pub fn Snapshot(comptime DB: type) type {
                 try seeds.append(a, .{ .node = node, .score = score });
             }
             try checkpoint(ptr);
+            const examined = @max(membership.examined, seeds.items.len);
             return .{ .seeds = try seeds.toOwnedSlice(a), .examined = examined, .approximate = request.dense != null or request.dense_queries.len != 0 or request.query == .dense_knn or result.total_hits_relation != .exact };
         }
         fn projectRelationship(ptr: *anyopaque, a: std.mem.Allocator, relationship: *const cypher.value.Relationship) !?*const cypher.value.Relationship {

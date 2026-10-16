@@ -27408,6 +27408,22 @@ pub const DB = struct {
         return result;
     }
 
+    pub const CypherPinnedDatabase = @import("cypher_pinned_read.zig").Database(DB);
+    pub const CypherPinnedSnapshot = @import("cypher_pinned_read.zig").Snapshot;
+    pub const CypherEdgeScanCursor = graph_mod.CypherEdgeScanCursor;
+    pub const CypherEdgePage = graph_mod.CypherEdgePage;
+    pub fn captureCypherPinnedSnapshot(self: *DB, alloc: Allocator, fence: *const StatementReadFence, graph: @import("cypher").catalog.Graph, table: []const u8) !CypherPinnedSnapshot {
+        if (comptime storage_engine.enabled) return storage_engine.call("captureCypherPinnedSnapshot", .{ self, alloc, fence, graph, table });
+        return @import("cypher_pinned_read.zig").capture(self, alloc, fence, graph, table);
+    }
+    pub fn scanCypherPinnedSnapshot(self: *DB, alloc: Allocator, cut: *CypherPinnedSnapshot, from: []const u8, to: []const u8, opts: types.ScanOptions) !types.ScanResult {
+        if (comptime storage_engine.enabled) return storage_engine.call("scanCypherPinnedSnapshot", .{ self, alloc, cut, from, to, opts });
+        return @import("cypher_pinned_read.zig").scan(self, alloc, cut, from, to, opts);
+    }
+    pub fn graphEdgesForCypherPinnedSnapshot(self: *DB, alloc: Allocator, cut: *CypherPinnedSnapshot, index: []const u8, key: []const u8, edge_types: []const []const u8, direction: graph_mod.EdgeDirection, cursor: ?graph_mod.CypherEdgeScanCursor, limits: graph_mod.EdgePageLimits) !graph_mod.CypherEdgePage {
+        if (comptime storage_engine.enabled) return storage_engine.call("graphEdgesForCypherPinnedSnapshot", .{ self, alloc, cut, index, key, edge_types, direction, cursor, limits });
+        return @import("cypher_pinned_read.zig").edges(self, alloc, cut, index, key, edge_types, direction, cursor, limits);
+    }
     pub const CypherBackend = @import("cypher").native.Adapter(DB, graph_mod.GraphIndex, graph_mod.CypherEdgeScanCursor);
     pub const CypherStatementSnapshot = @import("cypher_statement_snapshot.zig").Snapshot(DB);
     pub fn cypherDocumentKeyAllowed(key: []const u8) bool {
@@ -40758,19 +40774,20 @@ pub const DB = struct {
     }
 
     /// Only retained, authenticated graph cuts may enter this search path.
-    /// The caller supplies the authorized document whitelist before ranking.
+    /// Owner-supplied membership predicates authorize candidates before ranking.
     pub fn searchCypherCut(self: *DB, alloc: Allocator, req: types.SearchRequest, proof: []const u8, database: []const u8) !types.SearchResult {
         if (comptime storage_engine.enabled) return storage_engine.call("searchCypherCut", .{ self, alloc, req, proof, database });
-        if (!self.hasRetainedQueryCut() or !req.filter_doc_ids_positive) return error.CypherSnapshotRequired;
+        if (!self.hasRetainedQueryCut()) return error.CypherSnapshotRequired;
+        // Protected graph search must carry the owner's retained policy gate.
+        // A positive-ID bitmap is optional; building one would enumerate the
+        // entire table before a selective native search can start.
+        if (self.core.table_catalog.row_policy_phase == .active and req.native_key_predicate == null) return error.CypherSnapshotRequired;
         var lease = try self.acquireCypherReadAuthority(alloc, proof, database);
         defer lease.release();
         const access = self.beginDenseSearchAccess(req);
         defer self.endDenseSearchAccess(access);
         try self.enforcePortableRuntimeGate();
         var scoped = try self.searchRequestAtCurrentIdentityGeneration(req);
-        var filter = try self.resolvedDocFilterForIdsAlloc(true, scoped.filter_doc_ids, &.{}, scoped.identity_read_generation);
-        defer filter.deinit(self.alloc);
-        scoped.resolved_doc_filter = &filter;
         const Control = struct {
             lease: *row_policy_gate_mod.Gate.Lease,
             request: types.SearchRequest,

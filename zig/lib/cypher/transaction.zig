@@ -35,9 +35,18 @@ pub const Overlay = struct {
     /// This must support individual frees (the retained arena cannot).
     capture_allocator: ?A = null,
     active: bool = false,
+    /// Base callbacks must share a retained statement cut. Only touched values
+    /// are copied; untouched adjacency remains in the native indexes.
+    lazy: bool = false,
+    /// Writers retain the preimages already returned by their scan. Read-only
+    /// SQL overlays keep untouched rows page-owned for fused streaming.
+    retain_scan_preimages: bool = false,
+    replaced_producers: v.IdentitySet = .empty,
     work: ?b.Work = null,
     capture_accounting: bool = true,
     node_order: ?[]const usize = null,
+    staged_order: std.ArrayList(usize) = .empty,
+    staged_order_valid: bool = false,
     references: std.HashMapUnmanaged(v.Identity, std.ArrayList(Reference), v.Identity.Context, std.hash_map.default_max_load_percentage) = .empty,
     staged_read_documents: bool = false,
     nodes: std.ArrayList(Node) = .empty,
@@ -51,7 +60,7 @@ pub const Overlay = struct {
     captured: b.StartupWork = .{},
     const Reference = struct { position: usize, version: usize };
     const Node = struct { value: *v.Node, deleted: bool = false, created: bool = false, dirty: bool = false, projection_cached: bool = false, projected: ?*const v.Node = null };
-    const Relationship = struct { value: *v.Relationship, deleted: bool = false, created: bool = false, dirty: bool = false, version: usize = 0 };
+    const Relationship = struct { value: *v.Relationship, deleted: bool = false, created: bool = false, dirty: bool = false, version: usize = 0, from_base: bool = false };
     const plain_vtable: b.Backend.VTable = .{ .bind = bind, .checkpoint = checkpoint, .scan = scan, .get = get, .get_relationship = getRelationship, .expand = expand, .search = search, .set_work = setWork, .begin = begin, .startup_work = startupWork, .mutate = mutate, .commit = commit, .rollback = rollback, .new_identity = newIdentity };
     const projecting_vtable: b.Backend.VTable = projected: {
         var value = plain_vtable;
@@ -129,6 +138,7 @@ pub const Overlay = struct {
         defer if (self.base.vtable.set_work) |configure| configure(self.base.ptr, self.work);
         self.captured = if (self.base.vtable.startup_work) |work| work(self.base.ptr) else .{};
         errdefer rollback(ptr);
+        if (self.lazy) return;
         for (self.graph.?.labels, 0..) |label, index| {
             var duplicate = false;
             for (self.graph.?.labels[0..index]) |other| if (std.mem.eql(u8, label.table, other.table)) {
@@ -227,6 +237,7 @@ pub const Overlay = struct {
     /// All node insertion paths maintain the same identity index. Producers are
     /// retained entities too; resolving every edge's authority stays O(1).
     pub fn appendNode(self: *Overlay, a: A, node: Node) !void {
+        if (node.dirty) self.staged_order_valid = false;
         try self.nodes.ensureUnusedCapacity(a, 1);
         try self.node_positions.put(a, node.value.identity, self.nodes.items.len);
         self.nodes.appendAssumeCapacity(node);
@@ -300,10 +311,150 @@ pub const Overlay = struct {
             self.node_order = order;
         }
     }
+    fn ensureNode(self: *Overlay, a: A, identity: v.Identity) anyerror!?*Node {
+        if (self.findNode(identity)) |node| return node;
+        if (!self.lazy) return null;
+        var scratch = std.heap.ArenaAllocator.init(b.reclaimingAllocator(a));
+        defer scratch.deinit();
+        const retained = (try self.base.vtable.get(self.base.ptr, scratch.allocator(), identity)) orelse return null;
+        try self.capacity();
+        const retained_a = self.alloc.?;
+        const copy = @constCast((try (v.Value{ .node = retained }).clone(retained_a)).node);
+        try self.appendNode(retained_a, .{ .value = copy });
+        return self.findNode(identity);
+    }
+    fn prepareStagedOrder(self: *Overlay) !void {
+        if (self.staged_order_valid) return;
+        const a = self.alloc.?;
+        self.staged_order.clearRetainingCapacity();
+        for (self.nodes.items, 0..) |node, index| if (node.dirty) try self.staged_order.append(a, index);
+        std.mem.sort(usize, self.staged_order.items, self, struct {
+            fn less(overlay: *Overlay, left: usize, right: usize) bool {
+                const x = overlay.nodes.items[left].value.identity;
+                const y = overlay.nodes.items[right].value.identity;
+                const tables = std.mem.order(u8, x.table, y.table);
+                return tables == .lt or (tables == .eq and std.mem.lessThan(u8, x.key, y.key));
+            }
+        }.less);
+        self.staged_order_valid = true;
+    }
+    fn lazyScan(self: *Overlay, a: A, table: []const u8, after: ?[]const u8, limit: usize) !b.Page(*const v.Node) {
+        if (limit == 0) return error.CypherInvalidBackendPage;
+        const page = try self.base.vtable.scan(self.base.ptr, a, table, after, limit);
+        var found: std.ArrayList(*const v.Node) = .empty;
+        var present: v.IdentitySet = .empty;
+        for (page.items) |value| {
+            try present.put(a, value.identity, {});
+            if (self.findNode(value.identity)) |node| {
+                if (!node.deleted and node.value.labels.len != 0) try found.append(a, node.value);
+            } else {
+                // Scanning is not a write/read-set admission. Untouched rows
+                // remain page-owned; mutation/get imports a private copy only
+                // when the statement actually needs to retain that identity.
+                if (self.retain_scan_preimages) {
+                    try self.capacity();
+                    const retained = self.alloc.?;
+                    // The runtime's write scan uses its statement allocator.
+                    // Borrow immutable properties there; clone transient pages.
+                    const copy = if (a.ptr == retained.ptr and a.vtable == retained.vtable)
+                        try self.retainNode(retained, value)
+                    else
+                        @constCast((try (v.Value{ .node = value }).clone(retained)).node);
+                    try self.appendNode(retained, .{ .value = copy });
+                    try found.append(a, copy);
+                } else try found.append(a, value);
+            }
+        }
+        try self.prepareStagedOrder();
+        const order = self.staged_order.items;
+        var lo: usize = 0;
+        var hi = order.len;
+        while (lo < hi) {
+            const middle = lo + (hi - lo) / 2;
+            const identity = self.nodes.items[order[middle]].value.identity;
+            const tables = std.mem.order(u8, identity.table, table);
+            if (tables == .lt or (tables == .eq and if (after) |key| std.mem.order(u8, identity.key, key) != .gt else false)) lo = middle + 1 else hi = middle;
+        }
+        var staged: usize = 0;
+        var examined = page.examined orelse page.items.len;
+        for (order[lo..]) |index| {
+            const node = self.nodes.items[index];
+            if (!std.mem.eql(u8, node.value.identity.table, table)) break;
+            if (page.next) |key| if (std.mem.order(u8, node.value.identity.key, key) == .gt) break;
+            if (present.contains(node.value.identity)) continue;
+            try self.charge(1);
+            examined += 1;
+            if (node.deleted or node.value.labels.len == 0) continue;
+            try found.append(a, node.value);
+            staged += 1;
+            // Later staged keys cannot enter this page's retained prefix.
+            if (staged > limit) break;
+        }
+        std.mem.sort(*const v.Node, found.items, {}, struct {
+            fn less(_: void, left: *const v.Node, right: *const v.Node) bool {
+                return std.mem.lessThan(u8, left.identity.key, right.identity.key);
+            }
+        }.less);
+        const overflow = found.items.len > limit;
+        const items = found.items[0..@min(limit, found.items.len)];
+        return .{ .items = items, .next = if (overflow) items[items.len - 1].identity.key else page.next, .examined = examined };
+    }
+    const LazyCursor = struct { staged: bool = false, native: ?[]const u8 = null, offset: usize = 0 };
+    fn lazyExpand(self: *Overlay, a: A, mapping: c.Relationship, identity: v.Identity, direction: ast.Direction, after: ?[]const u8, limit: usize) anyerror!b.Page(*const v.Relationship) {
+        if (limit == 0) return error.CypherInvalidBackendPage;
+        const cursor = if (after) |encoded| try std.json.parseFromSliceLeaky(LazyCursor, a, encoded, .{}) else LazyCursor{};
+        var found: std.ArrayList(*const v.Relationship) = .empty;
+        if (!cursor.staged) {
+            var scratch = std.heap.ArenaAllocator.init(b.reclaimingAllocator(a));
+            defer scratch.deinit();
+            const temporary = scratch.allocator();
+            const page = try self.base.vtable.expand(self.base.ptr, temporary, mapping, identity, direction, cursor.native, limit);
+            for (page.items) |value| {
+                if (value.ownership == .field) {
+                    if (try value.producingDocument(temporary)) |producer| if (self.replaced_producers.contains(producer)) continue;
+                }
+                const item = if (self.findRelationship(.{ .identity = value.identity, .index = value.index })) |cached| cached else blk: {
+                    try self.capacity();
+                    const retained_a = self.alloc.?;
+                    const copy = @constCast((try (v.Value{ .relationship = value }).clone(retained_a)).relationship);
+                    try self.appendRelationship(retained_a, .{ .value = copy, .from_base = true });
+                    break :blk self.findRelationship(.{ .identity = value.identity, .index = value.index }).?;
+                };
+                if (!item.deleted and try self.producerVisible(a, item.value)) try found.append(a, item.value);
+            }
+            return .{ .items = try found.toOwnedSlice(a), .next = try std.json.Stringify.valueAlloc(a, LazyCursor{ .staged = page.next == null, .native = page.next }, .{}), .examined = page.examined orelse page.items.len };
+        }
+        const references = if (self.references.get(identity)) |list| list.items else &.{};
+        if (cursor.offset > references.len) return error.CypherInvalidBackendCursor;
+        const end = cursor.offset + @min(limit, references.len - cursor.offset);
+        for (references[cursor.offset..end]) |reference| {
+            try self.charge(1);
+            const item = self.currentReference(reference) orelse continue;
+            if (item.from_base or item.deleted or !std.mem.eql(u8, item.value.type, mapping.name) or !std.mem.eql(u8, item.value.index, mapping.index)) continue;
+            if (!((direction != .in and item.value.source.eql(identity)) or (direction != .out and item.value.target.eql(identity)))) continue;
+            if (try self.producerVisible(a, item.value)) try found.append(a, item.value);
+        }
+        return .{ .items = try found.toOwnedSlice(a), .next = if (end < references.len) try std.json.Stringify.valueAlloc(a, LazyCursor{ .staged = true, .offset = end }, .{}) else null, .examined = end - cursor.offset };
+    }
+    fn loadIncidents(self: *Overlay, a: A, identity: v.Identity) !void {
+        if (!self.lazy) return;
+        for (self.graph.?.relationships) |mapping| {
+            var after: ?[]const u8 = null;
+            while (true) {
+                const page = try self.lazyExpand(a, mapping, identity, .both, after, 256);
+                const examined = page.examined orelse page.items.len;
+                if (examined > self.max_edges -| self.captured.explored_edges) return error.CypherEdgeBudgetExceeded;
+                self.captured.explored_edges += examined;
+                after = page.next;
+                if (after == null) break;
+            }
+        }
+    }
     fn scan(ptr: *anyopaque, a: A, table: []const u8, after: ?[]const u8, limit: usize) !b.Page(*const v.Node) {
         const self = cast(ptr);
         try checkpoint(ptr);
         if (!self.active) return self.base.vtable.scan(self.base.ptr, a, table, after, limit);
+        if (self.lazy) return self.lazyScan(a, table, after, limit);
         if (limit == 0) return error.CypherInvalidBackendPage;
         try self.prepareNodeOrder();
         const order = self.node_order.?;
@@ -340,7 +491,7 @@ pub const Overlay = struct {
         const self = cast(ptr);
         try checkpoint(ptr);
         if (!self.active) return self.base.vtable.get(self.base.ptr, a, identity);
-        const node = self.findNode(identity) orelse return null;
+        const node = (try self.ensureNode(a, identity)) orelse return null;
         return if (node.deleted) null else node.value;
     }
     fn getRelationship(ptr: *anyopaque, a: A, identity: v.RelationshipIdentity) !?*const v.Relationship {
@@ -368,6 +519,7 @@ pub const Overlay = struct {
         try checkpoint(ptr);
         if (!self.active) return self.base.vtable.expand(self.base.ptr, a, mapping, identity, direction, after, limit);
         if (limit == 0) return error.CypherInvalidBackendPage;
+        if (self.lazy) return self.lazyExpand(a, mapping, identity, direction, after, limit);
         const references = if (self.references.get(identity)) |list| list.items else &.{};
         const offset = if (after) |cursor| try std.fmt.parseUnsigned(usize, cursor, 10) else 0;
         if (offset > references.len) return error.CypherInvalidBackendCursor;
@@ -416,6 +568,7 @@ pub const Overlay = struct {
     /// SQL has applied defaults/generated columns; re-running a Cypher CREATE
     /// normalizer here would turn an explicit SQL NULL back into a default.
     pub fn stageReadDocument(self: *Overlay, a: A, identity: v.Identity, postimage: ?*const v.Node) !void {
+        self.staged_order_valid = false;
         if (!self.active) return error.CypherTransactionRequired;
         const copy = if (postimage) |node| blk: {
             if (!node.identity.eql(identity)) return error.CypherInvalidIdentity;
@@ -448,7 +601,7 @@ pub const Overlay = struct {
     fn set(self: *Overlay, a: A, target: v.EntityIdentity, updates: []const v.Entry, replace: bool) !void {
         switch (target) {
             .node => |identity| {
-                const node = self.findNode(identity) orelse return error.CypherDeletedEntity;
+                const node = (try self.ensureNode(a, identity)) orelse return error.CypherDeletedEntity;
                 if (node.deleted) return error.CypherDeletedEntity;
                 node.value.properties = try self.properties(a, node.value.properties, updates, replace);
                 node.dirty = true;
@@ -461,6 +614,10 @@ pub const Overlay = struct {
                 const relationship = self.findRelationship(identity) orelse return error.CypherDeletedEntity;
                 if (relationship.deleted) return error.CypherDeletedEntity;
                 if (relationship.value.ownership != .explicit) return error.CypherDerivedRelationshipMutation;
+                if (self.lazy) {
+                    _ = try self.ensureNode(a, relationship.value.source);
+                    _ = try self.ensureNode(a, relationship.value.target);
+                }
                 relationship.value.properties = try self.properties(a, relationship.value.properties, updates, replace);
                 relationship.dirty = true;
             },
@@ -475,7 +632,7 @@ pub const Overlay = struct {
         // Initial producer admission belongs to the retained backend. Recheck
         // changed rows against postimage USING authority, independently of the
         // graph label predicates and the relationship's traversal endpoints.
-        const node = self.findNode(identity) orelse return false;
+        const node = (try self.ensureNode(a, identity)) orelse return false;
         if (node.deleted) return false;
         return (try projectNode(self, a, node.value)) != null;
     }
@@ -490,6 +647,7 @@ pub const Overlay = struct {
         const project = self.base.vtable.document_relationships orelse return;
         const relationships = try project(self.base.ptr, a, node);
         try self.retireOwnedRelationships(a, node.identity, true);
+        if (self.lazy) try self.replaced_producers.put(a, node.identity, {});
         for (relationships) |relationship| {
             try self.capacity();
             if (self.captured.explored_edges >= self.max_edges) return error.CypherEdgeBudgetExceeded;
@@ -504,9 +662,10 @@ pub const Overlay = struct {
         try checkpoint(ptr);
         if (!self.active) return error.CypherTransactionRequired;
         try mutation.validateProperties();
+        self.staged_order_valid = false;
         switch (mutation) {
             .create_node => |node| {
-                if (self.findNode(node.identity) != null) return error.CypherDuplicateIdentity;
+                if ((try self.ensureNode(a, node.identity)) != null) return error.CypherDuplicateIdentity;
                 try self.capacity();
                 const copy = try a.create(v.Node);
                 copy.* = node.*;
@@ -521,7 +680,7 @@ pub const Overlay = struct {
             },
             .create_relationship => |relationship| {
                 for ([_]v.Identity{ relationship.source, relationship.target }) |identity| {
-                    const endpoint = self.findNode(identity) orelse return error.CypherDeletedEntity;
+                    const endpoint = (try self.ensureNode(a, identity)) orelse return error.CypherDeletedEntity;
                     if (endpoint.deleted) return error.CypherDeletedEntity;
                 }
                 if (self.findRelationship(.{ .identity = relationship.identity, .index = relationship.index }) != null) return error.CypherDuplicateIdentity;
@@ -544,7 +703,8 @@ pub const Overlay = struct {
                 relationship.dirty = true;
             },
             .delete_node => |deletion| {
-                const node = self.findNode(deletion.identity) orelse return error.CypherDeletedEntity;
+                _ = (try self.ensureNode(a, deletion.identity)) orelse return error.CypherDeletedEntity;
+                try self.loadIncidents(a, deletion.identity);
                 if (self.references.get(deletion.identity)) |references| for (references.items) |reference| {
                     try self.charge(1);
                     const relationship = self.currentReference(reference) orelse continue;
@@ -559,8 +719,9 @@ pub const Overlay = struct {
                     relationship.deleted = true;
                     relationship.dirty = true;
                 };
-                node.deleted = true;
-                node.dirty = true;
+                const current = self.findNode(deletion.identity).?;
+                current.deleted = true;
+                current.dirty = true;
             },
         }
         try self.mutations.append(a, mutation);
@@ -581,9 +742,12 @@ pub const Overlay = struct {
         const self = cast(ptr);
         self.active = false;
         self.staged_read_documents = false;
+        self.replaced_producers = .empty;
         self.nodes = .empty;
         self.node_positions = .empty;
         self.node_order = null;
+        self.staged_order = .empty;
+        self.staged_order_valid = false;
         self.references = .empty;
         self.relationships = .empty;
         self.relationship_positions = .empty;

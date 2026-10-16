@@ -80,8 +80,9 @@ def test_cypher_semantic_and_hybrid_owner_cut_search(
 
 
 @pytest.mark.parametrize("num_shards", [1, 2])
+@pytest.mark.parametrize("predicate_label", [False, True])
 def test_authenticated_cypher_protected_semantic_and_hybrid(
-    openai_embedder, monkeypatch, num_shards
+    openai_embedder, monkeypatch, num_shards, predicate_label
 ):
     import os
     import time
@@ -179,7 +180,16 @@ def test_authenticated_cypher_protected_semantic_and_hybrid(
         )
         call(
             f"/graphs/{graph}",
-            {"labels": [{"name": "Document", "table": table}], "relationships": []},
+            {
+                "labels": [
+                    {
+                        "name": "Document",
+                        "table": table,
+                        **({"where": {"tenant": "visible"}} if predicate_label else {}),
+                    }
+                ],
+                "relationships": [],
+            },
         )
         call(
             "/sql",
@@ -367,3 +377,52 @@ def test_authenticated_cypher_hides_relationship_from_hidden_producer(monkeypatc
     finally:
         session.close()
         server.stop()
+
+
+def test_predicate_label_search_does_not_enumerate_or_cap_the_table(backup_api):
+    table = "cypher_large_search_" + uuid.uuid4().hex
+    graph = table + "_graph"
+    backup_api.create_table(table, num_shards=1)
+    created_graph = False
+    try:
+        # A selective posting beyond the old 65,536-row membership capture.
+        # Nonmembers still occupy the table; only the posting's parent needs
+        # graph membership evaluation before native top-k.
+        count = 66_000
+        for start in range(0, count, 2000):
+            backup_api.batch_write(
+                table,
+                inserts={
+                    f"n{i:06d}": {
+                        "id": str(i),
+                        "body": "needle" if i == count - 1 else "haystack",
+                        "tenant": "visible" if i == count - 1 else "hidden",
+                    }
+                    for i in range(start, min(start + 2000, count))
+                },
+                sync_level="full_index",
+            )
+        backup_api.post(
+            f"/graphs/{graph}",
+            {
+                "labels": [
+                    {"name": "Document", "table": table, "where": {"tenant": "visible"}}
+                ],
+                "relationships": [],
+            },
+        )
+        created_graph = True
+        result = backup_api.post(
+            f"/graphs/{graph}/query",
+            {
+                "query": f"CALL antfly.search('{table}', {{query:'body:needle',mode:'text',limit:1}}) YIELD node RETURN node.id",
+                "limits": {"scanned_anchors": 4},
+            },
+        )
+        assert result["complete"] is True, result
+        assert result["rows"] == [[{"type": "string", "value": str(count - 1)}]], result
+        assert result["stats"]["scanned_anchors"] <= 4, result
+    finally:
+        if created_graph:
+            backup_api.delete(f"/graphs/{graph}")
+        backup_api.delete_table(table)

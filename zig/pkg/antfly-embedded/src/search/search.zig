@@ -134,6 +134,10 @@ pub const NamedGraphResult = struct {
     result: graph_query.GraphQueryResult,
 };
 
+pub const DocNumPredicate = struct {
+    ptr: *anyopaque,
+    allows: *const fn (*anyopaque, u32) anyerror!bool,
+};
 pub const SearchRequest = struct {
     control: query_mod.ExecutionControl = .{},
     query: SearchQuery,
@@ -150,6 +154,7 @@ pub const SearchRequest = struct {
     filter_doc_bitmap: ?*const roaring.RoaringBitmap = null,
     exclude_doc_bitmap: ?*const roaring.RoaringBitmap = null,
     filter_doc_nums: []const u32 = &.{},
+    doc_num_predicate: ?DocNumPredicate = null,
     filter_doc_nums_positive: bool = false,
     exclude_doc_nums: []const u32 = &.{},
     /// Private coordinator hint, valid only for score top-K. Equal scores
@@ -1005,6 +1010,7 @@ fn executeScoredPhraseFilter(
     var collector = FastTopK{
         .alloc = alloc,
         .k = effectiveK(request, snap),
+        .doc_num_predicate = request.doc_num_predicate,
         .filter_doc_bitmap = request.filter_doc_bitmap,
         .exclude_doc_bitmap = request.exclude_doc_bitmap,
         .filter_doc_nums = request.filter_doc_nums,
@@ -1433,7 +1439,7 @@ fn executeMatchAll(
         var filtered = try std.ArrayListUnmanaged(u32).initCapacity(alloc, raw_doc_ids.len);
         errdefer filtered.deinit(alloc);
         for (raw_doc_ids) |doc_id| {
-            if (requestAllowsDocNum(request, doc_id)) filtered.appendAssumeCapacity(doc_id);
+            if (try requestAllowsDocNum(request, doc_id)) filtered.appendAssumeCapacity(doc_id);
         }
         const owned = try filtered.toOwnedSlice(alloc);
         owned_filtered = owned;
@@ -1632,7 +1638,7 @@ fn subtractScoresFromHits(alloc: Allocator, map: *ScoreMap, hits: []const scorer
 }
 
 fn requestHasDocNumConstraints(request: SearchRequest) bool {
-    return request.filter_doc_bitmap != null or request.exclude_doc_bitmap != null or request.filter_doc_nums_positive or request.exclude_doc_nums.len > 0;
+    return request.doc_num_predicate != null or request.filter_doc_bitmap != null or request.exclude_doc_bitmap != null or request.filter_doc_nums_positive or request.exclude_doc_nums.len > 0;
 }
 
 fn applyDocNumConstraintsToBitmap(alloc: Allocator, matches: *roaring.RoaringBitmap, request: SearchRequest) !void {
@@ -1654,7 +1660,7 @@ fn applyDocNumConstraintsToBitmap(alloc: Allocator, matches: *roaring.RoaringBit
             var visited: usize = 0;
             while (iterator.next()) |doc_id| : (visited += 1) {
                 if (visited % 256 == 0) try request.control.check();
-                if (requestAllowsDocNum(request, doc_id)) try allowed.add(doc_id);
+                if (try requestAllowsDocNum(request, doc_id)) try allowed.add(doc_id);
             }
         }
         matches.deinit();
@@ -1685,10 +1691,19 @@ fn applyDocNumConstraintsToBitmap(alloc: Allocator, matches: *roaring.RoaringBit
         matches.deinit();
         matches.* = allowed;
     }
+    if (request.doc_num_predicate) |predicate| {
+        var allowed = roaring.RoaringBitmap.init(alloc);
+        errdefer allowed.deinit();
+        var iterator = matches.iterator();
+        while (iterator.next()) |doc| if (try predicate.allows(predicate.ptr, doc)) try allowed.add(doc);
+        matches.deinit();
+        matches.* = allowed;
+    }
     try request.control.check();
 }
 
-fn requestAllowsDocNum(request: SearchRequest, doc_id: u32) bool {
+fn requestAllowsDocNum(request: SearchRequest, doc_id: u32) !bool {
+    if (request.doc_num_predicate) |predicate| if (!try predicate.allows(predicate.ptr, doc_id)) return false;
     if (request.filter_doc_bitmap) |bitmap| if (!bitmap.contains(doc_id)) return false;
     if (request.exclude_doc_bitmap) |bitmap| if (bitmap.contains(doc_id)) return false;
     if (request.filter_doc_nums_positive and !containsSortedU32(request.filter_doc_nums, doc_id)) return false;
@@ -1708,7 +1723,7 @@ fn applyDocNumConstraintsToScoreMap(
 
     var it = map.iterator();
     while (it.next()) |entry| {
-        if (!requestAllowsDocNum(request, entry.key_ptr.*)) {
+        if (!try requestAllowsDocNum(request, entry.key_ptr.*)) {
             try to_remove.append(alloc, entry.key_ptr.*);
         }
     }
@@ -1787,6 +1802,7 @@ const FastTopK = struct {
     filter_doc_bitmap: ?*const roaring.RoaringBitmap = null,
     exclude_doc_bitmap: ?*const roaring.RoaringBitmap = null,
     filter_doc_nums: []const u32 = &.{},
+    doc_num_predicate: ?DocNumPredicate = null,
     filter_doc_nums_positive: bool = false,
     exclude_doc_nums: []const u32 = &.{},
     hits: std.ArrayListUnmanaged(scorer_mod.ScoredHit) = .empty,
@@ -1857,7 +1873,7 @@ const FastTopK = struct {
     }
 
     pub fn collect(self: *FastTopK, doc_id: u32, score: f32) !void {
-        if (!self.allows(doc_id)) return;
+        if (!try self.allows(doc_id)) return;
         const hit = scorer_mod.ScoredHit{ .doc_id = doc_id, .score = score };
         if (self.producers.present()) {
             self.pending[self.pending_count] = hit;
@@ -1874,7 +1890,8 @@ const FastTopK = struct {
         try scorer_mod.offerTopK(self.alloc, &self.hits, self.k, hit);
     }
 
-    fn allows(self: *const FastTopK, doc_id: u32) bool {
+    fn allows(self: *const FastTopK, doc_id: u32) !bool {
+        if (self.doc_num_predicate) |predicate| if (!try predicate.allows(predicate.ptr, doc_id)) return false;
         if (self.filter_doc_bitmap) |bitmap| if (!bitmap.contains(doc_id)) return false;
         if (self.exclude_doc_bitmap) |bitmap| if (bitmap.contains(doc_id)) return false;
         if (self.filter_doc_nums_positive and !containsSortedU32(self.filter_doc_nums, doc_id)) return false;
@@ -2647,6 +2664,7 @@ fn executeSimpleTextBoolWithProducers(
         .alloc = alloc,
         .k = effectiveK(request, snap),
         .producers = producers,
+        .doc_num_predicate = request.doc_num_predicate,
         .filter_doc_bitmap = request.filter_doc_bitmap,
         .exclude_doc_bitmap = request.exclude_doc_bitmap,
         .filter_doc_nums = request.filter_doc_nums,
@@ -4415,7 +4433,7 @@ const StreamingBoolParallel = struct {
         var arena = std.heap.ArenaAllocator.init(a);
         defer arena.deinit();
         const producers: ProducerConstraints = .{ .include = if (self.include) |*adapter| adapter.wrapped() else null, .exclude = if (self.exclude) |*adapter| adapter.wrapped() else null };
-        var local: FastTopK = .{ .alloc = a, .k = self.collector.k, .after = self.request.search_after, .minimum_competitive_score = self.request.minimum_competitive_score, .producers = producers, .filter_doc_bitmap = self.request.filter_doc_bitmap, .exclude_doc_bitmap = self.request.exclude_doc_bitmap, .filter_doc_nums = self.request.filter_doc_nums, .filter_doc_nums_positive = self.request.filter_doc_nums_positive, .exclude_doc_nums = self.request.exclude_doc_nums };
+        var local: FastTopK = .{ .alloc = a, .k = self.collector.k, .after = self.request.search_after, .minimum_competitive_score = self.request.minimum_competitive_score, .producers = producers, .doc_num_predicate = self.request.doc_num_predicate, .filter_doc_bitmap = self.request.filter_doc_bitmap, .exclude_doc_bitmap = self.request.exclude_doc_bitmap, .filter_doc_nums = self.request.filter_doc_nums, .filter_doc_nums_positive = self.request.filter_doc_nums_positive, .exclude_doc_nums = self.request.exclude_doc_nums };
         defer local.deinit();
         while (true) {
             const index = self.next_work.fetchAdd(1, .monotonic);
@@ -4582,7 +4600,7 @@ fn scoreStreamingBoolPlans(alloc: Allocator, snap: *const index_mod.IndexSnapsho
 
 fn executeStreamingTextBool(alloc: Allocator, snap: *const index_mod.IndexSnapshot, bq: BoolQuery, request: SearchRequest, producers: ProducerConstraints) !?SearchResult {
     if (request.aggregations.len != 0 or !canStreamBool(.{ .bool_query = bq }, 0)) return null;
-    var collector: FastTopK = .{ .alloc = alloc, .k = @min(snap.liveDocCount(), request.k +| request.offset), .after = request.search_after, .minimum_competitive_score = request.minimum_competitive_score, .producers = producers, .filter_doc_bitmap = request.filter_doc_bitmap, .exclude_doc_bitmap = request.exclude_doc_bitmap, .filter_doc_nums = request.filter_doc_nums, .filter_doc_nums_positive = request.filter_doc_nums_positive, .exclude_doc_nums = request.exclude_doc_nums };
+    var collector: FastTopK = .{ .alloc = alloc, .k = @min(snap.liveDocCount(), request.k +| request.offset), .after = request.search_after, .minimum_competitive_score = request.minimum_competitive_score, .producers = producers, .doc_num_predicate = request.doc_num_predicate, .filter_doc_bitmap = request.filter_doc_bitmap, .exclude_doc_bitmap = request.exclude_doc_bitmap, .filter_doc_nums = request.filter_doc_nums, .filter_doc_nums_positive = request.filter_doc_nums_positive, .exclude_doc_nums = request.exclude_doc_nums };
     defer collector.deinit();
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
@@ -5376,10 +5394,11 @@ fn buildResult(
     if (requestHasDocNumConstraints(request)) {
         var filtered: std.ArrayListUnmanaged(scorer_mod.ScoredHit) = .empty;
         defer filtered.deinit(alloc);
-        for (scored) |hit| if (requestAllowsDocNum(request, hit.doc_id)) {
+        for (scored) |hit| if (try requestAllowsDocNum(request, hit.doc_id)) {
             try filtered.append(alloc, hit);
         };
         var next = request;
+        next.doc_num_predicate = null;
         next.filter_doc_bitmap = null;
         next.exclude_doc_bitmap = null;
         next.filter_doc_nums = &.{};
@@ -10159,4 +10178,35 @@ test "streaming boolean inherited publication cutoff prunes before payload admis
     try std.testing.expectEqual(TotalHitsRelation.gte, result.total_hits_relation);
     try std.testing.expectEqual(@as(u64, 20), diagnostics.segments_pruned);
     try std.testing.expectEqual(@as(u64, 0), diagnostics.segments_searched);
+}
+
+test "candidate predicates run before text top-k in native and fallback scorers" {
+    const a = std.testing.allocator;
+    const bytes = try buildTestSegmentWithStoredDocs(a, &.{
+        .{ .id = "hidden", .data = "{}", .terms = &.{.{ .term = "hello", .freq = 10, .norm = 10 }} },
+        .{ .id = "visible", .data = "{}", .terms = &.{.{ .term = "hello", .freq = 1, .norm = 10 }} },
+        .{ .id = "also-hidden", .data = "{}", .terms = &.{.{ .term = "hello", .freq = 5, .norm = 10 }} },
+    });
+    defer a.free(bytes);
+    var writer = try index_mod.IndexWriter.init(a);
+    defer writer.deinit();
+    try writer.addSegment(bytes);
+    const Gate = struct {
+        fail: bool = false,
+        fn allows(ptr: *anyopaque, doc: u32) !bool {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (self.fail) return error.PredicateFailed;
+            return doc == 1;
+        }
+    };
+    var gate: Gate = .{};
+    const term: SearchQuery = .{ .term = .{ .field = "title", .term = "hello" } };
+    for ([_]SearchQuery{ term, .{ .match_all = {} }, .{ .bool_query = .{ .must = &.{term} } } }) |query| {
+        var result = try execute(a, writer.snapshot(), .{ .query = query, .k = 1, .include_stored = false, .doc_num_predicate = .{ .ptr = &gate, .allows = Gate.allows } });
+        defer result.deinit();
+        try std.testing.expectEqual(@as(usize, 1), result.hits.len);
+        try std.testing.expectEqual(@as(u32, 1), result.hits[0].doc_id);
+    }
+    gate.fail = true;
+    try std.testing.expectError(error.PredicateFailed, execute(a, writer.snapshot(), .{ .query = term, .k = 1, .doc_num_predicate = .{ .ptr = &gate, .allows = Gate.allows } }));
 }

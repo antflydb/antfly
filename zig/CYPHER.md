@@ -19,7 +19,7 @@ each MATCH scope and accepts explicit zero-hop bounds.
 | Surface | Implemented behavior | Qualification and compatibility bounds |
 | --- | --- | --- |
 | Grammar/compiler | Generated conflict-free grammar; spans; Unicode strings and identifiers; owned AST; named and positional parameters; compile budgets | Full selected-version conformance suite, temporal/spatial types, additional Java regex constructs, legacy integer id() |
-| Read execution | MATCH/OPTIONAL MATCH, directional and variable-length paths, zero-hop paths, relationship uniqueness, UNWIND, list and pattern comprehensions/slices, chained comparisons, all/any/none/single, reduce, map projections, correlated read EXISTS, WITH/RETURN, grouping, DISTINCT, ORDER BY/SKIP/LIMIT, UNION, correlated CALL | Streaming/spill, optimized shortest paths, schema type binding, comprehensive expression compatibility |
+| Read execution | MATCH/OPTIONAL MATCH, directional and variable-length paths, zero-hop paths, relationship uniqueness, UNWIND, list and pattern comprehensions/slices, chained comparisons, all/any/none/single, reduce, map projections, correlated read EXISTS, WITH/RETURN, grouping, DISTINCT, ORDER BY/SKIP/LIMIT, UNION, correlated CALL | General pipeline streaming/spill, schema type binding, comprehensive expression compatibility |
 | Values | Qualified node and relationship identities, paths, lists/maps, three-valued equality and partial comparisons, numeric comparison, Cypher ORDER BY type ordering, tagged JSON | Decimal-string signed integers, typed parameter maps and collision-free envelopes implemented; SQL graph datum encoding implemented; pgwire JSONB entities, prepared parameters, NULLs, and ordinary-table joins qualified |
 | Write execution | CREATE/MERGE/SET/REMOVE/DELETE/DETACH DELETE hooks and statement overlays; native graph effects survive transaction prepare/reopen/commit/abort; source range and guard regressions qualified | Production authenticated distributed provider, principal-bound durable receipts, duplicate request-ID rejection, and concurrent MERGE qualified through the 66-check real three-metadata/three-data-node campaign, including owner-node receipt restart recovery. Receipts are replicated in metadata Raft; reads on every metadata node, availability while the original owner is killed, global request-ID rejection after leader failover, and opaque read/snapshot recovery are qualified. Recovery after owner loss while a committed write waits for embedding-index visibility is qualified without replaying the statement. The principal-bound `/transactions/{id}/status` receipt remains readable after table permission revocation and across owner loss, failover, restart, and table removal; it contains no staged rows or execution plans. |
 | Search | Typed antfly.search procedure, lossless private owner RPC, bounded top-K merge, score propagation through traversal, and explicit approximation metadata for owner-local scoring | Production preparation, owner-cut ranking with authorized candidate whitelists, work budgets and approximation metadata implemented; full-text HTTP and semantic/hybrid provider transport on one and two owners qualified. Full-text search is also qualified on real replicated owner nodes. Protected full-text tables are qualified, including score invariance after hidden documents are added. Protected semantic/hybrid search and post-commit indexing of a Cypher-created row are qualified on one and two shards. |
@@ -93,13 +93,13 @@ Go, Python, and TypeScript bindings treat the new symbols as optional when
 loading an older ABI-compatible library; unavailable calls report unsupported.
 Rust graph calls require a library exporting the new ABI symbols.
 
-Public Zig and WASM use the same durable catalog, immutable materialization,
+Public Zig and WASM use the same durable catalog, immutable storage cuts,
 postimage normalization, mutation planning, and native transaction ledger.
 Qualification covers exact integer parameters, persisted relationships,
 duplicate admission, rollback before commit, and minimal receipts. Hosted
 receipt readiness is conservative against the owner's current publication
-target. Materialization rejects wrong-owner and released capture capabilities;
-its owned properties survive subsequent document and edge publications.
+target. Capture rejects wrong-owner and released capabilities; pinned primary
+and adjacency transactions survive subsequent document and edge publications.
 Allocation-failure checks verify cleanup and explicit memory-budget failures.
 Embedded SQL search drains derived publication before capturing the shared
 statement cut, including search immediately following a durable SQL commit.
@@ -150,9 +150,10 @@ or entity arrays, and shares the runtime's work ceiling and cancellation checks
 before the durable decision. SET and REMOVE index entity-to-row aliases once
 per clause and refresh only affected rows, including aliases nested in paths
 and containers. Result ownership includes commit-time arena growth.
-Retained capture decodes each provider page in a temporary budgeted arena,
-clones authorized entities and cursors, then reclaims the scan and JSON buffers
-before the next page. This keeps temporary allocations out of the retained cut.
+Pinned storage reads decode each provider page in a temporary budgeted arena
+and return authorized entities and cursors. Lazy overlay lookups and expansion
+clone only needed entities, then reclaim the storage replies and JSON buffers.
+Terminal scan operators also reclaim their page-owned input before advancing.
 Native postimage normalization and field extraction likewise reclaim JSON and
 schema-expression scratch buffers before the next mutation. Empty relationship
 catalogs bypass extraction. Native regressions execute 8,000-row CREATE,
@@ -850,8 +851,8 @@ publish its readiness registry. Retryable enrichment admission failures retain
 their typed diagnostic and HTTP 503 status through retained-owner RPCs.
 Direct native adjacency reads use the native `full_index` visibility barrier;
 Cypher captures drain maintenance before freezing their coherent cut.
-Snapshot capture reuses the vertex identity index when checking producers and
-allocates a separate lookup cache only for off-graph producers.
+Statement-local entity indexes deduplicate producer authority lookups without
+enumerating producers during snapshot capture.
 Native metadata uses the private Cypher wire envelope only when the entire
 object has exactly `source_table`, `target_table`, and `antfly_cypher`, the table
 names are strings, and the marker contains exactly version 1 and valid tagged
@@ -859,9 +860,9 @@ map properties. That complete shape is reserved for the storage protocol.
 Ordinary, partial, malformed, and unsupported-version marker values remain user
 metadata, so a user property named `antfly_cypher` does not make an edge unreadable.
 Postimage read authority applies to producers independently of graph label
-membership. Referenced producers are captured under the same snapshot fences,
-including nonvertices, with budgeted, deduplicated lookups and indexed identity
-resolution. Losing read authority hides their assertions in the statement view.
+membership. Referenced producers are resolved lazily from the same immutable
+storage cut, including nonvertices, with budgeted, deduplicated lookups and
+indexed identity resolution. Losing read authority hides their assertions in the statement view.
 Online graph index activation installs its own resolver dependencies under stored
 destination authorization, preserves sibling definitions, and schedules corpus
 backfill outside the DDL barrier.
@@ -981,7 +982,7 @@ misrepresent the original query result.
   approximate ranking separately from exact graph traversal.
 - Authenticated HTTP and generated SDK routes expose graph queries and durable
   write status. SQL HTTP and pgwire support prepared graph composition. Public
-  C/Lite entry points use the same compiler, immutable materialization, postimage
+  C/Lite entry points use the same compiler, immutable storage cuts, postimage
   planner, native intents, and durable status semantics; portable Zig/WASM entry
   points are provided by the single-source graph host.
 - Production writes use statement overlays and native coordinated transactions.
@@ -1094,3 +1095,59 @@ or transaction receipt proves its disposition. Permission/conflict reason codes
 alone never override an unknown outcome. Receipt inspections also fence their
 responses by principal scope and write ID so an older inspection cannot replace
 a newer write's recovery state or message.
+
+### Physical execution and bounded retention
+
+Embedded Cypher and SQL `GRAPH_TABLE` retain primary and outgoing/reverse graph
+storage transactions under the shared statement cohort, then release every
+writer/replay fence before execution. Storage pins contain no vertex or edge
+population. Lite read forks borrow their original checkpoint/inode pin through
+the erased read family; each fork owns its own decode scratch. Graph pages fork
+both captured adjacency reads so page-local decoding does not accumulate in the
+storage owner. Catalog, schema, policy and graph identity checks remain live.
+
+Production and embedded write overlays load entities on demand. Scans merge
+native pages with staged postimages. Read-only overlays leave untouched rows
+page-owned; write scans retain their existing preimages to avoid redundant
+point lookups. Mutation and retained-identity lookups own private copies; incident adjacency is loaded
+before validating node deletion. Native conflict/range guards still certify
+the captured cut at commit. Producer visibility, regenerated field ownership,
+relationship postimages, and rollback remain shared across every clause.
+
+Anchor scans visit each physical table once even when multiple logical labels
+share it, applying the union of their predicates before binding. Single-node
+terminal projections fuse their scan with unordered limits, stable ordered top-k
+(`SKIP + LIMIT` heap capacity), or global count/sum/avg/min/max accumulators.
+Ordinary unordered projections avoid singleton grouping and unused sorting
+records. Page/evaluation arenas are reclaimed between batches; retained heap
+entries and min/max values have independent lifetimes. DISTINCT, collect, grouped
+aggregation and correlated pattern expressions retain the general operator.
+
+Eligible single-pattern shortest paths use breadth-first traversal and cached
+endpoint hydration. Bound destinations stop after the winning frontier layer.
+All-shortest ties are preserved; undirected positive cycles retain first-edge
+branches to avoid incorrectly eliminating valid cycles by
+relationship uniqueness. Correlated/multi-pattern matches, path-dependent
+constraints and prebound route aliases use the exhaustive selector. Owners
+accept bounded, aligned endpoint batches; the coordinator partitions these
+by table/owner, preserves missing/hidden values,
+and checks overlapping-owner results. Runtime caches deduplicate hydration
+without changing parallel-edge multiplicity.
+
+`antfly.search` no longer scans the table to enumerate allowed IDs. Unrestricted
+table labels without row policies use native indexed search directly. Restricted
+membership and active row policies are checked against the retained cut during native candidate selection, before
+top-k and pagination, including text fallback and match-all collectors. A bounded
+membership cache reuses checks across native phases. Candidate checks consume
+the remaining statement anchor/work budgets; there is no fixed 65,536-document
+pre-enumeration ceiling. Membership is never implemented by dropping disallowed
+hits from an already-selected top-k result.
+
+`tests/test_cypher_performance.py` qualifies both Lite and directory storage:
+point reads/writes with a one-anchor ceiling, shared-label counts, bounded-memory
+terminal operators, SQL graph composition, shortest paths on a dense acyclic
+graph, and lazy incident-edge deletion. Core regressions cover computed top-k
+values, stable ties, distinct label predicates, batched endpoint multiplicity,
+and Lite fork/cursor lifetime after parent close. Native search regressions
+exercise predicate labels alongside row policies and a selective posting in a
+66,000-document table with a four-anchor budget.

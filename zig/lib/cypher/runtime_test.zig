@@ -684,3 +684,91 @@ test "repeated string predicates pay each scan while immutable Unicode functions
         try std.testing.expectError(error.CypherStateBudgetExceeded, runtime.execute(std.testing.allocator, fixture.backend(), graph, &scanned, &.{.{ .name = "s", .value = .{ .string = text } }}, .{ .intermediate_states = 30_000 }));
     }
 }
+
+test "terminal reducers and top-k retain bounded computed values and stable ties" {
+    try check("MATCH (n:Document) RETURN count(*),sum(n.rank),avg(n.rank),min(n.id),max(n.id)", "[[3,6,2,\"a\",\"c\"]]");
+    try check("MATCH (n:Document) RETURN n.id ORDER BY n.rank DESC SKIP 1 LIMIT 1", "[[\"b\"]]");
+    try check("UNWIND [3,1,2,1] AS x RETURN x ORDER BY x LIMIT 3", "[[1],[1],[2]]");
+    try check("MATCH (n:Document) WHERE n.rank<0 RETURN count(*),sum(n.rank),avg(n.rank),min(n.id),max(n.id)", "[[0,0,null,null,null]]");
+    var diagnostic: c.Diagnostic = .{};
+    var compiled = try c.compile(std.testing.allocator, "UNWIND range(1,5000) AS x RETURN {x:x} AS m ORDER BY m.x DESC SKIP 2 LIMIT 3", .{}, &diagnostic);
+    defer compiled.deinit();
+    var fixture: Fixture = .{};
+    var result = try runtime.execute(std.testing.allocator, fixture.backend(), graph, &compiled, &.{}, .{ .memory_bytes = 2 << 20 });
+    defer result.deinit();
+    try std.testing.expectEqual(@as(usize, 3), result.rows.len);
+    for (result.rows, 0..) |row, index| try std.testing.expectEqual(@as(i64, @intCast(4998 - index)), row[0].map[0].value.integer);
+}
+
+test "shared-table scans preserve the union of different label predicates" {
+    var aliases = graph;
+    aliases.labels = &.{
+        .{ .name = "Document", .table = "docs", .predicate = &.{.{ .name = "rank", .value = .{ .integer = 1 } }} },
+        .{ .name = "Other", .table = "docs", .predicate = &.{.{ .name = "rank", .value = .{ .integer = 2 } }} },
+    };
+    aliases.relationships = &.{};
+    for ([_][]const u8{ "MATCH (n) RETURN count(n)", "MATCH (n) RETURN count(n) LIMIT 1" }) |query| {
+        var diagnostic: c.Diagnostic = .{};
+        var compiled = try c.compile(std.testing.allocator, query, .{}, &diagnostic);
+        defer compiled.deinit();
+        var fixture: Fixture = .{};
+        var result = try runtime.execute(std.testing.allocator, fixture.backend(), aliases, &compiled, &.{}, .{ .scanned_anchors = 3 });
+        defer result.deinit();
+        try std.testing.expectEqual(@as(i64, 2), result.rows[0][0].integer);
+        try std.testing.expectEqual(@as(usize, 3), result.stats.scanned_anchors);
+    }
+}
+
+test "paged expansion batches and caches endpoint lookups without dropping parallel edges" {
+    const Batched = struct {
+        fixture: Fixture = .{},
+        calls: usize = 0,
+        fn batch(ptr: *anyopaque, a: std.mem.Allocator, identities: []const v.Identity) ![]const ?*const v.Node {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            const nodes = try a.alloc(?*const v.Node, identities.len);
+            for (identities, nodes) |identity, *node| node.* = try Fixture.get(&self.fixture, a, identity);
+            return nodes;
+        }
+        fn checkpoint(_: *anyopaque) !void {}
+        fn scan(ptr: *anyopaque, a: std.mem.Allocator, name: []const u8, cursor: ?[]const u8, limit: usize) !b.Page(*const v.Node) {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return Fixture.scan(&self.fixture, a, name, cursor, limit);
+        }
+        fn get(ptr: *anyopaque, a: std.mem.Allocator, identity: v.Identity) !?*const v.Node {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return Fixture.get(&self.fixture, a, identity);
+        }
+        fn expand(ptr: *anyopaque, a: std.mem.Allocator, mapping: catalog.Relationship, identity: v.Identity, direction: c.ast.Direction, cursor: ?[]const u8, limit: usize) !b.Page(*const v.Relationship) {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return Fixture.expand(&self.fixture, a, mapping, identity, direction, cursor, limit);
+        }
+    };
+    var fixture: Batched = .{};
+    var table = fixture.fixture.backend().vtable.*;
+    table.get_many = Batched.batch;
+    table.scan = Batched.scan;
+    table.get = Batched.get;
+    table.expand = Batched.expand;
+    table.checkpoint = Batched.checkpoint;
+    var diagnostic: c.Diagnostic = .{};
+    var compiled = try c.compile(std.testing.allocator, "MATCH (a:Document)-[:CITES]->(b) WHERE antfly.documentKey(a)='a' RETURN b.id", .{}, &diagnostic);
+    defer compiled.deinit();
+    var result = try runtime.execute(std.testing.allocator, .{ .ptr = &fixture, .vtable = &table }, graph, &compiled, &.{}, .{});
+    defer result.deinit();
+    try std.testing.expectEqual(@as(usize, 2), result.rows.len);
+    try std.testing.expectEqual(@as(usize, 1), fixture.calls);
+}
+
+test "shortest paths preserve rebound route aliases and bound-target frontier limits" {
+    try check("MATCH (a:Document {id:'a'})-[r:CITES]->(b) WHERE r.weight=2 WITH a,b,r MATCH p=shortestPath((a)-[r:CITES]->(b)) RETURN r.weight", "[[2]]");
+    try check("MATCH p=(a:Document {id:'a'})-[r:CITES]->(b) WHERE r.weight=2 WITH a,b,p MATCH p=shortestPath((a)-[:CITES]->(b)) RETURN length(p)", "[[1]]");
+    var fixture: Fixture = .{};
+    var diagnostic: c.Diagnostic = .{};
+    var compiled = try c.compile(std.testing.allocator, "MATCH (a:Document) WHERE antfly.documentKey(a)='a' MATCH (b:Document) WHERE antfly.documentKey(b)='b' MATCH p=allShortestPaths((a)-[:CITES*1..3]->(b)) RETURN length(p)", .{}, &diagnostic);
+    defer compiled.deinit();
+    var result = try runtime.execute(std.testing.allocator, fixture.backend(), graph, &compiled, &.{}, .{ .scanned_anchors = 2, .explored_edges = 2 });
+    defer result.deinit();
+    try std.testing.expectEqual(@as(usize, 2), result.rows.len);
+    try std.testing.expectEqual(@as(usize, 2), result.stats.explored_edges);
+}

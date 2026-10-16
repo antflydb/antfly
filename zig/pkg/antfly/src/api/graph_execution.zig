@@ -98,7 +98,7 @@ pub fn execute(a: std.mem.Allocator, server: *server_mod.ApiHttpServer, identity
             .committed, .committed_pending, .committed_repair_required => .committed,
         };
     };
-    var overlay: cypher.transaction.Overlay = .{ .base = provider, .host = writer.host(), .max_entities = request.limits.intermediate_states, .max_anchors = request.limits.scanned_anchors, .max_edges = request.limits.explored_edges };
+    var overlay: cypher.transaction.Overlay = .{ .lazy = true, .retain_scan_preimages = true, .base = provider, .host = writer.host(), .max_entities = request.limits.intermediate_states, .max_anchors = request.limits.scanned_anchors, .max_edges = request.limits.explored_edges };
     writer.overlay = &overlay;
     if (writes and !compiled.query.explain) provider = overlay.backend();
     var result = try cypher.runtime.execute(a, provider, graph, &compiled, request.parameters, request.limits);

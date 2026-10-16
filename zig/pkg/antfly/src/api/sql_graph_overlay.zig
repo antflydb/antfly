@@ -14,8 +14,8 @@
 // limitations.
 
 //! Read-only graph view over a retained cohort and staged SQL postimages.
-//! Capture runs in the Cypher execution allocator, so all retained rows,
-//! projections, and adjacency remain subject to the query memory/work limits.
+//! Only staged rows and affected adjacency are retained in the execution
+//! allocator; untouched entities remain in the immutable owner cuts.
 const std = @import("std");
 const cypher = @import("cypher");
 const A = std.mem.Allocator;
@@ -61,7 +61,7 @@ pub const View = struct {
     }
     fn bind(ptr: *anyopaque, a: A, graph: cypher.catalog.Graph) !void {
         const self = cast(ptr);
-        self.inner = .{ .base = self.client.backend(), .host = .{ .ptr = self, .new_identity = unavailableIdentity, .commit = unavailableCommit }, .max_entities = self.limits.intermediate_states, .max_anchors = self.limits.scanned_anchors, .max_edges = self.limits.explored_edges };
+        self.inner = .{ .lazy = true, .base = self.client.backend(), .host = .{ .ptr = self, .new_identity = unavailableIdentity, .commit = unavailableCommit }, .max_entities = self.limits.intermediate_states, .max_anchors = self.limits.scanned_anchors, .max_edges = self.limits.explored_edges };
         const backend_inner = self.inner.backend();
         try backend_inner.vtable.bind(backend_inner.ptr, a, graph);
         try backend_inner.vtable.begin.?(backend_inner.ptr);
@@ -72,6 +72,15 @@ pub const View = struct {
         defer self.client.work = previous_work;
         self.staged_rows = .empty;
         self.projected_fields = .empty;
+        // Discover old contributions only on sources whose SQL postimages or
+        // physical edge deltas can replace them. This preserves field/artifact
+        // ownership without capturing unrelated vertices and adjacency.
+        var loaded: cypher.value.IdentitySet = .empty;
+        for (self.rows) |row| try self.loadSource(a, graph, row.identity, &loaded);
+        for (self.effects) |effects| {
+            for (effects.deletes) |edge| try self.loadSource(a, graph, .{ .table = effects.table, .key = edge.source }, &loaded);
+            for (effects.writes) |edge| try self.loadSource(a, graph, .{ .table = effects.table, .key = edge.source }, &loaded);
+        }
         for (self.inner.relationships.items) |relationship| try self.indexField(a, relationship.value);
         for (self.rows) |row| {
             const member = for (graph.labels) |label| {
@@ -88,6 +97,7 @@ pub const View = struct {
             if (self.inner.node_positions.get(row.identity)) |position| {
                 const node = &self.inner.nodes.items[position];
                 node.deleted = !authorized;
+                node.dirty = true;
                 if (projection.node) |value| node.value = @constCast(value);
             } else {
                 try self.capacity();
@@ -99,11 +109,12 @@ pub const View = struct {
                 // Authorized producer rows need not be admitted graph vertices.
                 // Keep hidden/deleted rows as tombstones so a base-cut lookup
                 // cannot restore their old producer authority.
-                try self.inner.appendNode(a, .{ .value = node, .deleted = !authorized });
+                try self.inner.appendNode(a, .{ .value = node, .deleted = !authorized, .dirty = true });
             }
             // A document owns its derived contributions even when an explicit
             // source override places their outgoing adjacency on another key.
             try self.inner.retireOwnedRelationships(a, row.identity, authorized);
+            try self.inner.replaced_producers.put(a, row.identity, {});
             for (projection.relationships) |relationship| {
                 try self.indexField(a, relationship);
                 try self.capacity();
@@ -165,6 +176,24 @@ pub const View = struct {
                 }
                 self.inner.captured.explored_edges +|= 1;
             };
+        }
+    }
+    fn loadSource(self: *View, a: A, graph: cypher.catalog.Graph, identity: cypher.value.Identity, loaded: *cypher.value.IdentitySet) !void {
+        if ((try loaded.getOrPut(a, identity)).found_existing) return;
+        const inner = self.inner.backend();
+        for (graph.relationships) |mapping| {
+            if (!std.mem.eql(u8, graph.label(mapping.source_label).?.table, identity.table)) continue;
+            var after: ?[]const u8 = null;
+            while (true) {
+                var scratch = std.heap.ArenaAllocator.init(cypher.backend.reclaimingAllocator(a));
+                defer scratch.deinit();
+                const page = try inner.vtable.expand(inner.ptr, scratch.allocator(), mapping, identity, .out, after, 128);
+                const examined = page.examined orelse page.items.len;
+                if (examined > self.limits.explored_edges -| self.inner.captured.explored_edges) return error.CypherEdgeBudgetExceeded;
+                self.inner.captured.explored_edges += examined;
+                after = if (page.next) |next| try a.dupe(u8, next) else null;
+                if (after == null) break;
+            }
         }
     }
     fn matches(graph: cypher.catalog.Graph, table: []const u8, mapping: cypher.catalog.Relationship, edge: anytype) bool {

@@ -226,12 +226,25 @@ def main():
             and search["stats"]["search_candidates"] >= 1
         )
         checks += 1
-        call(
+        selective = call(
             "POST",
             f"/graphs/{graph}/query",
             {
                 "query": f"CALL antfly.search('{table}', {{query:'Beta',limit:2}}) YIELD node RETURN node",
                 "limits": {"scanned_anchors": 1},
+            },
+        )
+        # Native candidate admission charges the selected posting, rather than
+        # enumerating every graph member before ranking.
+        assert (
+            len(selective["rows"]) == 1 and selective["stats"]["scanned_anchors"] == 1
+        ), selective
+        call(
+            "POST",
+            f"/graphs/{graph}/query",
+            {
+                "query": f"CALL antfly.search('{table}', {{query:'Beta',limit:2}}) YIELD node RETURN node",
+                "limits": {"scanned_anchors": 0},
             },
             status=429,
         )
