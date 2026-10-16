@@ -28319,10 +28319,10 @@ pub const DB = struct {
     const GraphReplacementIdentity = struct { name: []const u8, generation: u64 };
 
     fn advanceGraphReplacementUntil(self: *DB, deadline: ?u64) !bool {
-        return self.advanceGraphReplacementForIdentityUntil(deadline, null);
+        return self.advanceGraphReplacementForIdentityUntil(deadline, null, false);
     }
 
-    fn advanceGraphReplacementForIdentityUntil(self: *DB, deadline: ?u64, identity: ?GraphReplacementIdentity) !bool {
+    fn advanceGraphReplacementForIdentityUntil(self: *DB, deadline: ?u64, identity: ?GraphReplacementIdentity, bounded_replay: bool) !bool {
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return false;
         if (deadline) |end| if (self.graphReplacementWorkNow() >= end) return self.hasPendingGraphReplacements();
         if (!self.graph_replacement_mutex.tryLock()) return self.hasPendingGraphReplacements();
@@ -28352,7 +28352,7 @@ pub const DB = struct {
                 try self.core.index_manager.saveGraphReplacementBuild(self.core.store, saved);
             }
             if (saved.retry_after_ns > retry_now) continue;
-            return self.advanceGraphReplacementOnce(deadline, saved) catch |err| {
+            return self.advanceGraphReplacementOnce(deadline, saved, bounded_replay) catch |err| {
                 if (err == error.Canceled or err == error.Cancelled) {
                     // Interrupting this owner is not cancelling the durable
                     // job. Discard volatile work and preserve its checkpoint.
@@ -28459,7 +28459,7 @@ pub const DB = struct {
         if (created) try self.restartEnrichmentAfterStructuralMutation("graph replacement replay", "");
     }
 
-    fn advanceGraphReplacementOnce(self: *DB, deadline: ?u64, saved: index_manager_mod.GraphReplacementBuild) !bool {
+    fn advanceGraphReplacementOnce(self: *DB, deadline: ?u64, saved: index_manager_mod.GraphReplacementBuild, bounded_replay: bool) !bool {
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return false;
         var owner = self.acquireReplicationMutationShared();
         defer if (owner) |*lease| lease.release();
@@ -28592,17 +28592,24 @@ pub const DB = struct {
             var artifacts: std.ArrayList([]const u8) = .empty;
             var count: usize = 0;
             var visited: usize = 0;
+            var source_bytes: usize = 0;
+            // Detached pages amortize native checkpoint/publication overhead;
+            // bound both document count and scanned bytes rather than growing
+            // working memory with large rows. Foreground waits keep short pages.
+            const document_limit: usize = if (bounded_replay) 64 else 32;
             const build_deadline = @min(deadline orelse std.math.maxInt(u64), monotonicTimeNs() +| 100 * std.time.ns_per_ms);
             while (row) |kv| : (row = try cursor.next()) {
                 if (!std.mem.lessThan(u8, kv.key, source_upper)) {
                     row = null;
                     break;
                 }
-                if (count == 32 or visited == 4096) break;
+                if (count == document_limit or visited == 4096) break;
+                if (visited != 0 and source_bytes +| kv.value.len > 1024 * 1024) break;
                 // Setup can consume a short caller quantum. Admit one
                 // bounded scan unit so repeated waits cannot starve the job.
                 if (visited != 0 and monotonicTimeNs() >= build_deadline) break;
                 visited += 1;
+                source_bytes +|= kv.value.len;
                 if (internal_keys.isStoredDocumentRowKey(kv.key)) {
                     const key = (try internal_keys.decodeStoredDocumentRowKeyAlloc(a, kv.key)).?;
                     count += 1;
@@ -28635,7 +28642,11 @@ pub const DB = struct {
         }
         const target = self.core.nextDerivedSequence();
         const before_catchup = job.applied_sequence;
-        job.applied_sequence = try self.catchUpGraphReplacement(private, cfg.name, job.applied_sequence, target, 1024, deadline);
+        // Construction setup may exhaust a short caller deadline. Background
+        // replay gets its own finite quantum after the base page, so a moving
+        // journal tip cannot monopolize construction or discard its progress.
+        const catchup_deadline = if (bounded_replay) deadline orelse (self.graphReplacementWorkNow() +| 100 * std.time.ns_per_ms) else deadline;
+        job.applied_sequence = try self.catchUpGraphReplacement(private, cfg.name, job.applied_sequence, target, 1024, catchup_deadline);
         if (job.applied_sequence > before_catchup) job.tail_source_cursor = 0;
         // Yielding is not a durability boundary. Keep volatile progress with
         // the resident shadow, retaining the journal at the last durable cut.
@@ -28671,7 +28682,7 @@ pub const DB = struct {
         self.clearGraphReplacementProgress();
         self.graph_replacement_progress = .{ .job = progress_job, .checkpoint_ns = if (checkpoint) now else previous_checkpoint };
         progress_transferred = true;
-        if (job.phase != .catching_up) return true;
+        if (job.phase != .catching_up or bounded_replay) return true;
         // Activation acquires its own structural/role admission. Release the
         // construction leases first so a waiting snapshot/role fence cannot
         // deadlock a nested acquisition by this owner.
@@ -28764,7 +28775,7 @@ pub const DB = struct {
             // corpus builds. Recheck its generation under scheduler ownership
             // so cancellation/name reuse cannot redirect this quantum.
             try self.driveManualGraphReplacementReplay(pending.producer_replay_target, deadline);
-            _ = try self.advanceGraphReplacementForIdentityUntil(deadline, .{ .name = name, .generation = generation });
+            _ = try self.advanceGraphReplacementForIdentityUntil(deadline, .{ .name = name, .generation = generation }, false);
             // The control IO also exists for manual/inline runtimes. Never
             // spin when there is no independent background IO runtime.
             try self.core.index_manager.checkpointIo().sleep(.fromMilliseconds(1), .awake);
@@ -30727,14 +30738,16 @@ pub const DB = struct {
 
     fn runDerivedUntilWithOptions(self: *DB, sequence: u64, options: ReplayDrainOptions) !void {
         if (sequence == 0) return;
+        if (!self.executor.hasWorkers()) {
+            try ensureSnapshotActive(options.cancellation);
+            try replayPendingDerivedBatches(self, null, null, options);
+            try ensureSnapshotActive(options.cancellation);
+            return;
+        }
         if (options.cancellation.ptr != null) {
             return try self.runDerivedUntilWithVisibilityWait(sequence, .{
                 .cancellation = options.cancellation,
             });
-        }
-        if (!self.executor.hasWorkers()) {
-            try replayPendingDerivedBatches(self, null, null, options);
-            return;
         }
         self.executor.notifySequence(sequence);
         if (options.no_progress_timeout_ns != 0) {
@@ -32822,11 +32835,26 @@ pub const DB = struct {
         return self.hasPendingGraphReplacements() or self.local_execution.relational_index_maintenance_sweep.isPending();
     }
 
+    /// Called only by a Lite owner holding its live coordinator and path
+    /// publication fence. Producer replay runs in the separate detached turn.
+    pub fn finishBackgroundGraphReplacement(self: *DB, name: []const u8, generation: u64) !bool {
+        if (comptime storage_engine.enabled) return storage_engine.call("finishBackgroundGraphReplacement", .{ self, name, generation });
+        return self.advanceGraphReplacementForIdentityUntil(self.graphReplacementWorkNow() +| 100 * std.time.ns_per_ms, .{ .name = name, .generation = generation }, false);
+    }
+
     /// Detached Lite turns alternate replay with generation-scoped shadow
     /// construction. Never chase a moving write tip or rebuild shadows while
     /// retaining a serving-index publication footprint.
-    pub fn runBackgroundReplayWithCancellation(self: *DB, cancellation: types.CancellationToken) !bool {
-        if (comptime storage_engine.enabled) return storage_engine.call("runBackgroundReplayWithCancellation", .{ self, cancellation });
+    pub fn runBackgroundTurnWithCancellation(self: *DB, cancellation: types.CancellationToken, shadow: bool) !bool {
+        if (comptime storage_engine.enabled) return storage_engine.call("runBackgroundTurnWithCancellation", .{ self, cancellation, shadow });
+        try ensureSnapshotActive(cancellation);
+        if (shadow) {
+            if (self.hasConfiguredResolvers()) {
+                if (self.resolution_runtime == null) try self.initResolutionRuntime();
+                if (self.promotion_runtime == null) try self.initPromotionRuntime();
+            }
+            return self.advanceGraphReplacementForIdentityUntil(null, null, true);
+        }
         const before = self.core.nextDerivedSequence();
         try self.runUntilIdleWithReplayDrainOptions(.{
             .cancellation = cancellation,
@@ -139317,7 +139345,7 @@ test "inline resolver replacement wait isolates later backed off producer failur
     {
         const jobs = try db.graphReplacementStatusAlloc(a);
         defer jobs.deinit();
-        try std.testing.expect(try db.advanceGraphReplacementOnce(null, jobs.value[1]));
+        try std.testing.expect(try db.advanceGraphReplacementOnce(null, jobs.value[1], false));
     }
     {
         const jobs = try db.graphReplacementStatusAlloc(a);
@@ -139352,7 +139380,7 @@ test "inline resolver replacement named scheduler rejects a reused reservation g
     const current = try db.replaceGraphIndex("old", cfg);
     try std.testing.expect(current != previous);
     // Model reuse between a waiter's observation and scheduler admission.
-    try std.testing.expect(try db.advanceGraphReplacementForIdentityUntil(null, .{ .name = "new", .generation = previous }));
+    try std.testing.expect(try db.advanceGraphReplacementForIdentityUntil(null, .{ .name = "new", .generation = previous }, false));
     try std.testing.expect(db.indexGeneration("new") == null);
     const jobs = try db.graphReplacementStatusAlloc(a);
     defer jobs.deinit();

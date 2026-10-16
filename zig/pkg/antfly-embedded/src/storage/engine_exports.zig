@@ -150,8 +150,12 @@ fn runUntilIdleWithoutWaitingForEnrichmentRetriesWithCancellation(
     return .{ .value = self.runUntilIdleWithoutWaitingForEnrichmentRetriesWithCancellation(cancellation) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
 
-fn runBackgroundReplayWithCancellation(self: *DB, cancellation: types.CancellationToken) engine.Outcome(bool) {
-    return .{ .value = self.runBackgroundReplayWithCancellation(cancellation) catch |err| return .{ .failure = .init(@errorName(err)) } };
+fn finishBackgroundGraphReplacement(self: *DB, name: []const u8, generation: u64) engine.Outcome(bool) {
+    return .{ .value = self.finishBackgroundGraphReplacement(name, generation) catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
+
+fn runBackgroundTurnWithCancellation(self: *DB, cancellation: types.CancellationToken, shadow: bool) engine.Outcome(bool) {
+    return .{ .value = self.runBackgroundTurnWithCancellation(cancellation, shadow) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
 
 fn runBackgroundMaintenanceWithCancellation(self: *DB, cancellation: types.CancellationToken) engine.Outcome(bool) {

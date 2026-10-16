@@ -187,6 +187,7 @@ pub const PreparedPublication = struct {
                 snapshot.refreshIndexPublicationCheckpoint(file.header) catch {
                     self.index_inputs_changed = true;
                 };
+                if (self.owner.current) |live_root| snapshot.file.inheritAllocatorVerification(&live_root.owned_lite_backend.?.native_docstore.?.file) catch {};
             } else self.index_inputs_changed = true;
         } else self.index_inputs_changed = true;
     }
@@ -502,6 +503,16 @@ pub const Owner = struct {
             const file = &current.owned_lite_backend.?.native_docstore.?.file;
             const same_inode = (try probe.file.stat(probe.runtime())).inode == (try file.file.stat(file.runtime())).inode;
             if (current.maintenance_references == 0 and same_inode and std.meta.eql(probe.header, file.header)) return current;
+            if (current.maintenance_references == 0 and same_inode and !needsOutcomeReconciliation(current) and
+                try file.runtimeMetadataUnchanged(&probe) and try loadedIndexInputsUnchanged(current, file, &probe))
+            {
+                // Lease bookkeeping and unpublished shadow files do not change
+                // a serving runtime. Reopening it would publish another lease
+                // for every immutable input while foreground traffic waits.
+                try current.owned_lite_backend.?.native_docstore.?.refreshIndexPublicationCheckpoint(probe.header);
+                if (self.maintenance_snapshot) |snapshot| try file.inheritAllocatorVerification(&snapshot.owned_lite_backend.?.native_docstore.?.file);
+                return current;
+            }
             if (self.maintenance_snapshot) |snapshot| {
                 const captured = &snapshot.owned_lite_backend.?.native_docstore.?.file;
                 if (std.meta.eql(probe.header, captured.header) and
@@ -510,13 +521,16 @@ pub const Owner = struct {
         }
         var options = self.options;
         options.externally_locked = true;
+        if (known_maintenance orelse self.current) |verified| options.allocator_verification_owner = &verified.owned_lite_backend.?.native_docstore.?.file;
         const replacement = try api.openLiteHandleAllocWithRuntime(alloc, self.path, options, false, h.handleLockIo(), null);
         errdefer h.closeHandle(replacement);
         if (self.current) |previous| {
             if (known_maintenance) |snapshot| {
+                try replacement.owned_lite_backend.?.native_docstore.?.file.inheritAllocatorVerification(&snapshot.owned_lite_backend.?.native_docstore.?.file);
                 replacement.sql_commit_recovery_needed = previous.sql_commit_recovery_needed or snapshot.sql_commit_recovery_needed;
                 replacement.sql_ddl_recovery_needed = previous.sql_ddl_recovery_needed or snapshot.sql_ddl_recovery_needed;
             }
+            try replacement.owned_lite_backend.?.native_docstore.?.file.inheritAllocatorVerification(&previous.owned_lite_backend.?.native_docstore.?.file);
             inheritReclamationTelemetry(replacement.owned_lite_backend.?.native_docstore.?, previous.owned_lite_backend.?.native_docstore.?);
             try self.retired.append(alloc, previous);
             previous.lease_snapshot = true;
@@ -544,6 +558,28 @@ pub const Owner = struct {
         }
         self.collectRetired();
         return replacement;
+    }
+
+    fn loadedIndexInputsUnchanged(root: *h.Handle, before: *native.NativeFile, after: *native.NativeFile) !bool {
+        if (before.activeCheckpoint().index_catalog_root_page == after.activeCheckpoint().index_catalog_root_page) return true;
+        if (!try databaseIndexInputsUnchanged(&root.db, before, after)) return false;
+        var tables = root.embedded_tables.valueIterator();
+        while (tables.next()) |table| if (!try databaseIndexInputsUnchanged(&table.*.db, before, after)) return false;
+        return true;
+    }
+
+    fn databaseIndexInputsUnchanged(database: *h.db_mod.DB, before: *native.NativeFile, after: *native.NativeFile) !bool {
+        const indexes = try database.core.listIndexes(alloc);
+        defer {
+            for (indexes) |*index| index.deinit(alloc);
+            alloc.free(indexes);
+        }
+        for (indexes) |index| {
+            const prefix = try std.fmt.allocPrint(alloc, "{s}/indexes/{s}/", .{ database.core.index_manager.base_path, index.name });
+            defer alloc.free(prefix);
+            if (!try before.indexCatalogPrefixUnchanged(after, prefix)) return false;
+        }
+        return true;
     }
 
     pub fn collectRetired(self: *Owner) void {
@@ -644,6 +680,7 @@ pub const Owner = struct {
                 if (!try publication.indexInputsUnchanged(file, &latest)) return error.EnrichmentWaitCanceled;
             }
             try root.owned_lite_backend.?.native_docstore.?.refreshIndexPublicationCheckpoint(latest.header);
+            if (self.current) |current| try file.inheritAllocatorVerification(&current.owned_lite_backend.?.native_docstore.?.file);
             self.publication_stats.rebased +|= 1;
         }
         root.maintenance_writer_lease = lease;
@@ -696,6 +733,7 @@ pub const Owner = struct {
         var options = self.options;
         options.externally_locked = true;
         options.artifact_reader_fence = true;
+        options.allocator_verification_owner = file;
         const snapshot = if (need_database) blk: {
             const opened = try api.openLiteHandleAllocWithRuntime(alloc, self.path, options, false, h.handleLockIo(), null);
             if (comptime h.builtin.is_test) self.test_runtime_snapshot_opens += 1;
@@ -717,7 +755,9 @@ pub const Owner = struct {
         snapshot.sql_commit_recovery_needed = foreground.sql_commit_recovery_needed;
         snapshot.sql_ddl_recovery_needed = foreground.sql_ddl_recovery_needed;
         const store = snapshot.owned_lite_backend.?.native_docstore.?;
+        try store.file.inheritAllocatorVerification(file);
         if (self.maintenance_snapshot) |old| {
+            try store.file.inheritAllocatorVerification(&old.owned_lite_backend.?.native_docstore.?.file);
             // Policy scheduling and telemetry belong to this connection;
             // assessment caches and page roots belong to the new generation.
             store.maintenance_policy = old.owned_lite_backend.?.native_docstore.?.maintenance_policy;
@@ -789,11 +829,20 @@ pub const Owner = struct {
         if (run_database and self.maintenance_shadow_next) {
             const jobs = try database.graphReplacementStatusAlloc(turn_alloc);
             defer jobs.deinit();
-            for (jobs.value) |job| if (job.phase != .failed) {
+            for (jobs.value) |job| if (job.phase == .catching_up) {
+                // Construction remains detached. Cutover uses the live
+                // coordinator under this short owner/path fence, so its tail
+                // target and catalog swap exclude foreground appends together.
+                _ = try database.finishBackgroundGraphReplacement(job.name, job.generation);
+                self.maintenance_shadow_next = false;
+                self.notifyMutation();
+                return true;
+            };
+            for (jobs.value) |job| if (job.phase == .building) {
                 try shadow_scopes.append(turn_alloc, .{
                     .name = try turn_alloc.dupe(u8, job.name),
                     .generation = job.generation,
-                    .prefix = try std.fmt.allocPrint(turn_alloc, "{s}/{s}/", .{ database.core.index_manager.base_path, job.name }),
+                    .prefix = try std.fmt.allocPrint(turn_alloc, "{s}/indexes/{s}/", .{ database.core.index_manager.base_path, job.name }),
                 });
             };
         }
@@ -840,10 +889,7 @@ pub const Owner = struct {
         // turn before replay, whose serving-index publication invalidates the
         // broad capture. Unrelated serving writes may rebase this turn, while
         // changes to any selected shadow generation still reject publication.
-        var pending = if (run_database) (if (shadow_scopes.items.len != 0)
-            database.advanceGraphReplacement()
-        else
-            database.runBackgroundReplayWithCancellation(cancellation)) catch |err| blk: {
+        var pending = if (run_database) database.runBackgroundTurnWithCancellation(cancellation, shadow_scopes.items.len != 0) catch |err| blk: {
             maintenance_error = err;
             break :blk true;
         } else false;

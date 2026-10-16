@@ -5983,6 +5983,72 @@ test "capi SQL detached renewal releases the mutex and rejects changed tenure" {
     try Runtime.testDetachedLeaseRenewal();
 }
 
+test "capi SQL runtime refresh fences serving inputs while reusing lease and shadow bookkeeping" {
+    if (builtin.single_threaded or builtin.os.tag == .freestanding) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const io = shared.handleLockIo();
+    var directory = try TestDirectory.init("capi-runtime-reuse");
+    defer directory.cleanup();
+    const path = try tempTestAflitePath(a, directory.path(), "database");
+    defer a.free(path);
+    defer cleanupTestFile(path);
+    var options: capi.OpenOptions = .{};
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_open_options_init(&options));
+    options.storage_kind = capi.storage_kind_lite;
+    options.profile = capi.profile_native;
+    var handle: ?*anyopaque = null;
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_create_with_options(path, &options, &handle));
+    defer antfly_db_close(handle);
+    const owner = blk: {
+        const guard = public.enterHandle(handle, .exclusive).?;
+        defer guard.leave();
+        break :blk guard.connection.?.owner;
+    };
+    owner.stopping.store(true, .release);
+    owner.wake.set(io);
+    owner.worker.?.join();
+    owner.worker = null;
+    owner.stopping.store(false, .release);
+    owner.gate.mutex.lockUncancelable(io);
+    defer owner.gate.mutex.unlock(io);
+    var path_lease = try lite_backend.native.lockWriterPathWithIo(a, io, path);
+    defer path_lease.close();
+    for ([_]enum { lease_add, lease_delete, shadow, serving, metadata, primary, retired_checkpoint }{
+        .lease_add, .lease_delete, .shadow, .serving, .metadata, .primary, .retired_checkpoint,
+    }) |change| {
+        const before = owner.current.?;
+        {
+            var writer = try lite_backend.native.NativeFile.openWithIo(a, io, path, .{ .externally_locked = true });
+            defer writer.close();
+            switch (change) {
+                .lease_add => try writer.putCatalogRecord(lite_backend.native.NativeFile.artifact_lease_key_prefix ++ "refresh-probe", "lease"),
+                .lease_delete => try writer.putCatalogBatch(&.{.{ .key = lite_backend.native.NativeFile.artifact_lease_key_prefix ++ "refresh-probe", .is_delete = true }}),
+                .shadow, .serving => {
+                    const indexes = try before.db.core.listIndexes(a);
+                    defer {
+                        for (indexes) |*index| index.deinit(a);
+                        a.free(indexes);
+                    }
+                    const key = try std.fmt.allocPrint(a, "{s}/indexes/{s}/refresh-probe.bin", .{ before.db.core.index_manager.base_path, if (change == .shadow) "unpublished-shadow" else indexes[0].name });
+                    defer a.free(key);
+                    try writer.putIndexCatalogRecord(key, "physical input");
+                },
+                .metadata => try writer.putCatalogRecord("runtime-probe", "changed"),
+                .primary => try writer.putDocument("runtime-probe", "{}"),
+                .retired_checkpoint => {
+                    try writer.putCatalogRecord(lite_backend.native.NativeFile.artifact_lease_key_prefix ++ "evict-a", "lease");
+                    try writer.putCatalogRecord(lite_backend.native.NativeFile.artifact_lease_key_prefix ++ "evict-b", "lease");
+                },
+            }
+        }
+        const after = try owner.refresh();
+        if (change == .lease_add or change == .lease_delete or change == .shadow)
+            try std.testing.expectEqual(before, after)
+        else
+            try std.testing.expect(before != after);
+    }
+}
+
 test "capi SQL idle native maintenance avoids runtime construction and resumes work" {
     if (builtin.single_threaded or builtin.os.tag == .freestanding) return error.SkipZigTest;
     const a = std.testing.allocator;
