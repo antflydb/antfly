@@ -227,7 +227,7 @@ pub const Row = struct {
     typed_cells: ?TypedCells = null,
 
     pub const TypedCells = struct {
-        layout: TypedLayout,
+        layout: *const TypedLayout,
         values: []const Cell = &.{},
         presence: ?[]const bool = null,
         /// Shared immutable column blocks, owned by the enclosing page lease.
@@ -258,8 +258,9 @@ pub const Row = struct {
 
         /// Names borrow the immutable relation binding; entries belong to the
         /// page arena. Duplicate names must not silently overwrite an ordinal.
-        pub fn init(arena: std.mem.Allocator, names: []const []const u8) !TypedLayout {
-            var result: TypedLayout = .{ .names = names };
+        pub fn init(arena: std.mem.Allocator, names: []const []const u8) !*const TypedLayout {
+            const result = try arena.create(TypedLayout);
+            result.* = .{ .names = names };
             for (names, 0..) |name, index| {
                 const entry = try result.ordinals.getOrPut(arena, name);
                 if (entry.found_existing) return error.InvalidSqlBackendResponse;
@@ -270,7 +271,7 @@ pub const Row = struct {
 
         /// Clone once per emitted page, not once per row. No names or directory
         /// entries may borrow a cursor that can close before the page consumer.
-        pub fn clone(self: TypedLayout, alloc: std.mem.Allocator) !TypedLayout {
+        pub fn clone(self: *const TypedLayout, alloc: std.mem.Allocator) !*const TypedLayout {
             const names = try alloc.alloc([]const u8, self.names.len);
             for (self.names, names) |name, *out| out.* = try alloc.dupe(u8, name);
             return init(alloc, names);
@@ -280,7 +281,7 @@ pub const Row = struct {
     /// Clone once at the page ownership boundary; consumers borrow the typed
     /// cells until that page is released. Layout and allocations must belong
     /// to the same page owner (or a longer-lived immutable binding).
-    pub fn fromDatums(alloc: std.mem.Allocator, id: []const u8, layout: TypedLayout, values: []const Cell) !Row {
+    pub fn fromDatums(alloc: std.mem.Allocator, id: []const u8, layout: *const TypedLayout, values: []const Cell) !Row {
         if (layout.ordinals.count() != values.len) return error.InvalidSqlBackendResponse;
         const owned = try alloc.alloc(Cell, values.len);
         for (values, owned) |value, *out| out.* = try @import("operators.zig").cloneDatum(alloc, value);
@@ -344,7 +345,7 @@ pub const Row = struct {
 
     /// Payload ownership transfer with a page-shared, owned name directory.
     /// Compiled pattern objects retain their existing statement-owner lifetime.
-    pub fn cloneWithLayout(self: Row, alloc: std.mem.Allocator, layout: ?TypedLayout) !Row {
+    pub fn cloneWithLayout(self: Row, alloc: std.mem.Allocator, layout: ?*const TypedLayout) !Row {
         var result = self;
         result.id = try alloc.dupe(u8, self.id);
         if (self.index_cursor) |cursor| result.index_cursor = try alloc.dupe(u8, cursor);

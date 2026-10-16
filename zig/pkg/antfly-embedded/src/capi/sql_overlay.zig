@@ -66,7 +66,7 @@ const Overlay = struct {
         errdefer arena.deinit();
         const a = arena.allocator();
         var rows: std.ArrayList(catalog.Row) = .empty;
-        var layout: ?catalog.Row.TypedLayout = null;
+        var layout: ?*const catalog.Row.TypedLayout = null;
         while (rows.items.len < limit) {
             const native = try self.peek();
             const staged: ?catalog.Row = if (self.staged_index < self.staged.len) self.staged[self.staged_index] else null;
@@ -215,7 +215,7 @@ test "SQL overlay native pages retain typed cells after source page release" {
     defer page.deinit();
     try std.testing.expect(overlay.native_done and overlay.page == null);
     try std.testing.expectEqual(@as(usize, 2), page.rows.len);
-    try std.testing.expect(page.rows[0].typed_cells.?.layout.ordinals.metadata == page.rows[1].typed_cells.?.layout.ordinals.metadata);
+    try std.testing.expect(page.rows[0].typed_cells.?.layout == page.rows[1].typed_cells.?.layout);
     var expected = try @import("../sql/array_text.zig").decode(a, .int64, "[-1:1]={9007199254740993,NULL,2}", .{});
     defer expected.deinit();
     for (page.rows, 0..) |row, i| {
