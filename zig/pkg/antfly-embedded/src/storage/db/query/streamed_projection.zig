@@ -23,6 +23,7 @@ pub const Context = struct {
     scratch: std.mem.Allocator,
     value: union(enum) {
         row: struct { plan: Plan, row: codec.OrdinalRowView },
+        whole_row: codec.OrdinalRowView,
         sources: struct { plan: Plan, sources: Plan.Sources },
         document: struct { plan: *const document.SpanProjectionPlan, raw: []const u8 },
         json_fields: []const u8,
@@ -36,6 +37,7 @@ pub const Context = struct {
         const writer = receiver.writer();
         switch (self.value) {
             .row => |v| try v.plan.writeRowFields(self.scratch, v.row, writer),
+            .whole_row => |row| try row.writeScanFields(self.scratch, writer),
             .sources => |v| try v.plan.writeSourcesFields(self.scratch, v.sources, writer),
             .document => |v| try document.writeLookupFields(self.scratch, writer, v.raw, v.plan),
             .json_fields => |raw| try document.writeRawScanFields(self.scratch, writer, raw),
@@ -82,6 +84,46 @@ test "public graph metric borrowed wire synchronous scan projection streams boun
         defer output.deinit();
         try context.borrow().writeFields(&output.writer);
         try std.testing.expectEqualStrings(expected.written(), output.written());
+        try std.testing.expectEqual(@as(usize, 0), budget.live);
+    }
+}
+
+test "public graph metric borrowed wire full row producers avoid reconstruction and preserve identity normalization" {
+    const a = std.testing.allocator;
+    const schema = @import("../../schema.zig");
+    const columns = [_]schema.RelationalColumn{
+        .{ .name = "text", .path = "text", .column_type = .string },
+        .{ .name = "payload", .path = "payload", .column_type = .json, .is_json = true, .json_kind = .any },
+        .{ .name = "ratio", .path = "ratio", .column_type = .number },
+    };
+    const table: schema.TableSchema = .{ .version = 1, .storage_mode = .relational, .relational_columns = &columns };
+    var layout = try codec.PhysicalLayout.init(a, table);
+    defer layout.deinit();
+    const large = try a.alloc(u8, 1024 * 1024);
+    defer a.free(large);
+    @memset(large, 'x');
+    for ([_][]const u8{ "{\"n\":100}", "{\"_id\":\"inner\",\"n\":100}" }) |json| {
+        const bytes = try codec.serializeOrdinal(a, 1, &columns, &.{
+            .{ .ordinal = 0, .path = "text", .value_type = .bytes_val, .value = .{ .bytes_val = large } },
+            .{ .ordinal = 1, .path = "payload", .is_json = true, .value_type = .bytes_val, .value = .{ .bytes_val = json } },
+            .{ .ordinal = 2, .path = "ratio", .value_type = .f64_val, .value = .{ .f64_val = 1e-12 } },
+        }, @splat(0));
+        defer a.free(bytes);
+        const row = try codec.ordinalRowViewTrusted(bytes, table, &layout);
+        const legacy = try row.reconstructValueAlloc(a);
+        defer a.free(legacy);
+        var expected = std.Io.Writer.Allocating.init(a);
+        defer expected.deinit();
+        try document.writeRawScanFields(a, &expected.writer, legacy);
+        var budget: @import("../../lite/test_allocator.zig").BudgetAllocator = .{ .backing = a, .limit = if (std.mem.indexOf(u8, json, "_id") == null) 0 else 8 * 1024 * 1024 };
+        var context: Context = .{ .scratch = budget.allocator(), .value = .{ .whole_row = row } };
+        var actual = std.Io.Writer.Allocating.init(a);
+        defer actual.deinit();
+        try context.borrow().writeFields(&actual.writer);
+        try std.testing.expectEqualStrings(expected.written(), actual.written());
+        try std.testing.expectEqual(@as(usize, 0), budget.live);
+        var failed = std.Io.Writer.fixed(&.{});
+        try std.testing.expectError(error.WriteFailed, context.borrow().writeFields(&failed));
         try std.testing.expectEqual(@as(usize, 0), budget.live);
     }
 }

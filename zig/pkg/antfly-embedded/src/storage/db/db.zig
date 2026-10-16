@@ -39872,9 +39872,10 @@ pub const DB = struct {
                     ordinal_filter_match = try filter.matches(state.alloc, raw_key, ordinal_row.?);
                     if (ordinal_filter_match == false) return .@"continue";
                 };
+                const stream_whole_row = relational and state.visitor.borrow_documents and state.opts.include_documents and state.opts.fields.len == 0 and state.opts.include_all_fields;
                 const needs_logical_value = !relational or semantic_hash == null or
                     (state.filter != null and ordinal_filter_match == null) or
-                    (state.opts.include_documents and state.direct_projection_fields == null);
+                    (state.opts.include_documents and state.direct_projection_fields == null and !stream_whole_row);
                 // Scan callbacks pin their borrowed storage slices until they
                 // return. A synchronous plain-document producer can keep that
                 // borrow instead of copying the entire input before projection.
@@ -39904,7 +39905,9 @@ pub const DB = struct {
                 var streamed: ?@import("query/streamed_projection.zig").Context = null;
                 if (state.visitor.borrow_documents and state.opts.include_documents) {
                     if (ordinal_row) |row| {
-                        if (row_plan.?.projection) |plan| streamed = .{ .scratch = state.alloc, .value = .{ .row = .{ .plan = plan, .row = row } } };
+                        if (stream_whole_row) {
+                            streamed = .{ .scratch = state.alloc, .value = .{ .whole_row = row } };
+                        } else if (row_plan.?.projection) |plan| streamed = .{ .scratch = state.alloc, .value = .{ .row = .{ .plan = plan, .row = row } } };
                     } else if (state.stream_plan) |plan| streamed = .{ .scratch = state.alloc, .value = .{ .document = .{ .plan = plan, .raw = logical_value.? } } };
                 }
                 const projected = if (state.opts.include_documents and streamed == null)
@@ -67205,6 +67208,24 @@ test "relational columnar typed masks avoid vector expansion and eliminated colu
     try db.scanVisit(alloc, "", "", dirty_opts, .{ .context = &stream, .visit = Stream.visit, .borrow_documents = true });
     try std.testing.expectEqual(dirty.documents.len, stream.count);
     try std.testing.expect(dirty_stats.primary_rows_read > 0);
+    for ([_]bool{ false, true }) |disable_columnar| {
+        var whole = try db.scan(alloc, "", "", .{ .include_documents = true });
+        defer whole.deinit(alloc);
+        stream = .{ .expected = whole.documents };
+        try db.scanVisit(alloc, "", "", .{ .include_documents = true, .disable_columnar_scan = disable_columnar }, .{ .context = &stream, .visit = Stream.visit, .borrow_documents = true });
+        try std.testing.expectEqual(whole.documents.len, stream.count);
+    }
+    // A small LIMIT keeps the clean covered-row path in columnar execution;
+    // its borrowed primary scope must stay alive through producer completion.
+    try std.testing.expect(try db.rebuildRelationalColumns());
+    var first = try db.scan(alloc, "", "", .{ .include_documents = true, .limit = 1 });
+    defer first.deinit(alloc);
+    stream = .{ .expected = first.documents };
+    var full_stats: types.ColumnarScanStats = .{};
+    try db.scanVisit(alloc, "", "", .{ .include_documents = true, .limit = 1, .columnar_stats = &full_stats }, .{ .context = &stream, .visit = Stream.visit, .borrow_documents = true });
+    try std.testing.expectEqual(first.documents.len, stream.count);
+    try std.testing.expect(full_stats.used);
+    try std.testing.expectEqual(@as(u64, 1), full_stats.primary_rows_read);
 }
 
 test "relational columnar bounded compaction splits empty ranges and resumes canceled staging" {

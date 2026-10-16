@@ -32,7 +32,24 @@ pub const View = struct {
     /// bytes. Copying view state cannot authorize an unrelated source span.
     canonical_source: ?[]const u8 = null,
     root_sources: []const RootSource = &.{},
+    canonical_paths: []const CanonicalPath = &.{},
+    canonical_path_source: ?[]const u8 = null,
     validated_ranges: ?*const ValidatedRanges.Ref = null,
+    const CanonicalPath = struct { parts: []const []const u8, raw: []const u8 };
+    /// Only complete leaf spans carry copy authority. Ancestors remain ordinary
+    /// source nodes; a later whole/overlapping selection can use lazy navigation.
+    pub fn canonicalPath(self: *const View, parts: []const []const u8) ?[]const u8 {
+        const source = self.canonical_path_source orelse return null;
+        if (source.ptr != self.root.raw.ptr or source.len != self.root.raw.len or !self.canCopyCanonical(source)) return null;
+        for (self.canonical_paths) |path| {
+            if (path.parts.len != parts.len) continue;
+            for (path.parts, parts) |left, right| {
+                if (!std.mem.eql(u8, left, right)) break;
+            } else return path.raw;
+        }
+        return null;
+    }
+
     pub const ValidatedRanges = @import("validated_ranges.zig").ValidatedRanges;
     /// `raw` must be a complete subvalue identified by this view's traversal.
     pub fn canCopyCanonical(self: *const View, raw: []const u8) bool {
@@ -362,9 +379,9 @@ pub const View = struct {
         ranges: ?*ValidatedRanges = null,
     };
     /// Admission has already established syntax and unique keys for this exact
-    /// pinned source. Flat terminal selectors need not inspect trailing siblings
-    /// after every requested name is found. General/deep selectors retain the
-    /// validating traversal; partial navigation never claims a complete object.
+    /// pinned source. Terminal selections can skip trailing siblings; nested
+    /// selections cache only complete leaf spans from a bounded prefix probe.
+    /// Ordinary navigation never claims a complete index of a partial object.
     fn canonicalPrefixFits(view: *const View, selector: *const Selector) bool {
         // A tiny, allocation-free probe pays only when it can avoid a large
         // tail. Truncated strings/numbers/containers simply select the ordinary
@@ -392,10 +409,91 @@ pub const View = struct {
             if (found == selector.fields.count()) return true;
         }
     }
+    const CanonicalPrefix = struct {
+        const max_nodes = 64;
+        const max_depth = 32;
+        const Record = struct { name: []const u8, parent: ?usize, raw: ?[]const u8 = null };
+        records: [max_nodes]Record = undefined,
+        count: usize = 0,
+        found: usize = 0,
+        leaves: usize = 0,
+        fn countLeaves(selected: *const Selector, nodes: *usize, depth: usize) ?usize {
+            if (depth == max_depth or selected.fields.count() > max_nodes - nodes.*) return null;
+            nodes.* += selected.fields.count();
+            var leaves: usize = 0;
+            var it = selected.fields.iterator();
+            while (it.next()) |entry| {
+                if (std.mem.eql(u8, entry.key_ptr.*, "*")) return null;
+                leaves += if (entry.value_ptr.*.fields.count() == 0) 1 else countLeaves(entry.value_ptr.*, nodes, depth + 1) orelse return null;
+            }
+            return leaves;
+        }
+        fn walk(self: *@This(), scanner: *std.json.Scanner, alloc: Allocator, selected: *const Selector, parent: ?usize, depth: usize) anyerror!bool {
+            if (depth == max_depth or try scanner.next() != .object_begin) return error.IneligibleCanonicalPrefix;
+            while (try scanner.peekNextTokenType() != .object_end) {
+                const name = switch (try scanner.nextAllocMax(alloc, .alloc_if_needed, scanner.input.len)) {
+                    .string, .allocated_string => |key| key,
+                    else => return error.IneligibleCanonicalPrefix,
+                };
+                _ = try scanner.peekNextTokenType();
+                if (selected.fields.getEntry(name)) |entry| {
+                    if (self.count == max_nodes) return error.IneligibleCanonicalPrefix;
+                    const index = self.count;
+                    self.records[index] = .{ .name = entry.key_ptr.*, .parent = parent };
+                    self.count += 1;
+                    if (entry.value_ptr.*.fields.count() == 0) {
+                        const start = scanner.cursor;
+                        try scanner.skipValue();
+                        if (scanner.cursor >= scanner.input.len) return error.IneligibleCanonicalPrefix;
+                        self.records[index].raw = scanner.input[start..scanner.cursor];
+                        self.found += 1;
+                        if (self.found == self.leaves) return true;
+                    } else if (try self.walk(scanner, alloc, entry.value_ptr.*, index, depth + 1)) return true;
+                } else try scanner.skipValue();
+            }
+            _ = try scanner.next();
+            return false;
+        }
+    };
+    fn prepareCanonicalPaths(view: *View, selector: *const Selector) !bool {
+        const raw = view.root.raw;
+        if (raw.len <= 4096) return false;
+        var nodes: usize = 0;
+        var probe: CanonicalPrefix = .{ .leaves = CanonicalPrefix.countLeaves(selector, &nodes, 0) orelse return false };
+        if (probe.leaves == 0) return false;
+        var bytes: [512]u8 = undefined;
+        var fixed = std.heap.FixedBufferAllocator.init(&bytes);
+        var scanner = std.json.Scanner.initCompleteInput(fixed.allocator(), raw[0..@min(raw.len, 256)]);
+        defer scanner.deinit();
+        if (!(probe.walk(&scanner, fixed.allocator(), selector, null, 0) catch return false)) return false;
+        errdefer view.invalidatePreparation();
+        const paths = try view.alloc.alloc(CanonicalPath, probe.leaves);
+        var next: usize = 0;
+        for (probe.records[0..probe.count], 0..) |record, index| if (record.raw) |span| {
+            var names: [CanonicalPrefix.max_depth][]const u8 = undefined;
+            var len: usize = 0;
+            var current: ?usize = index;
+            while (current) |i| {
+                names[len] = probe.records[i].name;
+                len += 1;
+                current = probe.records[i].parent;
+            }
+            const parts = try view.alloc.alloc([]const u8, len);
+            for (parts, 0..) |*part, i| part.* = try view.alloc.dupe(u8, names[len - i - 1]);
+            paths[next] = .{ .parts = parts, .raw = span };
+            next += 1;
+        };
+        view.canonical_paths = paths;
+        view.canonical_path_source = raw;
+        return true;
+    }
     fn prepareCanonicalTerminals(view: *View, selector: *const Selector) !bool {
         if (view.root.kind() != '{' or !view.canCopyCanonical(view.root.raw) or selector.fields.count() == 0) return false;
         var selected = selector.fields.iterator();
-        while (selected.next()) |entry| if (std.mem.eql(u8, entry.key_ptr.*, "*") or entry.value_ptr.*.fields.count() != 0) return false;
+        while (selected.next()) |entry| {
+            if (std.mem.eql(u8, entry.key_ptr.*, "*")) return false;
+            if (entry.value_ptr.*.fields.count() != 0) return view.prepareCanonicalPaths(selector);
+        }
         if (!view.canonicalPrefixFits(selector)) return false;
         const raw = view.root.raw;
         errdefer view.invalidatePreparation();
@@ -437,6 +535,8 @@ pub const View = struct {
     pub fn prepareProjectionWithOptions(view: *View, selector: *const Selector, policy: DuplicatePolicy, root_mode: RootMode, options: PreparationOptions) !void {
         const raw = view.root.raw;
         view.validated_ranges = null;
+        view.canonical_paths = &.{};
+        view.canonical_path_source = null;
         if (policy == .visited and !options.retain_root_fields and options.root_excluded.len == 0 and try view.prepareCanonicalTerminals(selector)) return;
         if (options.ranges) |ranges| ranges.reserveFor(raw.len);
         errdefer {
@@ -454,6 +554,8 @@ pub const View = struct {
 
     fn invalidatePreparation(view: *View) void {
         view.validated_ranges = null;
+        view.canonical_paths = &.{};
+        view.canonical_path_source = null;
         view.root.children = null;
         view.root.object_index = .empty;
         view.root.array_index.clearRetainingCapacity();

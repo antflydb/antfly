@@ -431,7 +431,36 @@ pub const Output = union(enum) {
     pub fn includePlanned(owner: *Owner, dst: *Object, name: []const u8, source: Source, path: []const []const u8, selected: ?*const plan_mod.Selector) anyerror!void {
         return includeWithBase(owner, .{ .map = dst }, name, source, path, selected);
     }
+    /// A canonical prefix proof records complete terminal spans and establishes
+    /// object ancestry. Apply it only to independent projected objects. Borrowed
+    /// bases/overlays use normal navigation so ordered whole-parent selections
+    /// retain every original sibling and their existing replacement semantics.
+    fn includeCanonicalPath(owner: *Owner, target: Target, name: []const u8, source: Source, path: []const []const u8) !bool {
+        if (target.base != null or source != .span or path.len == 0 or source.span.node != &source.span.view.root) return false;
+        const raw = source.span.view.canonicalPath(path) orelse return false;
+        var check = target.map;
+        var key = name;
+        for (0..path.len) |i| {
+            const existing = check.getPtr(key) orelse break;
+            if (existing.* != .object) return false;
+            check = &existing.object;
+            key = path[i];
+        }
+        const a = owner.alloc;
+        var dst = target.map;
+        key = name;
+        for (path) |part| {
+            if (!dst.contains(key)) try put(a, dst, key, .{ .object = .empty });
+            dst = &dst.getPtr(key).?.object;
+            key = part;
+        }
+        const node = try a.create(View.Node);
+        node.* = .{ .raw = raw };
+        try put(a, dst, key, .{ .borrowed = .{ .span = .{ .view = source.span.view, .node = node } } });
+        return true;
+    }
     fn includeWithBase(owner: *Owner, target: Target, name: []const u8, source: Source, path: []const []const u8, selected: ?*const plan_mod.Selector) anyerror!void {
+        if (try includeCanonicalPath(owner, target, name, source, path)) return;
         const a = owner.alloc;
         const dst = target.map;
         if (path.len == 0 or (source == .embedding_stream and path.len == 1 and std.mem.eql(u8, path[0], "*"))) return put(a, dst, name, .{ .borrowed = source });

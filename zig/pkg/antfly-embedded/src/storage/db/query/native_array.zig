@@ -51,14 +51,75 @@ pub const Prepared = struct {
     pub fn size(self: *Prepared, a: A, part: Part) !usize {
         const slot = &self.sizes[@backingInt(part)];
         if (slot.*) |n| return n;
-        var counter: Counter = .{ .limit = @min(8 * 1024 * 1024, ((arrays.Limits{}).work -| self.view.count) / 2) };
-        // Count through a bounded destination so an oversized envelope stops
-        // during traversal rather than after formatting every remaining cell.
-        self.write(a, counter.initWriter(), part) catch |err| return if (err == error.WriteFailed) error.SqlProgramLimitExceeded else err;
-        const n = counter.count;
-        // Preserve the wire and work ceilings without allocating the envelope.
-        if (n > 8 * 1024 * 1024 or n > ((arrays.Limits{}).work -| self.view.count) / 2) return error.SqlProgramLimitExceeded;
+        const limit = @min(8 * 1024 * 1024, ((arrays.Limits{}).work -| self.view.count) / 2);
+        const n = try self.measure(a, part, limit);
         slot.* = n;
+        return n;
+    }
+    fn add(total: *usize, n: usize, limit: usize) !void {
+        if (n > limit - total.*) return error.SqlProgramLimitExceeded;
+        total.* += n;
+    }
+    fn integerSize(integer: i64) usize {
+        const negative = integer < 0;
+        var digits: usize = if (negative) 2 else 1;
+        var n: u64 = @abs(integer);
+        while (n >= 10) : (n /= 10) digits += 1;
+        return digits;
+    }
+    fn stringSize(bytes: []const u8, limit: usize) !usize {
+        var n: usize = 2;
+        if (n > limit) return error.SqlProgramLimitExceeded;
+        for (bytes) |byte| try add(&n, switch (byte) {
+            '"', '\\', '\n', '\r', '\t', 8, 12 => 2,
+            0...7, 11, 14...31 => 6,
+            else => 1,
+        }, limit);
+        return n;
+    }
+    /// Size primitive domains from admitted cell descriptors instead of running
+    /// the serializer into an unbuffered counter. Float/NUMERIC formatting stays
+    /// with the standard codec; all domains retain the same bounded admission.
+    fn measure(self: *const Prepared, a: A, part: Part, limit: usize) anyerror!usize {
+        if (part == .whole) {
+            var n: usize = "{\"dimensions\":,\"values\":,\"sql_nulls\":}".len;
+            if (n > limit) return error.SqlProgramLimitExceeded;
+            for ([_]Part{ .dimensions, .values, .sql_nulls }) |child| try add(&n, try self.measure(a, child, limit - n), limit);
+            return n;
+        }
+        if (part == .values and (self.view.kind == .float32 or self.view.kind == .float64 or self.view.kind == .numeric)) {
+            var counter: Counter = .{ .limit = limit };
+            self.write(a, counter.initWriter(), part) catch |err| return if (err == error.WriteFailed) error.SqlProgramLimitExceeded else err;
+            return counter.count;
+        }
+        var n: usize = 2;
+        if (n > limit) return error.SqlProgramLimitExceeded;
+        for (0..self.length(part)) |i| {
+            if (i != 0) try add(&n, 1, limit);
+            const wire_size: usize = switch (part) {
+                .whole => unreachable,
+                .dimensions => blk: {
+                    const d = try self.view.dimension(i);
+                    break :blk "{\"length\":,\"lower_bound\":}".len + integerSize(d.length) + integerSize(d.lower);
+                },
+                .sql_nulls => if ((try self.view.cell(i)).sql_null) 4 else 5,
+                .values => blk: {
+                    const cell = try self.view.cell(i);
+                    if (cell.sql_null) break :blk 4;
+                    break :blk switch (self.view.kind) {
+                        .int16 => 2 + integerSize(std.mem.readInt(i16, cell.bytes[0..2], .little)),
+                        .int32 => 2 + integerSize(std.mem.readInt(i32, cell.bytes[0..4], .little)),
+                        .int64 => 2 + integerSize(std.mem.readInt(i64, cell.bytes[0..8], .little)),
+                        .text => try stringSize(cell.bytes, limit - n),
+                        .boolean => if (cell.bytes[0] == 1) 4 else 5,
+                        .uuid => 38,
+                        .jsonb => cell.bytes.len,
+                        else => unreachable,
+                    };
+                },
+            };
+            try add(&n, wire_size, limit);
+        }
         return n;
     }
     pub fn value(self: *const Prepared, a: A, index: usize) !std.json.Value {
@@ -187,4 +248,28 @@ test "public graph metric borrowed wire native SQL array preparation enforces bo
     // Tiny selected metadata remains usable even when the whole wire envelope
     // cannot be admitted. Failed sizing never poisons another part's cache.
     try std.testing.expect((try prepared.size(budget.allocator(), .dimensions)) < 100);
+}
+
+test "public graph metric borrowed wire primitive array lengths match every escape and integer boundary" {
+    const a = std.testing.allocator;
+    var all: [127]u8 = undefined;
+    for (0..127) |i| all[i] = @intCast(i + 1);
+    const text = "quote\" slash\\ newline\n return\r tab\t back\x08 form\x0c ctrl\x01 é中";
+    for ([_][]const u8{ text, all[0..], "" }) |value| {
+        const array = try arrays.Value.init(.text, &.{.{ .length = 2, .lower = -3 }}, &.{ arrays.Element.json(.{ .string = value }), .{ .value = .null, .sql_null = true } }, .{});
+        const bytes = try storage.encodeAlloc(a, array, .{});
+        defer a.free(bytes);
+        var prepared = try Prepared.init(a, .text, bytes, true);
+        for ([_]Part{ .whole, .dimensions, .values, .sql_nulls }) |part| {
+            var output = std.Io.Writer.Allocating.init(a);
+            defer output.deinit();
+            try prepared.write(a, &output.writer, part);
+            try std.testing.expectEqual(output.written().len, try prepared.size(a, part));
+        }
+    }
+    for ([_]i64{ 0, 9, 10, -1, -9, -10, std.math.minInt(i64), std.math.maxInt(i64) }) |value| {
+        var buffer: [32]u8 = undefined;
+        const written = try std.fmt.bufPrint(&buffer, "{d}", .{value});
+        try std.testing.expectEqual(written.len, Prepared.integerSize(value));
+    }
 }

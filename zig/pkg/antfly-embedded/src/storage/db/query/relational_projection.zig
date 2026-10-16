@@ -824,3 +824,69 @@ test "public graph metric borrowed wire multiple prepared SQL arrays release sid
     try Check.run(a, plan, row);
     try @import("antfly_platform").allocator.checkAllAllocationFailures(a, Check.run, .{ plan, row });
 }
+
+test "public graph metric borrowed wire nested canonical prefix paths preserve overlays and bound scratch" {
+    const a = std.testing.allocator;
+    const tail = try a.alloc(u8, 1024 * 1024);
+    defer a.free(tail);
+    @memset(tail, 'x');
+    var input = std.Io.Writer.Allocating.init(a);
+    defer input.deinit();
+    try input.writer.writeAll("{\"a\":{\"b\":{\"c\":1,\"d\":2,\"tail\":\"");
+    try input.writer.writeAll(tail);
+    try input.writer.writeAll("\"}}}");
+    const columns = [_]schema.RelationalColumn{.{ .name = "payload", .path = "payload", .column_type = .json, .is_json = true, .json_kind = .any }};
+    const table: schema.TableSchema = .{ .version = 1, .storage_mode = .relational, .relational_columns = &columns };
+    var layout = try codec.PhysicalLayout.init(a, table);
+    defer layout.deinit();
+    const bytes = try codec.serializeOrdinal(a, 1, &columns, &.{.{ .ordinal = 0, .path = "payload", .is_json = true, .value_type = .bytes_val, .value = .{ .bytes_val = input.written() } }}, @splat(0));
+    defer a.free(bytes);
+    const row = try codec.ordinalRowViewTrusted(bytes, table, &layout);
+    const full = try row.reconstructValueAlloc(a);
+    defer a.free(full);
+    const cases = [_][]const []const u8{
+        &.{ "payload.a.b.c", "payload.a.b.d" },
+        &.{ "payload.a.b.d", "payload.a.b.c", "payload.a.b.c" },
+        &.{ "payload.a.b.c", "payload.a.b" },
+        &.{ "payload.a.b", "payload.a.b.c" },
+        &.{ "payload", "payload.a.b.c" },
+        &.{ "payload.a.b.c", "payload.a.b.missing" },
+    };
+    for (cases, 0..) |fields, i| {
+        var plan = try Plan.init(a, table, &layout, fields);
+        defer plan.deinit();
+        var expected = try document_query.lookupJson(a, full, .{ .fields = fields, .include_all_fields = false });
+        defer expected.deinit(a);
+        var no_resize: @import("../../lite/test_allocator.zig").NoResizeAllocator = .{ .backing = a };
+        var budget: @import("../../lite/test_allocator.zig").BudgetAllocator = .{ .backing = no_resize.allocator(), .limit = 32 * 1024 };
+        const actual = try plan.projectWithOutputPolicy(budget.allocator(), a, row, true);
+        defer a.free(actual);
+        try std.testing.expectEqualStrings(expected.json, actual);
+        try std.testing.expectEqual(@as(usize, 0), budget.live);
+        if (i == 0) {
+            const Check = struct {
+                fn run(scratch: std.mem.Allocator, projection: Plan, source: codec.OrdinalRowView, want: []const u8) !void {
+                    const output = try projection.projectWithOutputPolicy(scratch, std.testing.allocator, source, true);
+                    defer std.testing.allocator.free(output);
+                    try std.testing.expectEqualStrings(want, output);
+                }
+            };
+            try @import("antfly_platform").allocator.checkAllAllocationFailures(a, Check.run, .{ plan, row, expected.json });
+        }
+    }
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const selector = try @import("json_projection_plan.zig").compile(arena.allocator(), &.{.{ .parts = &.{ "a", "b", "c" } }});
+    var view = JsonView.init(arena.allocator(), input.written());
+    view.canonical_source = input.written();
+    try view.prepareProjection(selector, .visited, .object_only);
+    try std.testing.expectEqualStrings("1", view.canonicalPath(&.{ "a", "b", "c" }).?);
+    // A full parent is never represented by an incomplete borrowed span.
+    try std.testing.expect(view.canonicalPath(&.{ "a", "b" }) == null);
+    try std.testing.expect((try view.field(&view.root, "a")) != null);
+    view.parse_numbers = true;
+    try std.testing.expect(view.canonicalPath(&.{ "a", "b", "c" }) == null);
+    view.parse_numbers = false;
+    view.root.raw = "{\"a\":{\"b\":{\"c\":99}}}";
+    try std.testing.expect(view.canonicalPath(&.{ "a", "b", "c" }) == null);
+}

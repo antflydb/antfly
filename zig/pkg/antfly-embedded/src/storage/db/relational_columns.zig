@@ -3159,6 +3159,13 @@ pub fn scan(db: anytype, alloc: alloc_type, txn: *store_mod.DocStore.Txn, from: 
                         // A clean covered row must still name the exact primary
                         // image. Never emit stale selection after derived damage.
                         if (!std.mem.eql(u8, &row.hash, &typed.semanticHash()) or row.timestamp != typed.writeTimestampNs()) return error.InvalidColumnSegment;
+                        if (visitor.borrow_documents and opts.fields.len == 0 and opts.include_all_fields) {
+                            // The primary scope must outlive synchronous delivery.
+                            var context: @import("query/streamed_projection.zig").Context = .{ .scratch = row_alloc, .value = .{ .whole_row = typed } };
+                            try deliverValue(alloc, row, null, context.borrow(), opts, visitor, progress);
+                            if (opts.limit > 0 and progress.delivered >= opts.limit) return true;
+                            continue;
+                        }
                         projected = try projectPrimary(schema_plan, materializer, row_alloc, row.key, typed);
                     }
                 }
@@ -3216,6 +3223,9 @@ fn deliverPrimary(alloc: alloc_type, scratch: alloc_type, plan: *const scan_plan
     if (visitor.borrow_documents and opts.include_documents) if (plan.projected) |projection| {
         streamed = .{ .scratch = scratch, .value = .{ .row = .{ .plan = projection, .row = typed } } };
     };
+    if (visitor.borrow_documents and opts.include_documents and opts.fields.len == 0 and opts.include_all_fields) {
+        streamed = .{ .scratch = scratch, .value = .{ .whole_row = typed } };
+    }
     const projected = if (opts.include_documents and streamed == null) try projectPrimary(plan, materializer, scratch, row.key, typed) else null;
     try deliverValue(alloc, row, projected, if (streamed) |*context| context.borrow() else null, opts, visitor, progress);
 }

@@ -1124,6 +1124,7 @@ const ParsedOrdinal = struct {
 pub const OrdinalCellIterator = struct {
     parsed: ParsedOrdinal,
     table_schema: runtime_schema.TableSchema,
+    validate_payloads: bool = true,
     next_ordinal: usize = 0,
     next_sparse_entry: usize = 0,
 
@@ -1148,7 +1149,7 @@ pub const OrdinalCellIterator = struct {
             if (ordinal >= self.table_schema.relational_columns.len) return error.InvalidRelationalRow;
             const column = self.table_schema.relational_columns[ordinal];
             const payload = try sparsePayloadSliceAtIndex(self.parsed, entry_index);
-            return try ordinalCellFromPayload(column, ordinal, payload, sparseEntryIsNull(self.parsed, entry_index));
+            return try ordinalCellFromPayloadWithValidation(column, ordinal, payload, sparseEntryIsNull(self.parsed, entry_index), self.validate_payloads);
         }
 
         while (self.next_ordinal < self.table_schema.relational_columns.len) {
@@ -1160,7 +1161,7 @@ pub const OrdinalCellIterator = struct {
                 try ordinalPayloadSliceChecked(self.parsed, column, ordinal)
             else
                 ordinalPayloadSlice(self.parsed, self.table_schema.relational_columns, column, ordinal);
-            return try ordinalCellFromPayload(column, ordinal, payload, bitmapBit(self.parsed.nulls, ordinal));
+            return try ordinalCellFromPayloadWithValidation(column, ordinal, payload, bitmapBit(self.parsed.nulls, ordinal), self.validate_payloads);
         }
         return null;
     }
@@ -1253,6 +1254,52 @@ pub const OrdinalRowView = struct {
     pub fn reconstructValueAlloc(self: OrdinalRowView, alloc: Allocator) ![]u8 {
         if (self.checksum_groups) |groups| try groups.verify(0, groups.body.len);
         return try reconstructParsedOrdinalValueAlloc(alloc, self.parsed, self.table_schema);
+    }
+
+    /// Full-document scan output borrows every physical cell. Preserve the
+    /// historical document-wide normalization boundary for literal _id tokens;
+    /// ordinary rows need no reconstructed JSON owner or output-sized scratch.
+    pub fn writeScanFields(self: OrdinalRowView, scratch: Allocator, writer: *std.Io.Writer) !void {
+        var iterator = try self.cellIterator();
+        iterator.validate_payloads = !self.payloads_validated;
+        var probe = iterator;
+        while (try probe.next()) |cell| {
+            var normalize = std.mem.eql(u8, cell.path, "_id");
+            if (!cell.is_null and cell.value_type == .bytes_val) {
+                const bytes = cell.value.bytes_val;
+                if (cell.sql_array_element_type) |kind| {
+                    if (kind == .text or kind == .jsonb) {
+                        const array = try @import("../query/native_array.zig").Prepared.init(scratch, kind, bytes, self.payloads_validated);
+                        for (0..array.view.count) |i| {
+                            const element = try array.view.cell(i);
+                            if (!element.sql_null and (if (kind == .text) std.mem.eql(u8, element.bytes, "_id") else std.mem.indexOf(u8, element.bytes, "\"_id\"") != null)) {
+                                normalize = true;
+                                break;
+                            }
+                        }
+                    }
+                } else if (cell.is_json) {
+                    normalize = normalize or std.mem.indexOf(u8, bytes, "\"_id\"") != null;
+                } else if (!cell.is_dense_vector and !cell.is_numeric) {
+                    normalize = normalize or std.mem.eql(u8, bytes, "_id");
+                }
+            }
+            if (normalize) {
+                const json = try self.reconstructValueAlloc(scratch);
+                defer scratch.free(json);
+                return @import("../document_query.zig").writeRawScanFields(scratch, writer, json);
+            }
+        }
+        while (try iterator.next()) |cell| {
+            if (!cell.is_null and cell.sql_array_element_type != null) {
+                var array = try @import("../query/native_array.zig").Prepared.init(scratch, cell.sql_array_element_type.?, cell.value.bytes_val, self.payloads_validated);
+                _ = try array.size(scratch, .whole);
+                try writer.writeByte(',');
+                try writeJsonString(writer, cell.path);
+                try writer.writeByte(':');
+                try array.write(scratch, writer, .whole);
+            } else try writeCellMember(scratch, writer, cell, true);
+        }
     }
 
     pub fn materializeRootAlloc(self: OrdinalRowView, alloc: Allocator) !MaterializedOrdinalRoot {
