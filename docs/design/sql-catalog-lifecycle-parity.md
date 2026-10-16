@@ -9971,3 +9971,59 @@ activation still requires retained typed key descriptors, predicate implication,
 prepared probe operands, coordinated snapshots/range proofs and a shared
 EXPLAIN/execution access plan. Raft index publication remains unfinished.
 No additional original cases are qualified: 531 implemented / 810 unresolved.
+
+### Request-owned complete index declarations and iterator failure integrity
+
+SQL table bindings now retain immutable ordered-index declarations separately
+from the existing direct-total probe list. The descriptors preserve mixed
+column/expression key order, declared expression result domains, collation,
+direction, NULL placement, included columns and every partial predicate,
+including constant-false membership and exact numeric operand tokens.
+They describe eligibility only: no readiness, owner coverage, publication
+pointer, authorization decision or predicate proof is cached.
+
+The server schema cache derives these descriptors on a miss and clones the
+compact owned trees directly on hits, without stringify/reparse. Both cached
+and uncached paths survive parser retirement and cache eviction. Cache retention
+remains bounded by the existing entry budget; oversized entries use the
+statement-owned fallback. Existing direct-total consumers cannot accidentally
+use an expression/partial declaration. Malformed native key combinations,
+predicate shapes, unsupported access channels and declaration limits fail closed.
+The regression covers SQL-lowered definitions, mixed composite keys, exact
+integers above binary64 precision, constant-false membership, fallback,
+eviction and exhaustive allocation failures.
+
+The first broad Debug run exposed a swallowed allocation failure in UNNEST's
+exhaustion pull. The focused reproduction and captured failure stack identify
+`ArenaAllocator.reset(retain_with_limit)` consolidation, not array expansion,
+at the induced allocation cut. Retention can allocate even when no later row
+needs allocating. UNNEST now clears borrowed cells before resetting and
+propagates failure. Analogous recursive, scalar-Apply, membership and hash/spill
+join iterator retention paths also propagate failure. Scratch retention and
+normal reuse remain enabled; this is not a free-all workaround. The existing
+UNNEST allocation-fault and capture-close contract passes unchanged; temporary
+diagnostic instrumentation was removed.
+
+Final validation:
+
+- Full Debug SQL: 875 core plus 234 server tests pass, four existing opt-in
+  skips, zero failures/leaks, 21/21 steps in
+  `/private/tmp/antfly-sql-index-descriptor-full-final-debug.log`.
+- Mounted Debug: all 14 cache/owner-admission contracts pass without skips,
+  failures or leaks, 75/75 steps in
+  `/private/tmp/antfly-sql-index-descriptor-mounted-postfix-debug.log`.
+  The fixture runs with loopback permission; the earlier sandbox bind denial
+  is recorded separately and is not counted as successful mounted coverage.
+- Focused malformed-definition and all four UNNEST contracts pass in
+  `/private/tmp/antfly-sql-index-descriptor-rejection-debug.log` and
+  `/private/tmp/antfly-sql-unnest-allocation-fixed-debug.log`.
+- Formatting, licensing, the 2,062-source Apache boundary and original
+  inventory audits pass. No inventory or disposition changes.
+
+This closes declaration retention, not indexed-read activation. Remaining work
+includes binding the embedded resolver to the same descriptor contract, shared
+typed expression/partial access planning, invocation-owned probe operands,
+fresh generation/owner-coverage authority, coordinated snapshot/range proofs,
+and one EXPLAIN/execution plan. Raft-backed index publication and per-constraint
+NOT VALID/VALIDATE intent remain incomplete. No additional original cases are
+qualified: 531 implemented / 810 unresolved.

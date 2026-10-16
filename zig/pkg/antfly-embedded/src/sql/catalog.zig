@@ -50,6 +50,135 @@ pub const Index = struct {
     columns: []const []const u8,
 };
 
+/// Immutable declared access shapes, not proof of readiness or membership.
+/// Keep these separate from `Index`: existing direct-total probe consumers
+/// must not accidentally treat a partial or expression index as total.
+pub const IndexDefinition = struct {
+    const native = @import("../storage/relational_index.zig");
+    pub const Key = struct {
+        column: []const u8,
+        expression: ?std.json.Value,
+        result_type: ?@import("../storage/schema.zig").RelationalColumnType,
+        collation: ?[]const u8,
+        direction: native.RelationalIndexKeyDirection,
+        nulls: native.RelationalIndexKeyNulls,
+    };
+    pub const Predicate = struct {
+        constant: ?bool,
+        column: []const u8,
+        op: native.UniquePredicateOp,
+        value: ?std.json.Value,
+        collation: ?[]const u8,
+    };
+    name: []const u8,
+    keys: []const Key,
+    include_columns: []const []const u8,
+    where: []const Predicate,
+
+    fn copyOptional(a: std.mem.Allocator, value: ?[]const u8) !?[]const u8 {
+        return if (value) |bytes| try a.dupe(u8, bytes) else null;
+    }
+
+    /// All allocations, including partial failure, belong to the caller's
+    /// preparation region. Decode only on schema derivation, never cache hits.
+    pub fn fromNativeLeaky(a: std.mem.Allocator, definition: native.RelationalIndexDefinition) !IndexDefinition {
+        // This view describes the schema's ordered tuple declarations only.
+        // Other access methods and legacy expression channels need their own
+        // binding contracts rather than an incomplete tuple approximation.
+        if (definition.access_method != .ordered_tuple or definition.expressions.len != 0 or definition.where_expressions.len != 0 or
+            definition.keys.len == 0 or definition.keys.len > 32 or definition.where.len > 256 or definition.include_columns.len > 256)
+            return error.InvalidSqlBackendResponse;
+        const keys = try a.alloc(Key, definition.keys.len);
+        for (definition.keys, keys) |source, *key| {
+            if ((source.expression_json != null) != (source.result_type != null) or
+                (source.expression_json != null) == (source.column.len != 0)) return error.InvalidSqlBackendResponse;
+            key.* = .{
+                .column = try a.dupe(u8, source.column),
+                .expression = if (source.expression_json) |bytes| try std.json.parseFromSliceLeaky(std.json.Value, a, bytes, .{ .parse_numbers = false, .allocate = .alloc_always }) else null,
+                .result_type = source.result_type,
+                .collation = try copyOptional(a, source.collation),
+                .direction = source.direction,
+                .nulls = source.nulls,
+            };
+        }
+        const predicates = try a.alloc(Predicate, definition.where.len);
+        for (definition.where, predicates) |source, *predicate| {
+            if (source.constant != null) {
+                if (source.field.len != 0 or source.op != .eq or source.value_json != null or source.collation != null)
+                    return error.InvalidSqlBackendResponse;
+            } else if (source.field.len == 0) return error.InvalidSqlBackendResponse;
+            predicate.* = .{
+                .constant = source.constant,
+                .column = try a.dupe(u8, source.field),
+                .op = source.op,
+                .value = if (source.value_json) |bytes| try std.json.parseFromSliceLeaky(std.json.Value, a, bytes, .{ .parse_numbers = false, .allocate = .alloc_always }) else null,
+                .collation = try copyOptional(a, source.collation),
+            };
+        }
+        return .{ .name = try a.dupe(u8, definition.name), .keys = keys, .include_columns = try copyNames(a, definition.include_columns), .where = predicates };
+    }
+
+    fn copyNames(a: std.mem.Allocator, input: []const []const u8) ![]const []const u8 {
+        const output = try a.alloc([]const u8, input.len);
+        for (input, output) |name, *copy| copy.* = try a.dupe(u8, name);
+        return output;
+    }
+
+    /// Request ownership survives cache eviction. Clone the compact trees
+    /// directly, preserving exact literal tokens without stringify/reparse.
+    pub fn cloneLeaky(self: IndexDefinition, a: std.mem.Allocator) !IndexDefinition {
+        const keys = try a.alloc(Key, self.keys.len);
+        for (self.keys, keys) |source, *key| {
+            key.* = source;
+            key.column = try a.dupe(u8, source.column);
+            key.collation = try copyOptional(a, source.collation);
+            key.expression = if (source.expression) |value| try @import("../storage/typed_json.zig").clone(a, value) else null;
+        }
+        const predicates = try a.alloc(Predicate, self.where.len);
+        for (self.where, predicates) |source, *predicate| {
+            predicate.* = source;
+            predicate.column = try a.dupe(u8, source.column);
+            predicate.collation = try copyOptional(a, source.collation);
+            predicate.value = if (source.value) |value| try @import("../storage/typed_json.zig").clone(a, value) else null;
+        }
+        return .{ .name = try a.dupe(u8, self.name), .keys = keys, .include_columns = try copyNames(a, self.include_columns), .where = predicates };
+    }
+};
+
+test "SQL index descriptors reject incomplete native access shapes" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const native = @import("../storage/relational_index.zig");
+    const valid: native.RelationalIndexDefinition = .{ .name = "key", .owner_kind = .table, .owner_name = native.relational_table_index_owner_name, .access_method = .ordered_tuple, .keys = &.{.{ .column = "id" }} };
+    _ = try IndexDefinition.fromNativeLeaky(a, valid);
+    for ([_][]const native.RelationalIndexKey{
+        &.{},
+        &.{.{}},
+        &.{.{ .column = "id", .expression_json = "{}", .result_type = .integer }},
+        &.{.{ .expression_json = "{}" }},
+        &.{.{ .column = "id", .result_type = .integer }},
+    }) |keys| {
+        var malformed = valid;
+        malformed.keys = keys;
+        try std.testing.expectError(error.InvalidSqlBackendResponse, IndexDefinition.fromNativeLeaky(a, malformed));
+    }
+    for ([_]native.UniquePredicate{
+        .{},
+        .{ .constant = true, .field = "id" },
+        .{ .constant = false, .op = .ne },
+        .{ .constant = true, .value_json = "null" },
+        .{ .constant = true, .collation = "binary" },
+    }) |predicate| {
+        var malformed = valid;
+        malformed.where = &.{predicate};
+        try std.testing.expectError(error.InvalidSqlBackendResponse, IndexDefinition.fromNativeLeaky(a, malformed));
+    }
+    var other_method = valid;
+    other_method.access_method = .scalar_column;
+    try std.testing.expectError(error.InvalidSqlBackendResponse, IndexDefinition.fromNativeLeaky(a, other_method));
+}
+
 /// Pinned declarative constraints, not similarly named access indexes. Native
 /// execution independently rebinds the name to its guarded durable generation.
 pub const Constraint = struct {
@@ -120,6 +249,7 @@ pub const Table = struct {
     external_indexes: ?ExternalIndexes = null,
     columns: []const Column,
     indexes: []const Index = &.{},
+    index_definitions: []const IndexDefinition = &.{},
     constraints: []const Constraint = &.{},
     /// Request-owned logical authority. Never use a mutable adapter's last
     /// resolved name to validate an earlier table in a join or subquery.

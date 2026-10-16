@@ -755,7 +755,7 @@ fn Engine(comptime Context: type) type {
                             try Iterator.createRecursive(engine, plan.step, plan.id);
                         self.iterator.?.markPrefixProducer();
                     }
-                    _ = self.scratch.reset(.{ .retain_with_limit = 16 * 1024 });
+                    if (!self.scratch.reset(.{ .retain_with_limit = 16 * 1024 })) return error.OutOfMemory;
                     const a = self.scratch.allocator();
                     if (try self.iterator.?.nextDemand(a, 1)) |values| {
                         const normalized = try normalize(a, self.node.columns, values);
@@ -1344,8 +1344,11 @@ fn Engine(comptime Context: type) type {
                 while (true) {
                     try self.engine.checkpoint();
                     if (self.unnest_values == null or self.unnest_index == self.unnest_count) {
-                        _ = self.arena.reset(.{ .retain_with_limit = 16 * 1024 });
                         self.unnest_values = null;
+                        // Retention can consolidate arena blocks and allocate.
+                        // Clear borrowed cells first and propagate failure,
+                        // including on the final exhaustion pull.
+                        if (!self.arena.reset(.{ .retain_with_limit = 16 * 1024 })) return error.OutOfMemory;
                         const input = (try self.left.?.next(self.arena.allocator())) orelse return null;
                         const values = try self.arena.allocator().alloc(Datum, function.arrays.len);
                         self.unnest_count = 0;
@@ -1414,7 +1417,7 @@ fn Engine(comptime Context: type) type {
                         const row = if (apply.single_row) blk: {
                             const owned = try self.scratch.allocator().alloc(Datum, right.len);
                             for (right, owned) |value, *out| out.* = try operators.cloneDatum(self.scratch.allocator(), value);
-                            _ = self.probe_arena.reset(.{ .retain_with_limit = 16 * 1024 });
+                            if (!self.probe_arena.reset(.{ .retain_with_limit = 16 * 1024 })) return error.OutOfMemory;
                             if (try self.right.?.next(self.probe_arena.allocator()) != null) return error.SqlCardinalityViolation;
                             break :blk owned;
                         } else right;
@@ -1968,7 +1971,7 @@ fn Engine(comptime Context: type) type {
                     self.membership_index = try operators.TupleMembership.create(self.engine.context.alloc, join.right_keys.len, .{ .rows = self.engine.context.limits.scan_rows, .bytes = self.engine.context.limits.retained_bytes, .work = self.engine.context.limits.scan_rows *| 64 }, .{ .ptr = self.engine, .call = membershipCheckpoint });
                     while (true) {
                         try self.engine.checkpoint();
-                        _ = self.scratch.reset(.retain_capacity);
+                        if (!self.scratch.reset(.retain_capacity)) return error.OutOfMemory;
                         const a = self.scratch.allocator();
                         const row = try self.right.?.next(a) orelse break;
                         const keys_ = try self.keys(a, join.right_keys, row);
@@ -1986,7 +1989,7 @@ fn Engine(comptime Context: type) type {
                     }
                 }
                 const row = try self.left.?.next(alloc) orelse return null;
-                _ = self.scratch.reset(.retain_capacity);
+                if (!self.scratch.reset(.retain_capacity)) return error.OutOfMemory;
                 const keys_ = try self.keys(self.scratch.allocator(), join.left_keys, row);
                 const null_correlation = for (keys_[0..correlations]) |key| {
                     if (key.sql_null) break true;
@@ -2055,7 +2058,7 @@ fn Engine(comptime Context: type) type {
                                     defer transfer.deinit();
                                     var index: usize = 0;
                                     while (try self.hash_join.?.unmatched(&index)) |match| {
-                                        _ = transfer.reset(.retain_capacity);
+                                        if (!transfer.reset(.retain_capacity)) return error.OutOfMemory;
                                         try owner.add(true, try match.materializeValues(transfer.allocator()), try match.materializeKeys(transfer.allocator()), @intCast(match.index));
                                     }
                                     self.hash_join.?.deinit();
@@ -2081,7 +2084,7 @@ fn Engine(comptime Context: type) type {
                             .flipped = self.flipped_join,
                         };
                         while (true) {
-                            _ = scratch.reset(.retain_capacity);
+                            if (!scratch.reset(.retain_capacity)) return error.OutOfMemory;
                             const a = scratch.allocator();
                             const count = @min(self.engine.context.limits.executionRows(), @max(@as(usize, 1), self.engine.context.limits.retained_bytes / (16 * 1024 + self.left.?.node.columns.len * @sizeOf(Datum) * 16)));
                             const batch = try self.left.?.nextBatch(a, count, null);
@@ -2112,7 +2115,7 @@ fn Engine(comptime Context: type) type {
                             // lifetime. Reuse retained pages across output rows;
                             // returned cells still reference the stable probe/build
                             // rows, not this transient candidate allocation.
-                            _ = self.scratch.reset(.retain_capacity);
+                            if (!self.scratch.reset(.retain_capacity)) return error.OutOfMemory;
                             if (self.left_values == null) self.left_values = try self.probe_payload.row(self.probe_arena.allocator(), self.probe_index - 1);
                             const values = try self.combine(self.scratch.allocator(), self.left_values, try match.materializeValues(self.scratch.allocator()));
                             if (join.condition) |program| {
