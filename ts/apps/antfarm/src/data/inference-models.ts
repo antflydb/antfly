@@ -155,7 +155,12 @@ export interface InferenceModel {
   sourceUrl: string;
   type: ModelType;
   description: string;
-  capabilities?: ExtractorCapability[];
+  /** Server-advertised executable capabilities. */
+  capabilities?: string[];
+  /** Server-advertised accepted input modalities. */
+  inputs?: string[];
+  /** Antfly CLI download guidance is only applicable to the Antfly provider. */
+  allowDownloads?: boolean;
   variants: QuantizationType[];
   backends?: Backend[];
   architecture?: string;

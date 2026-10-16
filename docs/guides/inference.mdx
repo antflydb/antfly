@@ -204,6 +204,12 @@ The chunkers `fixed_bert` and `fixed_bpe` are built in and need no download. Chu
 - **Memory.** Model loads and requests reserve memory before they allocate. The reservation comes from one process envelope shared with storage and caches. Set the envelope with `--process-memory-budget-mb` or `ANTFLY_PROCESS_MEMORY_BUDGET_MB` on `antfly standalone` or `antfly inference run`. Otherwise the cgroup limit is used, and host memory without a cgroup limit. In Kubernetes Burstable pods, set it below the container limit. A request that can never fit returns `MODEL_RESOURCE_LIMIT`. Temporary pressure returns a retryable `MODEL_RESOURCE_BUSY` once idle models have been evicted.
 - **Query priority.** Background enrichment yields to query-time work in the same database process. Embedding backfill pauses (up to 5 s) while a query-time embed is running, and background generation pauses while an interactive generate or chat request is in flight. Backfill that receives `503` retries with backoff.
 
+### Loading models in Antfarm
+
+Antfarm's Models page shows whether a local model is available, loading, loaded, or in use. **Load model** warms the same cache used by ordinary inference. **Unload** releases an idle model; it does not delete downloaded files. These are dashboard controls, not public model-instance resources or SDK operations.
+
+The controls affect the shared local inference process, not just the current browser tab. Loading does not pin weights: normal idle and memory-pressure eviction still applies. Loaded models may use streamed or backend-managed weights rather than full GPU residency. Models that are loading, serving requests, or managed by startup preload configuration cannot be unloaded from the dashboard.
+
 ### When to Split Inference Out
 
 Embedded inference suits a single machine and models that fit comfortably beside the database's caches. Run `antfly inference run` (or an operator `InferencePool`) and point `inference.api_url` at it when:

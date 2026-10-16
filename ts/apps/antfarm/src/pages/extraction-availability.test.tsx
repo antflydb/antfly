@@ -7,9 +7,17 @@ import KnowledgeGraphPlaygroundPage from "./KnowledgeGraphPlaygroundPage";
 const mocks = vi.hoisted(() => ({ models: ["gliner2"], request: vi.fn() }));
 vi.mock("@/hooks/use-connections", () => ({
   useSelectedInferenceModelNames: () => ({ models: mocks.models, loading: false }),
+  useSelectedInferenceModels: () => ({
+    models: mocks.models.map((name) => ({ name })),
+    loading: false,
+  }),
 }));
 vi.mock("@/hooks/use-api-config", () => ({
-  useApiConfig: () => ({ inferenceUrl: () => "/extract" }),
+  useApiConfig: () => ({
+    inferenceUrl: () => "/extract",
+    inferenceConnectionId: "local-inference",
+    setInferenceConnectionId: vi.fn(),
+  }),
 }));
 vi.mock("@/components/branded-empty-state", () => ({ PlaygroundEmptyState: () => null }));
 vi.mock("@/components/playground/BackendInfoBar", () => ({ BackendInfoBar: () => null }));

@@ -1,5 +1,5 @@
 import { Badge, Button } from "@antfly/design-system";
-import { Check, Copy, Download, ExternalLink } from "lucide-react";
+import { Check, Copy, ExternalLink, PackageSearch } from "lucide-react";
 import { useState } from "react";
 import { Link } from "react-router-dom";
 import {
@@ -75,21 +75,21 @@ export function NoModelsGuide({
   return (
     <div className={containerClasses}>
       <div className="flex items-start gap-3">
-        <Download
+        <PackageSearch
           className={`h-4 w-4 mt-0.5 shrink-0 ${soft ? "text-muted-foreground" : "af-status-icon-warning"}`}
         />
         <div className="flex-1 min-w-0">
-          <p className={titleClasses}>No {typeName} models installed</p>
+          <p className={titleClasses}>No compatible {typeName} model is available</p>
           <p className={`${descClasses} mt-1`}>
             {soft
-              ? `Download a model for semantic ${typeName} capabilities. The fixed-token mode still works without a model.`
-              : `Download a ${typeName} model to get started. Use the commands below or browse the model catalog.`}
+              ? `Add a compatible model for semantic ${typeName}. The fixed-token mode remains available without one.`
+              : `Connect or install a ${typeName} model, then refresh model discovery.`}
           </p>
 
           {suggestions.length > 0 && (
             <div className="mt-3 space-y-2">
               {suggestions.map((model) => {
-                const command = getDownloadCommand(model);
+                const command = model.allowDownloads ? getDownloadCommand(model) : "";
                 return (
                   <div
                     key={model.id}
@@ -104,11 +104,17 @@ export function NoModelsGuide({
                           </Badge>
                         )}
                       </div>
-                      <code className="text-[11px] text-muted-foreground font-mono block truncate">
-                        {command}
-                      </code>
+                      {command ? (
+                        <code className="text-[11px] text-muted-foreground font-mono block truncate">
+                          {command}
+                        </code>
+                      ) : (
+                        <span className="text-[11px] text-muted-foreground">
+                          Available through {model.connectionName}
+                        </span>
+                      )}
                     </div>
-                    <CopyCommandButton command={command} />
+                    {command ? <CopyCommandButton command={command} /> : null}
                   </div>
                 );
               })}

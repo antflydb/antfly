@@ -3,14 +3,14 @@ import {
   Collapsible,
   CollapsibleContent,
   CollapsibleTrigger,
-  DashboardPage,
-  DashboardPageActions,
-  DashboardPageDescription,
-  DashboardPageHeader,
-  DashboardPageTitle,
   DashboardToolbar,
   Input,
   MonoLabel,
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
   Sheet,
   SheetContent,
   SheetDescription,
@@ -29,6 +29,7 @@ import {
   BookOpen,
   Check,
   ChevronDown,
+  CircleDot,
   Cloud,
   Copy,
   Cpu,
@@ -38,6 +39,8 @@ import {
   Gauge,
   Monitor,
   Package,
+  Power,
+  PowerOff,
   RefreshCw,
   Scissors,
   Search,
@@ -50,10 +53,10 @@ import {
 import type React from "react";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useNavigate } from "react-router-dom";
+import { AIWorkflowHeader, AIWorkflowPage } from "@/components/ai-workflow";
 import { ErrorState, NoResultsState } from "@/components/branded-empty-state";
 import { ConnectedProvidersSummary } from "@/components/ConnectedProvidersSummary";
 import { RuntimeProfiles } from "@/components/models/RuntimeProfiles";
-import { isProductEnabled } from "@/config/products";
 import {
   type Backend,
   type ExtractorCapability,
@@ -72,6 +75,12 @@ import {
 } from "@/data/inference-models";
 import { useApiConfig } from "@/hooks/use-api-config";
 import { useInferenceRegistry } from "@/hooks/use-inference-registry";
+import {
+  type ModelRuntime,
+  type ModelRuntimeInstance,
+  useModelRuntime,
+} from "@/hooks/use-model-runtime";
+import { huggingFaceRepoId } from "@/lib/huggingface-model-ref";
 import { cn } from "@/lib/utils";
 
 // Icon mapping for model types
@@ -103,6 +112,38 @@ const CAPABILITY_LABELS: Record<ExtractorCapability, string> = {
   answers: "QA",
 };
 
+function capabilityLabel(capability: string): string {
+  return CAPABILITY_LABELS[capability as ExtractorCapability] ?? capability.replaceAll("_", " ");
+}
+
+function modelProvider(model: InferenceModel): string {
+  // Local inference's connection provider is Antfly; the namespace identifies
+  // the model publisher (for example, google or fastino).
+  const namespace = huggingFaceRepoId(model.source)?.split("/")[0];
+  return (namespace || model.provider).toLowerCase();
+}
+
+function runtimeStatus(runtime: ModelRuntime | undefined) {
+  if (!runtime) return { label: "Available", tone: "text-muted-foreground" };
+  if (runtime.runtimes.some((item) => item.state === "in_use")) {
+    return { label: "In use", tone: "af-status-text-info" };
+  }
+  if (
+    runtime.load_state === "loading" ||
+    runtime.runtimes.some((item) => item.state === "loading")
+  ) {
+    return { label: "Loading", tone: "af-status-text-warning" };
+  }
+  if (runtime.runtimes.length > 0) return { label: "Loaded", tone: "af-status-text-success" };
+  return { label: "Available", tone: "text-muted-foreground" };
+}
+
+function runtimeInstanceLabel(instance: ModelRuntimeInstance): string {
+  if (instance.state === "in_use") return "In use";
+  if (instance.state === "loading") return "Loading";
+  return "Loaded";
+}
+
 // Hardware capability icons
 const HARDWARE_ICONS: Record<HardwareCapability, React.FC<{ className?: string }>> = {
   "nvidia-gpu": Monitor,
@@ -120,6 +161,9 @@ const HardwareBadges: React.FC<{
   backends?: string[];
   showLabels?: boolean;
 }> = ({ backends, showLabels = true }) => {
+  if (!backends || backends.length === 0) {
+    return <span className="text-xs text-muted-foreground">Reported after runtime load</span>;
+  }
   const capabilities = getHardwareCapabilities(backends as Backend[]);
 
   return (
@@ -176,18 +220,14 @@ function formatNumber(num: number): string {
   return num.toString();
 }
 
-function isHuggingFaceSource(source: string): boolean {
-  return source.includes("/") && !source.startsWith("/") && !source.includes("://");
-}
-
 // Hook to fetch HuggingFace stats for a model
 function useHFStats(source: string): HFStats {
-  const shouldFetch = isHuggingFaceSource(source);
+  const repoId = huggingFaceRepoId(source);
   const [stats, setStats] = useState<HFStats>(() => {
-    if (!shouldFetch) {
+    if (!repoId) {
       return { downloads: 0, likes: 0, loading: false, error: true };
     }
-    const cached = hfStatsCache.get(source);
+    const cached = hfStatsCache.get(repoId);
     if (cached) {
       return { ...cached, loading: false, error: false };
     }
@@ -195,13 +235,14 @@ function useHFStats(source: string): HFStats {
   });
 
   useEffect(() => {
-    if (!shouldFetch) {
+    if (!repoId) {
       setStats({ downloads: 0, likes: 0, loading: false, error: true });
       return;
     }
+    const normalizedRepoId = repoId;
 
     // Skip if already cached
-    const cached = hfStatsCache.get(source);
+    const cached = hfStatsCache.get(normalizedRepoId);
     if (cached) {
       setStats({ ...cached, loading: false, error: false });
       return;
@@ -211,7 +252,7 @@ function useHFStats(source: string): HFStats {
 
     async function fetchStats() {
       try {
-        const response = await fetch(`https://huggingface.co/api/models/${source}`, {
+        const response = await fetch(`https://huggingface.co/api/models/${normalizedRepoId}`, {
           signal: controller.signal,
         });
 
@@ -221,7 +262,7 @@ function useHFStats(source: string): HFStats {
         if (!response.ok) {
           // Handle rate limiting specifically
           if (response.status === 429) {
-            console.warn(`HuggingFace API rate limited for ${source}`);
+            console.warn(`HuggingFace API rate limited for ${normalizedRepoId}`);
           }
           throw new Error(`Failed to fetch: ${response.status}`);
         }
@@ -237,7 +278,7 @@ function useHFStats(source: string): HFStats {
         };
 
         // Cache the result
-        hfStatsCache.set(source, result);
+        hfStatsCache.set(normalizedRepoId, result);
         setStats({ ...result, loading: false, error: false });
       } catch (err) {
         if ((err as Error).name !== "AbortError" && !controller.signal.aborted) {
@@ -249,7 +290,7 @@ function useHFStats(source: string): HFStats {
     fetchStats();
 
     return () => controller.abort();
-  }, [source, shouldFetch]);
+  }, [repoId]);
 
   return stats;
 }
@@ -280,7 +321,7 @@ const HFLogo: React.FC<{ className?: string }> = ({ className }) => (
 const ModelStats: React.FC<{ source: string; compact?: boolean }> = ({ source, compact }) => {
   const { downloads, likes, loading, error } = useHFStats(source);
 
-  if (!isHuggingFaceSource(source)) {
+  if (!huggingFaceRepoId(source)) {
     return null;
   }
 
@@ -403,9 +444,13 @@ const TypePill: React.FC<{
 
 const ModelCard: React.FC<{
   model: InferenceModel;
+  runtime?: ModelRuntime;
+  providerManaged: boolean;
   onClick: () => void;
-}> = ({ model, onClick }) => {
+}> = ({ model, runtime, providerManaged, onClick }) => {
   const Icon = MODEL_TYPE_ICONS[model.type];
+  const status = runtimeStatus(runtime);
+  const builtIn = model.type === "chunker" && model.source === "fixed";
 
   return (
     <button
@@ -440,19 +485,35 @@ const ModelCard: React.FC<{
 
       <div className="flex items-center justify-between gap-2">
         <div className="flex items-center gap-2 text-xs text-muted-foreground">
-          {model.inRegistry ? (
+          {builtIn ? (
+            <span className="inline-flex items-center gap-1 af-status-text-success">
+              <CircleDot className="w-3 h-3" />
+              Built-in
+            </span>
+          ) : providerManaged ? (
             <span className="inline-flex items-center gap-1">
-              <Zap className="w-3 h-3" />
-              Ready
+              <Cloud className="w-3 h-3" />
+              Provider-managed
             </span>
           ) : (
+            <span className={cn("inline-flex items-center gap-1", status.tone)}>
+              <CircleDot className="w-3 h-3" />
+              {status.label}
+            </span>
+          )}
+          {model.inRegistry && providerManaged ? (
+            <span className="inline-flex items-center gap-1">
+              <Zap className="w-3 h-3" />
+              Available
+            </span>
+          ) : !model.inRegistry ? (
             <span className="inline-flex items-center gap-1">
               <Package className="w-3 h-3" />
               Export
             </span>
-          )}
+          ) : null}
           {model.capabilities?.slice(0, 2).map((cap) => (
-            <span key={cap}>{CAPABILITY_LABELS[cap]}</span>
+            <span key={cap}>{capabilityLabel(cap)}</span>
           ))}
           {model.capabilities && model.capabilities.length > 2 && (
             <span>+{model.capabilities.length - 2}</span>
@@ -472,8 +533,27 @@ const ModelDetailSheet: React.FC<{
   onOpenChange: (open: boolean) => void;
   types: { type: ModelType; name: string }[];
   quantizationOptions: QuantizationOption[];
-  allowDownloads: boolean;
-}> = ({ model, open, onOpenChange, types, quantizationOptions, allowDownloads }) => {
+  runtime?: ModelRuntime;
+  runtimeSupported: boolean;
+  providerManaged: boolean;
+  actionPending: boolean;
+  runtimeError: string | null;
+  onLoad: (task: string, model: string) => Promise<unknown>;
+  onUnload: (runtimeId: string) => Promise<unknown>;
+}> = ({
+  model,
+  open,
+  onOpenChange,
+  types,
+  quantizationOptions,
+  runtime,
+  runtimeSupported,
+  providerManaged,
+  actionPending,
+  runtimeError,
+  onLoad,
+  onUnload,
+}) => {
   const navigate = useNavigate();
   const { setInferenceConnectionId } = useApiConfig();
   const [selectedVariant, setSelectedVariant] = useState<QuantizationType | undefined>(undefined);
@@ -510,7 +590,9 @@ const ModelDetailSheet: React.FC<{
     if (opt.generatorOnly && model.type !== "generator") return false;
     return model.variants.includes(opt.type);
   });
-  const canShowDownloadCommand = allowDownloads && model.sourceUrl !== "";
+  const canShowDownloadCommand = model.allowDownloads === true && model.sourceUrl !== "";
+  const status = runtimeStatus(runtime);
+  const builtIn = model.type === "chunker" && model.source === "fixed";
 
   const selectedVariantInfo = selectedVariant
     ? availableVariants.find((q) => q.type === selectedVariant)
@@ -559,7 +641,7 @@ const ModelDetailSheet: React.FC<{
               {model.inRegistry ? (
                 <span className="inline-flex items-center gap-1 px-2 py-1 rounded-none text-xs font-medium bg-success/10 text-success dark:text-success border border-success/20">
                   <Zap className="w-3 h-3" />
-                  Ready
+                  Available
                 </span>
               ) : (
                 <span className="inline-flex items-center gap-1 px-2 py-1 rounded-none text-xs bg-muted text-muted-foreground border border-border">
@@ -582,9 +664,9 @@ const ModelDetailSheet: React.FC<{
           {/* Description */}
           <p className="text-sm text-muted-foreground leading-relaxed">{model.description}</p>
 
-          {/* Hardware Compatibility */}
+          {/* Hardware is authoritative only after runtime selection. */}
           <div>
-            <h4 className="text-xs font-medium text-muted-foreground mb-2">Runs on</h4>
+            <h4 className="text-xs font-medium text-muted-foreground mb-2">Catalog targets</h4>
             <HardwareBadges backends={model.backends} />
           </div>
 
@@ -602,28 +684,108 @@ const ModelDetailSheet: React.FC<{
                     )}
                   >
                     <Check className="w-3 h-3" />
-                    {CAPABILITY_LABELS[cap]}
+                    {capabilityLabel(cap)}
                   </span>
                 ))}
               </div>
             </div>
           )}
 
+          <div className="border border-border bg-background-secondary/25 p-4">
+            <div className="flex items-start justify-between gap-3">
+              <div>
+                <h4 className="font-mono text-xs font-medium uppercase tracking-[0.08em]">
+                  Model status
+                </h4>
+                <p className="mt-1 text-xs text-muted-foreground">
+                  {builtIn
+                    ? "This built-in chunking mode does not load a model."
+                    : providerManaged
+                      ? "Loading and residency are managed by this provider."
+                      : !runtimeSupported
+                        ? "This server does not support Antfarm model controls. Running a request still loads the model on demand."
+                        : "Load and unload affect the shared server cache, including other clients. Idle eviction still applies."}
+                </p>
+              </div>
+              <span className={cn("shrink-0 font-mono text-xs", status.tone)}>
+                {builtIn
+                  ? "Built-in · Available"
+                  : providerManaged
+                    ? "Provider-managed"
+                    : status.label}
+              </span>
+            </div>
+
+            {!builtIn && !providerManaged && runtimeSupported ? (
+              <div className="mt-3 space-y-2">
+                {(runtime?.runtimes ?? []).map((instance: ModelRuntimeInstance) => (
+                  <div
+                    key={instance.runtime_id}
+                    className="flex items-center justify-between gap-3 border-t border-border pt-2"
+                  >
+                    <div className="min-w-0 text-xs">
+                      <div className="font-mono text-foreground">
+                        {runtimeInstanceLabel(instance)}
+                        {instance.backend ? ` · ${instance.backend}` : ""}
+                      </div>
+                      <div className="truncate text-muted-foreground">
+                        {instance.runtime_kind}
+                        {instance.device ? ` · ${instance.device}` : ""}
+                        {instance.residency_mode ? ` · ${instance.residency_mode}` : ""}
+                        {instance.startup_managed ? " · Startup managed" : ""}
+                      </div>
+                    </div>
+                    <Button
+                      type="button"
+                      size="sm"
+                      variant="outline"
+                      disabled={
+                        actionPending ||
+                        instance.state !== "loaded" ||
+                        instance.startup_managed ||
+                        instance.active_requests > 0
+                      }
+                      title={
+                        instance.startup_managed
+                          ? "Startup-managed models cannot be unloaded here"
+                          : instance.state === "in_use" || instance.active_requests > 0
+                            ? "Wait for active requests to finish"
+                            : undefined
+                      }
+                      onClick={() => void onUnload(instance.runtime_id).catch(() => undefined)}
+                    >
+                      <PowerOff className="size-3.5" /> Unload
+                    </Button>
+                  </div>
+                ))}
+                {(runtime?.runtimes.length ?? 0) === 0 ? (
+                  <Button
+                    type="button"
+                    size="sm"
+                    className="w-full"
+                    disabled={actionPending || runtime?.load_state === "loading"}
+                    onClick={() => void onLoad(model.type, model.source).catch(() => undefined)}
+                  >
+                    <Power className="size-3.5" />
+                    {runtime?.load_state === "loading" ? "Loading…" : "Load model"}
+                  </Button>
+                ) : null}
+                {runtimeError ? (
+                  <p role="alert" className="text-xs text-destructive">
+                    {runtimeError}
+                  </p>
+                ) : null}
+              </div>
+            ) : null}
+          </div>
+
           {/* Download Configuration */}
           {!canShowDownloadCommand ? (
             <div className="rounded-none border border-border bg-muted/30 px-4 py-3">
               <p className="text-xs text-muted-foreground">
-                {model.sourceUrl ? (
-                  <>
-                    Use{" "}
-                    <code className="font-mono bg-muted px-1 py-0.5 rounded-none">
-                      antfly inference pull
-                    </code>{" "}
-                    CLI or the Antfly inference operator to manage models in production deployments.
-                  </>
-                ) : (
-                  "This model is provided by the running Antfly inference runtime and does not need a download command."
-                )}
+                {model.provider === "antfly"
+                  ? "This model is provided by the running Antfly inference runtime and does not need a download command."
+                  : `Manage this model through ${model.connectionName}. Antfly CLI downloads are only available for Antfly inference models.`}
               </p>
             </div>
           ) : (
@@ -809,7 +971,9 @@ const ModelDetailSheet: React.FC<{
               onClick={() => {
                 const route = MODEL_TYPE_PLAYGROUND[model.type];
                 setInferenceConnectionId(model.connectionId);
-                navigate(`${route}?model=${encodeURIComponent(model.source)}`);
+                navigate(
+                  `${route}?model=${encodeURIComponent(model.source)}&connection=${encodeURIComponent(model.connectionId)}`
+                );
                 onOpenChange(false);
               }}
             >
@@ -913,32 +1077,23 @@ const TypeContextBanner: React.FC<{
 const ModelsPage: React.FC = () => {
   const { models, types, quantizationOptions, loading, error, retry } = useInferenceRegistry();
   const { apiUrl, inferenceApiUrl } = useApiConfig();
+  const runtime = useModelRuntime();
   const navigate = useNavigate();
   const [searchQuery, setSearchQuery] = useState("");
   const [selectedType, setSelectedType] = useState<ModelType | "all">("all");
   const [selectedConnection, setSelectedConnection] = useState("all");
-  const [selectedModel, setSelectedModel] = useState<InferenceModel | null>(null);
+  const [selectedProvider, setSelectedProvider] = useState("all");
+  const [selectedModelId, setSelectedModelId] = useState<string | null>(null);
   const [sheetOpen, setSheetOpen] = useState(false);
-  const [allowDownloads, setAllowDownloads] = useState(false);
+  const selectedModel = selectedModelId
+    ? (models.find((model) => model.id === selectedModelId) ?? null)
+    : null;
 
-  // Determine download availability
   useEffect(() => {
-    const checkDownloads = async () => {
-      try {
-        if (isProductEnabled("antfly")) {
-          // Full antfarm build: check the deployment topology from Antfly status.
-          const response = await fetch(`${apiUrl}/status`);
-          if (response.ok) {
-            const data = await response.json();
-            setAllowDownloads(data.deployment_mode === "standalone");
-          }
-        }
-      } catch {
-        // Default to not showing downloads on error
-      }
-    };
-    checkDownloads();
-  }, [apiUrl]);
+    if (!selectedModelId || models.some((model) => model.id === selectedModelId)) return;
+    setSheetOpen(false);
+    setSelectedModelId(null);
+  }, [models, selectedModelId]);
 
   const connections = useMemo(
     () =>
@@ -948,10 +1103,16 @@ const ModelsPage: React.FC = () => {
     [models]
   );
 
+  const providers = useMemo(
+    () => [...new Set(models.map(modelProvider))].sort((a, b) => a.localeCompare(b)),
+    [models]
+  );
+
   const filteredModels = useMemo(() => {
     return models.filter((model) => {
       if (selectedType !== "all" && model.type !== selectedType) return false;
       if (selectedConnection !== "all" && model.connectionId !== selectedConnection) return false;
+      if (selectedProvider !== "all" && modelProvider(model) !== selectedProvider) return false;
 
       if (searchQuery) {
         const query = searchQuery.toLowerCase();
@@ -964,7 +1125,7 @@ const ModelsPage: React.FC = () => {
 
       return true;
     });
-  }, [models, searchQuery, selectedConnection, selectedType]);
+  }, [models, searchQuery, selectedConnection, selectedProvider, selectedType]);
 
   const modelsByType = useMemo(() => {
     const grouped: Record<ModelType, InferenceModel[]> = {
@@ -1007,23 +1168,23 @@ const ModelsPage: React.FC = () => {
   }, [models]);
 
   const handleModelClick = (model: InferenceModel) => {
-    setSelectedModel(model);
+    setSelectedModelId(model.id);
     setSheetOpen(true);
   };
 
-  const readyCount = models.filter((m) => m.inRegistry).length;
+  const availableCount = models.filter((m) => m.inRegistry).length;
   const huggingFaceCount = models.filter((m) => m.sourceUrl).length;
 
   // Loading state
   if (loading) {
     return (
-      <DashboardPage>
-        <DashboardPageHeader>
+      <AIWorkflowPage>
+        <div className="af-ai-workflow-header flex flex-col gap-4 pb-5 md:flex-row md:items-end md:justify-between">
           <div>
             <div className="mb-3 h-7 w-64 animate-pulse rounded-none bg-muted" />
             <div className="h-4 w-full max-w-md animate-pulse rounded-none bg-muted" />
           </div>
-        </DashboardPageHeader>
+        </div>
         <div className="grid grid-cols-1 lg:grid-cols-2 xl:grid-cols-3 gap-4">
           {Array.from({ length: 6 }).map((_, i) => (
             // biome-ignore lint/suspicious/noArrayIndexKey: skeleton placeholders are positional
@@ -1043,39 +1204,34 @@ const ModelsPage: React.FC = () => {
             </div>
           ))}
         </div>
-      </DashboardPage>
+      </AIWorkflowPage>
     );
   }
 
   // Error state
   if (error) {
     return (
-      <DashboardPage className="min-h-full items-center justify-center">
+      <AIWorkflowPage className="min-h-full items-center justify-center">
         <ErrorState
           message="Could not load models from configured inference connections. Check Connections and try again."
           onRetry={retry}
         />
-      </DashboardPage>
+      </AIWorkflowPage>
     );
   }
 
   return (
-    <DashboardPage>
-      <DashboardPageHeader>
-        <div>
-          <DashboardPageTitle className="font-aeonik">Models & Runtime</DashboardPageTitle>
-          <DashboardPageDescription>
-            Browse {models.length} models available through local, shared, and external inference
-            connections.
-          </DashboardPageDescription>
-        </div>
-        <DashboardPageActions>
+    <AIWorkflowPage>
+      <AIWorkflowHeader
+        title="Models & Runtime"
+        description={`Browse ${models.length} models available through local, shared, and external inference connections.`}
+        actions={
           <div className="flex items-center gap-4 text-sm text-muted-foreground">
             <span>
               <span className="font-medium text-foreground tabular-nums">
-                <AnimatedCounter value={readyCount} />
+                <AnimatedCounter value={availableCount} />
               </span>{" "}
-              ready
+              available
             </span>
             <span>
               <span className="font-medium text-foreground tabular-nums">
@@ -1084,32 +1240,50 @@ const ModelsPage: React.FC = () => {
               Hugging Face
             </span>
           </div>
-        </DashboardPageActions>
-      </DashboardPageHeader>
+        }
+      />
 
       <ConnectedProvidersSummary />
 
       {/* Search and filters */}
       <DashboardToolbar className="md:flex-col md:items-stretch">
-        <div className="relative">
-          <Search className="absolute left-3.5 top-1/2 -translate-y-1/2 w-4 h-4 text-muted-foreground" />
-          <Input
-            placeholder="Search models..."
-            value={searchQuery}
-            onChange={(e) => setSearchQuery(e.target.value)}
-            className="pl-10 h-11 bg-background w-full"
-          />
-          {searchQuery && (
-            <Button
-              variant="ghost"
-              size="icon"
-              aria-label="Clear search"
-              className="absolute right-1 top-1/2 -translate-y-1/2 h-8 w-8 hover:bg-muted"
-              onClick={() => setSearchQuery("")}
+        <div className="flex flex-col gap-3 sm:flex-row">
+          <div className="relative flex-1">
+            <Search className="absolute left-3.5 top-1/2 -translate-y-1/2 w-4 h-4 text-muted-foreground" />
+            <Input
+              placeholder="Search models..."
+              value={searchQuery}
+              onChange={(e) => setSearchQuery(e.target.value)}
+              className="pl-10! h-11 bg-background w-full"
+            />
+            {searchQuery && (
+              <Button
+                variant="ghost"
+                size="icon"
+                aria-label="Clear search"
+                className="absolute right-1 top-1/2 -translate-y-1/2 h-8 w-8 hover:bg-muted"
+                onClick={() => setSearchQuery("")}
+              >
+                <X className="w-4 h-4" />
+              </Button>
+            )}
+          </div>
+          <Select value={selectedProvider} onValueChange={setSelectedProvider}>
+            <SelectTrigger
+              aria-label="Filter models by provider"
+              className="w-full shrink-0 data-[size=default]:h-11 sm:w-52!"
             >
-              <X className="w-4 h-4" />
-            </Button>
-          )}
+              <SelectValue placeholder="All providers" />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value="all">All providers</SelectItem>
+              {providers.map((provider) => (
+                <SelectItem key={provider} value={provider}>
+                  {provider}
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
         </div>
 
         <div
@@ -1189,12 +1363,27 @@ const ModelsPage: React.FC = () => {
       </DashboardToolbar>
 
       {filteredModels.length > 0 && (
-        <RuntimeProfiles
-          key={JSON.stringify([apiUrl, inferenceApiUrl])}
-          models={filteredModels}
-          endpointKey={JSON.stringify([apiUrl, inferenceApiUrl])}
-          onDetails={handleModelClick}
-        />
+        <Collapsible className="border border-border bg-background-secondary/20">
+          <CollapsibleTrigger className="flex w-full items-center justify-between gap-4 px-4 py-3 text-left outline-none hover:bg-accent/40 focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-inset">
+            <span>
+              <span className="block font-mono text-xs font-medium uppercase tracking-[0.08em]">
+                Runtime profiles
+              </span>
+              <span className="mt-0.5 block text-xs text-muted-foreground">
+                Optional browser-entered estimates for deployment planning
+              </span>
+            </span>
+            <ChevronDown className="size-4 shrink-0 transition-transform [[data-state=open]_&]:rotate-180" />
+          </CollapsibleTrigger>
+          <CollapsibleContent className="border-t border-border p-4">
+            <RuntimeProfiles
+              key={JSON.stringify([apiUrl, inferenceApiUrl])}
+              models={filteredModels}
+              endpointKey={JSON.stringify([apiUrl, inferenceApiUrl])}
+              onDetails={handleModelClick}
+            />
+          </CollapsibleContent>
+        </Collapsible>
       )}
 
       {/* Type Context Banner - shows when a specific type is selected */}
@@ -1227,6 +1416,8 @@ const ModelsPage: React.FC = () => {
                     <ModelCard
                       key={model.id}
                       model={model}
+                      runtime={runtime.runtimeFor(model.type, model.source)}
+                      providerManaged={model.connectionId !== "local-inference"}
                       onClick={() => handleModelClick(model)}
                     />
                   ))}
@@ -1239,7 +1430,13 @@ const ModelsPage: React.FC = () => {
         // Flat grid for filtered view
         <div className="grid grid-cols-1 lg:grid-cols-2 xl:grid-cols-3 gap-4">
           {filteredModels.map((model) => (
-            <ModelCard key={model.id} model={model} onClick={() => handleModelClick(model)} />
+            <ModelCard
+              key={model.id}
+              model={model}
+              runtime={runtime.runtimeFor(model.type, model.source)}
+              providerManaged={model.connectionId !== "local-inference"}
+              onClick={() => handleModelClick(model)}
+            />
           ))}
         </div>
       )}
@@ -1251,9 +1448,17 @@ const ModelsPage: React.FC = () => {
         onOpenChange={setSheetOpen}
         types={types}
         quantizationOptions={quantizationOptions}
-        allowDownloads={allowDownloads}
+        runtime={
+          selectedModel ? runtime.runtimeFor(selectedModel.type, selectedModel.source) : undefined
+        }
+        runtimeSupported={runtime.supported}
+        providerManaged={selectedModel?.connectionId !== "local-inference"}
+        actionPending={runtime.actionPending}
+        runtimeError={runtime.error}
+        onLoad={runtime.load}
+        onUnload={runtime.unload}
       />
-    </DashboardPage>
+    </AIWorkflowPage>
   );
 };
 

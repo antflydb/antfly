@@ -4,7 +4,11 @@
 import type { Connection } from "@antfly/sdk";
 import { act, cleanup, renderHook, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { liveModelSuggestions, useConnectionsWithModels } from "./use-connections";
+import {
+  liveModelSuggestions,
+  useConnectedModels,
+  useConnectionsWithModels,
+} from "./use-connections";
 
 const { listConnections, apiUrlRef, client } = vi.hoisted(() => {
   const listConnections = vi.fn();
@@ -18,7 +22,11 @@ const { listConnections, apiUrlRef, client } = vi.hoisted(() => {
 });
 
 vi.mock("@/hooks/use-api-config", () => ({
-  useApiConfig: () => ({ apiUrl: apiUrlRef.current, client }),
+  useApiConfig: () => ({
+    apiUrl: apiUrlRef.current,
+    inferenceApiUrl: "http://inference.test",
+    client,
+  }),
 }));
 
 // The connections cache is module scoped and keyed by API URL, so each test
@@ -128,6 +136,47 @@ describe("useConnectionsWithModels", () => {
   });
 });
 
+describe("useConnectedModels compatibility", () => {
+  const fetchMock = vi.fn<typeof fetch>();
+
+  beforeEach(() => {
+    listConnections.mockReset();
+    isolateCache();
+    fetchMock.mockReset();
+    vi.stubGlobal("fetch", fetchMock);
+  });
+
+  afterEach(() => {
+    cleanup();
+    vi.unstubAllGlobals();
+  });
+
+  it("falls back to direct local discovery when the server predates connections", async () => {
+    listConnections.mockResolvedValue(undefined);
+    fetchMock.mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          embedders: { "acme/text-embed": { inputs: ["text"] } },
+        }),
+        { status: 200, headers: { "content-type": "application/json" } }
+      )
+    );
+
+    const hook = renderHook(() => useConnectedModels());
+    await waitFor(() => expect(hook.result.current.loading).toBe(false));
+    await waitFor(() => expect(hook.result.current.providers).toHaveLength(1));
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      "http://inference.test/ai/v1/models",
+      expect.objectContaining({ credentials: "same-origin" })
+    );
+    expect(hook.result.current.providers[0]?.inference?.models?.embedders).toEqual([
+      expect.objectContaining({ name: "acme/text-embed", inputs: ["text"] }),
+    ]);
+    hook.unmount();
+  });
+});
+
 describe("useConnectionsWithModels revalidation", () => {
   let now = 1_700_000_000_000;
 
@@ -226,6 +275,8 @@ describe("useConnectionsWithModels revalidation", () => {
     listConnections.mockReturnValueOnce(new Promise((done) => (resolveEndpointB = done)));
     view.rerender();
     await waitFor(() => expect(listConnections).toHaveBeenCalledTimes(3));
+    expect(view.result.current.loading).toBe(true);
+    expect(view.result.current.connections).toEqual([]);
 
     await act(async () => {
       resolveEndpointB({ connections: [providerConnection({ id: "endpoint-b" })] });

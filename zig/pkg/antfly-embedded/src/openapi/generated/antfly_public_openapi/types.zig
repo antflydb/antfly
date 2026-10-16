@@ -2960,6 +2960,10 @@ pub const ConnectedModel = struct {
     dimensions: ?i64 = null,
     /// True when this model is referenced by a configured embedder, generator, reranker, or chunker.
     configured: ?bool = null,
+    /// Inference capabilities advertised by the provider for this model and task.
+    capabilities: ?[]const []const u8 = null,
+    /// Input modalities accepted by the provider's resolved executor.
+    inputs: ?[]const []const u8 = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
@@ -2967,6 +2971,8 @@ pub const ConnectedModel = struct {
         .{ "display_name", "display_name", true },
         .{ "dimensions", "dimensions", true },
         .{ "configured", "configured", true },
+        .{ "capabilities", "capabilities", true },
+        .{ "inputs", "inputs", true },
     };
 
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
@@ -2991,6 +2997,14 @@ pub const ConnectedModel = struct {
         }
         if (self.configured) |value| {
             try jw.objectField("configured");
+            try jw.write(value);
+        }
+        if (self.capabilities) |value| {
+            try jw.objectField("capabilities");
+            try jw.write(value);
+        }
+        if (self.inputs) |value| {
+            try jw.objectField("inputs");
             try jw.write(value);
         }
         try jw.endObject();

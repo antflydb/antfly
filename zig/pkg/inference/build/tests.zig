@@ -38,7 +38,7 @@ pub fn create(ctx: Context) Suite {
     // macOS build with Metal measured 11.2 GiB. Reserve target-specific
     // headroom rather than rejecting successful accelerator compilations.
     const tests = b.addTest(.{
-        .max_rss = @as(usize, if (ctx.target.result.os.tag == .macos) 14 else 9) * 1024 * 1024 * 1024,
+        .max_rss = @as(usize, if (ctx.target.result.os.tag == .macos and ctx.backend.enable_metal) 14 else 9) * 1024 * 1024 * 1024,
         .root_module = b.createModule(.{
             .root_source_file = ctx.path("src/inference.zig"),
             .target = ctx.target,

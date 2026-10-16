@@ -5,7 +5,6 @@ import {
   CardContent,
   CardHeader,
   CardTitle,
-  DashboardPage,
   DashboardPageActions,
   DashboardPageDescription,
   DashboardPageHeader,
@@ -22,7 +21,6 @@ import {
   Textarea,
 } from "@antfly/design-system";
 import type { EmbedResponse } from "@antfly/sdk";
-import { ReloadIcon } from "@radix-ui/react-icons";
 import {
   ArrowDownUp,
   Clock,
@@ -36,13 +34,20 @@ import {
   Zap,
 } from "lucide-react";
 import type React from "react";
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
+import {
+  AIWorkflowContextBar,
+  AIWorkflowPage,
+  AIWorkflowSubmitButton,
+} from "@/components/ai-workflow";
 import { PlaygroundEmptyState } from "@/components/branded-empty-state";
 import { BackendInfoBar } from "@/components/playground/BackendInfoBar";
 import { NoModelsGuide } from "@/components/playground/NoModelsGuide";
 import { useApiConfig } from "@/hooks/use-api-config";
-import { useSelectedInferenceModelNames } from "@/hooks/use-connections";
-import { fetchWithRetry } from "@/lib/utils";
+import { useSelectedInferenceModels } from "@/hooks/use-connections";
+import { useModelSelection } from "@/hooks/use-model-selection";
+import { modelsAcceptingInput } from "@/lib/inference-playground-contracts";
+import { beginAbortableRequest, fetchInferenceJson, finishAbortableRequest } from "@/lib/utils";
 
 interface ScoredDocument {
   index: number;
@@ -144,12 +149,9 @@ function SimilarityBar({ score, maxScore }: { score: number; maxScore: number })
 }
 
 const EmbeddingPlaygroundPage: React.FC = () => {
-  const { inferenceUrl } = useApiConfig();
+  const { inferenceUrl, inferenceApiUrl, inferenceConnectionId } = useApiConfig();
   const [query, setQuery] = useState("");
   const [documents, setDocuments] = useState<string[]>([""]);
-  const [selectedModel, setSelectedModel] = useState("");
-  const [availableModels, setAvailableModels] = useState<string[]>([]);
-  const [modelsLoaded, setModelsLoaded] = useState(false);
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [processingTime, setProcessingTime] = useState<number | null>(null);
@@ -158,18 +160,31 @@ const EmbeddingPlaygroundPage: React.FC = () => {
   const [dimensions, setDimensions] = useState<number | null>(null);
   const [showSparklines, setShowSparklines] = useState(true);
   const abortControllerRef = useRef<AbortController | null>(null);
-  const { models: connectionModels, loading: modelsLoading } =
-    useSelectedInferenceModelNames("embedder");
+  const { models: connectedModels, loading: modelsLoading } =
+    useSelectedInferenceModels("embedder");
+  const connectionModels = useMemo(
+    () => modelsAcceptingInput(connectedModels, "text").map((model) => model.name),
+    [connectedModels]
+  );
+  const availableModels = connectionModels;
+  const modelsLoaded = !modelsLoading;
+  const { model: selectedModel, setModel: setSelectedModel } = useModelSelection({
+    models: availableModels,
+    defaultModel: connectionModels.find((model) => model.includes("bge-small")),
+  });
 
+  // biome-ignore lint/correctness/useExhaustiveDependencies: model/backend identity invalidates in-flight results
   useEffect(() => {
-    setAvailableModels(connectionModels);
-    setSelectedModel((current) =>
-      current && connectionModels.includes(current)
-        ? current
-        : connectionModels.find((model) => model.includes("bge-small")) || connectionModels[0] || ""
-    );
-    setModelsLoaded(!modelsLoading);
-  }, [connectionModels, modelsLoading]);
+    abortControllerRef.current?.abort();
+    abortControllerRef.current = null;
+    setIsLoading(false);
+    setResults(null);
+    setQueryEmbedding(null);
+    setDimensions(null);
+    setError(null);
+    setProcessingTime(null);
+    return () => abortControllerRef.current?.abort();
+  }, [selectedModel, inferenceApiUrl, inferenceConnectionId]);
 
   const handleEmbed = async () => {
     const nonEmptyDocs = documents.filter((d) => d.trim());
@@ -187,11 +202,7 @@ const EmbeddingPlaygroundPage: React.FC = () => {
       return;
     }
 
-    if (abortControllerRef.current) {
-      abortControllerRef.current.abort();
-    }
-
-    abortControllerRef.current = new AbortController();
+    const controller = beginAbortableRequest(abortControllerRef);
     setIsLoading(true);
     setError(null);
     setResults(null);
@@ -203,15 +214,14 @@ const EmbeddingPlaygroundPage: React.FC = () => {
     try {
       // Embed query and all documents in one call
       const allTexts = [query, ...nonEmptyDocs];
-      const raw = await fetchWithRetry(inferenceUrl("embed"), {
+      const response = await fetchInferenceJson<EmbedResponse>(inferenceUrl("embed"), {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ model: selectedModel, input: allTexts }),
-        signal: abortControllerRef.current.signal,
+        signal: controller.signal,
       });
-      if (!raw.ok) throw new Error(`Embed failed: ${raw.status}`);
-      const response: EmbedResponse = await raw.json();
 
+      if (abortControllerRef.current !== controller || controller.signal.aborted) return;
       const embeddings = response.data
         .map((item) => item.embedding)
         .filter((embedding): embedding is number[] => Array.isArray(embedding));
@@ -237,16 +247,23 @@ const EmbeddingPlaygroundPage: React.FC = () => {
       setResults(scored);
       setProcessingTime(performance.now() - startTime);
     } catch (err) {
-      if (err instanceof Error && err.name === "AbortError") {
+      if (
+        abortControllerRef.current !== controller ||
+        controller.signal.aborted ||
+        (err instanceof Error && err.name === "AbortError")
+      ) {
         return;
       }
       setError(err instanceof Error ? err.message : "Failed to connect to inference");
     } finally {
-      setIsLoading(false);
+      if (finishAbortableRequest(abortControllerRef, controller)) setIsLoading(false);
     }
   };
 
   const handleReset = () => {
+    abortControllerRef.current?.abort();
+    abortControllerRef.current = null;
+    setIsLoading(false);
     setQuery("");
     setDocuments([""]);
     setResults(null);
@@ -279,7 +296,7 @@ const EmbeddingPlaygroundPage: React.FC = () => {
   const maxSimilarity = results ? Math.max(...results.map((r) => r.similarity)) : 1;
 
   return (
-    <DashboardPage className="h-full space-y-3">
+    <AIWorkflowPage className="h-full space-y-3">
       <DashboardPageHeader>
         <div>
           <DashboardPageTitle className="font-aeonik">Embedding Playground</DashboardPageTitle>
@@ -298,13 +315,12 @@ const EmbeddingPlaygroundPage: React.FC = () => {
           </Button>
         </DashboardPageActions>
       </DashboardPageHeader>
-
-      <BackendInfoBar />
-
+      <AIWorkflowContextBar>
+        <BackendInfoBar />
+      </AIWorkflowContextBar>
       {modelsLoaded && availableModels.length === 0 && (
         <NoModelsGuide modelType="embedder" typeName="embedder" />
       )}
-
       {/* Configuration Panel */}
       <Card>
         <CardHeader className="pb-4">
@@ -353,7 +369,7 @@ const EmbeddingPlaygroundPage: React.FC = () => {
             </div>
           </div>
           <FormActions>
-            <Button
+            <AIWorkflowSubmitButton
               onClick={handleEmbed}
               disabled={
                 isLoading ||
@@ -361,30 +377,26 @@ const EmbeddingPlaygroundPage: React.FC = () => {
                 !selectedModel ||
                 documents.filter((d) => d.trim()).length === 0
               }
+              running={isLoading}
+              runningLabel="Embedding"
+              onCancel={() => {
+                abortControllerRef.current?.abort();
+                abortControllerRef.current = null;
+                setIsLoading(false);
+              }}
             >
-              {isLoading ? (
-                <>
-                  <ReloadIcon className="h-4 w-4 mr-2 animate-spin" />
-                  Embedding
-                </>
-              ) : (
-                <>
-                  <ArrowDownUp className="h-4 w-4 mr-2" />
-                  Embed &amp; Compare
-                </>
-              )}
-            </Button>
+              <ArrowDownUp className="h-4 w-4 mr-2" />
+              Embed &amp; Compare
+            </AIWorkflowSubmitButton>
           </FormActions>
         </CardContent>
       </Card>
-
       {/* Error Display */}
       {error && (
         <div className="rounded-none border border-destructive/30 bg-destructive/10 p-4 text-sm text-destructive">
           {error}
         </div>
       )}
-
       {/* Results Stats Bar */}
       {results && (
         <DashboardToolbar className="flex-row items-center gap-3 md:items-center">
@@ -419,7 +431,6 @@ const EmbeddingPlaygroundPage: React.FC = () => {
           </Button>
         </DashboardToolbar>
       )}
-
       {/* Main Content - Side by Side */}
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
         {/* Input Panel - Documents */}
@@ -519,7 +530,6 @@ const EmbeddingPlaygroundPage: React.FC = () => {
           </CardContent>
         </Card>
       </div>
-
       {/* Help text */}
       <div className="text-xs text-muted-foreground space-y-1">
         <p>
@@ -533,7 +543,7 @@ const EmbeddingPlaygroundPage: React.FC = () => {
           first 60 dimensions of each embedding vector.
         </p>
       </div>
-    </DashboardPage>
+    </AIWorkflowPage>
   );
 };
 

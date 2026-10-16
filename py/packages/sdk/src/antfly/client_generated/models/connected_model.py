@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from typing import Any, TypeVar
+from typing import Any, TypeVar, cast
 
 from attrs import define as _attrs_define
 from attrs import field as _attrs_field
@@ -20,12 +20,16 @@ class ConnectedModel:
         dimensions (int | Unset): Embedding output dimension when known.
         configured (bool | Unset): True when this model is referenced by a configured embedder, generator, reranker, or
             chunker.
+        capabilities (list[str] | Unset): Inference capabilities advertised by the provider for this model and task.
+        inputs (list[str] | Unset): Input modalities accepted by the provider's resolved executor.
     """
 
     name: str
     display_name: str | Unset = UNSET
     dimensions: int | Unset = UNSET
     configured: bool | Unset = UNSET
+    capabilities: list[str] | Unset = UNSET
+    inputs: list[str] | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
@@ -36,6 +40,14 @@ class ConnectedModel:
         dimensions = self.dimensions
 
         configured = self.configured
+
+        capabilities: list[str] | Unset = UNSET
+        if not isinstance(self.capabilities, Unset):
+            capabilities = self.capabilities
+
+        inputs: list[str] | Unset = UNSET
+        if not isinstance(self.inputs, Unset):
+            inputs = self.inputs
 
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
@@ -50,6 +62,10 @@ class ConnectedModel:
             field_dict["dimensions"] = dimensions
         if configured is not UNSET:
             field_dict["configured"] = configured
+        if capabilities is not UNSET:
+            field_dict["capabilities"] = capabilities
+        if inputs is not UNSET:
+            field_dict["inputs"] = inputs
 
         return field_dict
 
@@ -64,11 +80,17 @@ class ConnectedModel:
 
         configured = d.pop("configured", UNSET)
 
+        capabilities = cast(list[str], d.pop("capabilities", UNSET))
+
+        inputs = cast(list[str], d.pop("inputs", UNSET))
+
         connected_model = cls(
             name=name,
             display_name=display_name,
             dimensions=dimensions,
             configured=configured,
+            capabilities=capabilities,
+            inputs=inputs,
         )
 
         connected_model.additional_properties = d

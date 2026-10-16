@@ -1,5 +1,6 @@
-import type { ConnectedModelType, Connection } from "@antfly/sdk";
+import type { ConnectedModel, ConnectedModelType, Connection } from "@antfly/sdk";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { isProductEnabled } from "@/config/products";
 import { useApiConfig } from "@/hooks/use-api-config";
 
 const FETCH_TIMEOUT = 15000; // 15 seconds — model expansion fans out to providers
@@ -70,7 +71,7 @@ function cacheConnections(
   return entry;
 }
 
-function useConnectionsInternal(includeModels: boolean): ConnectionsState {
+function useConnectionsInternal(includeModels: boolean, enabled = true): ConnectionsState {
   const { apiUrl, client } = useApiConfig();
   const cacheKey = `${apiUrl}|models=${includeModels}`;
   // Seed from the cached payload however old it is. Showing the last known
@@ -81,6 +82,8 @@ function useConnectionsInternal(includeModels: boolean): ConnectionsState {
   const [loading, setLoading] = useState(cached == null);
   const [error, setError] = useState<string | null>(null);
   const isMountedRef = useRef(true);
+  const activeCacheKeyRef = useRef(cacheKey);
+  activeCacheKeyRef.current = cacheKey;
   // Requests this consumer is itself waiting on, so a sibling's result cannot
   // clear a skeleton that belongs to an outstanding foreground load.
   const foregroundPendingRef = useRef(0);
@@ -128,7 +131,9 @@ function useConnectionsInternal(includeModels: boolean): ConnectionsState {
         }
         const result = await request;
 
-        if (signal?.aborted || !isMountedRef.current) return;
+        if (signal?.aborted || !isMountedRef.current || activeCacheKeyRef.current !== cacheKey) {
+          return;
+        }
         const entry = cacheConnections(cacheKey, result, refresh);
 
         setConnections(entry.connections);
@@ -137,7 +142,7 @@ function useConnectionsInternal(includeModels: boolean): ConnectionsState {
         setLoading(false);
       } catch (err) {
         if (signal?.aborted) return;
-        if (!isMountedRef.current) return;
+        if (!isMountedRef.current || activeCacheKeyRef.current !== cacheKey) return;
 
         // A failed revalidation keeps the last good inventory on screen; only a
         // foreground load has nothing to fall back to.
@@ -161,6 +166,7 @@ function useConnectionsInternal(includeModels: boolean): ConnectionsState {
   // by one mounted component does not leave its siblings disagreeing about
   // which models exist.
   useEffect(() => {
+    if (!enabled) return;
     const listener: CacheListener = (entry) => {
       setConnections(entry.connections);
       setSupported(entry.supported);
@@ -179,16 +185,33 @@ function useConnectionsInternal(includeModels: boolean): ConnectionsState {
       listeners.delete(listener);
       if (listeners.size === 0) cacheListeners.delete(cacheKey);
     };
-  }, [cacheKey]);
+  }, [cacheKey, enabled]);
 
   useEffect(() => {
     isMountedRef.current = true;
+
+    if (!enabled) {
+      setConnections([]);
+      setSupported(false);
+      setLoading(false);
+      setError(null);
+      return () => {
+        isMountedRef.current = false;
+      };
+    }
 
     const fromCache = connectionsCache.get(cacheKey);
     if (fromCache) {
       setConnections(fromCache.connections);
       setSupported(fromCache.supported);
       setLoading(false);
+      setError(null);
+    } else {
+      // Inventory belongs to its API endpoint. Do not render the previous
+      // endpoint's providers while the first request for this key is pending.
+      setConnections([]);
+      setSupported(true);
+      setLoading(true);
       setError(null);
     }
 
@@ -201,7 +224,7 @@ function useConnectionsInternal(includeModels: boolean): ConnectionsState {
       isMountedRef.current = false;
       controller.abort();
     };
-  }, [cacheKey, fetchConnections]);
+  }, [cacheKey, enabled, fetchConnections]);
 
   // Model files may be installed out of band by `antfly inference pull`, so the
   // expanded inventory is revalidated while the model UI stays open. The fetch
@@ -209,7 +232,7 @@ function useConnectionsInternal(includeModels: boolean): ConnectionsState {
   // off remote provider listing APIs, and the embedded inference listing is
   // served live either way.
   useEffect(() => {
-    if (!includeModels) return;
+    if (!includeModels || !enabled) return;
 
     // A poll belongs to this endpoint's effect lifetime. Without this signal,
     // a response started for a previous endpoint can resolve after a switch
@@ -235,7 +258,7 @@ function useConnectionsInternal(includeModels: boolean): ConnectionsState {
       window.clearInterval(timer);
       document.removeEventListener("visibilitychange", revalidate);
     };
-  }, [cacheKey, fetchConnections, includeModels]);
+  }, [cacheKey, enabled, fetchConnections, includeModels]);
 
   return { connections, supported, loading, error, retry };
 }
@@ -250,9 +273,143 @@ export function useConnectionsWithModels(): ConnectionsState {
   return useConnectionsInternal(true);
 }
 
+interface DirectModelInfo {
+  capabilities?: string[];
+  inputs?: string[];
+}
+
+interface DirectModelsResponse {
+  embedders?: Record<string, DirectModelInfo>;
+  rerankers?: Record<string, DirectModelInfo>;
+  chunkers?: Record<string, DirectModelInfo>;
+  generators?: Record<string, DirectModelInfo>;
+  extractors?: Record<string, DirectModelInfo>;
+  rewriters?: Record<string, DirectModelInfo>;
+  readers?: Record<string, DirectModelInfo>;
+  transcribers?: Record<string, DirectModelInfo>;
+}
+
+function directModelEntries(models: Record<string, DirectModelInfo> | undefined): ConnectedModel[] {
+  return Object.entries(models ?? {}).map(([name, info]) => ({
+    name,
+    capabilities: info.capabilities,
+    inputs: info.inputs,
+  }));
+}
+
+function useDirectInferenceModels(enabled: boolean): ConnectedModelsState {
+  const { inferenceApiUrl } = useApiConfig();
+  const [providers, setProviders] = useState<Connection[]>([]);
+  const [loading, setLoading] = useState(enabled);
+  const [error, setError] = useState<string | null>(null);
+  const requestRef = useRef(0);
+  const generationRef = useRef(0);
+  const abortRef = useRef<AbortController | null>(null);
+  const foregroundPendingRef = useRef(false);
+
+  const fetchModels = useCallback(
+    async (background = false) => {
+      if (!enabled) return;
+      if (background && foregroundPendingRef.current) return;
+      const generation = generationRef.current;
+      const request = ++requestRef.current;
+      abortRef.current?.abort();
+      const controller = new AbortController();
+      abortRef.current = controller;
+      if (!background) {
+        foregroundPendingRef.current = true;
+        setLoading(true);
+      }
+      try {
+        const response = await fetch(`${inferenceApiUrl}/ai/v1/models`, {
+          credentials: "same-origin",
+          signal: AbortSignal.any([controller.signal, AbortSignal.timeout(FETCH_TIMEOUT)]),
+        });
+        if (!response.ok) throw new Error(`Model discovery failed (${response.status})`);
+        const body = (await response.json()) as DirectModelsResponse;
+        if (generation !== generationRef.current || request !== requestRef.current) return;
+        const groups = {
+          embedders: directModelEntries(body.embedders),
+          rerankers: directModelEntries(body.rerankers),
+          chunkers: directModelEntries(body.chunkers),
+          generators: directModelEntries(body.generators),
+          extractors: directModelEntries(body.extractors),
+          rewriters: directModelEntries(body.rewriters),
+          readers: directModelEntries(body.readers),
+          transcribers: directModelEntries(body.transcribers),
+        };
+        const modelKinds = Object.entries(groups)
+          .filter(([, entries]) => entries.length > 0)
+          .map(([key]) => key.replace(/s$/, ""));
+        setProviders([
+          {
+            id: "local-inference",
+            name: "local-inference",
+            display_name: "Local inference",
+            kind: "inference",
+            status: "connected",
+            capabilities: modelKinds.map((kind) => `models.${kind}`),
+            inference: {
+              provider: "antfly",
+              configured_model_types: modelKinds as ConnectedModelType[],
+              models: groups,
+            },
+          } as Connection,
+        ]);
+        setError(null);
+      } catch (cause) {
+        if (
+          controller.signal.aborted ||
+          generation !== generationRef.current ||
+          request !== requestRef.current
+        ) {
+          return;
+        }
+        if (background) return;
+        setProviders([]);
+        setError(cause instanceof Error ? cause.message : "Failed to discover inference models");
+      } finally {
+        if (!background && generation === generationRef.current && request === requestRef.current) {
+          foregroundPendingRef.current = false;
+          setLoading(false);
+        }
+      }
+    },
+    [enabled, inferenceApiUrl]
+  );
+
+  useEffect(() => {
+    if (!enabled) return;
+    generationRef.current += 1;
+    void fetchModels();
+    const poll = () => {
+      if (document.visibilityState === "visible") void fetchModels(true);
+    };
+    const timer = window.setInterval(poll, CACHE_TTL_MS);
+    document.addEventListener("visibilitychange", poll);
+    return () => {
+      generationRef.current += 1;
+      requestRef.current += 1;
+      foregroundPendingRef.current = false;
+      abortRef.current?.abort();
+      window.clearInterval(timer);
+      document.removeEventListener("visibilitychange", poll);
+    };
+  }, [enabled, fetchModels]);
+
+  return { providers, supported: true, loading, error, retry: () => void fetchModels() };
+}
+
 /** Inference provider connections with live model listings. */
 export function useConnectedModels(): ConnectedModelsState {
-  const state = useConnectionsInternal(true);
+  const inferenceOnly = isProductEnabled("inference") && !isProductEnabled("antfly");
+  const state = useConnectionsInternal(true, !inferenceOnly);
+  // Full Antfarm builds prefer the database connection catalog so they can
+  // route remote providers. Servers from before `/connections` still expose
+  // the local `/ai/v1/models` catalog, so retain that as a compatibility path.
+  const useDirect = inferenceOnly || !state.supported;
+  const direct = useDirectInferenceModels(useDirect);
+  if (useDirect) return direct;
   return {
     providers: state.connections.filter((connection) => connection.kind === "inference"),
     supported: state.supported,
@@ -263,23 +420,47 @@ export function useConnectedModels(): ConnectedModelsState {
 }
 
 /** Models exposed by the inference connection selected for playground requests. */
-export function useSelectedInferenceModelNames(kind: ConnectedModelType): {
-  models: string[];
+export interface SelectedInferenceModel {
+  name: string;
+  display_name?: string;
+  dimensions?: number;
+  configured?: boolean;
+  capabilities?: string[];
+  inputs?: string[];
+}
+
+export function useSelectedInferenceModels(kind: ConnectedModelType): {
+  models: SelectedInferenceModel[];
   loading: boolean;
 } {
   const { inferenceConnectionId } = useApiConfig();
   const { providers, loading } = useConnectedModels();
   const selected = providers.find((connection) => connection.id === inferenceConnectionId);
   const listed = selected?.inference?.models;
-  const models = useMemo(
+  const models = useMemo<SelectedInferenceModel[]>(
     () =>
       [
         ...(listed?.[kind === "other" ? "other" : `${kind}s`] ?? []),
         ...(kind === "generator" ? (listed?.other ?? []) : []),
-      ].map((model) => model.name),
+      ] as SelectedInferenceModel[],
     [kind, listed]
   );
-  return { models: useMemo(() => [...new Set(models)], [models]), loading };
+  return {
+    models: useMemo(
+      () => [...new Map(models.map((model) => [model.name, model])).values()],
+      [models]
+    ),
+    loading,
+  };
+}
+
+/** Model IDs exposed by the inference connection selected for playground requests. */
+export function useSelectedInferenceModelNames(kind: ConnectedModelType): {
+  models: string[];
+  loading: boolean;
+} {
+  const { models, loading } = useSelectedInferenceModels(kind);
+  return { models: useMemo(() => models.map((model) => model.name), [models]), loading };
 }
 
 /**

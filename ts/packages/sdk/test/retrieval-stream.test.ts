@@ -207,3 +207,88 @@ it("sends graph navigation through the retrieval endpoint and preserves the agen
     start_key: "start",
   });
 });
+
+describe("retrieval request cancellation", () => {
+  it("does not send a pre-cancelled non-streaming request", async () => {
+    const fetch = vi.spyOn(globalThis, "fetch");
+    const controller = new AbortController();
+    controller.abort();
+    await expect(
+      new AntflyClient({ baseUrl: "http://localhost:8080" }).retrievalAgent(request, undefined, {
+        signal: controller.signal,
+      })
+    ).rejects.toMatchObject({ name: "AbortError" });
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    false,
+    true,
+  ])("cancels pending HTTP before response headers (stream=%s)", async (stream) => {
+    let transportSignal: AbortSignal | undefined;
+    vi.spyOn(globalThis, "fetch").mockImplementation((_url, init) => {
+      transportSignal = init?.signal ?? undefined;
+      return new Promise((_resolve, reject) => {
+        transportSignal?.addEventListener("abort", () => reject(transportSignal?.reason), {
+          once: true,
+        });
+      });
+    });
+    const controller = new AbortController();
+    const client = new AntflyClient({ baseUrl: "http://localhost:8080" });
+    const result = stream
+      ? client.streamRetrievalAgent(request, {}, { signal: controller.signal })
+      : client.retrievalAgent(request, undefined, { signal: controller.signal });
+    const rejection = expect(result).rejects.toMatchObject({ name: "AbortError" });
+    controller.abort();
+    await rejection;
+    expect(transportSignal?.aborted).toBe(true);
+  });
+
+  it("stops dispatching buffered frames after caller cancellation", async () => {
+    vi.spyOn(globalThis, "fetch").mockResolvedValueOnce(
+      responseFromBytes(
+        encoder.encode('event: generation\ndata: "first"\n\nevent: generation\ndata: "late"\n\n')
+      )
+    );
+    const controller = new AbortController();
+    const onGeneration = vi.fn((chunk: string) => {
+      if (chunk === "first") controller.abort();
+    });
+    const onError = vi.fn();
+
+    await new AntflyClient({ baseUrl: "http://localhost:8080" }).streamRetrievalAgent(
+      request,
+      { onGeneration, onError },
+      { signal: controller.signal }
+    );
+    await vi.waitFor(() => expect(onGeneration).toHaveBeenCalledOnce());
+    expect(onGeneration).toHaveBeenCalledWith("first");
+    expect(onError).not.toHaveBeenCalled();
+  });
+
+  it("does not deliver a JSON fallback that finishes after caller cancellation", async () => {
+    let resolveJson: (value: unknown) => void = () => {};
+    const json = vi.fn(
+      () =>
+        new Promise((resolve) => {
+          resolveJson = resolve;
+        })
+    );
+    const response = new Response("{}", { headers: { "Content-Type": "application/json" } });
+    vi.spyOn(response, "json").mockImplementation(json);
+    vi.spyOn(globalThis, "fetch").mockResolvedValueOnce(response);
+    const controller = new AbortController();
+    const onDone = vi.fn();
+    const pending = new AntflyClient({
+      baseUrl: "http://localhost:8080",
+    }).streamRetrievalAgent(request, { onDone }, { signal: controller.signal });
+    await vi.waitFor(() => expect(json).toHaveBeenCalledOnce());
+
+    controller.abort();
+    resolveJson({ generation: "late" });
+
+    await expect(pending).rejects.toMatchObject({ name: "AbortError" });
+    expect(onDone).not.toHaveBeenCalled();
+  });
+});

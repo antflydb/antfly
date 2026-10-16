@@ -15111,6 +15111,16 @@ components:
           type: boolean
           description: True when this model is referenced by a configured embedder, generator, reranker,
             or chunker.
+        capabilities:
+          type: array
+          items:
+            type: string
+          description: Inference capabilities advertised by the provider for this model and task.
+        inputs:
+          type: array
+          items:
+            type: string
+          description: Input modalities accepted by the provider's resolved executor.
     InferenceConnection:
       type: object
       required:

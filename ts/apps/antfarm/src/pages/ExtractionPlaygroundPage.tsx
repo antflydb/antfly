@@ -5,7 +5,6 @@ import {
   CardContent,
   CardHeader,
   CardTitle,
-  DashboardPage,
   DashboardPageActions,
   DashboardPageDescription,
   DashboardPageHeader,
@@ -24,7 +23,6 @@ import {
   Switch,
   Textarea,
 } from "@antfly/design-system";
-import { ReloadIcon } from "@radix-ui/react-icons";
 import {
   Clock,
   Hash,
@@ -37,17 +35,25 @@ import {
   Zap,
 } from "lucide-react";
 import type React from "react";
-import { useCallback, useEffect, useRef, useState } from "react";
-import { useSearchParams } from "react-router-dom";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+  AIWorkflowContextBar,
+  AIWorkflowPage,
+  AIWorkflowPanel,
+  AIWorkflowSubmitButton,
+  AIWorkflowWorkbench,
+} from "@/components/ai-workflow";
 import { Combobox } from "@/components/Combobox";
 import { BackendInfoBar } from "@/components/playground/BackendInfoBar";
 import { NoModelsGuide } from "@/components/playground/NoModelsGuide";
 import type { SamplePreset } from "@/components/playground/SamplePresets";
 import { SamplePresets } from "@/components/playground/SamplePresets";
 import { useApiConfig } from "@/hooks/use-api-config";
-import { useSelectedInferenceModelNames } from "@/hooks/use-connections";
+import { useSelectedInferenceModels } from "@/hooks/use-connections";
+import { useModelSelection } from "@/hooks/use-model-selection";
 import { extractionUnavailableReason } from "@/lib/extraction-model";
-import { fetchWithRetry } from "@/lib/utils";
+import { modelsAcceptingInput } from "@/lib/inference-playground-contracts";
+import { beginAbortableRequest, fetchInferenceJson, finishAbortableRequest } from "@/lib/utils";
 
 // Entity extraction response types matching the Antfly inference API.
 interface NEREntity {
@@ -231,8 +237,7 @@ const EXTRACT_SAMPLES = {
 };
 
 const ExtractionPlaygroundPage: React.FC = () => {
-  const { inferenceUrl } = useApiConfig();
-  const [searchParams, setSearchParams] = useSearchParams();
+  const { inferenceUrl, inferenceApiUrl, inferenceConnectionId } = useApiConfig();
 
   // Restore state from localStorage
   const [mode, setMode] = useState<PlaygroundMode>(() => {
@@ -256,7 +261,7 @@ const ExtractionPlaygroundPage: React.FC = () => {
     }
     return "";
   });
-  const [selectedModel, setSelectedModel] = useState(() => {
+  const storedModel = useMemo(() => {
     try {
       const saved = localStorage.getItem(STORAGE_KEY);
       if (saved) return JSON.parse(saved).selectedModel || "";
@@ -264,7 +269,7 @@ const ExtractionPlaygroundPage: React.FC = () => {
       /* ignore */
     }
     return "";
-  });
+  }, []);
 
   // Entity extraction state
   const [labels, setLabels] = useState<string[]>(() => {
@@ -343,12 +348,21 @@ const ExtractionPlaygroundPage: React.FC = () => {
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [processingTime, setProcessingTime] = useState<number | null>(null);
-  const [extractorModels, setExtractorModels] = useState<string[]>([]);
-  const [modelsLoaded, setModelsLoaded] = useState(false);
   const abortControllerRef = useRef<AbortController | null>(null);
   const labelColorMapRef = useRef<Map<string, number>>(new Map());
-  const { models: connectionExtractors, loading: extractorsLoading } =
-    useSelectedInferenceModelNames("extractor");
+  const { models: connectedExtractors, loading: extractorsLoading } =
+    useSelectedInferenceModels("extractor");
+  const connectionExtractors = useMemo(
+    () => modelsAcceptingInput(connectedExtractors, "text").map((model) => model.name),
+    [connectedExtractors]
+  );
+  const availableModels = connectionExtractors;
+  const modelsLoaded = !extractorsLoading;
+  const { model: selectedModel, setModel: setSelectedModel } = useModelSelection({
+    models: availableModels,
+    defaultModel: storedModel,
+    preserveRequestedModel: true,
+  });
 
   // Persist state to localStorage
   useEffect(() => {
@@ -378,37 +392,23 @@ const ExtractionPlaygroundPage: React.FC = () => {
     includeSpans,
   ]);
 
-  const availableModels = extractorModels;
   const unavailableReason = extractionUnavailableReason(
     selectedModel,
     connectionExtractors,
     extractorsLoading
   );
 
+  // biome-ignore lint/correctness/useExhaustiveDependencies: model/backend identity invalidates in-flight results
   useEffect(() => {
-    setExtractorModels(connectionExtractors);
-    setModelsLoaded(!extractorsLoading);
-  }, [connectionExtractors, extractorsLoading]);
-
-  // Default an empty selection; preserve unavailable IDs so the user sees why they cannot run.
-  useEffect(() => {
-    setSelectedModel((prev: string) => prev || extractorModels[0] || "");
-  }, [extractorModels]);
-
-  // Handle ?model= URL param from Model Directory "Open in Playground"
-  useEffect(() => {
-    const modelParam = searchParams.get("model");
-    if (modelParam && modelsLoaded) {
-      setSelectedModel(modelParam);
-      setSearchParams(
-        (prev) => {
-          prev.delete("model");
-          return prev;
-        },
-        { replace: true }
-      );
-    }
-  }, [searchParams, modelsLoaded, setSearchParams]);
+    abortControllerRef.current?.abort();
+    abortControllerRef.current = null;
+    setIsLoading(false);
+    setEntityResult(null);
+    setExtractResult(null);
+    setError(null);
+    setProcessingTime(null);
+    return () => abortControllerRef.current?.abort();
+  }, [selectedModel, inferenceApiUrl, inferenceConnectionId]);
 
   const getColorForLabel = (label: string) => {
     const normalizedLabel = label.toLowerCase();
@@ -454,12 +454,7 @@ const ExtractionPlaygroundPage: React.FC = () => {
       return;
     }
 
-    // Cancel any previous request
-    if (abortControllerRef.current) {
-      abortControllerRef.current.abort();
-    }
-
-    abortControllerRef.current = new AbortController();
+    const controller = beginAbortableRequest(abortControllerRef);
     setIsLoading(true);
     setError(null);
     setEntityResult(null);
@@ -470,7 +465,7 @@ const ExtractionPlaygroundPage: React.FC = () => {
 
     try {
       if (mode === "entities") {
-        const response = await fetchWithRetry(inferenceUrl("extract"), {
+        const data = await fetchInferenceJson<ExtractResponse>(inferenceUrl("extract"), {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
@@ -482,15 +477,9 @@ const ExtractionPlaygroundPage: React.FC = () => {
               include_spans: true,
             },
           }),
-          signal: abortControllerRef.current.signal,
+          signal: controller.signal,
         });
-
-        if (!response.ok) {
-          const errorText = await response.text();
-          throw new Error(errorText || `HTTP ${response.status}`);
-        }
-
-        const data: ExtractResponse = await response.json();
+        if (abortControllerRef.current !== controller || controller.signal.aborted) return;
         setEntityResult(data);
       } else {
         // Build schema for extract API
@@ -501,7 +490,7 @@ const ExtractionPlaygroundPage: React.FC = () => {
           };
         }
 
-        const response = await fetchWithRetry(inferenceUrl("extract"), {
+        const data = await fetchInferenceJson<ExtractResponse>(inferenceUrl("extract"), {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
@@ -514,20 +503,18 @@ const ExtractionPlaygroundPage: React.FC = () => {
               include_spans: includeSpans,
             },
           }),
-          signal: abortControllerRef.current.signal,
+          signal: controller.signal,
         });
-
-        if (!response.ok) {
-          const errorText = await response.text();
-          throw new Error(errorText || `HTTP ${response.status}`);
-        }
-
-        const data: ExtractResponse = await response.json();
+        if (abortControllerRef.current !== controller || controller.signal.aborted) return;
         setExtractResult(data);
       }
       setProcessingTime(performance.now() - startTime);
     } catch (err) {
-      if (err instanceof Error && err.name === "AbortError") {
+      if (
+        abortControllerRef.current !== controller ||
+        controller.signal.aborted ||
+        (err instanceof Error && err.name === "AbortError")
+      ) {
         return;
       }
       setError(
@@ -536,7 +523,7 @@ const ExtractionPlaygroundPage: React.FC = () => {
           : "Failed to connect to Antfly inference. Make sure the runtime is running."
       );
     } finally {
-      setIsLoading(false);
+      if (finishAbortableRequest(abortControllerRef, controller)) setIsLoading(false);
     }
   }, [
     inputText,
@@ -564,6 +551,9 @@ const ExtractionPlaygroundPage: React.FC = () => {
   }, [handleExtractionSubmit]);
 
   const handleReset = () => {
+    abortControllerRef.current?.abort();
+    abortControllerRef.current = null;
+    setIsLoading(false);
     setInputText("");
     setLabels(DEFAULT_LABELS);
     setNewLabel("");
@@ -826,7 +816,7 @@ const ExtractionPlaygroundPage: React.FC = () => {
   const resultModel = mode === "entities" ? entityResult?.model : extractResult?.model;
 
   return (
-    <DashboardPage className="h-full">
+    <AIWorkflowPage className="h-full">
       <DashboardPageHeader>
         <div>
           <DashboardPageTitle>Extraction Playground</DashboardPageTitle>
@@ -842,19 +832,15 @@ const ExtractionPlaygroundPage: React.FC = () => {
           </Button>
         </DashboardPageActions>
       </DashboardPageHeader>
-
-      <BackendInfoBar />
-
+      <AIWorkflowContextBar>
+        <BackendInfoBar />
+      </AIWorkflowContextBar>
       {modelsLoaded && availableModels.length === 0 && (
         <NoModelsGuide modelType="extractor" typeName="extraction model" />
       )}
-
       {/* Configuration Panel */}
-      <Card>
-        <CardHeader className="pb-4">
-          <CardTitle className="text-lg">Configuration</CardTitle>
-        </CardHeader>
-        <CardContent className="space-y-4">
+      <AIWorkflowPanel title="Configuration" className="min-w-0 overflow-hidden">
+        <div className="min-w-0 space-y-4">
           {/* Mode Toggle */}
           <div className="flex gap-2">
             <Button
@@ -1108,37 +1094,38 @@ const ExtractionPlaygroundPage: React.FC = () => {
           )}
 
           <FormActions>
-            <Button
+            <AIWorkflowSubmitButton
               onClick={handleExtractionSubmit}
               disabled={isLoading || !inputText.trim() || !selectedModel || !!unavailableReason}
+              running={isLoading}
+              runningLabel="Processing"
+              onCancel={() => {
+                abortControllerRef.current?.abort();
+                abortControllerRef.current = null;
+                setIsLoading(false);
+              }}
             >
-              {isLoading ? (
+              {mode === "entities" ? (
                 <>
-                  <ReloadIcon className="h-4 w-4 mr-2 animate-spin" />
-                  Processing
+                  {" "}
+                  <Tag className="h-4 w-4 mr-2" /> Extract Entities{" "}
                 </>
               ) : (
                 <>
-                  {mode === "entities" ? (
-                    <Tag className="h-4 w-4 mr-2" />
-                  ) : (
-                    <SlidersHorizontal className="h-4 w-4 mr-2" />
-                  )}
-                  {mode === "entities" ? "Extract Entities" : "Extract Data"}
+                  {" "}
+                  <SlidersHorizontal className="h-4 w-4 mr-2" /> Extract Data{" "}
                 </>
               )}
-            </Button>
+            </AIWorkflowSubmitButton>
           </FormActions>
-        </CardContent>
-      </Card>
-
+        </div>
+      </AIWorkflowPanel>
       {/* Error Display */}
       {error && (
         <div className="rounded-none border border-destructive/30 bg-destructive/10 p-4 text-sm text-destructive">
           {error}
         </div>
       )}
-
       {/* Results Stats Bar */}
       {hasResult && (
         <DashboardToolbar className="flex-row items-center gap-3 md:items-center">
@@ -1168,9 +1155,8 @@ const ExtractionPlaygroundPage: React.FC = () => {
           )}
         </DashboardToolbar>
       )}
-
       {/* Main Content - Side by Side */}
-      <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+      <AIWorkflowWorkbench className="grid-cols-1 lg:grid-cols-2">
         {/* Input Panel */}
         <Card className="flex flex-col">
           <CardHeader className="pb-3">
@@ -1324,8 +1310,7 @@ const ExtractionPlaygroundPage: React.FC = () => {
             )}
           </CardContent>
         </Card>
-      </div>
-
+      </AIWorkflowWorkbench>
       {/* Help text */}
       <div className="text-xs text-muted-foreground space-y-1">
         {mode === "entities" ? (
@@ -1353,7 +1338,7 @@ const ExtractionPlaygroundPage: React.FC = () => {
           </>
         )}
       </div>
-    </DashboardPage>
+    </AIWorkflowPage>
   );
 };
 

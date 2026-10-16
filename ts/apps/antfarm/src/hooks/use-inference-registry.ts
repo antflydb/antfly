@@ -43,7 +43,9 @@ const MODEL_TYPE_NAMES: Record<ModelType, string> = {
   transcriber: "transcription",
 };
 
-const TASK_KEYS = Object.keys(TASK_TO_TYPE) as InferenceTaskKey[];
+const TASK_KEYS = (Object.keys(TASK_TO_TYPE) as InferenceTaskKey[]).filter(
+  (task) => task !== "rewriters"
+);
 
 function modelId(type: ModelType, name: string): string {
   return `${type}-${name}`
@@ -82,13 +84,6 @@ const MODEL_TYPES: ModelTypeInfo[] = [
     name: "Extractor",
     description: "Entity extraction, relation extraction, and question answering",
     icon: "Tag",
-  },
-  {
-    type: "rewriter",
-    name: "Rewriter",
-    description:
-      "Sequence-to-sequence text transformation like paraphrasing and question generation",
-    icon: "RefreshCw",
   },
   {
     type: "generator",
@@ -183,6 +178,9 @@ export function transformConnectionModels(connections: Connection[]): InferenceM
           sourceUrl,
           type,
           description: `${MODEL_TYPE_NAMES[type][0]?.toUpperCase()}${MODEL_TYPE_NAMES[type].slice(1)} model available through ${connectionName}.`,
+          capabilities: listed.capabilities,
+          inputs: listed.inputs,
+          allowDownloads: inference.provider === "antfly",
           variants: [],
           inRegistry: connection.status === "connected",
         });

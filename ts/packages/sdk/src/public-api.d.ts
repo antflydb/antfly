@@ -5983,6 +5983,10 @@ export interface components {
             dimensions?: number;
             /** @description True when this model is referenced by a configured embedder, generator, reranker, or chunker. */
             configured?: boolean;
+            /** @description Inference capabilities advertised by the provider for this model and task. */
+            capabilities?: string[];
+            /** @description Input modalities accepted by the provider's resolved executor. */
+            inputs?: string[];
         };
         InferenceConnection: {
             provider: components["schemas"]["InferenceProviderType"];

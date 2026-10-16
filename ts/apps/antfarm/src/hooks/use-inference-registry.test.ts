@@ -53,4 +53,76 @@ describe("transformConnectionModels", () => {
     expect(models).toHaveLength(1);
     expect(models[0]).toMatchObject({ name: "Acme Chat", source: "acme/chat" });
   });
+
+  it("preserves server-advertised execution metadata", () => {
+    const models = transformConnectionModels([
+      {
+        id: "local-inference",
+        name: "local-inference",
+        kind: "inference",
+        status: "connected",
+        capabilities: ["models.extractor"],
+        inference: {
+          provider: "antfly",
+          models: {
+            extractors: [
+              {
+                name: "acme/extract",
+                capabilities: ["relations", "answers"],
+                inputs: ["text"],
+              },
+            ],
+          },
+        },
+      } as unknown as Connection,
+    ]);
+
+    expect(models[0]).toMatchObject({
+      capabilities: ["relations", "answers"],
+      inputs: ["text"],
+      allowDownloads: true,
+    });
+  });
+
+  it("keeps unsupported seq2seq models out of the active catalog", () => {
+    const models = transformConnectionModels([
+      {
+        id: "local-inference",
+        name: "local-inference",
+        kind: "inference",
+        status: "connected",
+        capabilities: [],
+        inference: {
+          provider: "antfly",
+          models: { rewriters: [{ name: "acme/rewrite" }] },
+        },
+      },
+    ]);
+
+    expect(models).toEqual([]);
+  });
+
+  it.each([
+    "antfly",
+    "openrouter",
+    "openai",
+    "ollama",
+  ] as const)("only offers Antfly CLI download guidance for the Antfly provider (%s)", (provider) => {
+    const models = transformConnectionModels([
+      {
+        id: provider,
+        name: provider,
+        kind: "inference",
+        status: "connected",
+        capabilities: [],
+        sources: [],
+        inference: {
+          provider,
+          models: { generators: [{ name: "acme/chat" }] },
+        },
+      },
+    ]);
+
+    expect(models[0].allowDownloads).toBe(provider === "antfly");
+  });
 });

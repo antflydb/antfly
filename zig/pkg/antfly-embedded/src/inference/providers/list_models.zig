@@ -73,10 +73,16 @@ pub const ListedModel = struct {
     display_name: ?[]u8 = null,
     kind: ModelKind = .other,
     dimensions: ?u32 = null,
+    capabilities: [][]u8 = &.{},
+    inputs: [][]u8 = &.{},
 
     pub fn deinit(self: *ListedModel, alloc: std.mem.Allocator) void {
         alloc.free(self.name);
         if (self.display_name) |value| alloc.free(value);
+        for (self.capabilities) |value| alloc.free(value);
+        if (self.capabilities.len > 0) alloc.free(self.capabilities);
+        for (self.inputs) |value| alloc.free(value);
+        if (self.inputs.len > 0) alloc.free(self.inputs);
         self.* = undefined;
     }
 };
@@ -296,6 +302,45 @@ const ResultBuilder = struct {
         });
     }
 
+    fn appendAntfly(
+        self: *ResultBuilder,
+        name: []const u8,
+        kind: ModelKind,
+        dimensions: ?u32,
+        info: ?*const std.json.Value,
+    ) !void {
+        try self.append(name, null, kind, dimensions);
+        errdefer {
+            var model = self.models.pop().?;
+            model.deinit(self.alloc);
+        }
+        const model = &self.models.items[self.models.items.len - 1];
+        const object = if (info) |value| switch (value.*) {
+            .object => |*object| object,
+            else => return,
+        } else return;
+        for ([_][]const u8{ "capabilities", "inputs" }) |field_name| {
+            const raw = object.get(field_name) orelse continue;
+            if (raw != .array) continue;
+            var values = std.ArrayList([]u8).empty;
+            errdefer {
+                for (values.items) |value| self.alloc.free(value);
+                values.deinit(self.alloc);
+            }
+            for (raw.array.items) |item| {
+                if (item != .string) continue;
+                const owned_value = try self.alloc.dupe(u8, item.string);
+                errdefer self.alloc.free(owned_value);
+                try values.append(self.alloc, owned_value);
+            }
+            if (std.mem.eql(u8, field_name, "capabilities")) {
+                model.capabilities = try values.toOwnedSlice(self.alloc);
+            } else {
+                model.inputs = try values.toOwnedSlice(self.alloc);
+            }
+        }
+    }
+
     fn toOwned(self: *ResultBuilder) !ListResult {
         return .{ .models = try self.models.toOwnedSlice(self.alloc) };
     }
@@ -490,9 +535,21 @@ pub fn parseAntflyModels(alloc: std.mem.Allocator, body: []const u8) !ListResult
     var builder = ResultBuilder.init(alloc);
     errdefer builder.deinit();
 
-    const groups = [_]ModelKind{ .embedder, .generator, .reranker, .chunker, .classifier, .rewriter, .reader, .transcriber, .extractor };
-    for (groups) |kind| {
-        const group_value = parsed.value.object.get(kind.groupKey()) orelse continue;
+    const groups = [_]struct { ModelKind, []const u8 }{
+        .{ .embedder, "embedders" },
+        .{ .generator, "generators" },
+        .{ .reranker, "rerankers" },
+        .{ .chunker, "chunkers" },
+        .{ .classifier, "deciders" },
+        .{ .classifier, "classifiers" },
+        .{ .rewriter, "rewriters" },
+        .{ .reader, "readers" },
+        .{ .transcriber, "transcribers" },
+        .{ .extractor, "extractors" },
+    };
+    for (groups) |group| {
+        const kind = group[0];
+        const group_value = parsed.value.object.get(group[1]) orelse continue;
         if (group_value != .object) continue;
         var it = group_value.object.iterator();
         while (it.next()) |entry| {
@@ -502,7 +559,7 @@ pub fn parseAntflyModels(alloc: std.mem.Allocator, body: []const u8) !ListResult
                     if (dims == .integer and dims.integer > 0) dimensions = @intCast(dims.integer);
                 }
             }
-            try builder.append(entry.key_ptr.*, null, kind, dimensions);
+            try builder.appendAntfly(entry.key_ptr.*, kind, dimensions, entry.value_ptr);
         }
     }
     return try builder.toOwned();
@@ -640,6 +697,25 @@ test "parse antfly task keyed models" {
     try std.testing.expectEqual(ModelKind.generator, result.models[1].kind);
     try std.testing.expectEqual(ModelKind.chunker, result.models[2].kind);
     try std.testing.expectEqual(ModelKind.transcriber, result.models[3].kind);
+}
+
+test "parse antfly metadata remains valid across every allocation failure" {
+    const Runner = struct {
+        fn run(alloc: std.mem.Allocator) !void {
+            var result = try parseAntflyModels(alloc,
+                \\{ "allow_downloads": false, "embedders": { "owner/embed": {
+                \\  "capabilities": ["dense", "sparse"], "inputs": ["text", "image"],
+                \\  "qualified_limits": { "max_tokens": 256 }
+                \\} }, "deciders": { "owner/decide": { "capabilities": ["classification"] } } }
+            );
+            defer result.deinit(alloc);
+            try std.testing.expectEqual(@as(usize, 2), result.models.len);
+            try std.testing.expectEqualStrings("sparse", result.models[0].capabilities[1]);
+            try std.testing.expectEqualStrings("image", result.models[0].inputs[1]);
+            try std.testing.expectEqual(ModelKind.classifier, result.models[1].kind);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Runner.run, .{});
 }
 
 test "mock provider lists static models" {
