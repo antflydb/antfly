@@ -9153,7 +9153,7 @@ fn queryFieldUsesKeywordAnalyzer(
     return analyzer.tokenizer == .keyword and analyzer.filters.len == 0 and analyzer.char_filters.len == 0;
 }
 
-fn resolveFilterTextIndexEntry(
+pub fn resolveFilterTextIndexEntry(
     executor: StructuredFilterResolverExecutor,
     primary_text_index_name: ?[]const u8,
     index_name: ?[]const u8,

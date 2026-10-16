@@ -362,6 +362,8 @@ pub fn registerLiteIndexResolvers(handle: *Handle, config_json: []const u8, roll
         cfg.value.namespace_generation = 0;
         cfg.value.inline_managed = true;
         cfg.value.retired = false;
+        cfg.value.replacement_index = "";
+        cfg.value.replacement_resolver = "";
         // Record the touch before mutating, so a mid-loop failure (an
         // invalid later resolver, a label conflict) still restores every
         // earlier insertion or replacement this call made.
@@ -2399,6 +2401,8 @@ pub const LiteResolvedOpenOptions = struct {
     /// Internal: the connection boundary owns the cross-process path lease.
     externally_locked: bool = false,
     artifact_reader_fence: bool = false,
+    /// Borrowed only during open, under the connection's publication fence.
+    allocator_verification_owner: ?*lite_backend.native.NativeFile = null,
 };
 
 pub fn optionFieldType(comptime Options: type, comptime field_name: []const u8) type {
@@ -2628,6 +2632,10 @@ pub fn openLiteHandleAllocWithRuntime(
             .io = borrowed_io,
         });
     errdefer backend.deinit();
+    if (resolved.allocator_verification_owner) |verified| {
+        if (!resolved.externally_locked) return error.InvalidArgument;
+        try backend.native_docstore.?.file.inheritAllocatorVerification(verified);
+    }
     if (resolved.externally_locked) {
         backend.native_docstore.?.file.externally_locked = true;
         backend.native_docstore.?.maintenance_start_suppressed = true;
@@ -7650,7 +7658,8 @@ fn addIndexJsonRegistered(
     // resolution artifacts. Otherwise a new generation can be built while its
     // resolver is retired, then skip already-current resolutions on replay.
     // The undo buffer restores both active and retired state on failed admission.
-    if (kind == .graph) {
+    const shadow_replacement = !existing_index and replacement != null and handle.database().core.index_manager.get(replacement.?.string) != null;
+    if (kind == .graph and !shadow_replacement) {
         registerLiteIndexResolvers(handle, parsed.value.config_json, &rollback.?) catch |err| {
             rollback.?.restore();
             if (err == error.ResolverMergeNamespaceChange)
@@ -8653,4 +8662,46 @@ comptime {
         "antfly_db_finalize_split",
         "antfly_db_snapshot",
     });
+}
+
+test "inline resolver replacement C API admits the same public name with fresh artifacts" {
+    const a = std.testing.allocator;
+    var directory = try TestDirectory.init("inline-resolver-public-replacement");
+    defer directory.cleanup();
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, directory.path());
+    const path = try std.fmt.allocPrintSentinel(a, "{s}/db.aflite", .{directory.path()}, 0);
+    defer a.free(path);
+    const handle = try openLiteHandleAlloc(path, .{ .no_sync = true, .profile = .native }, true);
+    const id = try publishHandle(handle);
+    defer antfly_db_close(id);
+    const old =
+        \\{"name":"old","kind":"graph","config_json":{"artifact":{"name":"kg_v1","kind":"asset","source":{"type":"field","value":"kg"},"content_type":"application/json"},"source":{"artifact":"kg_v1","format":"extraction_graph","mention_edge_type":"mentions"},"edge_types":[{"name":"mentions"}],"resolvers":[{"name":"concepts","table":"default","source_artifact":"kg_v1","resolution_artifact":"resolved_v1","key_template":"entity/{{ slug _entity.text }}","promote":false}]}}
+    ;
+    const next =
+        \\{"name":"new","kind":"graph","replaces":"old","config_json":{"artifact":{"name":"kg_v2","kind":"asset","source":{"type":"field","value":"kg"},"content_type":"application/json"},"source":{"artifact":"kg_v2","format":"extraction_graph","mention_edge_type":"mentions"},"edge_types":[{"name":"mentions"}],"resolvers":[{"name":"concepts","table":"default","source_artifact":"kg_v2","resolution_artifact":"resolved_v2","key_template":"entity/{{ uslug _entity.text }}","promote":false}]}}
+    ;
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_add_index_json(id, .fromSlice(old)));
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_add_index_json(id, .fromSlice(next)));
+    // An identical pending admission joins its durable generation.
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_add_index_json(id, .fromSlice(next)));
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_run_until_idle(id));
+    {
+        const guard = enterHandle(id, .read) orelse return error.TestUnexpectedResult;
+        defer guard.leave();
+        try std.testing.expect(guard.entry_error == null);
+        const database = guard.handle.database();
+        const resolvers = try database.listResolvers(a);
+        defer {
+            for (resolvers) |*cfg| cfg.deinit(a);
+            a.free(resolvers);
+        }
+        try std.testing.expectEqual(@as(usize, 1), resolvers.len);
+        try std.testing.expectEqualStrings("concepts", resolvers[0].name);
+        try std.testing.expectEqualStrings("kg_v2", resolvers[0].source_artifact);
+        try std.testing.expectEqualStrings("resolved_v2", resolvers[0].resolution_artifact);
+        try std.testing.expectEqualStrings("entity/{{ uslug _entity.text }}", resolvers[0].key_template);
+        try std.testing.expect(database.indexGeneration("old") == null);
+    }
+    // Replaying the declarative config after activation remains idempotent.
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_add_index_json(id, .fromSlice(next)));
 }

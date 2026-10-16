@@ -63,8 +63,9 @@ pub const Source = union(enum) {
     contiguous: []const u8,
     ranges: Ranges,
 
-    // Native callback contracts include field type names. A named payload
-    // keeps the representation identical across separately compiled owners.
+    // Native callback contracts include immediate field type names. Anonymous
+    // payload names contain compilation-local IDs and cannot identify the same
+    // source representation in independently compiled runtime archives.
     pub const Ranges = struct {
         ptr: *anyopaque,
         length: u64,
