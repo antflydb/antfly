@@ -64397,7 +64397,10 @@ test "relational columnar selected payload pages bound wide projection reads" {
         try std.testing.expectEqualDeep(all.documents[0], filtered.documents[0]);
         try std.testing.expectEqualDeep(all.documents[63], filtered.documents[1]);
         try std.testing.expect(filtered_stats.payload_bytes_read * 4 < all_stats.payload_bytes_read);
-        try std.testing.expectEqual(@as(u64, 2), filtered_stats.values_materialized);
+        // Typed predicates and borrowed text projection need neither logical
+        // value materialization nor a block-owned logical cache.
+        try std.testing.expectEqual(@as(u64, 0), filtered_stats.values_materialized);
+        try std.testing.expectEqual(@as(u64, 0), filtered_stats.logical_slots_initialized);
         // Equivalent predicate order must not force wide payload reads.
         const reversed_filter = try std.fmt.allocPrint(scratch, "{{\"conjuncts\":[{{\"term\":{{\"payload\":\"{s}\"}}}},{{\"term\":{{\"n\":0}}}}]}}", .{payloads[0]});
         var reversed_stats: types.ColumnarScanStats = .{};
