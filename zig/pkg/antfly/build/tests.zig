@@ -2695,7 +2695,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     lake_integration_mod.addImport("antfly_openapi_specs", antfly_imports.embedded_openapi);
     const lake_integration_tests = b.addTest(.{
         .root_module = lake_integration_mod,
-        .filters = &.{ "lake SQL", "external lake" },
+        .filters = selectTestFilters(b, &.{ "lake SQL", "external lake" }),
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
     b.step("lake-integration-test", "Run public lake binding and SQL cursor integration tests").dependOn(&addFilteredTestRunArtifact(b, lake_integration_tests).step);
