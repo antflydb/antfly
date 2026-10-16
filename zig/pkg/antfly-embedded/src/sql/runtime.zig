@@ -2532,6 +2532,8 @@ test "SQL result boundary preserves array ownership descriptors and NULL provena
 }
 
 const TestBackend = struct {
+    const stored_tag_elements = [_]Datum{ Datum.fromJson(.{ .string = "urgent" }), .{}, Datum.fromJson(.{ .string = "vip" }) };
+    stored_arrays: bool = false,
     estimate_scans: bool = false,
     enable_dynamic_filters: bool = false,
     dynamic_filters: usize = 0,
@@ -2612,8 +2614,13 @@ const TestBackend = struct {
         backend.statement_scan_count = scans.len;
         return .{ .ptr = owner, .cursors = cursors, .close = Statement.close };
     }
-    fn resolve(_: *anyopaque, _: std.mem.Allocator, _: ast.Name, _: catalog.Action) !catalog.Table {
-        return .{ .id = 19, .physical_name = "table:stable", .schema_version = 7, .columns = &.{.{ .name = "id", .path = "id", .type = .integer, .nullable = false }} };
+    fn resolve(ptr: *anyopaque, _: std.mem.Allocator, _: ast.Name, _: catalog.Action) !catalog.Table {
+        const self: *TestBackend = @ptrCast(@alignCast(ptr));
+        const columns: []const catalog.Column = &.{
+            .{ .name = "id", .path = "id", .type = .integer, .nullable = false },
+            .{ .name = "tags", .path = "tags", .type = .array, .element_type = .text },
+        };
+        return .{ .id = 19, .physical_name = "table:stable", .schema_version = 7, .columns = if (self.stored_arrays) columns else columns[0..1] };
     }
     fn scan(ptr: *anyopaque, alloc: std.mem.Allocator, table_def: catalog.Table, request: catalog.Scan) !catalog.Page {
         const self: *TestBackend = @ptrCast(@alignCast(ptr));
@@ -2630,6 +2637,15 @@ const TestBackend = struct {
             var object: std.json.ObjectMap = .empty;
             try object.put(alloc, "id", if (self.group_modulo) |modulo| .{ .integer = @intCast(index % modulo) } else if (self.group_every) |every| .{ .integer = @intCast(index / every) } else .{ .number_string = "9007199254740993" });
             row.* = .{ .id = try std.fmt.allocPrint(alloc, "{d}", .{index}), .version = 99, .value = .{ .object = object } };
+            if (self.stored_arrays) {
+                const elements: []const Datum = if (index == 0) &stored_tag_elements else &.{};
+                const dimensions = try alloc.alloc(@import("array_value.zig").Dimension, 1);
+                dimensions[0] = .{ .length = @intCast(elements.len) };
+                const array = try alloc.create(@import("array_value.zig").Value);
+                array.* = try @import("array_value.zig").Value.init(.text, dimensions, elements, .{});
+                row.* = try catalog.Row.fromDatums(alloc, row.id, try catalog.Row.TypedLayout.init(alloc, &.{ "id", "tags" }), &.{ Datum.fromJson(object.get("id").?), if (index == 2) .{} else Datum.typedArray(array) });
+                row.version = 99;
+            }
         }
         return .{ .rows = rows, .after = if (request.primary_key == null and from + count_rows < self.row_count) try std.fmt.allocPrint(alloc, "{d}", .{from + count_rows}) else null };
     }
@@ -3262,6 +3278,134 @@ test "SQL USING closes one coordinated capture across every allocation failure" 
         }
     };
     var compiled = try compiler.compile(std.testing.allocator, "SELECT k, a.k, b.k FROM (SELECT _id AS k FROM things WHERE _id != '2') a FULL JOIN (SELECT _id AS k FROM things WHERE _id != '0') b USING(k) ORDER BY 1 LIMIT 1", .{});
+    defer compiled.deinit();
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Check.run, .{&compiled});
+}
+
+test "SQL UNNEST streams typed arrays with storage order zip padding and ordinality" {
+    const a = std.testing.allocator;
+    const Case = struct { id: []const u8, sql: []const u8, columns: []const []const u8, column_oids: []const u32, rows: []const []const std.json.Value, sql_nulls: []const []const bool };
+    var reference = try std.json.parseFromSlice(struct { format: u8, reference: []const u8, entries: []const Case }, a, @embedFile("fixtures/sql_array_expansion_reference.json"), .{});
+    defer reference.deinit();
+    try std.testing.expectEqual(@as(u8, 1), reference.value.format);
+    try std.testing.expectEqualStrings("PostgreSQL exact SQL", reference.value.reference);
+    try std.testing.expectEqual(@as(usize, 17), reference.value.entries.len);
+    for (reference.value.entries) |case| for ([_]u32{ 1, 3, 64 }) |page_rows| {
+        var backend: TestBackend = .{ .row_count = 3, .stored_arrays = true };
+        var compiled = try compiler.compile(std.testing.allocator, case.sql, .{});
+        defer compiled.deinit();
+        var result = try execute(std.testing.allocator, backend.coordinated(), &compiled, &.{}, .{ .page_rows = page_rows });
+        defer result.deinit();
+        const expected = try std.json.Stringify.valueAlloc(a, case.rows, .{});
+        defer a.free(expected);
+        const json = try std.json.Stringify.valueAlloc(std.testing.allocator, result.output.rows, .{});
+        defer std.testing.allocator.free(json);
+        try std.testing.expectEqualStrings(expected, json);
+        try std.testing.expectEqual(case.columns.len, result.output.columns.len);
+        for (result.output.columns, case.columns, case.column_oids) |column, name, oid| {
+            try std.testing.expectEqualStrings(name, column.name);
+            const actual = if (column.element_type) |element| element.oid() else switch (column.type) {
+                .integer => @as(u32, 20),
+                .number => 701,
+                .string => 25,
+                .uuid => 2950,
+                .boolean => 16,
+                .json => 3802,
+                else => return error.TestUnexpectedResult,
+            };
+            try std.testing.expectEqual(oid, actual);
+        }
+        try std.testing.expectEqual(case.sql_nulls.len, result.output.sql_nulls.?.len);
+        for (case.sql_nulls, result.output.sql_nulls.?) |want, actual| try std.testing.expectEqualSlices(bool, want, actual);
+        try std.testing.expectEqual(backend.statement_opens, backend.statement_closes);
+    };
+}
+
+test "SQL UNNEST implicit lateral inputs retain one capture and outer NULL extension" {
+    for ([_][]const u8{ ", unnest", " CROSS JOIN LATERAL unnest", " JOIN LATERAL unnest" }, 0..) |syntax, index| {
+        var backend: TestBackend = .{ .row_count = 3 };
+        const sql = try std.fmt.allocPrint(std.testing.allocator, "SELECT d._id, tag FROM things d{s}(string_to_array(d._id || ' urgent', ' ')) AS tag{s} WHERE tag = 'urgent' ORDER BY d._id", .{ syntax, if (index == 2) " ON true" else "" });
+        defer std.testing.allocator.free(sql);
+        var compiled = try compiler.compile(std.testing.allocator, sql, .{});
+        defer compiled.deinit();
+        var result = try execute(std.testing.allocator, backend.coordinated(), &compiled, &.{}, .{ .page_rows = 1 });
+        defer result.deinit();
+        try std.testing.expectEqual(@as(usize, 3), result.output.rows.len);
+        for (result.output.rows, [_][]const u8{ "0", "1", "2" }) |row, expected| {
+            try std.testing.expectEqualStrings(expected, row[0].string);
+            try std.testing.expectEqualStrings("urgent", row[1].string);
+        }
+        try std.testing.expectEqual(@as(usize, 1), backend.statement_opens);
+        try std.testing.expectEqual(@as(usize, 1), backend.statement_closes);
+    }
+    {
+        var backend: TestBackend = .{ .row_count = 3 };
+        var compiled = try compiler.compile(std.testing.allocator, "SELECT d._id, t.v, t.n FROM things d LEFT JOIN unnest(CASE WHEN d._id = '1' THEN ARRAY[]::text[] ELSE ARRAY[NULL]::text[] END) WITH ORDINALITY t(v,n) ON true ORDER BY d._id", .{});
+        defer compiled.deinit();
+        var result = try execute(std.testing.allocator, backend.coordinated(), &compiled, &.{}, .{ .page_rows = 1 });
+        defer result.deinit();
+        try std.testing.expectEqual(@as(usize, 3), result.output.rows.len);
+        for (result.output.sql_nulls.?, 0..) |flags, index| {
+            try std.testing.expect(flags[1]);
+            try std.testing.expectEqual(index == 1, flags[2]);
+        }
+        try std.testing.expectEqualStrings("1", result.output.rows[0][2].string);
+    }
+}
+
+test "SQL UNNEST validates array inputs and lateral scope before capture" {
+    for ([_]struct { sql: []const u8, failure: anyerror }{
+        .{ .sql = "SELECT * FROM unnest(1)", .failure = error.SqlUndefinedFunction },
+        .{ .sql = "SELECT * FROM pg_catalog.unnest(ARRAY[1],ARRAY[2])", .failure = error.SqlUndefinedFunction },
+        .{ .sql = "SELECT * FROM unnest(NULL)", .failure = error.SqlAmbiguousFunction },
+        .{ .sql = "SELECT * FROM unnest(ARRAY[1]) t(x,y)", .failure = error.InvalidSqlParameters },
+        .{ .sql = "SELECT * FROM things d RIGHT JOIN unnest(ARRAY[d.id]) t ON true", .failure = error.InvalidLateralReference },
+        .{ .sql = "SELECT t.unnest FROM unnest(ARRAY[1],ARRAY[2]) t", .failure = error.AmbiguousSqlColumn },
+    }) |case| {
+        var backend: TestBackend = .{};
+        var compiled = try compiler.compile(std.testing.allocator, case.sql, .{});
+        defer compiled.deinit();
+        try std.testing.expectError(case.failure, execute(std.testing.allocator, backend.coordinated(), &compiled, &.{}, .{}));
+        try std.testing.expectEqual(@as(usize, 0), backend.statement_opens);
+    }
+}
+
+test "SQL UNNEST demand admission and allocation failures never materialize expanded inputs" {
+    const cells = try std.testing.allocator.alloc([]const u8, 10001);
+    defer std.testing.allocator.free(cells);
+    @memset(cells, "x");
+    const joined = try std.mem.join(std.testing.allocator, ",", cells);
+    defer std.testing.allocator.free(joined);
+    const array_text = try std.fmt.allocPrint(std.testing.allocator, "{{{s}}}", .{joined});
+    defer std.testing.allocator.free(array_text);
+    for ([_][]const u8{
+        "SELECT v FROM unnest($1::text[]) t(v) LIMIT 1",
+        "SELECT v FROM things d CROSS JOIN unnest($1::text[]) t(v) LIMIT 1",
+    }) |sql| {
+        var backend: TestBackend = .{ .row_count = 3 };
+        var compiled = try compiler.compile(std.testing.allocator, sql, .{});
+        defer compiled.deinit();
+        var result = try execute(std.testing.allocator, backend.coordinated(), &compiled, &.{.{ .string = array_text }}, .{ .scan_rows = 1 });
+        defer result.deinit();
+        try std.testing.expectEqual(@as(usize, 1), result.output.rows.len);
+        try std.testing.expectEqualStrings("x", result.output.rows[0][0].string);
+    }
+    {
+        var backend: TestBackend = .{};
+        var compiled = try compiler.compile(std.testing.allocator, "SELECT count(*) FROM unnest(ARRAY[1,2,3])", .{});
+        defer compiled.deinit();
+        try std.testing.expectError(error.SqlProgramLimitExceeded, execute(std.testing.allocator, backend.coordinated(), &compiled, &.{}, .{ .scan_rows = 2 }));
+    }
+    const Check = struct {
+        fn run(a: std.mem.Allocator, compiled: *const compiler.Compiled) !void {
+            var backend: TestBackend = .{ .row_count = 3 };
+            defer std.debug.assert(backend.statement_opens == backend.statement_closes);
+            var result = try execute(a, backend.coordinated(), compiled, &.{}, .{ .page_rows = 1 });
+            defer result.deinit();
+            try std.testing.expectEqual(@as(usize, 3), result.output.rows.len);
+        }
+    };
+    var compiled = try compiler.compile(std.testing.allocator, "SELECT d._id, t.v, t.n FROM things d LEFT JOIN unnest(ARRAY[d._id, NULL]) WITH ORDINALITY t(v,n) ON true ORDER BY d._id, t.n LIMIT 3", .{});
     defer compiled.deinit();
     try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Check.run, .{&compiled});
 }

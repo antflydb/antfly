@@ -106,6 +106,7 @@ const Names = std.StringHashMapUnmanaged(void);
 pub const PreparedScope = struct { table: []const u8, qualifiers: []const []const u8 };
 fn aliases(alloc: Allocator, relation: *const ast.Relation, names: *Names, prepared: ?PreparedScope) !void {
     switch (relation.*) {
+        .unnest => |function| try names.put(alloc, function.alias orelse "unnest", {}),
         .table => |table| {
             if (table.prepared_rows) if (prepared) |scope| if (std.mem.eql(u8, table.name.table, scope.table)) {
                 for (scope.qualifiers) |qualifier| try names.put(alloc, qualifier, {});
@@ -173,6 +174,7 @@ const Builder = struct {
     };
     fn relationDefines(value: *const ast.Relation, qualifier: []const u8) bool {
         return switch (value.*) {
+            .unnest => |part| std.mem.eql(u8, part.alias orelse "unnest", qualifier),
             .table => |part| std.mem.eql(u8, part.alias orelse part.name.table, qualifier),
             .derived => |part| std.mem.eql(u8, part.alias, qualifier),
             .join => |part| relationDefines(part.left, qualifier) or relationDefines(part.right, qualifier),
@@ -240,6 +242,9 @@ const Builder = struct {
     }
     fn nestedOuterRelation(self: *Builder, value: *const ast.Relation, scope: ?*const NestedScope) bool {
         return switch (value.*) {
+            .unnest => |part| for (part.args) |arg| {
+                if (self.nestedOuterScalar(arg, scope)) break true;
+            } else false,
             .table => false,
             .derived => |part| self.nestedOuterSelect(part.query, scope),
             .join => |part| self.nestedOuterRelation(part.left, scope) or self.nestedOuterRelation(part.right, scope) or

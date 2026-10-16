@@ -182,6 +182,15 @@ pub const Cte = struct {
 };
 pub const Search = struct { request: Value, limit: ?Value = null };
 pub const Relation = union(enum) {
+    /// FROM UNNEST expands typed arrays in storage order, zipping multiple
+    /// arguments with SQL NULL padding. Function inputs are implicitly lateral.
+    unnest: struct {
+        args: []const *const Scalar,
+        alias: ?[]const u8 = null,
+        columns: []const []const u8 = &.{},
+        ordinality: bool = false,
+        qualified: bool = false,
+    },
     table: struct {
         name: Name,
         search: ?*const Search = null,

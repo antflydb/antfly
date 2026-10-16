@@ -116,6 +116,7 @@ pub const Node = struct {
         recursive: struct { id: usize, seed: *const Node, step: *const Node, all: bool },
         materialized_ref: *const Node,
         scan: struct { index: usize, source_columns: []const []const u8 },
+        unnest: struct { source: *const Node, arrays: []const scalar.Program, ordinality: bool },
         join: struct { kind: ast.JoinKind, left: *const Node, right: *const Node, condition: ?scalar.Program, left_keys: []const scalar.Program, right_keys: []const scalar.Program, correlation: bool = false, membership: ?struct { correlations: usize } = null },
         apply: struct { id: usize, kind: ast.JoinKind, left: *const Node, right: *const Node, condition: ?scalar.Program, demand: ?scalar.Program = null, single_row: bool = false },
         query: struct {
@@ -1374,6 +1375,42 @@ const Builder = struct {
         if (depth > 32) return error.SqlProgramLimitExceeded;
         try self.backend.vtable.checkpoint(self.backend.ptr);
         return switch (input.*) {
+            .unnest => |function| blk: {
+                // PostgreSQL's zipped multi-array form is grammar sugar, not
+                // an overload of the schema-qualified single-array function.
+                if (function.qualified and function.args.len != 1) return error.SqlUndefinedFunction;
+                if (function.args.len == 0 or function.args.len > 1024) return error.SqlProgramLimitExceeded;
+                const width = function.args.len + @intFromBool(function.ordinality);
+                if (function.columns.len > width) return error.InvalidSqlParameters;
+                const source = try self.withOuter(try self.node(&.{}, .singleton));
+                const types = try self.scalarColumns(source.columns);
+                const columns = try self.alloc.alloc(Column, width);
+                const programs = try self.alloc.alloc(scalar.Program, if (self.shape_only) 0 else function.args.len);
+                for (function.args, columns[0..function.args.len], 0..) |arg, *column, index| {
+                    const expression_ = try self.expression(source.columns, arg, &.{});
+                    const symbolic = if (self.shape_only) try self.inferenceExpression(expression_, source.columns) else expression_;
+                    const output = try scalar.inferOutputWithInvocation(self.alloc, symbolic, if (self.shape_only) self.shape_columns.items else types, self.parameters, self.backend.parameter_invocation);
+                    if (output.kind == null) return error.SqlAmbiguousFunction;
+                    if (output.kind != .array) return error.SqlUndefinedFunction;
+                    const element = output.element_type orelse return error.SqlAmbiguousFunction;
+                    const kind: ast.ColumnType = switch (element) {
+                        .text => .string,
+                        .uuid => .uuid,
+                        .int16, .int32, .int64 => .integer,
+                        .float32, .float64, .numeric => .number,
+                        .boolean => .boolean,
+                        .jsonb => .json,
+                    };
+                    column.* = .{ .name = if (index < function.columns.len) function.columns[index] else if (function.args.len == 1) function.alias orelse "unnest" else "unnest", .internal = try self.internal(), .qualifier = function.alias orelse "unnest", .type = kind, .element_type = element, .nullable = true, .origin = if (self.shape_only) try self.scalarNode(.{ .cast = .{ .type = kind, .element_type = element, .operand = try self.scalarNode(.{ .literal = .null }) } }) else null };
+                    if (self.shape_only) {
+                        try self.constraints.append(self.alloc, .{ .expression = symbolic, .expected = .array });
+                    } else {
+                        programs[index] = try scalar.bindExpectedWithSettings(self.alloc, expression_, types, self.parameters, .array, .{ .invocation = self.backend.parameter_invocation }, self.backend.settings_view);
+                    }
+                }
+                if (function.ordinality) columns[width - 1] = .{ .name = if (function.columns.len == width) function.columns[width - 1] else "ordinality", .internal = try self.internal(), .qualifier = function.alias orelse "unnest", .type = .integer, .element_type = .int64, .nullable = false, .origin = if (self.shape_only) try self.scalarNode(.{ .cast = .{ .type = .integer, .operand = try self.scalarNode(.{ .literal = .null }) } }) else null };
+                break :blk try self.node(columns, if (self.shape_only) .singleton else .{ .unnest = .{ .source = source, .arrays = programs, .ordinality = function.ordinality } });
+            },
             .table => |reference| blk: {
                 if (reference.prepared_rows and std.mem.eql(u8, reference.name.table, prepared_scope_name)) {
                     const authorized = self.prepared_scope orelse return error.InvalidSqlBackendResponse;
@@ -1514,7 +1551,7 @@ const Builder = struct {
             },
             .join => |join| blk: {
                 const left = try self.relation(join.left, scope, depth + 1);
-                const lateral = join.right.* == .derived and join.right.derived.lateral;
+                const lateral = join.right.* == .unnest or (join.right.* == .derived and join.right.derived.lateral);
                 var apply_id: ?usize = null;
                 const right = if (lateral) right: {
                     if (self.outer_next == 32) return error.SqlProgramLimitExceeded;
@@ -1716,6 +1753,7 @@ const Builder = struct {
                 @constCast(source).operation = .{ .literal_rows = try self.alloc.dupe([]const scalar.Datum, &.{nulls}) };
             },
             .query => |query| try self.uncorrelated(query.source, id),
+            .unnest => |function| try self.uncorrelated(function.source, id),
             .materialized_ref => |node_| try self.uncorrelated(node_, id),
             .join => |join| {
                 try self.uncorrelated(join.left, id);
@@ -1856,6 +1894,10 @@ fn markSelect(alloc: Allocator, needed: *std.StringHashMapUnmanaged(void), state
 }
 fn projectScans(builder: *Builder, node: *const Node, needed: *std.StringHashMapUnmanaged(void)) anyerror!void {
     switch (node.operation) {
+        .unnest => |function| {
+            for (function.arrays) |program| for (program.required_columns) |ordinal| try needed.put(builder.alloc, function.source.columns[ordinal].internal, {});
+            try projectScans(builder, function.source, needed);
+        },
         .singleton, .recursive_ref, .outer_ref, .literal_rows => {},
         .prepared_rows => |names| {
             if (builder.prepared_scope != null) for (node.columns, names) |column, name| {

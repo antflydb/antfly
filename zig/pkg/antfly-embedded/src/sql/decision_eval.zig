@@ -86,6 +86,10 @@ pub fn validateStatement(a: std.mem.Allocator, provider: ?decisions.DecisionProv
 }
 fn validateRelation(a: std.mem.Allocator, provider: ?decisions.DecisionProvider, node: *const @import("relation_binding.zig").Node, parameters: []const std.json.Value) anyerror!void {
     switch (node.operation) {
+        .unnest => |function| {
+            try validateRelation(a, provider, function.source, parameters);
+            for (function.arrays) |*program| try validate(a, provider, program, parameters);
+        },
         .recursive => |part| {
             try validateRelation(a, provider, part.seed, parameters);
             try validateRelation(a, provider, part.step, parameters);

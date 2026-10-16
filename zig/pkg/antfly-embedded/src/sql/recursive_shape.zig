@@ -54,6 +54,11 @@ fn predicateReferences(value: *const ast.Predicate, name: []const u8, depth: usi
 fn relationReferences(value: *const ast.Relation, name: []const u8, depth: usize) anyerror!usize {
     if (depth > 64) return error.SqlProgramLimitExceeded;
     return switch (value.*) {
+        .unnest => |function| blk: {
+            var count: usize = 0;
+            for (function.args) |arg| count += try scalarReferences(arg, name, depth + 1);
+            break :blk count;
+        },
         .table => |table| @intFromBool(table.search == null and table.name.database == null and table.name.namespace == null and std.mem.eql(u8, table.name.table, name)),
         .derived => |derived| references(derived.query.*, name, depth + 1),
         .join => |join| try relationReferences(join.left, name, depth + 1) + try relationReferences(join.right, name, depth + 1) +
@@ -87,6 +92,9 @@ pub fn references(query: ast.Select, name: []const u8, depth: usize) anyerror!us
 fn validateRelation(value: *const ast.Relation, name: []const u8, depth: usize) anyerror!void {
     if (depth > 64) return error.SqlProgramLimitExceeded;
     switch (value.*) {
+        .unnest => |function| for (function.args) |arg| {
+            if (try scalarReferences(arg, name, depth + 1) != 0) return error.UnsupportedSqlShape;
+        },
         .table => {},
         .derived => |derived| if (try references(derived.query.*, name, depth + 1) != 0) return error.UnsupportedSqlShape,
         .join => |join| {

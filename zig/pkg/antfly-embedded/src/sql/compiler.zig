@@ -1316,8 +1316,30 @@ const Parser = struct {
             query.* = statement_value.select;
             return self.relationNode(.{ .derived = .{ .query = query, .alias = alias, .columns = try names.toOwnedSlice(self.alloc), .lateral = lateral } });
         }
-        if (lateral) return self.fail(error.InvalidSqlSyntax, "LATERAL requires a derived query");
         const name_value = try self.tableReferenceName();
+        if (name_value.database == null and (name_value.namespace == null or std.mem.eql(u8, name_value.namespace.?, "pg_catalog")) and std.mem.eql(u8, name_value.table, "unnest") and self.take(.lparen)) {
+            var args: std.ArrayList(*const ast.Scalar) = .empty;
+            while (true) {
+                try args.append(self.alloc, try self.scalar(0, 0));
+                if (!self.take(.comma)) break;
+            }
+            try self.expect(.rparen);
+            const ordinality = if (self.keyword(.with)) blk: {
+                if (!self.ddlWord("ordinality")) return self.fail(error.InvalidSqlSyntax, "expected WITH ORDINALITY");
+                break :blk true;
+            } else false;
+            const alias = try self.sourceAlias();
+            var columns: std.ArrayList([]const u8) = .empty;
+            if (alias != null and self.take(.lparen)) {
+                while (true) {
+                    try columns.append(self.alloc, try self.identifier());
+                    if (!self.take(.comma)) break;
+                }
+                try self.expect(.rparen);
+            }
+            return self.relationNode(.{ .unnest = .{ .args = try args.toOwnedSlice(self.alloc), .alias = alias, .columns = try columns.toOwnedSlice(self.alloc), .ordinality = ordinality, .qualified = name_value.namespace != null } });
+        }
+        if (lateral) return self.fail(error.InvalidSqlSyntax, "LATERAL requires a derived query or table function");
         if (name_value.database == null and name_value.namespace == null and std.ascii.eqlIgnoreCase(name_value.table, "antfly_search") and self.take(.lparen)) {
             const table_value = try self.value();
             if (table_value != .string or table_value.string.len == 0) return self.fail(error.InvalidSqlSyntax, "antfly_search requires a literal table name");

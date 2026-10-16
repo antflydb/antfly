@@ -881,6 +881,40 @@ pub fn runScalarKernels(alloc: std.mem.Allocator, handler: anytype) !void {
 }
 
 /// Supplemental PostgreSQL contracts, not original-corpus disposition credit.
+pub fn runArrayExpansion(alloc: std.mem.Allocator, handler: anytype) !void {
+    var reference = try std.json.parseFromSlice(struct {
+        format: u8,
+        reference: []const u8,
+        entries: []const struct { id: []const u8, sql: []const u8, columns: []const []const u8, column_oids: []const u32, rows: []const []const Json, sql_nulls: []const []const bool },
+    }, alloc, fixtures.array_expansion_reference, .{});
+    defer reference.deinit();
+    try std.testing.expectEqual(@as(u8, 1), reference.value.format);
+    try std.testing.expectEqualStrings("PostgreSQL exact SQL", reference.value.reference);
+    try std.testing.expectEqual(@as(usize, 17), reference.value.entries.len);
+    for (reference.value.entries) |entry| {
+        const case: fixtures.Corpus.Case = .{ .id = entry.id, .name = entry.sql, .family = "array", .sql = entry.sql, .params = &.{}, .source_expectation = "success" };
+        var response = try execute(alloc, handler, &case);
+        defer response.deinit();
+        const result = response.value;
+        try std.testing.expectEqualStrings("SELECT", result.command_tag);
+        try std.testing.expectEqual(@as(i64, 0), result.rows_affected);
+        try std.testing.expectEqual(entry.rows.len, result.rows.len);
+        try std.testing.expectEqual(entry.columns.len, result.columns.len);
+        for (result.columns, entry.columns, entry.column_oids) |column, name, oid| {
+            try std.testing.expectEqualStrings(name, column.name);
+            try std.testing.expect(postgresColumnMatches(column, oid));
+        }
+        for (result.rows, entry.rows, entry.sql_nulls, 0..) |row, want, flags, index| {
+            // This oracle already uses exact public wire encodings for
+            // bigint/NUMERIC. Do not round through the legacy float matcher.
+            try std.testing.expectEqual(want.len, row.len);
+            for (row, want) |actual, expected| try std.testing.expect(equivalent(actual, expected));
+            try std.testing.expectEqualSlices(bool, flags, result.sql_nulls.?[index]);
+        }
+    }
+}
+
+/// Supplemental PostgreSQL contracts, not original-corpus disposition credit.
 pub fn runArrayExpressions(alloc: std.mem.Allocator, handler: anytype) !void {
     const reference = try std.json.parseFromSlice(struct {
         reference: []const u8,

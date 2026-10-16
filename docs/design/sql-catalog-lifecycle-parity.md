@@ -9023,3 +9023,55 @@ native and fresh PostgreSQL gates), and
 `/private/tmp/antfly-sql-join-reference-guards-final.log` (three oracle guards).
 Inventory integrity, license headers, Apache product boundary and storage/
 control-catalog compilation-boundary audits are separate from release readiness.
+
+### Typed streaming array expansion
+
+The next large document-read cohort depends on array expansion. FROM UNNEST
+now has an explicit schema-independent AST and a typed relational operator,
+instead of treating a row producer as a scalar call or expanding JSON documents.
+Binding shares existing parameter, lexical-scope, shape, decision-capability,
+cold-projection and coordinated-capture boundaries. It retains scalar element
+identities, including integer widths, UUID, exact NUMERIC and JSONB. EXPLAIN
+exposes an Unnest node. Recursive dependency and subquery-scope visitors see
+function inputs rather than hiding their references.
+
+Execution evaluates each invocation's input arrays once and streams flat
+storage-order elements. Multi-array calls zip to the longest input with SQL
+NULL padding; empty and NULL arrays emit no rows by themselves. WITH ORDINALITY
+starts at one regardless of array lower bounds. Implicit/explicit lateral
+inputs and LEFT null extension use the existing Apply owner and captured cut.
+Only emitted cells cross the output ownership boundary, not whole duplicated
+arrays per expanded row. Expanded rows are charged to a statement-wide quota,
+with cancellation checkpoints and allocator-failure cleanup.
+
+Direct invariant UNNEST operators bypass eager expanded-row replay: LIMIT 1
+over a prepared 10,001-element array succeeds with a one-row expansion quota,
+both alone and beside a captured table. Scalar input preparation/work limits
+remain independent and unchanged. Generic invariant derived-query replay and
+other set-returning functions remain separate architectural work; this
+checkpoint does not claim every enclosing plan is prefix-lazy.
+
+An owned PostgreSQL 18+ server independently verifies 17 shared operator
+contracts, including stored arrays, multi-dimensional/lower-bound order, exact
+NUMERIC, UUID, JSON null versus SQL NULL and lateral outer joins. The native
+executor consumes that same reference at page sizes 1, 3 and 64, checking exact
+element OIDs, values and NULL flags. Mounted HTTP tests use actual typed storage
+and bounded native captures. These references preserve bigint/NUMERIC wire
+strings exactly; they never round them through a floating-point matcher. The
+oracle uses a read-only server-side cursor and bounded fetches. PostgreSQL also
+establishes that only the unqualified multi-array spelling is grammar sugar;
+schema-qualified UNNEST retains its single-array signature.
+
+Validation: `/private/tmp/antfly-sql-unnest-stored-debug-closed.log`,
+`/private/tmp/antfly-sql-unnest-public-debug-closed.log` and
+`/private/tmp/antfly-sql-unnest-oracle-check-final.log`. The native gate includes
+exhaustive allocation-failure ownership and row-admission tests; the HTTP gate
+also reruns all 22 previously qualified original joins. No throughput claim is
+assigned to these work-limit tests.
+
+No original case dispositions change: 505 implemented / 136 rejected /
+113 superseded / 832 unresolved. In particular, the document-view/index-backed
+UNNEST originals still need their actual mapping/catalog and indexed producer
+paths proven end to end; typed relational inputs are not a substitute for that
+contract. Persisted document SQL views, index-proof pushdown, ROWS FROM/other
+table functions, and broader distributed activation remain unfinished.

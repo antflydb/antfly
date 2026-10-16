@@ -128,6 +128,7 @@ fn relationPlan(alloc: Allocator, bound: *const relation.Bound, node: *const rel
         .prepared_rows => .{ .node_type = "Prepared Mutation Images" },
         .recursive_ref => .{ .node_type = "Recursive Reference" },
         .outer_ref => .{ .node_type = "Outer Reference" },
+        .unnest => |function| .{ .node_type = "Unnest", .plans = try alloc.dupe(Plan, &.{try relationPlan(alloc, bound, function.source, verbose, depth + 1, remaining)}) },
         .apply => |apply| blk: {
             const source: Plan = .{ .node_type = if (apply.demand != null) "Masked Apply" else "Lateral Apply", .join_kind = @tagName(apply.kind), .plans = try alloc.dupe(Plan, &.{ try relationPlan(alloc, bound, apply.left, verbose, depth + 1, remaining), try relationPlan(alloc, bound, apply.right, verbose, depth + 1, remaining) }) };
             var functions: std.ArrayList([]const u8) = .empty;

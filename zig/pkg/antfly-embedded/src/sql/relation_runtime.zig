@@ -59,6 +59,7 @@ fn dependsOn(node: *const binding.Node, id: usize) bool {
         .recursive_ref => |reference| reference == id,
         .materialized_ref => |source| dependsOn(source, id),
         .query => |query| dependsOn(query.source, id),
+        .unnest => |function| dependsOn(function.source, id),
         .join => |join| dependsOn(join.left, id) or dependsOn(join.right, id),
         .apply => |apply| dependsOn(apply.left, id) or dependsOn(apply.right, id),
         .set => |set| dependsOn(set.left, id) or dependsOn(set.right, id),
@@ -74,6 +75,7 @@ fn outerMask(node: *const binding.Node) u32 {
         .outer_ref => |id| @as(u32, 1) << @intCast(id),
         .materialized_ref => |source| outerMask(source),
         .query => |query| outerMask(query.source),
+        .unnest => |function| outerMask(function.source),
         .join => |join| outerMask(join.left) | outerMask(join.right),
         .apply => |apply| (outerMask(apply.left) | outerMask(apply.right)) & ~(@as(u32, 1) << @intCast(apply.id)),
         .set => |set| outerMask(set.left) | outerMask(set.right),
@@ -711,6 +713,7 @@ fn Engine(comptime Context: type) type {
         context: Context,
         cursors: []const catalog.Cursor,
         visited: usize = 0,
+        expanded_rows: usize = 0,
         work: usize = 0,
         cache_arena: std.heap.ArenaAllocator,
         static_rows: std.AutoHashMapUnmanaged(*const binding.Node, *Replay) = .empty,
@@ -909,6 +912,9 @@ fn Engine(comptime Context: type) type {
             query_remaining: usize = 0,
             query_buffer: []const []const Datum = &.{},
             query_buffer_index: usize = 0,
+            unnest_values: ?[]const Datum = null,
+            unnest_index: usize = 0,
+            unnest_count: usize = 0,
             set_entries: std.ArrayList(SetEntry) = .empty,
             set_heads: std.AutoHashMapUnmanaged(u64, usize) = .empty,
             set_ready: bool = false,
@@ -943,11 +949,14 @@ fn Engine(comptime Context: type) type {
                 const self = try alloc.create(Iterator);
                 self.* = .{ .engine = engine, .node = node, .arena = .init(alloc), .scratch = .init(alloc), .probe_arena = .init(alloc), .recursive_id = recursive_id, .apply_mode = apply_mode };
                 errdefer self.deinit();
-                if (recursive_id) |id| if (!dependsOn(node, id)) {
+                if (recursive_id) |id| if (node.operation != .unnest and !dependsOn(node, id)) {
                     self.cached_reader = try (try engine.staticRows(node)).openReader();
                     return self;
                 };
-                if (apply_mode and outerMask(node) == 0 and (recursive_id == null or !dependsOn(node, recursive_id.?))) {
+                // UNNEST reuses prepared array inputs, not an eager replay of
+                // all expanded rows. Even an invariant invocation must remain
+                // demand-driven for LIMIT, cancellation and row admission.
+                if (apply_mode and node.operation != .unnest and outerMask(node) == 0 and (recursive_id == null or !dependsOn(node, recursive_id.?))) {
                     self.cached_reader = try (try engine.staticRows(node)).openReader();
                     return self;
                 }
@@ -962,6 +971,7 @@ fn Engine(comptime Context: type) type {
                     },
                     .apply => |apply| self.left = try createContext(engine, apply.left, recursive_id, apply_mode),
                     .query => |query| self.left = try createContext(engine, query.source, recursive_id, apply_mode),
+                    .unnest => |function| self.left = try createContext(engine, function.source, recursive_id, apply_mode),
                     .set => |set| {
                         self.left = try createContext(engine, set.left, recursive_id, apply_mode);
                         self.right = try createContext(engine, set.right, recursive_id, apply_mode);
@@ -1094,6 +1104,7 @@ fn Engine(comptime Context: type) type {
                 }
                 if (self.cached_reader) |reader| return reader.next();
                 return switch (self.node.operation) {
+                    .unnest => |function| self.nextUnnest(alloc, function),
                     .materialized_ref => unreachable,
                     .recursive => blk: {
                         const state = try self.engine.recursive(self.node);
@@ -1256,6 +1267,40 @@ fn Engine(comptime Context: type) type {
                 defer self.batch_demand = previous;
                 return self.next(alloc);
             }
+            fn nextUnnest(self: *Iterator, alloc: Allocator, function: @FieldType(@FieldType(binding.Node, "operation"), "unnest")) anyerror!?[]const Datum {
+                while (true) {
+                    try self.engine.checkpoint();
+                    if (self.unnest_values == null or self.unnest_index == self.unnest_count) {
+                        _ = self.arena.reset(.{ .retain_with_limit = 16 * 1024 });
+                        self.unnest_values = null;
+                        const input = (try self.left.?.next(self.arena.allocator())) orelse return null;
+                        const values = try self.arena.allocator().alloc(Datum, function.arrays.len);
+                        self.unnest_count = 0;
+                        for (function.arrays, values) |program, *value| {
+                            value.* = try self.engine.context.evaluate(self.arena.allocator(), program, input);
+                            if (value.sql_null) continue;
+                            const array = value.array orelse return error.InvalidSqlBackendResponse;
+                            self.unnest_count = @max(self.unnest_count, array.elements.len);
+                        }
+                        self.unnest_values = values;
+                        self.unnest_index = 0;
+                        if (self.unnest_count == 0) continue;
+                    }
+                    if (self.engine.expanded_rows == self.engine.context.limits.scan_rows) return error.SqlProgramLimitExceeded;
+                    self.engine.expanded_rows += 1;
+                    const row = try alloc.alloc(Datum, self.node.columns.len);
+                    @memset(row, .{});
+                    for (self.unnest_values.?, row[0..function.arrays.len]) |value, *out| {
+                        if (value.sql_null) continue;
+                        const array = value.array orelse return error.InvalidSqlBackendResponse;
+                        if (self.unnest_index < array.elements.len) out.* = try operators.cloneDatum(alloc, array.elements[self.unnest_index]);
+                    }
+                    if (function.ordinality) row[row.len - 1] = Datum.fromJson(.{ .integer = @intCast(self.unnest_index + 1) });
+                    self.unnest_index += 1;
+                    return row;
+                }
+            }
+
             fn nextApply(self: *Iterator, alloc: Allocator, apply: @FieldType(@FieldType(binding.Node, "operation"), "apply")) anyerror!?[]const Datum {
                 while (true) {
                     try self.engine.checkpoint();
@@ -2067,6 +2112,7 @@ fn Engine(comptime Context: type) type {
                         if (hasPatterns(arm, depth + 1)) break true;
                     } else false,
                     .materialized_ref => |source| hasPatterns(source, depth + 1),
+                    .unnest => |function| hasPatterns(function.source, depth + 1),
                     .recursive, .recursive_ref => true,
                     else => false,
                 };
