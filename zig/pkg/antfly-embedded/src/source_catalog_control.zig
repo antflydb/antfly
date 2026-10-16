@@ -174,6 +174,7 @@ pub const sparse_sparse = @import("sparse/sparse.zig");
 pub const sql_aggregate_binding = @import("sql/aggregate_binding.zig");
 pub const sql_ast = @import("sql/ast.zig");
 pub const sql_catalog = @import("sql/catalog.zig");
+pub const sql_view_definition = @import("sql/view_definition.zig");
 pub const sql_parity_fixtures = @import("sql/parity_fixtures.zig");
 pub const sql_compiler = @import("sql/compiler.zig");
 pub const sql_conflict = @import("sql/conflict.zig");

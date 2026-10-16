@@ -45,6 +45,7 @@ test {
     _ = @import("returning_test.zig");
     _ = @import("conflict_test.zig");
     _ = @import("antfly_local_sources").sql_catalog;
+    _ = @import("antfly_local_sources").sql_view_definition;
     _ = @import("antfly_local_sources").sql_document_row;
     _ = @import("antfly_local_sources").sql_read_stream;
     _ = @import("antfly_local_sources").sql_operators;

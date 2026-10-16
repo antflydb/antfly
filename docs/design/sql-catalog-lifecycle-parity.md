@@ -9159,3 +9159,38 @@ from sampled payloads. Index-backed originals need real native candidate/proof
 paths plus residual evaluation against the captured cut; ordinary relational
 scans over a similarly named fixture are not their evidence. These catalog,
 authorization, conversion and producer paths remain unfinished.
+
+### Private SQL-view definition preparation
+
+`sql/view_definition.zig` now prepares owned read-only definitions through the
+existing compiler and semantic binder. Its resolver has only authorized point
+metadata lookup and cancellation capabilities, not data readers or mutation
+callbacks. Repeated lexical references resolve once. Distinct qualifications
+retain their SQL identities, while references to one physical table must agree
+on logical identity, schema version and digest within one catalog revision.
+
+The retained artifact contains SQL text, stable owner identity, security mode,
+ordered output names and exact builtin/array/NUMERIC descriptors, and sorted
+source identities with publication guards. Parameters, writable statements,
+duplicate output names and inconsistent metadata fail before activation.
+Source count, query size, syntax complexity and combined temporary/retained
+allocation capacity are bounded. Compiler/binder scratch is released before
+returning the artifact; it is not retained with saved definitions. Cancellation
+and allocator failures release both regions before ownership transfer.
+
+This is private preparation, **not persisted-view activation**. Source version
+and digest are publication guards, not a permanent ban on compatible source
+schema changes. Durable namespace admission, stable column dependencies,
+rename/drop/replace handling, current owner/RLS delegation, authorized view
+expansion and generated public APIs still need integration. No original SQL
+case dispositions change at this checkpoint.
+
+Validation: `/private/tmp/antfly-sql-view-definition-full-debug.log` passed the
+complete Debug SQL gate (841 core tests, 227 extracted SQL tests, three existing
+opt-in skips, zero failures/leaks). The subsequent same-identity consistency
+guard passed the final eight-test focused Debug run in
+`/private/tmp/antfly-sql-view-definition-final-debug.log`. A fresh owned
+PostgreSQL 18.6 experiment in
+`/private/tmp/antfly-sql-view-definition-postgres.log` confirmed partial output
+alias lists, exact integer/array/NUMERIC descriptors, duplicate output rejection
+and excess-alias rejection. It did not qualify stored-view execution or RLS.
