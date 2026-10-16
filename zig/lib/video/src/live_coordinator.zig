@@ -933,7 +933,7 @@ fn dynamicUnit(a: std.mem.Allocator, reader: *media.mp4.Reader, index: usize, op
     var single = reader.*;
     single.packets = reader.packets[index .. index + 1];
     const window = try windows.copyWithParameters(a, "dynamic-live-unit", &single, 0, &.{}, options.window);
-    return .{ .backing = window.snapshot, .reader = window.reader, .identity = window.identity, .identity_reservation = window.identity_reservation, .ordinal = index, .epoch = 0, .origin = .normalized_transport };
+    return .{ .backing = window.snapshot.?, .reader = window.reader, .identity = window.identity, .identity_reservation = window.identity_reservation, .ordinal = index, .epoch = 0, .origin = .normalized_transport };
 }
 fn assertDynamicPixels(a: std.mem.Allocator, prepared: *const Prepared, original: *media.mp4.Reader, original_index: usize) !void {
     var view = prepared.window.reader;

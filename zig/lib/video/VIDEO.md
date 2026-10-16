@@ -239,6 +239,27 @@ measures completed GPU execution. These gauges exclude preparation textures,
 decoder surfaces and opaque driver storage. They are not physical residency,
 bus traffic or whole-pipeline memory.
 
+## Window execution costs
+
+Apple WebM continuations validate compatibility once for their immutable picture
+and restart index. Decoder packet limits apply to the submitted dependency span,
+including warm continuation or backward replay, rather than total clip length.
+Changing an index requires a new owner. Backward replay preserves forward state.
+
+MP4 chunk windows borrow immutable coded storage, including range sources. Dynamic
+parameter sets use a first-packet bootstrap overlay. Request-bound selection keys
+combine immutable source/track identity with absolute picture IDs, so overlapping
+windows do not copy or rehash their coded dependencies. Standalone content-bound
+selection still verifies payloads. Sources and index storage outlive all workers.
+
+Resident frame projections assemble into one final tensor with device row copies,
+including variable token counts and repeated sampled pictures. CPU fallback uses
+one host destination. Preparation of one following window may overlap the current
+language backbone, after projection consumption has joined the current decoder.
+Lookahead has independent host/device admission, bounded queues, serial retry on
+resource pressure, and joined cleanup on early stop or cancellation. It does not
+share language KV state between independently contextualized embeddings.
+
 ## Verification
 
 Use the repository Zig toolchain. From the repository root:

@@ -27,6 +27,9 @@ pub const Lease = struct {
 pub const Provider = struct {
     context: *anyopaque,
     samples: usize,
+    /// Unknown-length streams return a shorter final lease and publish EOF here.
+    final_samples: ?*const fn (*anyopaque) ?usize = null,
+    probe: ?*const fn (*anyopaque, usize, usize) anyerror!?usize = null,
     sample_rate: u32,
     read: *const fn (*anyopaque, std.mem.Allocator, usize, usize) anyerror!Lease,
 };
@@ -87,20 +90,36 @@ pub const Stream = struct {
     buffer: std.ArrayList(f32) = .empty,
     base: usize = 0,
     received: usize = 0,
+    eof: bool = false,
+    producer_rate: u32 = 0,
     pub fn start(a: std.mem.Allocator, bytes: []const u8, control: @import("../execution_control.zig").InferenceExecutionControl) !?*Stream {
         if (comptime @import("builtin").single_threaded or @import("builtin").cpu.arch.isWasm() or @import("builtin").os.tag == .freestanding) return null;
         if (!try audio.streaming.supported(a, bytes)) return null;
-        const check = control.imageWorkControl();
-        const info = audio.streaming.inspect(a, bytes, .{ .context = check.context, .check_fn = check.check_fn }) catch |err| {
-            if (err == error.UnsupportedStreamingAudioProfile or err == error.UnsupportedAudioFormat) return null;
+        const self = try a.create(Stream);
+        self.* = .{ .a = a, .bytes = bytes, .control = control, .io = control.io orelse std.Options.debug_io, .info = .{ .samples = 0, .sample_rate = 0 }, .queue = undefined };
+        self.queue = .init(&self.storage);
+        self.thread = std.Thread.spawn(.{}, run, .{self}) catch |err| {
+            a.destroy(self);
             return err;
         };
-        if (info.samples == 0 or info.sample_rate == 0) return error.UnsupportedAudioFormat;
-        const self = try a.create(Stream);
-        errdefer a.destroy(self);
-        self.* = .{ .a = a, .bytes = bytes, .control = control, .io = control.io orelse std.Options.debug_io, .info = info, .queue = undefined };
-        self.queue = .init(&self.storage);
-        self.thread = try std.Thread.spawn(.{}, run, .{self});
+        errdefer self.deinit();
+        // The first block establishes the actual decoder output clock (including
+        // implicit SBR), without a separate duration/PCM validation traversal.
+        var first: [1][]f32 = undefined;
+        _ = self.queue.getUncancelable(self.io, &first, 1) catch {
+            self.join();
+            const err = self.failure orelse error.UnsupportedAudioFormat;
+            if (err == error.UnsupportedStreamingAudioProfile or err == error.UnsupportedAudioFormat) {
+                self.deinit();
+                return null;
+            }
+            return err;
+        };
+        defer a.free(first[0]);
+        self.info.sample_rate = self.producer_rate;
+        self.info.samples = @intCast(@min(std.math.maxInt(usize), @divFloor(@as(u128, std.math.maxInt(i64)) * self.info.sample_rate, std.time.ns_per_s)));
+        try self.buffer.appendSlice(a, first[0]);
+        self.received = first[0].len;
         return self;
     }
     fn run(self: *Stream) void {
@@ -112,7 +131,8 @@ pub const Stream = struct {
     }
     fn push(raw: *anyopaque, samples: []const f32, rate: u32, channels: u8) !void {
         const self: *Stream = @ptrCast(@alignCast(raw));
-        if (channels != 1 or rate != self.info.sample_rate) return error.UnsupportedAudioFormat;
+        if (channels != 1) return error.UnsupportedAudioFormat;
+        if (self.producer_rate == 0) self.producer_rate = rate else if (rate != self.producer_rate) return error.UnsupportedAudioFormat;
         const owned = try self.a.dupe(f32, samples);
         errdefer self.a.free(owned);
         try self.queue.putOneUncancelable(self.io, owned);
@@ -145,10 +165,21 @@ pub const Stream = struct {
         }
         self.join();
         if (self.failure) |err| return err;
-        if (total != self.info.samples) return error.IncompleteAudioStream;
+        if (self.eof and total != self.received) return error.IncompleteAudioStream;
+        self.received = total;
+        self.eof = true;
     }
     pub fn provider(self: *Stream) Provider {
-        return .{ .context = self, .samples = self.info.samples, .sample_rate = self.info.sample_rate, .read = read };
+        return .{ .context = self, .samples = self.info.samples, .final_samples = finalSamples, .probe = probe, .sample_rate = self.info.sample_rate, .read = read };
+    }
+    fn probe(raw: *anyopaque, first: usize, last: usize) !?usize {
+        const self: *Stream = @ptrCast(@alignCast(raw));
+        _ = try read(raw, self.a, first, @min(last, self.info.samples));
+        return finalSamples(raw);
+    }
+    fn finalSamples(raw: *anyopaque) ?usize {
+        const self: *Stream = @ptrCast(@alignCast(raw));
+        return if (self.eof) self.received else null;
     }
     fn read(raw: *anyopaque, _: std.mem.Allocator, first: usize, last: usize) !Lease {
         const self: *Stream = @ptrCast(@alignCast(raw));
@@ -158,11 +189,13 @@ pub const Stream = struct {
         std.mem.copyForwards(f32, self.buffer.items[0 .. self.buffer.items.len - discard], self.buffer.items[discard..]);
         self.buffer.items.len -= discard;
         self.base += discard;
-        while (self.received < last) {
+        while (self.received < last and !self.eof) {
             var item: [1][]f32 = undefined;
             _ = self.queue.getUncancelable(self.io, &item, 1) catch {
                 self.join();
-                return self.failure orelse error.IncompleteAudioStream;
+                if (self.failure) |err| return err;
+                self.eof = true;
+                break;
             };
             defer self.a.free(item[0]);
             const block_start = self.received;
@@ -176,7 +209,9 @@ pub const Stream = struct {
             if (self.buffer.items.len == 0) self.base = block_start + skip;
             try self.buffer.appendSlice(self.a, item[0][skip..]);
         }
-        if (first < self.base or last - self.base > self.buffer.items.len) return error.IncompleteAudioStream;
-        return .{ .pcm = .{ .samples = self.buffer.items[first - self.base .. last - self.base], .sample_rate = self.info.sample_rate } };
+        if (self.eof and first >= self.received) return .{ .pcm = .{ .samples = &.{}, .sample_rate = self.info.sample_rate } };
+        const stop = @min(last, self.received);
+        if (first < self.base or stop - self.base > self.buffer.items.len) return error.IncompleteAudioStream;
+        return .{ .pcm = .{ .samples = self.buffer.items[first - self.base .. stop - self.base], .sample_rate = self.info.sample_rate } };
     }
 };

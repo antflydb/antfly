@@ -504,6 +504,51 @@ fn trimTrailingFramesAlloc(allocator: std.mem.Allocator, samples: []f32, channel
     return out;
 }
 
+/// Unknown totals need only retain declared discard padding, not decode the
+/// source once to count and again to emit. Ring storage grows with actual input
+/// and remains subject to the caller's allocation budget.
+const TailSink = struct {
+    a: std.mem.Allocator,
+    sink: @import("pcm_sink.zig").Sink,
+    rate: u32,
+    channels: u8,
+    tail_samples: usize,
+    ring: std.ArrayList(f32) = .empty,
+    head: usize = 0,
+    output: [2048]f32 = undefined,
+    buffered: usize = 0,
+    total: usize = 0,
+    fn emit(self: *@This(), value: f32) !void {
+        self.output[self.buffered] = value;
+        self.buffered += 1;
+        if (self.buffered == self.output.len - self.output.len % self.channels) try self.flush();
+    }
+    fn flush(self: *@This()) !void {
+        if (self.buffered != 0) try self.sink.push(self.output[0..self.buffered], self.rate, self.channels);
+        self.buffered = 0;
+    }
+    fn write(raw: *anyopaque, pcm: []const f32, rate: u32, channels: u8) !void {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        if (rate != self.rate or channels != self.channels) return error.UnsupportedAudioFormat;
+        self.total = try std.math.add(usize, self.total, pcm.len);
+        if (self.tail_samples == 0) return self.sink.push(pcm, rate, channels);
+        for (pcm) |sample| {
+            if (self.ring.items.len < self.tail_samples) {
+                try self.ring.append(self.a, sample);
+            } else {
+                try self.emit(self.ring.items[self.head]);
+                self.ring.items[self.head] = sample;
+                self.head = (self.head + 1) % self.ring.items.len;
+            }
+        }
+    }
+    fn finish(self: *@This()) !void {
+        // Preserve existing container semantics: padding at least as long as
+        // the timeline does not discard the entire clip.
+        if (self.total <= self.tail_samples) for (self.ring.items) |sample| try self.emit(sample);
+        try self.flush();
+    }
+};
 const TimelineSink = struct {
     sink: @import("pcm_sink.zig").Sink,
     times: []const u64,
@@ -642,19 +687,26 @@ pub fn visitInterleaved(a: std.mem.Allocator, bytes: []const u8, sink: @import("
             try native.appendSlice(a, demuxed.codec_private);
             for (demuxed.access_units) |unit| try native.appendSlice(a, unit);
             const info = try flac.parseStreamInfo(native.items);
-            // STREAMINFO may omit total_samples in a live recording. Count a
-            // validation pass without retaining PCM before constructing the
-            // final-tail timeline; execution still uses bounded codec blocks.
-            const Counter = struct {
-                frames: usize = 0,
-                fn write(raw: *anyopaque, pcm: []const f32, _: u32, channels: u8) !void {
-                    const self: *@This() = @ptrCast(@alignCast(raw));
-                    self.frames = try std.math.add(usize, self.frames, pcm.len / channels);
+            if (info.total_samples == 0) {
+                const trim = if (demuxed.discard_padding_ns > 0) nsToFrames(@intCast(demuxed.discard_padding_ns), info.sample_rate) else 0;
+                var tail = TailSink{ .a = a, .sink = sink, .rate = info.sample_rate, .channels = info.channels, .tail_samples = try std.math.mul(usize, trim, info.channels) };
+                defer tail.ring.deinit(a);
+                const delay = nsToFrames(demuxed.codec_delay_ns, info.sample_rate);
+                var gap = nsToFrames(demuxed.access_unit_times_ns[0], info.sample_rate) -| delay;
+                if (gap > max_timeline_silence_seconds * info.sample_rate) return error.UnsupportedAudioFormat;
+                if (gap > @max(1, info.sample_rate / 1000)) {
+                    const zeros: [2048]f32 = @splat(0);
+                    while (gap != 0) {
+                        const count = @min(gap, zeros.len / info.channels);
+                        try TailSink.write(&tail, zeros[0 .. count * info.channels], info.sample_rate, info.channels);
+                        gap -= count;
+                    }
                 }
-            };
-            var counter = Counter{};
-            if (info.total_samples == 0) try flac.visitInterleaved(a, native.items, .{ .context = &counter, .write = Counter.write });
-            const count = [_]usize{if (info.total_samples == 0) counter.frames else @intCast(info.total_samples)};
+                try flac.visitInterleaved(a, native.items, .{ .context = &tail, .write = TailSink.write });
+                try tail.finish();
+                return;
+            }
+            const count = [_]usize{@intCast(info.total_samples)};
             var timeline = try TimelineSink.init(sink, demuxed.access_unit_times_ns[0..1], &count, info.sample_rate, info.channels, nsToFrames(demuxed.codec_delay_ns, info.sample_rate), count[0], demuxed.discard_padding_ns);
             try flac.visitInterleaved(a, native.items, timeline.consumer());
             try timeline.finish();
@@ -1648,4 +1700,25 @@ test "streaming audio webm FLAC with unknown sample total preserves full PCM" {
     var capture = Capture{ .expected = expected.samples };
     try visitInterleaved(a, file, .{ .context = &capture, .write = Capture.write });
     try std.testing.expectEqual(expected.samples.len, capture.offset);
+}
+
+test "webm unknown-length discard padding ring preserves final-tail semantics" {
+    const Collect = struct {
+        samples: std.ArrayList(f32) = .empty,
+        fn write(raw: *anyopaque, pcm: []const f32, _: u32, _: u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try self.samples.appendSlice(std.testing.allocator, pcm);
+        }
+    };
+    const a = std.testing.allocator;
+    const input = [_]f32{ 0, 1, 2, 3, 4, 5, 6, 7 };
+    for ([_]usize{ 0, 2, 4, 8, 12 }) |trim| {
+        var collect = Collect{};
+        defer collect.samples.deinit(a);
+        var tail = TailSink{ .a = a, .sink = .{ .context = &collect, .write = Collect.write }, .rate = 48000, .channels = 2, .tail_samples = trim };
+        defer tail.ring.deinit(a);
+        for (0..4) |i| try TailSink.write(&tail, input[i * 2 ..][0..2], 48000, 2);
+        try tail.finish();
+        try std.testing.expectEqualSlices(f32, input[0..if (trim < input.len) input.len - trim else input.len], collect.samples.items);
+    }
 }

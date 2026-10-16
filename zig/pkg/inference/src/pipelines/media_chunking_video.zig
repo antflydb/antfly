@@ -20,6 +20,7 @@ const video = @import("antfly_video");
 const model_video = @import("embedding_gemma2_video.zig");
 pub const Owner = struct {
     continuation: model_video.DecoderContinuation,
+    source_binding: [32]u8,
     allocator: std.mem.Allocator,
     reader: *media.mp4.Reader,
     timed: []video.sampling.TimedPicture,
@@ -30,6 +31,7 @@ pub const Owner = struct {
     limits: @import("media_chunk_limits.zig").Limits,
     pub fn init(a: std.mem.Allocator, reader: *media.mp4.Reader, pool: *media.admission.Pool, limits: @import("media_chunk_limits.zig").Limits) !Owner {
         if (reader.packets.len == 0) return error.EmptyVideo;
+        if (reader.input.identity.len == 0) return error.InvalidVideoReaderSelection;
         var logical: ?video.h264_pictures.Index = null;
         errdefer if (logical) |*index| index.deinit();
         if (reader.track.codec == .avc) {
@@ -52,7 +54,7 @@ pub const Owner = struct {
             }
         }
         const registry = if (reader.track.inband_parameter_sets) try video.h264_dynamic.Session.init(a, reader, .{}) else null;
-        return .{ .continuation = .{ .allocator = a, .reader = reader, .parameter_sets = registry, .max_packets = limits.max_dependency_packets }, .allocator = a, .reader = reader, .timed = timed, .logical = logical, .registry = registry, .origin = origin, .pool = pool, .limits = limits };
+        return .{ .source_binding = model_video.immutableSourceBinding(reader), .continuation = .{ .allocator = a, .reader = reader, .parameter_sets = registry, .max_packets = limits.max_dependency_packets }, .allocator = a, .reader = reader, .timed = timed, .logical = logical, .registry = registry, .origin = origin, .pool = pool, .limits = limits };
     }
     pub fn deinit(self: *Owner) void {
         self.continuation.deinit();
@@ -114,7 +116,8 @@ pub const Owner = struct {
         view.packets = self.reader.packets[first..stop];
         const bootstrap = if (self.registry) |registry| try registry.bootstrapBefore(a, first) else null;
         defer if (bootstrap) |bytes| a.free(bytes);
-        var window = try video.live_windows.copyWithParameters(a, self.reader.input.identity, &view, 0, bootstrap orelse &.{}, .{ .max_packets = self.limits.max_dependency_packets, .stream = .{ .max_bytes = self.limits.max_coded_window_bytes, .admission_pool = self.pool, .control = self.reader.input.control } });
+        if (try std.math.add(u64, coded_bytes, if (bootstrap) |value| value.len else 0) > self.limits.max_coded_window_bytes) return error.ChunkCodedWindowBudgetExceeded;
+        var window = try video.live_windows.borrowWithParameters(a, &view, bootstrap orelse &.{}, .{ .max_packets = self.limits.max_dependency_packets, .stream = .{ .max_bytes = self.limits.max_coded_window_bytes, .admission_pool = self.pool, .control = self.reader.input.control } });
         errdefer window.deinit();
         for (window.reader.packets) |*packet| packet.pts = try std.math.sub(i64, packet.pts, self.origin);
         var subset: ?video.h264_pictures.Index = null;
@@ -148,17 +151,18 @@ pub const Owner = struct {
             for (pictures, window.reader.packets, 0..) |*picture, packet, id| picture.* = .{ .first_packet = id, .last_packet = id, .pts = packet.pts, .duration = packet.duration, .width = if (cfg) |configuration| @intCast(configuration.width) else self.reader.track.width, .height = if (cfg) |configuration| @intCast(configuration.height) else self.reader.track.height, .bit_depth = if (cfg) |configuration| configuration.bit_depth else 8, .chroma_format = if (cfg) |configuration| configuration.chroma_format else 1 };
             subset = .{ .allocator = a, .pictures = pictures, .timescale = self.reader.track.timescale, .packet_count = pictures.len };
         }
-        return .{ .coded = window, .logical = subset, .packet_base = first };
+        return .{ .coded = window, .logical = subset, .packet_base = first, .source_binding = self.source_binding };
     }
 };
 pub const Window = struct {
     coded: video.live_windows.Window,
+    source_binding: [32]u8,
     logical: ?video.h264_pictures.Index = null,
     selection: ?model_video.ReaderSelection = null,
     packet_base: usize,
     /// Bind only after the Window reaches its final address; workers borrow it.
     pub fn bind(self: *Window, policy: video.sampling.TimestampPolicy, pool: *media.admission.Pool) !void {
-        if (self.logical) |*index| self.selection = try model_video.ReaderSelection.init(self.coded.reader.allocator, &self.coded.reader, .{ .source_timestamps = policy }, index, pool, self.coded.reader.input.control);
+        if (self.logical) |*index| self.selection = try model_video.ReaderSelection.initImmutable(self.coded.reader.allocator, &self.coded.reader, .{ .source_timestamps = policy }, index, pool, self.coded.reader.input.control, self.source_binding, self.packet_base);
     }
     pub fn deinit(self: *Window) void {
         if (self.selection) |*selection| selection.deinit();

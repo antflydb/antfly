@@ -122,8 +122,10 @@ Native callbacks drain before each window's borrowed capture/control expires;
 backward requests replay independently without disturbing forward references.
 Failed owners are destroyed before retry. Native callbacks drain before borrowed
 window state retires, and Apple decoder surface reservations survive until owner
-release. Required dependency bytes are still materialized per window; retained
-references reduce reconstruction, rather than removing all repeat reads.
+release. MP4 windows borrow immutable coded storage and copy packet metadata only;
+dynamic SPS/PPS bootstrap data overlays the first packet. Request-bound selection
+uses immutable source/track identity and absolute picture IDs without rehashing
+coded dependencies. Standalone untrusted selections retain content verification.
 Decode required references while preparing only selected outputs. Reuse frame preparations and vision/projector results when
 source dependencies, model identity and display/geometry policy match. Retain
 device projections on Metal where possible. Each window still runs its own
@@ -245,11 +247,19 @@ preserved. Formats/profiles without an incremental visitor and single-threaded e
 retain the bounded fallback. AIFF/AIFC, AU and PCM/G.711 CAF stream bounded
 blocks. Chained Ogg Vorbis/Opus/FLAC, including mixed-codec chains, normalize each logical
 stream with bounded resampling;
-WebM FLAC without declared sample totals uses a PCM-free counting pass. Compressed input and packet metadata remain bounded contiguous owners;
+Streaming startup does not decode the source to count samples. The first block
+establishes the actual output rate; EOF publishes the final sample count. Bounded
+lookahead preserves final-window duration policy, including short tails. Unknown
+Ogg chain lengths normalize incrementally with one pending interpolation frame;
+unknown-total WebM FLAC retains declared trailing padding in a budgeted ring. Compressed input and packet metadata remain bounded contiguous owners;
 this does not yet promise remote packet-range streaming for every audio codec.
 Contiguous image/PDF decoders also use a bounded source/decode allocation;
 unsupported sizes fail without claiming completion. Model calls reuse the
-request's projected-frame cache and bounded CPU/Metal preparation queue. Execution
+request's projected-frame cache and bounded CPU/Metal preparation queue. Device
+projections assemble in one allocation. One separately admitted following window
+can decode/prepare during the current backbone; decoder access stays serialized,
+resource pressure retries serially, and abandonment joins before freeing source
+storage. Execution
 admission includes source ownership, transport/cache allowance, output retention
 and existing model resource permits. Resource limits never alter chunk identity.
 

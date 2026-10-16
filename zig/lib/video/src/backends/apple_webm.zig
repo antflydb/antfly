@@ -161,6 +161,25 @@ pub const Continuation = struct {
     reused_windows: u64 = 0,
     reservation: media.admission.Token = .{},
     busy: std.atomic.Value(bool) = .init(false),
+    // Index storage and packet metadata are immutable for this request owner.
+    validated_pictures: ?[]const pictures.Picture = null,
+    validated_config: Configuration = undefined,
+    validated_restarts: []const pictures.Restart = &.{},
+    validation_passes: usize = 0,
+    pub fn validateIndex(self: *@This(), reader: *media.webm.Reader, indexed: pictures.Index) !Configuration {
+        if (indexed.reader != reader or indexed.operating_point != 0) return error.InvalidVideoIndex;
+        if (!indexed.apple_packet_layout) return error.UnsupportedVideoProfile;
+        if (self.validated_pictures) |bound| {
+            if (bound.ptr != indexed.pictures.ptr or bound.len != indexed.pictures.len or self.validated_restarts.ptr != indexed.restarts.ptr or self.validated_restarts.len != indexed.restarts.len) return error.InvalidVideoIndex;
+            return self.validated_config;
+        }
+        const config = try validate(reader, indexed);
+        self.validated_pictures = indexed.pictures;
+        self.validated_restarts = indexed.restarts;
+        self.validated_config = config;
+        self.validation_passes += 1;
+        return config;
+    }
     pub fn create(a: std.mem.Allocator, reader: *const media.webm.Reader, options: Options) !*Continuation {
         const self = try a.create(Continuation);
         self.* = .{ .allocator = a, .reader = reader, .options = options };
@@ -188,18 +207,17 @@ pub const Continuation = struct {
         if (self.busy.cmpxchgStrong(false, true, .acquire, .monotonic) != null) return error.InvalidDecodeOptions;
         defer self.busy.store(false, .release);
         if (reader.packets.ptr != self.reader.packets.ptr or reader.packets.len != self.reader.packets.len or !std.mem.eql(u8, reader.input.identity, self.reader.input.identity)) return error.InvalidVideoIndex;
-        return decode(self.allocator, reader, indexed, selected, self.options, sink, self);
+        return decode(self.allocator, reader, indexed, selected, self.options, sink, self, null);
     }
 };
 pub fn decodeTo(a: std.mem.Allocator, reader: *media.webm.Reader, indexed: pictures.Index, selected: []const usize, options: Options, sink: Sink) !Receipt {
-    return decode(a, reader, indexed, selected, options, sink, null);
+    return decode(a, reader, indexed, selected, options, sink, null, null);
 }
-fn decode(a: std.mem.Allocator, reader: *media.webm.Reader, indexed: pictures.Index, selected: []const usize, options: Options, sink: Sink, continuation: ?*Continuation) !Receipt {
+fn decode(a: std.mem.Allocator, reader: *media.webm.Reader, indexed: pictures.Index, selected: []const usize, options: Options, sink: Sink, continuation: ?*Continuation, validated: ?Configuration) !Receipt {
     if (@import("builtin").os.tag != .macos) return error.UnsupportedVideoBackend;
     try reader.input.control.check();
     if (indexed.reader != reader or indexed.operating_point != 0) return error.InvalidVideoIndex;
     if (selected.len == 0 or selected.len > options.decode.max_frames or selected.len > 64) return error.ResourceLimitExceeded;
-    if (reader.packets.len > options.decode.max_decode_packets) return error.ResourceLimitExceeded;
     if (indexed.pictures.len == 0) return error.EmptyVideo;
     var first = selected[0];
     var last = first;
@@ -208,20 +226,23 @@ fn decode(a: std.mem.Allocator, reader: *media.webm.Reader, indexed: pictures.In
         first = @min(first, id);
         last = @max(last, id);
     }
-    const config = try validate(reader, indexed);
+    const config = if (validated) |config| config else if (continuation) |owner| try owner.validateIndex(reader, indexed) else try validate(reader, indexed);
     const shape = indexed.pictures[0];
     var restart: pictures.Restart = .{};
-    for (indexed.restarts) |point| {
+    const warm = if (continuation) |owner| owner.native != null else false;
+    if (warm) {
+        const owner = continuation.?;
+        // Forward work needs no restart-index scan. Seeking must not disturb
+        // references retained for later forward work.
+        if (indexed.pictures[first].packet_index.? < owner.next_packet) return decode(a, reader, indexed, selected, options, sink, null, config);
+        restart = .{ .packet = owner.next_packet, .logical = first };
+    } else for (indexed.restarts) |point| {
         if (point.logical > first) break;
         restart = point;
     }
-    if (continuation) |owner| if (owner.native != null) {
-        // Seeking must not disturb references retained for later forward work.
-        if (indexed.pictures[first].packet_index.? < owner.next_packet) return decode(a, reader, indexed, selected, options, sink, null);
-        restart = .{ .packet = owner.next_packet, .logical = first };
-    };
     const end = indexed.pictures[last].packet_index.?;
     if (restart.packet > end) return error.InvalidVideoIndex;
+    if (end - restart.packet + 1 > options.decode.max_decode_packets) return error.ResourceLimitExceeded;
     const bytes = try apple.surfaceAdmissionBytesForDepth(shape.width, shape.height, selected.len, shape.bit_depth);
     if (bytes > options.decode.max_surface_bytes) return error.ResourceLimitExceeded;
     const metadata = try std.math.mul(usize, selected.len, @sizeOf(?apple.Surface) + @sizeOf(bool));
@@ -239,7 +260,6 @@ fn decode(a: std.mem.Allocator, reader: *media.webm.Reader, indexed: pictures.In
     var transient: ?apple.CodedSession = null;
     defer if (transient) |*session| session.deinit();
     errdefer if (continuation) |owner| owner.reset();
-    const warm = if (continuation) |owner| owner.native != null else false;
     const session = if (continuation) |owner| retained: {
         owner.active = &capture;
         if (owner.native == null) {
@@ -538,6 +558,7 @@ test "Apple WebM continuation retains references across windows and preserves ba
         const receipt = try owner.decodeTo(&reader, indexed, &.{next}, sink);
         try std.testing.expectEqual(indexed.pictures[next].packet_index.? - cursor + 1, receipt.submitted_packets);
         try std.testing.expectEqual(@as(u64, 1), owner.reused_windows);
+        try std.testing.expectEqual(@as(usize, 1), owner.validation_passes);
         const forward = owner.next_packet;
         const decoded = owner.decoded_packets;
         _ = try owner.decodeTo(&reader, indexed, &.{0}, sink);
@@ -560,4 +581,22 @@ test "Apple WebM continuation retains references across windows and preserves ba
         live = false;
         try std.testing.expectEqual(baseline, pool.snapshot());
     }
+}
+
+test "Apple WebM decode budget bounds submitted span rather than source length" {
+    if (@import("builtin").os.tag != .macos) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var source = media.source.Source{ .allocator = a, .storage = .{ .borrowed = @embedFile("../../testdata/vpx-av1/vp9-sintel.webm") }, .identity = "Apple small span" };
+    var reader = try media.webm.Reader.init(a, &source, .{});
+    defer reader.deinit();
+    var indexed = try pictures.index(a, &reader, .{ .decoder = .{ .av1_all_layers = false } });
+    defer indexed.deinit();
+    try std.testing.expect(reader.packets.len > 1);
+    var parity = Parity{ .reader = &reader, .indexed = indexed };
+    const receipt = decodeTo(a, &reader, indexed, &.{0}, .{ .decode = .{ .require_hardware = false, .max_decode_packets = 1 } }, .{ .context = &parity, .accept = Parity.accept }) catch |err| {
+        if (err == error.VideoDecoderUnavailable) return error.SkipZigTest;
+        return err;
+    };
+    try std.testing.expectEqual(@as(usize, 1), receipt.submitted_packets);
+    try std.testing.expectError(error.ResourceLimitExceeded, decodeTo(a, &reader, indexed, &.{2}, .{ .decode = .{ .require_hardware = false, .max_decode_packets = 1 } }, .{ .context = &parity, .accept = Parity.accept }));
 }

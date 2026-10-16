@@ -66,8 +66,10 @@ pub const WebmDecoderContinuation = struct {
         if (self.apple == null) {
             if (indexed.pictures.len == 0) return error.EmptyVideo;
             const shape = indexed.pictures[0];
-            // Check platform eligibility before reserving persistent resources.
-            _ = try video.apple_webm.validate(reader, indexed);
+            // Bind immutable index eligibility once, before reserving surfaces.
+            const owner = try video.apple_webm.Continuation.create(self.allocator, self.reader, .{ .decode = .{ .require_hardware = false, .max_decode_packets = 8192 } });
+            errdefer owner.deinit();
+            _ = try owner.validateIndex(reader, indexed);
             const bytes = try video.apple.surfaceAdmissionBytesForDepth(shape.width, shape.height, 32, shape.bit_depth);
             self.permit = try session.admitHostPreprocess(std.math.cast(usize, bytes) orelse return error.ResourceLimitExceeded);
             errdefer {
@@ -76,7 +78,7 @@ pub const WebmDecoderContinuation = struct {
             }
             // CoreVideo backing belongs to the request's host working-memory
             // budget, including when Metal borrows it without a pixel copy.
-            self.apple = try video.apple_webm.Continuation.create(self.allocator, self.reader, .{ .decode = .{ .require_hardware = false, .max_decode_packets = 8192 } });
+            self.apple = owner;
         }
         return self.apple.?.decodeTo(reader, indexed, selected, .{ .context = capture, .accept = Capture.publishAppleWebm }) catch |err| {
             self.deinit();
@@ -186,6 +188,17 @@ pub const DecoderContinuation = struct {
     }
 };
 
+/// Source.identity names immutable bytes (digest or pinned object version).
+/// This request capability binds the original track before window rebasing.
+/// It deliberately uses a separate namespace from untrusted content hashing.
+pub fn immutableSourceBinding(reader: *const media.mp4.Reader) [32]u8 {
+    var hash = std.crypto.hash.sha2.Sha256.init(.{});
+    hash.update("antfly-immutable-video-source-v1");
+    hashValue(&hash, reader.input.identity);
+    hashValue(&hash, reader.input.length());
+    hashValue(&hash, reader.track);
+    return hash.finalResult();
+}
 pub const ReaderSelection = struct {
     continuation: ?*DecoderContinuation = null,
     packet_base: usize = 0,
@@ -193,6 +206,7 @@ pub const ReaderSelection = struct {
     selected: []const usize,
     projection_keys: []const CacheKey,
     binding: [32]u8,
+    immutable: bool = false,
     reservation: media.admission.Token = .{},
     pub fn init(a: std.mem.Allocator, reader: *const media.mp4.Reader, sampling: Sampling, logical: *const video.h264_pictures.Index, pool: ?*media.admission.Pool, control: media.source.Control) !ReaderSelection {
         if ((reader.track.codec != .avc and reader.track.codec != .mjpeg) or logical.packet_count != reader.packets.len or logical.timescale != reader.track.timescale or logical.pictures.len > 8192) return error.InvalidVideoReaderSelection;
@@ -207,7 +221,27 @@ pub const ReaderSelection = struct {
         const keys = try readerProjectionKeys(a, reader, logical, selected, control);
         errdefer a.free(keys);
         try reservation.resize(.{ .host_bytes = selected.len * (@sizeOf(usize) + @sizeOf(CacheKey)) });
-        return .{ .allocator = a, .selected = selected, .projection_keys = keys, .binding = binding, .reservation = reservation };
+        return .{ .allocator = a, .selected = selected, .projection_keys = keys, .binding = binding, .immutable = false, .reservation = reservation };
+    }
+    /// The owning source/packet index must remain immutable until all windows
+    /// and workers have drained. Absolute picture IDs make overlapping windows
+    /// reuse projections without reading or hashing coded dependencies again.
+    pub fn initImmutable(a: std.mem.Allocator, reader: *const media.mp4.Reader, sampling: Sampling, logical: *const video.h264_pictures.Index, pool: ?*media.admission.Pool, control: media.source.Control, source_binding: [32]u8, packet_base: usize) !ReaderSelection {
+        if (logical.packet_count != reader.packets.len or logical.timescale != reader.track.timescale) return error.InvalidVideoReaderSelection;
+        const bound = try std.math.add(usize, try std.math.mul(usize, logical.pictures.len, @sizeOf(video.sampling.TimedPicture)), 128 * @sizeOf(usize) + 32 * @sizeOf(CacheKey));
+        var reservation = if (pool) |shared| try shared.acquire(.{ .host_bytes = bound }) else media.admission.Token{};
+        errdefer reservation.deinit();
+        const selected = try selectLogical(a, logical.*, sampling, control);
+        errdefer a.free(selected);
+        if (selected.len == 0 or selected.len > 32) return error.InvalidVideoReaderSelection;
+        const keys = try a.alloc(CacheKey, selected.len);
+        errdefer a.free(keys);
+        for (selected, keys) |id, *key| {
+            if (id >= reader.packets.len) return error.InvalidVideoReaderSelection;
+            key.* = .{ .clip = source_binding, .picture = try std.math.add(usize, packet_base, id) };
+        }
+        try reservation.resize(.{ .host_bytes = selected.len * (@sizeOf(usize) + @sizeOf(CacheKey)) });
+        return .{ .allocator = a, .selected = selected, .projection_keys = keys, .binding = try readerMetadataBinding(reader, sampling, control), .immutable = true, .reservation = reservation };
     }
     pub fn deinit(self: *ReaderSelection) void {
         self.allocator.free(self.selected);
@@ -216,7 +250,7 @@ pub const ReaderSelection = struct {
         self.* = undefined;
     }
     pub fn select(self: *const ReaderSelection, a: std.mem.Allocator, reader: *const media.mp4.Reader, sampling: Sampling, control: media.source.Control) ![]usize {
-        const binding = try readerBinding(reader, sampling, control);
+        const binding = if (self.immutable) try readerMetadataBinding(reader, sampling, control) else try readerBinding(reader, sampling, control);
         if (!std.mem.eql(u8, &binding, &self.binding) or self.selected.len == 0 or self.selected.len > 32 or self.projection_keys.len != self.selected.len) return error.InvalidVideoReaderSelection;
         for (self.selected) |id| if (id >= reader.packets.len) return error.InvalidVideoReaderSelection;
         return a.dupe(usize, self.selected);
@@ -226,7 +260,7 @@ pub const ReaderSelection = struct {
 /// A complete single-packet IDR with static parameter sets starts a new hash
 /// chain. Dynamic configuration and split pictures retain the conservative chain.
 fn readerProjectionKeys(a: std.mem.Allocator, reader: *const media.mp4.Reader, logical: *const video.h264_pictures.Index, selected: []const usize, control: media.source.Control) ![]CacheKey {
-    const bytes = try packetBytes(reader);
+    var input = reader.input.*;
     const keys = try a.alloc(CacheKey, selected.len);
     errdefer a.free(keys);
     var ends: [32]usize = undefined;
@@ -250,8 +284,9 @@ fn readerProjectionKeys(a: std.mem.Allocator, reader: *const media.mp4.Reader, l
     var base: usize = 0;
     for (reader.packets[0 .. maximum + 1], 0..) |packet, index| {
         try control.check();
-        if (packet.offset > bytes.len or packet.size > bytes.len - packet.offset) return error.InvalidVideoReaderSelection;
-        const payload = bytes[@intCast(packet.offset)..][0..packet.size];
+        var lease = try bindingPacket(&input, packet);
+        defer lease.deinit();
+        const payload = lease.bytes;
         if (reader.track.codec == .mjpeg or (!reader.track.inband_parameter_sets and try video.avc.isPortableIdr(payload, reader.track.nal_length_bytes) and projectionReset(logical, index))) {
             hash = initial;
             base = index;
@@ -320,9 +355,39 @@ fn hashValue(hash: *std.crypto.hash.sha2.Sha256, value: anytype) void {
         else => @compileError("unsupported reader binding metadata"),
     }
 }
+fn bindingPacket(input: *media.source.Source, packet: media.mp4.Packet) !media.source.Lease {
+    try input.control.check();
+    return switch (input.storage) {
+        .borrowed => |bytes| blk: {
+            if (packet.offset > bytes.len or packet.size > bytes.len - packet.offset) return error.UnexpectedEndOfSource;
+            // The caller already owns immutable backing bytes. Hashing a
+            // synchronous view requires neither a copy nor another admission.
+            break :blk .{ .bytes = bytes[@intCast(packet.offset)..][0..packet.size], .source = null };
+        },
+        .range => try input.read(packet.offset, packet.size),
+    };
+}
+fn readerMetadataBinding(reader: *const media.mp4.Reader, sampling: Sampling, control: media.source.Control) ![32]u8 {
+    var hash = std.crypto.hash.sha2.Sha256.init(.{});
+    hash.update("antfly-immutable-reader-metadata-v1");
+    hashValue(&hash, reader.track);
+    hashValue(&hash, reader.input.identity);
+    hashValue(&hash, @as(u8, @backingInt(std.meta.activeTag(sampling))));
+    switch (sampling) {
+        .reference => {},
+        .timestamps, .source_timestamps => |p| hashValue(&hash, p),
+    }
+    for (reader.packets) |packet| {
+        try control.check();
+        hashValue(&hash, packet);
+    }
+    return hash.finalResult();
+}
 fn readerBinding(reader: *const media.mp4.Reader, sampling: Sampling, control: media.source.Control) ![32]u8 {
     try control.check();
-    const bytes = try packetBytes(reader);
+    var input = reader.input.*;
+    var copy = reader.*;
+    copy.input = &input;
     var hash = std.crypto.hash.sha2.Sha256.init(.{});
     hash.update("antfly-reader-selection-v1");
     hashValue(&hash, reader.track);
@@ -335,7 +400,9 @@ fn readerBinding(reader: *const media.mp4.Reader, sampling: Sampling, control: m
     for (reader.packets) |packet| {
         try control.check();
         hashValue(&hash, packet);
-        hash.update(bytes[@intCast(packet.offset)..][0..packet.size]);
+        var lease = try bindingPacket(copy.input, packet);
+        defer lease.deinit();
+        hash.update(lease.bytes);
     }
     return hash.finalResult();
 }
@@ -612,16 +679,20 @@ fn preparationSlots(selected: []const usize) u64 {
     return @min(unique, 5);
 }
 /// Packet readers are borrowed until synchronous encoding or Prefetch.deinit.
-/// The backing source must be immutable borrowed storage; metadata and packets
-/// stay owned by the caller. Model reads use independent counters and controls.
+/// The backing source must be immutable; borrowed bytes or range-provider
+/// context, metadata and packets stay owned by the caller. Model reads use independent counters and controls.
 pub fn packetBytes(reader: *const media.mp4.Reader) ![]const u8 {
-    const bytes = switch (reader.input.storage) {
-        .borrowed => |value| value,
-        .range => return error.UnsupportedVideoPacketSource,
+    if (reader.packets.len == 0 or reader.track.timescale == 0) return error.ResourceLimitExceeded;
+    var total: u64 = 0;
+    for (reader.packets) |packet| {
+        if (packet.offset > reader.input.length() or packet.size > reader.input.length() - packet.offset) return error.UnexpectedEndOfSource;
+        total = try std.math.add(u64, total, packet.size);
+    }
+    if (total == 0 or total > 64 * 1024 * 1024) return error.ResourceLimitExceeded;
+    return switch (reader.input.storage) {
+        .borrowed => |bytes| bytes,
+        .range => &.{},
     };
-    if (bytes.len == 0 or bytes.len > 64 * 1024 * 1024 or reader.packets.len == 0 or reader.track.timescale == 0) return error.ResourceLimitExceeded;
-    for (reader.packets) |packet| if (packet.offset > bytes.len or packet.size > bytes.len - packet.offset) return error.UnexpectedEndOfSource;
-    return bytes;
 }
 pub fn inspectReaderPlan(a: std.mem.Allocator, borrowed: *const media.mp4.Reader, control: Control, sampling: Sampling, pool: ?*media.admission.Pool, metal: bool) !Plan {
     return inspectReaderPlanWithSelection(a, borrowed, control, sampling, pool, metal, null);
@@ -630,6 +701,9 @@ pub fn inspectReaderPlanWithSelection(a: std.mem.Allocator, borrowed: *const med
     const bytes = try packetBytes(borrowed);
     const adapter = control.imageWorkControl();
     var source = media.source.Source{ .allocator = a, .storage = .{ .borrowed = bytes }, .identity = borrowed.input.identity, .admission_pool = pool, .control = .{ .context = adapter.context, .check_fn = adapter.check_fn }, .limits = .{ .max_total_bytes = 512 * 1024 * 1024 } };
+    source.storage = borrowed.input.storage;
+    source.identity = borrowed.input.identity;
+    source.limits = borrowed.input.limits;
     var reader = borrowed.*;
     reader.input = &source;
     return inspectPacketPlan(a, &reader, control, sampling, metal, selection);
@@ -756,7 +830,7 @@ pub const Prefetch = struct {
         const self = try a.create(Prefetch);
         errdefer a.destroy(self);
         self.* = .{ .a = a, .io = io, .device = device, .bytes = bytes, .packet_reader = reader, .reader_selection = selection, .webm_input = webm_input, .control = control, .sampling = sampling, .pool = pool, .cache = cache, .decoder = decoder };
-        if (cache != null and bytes.len <= 64 * 1024 * 1024) {
+        if (cache != null and selection == null and bytes.len <= 64 * 1024 * 1024) {
             if (reader) |input| {
                 const adapter = control.imageWorkControl();
                 self.clip_hash = try readerBinding(input, .reference, .{ .context = adapter.context, .check_fn = adapter.check_fn });
@@ -820,7 +894,7 @@ pub const Prefetch = struct {
         const bytes = self.bytes;
         const sampling = self.sampling;
         const pool = self.pool;
-        if (self.webm_input == null and (bytes.len == 0 or bytes.len > 64 * 1024 * 1024)) return error.ResourceLimitExceeded;
+        if (self.webm_input == null and self.packet_reader == null and (bytes.len == 0 or bytes.len > 64 * 1024 * 1024)) return error.ResourceLimitExceeded;
         var source = media.source.Source{ .allocator = a, .storage = .{ .borrowed = bytes }, .identity = "embedding-video", .admission_pool = pool, .control = .{ .context = self, .check_fn = check }, .limits = .{ .max_total_bytes = 512 * 1024 * 1024 } };
         if (self.webm_input) |input| {
             source.storage = input.reader.input.storage;
@@ -835,6 +909,9 @@ pub const Prefetch = struct {
             webm_reader = if (self.webm_input) |input| input.reader.* else try media.webm.Reader.init(a, &source, .{});
             webm_reader.input = &source;
         } else if (self.packet_reader) |borrowed| {
+            source.storage = borrowed.input.storage;
+            source.identity = borrowed.input.identity;
+            source.limits = borrowed.input.limits;
             reader = borrowed.*;
             reader.input = &source;
         } else {
@@ -890,8 +967,10 @@ pub const Prefetch = struct {
     /// Only the consumer runs model operations, while the producer continues
     /// decoding/preparing the next bounded pair. Returns independent output.
     pub fn encode(self: *Prefetch, cb: *const ComputeBackend) !Encoded {
+        return self.encodeAlloc(self.a, cb);
+    }
+    pub fn encodeAlloc(self: *Prefetch, a: std.mem.Allocator, cb: *const ComputeBackend) !Encoded {
         try self.control.check();
-        const a = self.a;
         var header: [1]Job = undefined;
         _ = self.queue.getUncancelable(self.io, &header, 1) catch {
             self.join();
@@ -957,20 +1036,8 @@ pub const Prefetch = struct {
         try capture.flushNativePending();
         try capture.finishDuplicates();
         if (resident) |tensors| {
-            // Each unique packet owns exactly one projection. Presentation duplicates
-            // refer to that projection and are appended in sampling order.
-            const first = std.mem.indexOfScalar(usize, selected, selected[0]).?;
-            var combined = try cb.ensureDeviceResidentOwned(try cb.primReshape(tensors[first] orelse return error.InvalidTensorShape, &.{ @intCast(frame_tokens[0]), 512 }));
+            const combined = try assembleProjections(a, cb, selected, tensors, frame_tokens);
             errdefer cb.free(combined);
-            var rows = frame_tokens[0];
-            for (selected[1..], 1..) |index, slot| {
-                const owner = std.mem.indexOfScalar(usize, selected, index).?;
-                if (frame_tokens[slot] == 0) return error.InvalidTensorShape;
-                const next = try cb.primConcatPrim(combined, tensors[owner] orelse return error.InvalidTensorShape, 0, &.{ @intCast(rows), 512 }, &.{ @intCast(frame_tokens[slot]), 512 });
-                cb.free(combined);
-                combined = next;
-                rows += frame_tokens[slot];
-            }
             return .{ .embeddings = try a.alloc(f32, 0), .tensor = combined, .backend = cb, .frame_tokens = frame_tokens };
         }
         // Callbacks arrive in decode order; compact in presentation slot order.
@@ -1010,7 +1077,7 @@ pub fn encodeConfigured(a: std.mem.Allocator, cb: *const ComputeBackend, bytes: 
     return encodeInput(a, cb, if (reader) |r| try packetBytes(r) else bytes, reader, control, configuration.sampling, configuration.pool, configuration.cache, configuration.selection, configuration.decoder, configuration.webm);
 }
 fn encodeInput(a: std.mem.Allocator, cb: *const ComputeBackend, bytes: []const u8, borrowed: ?*const media.mp4.Reader, control: Control, sampling: Sampling, pool: ?*media.admission.Pool, cache: ?*FrameCache, selection: ?*const ReaderSelection, decoder: video.decoding.Options, webm_input: ?WebmInput) !Encoded {
-    if (webm_input == null and (bytes.len == 0 or bytes.len > 64 * 1024 * 1024)) return error.ResourceLimitExceeded;
+    if (webm_input == null and borrowed == null and (bytes.len == 0 or bytes.len > 64 * 1024 * 1024)) return error.ResourceLimitExceeded;
     const adapter = control.imageWorkControl();
     var source = media.source.Source{ .allocator = a, .storage = .{ .borrowed = bytes }, .identity = "embedding-video", .admission_pool = pool, .control = .{ .context = adapter.context, .check_fn = adapter.check_fn }, .limits = .{ .max_total_bytes = 512 * 1024 * 1024 } };
     if (webm_input) |input| {
@@ -1026,6 +1093,9 @@ fn encodeInput(a: std.mem.Allocator, cb: *const ComputeBackend, bytes: []const u
         webm_reader = if (webm_input) |input| input.reader.* else try media.webm.Reader.init(a, &source, .{});
         webm_reader.input = &source;
     } else if (borrowed) |input| {
+        source.storage = input.input.storage;
+        source.identity = input.input.identity;
+        source.limits = input.input.limits;
         reader = input.*;
         reader.input = &source;
     } else {
@@ -1121,18 +1191,8 @@ fn encodeInput(a: std.mem.Allocator, cb: *const ComputeBackend, bytes: []const u
     if (resident) |tensors| {
         // Each unique packet owns exactly one projection. Presentation duplicates
         // refer to that projection and are appended in sampling order.
-        const first = std.mem.indexOfScalar(usize, selected, selected[0]).?;
-        var combined = try cb.ensureDeviceResidentOwned(try cb.primReshape(tensors[first] orelse return error.InvalidTensorShape, &.{ @intCast(frame_tokens[0]), 512 }));
+        const combined = try assembleProjections(a, cb, selected, tensors, frame_tokens);
         errdefer cb.free(combined);
-        var rows = frame_tokens[0];
-        for (selected[1..], 1..) |index, slot| {
-            const owner = std.mem.indexOfScalar(usize, selected, index).?;
-            if (frame_tokens[slot] == 0) return error.InvalidTensorShape;
-            const next = try cb.primConcatPrim(combined, tensors[owner] orelse return error.InvalidTensorShape, 0, &.{ @intCast(rows), 512 }, &.{ @intCast(frame_tokens[slot]), 512 });
-            cb.free(combined);
-            combined = next;
-            rows += frame_tokens[slot];
-        }
         return .{ .embeddings = try a.alloc(f32, 0), .tensor = combined, .backend = cb, .frame_tokens = frame_tokens };
     }
     // Callbacks arrive in decode order; compact in presentation slot order.
@@ -1147,6 +1207,40 @@ fn encodeInput(a: std.mem.Allocator, cb: *const ComputeBackend, bytes: []const u
 }
 fn appleAllowed(decoder: video.decoding.Options) bool {
     return @import("builtin").os.tag == .macos and decoder.policy != .portable;
+}
+/// Assemble presentation order, including duplicates, with linear traffic.
+/// Device backends allocate private storage once; portable backends use one
+/// host destination. No partially initialized tensor escapes on failure.
+fn assembleProjections(a: std.mem.Allocator, cb: *const ComputeBackend, selected: []const usize, tensors: []const ?CT, frame_tokens: []const usize) !CT {
+    if (selected.len == 0 or selected.len != tensors.len or selected.len != frame_tokens.len) return error.InvalidTensorShape;
+    var rows: usize = 0;
+    for (frame_tokens) |count| {
+        if (count == 0 or count > 140) return error.InvalidTensorShape;
+        rows = try std.math.add(usize, rows, count);
+    }
+    const shape = [_]i32{ std.math.cast(i32, rows) orelse return error.InvalidTensorShape, 512 };
+    if (try cb.allocUninitF32Shape(&shape)) |destination| {
+        errdefer cb.free(destination);
+        var offset: usize = 0;
+        for (selected, frame_tokens) |id, count| {
+            const owner = std.mem.indexOfScalar(usize, selected, id).?;
+            if (!try cb.copyRows2D(a, destination, offset, tensors[owner] orelse return error.InvalidTensorShape, 0, count, 512)) return error.UnsupportedPrimitiveOp;
+            offset += count;
+        }
+        return destination;
+    }
+    const output = try a.alloc(f32, try std.math.mul(usize, rows, 512));
+    defer a.free(output);
+    var offset: usize = 0;
+    for (selected, frame_tokens) |id, count| {
+        const owner = std.mem.indexOfScalar(usize, selected, id).?;
+        const values = try cb.toFloat32(tensors[owner] orelse return error.InvalidTensorShape, a);
+        defer a.free(values);
+        if (values.len != count * 512) return error.InvalidTensorShape;
+        @memcpy(output[offset..][0..values.len], values);
+        offset += values.len;
+    }
+    return cb.fromFloat32Shape(output, &shape);
 }
 fn appleUnavailable(capture: *Capture, err: anyerror) !void {
     if (capture.decoder.policy == .apple or capture.apple_published != 0 or !video.decoding.unavailable(err)) return err;
@@ -2839,4 +2933,69 @@ test "embeddinggemma2 Metal video retained Apple WebM preparation preserves requ
     const cb = compute.computeBackend();
     if (!cb.decoderRuntimeReady()) return error.SkipZigTest;
     try qualifyRetainedAppleWebm(try MetalCompute.videoDevice(&cb));
+}
+
+test "embeddinggemma2 video Metal projection assembly preserves duplicates and variable frame rows without downloads" {
+    if (!build_options.enable_metal) return error.SkipZigTest;
+    const metal = @import("../ops/metal_compute.zig");
+    const hosted = @import("../ops/gpu_hosted_store.zig");
+    const a = std.testing.allocator;
+    var store = hosted.WeightStore{ .allocator = a, .prefix = "", .lazy_weights = .empty };
+    defer {
+        metal.deinitPrefetchQueue(&store);
+        store.lazy_weights.deinit(a);
+    }
+    metal.initPrefetchQueue(&store, a);
+    var compute = try MetalCompute.init(a, &store, null);
+    defer compute.deinit();
+    const cb = compute.computeBackend();
+    if (!cb.decoderRuntimeReady()) return error.SkipZigTest;
+    const left: [512]f32 = @splat(0.25);
+    const right: [1024]f32 = @splat(-0.5);
+    const l = try cb.ensureDeviceResidentOwned(try cb.fromFloat32Shape(&left, &.{ 1, 512 }));
+    defer cb.free(l);
+    const r = try cb.ensureDeviceResidentOwned(try cb.fromFloat32Shape(&right, &.{ 2, 512 }));
+    defer cb.free(r);
+    const before = cb.debugTimingSnapshot().provider.metal_tensor_host_mirror_download_bytes;
+    const combined = try assembleProjections(a, &cb, &.{ 7, 9, 7 }, &.{ l, r, null }, &.{ 1, 2, 1 });
+    defer cb.free(combined);
+    try std.testing.expectEqual(before, cb.debugTimingSnapshot().provider.metal_tensor_host_mirror_download_bytes);
+    const values = try cb.toFloat32(combined, a);
+    defer a.free(values);
+    try std.testing.expectEqualSlices(f32, &left, values[0..512]);
+    try std.testing.expectEqualSlices(f32, &right, values[512..1536]);
+    try std.testing.expectEqualSlices(f32, &left, values[1536..]);
+}
+
+test "embeddinggemma2 video range reader preparation matches borrowed packets without materialization" {
+    const a = std.testing.allocator;
+    const bytes = @embedFile("../testdata/video/mjpeg.mov");
+    const Provider = struct {
+        data: []const u8,
+        reads: usize = 0,
+        fn read(raw: *anyopaque, offset: u64, output: []u8, control: media.source.Control) !usize {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try control.check();
+            const size = @min(output.len, self.data.len - @as(usize, @intCast(offset)));
+            @memcpy(output[0..size], self.data[@intCast(offset)..][0..size]);
+            self.reads += 1;
+            return size;
+        }
+    };
+    var provider = Provider{ .data = bytes };
+    var source = media.source.Source{ .allocator = a, .identity = "range-parity", .storage = .{ .range = .{ .context = &provider, .read_at = Provider.read, .length = bytes.len } } };
+    var reader = try media.mp4.Reader.init(a, &source, .{});
+    defer reader.deinit();
+    var pool = media.admission.Pool{ .limits = .{ .host_bytes = 512 * 1024 * 1024 } };
+    defer std.debug.assert(pool.snapshot().host_bytes == 0);
+    const sampling = Sampling{ .timestamps = .{ .max_frames = 2 } };
+    const expected = try Prefetch.start(a, std.testing.io, null, bytes, .{}, sampling, &pool);
+    defer expected.deinit();
+    const hash = try preparedReaderHash(a, expected);
+    const received = source.reads;
+    const actual = try Prefetch.startReader(a, std.testing.io, null, &reader, .{}, sampling, &pool);
+    defer actual.deinit();
+    try std.testing.expectEqual(hash, try preparedReaderHash(a, actual));
+    try std.testing.expectEqual(received, source.reads);
+    try std.testing.expect(provider.reads > received);
 }

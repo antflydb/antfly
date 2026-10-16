@@ -31,18 +31,23 @@ const Mono = struct {
         const dropped: usize = @intCast(@min(frames, self.skip));
         self.skip -= dropped;
         const count: usize = @intCast(@min(frames - dropped, self.remaining orelse std.math.maxInt(u64)));
-        const mono = try self.a.alloc(f32, count);
-        defer self.a.free(mono);
-        for (mono, 0..) |*out, frame| {
-            var sum: f32 = 0;
-            for (interleaved[(dropped + frame) * channels ..][0..channels]) |sample| {
-                const scaled = sample * self.scale;
-                sum += if (std.math.isFinite(scaled)) std.math.clamp(scaled, -1.0, 1.0) else 0;
+        var scratch: [2048]f32 = undefined;
+        var base: usize = 0;
+        while (base < count) {
+            const mono = scratch[0..@min(scratch.len, count - base)];
+            for (mono, 0..) |*out, i| {
+                const frame = base + i;
+                var sum: f32 = 0;
+                for (interleaved[(dropped + frame) * channels ..][0..channels]) |sample| {
+                    const scaled = sample * self.scale;
+                    sum += if (std.math.isFinite(scaled)) std.math.clamp(scaled, -1.0, 1.0) else 0;
+                }
+                out.* = sum / @as(f32, @floatFromInt(channels));
             }
-            out.* = sum / @as(f32, @floatFromInt(channels));
+            try self.sink.push(mono, rate, 1);
+            base += mono.len;
         }
         if (self.remaining) |remaining| self.remaining = remaining - count;
-        if (count != 0) try self.sink.push(mono, rate, 1);
     }
     fn consumer(self: *@This()) Sink {
         return .{ .context = self, .write = write };

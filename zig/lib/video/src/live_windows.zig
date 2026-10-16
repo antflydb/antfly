@@ -24,7 +24,8 @@ pub const Options = struct {
     max_identity_bytes: usize = 4096,
 };
 pub const Window = struct {
-    snapshot: *media.stream.Snapshot,
+    snapshot: ?*media.stream.Snapshot,
+    overlay: ?*ParameterOverlay = null,
     reader: media.mp4.Reader,
     epoch: usize,
     identity: []u8,
@@ -32,12 +33,95 @@ pub const Window = struct {
     pub fn deinit(self: *Window) void {
         const a = self.reader.allocator;
         self.reader.deinit();
-        self.snapshot.deinit();
+        if (self.snapshot) |snapshot| snapshot.deinit();
+        if (self.overlay) |overlay| overlay.deinit();
         a.free(self.identity);
         self.identity_reservation.deinit();
         self.* = undefined;
     }
 };
+/// Metadata-only view of an immutable request source. The source and its
+/// metadata outlive this window. Range providers remain demand-read; no coded
+/// bytes are materialized, and packet offsets keep their original meaning.
+pub fn borrow(a: std.mem.Allocator, reader: *media.mp4.Reader, options: Options) !Window {
+    if (reader.input.identity.len > options.max_identity_bytes or reader.packets.len == 0 or reader.packets.len > options.max_packets) return error.ResourceLimitExceeded;
+    var reservation = if (options.stream.admission_pool) |pool| try pool.acquire(.{ .host_bytes = try std.math.mul(usize, reader.packets.len, @sizeOf(media.mp4.Packet)) }) else media.admission.Token{};
+    errdefer reservation.deinit();
+    const packets = try a.dupe(media.mp4.Packet, reader.packets);
+    errdefer a.free(packets);
+    var identity_reservation = if (options.stream.admission_pool) |pool| try pool.acquire(.{ .host_bytes = reader.input.identity.len }) else media.admission.Token{};
+    errdefer identity_reservation.deinit();
+    const identity = try a.dupe(u8, reader.input.identity);
+    errdefer a.free(identity);
+    var view = reader.*;
+    view.allocator = a;
+    view.packets = packets;
+    view.metadata = .{ .bytes = &.{}, .source = null };
+    view.index_reservation = reservation;
+    return .{ .snapshot = null, .reader = view, .epoch = 0, .identity = identity, .identity_reservation = identity_reservation };
+}
+const ParameterOverlay = struct {
+    allocator: std.mem.Allocator,
+    input: media.source.Source,
+    original: *media.source.Source,
+    first: media.mp4.Packet,
+    prefix: []u8,
+    reservation: media.admission.Token,
+    fn read(raw: *anyopaque, offset: u64, destination: []u8, control: media.source.Control) !usize {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        try control.check();
+        const boundary = self.original.length();
+        if (offset < boundary) {
+            const count: usize = @intCast(@min(destination.len, boundary - offset));
+            var lease = try self.original.read(offset, count);
+            defer lease.deinit();
+            @memcpy(destination[0..count], lease.bytes);
+            return count;
+        }
+        const relative = offset - boundary;
+        if (relative < self.prefix.len) {
+            const count: usize = @intCast(@min(destination.len, self.prefix.len - relative));
+            @memcpy(destination[0..count], self.prefix[@intCast(relative)..][0..count]);
+            return count;
+        }
+        const payload_offset = relative - self.prefix.len;
+        if (payload_offset > self.first.size) return error.UnexpectedEndOfSource;
+        const count: usize = @intCast(@min(destination.len, self.first.size - payload_offset));
+        var lease = try self.original.read(try std.math.add(u64, self.first.offset, payload_offset), count);
+        defer lease.deinit();
+        @memcpy(destination[0..count], lease.bytes);
+        return count;
+    }
+    fn deinit(self: *@This()) void {
+        std.debug.assert(self.input.retained_bytes == 0);
+        self.allocator.free(self.prefix);
+        self.reservation.deinit();
+        self.allocator.destroy(self);
+    }
+};
+/// Dynamic SPS/PPS bootstrap overlays only the first packet. Remaining coded
+/// packets still borrow the original immutable source, including remote ranges.
+pub fn borrowWithParameters(a: std.mem.Allocator, reader: *media.mp4.Reader, parameters: []const u8, options: Options) !Window {
+    var window = try borrow(a, reader, options);
+    errdefer window.deinit();
+    if (parameters.len == 0) return window;
+    if (!reader.track.inband_parameter_sets or reader.track.codec != .avc) return error.UnsupportedDynamicVideoConfig;
+    const first = reader.packets[0];
+    const size = try std.math.add(usize, parameters.len, first.size);
+    if (size > options.stream.max_bytes or size > reader.input.limits.max_read_bytes) return error.ResourceLimitExceeded;
+    var reservation = if (options.stream.admission_pool) |pool| try pool.acquire(.{ .host_bytes = parameters.len + @sizeOf(ParameterOverlay) }) else media.admission.Token{};
+    errdefer reservation.deinit();
+    const prefix = try a.dupe(u8, parameters);
+    errdefer a.free(prefix);
+    const overlay = try a.create(ParameterOverlay);
+    errdefer a.destroy(overlay);
+    overlay.* = .{ .allocator = a, .original = reader.input, .first = first, .prefix = prefix, .reservation = reservation, .input = .{ .allocator = a, .identity = reader.input.identity, .limits = reader.input.limits, .control = options.stream.control, .admission_pool = options.stream.admission_pool, .storage = .{ .range = .{ .context = overlay, .read_at = ParameterOverlay.read, .length = try std.math.add(u64, reader.input.length(), size) } } } };
+    window.reader.packets[0].size = std.math.cast(u32, size) orelse return error.ResourceLimitExceeded;
+    window.overlay = overlay;
+    window.reader.input = &overlay.input;
+    window.reader.packets[0].offset = reader.input.length();
+    return window;
+}
 fn sameTrack(left: media.mp4.Track, right: media.mp4.Track) bool {
     var l = left;
     var r = right;
@@ -218,7 +302,7 @@ test "live packet window rejects mixed epochs duplicate clocks and packet bounds
     var identity = "independent".*;
     var window = try join(a, &identity, &.{one}, .{});
     @memset(&identity, 'x');
-    try std.testing.expectEqualStrings("independent", window.snapshot.input.identity);
+    try std.testing.expectEqualStrings("independent", window.snapshot.?.input.identity);
     defer window.deinit();
     const configuration = try a.dupe(u8, one.reader.track.avcc);
     defer a.free(configuration);
@@ -227,5 +311,36 @@ test "live packet window rejects mixed epochs duplicate clocks and packet bounds
     try std.testing.expectEqualSlices(u8, configuration, window.reader.track.avcc);
     var retained = try window.reader.readPacket(0);
     defer retained.deinit();
-    try std.testing.expectEqualSlices(u8, window.snapshot.bytes[@intCast(window.reader.packets[0].offset)..][0..window.reader.packets[0].size], retained.bytes);
+    try std.testing.expectEqualSlices(u8, window.snapshot.?.bytes[@intCast(window.reader.packets[0].offset)..][0..window.reader.packets[0].size], retained.bytes);
+}
+
+fn borrowedOverlayAllocationRun(a: std.mem.Allocator) !void {
+    var pool = media.admission.Pool{ .limits = .{ .host_bytes = 128 * 1024 * 1024 } };
+    defer std.debug.assert(pool.snapshot().host_bytes == 0);
+    var source = media.source.Source{ .allocator = a, .identity = "overlay", .storage = .{ .borrowed = @embedFile("../testdata/live/fragmented.mp4") }, .admission_pool = &pool };
+    var reader = try media.mp4.Reader.init(a, &source, .{});
+    defer reader.deinit();
+    try std.testing.expectError(error.ResourceLimitExceeded, borrow(a, &reader, .{ .max_identity_bytes = 0 }));
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    var separate = try borrow(arena.allocator(), &reader, .{});
+    separate.deinit();
+    reader.track.inband_parameter_sets = true;
+    const prefix = [_]u8{ 0, 0, 0, 1, 0x67 };
+    var expected = try copyWithParameters(a, "overlay", &reader, 0, &prefix, .{ .stream = .{ .admission_pool = &pool } });
+    defer expected.deinit();
+    var borrowed = try borrowWithParameters(a, &reader, &prefix, .{ .stream = .{ .admission_pool = &pool } });
+    defer borrowed.deinit();
+    try std.testing.expect(borrowed.snapshot == null);
+    for (reader.packets, 0..) |_, i| {
+        var wanted = try expected.reader.readPacket(i);
+        defer wanted.deinit();
+        var actual = try borrowed.reader.readPacket(i);
+        defer actual.deinit();
+        try std.testing.expectEqualSlices(u8, wanted.bytes, actual.bytes);
+    }
+}
+test "live packet window borrowed bootstrap matches materialization and releases every failed allocation" {
+    try borrowedOverlayAllocationRun(std.testing.allocator);
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, borrowedOverlayAllocationRun, .{});
 }

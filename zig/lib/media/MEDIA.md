@@ -9,14 +9,20 @@ introducing that dependency into portable container consumers.
 
 [Model-aware chunking](../../../docs/plans/model-aware-media-chunking.md) shares
 version-pinned source/index ownership across model windows and returns source
-coordinates with optional embeddings through `/ai/v1/chunk`. MP4 snapshots bounded
-coded windows; WebM retains its logical index and portable reference decoder
+coordinates with optional embeddings through `/ai/v1/chunk`. MP4 borrows bounded
+coded packet views over immutable source storage; WebM retains its logical index and portable reference decoder
 or eligible Apple VP9/AV1 session across forward windows; WAV ranges decode selected samples. Retained decoder
 leases belong to the request pool and outlive individual preparation/model
 windows. Backward selections replay independently. Compressed audio visitors
 retain codec state and feed bounded blocks into the model window queue, including
 HE-AAC/SBR/PS and chained Ogg Vorbis/Opus/FLAC. Logical audio chains reset codec
-state and normalize their clocks/channels without retaining whole-source PCM.
+state and normalize their clocks/channels without a whole-source PCM counting
+pass. The first decoded block establishes the output clock; bounded tail
+lookahead preserves minimum-duration final windows. EOF supplies the exact sample
+count and terminal validation. Unknown-length resampling holds one pending output
+frame; WebM FLAC holds only declared discard padding in a budgeted ring. A late
+codec/transport failure remains a terminal stream error, even if earlier chunks
+were delivered.
 HTTP/S3 references enforce immutable versions and exact range responses through
 configured scraping security/credentials. Media supplies leases, clocks and
 admission; model adapters supply token budgets. Container packets remain distinct
@@ -181,6 +187,22 @@ suppress verified accepted prefixes. Source continuity/configuration and manifes
 cursor commit after validated completion. Cancellation/consumer failure releases
 transient workspace while retaining the acknowledgment ledger. Buffered/streamed
 reads share a lifetime received-byte budget, including failed attempts.
+
+## Immutable model windows
+
+Request-owned packet views retain original source offsets and copy only packet
+metadata. Dynamic AVC bootstrap data overlays the first packet; other packets
+remain demand-read from the original source. Source storage, provider context and
+track metadata must outlive every window and preparation worker. Container
+identity must name immutable content, such as a digest or pinned object version.
+Owned live snapshots remain available when storage must outlive its producer.
+
+Model chunk selection binds this immutable capability and absolute picture IDs,
+avoiding coded payload copies and repeated payload hashing. Untrusted standalone
+selection APIs retain full content validation. Speculative preparation is limited
+to one next window, holds separate request/session host and device reservations,
+and starts only after the current decoder has drained. Admission pressure falls
+back to serial execution; cancellation joins workers before releasing sources.
 
 ## Verification
 

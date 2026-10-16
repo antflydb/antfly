@@ -32,75 +32,102 @@ const Counter = struct {
         self.shape.frames = try std.math.add(usize, self.shape.frames, samples.len / channels);
     }
 };
-fn shape(a: std.mem.Allocator, stream: ogg.PacketSequence) !Shape {
-    if (stream.packets.len == 0) return error.UnsupportedAudioFormat;
-    switch (try ogg.sniffFirstPacket(stream.packets[0].bytes)) {
-        .opus => {
-            var demuxed = try opus.demuxOggPacketsAlloc(a, stream.packets);
-            defer demuxed.deinit();
-            return .{ .rate = 48000, .channels = demuxed.header.channels, .frames = std.math.cast(usize, demuxed.playable_frames) orelse return error.UnsupportedAudioFormat };
-        },
-        .vorbis => {
-            var demuxed = try vorbis.demuxPacketsAlloc(a, stream.packets);
-            defer demuxed.deinit();
-            return .{ .rate = demuxed.headers.identification.sample_rate, .channels = demuxed.headers.identification.channels, .frames = std.math.cast(usize, demuxed.playable_samples) orelse return error.UnsupportedAudioFormat };
-        },
-        .flac => {
-            const encoded = try ogg.reconstructFlacPacketsAlloc(a, stream.packets);
-            defer a.free(encoded);
-            const info = try flac.parseStreamInfo(encoded);
-            if (info.total_samples != 0) return .{ .rate = info.sample_rate, .channels = info.channels, .frames = std.math.cast(usize, info.total_samples) orelse return error.UnsupportedAudioFormat };
-            var count = Counter{};
-            try flac.visitInterleaved(a, encoded, .{ .context = &count, .write = Counter.write });
-            return count.shape;
-        },
+/// Demux/setup belongs to one traversal and is reused for actual decoding.
+const Prepared = struct {
+    shape: Shape,
+    length_known: bool = true,
+    data: union(enum) { opus: opus.Demuxed, vorbis: vorbis.Demuxed, flac: []u8 },
+    fn init(a: std.mem.Allocator, stream: ogg.PacketSequence) !Prepared {
+        if (stream.packets.len == 0) return error.UnsupportedAudioFormat;
+        switch (try ogg.sniffFirstPacket(stream.packets[0].bytes)) {
+            .opus => {
+                var d = try opus.demuxOggPacketsAlloc(a, stream.packets);
+                errdefer d.deinit();
+                return .{ .shape = .{ .rate = 48000, .channels = d.header.channels, .frames = std.math.cast(usize, d.playable_frames) orelse return error.UnsupportedAudioFormat }, .data = .{ .opus = d } };
+            },
+            .vorbis => {
+                var d = try vorbis.demuxPacketsAlloc(a, stream.packets);
+                errdefer d.deinit();
+                return .{ .shape = .{ .rate = d.headers.identification.sample_rate, .channels = d.headers.identification.channels, .frames = std.math.cast(usize, d.playable_samples) orelse return error.UnsupportedAudioFormat }, .data = .{ .vorbis = d } };
+            },
+            .flac => {
+                const encoded = try ogg.reconstructFlacPacketsAlloc(a, stream.packets);
+                errdefer a.free(encoded);
+                const info = try flac.parseStreamInfo(encoded);
+                var count = std.math.cast(usize, info.total_samples) orelse return error.UnsupportedAudioFormat;
+                if (count == 0) {
+                    // Ogg FLAC's terminal granule is the exact sample clock even
+                    // when STREAMINFO leaves its total unknown. Validate it
+                    // against decoded output rather than decoding to count.
+                    const last = stream.packets[stream.packets.len - 1];
+                    if (last.is_eos and last.granule_applies and last.page_granule_position != std.math.maxInt(u64)) {
+                        count = std.math.cast(usize, last.page_granule_position) orelse return error.UnsupportedAudioFormat;
+                    }
+                }
+                return .{ .shape = .{ .rate = info.sample_rate, .channels = info.channels, .frames = count }, .length_known = count != 0, .data = .{ .flac = encoded } };
+            },
+        }
     }
-}
-fn visitStream(a: std.mem.Allocator, stream: ogg.PacketSequence, sink: Sink) !void {
-    switch (try ogg.sniffFirstPacket(stream.packets[0].bytes)) {
-        .opus => {
-            var demuxed = try opus.demuxOggPacketsAlloc(a, stream.packets);
-            defer demuxed.deinit();
-            try opus.visitPackets(a, demuxed.packets, demuxed.packet_tocs, demuxed.header.channels, demuxed.header.output_gain_q8, demuxed.header.pre_skip, demuxed.playable_frames, sink);
-        },
-        .vorbis => {
-            var demuxed = try vorbis.demuxPacketsAlloc(a, stream.packets);
-            defer demuxed.deinit();
-            try vorbis.visitDemuxed(a, demuxed, sink);
-        },
-        .flac => {
-            const encoded = try ogg.reconstructFlacPacketsAlloc(a, stream.packets);
-            defer a.free(encoded);
-            try flac.visitInterleaved(a, encoded, sink);
-        },
+    fn deinit(self: *Prepared, a: std.mem.Allocator) void {
+        switch (self.data) {
+            .opus => |*d| d.deinit(),
+            .vorbis => |*d| d.deinit(),
+            .flac => |bytes| a.free(bytes),
+        }
     }
-}
+    fn visit(self: Prepared, a: std.mem.Allocator, sink: Sink) !void {
+        const Checked = struct {
+            counter: Counter = .{},
+            sink: Sink,
+            fn write(raw: *anyopaque, samples: []const f32, rate: u32, channels: u8) !void {
+                const c: *@This() = @ptrCast(@alignCast(raw));
+                try Counter.write(&c.counter, samples, rate, channels);
+                try c.sink.push(samples, rate, channels);
+            }
+        };
+        var checked = Checked{ .sink = sink };
+        const output = Sink{ .context = &checked, .write = Checked.write };
+        switch (self.data) {
+            .opus => |d| try opus.visitPackets(a, d.packets, d.packet_tocs, d.header.channels, d.header.output_gain_q8, d.header.pre_skip, d.playable_frames, output),
+            .vorbis => |d| try vorbis.visitDemuxed(a, d, output),
+            .flac => |bytes| try flac.visitInterleaved(a, bytes, output),
+        }
+        const actual = checked.counter.shape;
+        if (actual.rate != self.shape.rate or actual.channels != self.shape.channels or (self.length_known and actual.frames != self.shape.frames)) return error.UnsupportedAudioFormat;
+    }
+};
 pub fn visit(a: std.mem.Allocator, bytes: []const u8, sink: Sink) !void {
     var streams = try ogg.parsePacketStreamsAlloc(a, bytes);
     defer streams.deinit();
     if (streams.streams.len == 0) return error.UnsupportedAudioFormat;
-    const shapes = try a.alloc(Shape, streams.streams.len);
-    defer a.free(shapes);
+    const prepared = try a.alloc(Prepared, streams.streams.len);
+    var initialized: usize = 0;
+    defer {
+        for (prepared[0..initialized]) |*item| item.deinit(a);
+        a.free(prepared);
+    }
     var target_rate: u32 = 0;
     var target_channels: u8 = 0;
-    for (streams.streams, shapes) |stream, *out| {
+    for (streams.streams, prepared) |stream, *out| {
         try @import("work_control.zig").check();
-        out.* = try shape(a, stream);
-        if (out.rate == 0 or out.channels == 0) return error.UnsupportedAudioFormat;
-        target_rate = @max(target_rate, out.rate);
-        target_channels = @max(target_channels, out.channels);
+        out.* = try Prepared.init(a, stream);
+        initialized += 1;
+        if (out.shape.rate == 0 or out.shape.channels == 0) return error.UnsupportedAudioFormat;
+        target_rate = @max(target_rate, out.shape.rate);
+        target_channels = @max(target_channels, out.shape.channels);
     }
-    for (streams.streams, shapes) |stream, source| {
+    for (prepared) |item| {
+        const source = item.shape;
         if (source.rate == target_rate and source.channels == target_channels) {
-            try visitStream(a, stream, sink);
+            try item.visit(a, sink);
             continue;
         }
         const previous = try a.alloc(f32, source.channels);
         defer a.free(previous);
         const output = try a.alloc(f32, @as(usize, target_channels) * 1024);
         defer a.free(output);
-        var normalized = normalizer.ChainSink{ .sink = sink, .source_rate = source.rate, .source_channels = source.channels, .target_rate = target_rate, .target_channels = target_channels, .source_frames = source.frames, .target_frames = normalizer.resampledFrameCount(source.frames, source.rate, target_rate), .previous = previous, .output = output };
-        try visitStream(a, stream, .{ .context = &normalized, .write = normalizer.ChainSink.write });
+        var normalized = normalizer.ChainSink{ .sink = sink, .source_rate = source.rate, .source_channels = source.channels, .target_rate = target_rate, .target_channels = target_channels, .source_frames = source.frames, .unknown_length = !item.length_known, .target_frames = normalizer.resampledFrameCount(source.frames, source.rate, target_rate), .previous = previous, .output = output };
+        try item.visit(a, .{ .context = &normalized, .write = normalizer.ChainSink.write });
         try normalized.finish();
     }
 }
