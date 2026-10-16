@@ -879,6 +879,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     });
     const runtime_io_abi_provider = b.addLibrary(.{
         .name = "runtime-io-abi-test-provider",
+        .use_llvm = @import("../../../build_support/embedded/shared_library.zig").llvmBackend(target.result),
         .linkage = .static,
         .root_module = runtime_io_abi_provider_mod,
     });
@@ -893,9 +894,14 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     antfly_imports.configureRuntimeContracts(runtime_io_abi_provider.root_module);
     antfly_imports.configureRuntimeContracts(runtime_io_abi_test_mod);
     antfly_imports.storage_boundary.configureSources(runtime_io_abi_test_mod, false, false);
+    for ([_]*std.Build.Module{ runtime_io_abi_provider_mod, runtime_io_abi_test_mod }) |module| {
+        module.addImport("antfly_platform", platform_mod);
+        module.addImport("antfly_hash", antfly_imports.hash);
+    }
     runtime_io_abi_test_mod.linkLibrary(runtime_io_abi_provider);
     const runtime_io_abi_tests = b.addTest(.{
         .root_module = runtime_io_abi_test_mod,
+        .use_llvm = @import("../../../build_support/embedded/shared_library.zig").llvmBackend(target.result),
         .filters = &.{"executor archive boundary"},
     });
     const run_runtime_io_abi_tests = b.addRunArtifact(runtime_io_abi_tests);
