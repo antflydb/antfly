@@ -176,9 +176,16 @@ pub fn runtimeCompileMaxRss(unit: RuntimeLibraryUnit, profile: CompileMemoryProf
     };
 }
 
-/// Native Linux LLVM test objects have different working sets from runtime
+/// Native linked test objects have different working sets from runtime
 /// archives. Keep measured floors at the linked-test compilation boundary.
 pub fn linkedTestCompileMaxRss(name: []const u8, host: std.Target, target: std.Target, optimize: ?std.lang.Optimize, authored: usize) usize {
+    // Native Apple Silicon CPU Debug qualification (SDK 26.3.1, Zig 0.17):
+    // public-api-parity peaked at 18,029,035,520 bytes. Reserve >25% headroom
+    // without changing cross-host, release or other test-object reservations.
+    if (host.os.tag == .macos and host.cpu.arch == .aarch64 and
+        target.os.tag == .macos and target.cpu.arch == .aarch64 and optimize == .debug and
+        std.mem.eql(u8, name, "public-api-parity"))
+        return @max(authored, 22 * 1024 * 1024 * 1024);
     if (host.os.tag != .linux or host.cpu.arch != .x86_64 or
         target.os.tag != .linux or target.cpu.arch != .x86_64 or target.abi != .gnu or optimize != .debug)
         return authored;
@@ -371,4 +378,23 @@ test "linked LLVM Debug test reservations cover native peaks without lowering au
         try std.testing.expectEqual(7 * gib, linkedTestCompileMaxRss(name, linux, linux, .safe, 7 * gib));
     }
     try std.testing.expectEqual(7 * gib, linkedTestCompileMaxRss("unmeasured", linux, linux, .debug, 7 * gib));
+}
+
+test "native Darwin Debug public API reservation covers measured peak without unsafe overlap" {
+    const macos = try std.zig.system.resolveTargetQuery(std.testing.io, .{ .cpu_arch = .aarch64, .os_tag = .macos });
+    const linux = try std.zig.system.resolveTargetQuery(std.testing.io, .{ .cpu_arch = .x86_64, .os_tag = .linux, .abi = .gnu });
+    const gib = 1024 * 1024 * 1024;
+    const peak: usize = 18_029_035_520;
+    const claim = linkedTestCompileMaxRss("public-api-parity", macos, macos, .debug, 15 * gib);
+    try std.testing.expect(claim >= peak + peak / 4);
+    // A 30 GiB local compiler budget cannot overlap this object with another
+    // 15 GiB API compile. Smaller work can still use the remaining capacity.
+    try std.testing.expect(claim + 15 * gib > 30 * gib);
+    try std.testing.expect(claim + 4 * gib <= 30 * gib);
+    try std.testing.expectEqual(24 * gib, linkedTestCompileMaxRss("public-api-parity", macos, macos, .debug, 24 * gib));
+    try std.testing.expectEqual(15 * gib, linkedTestCompileMaxRss("public-api-parity", macos, macos, .safe, 15 * gib));
+    try std.testing.expectEqual(15 * gib, linkedTestCompileMaxRss("public-api-parity", macos, linux, .debug, 15 * gib));
+    try std.testing.expectEqual(15 * gib, linkedTestCompileMaxRss("public-api-parity", linux, macos, .debug, 15 * gib));
+    try std.testing.expectEqual(7 * gib, linkedTestCompileMaxRss("data-runtime-tests", macos, macos, .debug, 7 * gib));
+    try std.testing.expectEqual(7 * gib, linkedTestCompileMaxRss("unmeasured", macos, macos, .debug, 7 * gib));
 }
