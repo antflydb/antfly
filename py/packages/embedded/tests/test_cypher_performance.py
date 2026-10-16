@@ -452,11 +452,14 @@ def test_dag_count_reports_overflow_only_for_qualifying_endpoints(graph_db):
 
 def test_selective_right_endpoint_drives_traversal(graph_db):
     db = graph_db
-    populate(db, 201)
     db.sql("CREATE INDEX docs_id ON docs(id)")
-    db.cypher_json("g", {"query": "MATCH (a:D),(b:D) WHERE b.score=a.score+1 CREATE (a)-[:R]->(b)"})
+    patterns = [f"(n{i}:D {{id:'n{i}'}})" for i in range(201)]
+    patterns += [f"(n{i})-[:R]->(n{i + 1})" for i in range(200)]
+    key = db.cypher_json("g", {"query": "CREATE " + ",".join(patterns) + " RETURN antfly.documentKey(n200)"})["rows"][
+        0
+    ][0]["value"]
     for predicate in ("{id:'n200'}", ""):
-        where = "" if predicate else " WHERE antfly.documentKey(b)='n200'"
+        where = "" if predicate else f" WHERE antfly.documentKey(b)='{key}'"
         result = db.cypher_json(
             "g",
             {
@@ -530,4 +533,4 @@ def test_unused_wide_relational_columns_are_not_hydrated(graph_db):
     assert [cell["value"] for cell in result["rows"][0]] == ["1000", "499500"]
     assert result["stats"]["memory_bytes"] < 2 << 20
     entity = db.cypher_json("wide", {"query": "MATCH (n:W) WHERE antfly.documentKey(n)='n0' RETURN n"})
-    assert entity["rows"][0][0]["value"]["properties"]["payload"]["value"] == "x" * 8192
+    assert entity["rows"][0][0]["value"]["properties"]["value"]["payload"]["value"] == "x" * 8192
