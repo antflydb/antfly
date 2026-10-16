@@ -324,6 +324,7 @@ pub const VTable = struct {
     relationalSnapshotDeinit: *const fn (*DB.RelationalStatementSnapshot) Outcome(void),
     statementFenceRelease: *const fn (*DB.StatementReadFence) Outcome(void),
     documentRowsUnderLease: *const fn (*const DB.QueryReadLease, Allocator, u32) Outcome(DB.DocumentRows),
+    documentRowsLookupBatch: *const fn (*DB.DocumentRows, []const []const u8, usize) Outcome(DB.DocumentRows.Batch),
     documentRowsLookup: *const fn (*DB.DocumentRows, []const u8) Outcome([]const u8),
     documentRowsReleasePage: *const fn (*DB.DocumentRows) Outcome(void),
     documentRowsDeinit: *const fn (*DB.DocumentRows) Outcome(void),

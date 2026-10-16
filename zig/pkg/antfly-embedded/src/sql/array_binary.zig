@@ -51,6 +51,16 @@ fn elementSize(kind: arrays.ElementType, element: arrays.Element) !usize {
 /// directly; JSONB uses a counting pass for its required length prefix, not a
 /// per-element temporary allocation. Writer failure remains a writer failure.
 pub fn encode(value: arrays.Value, writer: *std.Io.Writer, options: Options) !void {
+    return encodeInternal(value, writer, options, true);
+}
+
+/// Scalar codec for adapters without native views and a byte-for-byte oracle
+/// for the native emitter. Both paths share admission and wire-size preflight.
+pub fn encodeGeneric(value: arrays.Value, writer: *std.Io.Writer, options: Options) !void {
+    return encodeInternal(value, writer, options, false);
+}
+
+fn encodeInternal(value: arrays.Value, writer: *std.Io.Writer, options: Options, comptime native_blocks: bool) !void {
     const validated = try value.validate(options.values);
     if (validated.dimensions.len != value.dimensions.len) return error.InvalidSqlArrayShape;
     for (value.dimensions) |dimension| if (dimension.length > std.math.maxInt(i32)) return error.SqlProgramLimitExceeded;
@@ -75,6 +85,15 @@ pub fn encode(value: arrays.Value, writer: *std.Io.Writer, options: Options) !vo
         try writer.writeInt(i32, @intCast(dimension.length), .big);
         try writer.writeInt(i32, dimension.lower, .big);
     }
+    if (native_blocks) if (value.stored) |view| if (view.validation != null) {
+        switch (value.element_type) {
+            .boolean => return encodeStoredFixed(1, view.*, writer),
+            .int16 => return encodeStoredFixed(2, view.*, writer),
+            .int32, .float32 => return encodeStoredFixed(4, view.*, writer),
+            .int64, .float64 => return encodeStoredFixed(8, view.*, writer),
+            else => {},
+        }
+    };
     for (0..value.cardinality()) |array_cell_0| {
         const element = value.flatCell(array_cell_0);
         if (element.sql_null) {
@@ -105,6 +124,36 @@ pub fn encode(value: arrays.Value, writer: *std.Io.Writer, options: Options) !vo
             },
         }
     }
+}
+
+/// Walk canonical slots once in physical order. Compact NULLs consume no
+/// slot, dense NULLs consume a zero slot. Fixed-size buffers interleave PG
+/// lengths and big-endian payloads without constructing scalar Datums.
+fn encodeStoredFixed(comptime width: usize, view: @import("../common/sql_array_layout.zig").View, writer: *std.Io.Writer) !void {
+    var buffer: [4096]u8 = undefined;
+    var used: usize = 0;
+    var physical = view.payload_start;
+    var nulls: u8 = 0;
+    for (0..view.count) |index| {
+        if (buffer.len - used < 4 + width) {
+            try writer.writeAll(buffer[0..used]);
+            used = 0;
+        }
+        if (index % 8 == 0) nulls = view.bytes[view.bitmap_start + index / 8];
+        const sql_null = nulls & 1 != 0;
+        nulls >>= 1;
+        std.mem.writeInt(i32, buffer[used..][0..4], if (sql_null) -1 else width, .big);
+        used += 4;
+        if (sql_null) {
+            if (!view.compact) physical += width;
+            continue;
+        }
+        const Integer = @Int(.unsigned, width * 8);
+        std.mem.writeInt(Integer, buffer[used..][0..width], std.mem.readInt(Integer, view.bytes[physical..][0..width], .little), .big);
+        physical += width;
+        used += width;
+    }
+    try writer.writeAll(buffer[0..used]);
 }
 
 const Reader = struct {
@@ -379,4 +428,60 @@ test "SQL PostgreSQL array binary boundaries match receive normalization and dia
     var short: [4]u8 = undefined;
     var writer = std.Io.Writer.fixed(&short);
     try std.testing.expectError(error.WriteFailed, encode(boolean.value, &writer, .{}));
+}
+
+test "SQL native binary array blocks preserve scalar bytes null slots and writer failures" {
+    const a = std.testing.allocator;
+    for ([_]arrays.ElementType{ .boolean, .int16, .int32, .int64, .float32, .float64 }) |kind| {
+        for ([_]usize{ 0, 1, 7, 8, 63, 64, 65, 511, 512, 513, 1025 }) |count| {
+            for (0..3) |null_pattern| {
+                var arena = std.heap.ArenaAllocator.init(a);
+                defer arena.deinit();
+                const aa = arena.allocator();
+                const cells = try aa.alloc(arrays.Element, count);
+                for (cells, 0..) |*cell, index| {
+                    const sql_null = switch (null_pattern) {
+                        0 => false,
+                        1 => index % 17 == 0,
+                        else => index % 17 != 0,
+                    };
+                    cell.* = if (sql_null) .{} else arrays.Element.json(switch (kind) {
+                        .boolean => .{ .bool = index % 3 == 0 },
+                        .int16, .int32 => .{ .integer = @as(i64, @intCast(index)) - 512 },
+                        .int64 => .{ .integer = 9007199254740993 + @as(i64, @intCast(index)) },
+                        .float32, .float64 => .{ .float = switch (index % 5) {
+                            0 => std.math.nan(f64),
+                            1 => std.math.inf(f64),
+                            2 => -std.math.inf(f64),
+                            3 => -0.0,
+                            else => 1.25,
+                        } },
+                        else => unreachable,
+                    });
+                }
+                const expanded = try arrays.Value.init(kind, &.{.{ .length = @intCast(count), .lower = -3 }}, cells, .{});
+                const stored = try @import("array_storage.zig").encodeAlloc(aa, expanded, .{});
+                const compact = try @import("array_storage.zig").borrowLeaky(aa, kind, stored, .{});
+                var native: std.Io.Writer.Allocating = .init(a);
+                defer native.deinit();
+                var scalar: std.Io.Writer.Allocating = .init(a);
+                defer scalar.deinit();
+                try encode(compact, &native.writer, .{});
+                try encodeGeneric(compact, &scalar.writer, .{});
+                try std.testing.expectEqualSlices(u8, scalar.written(), native.written());
+                const decoded = try decodeLeaky(aa, kind, native.written(), .{ .compact = true });
+                var work: arrays.Budget = .{};
+                try std.testing.expectEqual(std.math.Order.eq, try compact.compare(decoded.value, &work));
+                const out = try aa.alloc(u8, native.written().len);
+                var exact: std.Io.Writer = .fixed(out);
+                try encode(compact, &exact, .{});
+                try std.testing.expectEqualSlices(u8, native.written(), out);
+                var short: std.Io.Writer = .fixed(out[0 .. out.len - 1]);
+                try std.testing.expectError(error.WriteFailed, encode(compact, &short, .{}));
+                var preflight: std.Io.Writer = .fixed(out);
+                try std.testing.expectError(error.SqlProgramLimitExceeded, encode(compact, &preflight, .{ .wire_bytes = out.len - 1 }));
+                try std.testing.expectEqual(@as(usize, 0), preflight.end);
+            }
+        }
+    }
 }

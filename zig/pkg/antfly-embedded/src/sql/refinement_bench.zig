@@ -819,7 +819,7 @@ test "native pipeline refinements benchmark dictionary spill decoding" {
 }
 
 const ProjectionStats = struct { ns: i96, peak: usize, allocations: usize, checksum: u64 };
-const ProjectionCase = enum { document, columns, array, array_copy, replay, replay_batch };
+const ProjectionCase = enum { document, columns, array, array_copy, array_wire, replay, replay_batch };
 const ProjectionFixture = struct {
     projection: @import("document_row.zig").Projection,
     layout: @import("catalog.zig").Row.TypedLayout,
@@ -895,6 +895,15 @@ const ProjectionFixture = struct {
                     _ = try input.validate(.{});
                     var writer: std.Io.Writer = .fixed(self.output);
                     try @import("array_binary.zig").encode(input, &writer, .{});
+                    result.checksum += writer.end;
+                }
+                result.checksum +%= std.hash.Wyhash.hash(0, self.output);
+            },
+            .array_wire => {
+                for (0..64) |_| {
+                    var writer: std.Io.Writer = .fixed(self.output);
+                    if (direct) try @import("array_binary.zig").encode(self.array, &writer, .{}) else try @import("array_binary.zig").encodeGeneric(self.array, &writer, .{});
+                    std.mem.doNotOptimizeAway(self.output.ptr);
                     result.checksum += writer.end;
                 }
                 result.checksum +%= std.hash.Wyhash.hash(0, self.output);

@@ -616,6 +616,9 @@ pub fn Adapter(comptime native: type) type {
                 const highlight_slot = layout.ordinals.get("_highlights");
                 var produced: usize = 0;
                 var bytes: usize = 0;
+                var document_values: []const ?[]const u8 = &.{};
+                var document_begin: usize = 0;
+                var document_end: usize = 0;
                 var document_scratch = std.heap.ArenaAllocator.init(self.alloc);
                 defer document_scratch.deinit();
                 while (produced < count and bytes < 256 * 1024) {
@@ -650,7 +653,18 @@ pub fn Adapter(comptime native: type) type {
                     } else {
                         const hit = self.result.hits[self.position + produced];
                         if (!document_scratch.reset(.{ .retain_with_limit = 256 * 1024 })) return error.OutOfMemory;
-                        const source: dependencies.sql_document_row.Projection.SearchSource = if (!self.needs_document) .{ .value = .{ .object = .empty } } else if (self.documents) |*documents| .{ .bytes = try documents.lookup(hit.id) } else if (hit.source_value) |value| .{ .value = value } else if (hit.stored_data) |data| .{ .bytes = data } else return error.InvalidSqlBackendResponse;
+                        if (self.needs_document) if (self.documents) |*documents| {
+                            if (produced == document_end) {
+                                const n = @min(count - produced, 64);
+                                var ids: [64][]const u8 = undefined;
+                                for (self.result.hits[self.position + produced ..][0..n], 0..) |candidate, index| ids[index] = candidate.id;
+                                const batch = try documents.lookupBatch(ids[0..n], 256 * 1024);
+                                document_values = batch.values;
+                                document_begin = produced;
+                                document_end = produced + batch.consumed;
+                            }
+                        };
+                        const source: dependencies.sql_document_row.Projection.SearchSource = if (!self.needs_document) .{ .value = .{ .object = .empty } } else if (self.documents != null) .{ .bytes = document_values[produced - document_begin].? } else if (hit.source_value) |value| .{ .value = value } else if (hit.stored_data) |data| .{ .bytes = data } else return error.InvalidSqlBackendResponse;
                         const highlights = if (highlight_slot != null) try highlightsValueLeaky(document_scratch.allocator(), hit.highlights) else null;
                         const out = &rows[produced];
                         out.* = try self.projection.projectSearch(a, document_scratch.allocator(), layout, hit.id, source, .{ .score = if (hit.score) |score| @as(f64, score) else null, .highlights = highlights });

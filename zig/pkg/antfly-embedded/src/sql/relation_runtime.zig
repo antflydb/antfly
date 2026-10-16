@@ -905,6 +905,7 @@ fn Engine(comptime Context: type) type {
             result_cursor: ?*@import("result_cursor.zig").Cursor = null,
             prepared_reader: ?*@import("result_cursor.zig").Cursor.ReplayReader = null,
             query_fields: ?[]const []const u8 = null,
+            query_plan: ?QueryPlan = null,
             query_skip: usize = 0,
             query_remaining: usize = 0,
             query_buffer: []const []const Datum = &.{},
@@ -930,6 +931,8 @@ fn Engine(comptime Context: type) type {
             sampled_index: usize = 0,
             sample_arena: ?std.heap.ArenaAllocator = null,
 
+            const QueryMap = struct { ordinals: []const usize, types: []const scalar.Type };
+            const QueryPlan = struct { input: QueryMap, forward: ?QueryMap };
             const SetEntry = struct { values: []const Datum, count: usize, next: ?usize };
 
             fn create(engine: *Self, node: *const binding.Node) anyerror!*Iterator {
@@ -1407,6 +1410,53 @@ fn Engine(comptime Context: type) type {
                 }
                 return values;
             }
+            /// Names/types are immutable for this iterator. Bind once in
+            /// linear time, including simple column expressions and aliases.
+            fn planQuery(self: *Iterator, query: anytype) !QueryPlan {
+                const a = self.arena.allocator();
+                var source: std.StringHashMapUnmanaged(usize) = .empty;
+                defer source.deinit(a);
+                for (query.source.columns, 0..) |column, index| {
+                    const entry = try source.getOrPut(a, column.internal);
+                    if (!entry.found_existing) entry.value_ptr.* = index;
+                }
+                const ordinals = try a.alloc(usize, query.binding.scalars.columns.len);
+                const types = try a.alloc(scalar.Type, ordinals.len);
+                for (query.binding.scalars.columns, ordinals, types) |column, *ordinal, *type_| {
+                    ordinal.* = source.get(column.name) orelse std.math.maxInt(usize);
+                    type_.* = .{ .kind = column.type, .element_type = column.element_type, .numeric_modifier = column.numeric_modifier };
+                }
+                const projected_ordinals = try a.alloc(usize, query.binding.columns.len);
+                const projected_types = try a.alloc(scalar.Type, projected_ordinals.len);
+                var forward = self.query_fields.?.len == query.binding.columns.len;
+                for (query.binding.columns, projected_ordinals, projected_types, 0..) |column, *ordinal, *type_, index| {
+                    if (!forward) break;
+                    const program = if (index < query.binding.scalars.projections.len) query.binding.scalars.projections[index] else null;
+                    if (program) |projection| {
+                        if (projection.instructions.len != 1 or projection.instructions[projection.root].operation != .column) {
+                            forward = false;
+                            break;
+                        }
+                        const slot = projection.instructions[projection.root].operation.column;
+                        if (slot >= ordinals.len) return error.InvalidSqlBackendResponse;
+                        ordinal.* = ordinals[slot];
+                    } else ordinal.* = source.get(self.query_fields.?[index]) orelse return error.InvalidSqlBackendResponse;
+                    if (ordinal.* >= query.source.columns.len) {
+                        forward = false;
+                        break;
+                    }
+                    const original = query.source.columns[ordinal.*];
+                    // Casts and expression effects keep the existing eager
+                    // vectors/error-prefix path. Identity projections borrow
+                    // native cells and normalize through the shared accessor.
+                    if (original.type != column.type or original.element_type != column.element_type or !std.meta.eql(original.numeric_modifier, column.numeric_modifier)) {
+                        forward = false;
+                        break;
+                    }
+                    type_.* = .{ .kind = column.type, .element_type = column.element_type, .numeric_modifier = column.numeric_modifier };
+                }
+                return .{ .input = .{ .ordinals = ordinals, .types = types }, .forward = if (forward) .{ .ordinals = projected_ordinals, .types = projected_types } else null };
+            }
             fn nextQueryBatch(self: *Iterator, _: Allocator, maximum: usize, query: @FieldType(@FieldType(binding.Node, "operation"), "query"), failure: ?*?anyerror) anyerror!@import("execution_batch.zig").Batch {
                 const Batch = @import("execution_batch.zig").Batch;
                 var context = self.engine.context;
@@ -1419,6 +1469,7 @@ fn Engine(comptime Context: type) type {
                     self.query_skip = try context.offsetCount(query.statement.offset);
                     self.query_remaining = query.statement.capRows(try context.count(query.statement.limit, std.math.maxInt(usize)));
                 }
+                if (self.query_plan == null) self.query_plan = try self.planQuery(query);
                 while (self.query_remaining != 0) {
                     _ = self.scratch.reset(.free_all);
                     const a = self.scratch.allocator();
@@ -1433,14 +1484,8 @@ fn Engine(comptime Context: type) type {
                         }
                         return .{ .rows = &.{} };
                     }
-                    const ordinals = try a.alloc(usize, context.binding.scalars.columns.len);
-                    const types = try a.alloc(scalar.Type, ordinals.len);
-                    for (context.binding.scalars.columns, ordinals, types) |definition, *ordinal, *type_| {
-                        ordinal.* = for (query.source.columns, 0..) |column, index| {
-                            if (std.mem.eql(u8, column.internal, definition.name)) break index;
-                        } else std.math.maxInt(usize);
-                        type_.* = .{ .kind = definition.type, .element_type = definition.element_type, .numeric_modifier = definition.numeric_modifier };
-                    }
+                    const ordinals = self.query_plan.?.input.ordinals;
+                    const types = self.query_plan.?.input.types;
                     const identity = try a.alloc(usize, input.len());
                     for (identity, 0..) |*index, value| index.* = value;
                     var bound: Batch = .{ .mapped = .{ .source = input, .ordinals = ordinals, .types = types, .selection = identity } };
@@ -1477,6 +1522,14 @@ fn Engine(comptime Context: type) type {
                         continue;
                     }
                     bound.mapped.selection = selected.items;
+                    if (self.query_plan.?.forward) |plan| {
+                        if (selected.items.len == self.query_remaining) upstream_error = null;
+                        if (upstream_error) |err| {
+                            if (failure) |out| out.* = err else return err;
+                        }
+                        self.query_remaining -= selected.items.len;
+                        return .{ .mapped = .{ .source = input, .ordinals = plan.ordinals, .types = plan.types, .selection = selected.items } };
+                    }
                     const output_errors = try a.alloc(?anyerror, selected.items.len);
                     @memset(output_errors, null);
                     const columns = try a.alloc([]const Datum, self.query_fields.?.len);
@@ -2307,7 +2360,7 @@ test "SQL prepared native batches avoid row matrices across memory and spill blo
     };
     const Mode = enum { rows, resident, disk };
     const Fixture = struct {
-        fn run(a: Allocator, mode: Mode, large: bool) !void {
+        fn run(a: Allocator, mode: Mode, large: bool, project: bool) !void {
             var dummy: u8 = 0;
             const row_count: usize = if (large) 300 else 3;
             const width: usize = if (large) 128 else 3;
@@ -2330,9 +2383,17 @@ test "SQL prepared native batches avoid row matrices across memory and spill blo
                 name.* = "a";
             }
             const node: binding.Node = .{ .columns = columns, .operation = .{ .prepared_rows = names } };
-            var engine: Engine(Runtime.Context) = .{ .context = .{ .alloc = a, .arena = sa, .backend = .{ .ptr = &dummy, .vtable = &.{ .checkpoint = Hook.check, .resolve = undefined, .scan = undefined, .mutate = undefined } }, .binding = undefined, .parameters = &.{}, .limits = .{}, .returning_rows = rows, .returning_cursor = cursor, .returning_layout = layout }, .cursors = &.{}, .cache_arena = .init(a) };
+            const projections = try sa.alloc(@import("ast.zig").Projection, width);
+            const outputs = try sa.alloc(describe.Column, width);
+            for (projections, outputs) |*projection, *output| {
+                projection.* = .{ .field = "a" };
+                output.* = .{ .name = "a", .type = .array, .element_type = .int64 };
+            }
+            const query: binding.Node = .{ .columns = columns, .operation = .{ .query = .{ .source = &node, .statement = .{ .columns = projections, .offset = .{ .integer = 1 } }, .binding = .{ .table = null, .action = .read, .columns = outputs, .parameter_types = &.{}, .json_literals = .empty } } } };
+            var working: @import("memory_budget.zig") = .{ .backing = a, .limit = 128 * 1024 };
+            var engine: Engine(Runtime.Context) = .{ .context = .{ .alloc = working.allocator(), .arena = sa, .backend = .{ .ptr = &dummy, .vtable = &.{ .checkpoint = Hook.check, .resolve = undefined, .scan = undefined, .mutate = undefined } }, .binding = undefined, .parameters = &.{}, .limits = .{}, .returning_rows = rows, .returning_cursor = cursor, .returning_layout = layout }, .cursors = &.{}, .cache_arena = .init(a) };
             defer engine.deinit();
-            const iterator = try Engine(Runtime.Context).Iterator.create(&engine, &node);
+            const iterator = try Engine(Runtime.Context).Iterator.create(&engine, if (project) &query else &node);
             defer iterator.deinit();
             var budget: @import("memory_budget.zig") = .{ .backing = a, .limit = 64 * 1024 };
             var page = std.heap.ArenaAllocator.init(budget.allocator());
@@ -2351,12 +2412,15 @@ test "SQL prepared native batches avoid row matrices across memory and spill blo
                 try std.testing.expectEqual(@as(i32, -3), cell.array.?.dimensions[0].lower);
                 count += batch.len();
             }
-            try std.testing.expectEqual(row_count, count);
-            if (large) std.debug.print("prepared native batch {s}: peak {d} bytes, former 17x128 descriptors alone {d} bytes\n", .{ @tagName(mode), budget.peak, 17 * 128 * @sizeOf(Datum) });
+            try std.testing.expectEqual(row_count - @intFromBool(project), count);
+            if (project) try std.testing.expect(iterator.query_plan.?.forward != null);
+            if (large) std.debug.print("prepared native batch {s} projected={any}: page peak {d}, operator peak {d}, former 17x128 descriptors alone {d} bytes\n", .{ @tagName(mode), project, budget.peak, working.peak, 17 * 128 * @sizeOf(Datum) });
         }
     };
     for ([_]Mode{ .rows, .resident, .disk }) |mode| {
-        try Fixture.run(std.testing.allocator, mode, true);
-        try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Fixture.run, .{ mode, false });
+        for ([_]bool{ false, true }) |project| {
+            try Fixture.run(std.testing.allocator, mode, true, project);
+            try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Fixture.run, .{ mode, false, project });
+        }
     }
 }

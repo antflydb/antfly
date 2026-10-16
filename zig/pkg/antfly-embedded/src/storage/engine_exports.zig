@@ -801,6 +801,9 @@ fn statementFenceRelease(fence: *DB.StatementReadFence) engine.Outcome(void) {
 fn documentRowsUnderLease(lease: *const DB.QueryReadLease, alloc: Allocator, version: u32) engine.Outcome(DB.DocumentRows) {
     return .{ .value = lease.documentRows(alloc, version) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
+fn documentRowsLookupBatch(reader: *DB.DocumentRows, ids: []const []const u8, max_bytes: usize) engine.Outcome(DB.DocumentRows.Batch) {
+    return .{ .value = reader.lookupBatch(ids, max_bytes) catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
 fn documentRowsLookup(reader: *DB.DocumentRows, key: []const u8) engine.Outcome([]const u8) {
     return .{ .value = reader.lookup(key) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }

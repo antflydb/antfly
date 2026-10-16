@@ -40162,14 +40162,88 @@ pub const DB = struct {
     }
 
     /// Delayed document hydration over the exact primary generation captured
-    /// with ranking. Only the current document's byte scope stays pinned;
-    /// callers copy selected cells before the next lookup retires that scope.
+    /// with ranking. A byte-bounded document window stays pinned; callers copy
+    /// selected cells before the next lookup or page release retires it.
     pub const DocumentRows = struct {
         db: *DB,
         read: docstore_mod.DocStore.Txn,
         schema: schema_registry_mod.SchemaView,
         policy: row_policy_gate_mod.Gate.Lease,
         window: DocumentPrimaryReadWindow,
+        metadata: std.heap.ArenaAllocator,
+        keys: [64][]const u8 = undefined,
+        ids: [64][]const u8 = undefined,
+        sizes: [64]?u64 = undefined,
+        cached: usize = 0,
+        next_cached: usize = 0,
+        values: [64]?[]const u8 = undefined,
+        pub const Batch = struct { values: []const ?[]const u8, consumed: usize };
+
+        // Keep keys and scalar size proofs separate from body scratch: sorted
+        // reads retire body scratch, and a small byte target can consume this
+        // metadata window over several calls. Never reuse proofs across pages.
+        fn prepare(self: *@This(), documents: []const []const u8) !void {
+            const available = self.cached - self.next_cached;
+            const common = @min(available, documents.len);
+            if (common != 0) {
+                const matches = for (documents[0..common], self.ids[self.next_cached..][0..common]) |wanted, cached_id| {
+                    if (!std.mem.eql(u8, wanted, cached_id)) break false;
+                } else true;
+                if (matches) return;
+            }
+            self.cached = 0;
+            self.next_cached = 0;
+            _ = self.metadata.reset(.free_all);
+            const a = self.metadata.allocator();
+            const count = @min(documents.len, self.keys.len);
+            for (documents[0..count], 0..) |id, index| {
+                self.ids[index] = try a.dupe(u8, id);
+                self.keys[index] = try encodeStoreLookupKeyWithPinnedSchemaAlloc(self.db, a, id, self.schema);
+            }
+            var contents: [64]?@import("../document_mutation_revision.zig").Content = undefined;
+            var timestamps: [64]u64 = undefined;
+            var scope = try self.read.openReadScope(a);
+            defer scope.close();
+            try @import("../document_mutation_revision.zig").loadWindow(&scope, a, self.keys[0..count], self.ids[0..count], contents[0..count], timestamps[0..count]);
+            for (contents[0..count], 0..) |content, index| self.sizes[index] = if (content) |proof| proof.bytes else null;
+            self.cached = count;
+        }
+
+        /// Sorted physical reads restore caller order. Metadata lengths are
+        /// revision-bound to this snapshot; unknown or oversized rows read in
+        /// isolation. A legal single document may exceed the soft byte target.
+        /// Results expire on the next lookup, batch or page release.
+        pub fn lookupBatch(self: *@This(), documents: []const []const u8, max_bytes: usize) !Batch {
+            if (comptime storage_engine.enabled) return storage_engine.call("documentRowsLookupBatch", .{ self, documents, max_bytes });
+            if (documents.len == 0 or documents.len > 64 or max_bytes == 0) return error.InvalidBatch;
+            self.window.retire();
+            errdefer self.window.retire();
+            if (documents.len == 1) {
+                self.values[0] = try self.lookup(documents[0]);
+                return .{ .values = self.values[0..1], .consumed = 1 };
+            }
+            try self.prepare(documents);
+            const available = @min(documents.len, self.cached - self.next_cached);
+            const limit = @min(max_bytes, DocumentPrimaryReadWindow.max_bytes);
+            var count: usize = 0;
+            var bytes: u64 = 0;
+            while (count < available) : (count += 1) {
+                const length = self.sizes[self.next_cached + count] orelse break;
+                if (length > limit -| bytes) break;
+                bytes += length;
+            }
+            count = @max(count, 1);
+            const keys = self.keys[self.next_cached..][0..count];
+            if (count == 1) {
+                self.values[0] = self.window.get(&self.read, keys[0], self.sizes[self.next_cached]) catch |err| switch (err) {
+                    error.NotFound => return error.StorageReadTemporarilyUnavailable,
+                    else => return err,
+                };
+            } else try self.window.getMany(&self.read, keys, self.values[0..count]);
+            for (self.values[0..count]) |value| if (value == null) return error.StorageReadTemporarilyUnavailable;
+            self.next_cached += count;
+            return .{ .values = self.values[0..count], .consumed = count };
+        }
 
         pub fn lookup(self: *@This(), key: []const u8) ![]const u8 {
             if (comptime storage_engine.enabled) return storage_engine.call("documentRowsLookup", .{ self, key });
@@ -40188,10 +40262,14 @@ pub const DB = struct {
         pub fn releasePage(self: *@This()) void {
             if (comptime storage_engine.enabled) return storage_engine.call("documentRowsReleasePage", .{self}) catch @panic("incompatible storage owner");
             self.window.retire();
+            _ = self.metadata.reset(.free_all);
+            self.cached = 0;
+            self.next_cached = 0;
         }
         pub fn deinit(self: *@This()) void {
             if (comptime storage_engine.enabled) return storage_engine.call("documentRowsDeinit", .{self}) catch @panic("incompatible storage owner");
             self.window.deinit();
+            self.metadata.deinit();
             self.read.abort();
             self.schema.release();
             self.policy.release();
@@ -40227,7 +40305,7 @@ pub const DB = struct {
             if (view.storageMode() != .document or view.version() != schema_version) return error.PreparedGenerationChanged;
             var read = try self.db.core.store.beginReadTxn();
             errdefer read.abort();
-            return .{ .db = self.db, .read = read, .schema = view, .policy = self.row_policy_lease.clone(), .window = .init(alloc) };
+            return .{ .db = self.db, .read = read, .schema = view, .policy = self.row_policy_lease.clone(), .window = .init(alloc), .metadata = .init(@import("antfly_platform").allocator.reclaimingScratch(alloc)) };
         }
 
         pub fn search(self: QueryReadLease, alloc: Allocator, req: types.SearchRequest) !SearchWithDenseProfileResult {
