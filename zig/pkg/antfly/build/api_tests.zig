@@ -2211,6 +2211,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     // Recovery selections belong to the native Zig test inventory.
     const hosted_initial_fk_recovery_tests = b.addTest(.{
         .name = "antfly-hosted-initial-fk-recovery",
+        .max_rss = @import("runtime_memory.zig").testCompileMaxRss("antfly-hosted-initial-fk-recovery", b.graph.host.result, target.result, optimize, 0),
         .root_module = hosted_initial_fk_test_mod,
         .filters = &.{ "mounted initial", "hosted initial FK real services and facade retain all required capabilities", "FK plan table and range descriptors survive snapshot release", "initial FK plan waits for all external parent schema migrations" },
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
@@ -2253,6 +2254,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .dependOn(&addFilteredTestRunArtifact(b, hosted_graph_truncate_tests).step);
     const hosted_truncate_fk_recovery_tests = b.addTest(.{
         .name = "antfly-hosted-truncate-fk-recovery",
+        .max_rss = @import("runtime_memory.zig").testCompileMaxRss("antfly-hosted-truncate-fk-recovery", b.graph.host.result, target.result, optimize, 0),
         .root_module = hosted_fk_drop_test_mod,
         .filters = &.{ "mounted hosted external-parent FK DROP publishes after parent ACK", "mounted hosted external-parent FK TRUNCATE", "mounted hosted graph TRUNCATE", "owner catalog busy without index debt keeps provisioning retry until full reconciliation" },
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
@@ -2321,6 +2323,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .dependOn(&addFilteredTestRunArtifact(b, hosted_self_fk_leader_transfer_tests).step);
     const hosted_self_fk_recovery_tests = b.addTest(.{
         .name = "antfly-hosted-self-fk-recovery",
+        .max_rss = @import("runtime_memory.zig").testCompileMaxRss("antfly-hosted-self-fk-recovery", b.graph.host.result, target.result, optimize, 0),
         .root_module = hosted_self_fk_test_mod,
         // Exact positive proofs: never include the old guard-on assertions.
         .filters = &.{ "mounted hosted self-FK ADD DROP restart", "mounted hosted self-FK publication resumes after lost owner and metadata replies", "mounted hosted self-FK resumes after metadata and owner cold restart at parent ACK", "mounted hosted self-FK survives three-voter owner leadership transfer at ADD and DROP ACK" },

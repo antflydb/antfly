@@ -2055,15 +2055,16 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     test_imports.configure(b, secret_backend_test_mod, true, true);
     secret_backend_test_mod.addImport("antfly_openapi_specs", antfly_imports.embedded_openapi);
     const secret_backend_tests = b.addTest(.{
+        .name = "secret-backends-tests",
         .root_module = secret_backend_test_mod,
         // ReleaseSafe peaks above the aggregate estimates on both platforms:
         // 12.88 GB measured on x86_64-linux in the VOPR qualification lane,
-        // above 10 GiB on macOS. Debug keeps the conservative default so the
-        // unit lanes retain their tighter scheduler claim.
-        .max_rss = @as(usize, switch (target.result.os.tag) {
+        // above 10 GiB on macOS. Native Darwin Debug has its own measured
+        // floor; other compilation profiles retain these authored claims.
+        .max_rss = @import("runtime_memory.zig").testCompileMaxRss("secret-backends-tests", b.graph.host.result, target.result, optimize, @as(usize, switch (target.result.os.tag) {
             .macos => 13,
             else => if (optimize == .debug) 7 else 14,
-        }) * 1024 * 1024 * 1024,
+        }) * 1024 * 1024 * 1024),
         .filters = &.{"secret backend"},
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });

@@ -184,6 +184,9 @@ pub fn testCompileMaxRss(name: []const u8, host: std.Target, target: std.Target,
     // peaked at 18,029,035,520/14,373,978,112/13,895,155,712/14,097,039,360
     // bytes respectively; raft-unit-tests peaked at 14,420,606,976 bytes.
     // api-table-write-implementation-tests peaked at 13,252,476,928 bytes.
+    // secret-backends-tests peaked at 15,418,605,568 bytes.
+    // Hosted truncate recovery/data implementation peaked at
+    // 12,111,249,408/13,980,401,664 bytes.
     // Reserve >25% headroom
     // without changing cross-host, release or other test-object reservations.
     if (host.os.tag == .macos and host.cpu.arch == .aarch64 and
@@ -196,6 +199,11 @@ pub fn testCompileMaxRss(name: []const u8, host: std.Target, target: std.Target,
             .{ .name = "api-derived-coverage-tests", .gib = 17 },
             .{ .name = "raft-unit-tests", .gib = 17 },
             .{ .name = "api-table-write-implementation-tests", .gib = 16 },
+            .{ .name = "secret-backends-tests", .gib = 19 },
+            .{ .name = "antfly-hosted-truncate-fk-recovery", .gib = 15 },
+            .{ .name = "data-runtime-implementation-tests", .gib = 17 },
+            .{ .name = "antfly-hosted-self-fk-recovery", .gib = 14 },
+            .{ .name = "antfly-hosted-initial-fk-recovery", .gib = 14 },
         };
         for (floors) |floor| if (std.mem.eql(u8, name, floor.name))
             return @max(authored, floor.gib * 1024 * 1024 * 1024);
@@ -421,8 +429,8 @@ test "native Darwin Debug test reservations cover measured peaks without unsafe 
     try std.testing.expectEqual(12 * gib, testCompileMaxRss("api-docid-tests", macos, linux, .debug, 12 * gib));
     try std.testing.expectEqual(12 * gib, testCompileMaxRss("api-docid-tests", linux, macos, .debug, 12 * gib));
     try std.testing.expectEqual(7 * gib, testCompileMaxRss("api-docid-tests", linux, linux, .debug, 7 * gib));
-    const names = [_][]const u8{ "api-auth-tests", "api-derived-coverage-tests", "raft-unit-tests", "api-table-write-implementation-tests" };
-    const peaks = [_]usize{ 13_895_155_712, 14_097_039_360, 14_420_606_976, 13_252_476_928 };
+    const names = [_][]const u8{ "api-auth-tests", "api-derived-coverage-tests", "raft-unit-tests", "api-table-write-implementation-tests", "secret-backends-tests", "antfly-hosted-truncate-fk-recovery", "data-runtime-implementation-tests", "antfly-hosted-self-fk-recovery", "antfly-hosted-initial-fk-recovery" };
+    const peaks = [_]usize{ 13_895_155_712, 14_097_039_360, 14_420_606_976, 13_252_476_928, 15_418_605_568, 12_111_249_408, 13_980_401_664, 11_942_445_056, 11_940_200_448 };
     for (names, peaks) |name, measured| {
         const floor = testCompileMaxRss(name, macos, macos, .debug, 12 * gib);
         try std.testing.expect(floor >= measured + measured / 4);
