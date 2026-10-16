@@ -352,6 +352,8 @@ test "relational index publication work discovery bounds unrelated live locks an
         var terminal = head;
         terminal.table_id = table;
         terminal.phase = .canceled;
+        terminal.revision = 4;
+        terminal.cancellation_revision = 3;
         terminal.failure = .requested;
         terminal.counts = .{ 1, 1, 0, 0, 0, 1, 1 };
         bytes.* = try terminal.encode();

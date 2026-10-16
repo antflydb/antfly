@@ -5055,6 +5055,34 @@ pub const OwnerAckTestFixture = if (@import("builtin").is_test) struct {
         try std.testing.expect(try status.value.isAcknowledged(ack));
         try std.testing.expectEqual(index_progress.Phase.cancel_releasing, status.value.head.phase);
         {
+            const request: index_publication.OwnerRequest = .{ .table_id = head.table_id, .group_id = binding.fence.owner_group_id, .id = head.plan_id, .operation = .cancel_release };
+            const reply = try store.relationalIndexOwnerDecisionJson(alloc, group, request);
+            defer alloc.free(reply);
+            var permission = try std.json.parseFromSlice(index_publication.OwnerDecision, alloc, reply, .{});
+            defer permission.deinit();
+            try permission.value.requireRequest(request);
+            const grant = permission.value.native_cancel_release.?;
+            try std.testing.expectEqualDeep(record, grant.canceled);
+            try std.testing.expectEqual(ack.signed.proof.root_generation, grant.cleanup_proof.root_generation);
+            var later = permission.value.head;
+            later.revision += 1;
+            try grant.validateFor(group, permission.value.metadata_incarnation, later, permission.value.owner);
+            var invalid = grant;
+            invalid.cleanup_proof.root_generation = 0;
+            try std.testing.expectError(error.InvalidCatalogRecord, invalid.validateFor(group, permission.value.metadata_incarnation, later, permission.value.owner));
+            invalid = grant;
+            invalid.cleanup_proof.root_generation += 1;
+            const forged_receipt = try invalid.canceled.receipt();
+            invalid.cleanup_proof = try invalid.cleanup_proof.sign(root, try forged_receipt.digest());
+            try std.testing.expectError(error.InvalidCatalogRecord, invalid.validateFor(group, permission.value.metadata_incarnation, later, permission.value.owner));
+            invalid = grant;
+            invalid.decision_digest[0] ^= 1;
+            try std.testing.expectError(error.InvalidCatalogRecord, invalid.validateFor(group, permission.value.metadata_incarnation, later, permission.value.owner));
+            try setIndexTestRootGeneration(alloc, store, group, ack.signed, grant.cleanup_proof.root_generation + 1);
+            try std.testing.expectError(error.IndexOwnerReceiptChanged, store.relationalIndexOwnerDecisionJson(alloc, group, request));
+            try setIndexTestRootGeneration(alloc, store, group, ack.signed, grant.cleanup_proof.root_generation);
+        }
+        {
             var forged = ack;
             forged.cancellation.?.record.cleanup.claim_allocation += 1;
             forged.signed.receipt = try forged.cancellation.?.record.receipt();
@@ -5091,6 +5119,25 @@ pub const OwnerAckTestFixture = if (@import("builtin").is_test) struct {
         var read = try store.store.beginReadTxn();
         defer read.abort();
         try std.testing.expect(try @import("../table_lifecycle_lock.zig").read(&read, group, head.table_id) != null);
+    }
+
+    fn setIndexTestRootGeneration(alloc: std.mem.Allocator, store: *RaftApplyStore, group: u64, signed: index_publication.SignedReceipt, generation: u64) !void {
+        var txn = try store.store.beginWriteTxn();
+        errdefer txn.abort();
+        var arena = std.heap.ArenaAllocator.init(alloc);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const current = (try store.loadStoreHeaderTxn(&txn, group, signed.proof.identity.store_id)).?;
+        defer metadata_table_manager.freeStore(alloc, current);
+        const address = try RaftApplyStore.ReportAddress.active(a, &txn, group, current.store_id);
+        const report = (try RaftApplyStore.readStoreGroupReportTxn(a, &txn, group, address, signed.receipt.owner.group_id, true)).?;
+        const runtimes = try a.dupe(@TypeOf(report.runtime_statuses[0]), report.runtime_statuses);
+        runtimes[0].lsm_root_generation = generation;
+        var refreshed = current;
+        refreshed.runtime_statuses = runtimes;
+        refreshed.group_statuses = report.group_statuses;
+        _ = try store.updateListingStoreTxn(&txn, group, current.store_id, refreshed);
+        try txn.commit();
     }
 
     fn testNativePublicationDecision(alloc: std.mem.Allocator, source: *RaftApplyStore, group: u64, head: index_progress.Head, signing_root: @import("antfly_local_sources").storage_db_root_signing_identity.State) !void {
@@ -6177,10 +6224,69 @@ pub const OwnerAckTestFixture = if (@import("builtin").is_test) struct {
                     cleanup.signed.proof = try cleanup.signed.proof.sign(root, try cleanup.signed.receipt.digest());
                     const release_bytes = try std.json.Stringify.valueAlloc(a, cleanup, .{});
                     defer a.free(release_bytes);
-                    _ = try store.prepareRelationalIndexOwnerAckTxn(&txn, group, release_bytes);
-                    try store.ackRelationalIndexPublicationTxn(&txn, group, release_bytes);
+                    const terminal = try store.prepareRelationalIndexOwnerAckTxn(&txn, group, release_bytes);
+                    const epoch_before_release = try RaftApplyStore.relationSourceEpochTxn(&txn, group);
+                    const TerminalFault = struct {
+                        txn: *docstore.DocStore.Txn,
+                        fail_at: usize,
+                        after: bool,
+                        writes: usize = 0,
+                        pub fn get(self: *@This(), key: []const u8) ![]const u8 {
+                            return self.txn.get(key);
+                        }
+                        pub fn put(self: *@This(), key: []const u8, value: []const u8) !void {
+                            try self.beforeWrite();
+                            try self.txn.put(key, value);
+                            try self.afterWrite();
+                        }
+                        pub fn delete(self: *@This(), key: []const u8) !void {
+                            try self.beforeWrite();
+                            try self.txn.delete(key);
+                            try self.afterWrite();
+                        }
+                        fn beforeWrite(self: *@This()) !void {
+                            self.writes += 1;
+                            if (!self.after and self.writes == self.fail_at) return error.TestTerminalAckWriteFailed;
+                        }
+                        fn afterWrite(self: *@This()) !void {
+                            if (self.after and self.writes == self.fail_at) return error.TestTerminalAckWriteFailed;
+                        }
+                    };
+                    // Head, owner, proof, active pointer, source clock and lock:
+                    // no partial terminal cut may escape a failed command.
+                    for (1..7) |fail_at| for ([_]bool{ false, true }) |after| {
+                        var journal = command_journal.Journal.init(a, &txn);
+                        defer journal.deinit();
+                        try journal.attach();
+                        var fault: TerminalFault = .{ .txn = &txn, .fail_at = fail_at, .after = after };
+                        try std.testing.expectError(error.TestTerminalAckWriteFailed, terminal.stage(&fault, group));
+                        try journal.rollback();
+                        try std.testing.expectEqualDeep(canceled_head, try index_progress.Head.decode(try txn.get(try index_publication.headKey(&buf, group, ack.table_id))));
+                        try index_publication.requireActivePointer(&txn, group, canceled_head);
+                        try std.testing.expect(try @import("../table_lifecycle_lock.zig").read(&txn, group, ack.table_id) != null);
+                        try std.testing.expect(epoch_before_release.eql(try RaftApplyStore.relationSourceEpochTxn(&txn, group)));
+                        try std.testing.expectError(error.NotFound, txn.get(try index_publication.proofKey(&buf, group, ack.table_id, 0, .cancel_released)));
+                    };
+                    var outcome: CommittedApplyOutcome = .{ .alloc = a };
+                    defer outcome.deinit();
+                    std.debug.assert(store.active_outcome == null);
+                    store.active_outcome = &outcome;
+                    defer store.active_outcome = null;
+                    // Exercise the production shared catalog journal, not
+                    // just the progress helper. It must retire the pending
+                    // index name while preserving the document/table cut.
+                    try store.applyTransitionCommandTxn(&txn, group, .{ .ack_relational_index_publication = release_bytes });
                     canceled_head = try index_progress.Head.decode(try txn.get(try index_publication.headKey(&buf, group, ack.table_id)));
                     try std.testing.expectEqual(.canceled, canceled_head.phase);
+                    try index_publication.requireActivePointer(&txn, group, canceled_head);
+                    try std.testing.expectEqual(null, try @import("../table_lifecycle_lock.zig").read(&txn, group, ack.table_id));
+                    const epoch_after_release = try RaftApplyStore.relationSourceEpochTxn(&txn, group);
+                    try std.testing.expectEqual(epoch_before_release.revision + 1, epoch_after_release.revision);
+                    var live = (try relation_reconciliation.LiveStore(docstore.DocStore.Txn).open(&txn, group)).?;
+                    try std.testing.expect(live.root.epoch.eql(epoch_after_release));
+                    try std.testing.expectEqual(null, try live.getEntry(.{ .namespace_id = plan.namespace_id, .name = plan.index_name }));
+                    try std.testing.expectEqualDeep(plan.table_guard.owner, (try live.getClaim(.{ .namespace_id = plan.namespace_id, .name = plan.before.name })).?);
+                    try verifyRelationCheckpointTxn(a, &txn);
                 }
                 const source = blk: {
                     var read = try store.store.beginReadTxn();
@@ -15124,11 +15230,17 @@ pub const RaftApplyStore = struct {
         if (command == .compare_and_replace_table) if (command.compare_and_replace_table.relation_guard) |guard| {
             try self.validateRelationMutationTxn(&txn, group_id, guard, command.compare_and_replace_table.expected, command.compare_and_replace_table.replacement);
         };
+        const index_ack_source_before = if (command == .ack_relational_index_publication)
+            try relation_reconciliation.readSourceRevision(&txn, group_id)
+        else
+            null;
         try self.applyTransitionCommandTxn(&txn, group_id, command);
-        // These exact commands cannot change visible table/schema/name state.
+        // Ordinary ACKs preserve the projection. The final cancellation ACK
+        // retires the pending name source and must invalidate it atomically.
         // All other and future commands conservatively invalidate projection.
         try advanceStandaloneRevisionWithProjection(&txn, switch (command) {
-            .complete_relational_index_source, .accept_relational_index_delivery, .ack_relational_index_publication, .apply_store_root_enrollment => false,
+            .ack_relational_index_publication => index_ack_source_before.? != try relation_reconciliation.readSourceRevision(&txn, group_id),
+            .complete_relational_index_source, .accept_relational_index_delivery, .apply_store_root_enrollment => false,
             else => true,
         });
         try self.stageStandaloneHotStandby(&txn, &capture, group_id);
@@ -17838,6 +17950,13 @@ pub const RaftApplyStore = struct {
                 var proof_buf: [160]u8 = undefined;
                 try txn.put(try index_publication.proofKey(&proof_buf, group_id, self.table_id, self.ordinal, self.action), self.proof_bytes.slice());
                 const next = try index_progress.Head.decode(&self.update.next_head);
+                if (next.phase == .canceled) {
+                    // The shared relation-command journal derives the exact
+                    // name removal from this source deletion. Never release
+                    // the lock while leaving a phantom pending publication.
+                    try txn.delete(try index_publication.activeKey(&proof_buf, group_id, self.table_id));
+                    try relation_reconciliation.advanceTrackedSource(txn, group_id);
+                }
                 if (next.phase == .published or next.phase == .canceled)
                     try @import("../table_lifecycle_lock.zig").release(txn, group_id, self.table_id, .{ .kind = .index_build, .id = next.plan_id });
             }
@@ -18446,6 +18565,14 @@ pub const RaftApplyStore = struct {
                 .installed = .{ .command = witness.command, .position = accepted.signed.receipt.position.native },
                 .decision_digest = try index_publication.NativeReleaseGrant.decisionDigest(group_id, incarnation, head),
             };
+        }
+        if (owner.owner.authority == .native and request.operation == .cancel_release) {
+            const accepted = try index_publication.storedProof(self.alloc, try txn.get(try index_publication.proofKey(&buf, group_id, request.table_id, ordinal, .canceled)), head, owner, .canceled);
+            const witness = accepted.cancellation orelse return error.InvalidCatalogRecord;
+            // A replacement root/report is not permission to lift a fence on
+            // behalf of the root that actually acknowledged cohort cleanup.
+            try self.requireIndexOwnerRootReceiptTxn(&txn, group_id, accepted.signed, head.reader_requirements);
+            decision.native_cancel_release = .{ .canceled = witness.record, .decision_digest = try index_publication.cancellationReleaseDecisionDigest(group_id, incarnation, head), .cleanup_proof = accepted.signed.proof };
         }
         var route_arena = std.heap.ArenaAllocator.init(self.alloc);
         defer route_arena.deinit();
@@ -22657,7 +22784,9 @@ pub const RaftApplyStore = struct {
             .accept_relational_index_delivery => metadataSnapshotProjectionBit(.index_delivery_source) | metadataSnapshotProjectionBit(.index_delivery_target) | metadataSnapshotProjectionBit(.index_publication_owner) | metadataSnapshotProjectionBit(.standalone_native_owner),
             .complete_relational_index_source => metadataSnapshotProjectionBit(.index_delivery_source) | metadataSnapshotProjectionBit(.index_publication_owner) | metadataSnapshotProjectionBit(.index_publication_head) | metadataSnapshotProjectionBit(.standalone_native_owner),
             .begin_relational_index_publication => metadataSnapshotProjectionBit(.index_publication_proof) | metadataSnapshotProjectionBit(.index_publication_inputs) | metadataSnapshotProjectionBit(.index_publication_dispatch) | metadataSnapshotProjectionBit(.index_publication_owner_group) | metadataSnapshotProjectionBit(.index_publication_plan) | metadataSnapshotProjectionBit(.index_publication_active) | metadataSnapshotProjectionBit(.index_publication_head) | metadataSnapshotProjectionBit(.index_publication_owner) | metadataSnapshotProjectionBit(.fk_generation_table_lock) | metadataSnapshotProjectionBit(.table),
-            .ack_relational_index_publication => metadataSnapshotProjectionBit(.index_publication_head) | metadataSnapshotProjectionBit(.index_publication_owner) | metadataSnapshotProjectionBit(.index_publication_proof) | metadataSnapshotProjectionBit(.fk_generation_table_lock),
+            .ack_relational_index_publication => metadataSnapshotProjectionBit(.index_publication_head) | metadataSnapshotProjectionBit(.index_publication_owner) | metadataSnapshotProjectionBit(.index_publication_proof) | metadataSnapshotProjectionBit(.fk_generation_table_lock) |
+                metadataSnapshotProjectionBit(.index_publication_active) | metadataSnapshotProjectionBit(.relation_source) |
+                metadataSnapshotProjectionBit(.relation_names) | metadataSnapshotProjectionBit(.relation_candidates) | metadataSnapshotProjectionBit(.relation_live),
             .decide_relational_index_publication => metadataSnapshotProjectionBit(.index_publication_head) | metadataSnapshotProjectionBit(.index_publication_active) | metadataSnapshotProjectionBit(.table) | metadataSnapshotProjectionBit(.lake_index_lifecycle),
             .cancel_relational_index_publication => metadataSnapshotProjectionBit(.index_publication_head),
             .apply_relation_reconciliation => metadataSnapshotProjectionBit(.relation_source) | metadataSnapshotProjectionBit(.relation_reconciliation) |
@@ -35869,7 +35998,12 @@ test "relational index publication terminal ACK snapshot key registry includes e
     const expected = RaftApplyStore.metadataSnapshotProjectionBit(.index_publication_head) |
         RaftApplyStore.metadataSnapshotProjectionBit(.index_publication_owner) |
         RaftApplyStore.metadataSnapshotProjectionBit(.index_publication_proof) |
-        RaftApplyStore.metadataSnapshotProjectionBit(.fk_generation_table_lock);
+        RaftApplyStore.metadataSnapshotProjectionBit(.fk_generation_table_lock) |
+        RaftApplyStore.metadataSnapshotProjectionBit(.index_publication_active) |
+        RaftApplyStore.metadataSnapshotProjectionBit(.relation_source) |
+        RaftApplyStore.metadataSnapshotProjectionBit(.relation_names) |
+        RaftApplyStore.metadataSnapshotProjectionBit(.relation_candidates) |
+        RaftApplyStore.metadataSnapshotProjectionBit(.relation_live);
     try std.testing.expectEqual(expected, mask);
 }
 

@@ -8287,3 +8287,41 @@ fixture expecting the internal catalog error at the snapshot boundary; the final
 fixture asserts both `InvalidCatalogRecord` internally and `InvalidMetadataSnapshot`
 at snapshot validation. Production rejection was retained unchanged. Original
 accounting remains 483 implemented / 862 unresolved.
+
+### Immutable cancellation barrier and terminal catalog retirement
+
+The private publication head (format 4) retains the exact revision at which all
+owners acknowledged durable cleanup. Cancellation release decisions bind this
+immutable barrier, the job/cohort and failure reason, not the moving ACK revision
+or source EOF. Failed builds need not reach EOF. Later release ACKs and root
+reattestations cannot change the decision identity.
+
+Native cancellation-release permission carries the accepted cleanup record and
+its root proof. Metadata rechecks the current runtime root before issuing it;
+the permission verifies the accepted owner receipt and physical commitment.
+Even a freshly signed proof for another root generation cannot substitute for
+the accepted cleanup proof. The receiving release operation still needs to pin
+that generation before any native fence lift; this grant alone does not activate
+native cancellation release.
+
+The final cancellation ACK now deletes the active publication pointer, advances
+the tracked catalog source clock and retires the lifecycle lock atomically with
+head/owner/proof updates. It participates in the existing relation-command
+journal: reserved index names are removed by the same source-derived catalog
+projection used by other table/publication operations, without a separate index
+name registry. Snapshot projection accounting includes every affected record
+class. Ordinary ACKs retain the standalone projection; only a changed source
+clock invalidates it.
+
+The frozen-source focused Debug gate passed 72/72 build steps in
+`/private/tmp/antfly-index-cancel-terminal-catalog-debug-3.log`: 56 metadata,
+four ACK and one service test executions, plus the pure progress lane, with no
+failures or leaks. Both Raft and native metadata fixtures exercise the shared
+catalog journal, complete checkpoint verification and rollback before/after
+each of the six terminal writes. They use synthetic signed owner cuts, not
+evidence of native fence release. Formatting, diff, licensing, Apache boundary,
+control-catalog and original inventory integrity checks pass.
+
+Native terminal fence release, accepted release-proof reconstruction, mounted
+cancellation scheduling and public online-index admission remain unfinished.
+No original SQL case credit or end-to-end activation is claimed.

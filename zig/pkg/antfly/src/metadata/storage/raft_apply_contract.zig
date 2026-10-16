@@ -264,6 +264,7 @@ pub fn transitionMutatesRelationSource(command: anytype) bool {
         .apply_fk_generation_publication,
         .begin_relational_index_publication,
         .decide_relational_index_publication,
+        .ack_relational_index_publication,
         .apply_fk_initial_create,
         .upsert_table,
         .compare_and_replace_table,

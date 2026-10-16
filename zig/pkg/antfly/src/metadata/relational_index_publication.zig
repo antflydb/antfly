@@ -681,6 +681,32 @@ pub const NativeInstallGrant = struct {
 
 /// Release is a separate all-owner decision, not permission inferred from one
 /// owner's installation. Reconstruct it from metadata's exact retained cut.
+/// The immutable all-owner cleanup cut is separate from the moving ACK CAS
+/// revision and from source EOF (a failed build need never reach EOF).
+pub fn cancellationReleaseDecisionDigest(group: u64, incarnation: local.metadata_incarnation.MetadataClusterIncarnation, head: progress.Head) !Digest {
+    try head.validate();
+    if (group == 0 or !local.metadata_incarnation.isValid(incarnation) or
+        (head.phase != .cancel_releasing and head.phase != .canceled) or
+        head.counts[@backingInt(progress.Action.canceled)] != head.owner_count) return error.InvalidCatalogRecord;
+    var state = std.crypto.hash.Blake3.init(.{});
+    state.update("antfly/native-index-cancellation-release-decision/v1");
+    state.update(&incarnation);
+    state.update(&head.plan_id);
+    state.update(&head.plan_digest);
+    state.update(&head.candidate_digest);
+    state.update(&head.reservation_digest);
+    var numbers: [27]u8 = undefined;
+    std.mem.writeInt(u64, numbers[0..8], group, .little);
+    std.mem.writeInt(u64, numbers[8..16], head.table_id, .little);
+    std.mem.writeInt(u64, numbers[16..24], head.cancellation_revision, .little);
+    std.mem.writeInt(u16, numbers[24..26], head.owner_count, .little);
+    numbers[26] = @backingInt(head.failure);
+    state.update(&numbers);
+    var result: Digest = undefined;
+    state.final(&result);
+    return result;
+}
+
 pub const NativeReleaseGrant = struct {
     installed: local.storage_db_relational_index_validation.Installed,
     decision_digest: Digest,
@@ -754,6 +780,27 @@ pub fn requireNativeCancellationWitness(group: u64, head: progress.Head, owner: 
     }
 }
 
+/// Metadata's accepted cleanup cut plus the root generation that must be
+/// pinned BEFORE a receiver releases anything. This is not root adoption.
+pub const NativeCancellationReleaseGrant = struct {
+    canceled: local.storage_db_relational_index_owner_job.Canceled,
+    decision_digest: Digest,
+    cleanup_proof: RootProof,
+
+    pub fn validateFor(self: @This(), group: u64, incarnation: local.metadata_incarnation.MetadataClusterIncarnation, head: progress.Head, owner: progress.OwnerState) !void {
+        try owner.validate();
+        const receipt = try self.canceled.receipt();
+        const signed: SignedReceipt = .{ .receipt = receipt, .proof = self.cleanup_proof };
+        signed.verifySignature() catch return error.InvalidCatalogRecord;
+        if (!std.mem.eql(u8, &self.cleanup_proof.identity.metadata_incarnation, &incarnation) or !std.meta.eql(receipt.owner, owner.owner) or
+            !std.mem.eql(u8, &receipt.candidate_digest, &head.candidate_digest) or
+            !std.mem.eql(u8, &receipt.reservation_digest, &head.reservation_digest) or
+            !std.mem.eql(u8, &try receipt.digest(), &owner.receipts[@backingInt(progress.Action.canceled)]) or
+            !std.mem.eql(u8, &try signed.commitment(), &owner.attestations[@backingInt(progress.Action.canceled)]) or
+            !std.mem.eql(u8, &self.decision_digest, &try cancellationReleaseDecisionDigest(group, incarnation, head))) return error.InvalidCatalogRecord;
+    }
+};
+
 pub const OwnerDecision = struct {
     pub const Attestation = struct {
         table_name: []const u8,
@@ -772,6 +819,7 @@ pub const OwnerDecision = struct {
     target_expectation: ?local.storage_db_relational_index_owner_job.private_claims.TargetExpectation = null,
     native_install: ?NativeInstallGrant = null,
     native_release: ?NativeReleaseGrant = null,
+    native_cancel_release: ?NativeCancellationReleaseGrant = null,
     /// Read-only recovery of an already accepted latest stage. This is never
     /// execution permission, schema input, or an index allocation request.
     attestation: ?Attestation = null,
@@ -797,6 +845,14 @@ pub const OwnerDecision = struct {
             const grant = self.native_release orelse return error.InvalidCatalogRecord;
             try grant.validateFor(self.metadata_group_id, self.metadata_incarnation, self.head, self.owner);
         } else if (self.native_release != null) return error.InvalidCatalogRecord;
+        if (request.operation == .cancel_release and self.disposition == .execute and self.owner.owner.authority == .native) {
+            const grant = self.native_cancel_release orelse return error.InvalidCatalogRecord;
+            try grant.validateFor(self.metadata_group_id, self.metadata_incarnation, self.head, self.owner);
+            try self.requireRetainedNativeBinding(grant.canceled.binding);
+            const view = self.native_signing orelse return error.InvalidCatalogRecord;
+            if (!std.meta.eql(grant.cleanup_proof.identity, view.identity) or grant.cleanup_proof.reporter_incarnation != view.reporter_incarnation or
+                grant.cleanup_proof.authority != .native or !std.mem.eql(u8, &grant.cleanup_proof.authority.native, &view.binding_digest)) return error.InvalidCatalogRecord;
+        } else if (self.native_cancel_release != null) return error.InvalidCatalogRecord;
         if (request.claim_groups) |groups| {
             if (self.disposition == .execute) {
                 const routes = self.claim_routes orelse return error.InvalidCatalogRecord;
@@ -2524,6 +2580,42 @@ test "relational index publication projected candidate rejects changed admitted 
     changed.reader_requirements = .{ .semantic_version = 30, .encoding_version = 17 };
     try std.testing.expectError(error.InvalidCatalogRecord, inputs.value.prepareCandidate(a, changed));
     try std.testing.expectError(error.InvalidCatalogRecord, inputs.value.prepareNativeManifest(a, changed));
+}
+
+test "relational index publication cancellation release decision pins the cohort barrier not later ACK revisions" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const plan = try testing.plan(arena.allocator());
+    var prepared = try plan.prepare(a);
+    defer prepared.deinit();
+    var head = try prepared.head.cancel(prepared.head.revision, .duplicate_key);
+    const incarnation = std.fmt.bytesToHex(plan.table_guard.incarnation, .lower);
+    try std.testing.expectError(error.InvalidCatalogRecord, cancellationReleaseDecisionDigest(13, incarnation, head));
+    const owners = try a.dupe(progress.OwnerState, prepared.owners);
+    defer a.free(owners);
+    for (owners) |*owner| {
+        const update = try progress.acknowledge(head, owner.*, head.revision, .{ .owner = owner.owner, .action = .canceled, .position = .{ .raft = .{ .term = 1, .index = 9 } }, .candidate_digest = head.candidate_digest, .reservation_digest = head.reservation_digest, .evidence_digest = @splat(7) });
+        head = update.head;
+        owner.* = update.owner;
+    }
+    const decision = try cancellationReleaseDecisionDigest(13, incarnation, head);
+    const barrier = head.cancellation_revision;
+    const encoded = try head.encode();
+    try std.testing.expectEqualDeep(head, try progress.Head.decode(&encoded));
+    for (owners) |*owner| {
+        const update = try progress.acknowledge(head, owner.*, head.revision, .{ .owner = owner.owner, .action = .cancel_released, .position = .{ .raft = .{ .term = 1, .index = 10 } }, .candidate_digest = head.candidate_digest, .reservation_digest = head.reservation_digest, .evidence_digest = @splat(8) });
+        head = update.head;
+        owner.* = update.owner;
+        try std.testing.expectEqual(barrier, head.cancellation_revision);
+        try std.testing.expectEqual(decision, try cancellationReleaseDecisionDigest(13, incarnation, head));
+    }
+    head.revision += 1; // An accepted latest-root attestation can bump the CAS.
+    try std.testing.expectEqual(decision, try cancellationReleaseDecisionDigest(13, incarnation, head));
+    head.failure = .requested;
+    try std.testing.expect(!std.mem.eql(u8, &decision, &try cancellationReleaseDecisionDigest(13, incarnation, head)));
+    head.cancellation_revision = 0;
+    try std.testing.expectError(error.InvalidGenerationPublication, head.validate());
 }
 
 test "relational index publication permission separates phase execution acknowledged retries and cancellation" {
