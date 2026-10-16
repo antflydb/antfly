@@ -9,14 +9,14 @@ a completion claim. PostgreSQL is the SQL standard and independent test oracle.
 ## Baseline and priorities
 
 The [original inventory](sql/parity-inventory.md) remains authoritative:
-483 implemented / 136 rejected / 105 superseded / 862 unresolved. Counts below
+483 implemented / 136 rejected / 113 superseded / 854 unresolved. Counts below
 are unresolved family pools, not promises that one implementation closes them.
 
 | Priority | Pool | Cases | Shared delivery boundary |
 | --- | --- | ---: | --- |
 | 1 | DDL, catalog and sessions | 308 | Public relation ownership, schema/index activation and retirement, session lifecycle and recovery |
 | 2 | Source/joined mutations and MERGE/recursion | 128 | Captured source ownership, bounded selection, atomic commit and distributed failure evidence |
-| 3 | Read and query | 131 | Faithful typed fixtures, binding/correlation, endpoint results and diagnostics |
+| 3 | Read and query | 130 | Faithful typed fixtures, binding/correlation, endpoint results and diagnostics |
 | 4 | Document writes | 70 | Document-specific schema/index profiles, complete postimages and integrity admission |
 | 5 | Historically unsupported writes | 92 | Individual PostgreSQL contract review, implementations or proven required rejections |
 
@@ -8943,3 +8943,37 @@ subject to the prior safety restriction; explicit approval has been requested.
 Cardinality/latency benchmarks, source reporting, real-owner SQL build/rollback/
 restart and the broader SQL pools remain open. Inventory is unchanged at
 483 implemented / 862 unresolved.
+
+### Exact original output-alias contracts
+
+Eight previously unqualified originals now have exact PostgreSQL and mounted
+native diagnostic evidence: `sql-1228`, `sql-1233`, `sql-1234`, `sql-1235`,
+`sql-1238`, `sql-1239`, `sql-1333` and `sql-1582`. The PostgreSQL standard does
+not expose SELECT output labels inside HAVING or compound ORDER BY expressions;
+bare sort labels retain their separate output-name resolution. See
+[PostgreSQL SELECT](https://www.postgresql.org/docs/18/sql-select.html).
+
+The current binder already implements that separation. No replacement binder,
+blanket unsupported error or statement rewrite was introduced. The new fixture
+loads unchanged original SQL and parameters by ID, uses the complete shared
+typed relational profile and an explicit document-table schema, and expects
+SQLSTATE 42703. A fail-fast data-source adapter proves rejection before lookup,
+scan, query or statement-view acquisition. Two native/PostgreSQL positive
+controls distinguish a bare output label from a compound input-column sort key
+using complete values and the integer result type. The oracle additionally
+checks each missing identifier and preserves both source table populations.
+
+The first test-selection audit correctly rejected an unregistered fixture; that
+empty selection is not evidence. Explicit API-root registration then passed
+80/80 Debug build steps. Both registered ledger gates subsequently passed in
+`/private/tmp/antfly-sql-original-name-resolution-evidence.log`: the mounted
+name-resolution test, the existing positive 12-original aggregate campaign and
+the PostgreSQL 18+ oracle. No skips, native failures or leaks were reported.
+License, inventory and compilation-boundary checks pass.
+
+Only these eight historical positive alias contracts are marked superseded by
+their tested PostgreSQL-required diagnostics. They are not counted as newly
+implemented features or as product-specific unsupported-case rejections.
+Inventory is now 483 implemented / 136 rejected / 113 superseded / 854 unresolved.
+Production reporter namespace switching/retirement remains disabled pending the
+requested explicit approval; broader SQL execution gaps remain open.

@@ -2,6 +2,8 @@
   "ledger_format": 1,
   "inventory_sha256": "c203a4dcf0094b75e1d3764e90beebddaf844a9ce604543c0a4dbc0ffe8ae173",
   "gates": {
+    "sql-original-name-resolution-native-debug": {"command":["zig","build","public-api-parity-test","-Doptimize=Debug","-j1","-Dtest-filter=httpx SQL original PostgreSQL name resolution rejects aliases before data reads","-Dtest-filter=httpx SQL PostgreSQL original aggregate reads preserve filters captures and nulls"],"cwd":"zig","timeout_seconds":1800},
+    "sql-original-name-resolution-postgres": {"command":["uv","run","--project","scripts","--with","psycopg[binary]==3.3.6","python","-m","unittest","discover","-s","scripts","-p","test_sql_name_resolution.py"],"cwd":".","timeout_seconds":180},
     "sql-original-noop-mutations-debug": {"command":["zig","build","public-api-parity-test","-Doptimize=Debug","-j2","-Dtest-filter=httpx SQL PostgreSQL no-op conflicts preserve primary versions and retain one source read"],"cwd":"zig","timeout_seconds":1800},
     "sql-schema-default-native-debug": {"command":["zig","build","sql-test","-Doptimize=Debug","-j2","-Dtest-filter=SQL catalog default admission matches PostgreSQL subquery prohibition"],"cwd":"zig","timeout_seconds":1800},
     "sql-schema-default-public-debug": {"command":["zig","build","public-api-parity-test","-Doptimize=Debug","-j2","-Dtest-filter=httpx SQL malformed catalog requests fail before publication"],"cwd":"zig","timeout_seconds":1800},
@@ -12027,8 +12029,12 @@
     },
     {
       "id": "sql-1228",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "superseded",
+      "reason": "PostgreSQL does not expose the SELECT output alias amount_sum to HAVING. The unchanged original and its parameters fail with SQLSTATE 42703 for amount_sum on the complete typed input schema; the mounted endpoint matches before any data-source call. This supersedes the historical positive alias contract, not an unsupported aggregate implementation.",
+      "evidence": [
+        {"path":"zig/pkg/antfly/src/api/sql_name_resolution_test.zig","test":"httpx SQL original PostgreSQL name resolution rejects aliases before data reads","gate":"sql-original-name-resolution-native-debug"},
+        {"path":"zig/pkg/antfly/src/api/sql_name_resolution_test.zig","test":"httpx SQL original PostgreSQL name resolution rejects aliases before data reads","gate":"sql-original-name-resolution-postgres"}
+      ]
     },
     {
       "id": "sql-1229",
@@ -12064,18 +12070,30 @@
     },
     {
       "id": "sql-1233",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "superseded",
+      "reason": "PostgreSQL resolves HAVING in the input/group namespace, not the SELECT output-alias namespace. The unchanged original fails with SQLSTATE 42703 for quantity_sum; the mounted endpoint matches before any data-source call. The historical positive alias-expression contract is superseded by this required diagnostic.",
+      "evidence": [
+        {"path":"zig/pkg/antfly/src/api/sql_name_resolution_test.zig","test":"httpx SQL original PostgreSQL name resolution rejects aliases before data reads","gate":"sql-original-name-resolution-native-debug"},
+        {"path":"zig/pkg/antfly/src/api/sql_name_resolution_test.zig","test":"httpx SQL original PostgreSQL name resolution rejects aliases before data reads","gate":"sql-original-name-resolution-postgres"}
+      ]
     },
     {
       "id": "sql-1234",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "superseded",
+      "reason": "Parentheses do not expose SELECT aliases in PostgreSQL HAVING. The unchanged original fails with SQLSTATE 42703 for quantity_sum on the declared input schema; the mounted endpoint matches before any data-source call. This is a tested replacement of the historical positive contract.",
+      "evidence": [
+        {"path":"zig/pkg/antfly/src/api/sql_name_resolution_test.zig","test":"httpx SQL original PostgreSQL name resolution rejects aliases before data reads","gate":"sql-original-name-resolution-native-debug"},
+        {"path":"zig/pkg/antfly/src/api/sql_name_resolution_test.zig","test":"httpx SQL original PostgreSQL name resolution rejects aliases before data reads","gate":"sql-original-name-resolution-postgres"}
+      ]
     },
     {
       "id": "sql-1235",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "superseded",
+      "reason": "PostgreSQL permits a bare output label in ORDER BY, but not an alias variable nested inside arithmetic. The unchanged original fails with SQLSTATE 42703 for quantity_sum; the mounted endpoint matches before any data-source call. Positive native/PostgreSQL controls preserve bare-label ordering and input-column expression binding.",
+      "evidence": [
+        {"path":"zig/pkg/antfly/src/api/sql_name_resolution_test.zig","test":"httpx SQL original PostgreSQL name resolution rejects aliases before data reads","gate":"sql-original-name-resolution-native-debug"},
+        {"path":"zig/pkg/antfly/src/api/sql_name_resolution_test.zig","test":"httpx SQL original PostgreSQL name resolution rejects aliases before data reads","gate":"sql-original-name-resolution-postgres"}
+      ]
     },
     {
       "id": "sql-1236",
@@ -12089,13 +12107,21 @@
     },
     {
       "id": "sql-1238",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "superseded",
+      "reason": "Boolean OR does not expose SELECT output aliases in PostgreSQL HAVING. The unchanged original fails with SQLSTATE 42703 for quantity_sum; the mounted endpoint matches before any data-source call. This supersedes historical positive alias behavior without claiming a new aggregate feature.",
+      "evidence": [
+        {"path":"zig/pkg/antfly/src/api/sql_name_resolution_test.zig","test":"httpx SQL original PostgreSQL name resolution rejects aliases before data reads","gate":"sql-original-name-resolution-native-debug"},
+        {"path":"zig/pkg/antfly/src/api/sql_name_resolution_test.zig","test":"httpx SQL original PostgreSQL name resolution rejects aliases before data reads","gate":"sql-original-name-resolution-postgres"}
+      ]
     },
     {
       "id": "sql-1239",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "superseded",
+      "reason": "Parentheses and boolean OR do not expose SELECT aliases in PostgreSQL HAVING. The unchanged original fails with SQLSTATE 42703 for quantity_sum; the mounted endpoint matches before any data-source call. This is a tested supersession of the historical positive alias contract.",
+      "evidence": [
+        {"path":"zig/pkg/antfly/src/api/sql_name_resolution_test.zig","test":"httpx SQL original PostgreSQL name resolution rejects aliases before data reads","gate":"sql-original-name-resolution-native-debug"},
+        {"path":"zig/pkg/antfly/src/api/sql_name_resolution_test.zig","test":"httpx SQL original PostgreSQL name resolution rejects aliases before data reads","gate":"sql-original-name-resolution-postgres"}
+      ]
     },
     {
       "id": "sql-1240",
@@ -12950,8 +12976,12 @@
     },
     {
       "id": "sql-1333",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "superseded",
+      "reason": "PostgreSQL resolves compound ORDER BY expressions against joined input columns, not SELECT output-alias variables. The unchanged self-join original fails with SQLSTATE 42703 for order_amount; the mounted endpoint matches before acquiring either input. Bare output labels remain supported by independent positive controls.",
+      "evidence": [
+        {"path":"zig/pkg/antfly/src/api/sql_name_resolution_test.zig","test":"httpx SQL original PostgreSQL name resolution rejects aliases before data reads","gate":"sql-original-name-resolution-native-debug"},
+        {"path":"zig/pkg/antfly/src/api/sql_name_resolution_test.zig","test":"httpx SQL original PostgreSQL name resolution rejects aliases before data reads","gate":"sql-original-name-resolution-postgres"}
+      ]
     },
     {
       "id": "sql-1334",
@@ -15175,8 +15205,12 @@
     },
     {
       "id": "sql-1582",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "superseded",
+      "reason": "Document tables obey the same PostgreSQL HAVING namespace as relational tables. On the explicit native document schema, the unchanged original fails with SQLSTATE 42703 for the SELECT alias row_count; the mounted endpoint matches before any data-source call. This replaces historical positive alias behavior and grants no broader document-aggregate activation credit.",
+      "evidence": [
+        {"path":"zig/pkg/antfly/src/api/sql_name_resolution_test.zig","test":"httpx SQL original PostgreSQL name resolution rejects aliases before data reads","gate":"sql-original-name-resolution-native-debug"},
+        {"path":"zig/pkg/antfly/src/api/sql_name_resolution_test.zig","test":"httpx SQL original PostgreSQL name resolution rejects aliases before data reads","gate":"sql-original-name-resolution-postgres"}
+      ]
     },
     {
       "id": "sql-1583",
