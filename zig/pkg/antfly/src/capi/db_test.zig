@@ -6070,6 +6070,174 @@ test "capi SQL runtime refresh fences serving inputs while reusing lease and sha
     }
 }
 
+test "capi native replacement wait observes its background owner without rebuilding" {
+    if (builtin.single_threaded or builtin.os.tag == .freestanding) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var directory = try TestDirectory.init("native-replacement-observer");
+    defer directory.cleanup();
+    const path = try tempTestAflitePath(a, directory.path(), "database");
+    defer a.free(path);
+    defer cleanupTestFile(path);
+    var options: capi.OpenOptions = .{};
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_open_options_init(&options));
+    options.storage_kind = capi.storage_kind_lite;
+    options.profile = capi.profile_native;
+    var handle: ?*anyopaque = null;
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_create_with_options(path, &options, &handle));
+    defer antfly_db_close(handle);
+    const owner = blk: {
+        const guard = public.enterHandle(handle, .exclusive).?;
+        defer guard.leave();
+        break :blk guard.connection.?.owner;
+    };
+    owner.stopping.store(true, .release);
+    owner.wake.set(shared.handleLockIo());
+    owner.worker.?.join();
+    // Simulate a paused native builder while preserving its ownership. Only
+    // explicit scheduler turns below may mutate its reservation.
+    defer owner.worker = null;
+    owner.stopping.store(false, .release);
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_add_index_json(handle, .fromSlice(
+        \\{"name":"old","type":"graph","edge_types":[{"name":"R","field":"links"}]}
+    )));
+    var inserted: capi.Buffer = .{};
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_batch_json(handle, .fromSlice(
+        \\{"inserts":{"source":{"links":["target"]}}}
+    ), &inserted));
+    freeRawBuffer(inserted.ptr, inserted.len);
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_run_until_idle(handle));
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_add_index_json(handle, .fromSlice(
+        \\{"name":"new","type":"graph","replaces":"old","edge_types":[{"name":"R","field":"links"}]}
+    )));
+    const Reservation = struct {
+        fn bytes(allocator: std.mem.Allocator, id: ?*anyopaque) ![]u8 {
+            const guard = public.enterHandle(id, .read).?;
+            defer guard.leave();
+            const jobs = try guard.handle.database().graphReplacementStatusAlloc(allocator);
+            defer jobs.deinit();
+            try std.testing.expectEqual(@as(usize, 1), jobs.value.len);
+            return std.json.Stringify.valueAlloc(allocator, jobs.value, .{});
+        }
+    };
+    const before = try Reservation.bytes(a, handle);
+    defer a.free(before);
+    try std.testing.expectEqual(capi.ErrorCode.busy, antfly_db_add_index_json(handle, .fromSlice(
+        \\{"name":"new","type":"graph","replaces":"old","wait":{"timeout_ms":1000},"edge_types":[{"name":"R","field":"links"}]}
+    )));
+    const after = try Reservation.bytes(a, handle);
+    defer a.free(after);
+    try std.testing.expectEqualStrings(before, after);
+    for (0..32) |_| if (!try owner.maintenanceTurnForTest()) break;
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_add_index_json(handle, .fromSlice(
+        \\{"name":"new","type":"graph","replaces":"old","wait":{"timeout_ms":0},"edge_types":[{"name":"R","field":"links"}]}
+    )));
+}
+
+test "capi native resolver maintenance retries transient inference and survives reopen" {
+    if (builtin.single_threaded or builtin.os.tag == .freestanding) return error.SkipZigTest;
+    const producer = @import("antfly_local_sources").storage_db_enrichment_asset_producer;
+    const Fixture = struct {
+        failures: usize = 0,
+        successful: usize = 0,
+        fn memory(_: *anyopaque, _: std.mem.Allocator, _: []const producer.Request) !@import("antfly_inference_work").InvocationMemoryPlan {
+            return .{ .attachment_transport = .data_uri, .fixed_bytes = 16 << 20, .allocator_limit_bytes = 16 << 20, .max_result_bytes_per_item = 1 << 20, .max_result_bytes = 1 << 20 };
+        }
+        fn produce(ptr: *anyopaque, a: std.mem.Allocator, _: producer.Request) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            // Admission pressure and an open provider circuit must preserve
+            // durable replay debt, not require another foreground write.
+            if (self.failures < 2) {
+                self.failures += 1;
+                return if (self.failures == 1) error.ResourceTemporarilyUnavailable else error.InferenceCircuitOpen;
+            }
+            self.successful += 1;
+            return a.dupe(u8, "{\"entities\":[{\"id\":\"a\",\"text\":\"Antfly\",\"label\":\"technology\"}],\"relations\":[]}");
+        }
+        fn produceBounded(ptr: *anyopaque, a: std.mem.Allocator, request: producer.Request, context: producer.InvocationContext) ![]u8 {
+            try context.check();
+            return produce(ptr, a, request);
+        }
+        fn notify(ptr: *anyopaque, root: *shared.Handle) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (!root.db_live) return;
+            const runtime = root.db.enrichment_runtime orelse return;
+            runtime.config.asset_producer = .{ .ptr = self, .vtable = &.{ .produce = produce, .produce_with_context = produceBounded, .foreground_bounded = true, .invocation_memory_for_requests = memory } };
+            runtime.config.inline_retry_max_attempts = 1;
+        }
+        fn pause(handle: ?*anyopaque) !std.meta.Child(@FieldType(shared.Handle, "maintenance_owner")) {
+            const owner = blk: {
+                const guard = public.enterHandle(handle, .exclusive).?;
+                defer guard.leave();
+                break :blk guard.connection.?.owner;
+            };
+            owner.stopping.store(true, .release);
+            owner.wake.set(shared.handleLockIo());
+            owner.worker.?.join();
+            owner.worker = null;
+            owner.stopping.store(false, .release);
+            return owner;
+        }
+    };
+    const a = std.testing.allocator;
+    var directory = try TestDirectory.init("native-resolver-retry");
+    defer directory.cleanup();
+    const path = try tempTestAflitePath(a, directory.path(), "database");
+    defer a.free(path);
+    defer cleanupTestFile(path);
+    var options: capi.OpenOptions = .{};
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_open_options_init(&options));
+    options.storage_kind = capi.storage_kind_lite;
+    options.profile = capi.profile_native;
+    options.flags |= capi.open_flag_generated_enrichment_replay;
+    var handle: ?*anyopaque = null;
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_create_with_options(path, &options, &handle));
+    defer if (handle != null) antfly_db_close(handle);
+    var owner = try Fixture.pause(handle);
+    var fixture: Fixture = .{};
+    owner.test_after_capture = .{ .ptr = &fixture, .notify = Fixture.notify };
+    try std.testing.expectEqual(capi.ErrorCode.ok, struct {
+        extern fn antfly_db_create_table_json(?*anyopaque, capi.Slice, capi.Slice) capi.ErrorCode;
+    }.antfly_db_create_table_json(handle, .fromSlice("concepts"), .fromSlice("{}")));
+    const config =
+        \\{"source":{"artifact":"extraction","path":"$.relations[*]","format":"extraction_relation","mention_edge_type":"about"},"artifact":{"name":"extraction","kind":"asset","source":{"type":"field","value":"text"},"content_type":"application/json","producer_json":{"type":"generator","config":{"provider":"mock"}}},"edge_types":[{"name":"about"}],"resolvers":[{"name":"concepts","table":"concepts","source_artifact":"extraction","resolution_artifact":"resolution","key_template":"concept/{{ uslug _entity.text }}"}]}
+    ;
+    const index = try std.json.Stringify.valueAlloc(a, .{ .name = "kg", .kind = "graph", .config_json = config }, .{});
+    defer a.free(index);
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_add_index_json(handle, .fromSlice(index)));
+    for (0..30) |i| {
+        {
+            const guard = public.enterHandle(handle, .exclusive).?;
+            defer guard.leave();
+            const key = try std.fmt.allocPrint(a, "d{d}", .{i});
+            defer a.free(key);
+            try guard.handle.db.batch(.{ .writes = &.{.{ .key = key, .value = "{\"text\":\"Antfly\"}" }}, .sync_level = .write });
+            owner.maintenance_pending = true;
+        }
+        _ = try owner.maintenanceTurnForTest();
+    }
+    try std.testing.expect(fixture.failures > 0);
+    antfly_db_close(handle);
+    handle = null;
+    // Reopen with unfinished work and no new mutation or foreground drain.
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_open_with_options(path, &options, &handle));
+    owner = try Fixture.pause(handle);
+    owner.test_after_capture = .{ .ptr = &fixture, .notify = Fixture.notify };
+    for (0..160) |_| {
+        if (!try owner.maintenanceTurnForTest()) break;
+        try shared.handleLockIo().sleep(.fromMilliseconds(25), .awake);
+    }
+    try std.testing.expectEqual(@as(usize, 2), fixture.failures);
+    try std.testing.expect(fixture.successful >= 30);
+    const guard = public.enterHandle(handle, .read).?;
+    defer guard.leave();
+    const stats = guard.handle.db.pendingWorkStats();
+    try std.testing.expect(stats.enrichment.applied_sequence >= stats.enrichment.target_sequence);
+    try std.testing.expect(!stats.resolution.catch_up_required);
+    if (stats.promotion.catch_up_required) std.debug.print("resolver reopen stats={f} publications={f}\n", .{ std.json.fmt(stats, .{}), std.json.fmt(owner.publication_stats, .{}) });
+    try std.testing.expect(!stats.promotion.catch_up_required);
+    try std.testing.expectEqual(@as(?[]const u8, null), owner.publication_stats.last_maintenance_error);
+}
+
 test "capi SQL idle native maintenance avoids runtime construction and resumes work" {
     if (builtin.single_threaded or builtin.os.tag == .freestanding) return error.SkipZigTest;
     const a = std.testing.allocator;

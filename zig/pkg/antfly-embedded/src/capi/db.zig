@@ -7555,13 +7555,20 @@ pub fn antfly_db_add_index_json(handle_ptr: ?*anyopaque, config_json: capi.Slice
     while (true) {
         if (builtin.is_test) if (test_index_before_wait_quantum) |hook|
             hook(handle_ptr) catch |err| return capi.mapError(err);
+        var background_owner = false;
         const pending = blk: {
             const guard = enterHandle(handle_ptr, .maintain) orelse return capi.mapError(error.InvalidArgument);
             defer guard.leave();
             if (guard.entry_error) |code| return capi.ensureError(code, @src().fn_name);
             const database = guard.handle.database();
+            const context = guard.handle.lite_connection_context orelse if (guard.handle.parent_handle) |parent| parent.lite_connection_context else null;
+            background_owner = if (context) |connection| connection.owner.worker != null else false;
             const now = monotonicNowNs();
-            const quantum_ms = @min(@as(u64, 100), (deadline -| now +| (std.time.ns_per_ms - 1)) / std.time.ns_per_ms);
+            // Native Lite already owns a detached builder. Foreground build
+            // quanta compete with its larger pages and repeatedly invalidate
+            // its captured inputs. Observe that owner's generation instead;
+            // manual/hosted and directory runtimes retain their inline driver.
+            const quantum_ms = if (background_owner) 0 else @min(@as(u64, 100), (deadline -| now +| (std.time.ns_per_ms - 1)) / std.time.ns_per_ms);
             database.waitGraphReplacement(name, generation, quantum_ms) catch |err| switch (err) {
                 error.Busy => break :blk true,
                 else => return capi.mapError(err),
@@ -7569,8 +7576,10 @@ pub fn antfly_db_add_index_json(handle_ptr: ?*anyopaque, config_json: capi.Slice
             break :blk false;
         };
         if (!pending) return .ok;
-        if (monotonicNowNs() >= deadline) return capi.mapError(error.Busy);
-        handleLockIo().sleep(.fromMilliseconds(1), .awake) catch |err| return capi.mapError(err);
+        const now = monotonicNowNs();
+        if (now >= deadline) return capi.mapError(error.Busy);
+        const delay_ns = @min(deadline - now, (if (background_owner) @as(u64, 25) else 1) * std.time.ns_per_ms);
+        handleLockIo().sleep(.fromNanoseconds(@intCast(delay_ns)), .awake) catch |err| return capi.mapError(err);
     }
 }
 
