@@ -572,7 +572,9 @@ const ParallelScan = struct {
             for (children) |child| child.close(child.ptr);
             return null;
         }
-        const workspace = workspace_budget / fanout;
+        // Caller execution spends the statement's own bounded workspace even
+        // when other statements hold every shared scheduler byte.
+        const workspace = @max(workspace_budget / fanout, @min(4 * 1024 * 1024, source.budget.limit -| source.budget.live));
         var moved: usize = 0;
         errdefer for (children[moved..]) |child| child.close(child.ptr);
         const self = try a.create(ParallelScan);
@@ -610,6 +612,7 @@ const ParallelScan = struct {
             lane.stream.context.arena = lane.stream.arena.allocator();
             // Scratch ownership is independent of the logical scan batch.
             // Only the ordered consumer charges page progress.
+            lane.stream.context.limits.retained_bytes = workspace;
             lane.stream.context.limits.scan_pages = std.math.maxInt(usize);
             lane.stream.context.limits.scan_rows = std.math.maxInt(usize);
             moved += 1;
@@ -688,7 +691,7 @@ const ParallelScan = struct {
                 lane.current = item[0];
                 lane.index = 0;
                 lane.consumed_scan = 0;
-                if (item[0].scan_rows == 0) try source.admitEmptyPage();
+                if (item[0].scan_rows == 0 and !item[0].exhausted) try source.admitEmptyPage();
             }
             const current = lane.current.?;
             var failure: ?anyerror = null;
@@ -1186,12 +1189,14 @@ pub const Stream = struct {
             const a = scratch.allocator();
             const capacity = self.scanCapacity();
             const credit = (self.context.limits.scan_pages -| self.empty_scan_pages) *| capacity -| self.visited;
-            const wanted: u32 = @intCast(@min(@min(capacity, @min(credit, self.context.limits.scan_rows -| self.visited)), @min(self.remaining, max_rows - pending.len()) +| self.skip));
-            if (wanted == 0) return error.SqlProgramLimitExceeded;
+            // An exact row/page limit still permits a terminal EOF probe.
+            // A returned row or a nonterminal empty page is charged below and
+            // fails the exhausted quota before becoming visible.
+            const wanted: u32 = @intCast(@max(1, @min(@min(capacity, @min(credit, self.context.limits.scan_rows -| self.visited)), @min(self.remaining, max_rows - pending.len()) +| self.skip)));
             const cursor = self.cursor.?;
             const page = try cursor.next_columns.?(cursor.ptr, a, wanted);
             if (page.selection.len > wanted) return error.InvalidSqlBackendResponse;
-            if (page.selection.len == 0) try self.admitEmptyPage() else try self.admitRows(page.selection.len);
+            if (page.selection.len != 0) try self.admitRows(page.selection.len) else if (page.after != null) try self.admitEmptyPage();
             const before = pending.len();
             const bytes = self.appendColumnPage(pending, a, page) catch |err| switch (err) {
                 error.SqlDivisionByZero, error.SqlNumericOutOfRange, error.SqlTypeMismatch, error.SqlProgramLimitExceeded, error.InvalidSqlDateTime, error.SqlCardinalityViolation => if (pending.len() == before) try self.appendScalarColumnPage(pending, a, page) else return err,
@@ -1729,6 +1734,62 @@ const NativeColumns = struct {
     }
 };
 
+test "SQL terminal EOF preserves exact native scan quotas and bounds empty loops" {
+    const Delayed = struct {
+        endless: bool = false,
+        fixture: Fixture,
+        fn open(raw: *anyopaque, a: std.mem.Allocator, table: catalog.Table, request: catalog.Scan) !?catalog.Cursor {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            _ = try NativeColumns.open(&self.fixture, a, table, request);
+            return .{ .ptr = raw, .next = rows, .next_columns = columns, .close = close };
+        }
+        fn rows(_: *anyopaque, _: std.mem.Allocator, _: u32) !catalog.Page {
+            unreachable;
+        }
+        fn close(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            Fixture.close(&self.fixture);
+        }
+        fn columns(raw: *anyopaque, a: std.mem.Allocator, limit: u32) !catalog.ColumnPage {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            var page = try NativeColumns.nextColumns(&self.fixture, a, limit);
+            if (self.endless or page.selection.len != 0) page.after = "more";
+            return page;
+        }
+    };
+    const a = std.testing.allocator;
+    for ([_]usize{ 4, 5, 0 }) |count| {
+        var fixture: Delayed = .{ .endless = count == 0, .fixture = .{ .count = count } };
+        var backend = Fixture.backend(undefined);
+        var vtable = backend.vtable.*;
+        vtable.open_scan = Delayed.open;
+        vtable.checkpoint = struct {
+            fn check(_: *anyopaque) !void {}
+        }.check;
+        backend.ptr = &fixture;
+        backend.vtable = &vtable;
+        var compiled = try compiler.compile(a, "SELECT n FROM docs", .{});
+        defer compiled.deinit();
+        const stream = (try Stream.open(a, backend, &compiled, &.{}, .{ .scan_rows = 4, .scan_pages = 1, .execution_batch_rows = 4 })).?;
+        defer stream.close();
+        var seen: usize = 0;
+        var failed = false;
+        while (true) {
+            var page = stream.next(137) catch |err| {
+                try std.testing.expectEqual(error.SqlProgramLimitExceeded, err);
+                failed = true;
+                break;
+            };
+            defer page.deinit();
+            seen += page.output.rows.len;
+            if (page.exhausted) break;
+        }
+        try std.testing.expectEqual(count != 4, failed);
+        try std.testing.expectEqual(@as(usize, if (count == 0) 0 else 4), seen);
+        if (count == 0) try std.testing.expectEqual(@as(usize, 2), fixture.fixture.calls);
+    }
+}
+
 test "SQL native array projections retain bounds and NULL cells across leased and public pages" {
     const Faults = struct {
         fn run(a: std.mem.Allocator) !void {
@@ -1879,17 +1940,30 @@ test "external lake rolling ordered delivery preserves batches errors and satura
             const self: *@This() = @ptrCast(@alignCast(raw));
             if (self.batch == 2) return null;
             const cursors = try a.alloc(catalog.Cursor, 2);
-            for (self.children[self.batch * 2 ..][0..2], cursors) |*child, *cursor| cursor.* = (try NativeColumns.open(child, a, undefined, .{ .fields = &.{}, .limit = 4096 })).?;
+            for (self.children[self.batch * 2 ..][0..2], cursors) |*child, *cursor| {
+                cursor.* = (try NativeColumns.open(child, a, undefined, .{ .fields = &.{}, .limit = 4096 })).?;
+                cursor.next_columns = delayedEof;
+            }
             self.batch += 1;
             return cursors;
+        }
+        fn delayedEof(raw: *anyopaque, a: std.mem.Allocator, limit: u32) !catalog.ColumnPage {
+            var page = try NativeColumns.nextColumns(raw, a, limit);
+            if (page.selection.len != 0) page.after = "more";
+            return page;
         }
     };
     const a = std.testing.allocator;
     for ([_]bool{ false, true }) |saturated| for ([_]bool{ false, true }) |fail_later| {
         const scheduling = @import("parallel_scheduler.zig").global();
         const saved = scheduling.max_workers;
-        if (saturated) scheduling.max_workers = 0;
+        const saved_bytes = scheduling.max_bytes;
+        if (saturated) {
+            scheduling.max_workers = 0;
+            scheduling.max_bytes = 0;
+        }
         defer scheduling.max_workers = saved;
+        defer scheduling.max_bytes = saved_bytes;
         var fixture: Rolling = .{};
         var backend = Fixture.backend(undefined);
         var vtable = backend.vtable.*;
@@ -1902,7 +1976,7 @@ test "external lake rolling ordered delivery preserves batches errors and satura
         backend.execution_io = std.testing.io;
         var compiled = try compiler.compile(a, if (fail_later) "SELECT 1 / (15000 - n) FROM docs" else "SELECT n + 1 FROM docs", .{});
         defer compiled.deinit();
-        const stream = (try Stream.open(a, backend, &compiled, &.{}, .{})).?;
+        const stream = (try Stream.open(a, backend, &compiled, &.{}, .{ .scan_pages = 5 })).?;
         defer stream.close();
         var seen: usize = 0;
         var failed = false;

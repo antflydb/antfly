@@ -1313,3 +1313,28 @@ restarts and checks filtered/grouped aggregates; cold Iceberg coverage now also
 includes ten independently written files. Compiler error metadata, lint,
 whitespace, source licenses and the Apache boundary passed. These timings are
 functional qualification rather than archive latency benchmarks.
+
+
+### Rolling scan work and ordered maintenance
+
+Publication scans retain bounded file windows and share individual row-group
+claims. Sealed dynamic filters travel with every fixed or rolling worker; their
+physical min/max bounds only prune, while exact membership remains authoritative
+and includes fields hidden from the result projection. Idle consumers park on
+an I/O condition and continue observing request cancellation and deadlines.
+
+One optional independently owned cursor warms parsed Parquet footers for the
+next window under shared I/O admission and a 16 MiB private workspace. Required
+navigation advances only on demand. Warming cannot surface a later file's
+metadata error before an earlier delivered prefix, and statement close joins
+all warming before releasing navigation/source authority. Denied admission
+uses the ordinary required read path. Ordered batches use statement-backed
+caller workspace when concurrent scheduling is saturated; their batch sizing
+follows that workspace. Terminal worker EOF does not consume SQL scan quota.
+
+Ordered index updates keep dictionary ancestry and data-run ancestry separate,
+and carry explicit retirement slots as well as the streaming merge's keep mask.
+The initial checkpoint handles the snapshot delta; subsequent file checkpoints
+authenticate and edit only that file's dictionary/retirement paths. This preserves
+stable slot histories and old-reader roots without repeated archive-sized mask
+walks during sparse incremental publication.

@@ -5606,6 +5606,16 @@ def test_published_parquet_skewed_files_share_row_groups_and_stream_in_order(tmp
                 ]
                 for bucket in range(5)
             ]
+            # The sealed join filter must reach the probe scan even though
+            # only aggregate output is projected; duplicates retain join weight.
+            assert call(
+                "POST",
+                "/sql",
+                {
+                    "statement": "SELECT SUM(p.amount), COUNT(*) FROM skew_scan p "
+                    "JOIN (VALUES (0),(1),(1),(2),(NULL)) b(k) ON p.amount=b.k"
+                },
+            )["rows"] == [["4", "4"]]
         failed = False
     finally:
         server.stop()

@@ -135,10 +135,34 @@ pub const Delta = struct {
     dictionary_slots: ?[]const u32 = null,
     previous: ?Root = null,
     keep: []const bool = &.{},
+    /// Explicit retirements avoid walking the complete slot mask per checkpoint.
+    retired_slots: ?[]const u32 = null,
     files: []const []const u8 = &.{},
     fingerprints: []const [32]u8 = &.{},
     reverse_built: bool = false,
     built_reverse: ?tree.Ref = null,
+};
+const Retirements = struct {
+    keep: []const bool,
+    slots: ?[]const u32,
+    position: usize = 0,
+    previous: ?u32 = null,
+    fn next(self: *@This()) !?u32 {
+        if (self.slots) |slots| {
+            if (self.position == slots.len) return null;
+            const slot = slots[self.position];
+            if (slot >= self.keep.len or self.keep[slot] or (self.previous != null and slot <= self.previous.?)) return error.InvalidNativeLakeRowIndex;
+            self.position += 1;
+            self.previous = slot;
+            return slot;
+        }
+        while (self.position < self.keep.len) {
+            const slot = self.position;
+            self.position += 1;
+            if (!self.keep[slot]) return @intCast(slot);
+        }
+        return null;
+    }
 };
 /// Initial scans arrive in file-slot/row coordinates. Build the reverse tree
 /// directly in that order instead of sorting the tuple stream a second time.
@@ -301,8 +325,8 @@ pub fn publishIncremental(a: A, result_alloc: A, store: *stores.ArtifactStore, s
     const has_delta = if (delta.previous) |previous| blk: {
         if (previous.building or delta.run_only or previous.tie_version != 1 or previous.reverse == null or (previous.page != null and previous.predicates == null)) break :blk false;
         var removed: u64 = 0;
-        for (delta.keep, 0..) |keep_file, slot| {
-            if (keep_file) continue;
+        var retirements: Retirements = .{ .keep = delta.keep, .slots = delta.retired_slots };
+        while (try retirements.next()) |slot| {
             var lower: [4]u8 = undefined;
             var upper: [4]u8 = undefined;
             std.mem.writeInt(u32, &lower, @intCast(slot), .big);
@@ -319,8 +343,8 @@ pub fn publishIncremental(a: A, result_alloc: A, store: *stores.ArtifactStore, s
         // Walk only the reverse ranges belonging to replaced/removed files.
         // Every cursor stays on the retained prior root while copy-on-write
         // mutations publish a new candidate, never a partially visible index.
-        for (delta.keep, 0..) |keep_file, slot| {
-            if (keep_file) continue;
+        var retirements: Retirements = .{ .keep = delta.keep, .slots = delta.retired_slots };
+        while (try retirements.next()) |slot| {
             var prefix: [4]u8 = undefined;
             std.mem.writeInt(u32, &prefix, @intCast(slot), .big);
             var upper: [4]u8 = undefined;
@@ -2012,4 +2036,24 @@ test "external lake sparse wide public ties spill participants without archive p
             try std.testing.expect(resumed.public_probes > 0 and resumed.public_probes < 512);
         }
     }
+}
+
+test "external lake ordered retirement planning visits explicit changed slots only" {
+    const a = std.testing.allocator;
+    const keep = try a.alloc(bool, 1_000_000);
+    defer a.free(keep);
+    @memset(keep, true);
+    keep[999_999] = false;
+    var changed: Retirements = .{ .keep = keep, .slots = &.{999_999} };
+    try std.testing.expectEqual(@as(?u32, 999_999), try changed.next());
+    try std.testing.expectEqual(@as(?u32, null), try changed.next());
+    try std.testing.expectEqual(@as(usize, 1), changed.position);
+    var unchanged: Retirements = .{ .keep = keep, .slots = &.{} };
+    try std.testing.expectEqual(@as(?u32, null), try unchanged.next());
+    try std.testing.expectEqual(@as(usize, 0), unchanged.position);
+    var legacy: Retirements = .{ .keep = keep, .slots = null };
+    try std.testing.expectEqual(@as(?u32, 999_999), try legacy.next());
+    try std.testing.expectEqual(@as(?u32, null), try legacy.next());
+    var invalid: Retirements = .{ .keep = keep, .slots = &.{0} };
+    try std.testing.expectError(error.InvalidNativeLakeRowIndex, invalid.next());
 }

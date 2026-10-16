@@ -4881,3 +4881,59 @@ restarts and checks filtered/grouped aggregates; cold Iceberg coverage now also
 includes ten independently written files. Compiler error metadata, lint,
 whitespace, source licenses and the Apache boundary passed. These timings are
 functional qualification rather than archive latency benchmarks.
+
+
+## Ordered quota boundaries and pipelined footer navigation
+
+Ordered delivery reserves useful caller workspace independently of shared
+scheduler availability. Worker execution batches use that lane's memory limit,
+so saturation cannot assign zero workspace or run a statement-sized expression
+batch inside a small lane. Terminal worker EOF is administrative completion and
+does not consume a logical scan page. Exact row/page limits permit a one-row EOF
+probe; any actual row or nonterminal empty response still passes ordinary quota
+admission before it becomes visible.
+
+A statement may retain one independent enumeration lookahead cursor and at most
+one admitted I/O task. It advances monotonically and warms parsed, version-bound
+Parquet footers for the next one-file ordered batch or four-file unordered
+window while current row groups execute. Its private metadata workspace is
+bounded at 16 MiB, alongside the existing bounded decoded cache. Scheduler denial
+keeps required reads synchronous; speculative metadata failures disable warming
+and remain deferred until required enumeration reaches the affected file.
+Required progress never waits for unrelated speculative footers: caught-up
+readers coalesce through the shared cache. Closing the statement cancels and
+joins warming before releasing source leases.
+
+Unordered rolling workers borrow the sealed dynamic filter and retain exact
+residual membership evaluation, including projection-hidden join fields. Small
+fixed work plans use the same propagation. Idle lanes wait on a native I/O
+condition with deadline checks rather than polling between windows.
+
+Ordered maintenance carries explicit sorted retirement slots. The first
+checkpoint retires the planned changed/removed slots once; later checkpoints
+visit only their own file slot. The full keep mask still governs streaming
+merges, and legacy/direct callers can retain mask-based discovery. Dictionary
+fingerprint updates and retirement planning now both avoid a full slot census
+per source-file checkpoint.
+
+Regressions cover exhausted scheduler bytes, exact EOF quotas and nonterminal
+empty loops, footer lookahead admission/denial, deferred descriptor errors,
+filtered small/rolling workers, concurrent claim release, and bounded retirement
+iteration over a million-slot fixture. The real skewed-file Parquet flow also
+checks an aggregate join with duplicate and NULL build keys after cold restarts.
+Archive-scale speedup factors remain unmeasured.
+
+
+Qualification with origin/main `f9f1582346`: the Debug CLI built and a full
+498-test lake integration run passed (185 shared-engine + 313 server), without
+failures or leaks. Six focused SQL contracts passed. After the final nonblocking
+footer refinement, the native rolling-scan regression passed again, including
+a fully delivered first batch followed by demand progress while speculative
+navigation remained paused, cancellation/ownership checks and empty-filter
+fast paths. All 50 distinct real Parquet/Iceberg E2Es qualified against the final
+production implementation. E2E execution resumed after storage-headroom guards
+stopped fixture startup; the successful runs covered 39, four and seven cases.
+The production disk guard remained enabled. Compiler-derived error metadata,
+Zig/Python formatting and lint, whitespace, source licenses and the Apache
+boundary (2,065 source files) passed. Archive-scale latency/RSS and live-provider
+retention qualification remain deferred.

@@ -92,6 +92,10 @@ pub const Stream = struct {
     iterator: ?serving.ServingSource.FileIterator = null,
     iterator_parent: ?*serving.ServingSource = null,
     iterator_started: bool = false,
+    enumerated_files: usize = 0,
+    enumeration_lookahead: ?*EnumerationLookahead = null,
+    enumeration_prefetch_tasks: usize = 0,
+    enumeration_prefetch_files: usize = 0,
     selection: ?@import("lake_row_selection.zig").Selection = null,
     resume_at: ?struct { group: u32, row: u64 } = null,
     active_file: usize = 0,
@@ -128,6 +132,89 @@ pub const Stream = struct {
     lookahead_names: []const []const u8 = &.{},
     lookahead_required: []const bool = &.{},
 
+    /// One independently owned navigation cursor warms the next bounded file
+    /// window while current row groups execute. Required enumeration remains
+    /// untouched: speculative metadata errors are observed only on demand.
+    const EnumerationLookahead = struct {
+        backing: Allocator,
+        budget: @import("../../sql/memory_budget.zig"),
+        stream: Stream = undefined,
+        io: std.Io,
+        task: ?@import("../../sql/parallel_scheduler.zig").Task(anyerror!void) = null,
+        target: usize = 0,
+        width: usize = 1,
+        warmed: usize = 0,
+        ended: bool = false,
+        disabled: bool = false,
+        fn run(self: *@This()) anyerror!void {
+            // Catch up only descriptors when earlier speculative admission was
+            // denied. A cursor advances monotonically, never rescans a prefix.
+            const iterator = self.stream.iterator.?;
+            while (self.stream.enumerated_files < self.target) {
+                try self.stream.context.ensureActive();
+                var file = (try iterator.next(iterator.ptr, self.stream.alloc, self.stream.context)) orelse {
+                    self.ended = true;
+                    return;
+                };
+                file.deinit(self.stream.alloc);
+                self.stream.enumerated_files += 1;
+            }
+            if (!try self.stream.nextEnumerationWindow(self.width)) {
+                self.ended = true;
+                return;
+            }
+            for (self.stream.files) |index| {
+                try self.stream.context.ensureActive();
+                if (!self.stream.fileMatches(self.stream.source.inventory.files[index])) continue;
+                try self.stream.pinFileVersion(index);
+                const reader = self.stream.source.scanner.shared_reader.?;
+                const footer = try reader.footer(self.stream.source.fileAt(index));
+                footer.release();
+                self.warmed += 1;
+            }
+        }
+        fn deinit(self: *@This()) void {
+            if (self.task) |*task| task.cancel(self.io) catch {};
+            self.stream.deinit();
+            std.debug.assert(self.budget.live == 0);
+            self.backing.destroy(self);
+        }
+    };
+    fn joinEnumerationLookahead(self: *Stream) void {
+        const warm = self.enumeration_lookahead orelse return;
+        if (warm.task) |*task| {
+            // Speculation never gates required progress. Required readers
+            // coalesce through the shared footer cache when they catch up.
+            if (!task.isComplete()) return;
+            task.await(warm.io) catch {
+                warm.disabled = true;
+            };
+            warm.task = null;
+            self.enumeration_prefetch_files = warm.warmed;
+        }
+    }
+    pub fn prefetchEnumeration(self: *Stream, width: usize) void {
+        if (self.iterator == null or self.iterator_parent == null) return;
+        const reader = self.source.scanner.shared_reader orelse return;
+        const io = reader.context.io orelse return;
+        if (self.enumeration_lookahead == null) {
+            const backing = @import("antfly_platform").allocator.processAllocator(std.heap.page_allocator);
+            const warm = backing.create(EnumerationLookahead) catch return;
+            warm.* = .{ .backing = backing, .budget = .{ .backing = backing, .limit = 16 * 1024 * 1024 }, .io = io };
+            warm.stream = initEnumerated(warm.budget.allocator(), self.iterator_parent.?, self.columns, self.predicates, self.context, self.limits) catch {
+                backing.destroy(warm);
+                return;
+            };
+            warm.stream.schema_contract = self.schema_contract;
+            self.enumeration_lookahead = warm;
+        }
+        const warm = self.enumeration_lookahead.?;
+        if (warm.disabled or warm.ended or warm.task != null) return;
+        warm.target = self.enumerated_files;
+        warm.width = @max(1, @min(4, width));
+        warm.task = @import("../../sql/parallel_scheduler.zig").global().submitIoTransient(io, 16 * 1024 * 1024, EnumerationLookahead.run, .{warm});
+        if (warm.task != null) self.enumeration_prefetch_tasks += 1;
+    }
     fn lookaheadCanceled(raw: *const anyopaque) bool {
         const self: *const Stream = @ptrCast(@alignCast(raw));
         if (self.lookahead_cancelled.load(.acquire)) return true;
@@ -445,6 +532,7 @@ pub const Stream = struct {
         const iterator = self.iterator.?;
         self.iterator_started = true;
         var file = (try iterator.next(iterator.ptr, self.alloc, self.context)) orelse return false;
+        self.enumerated_files += 1;
         errdefer file.deinit(self.alloc);
         const files = try self.alloc.alloc(external.FileEntry, 1);
         errdefer self.alloc.free(files);
@@ -662,6 +750,7 @@ pub const Stream = struct {
     /// All children of the previous file must be closed before advancing.
     /// Only one footer's work census is retained by the rolling scheduler.
     pub fn nextEnumerationWork(self: *Stream) !bool {
+        self.joinEnumerationLookahead();
         self.clearFile();
         self.releaseWork();
         if (self.iterator == null) return false;
@@ -670,6 +759,7 @@ pub const Stream = struct {
     /// Unordered work keeps a small rolling window so tiny files can overlap
     /// while a large file still shares all its row groups among workers.
     pub fn nextEnumerationWindow(self: *Stream, maximum: usize) !bool {
+        self.joinEnumerationLookahead();
         self.clearFile();
         self.releaseWork();
         const iterator = self.iterator orelse return false;
@@ -685,6 +775,7 @@ pub const Stream = struct {
             var file = (try iterator.next(iterator.ptr, self.alloc, self.context)) orelse break;
             errdefer file.deinit(self.alloc);
             try entries.append(self.alloc, file);
+            self.enumerated_files += 1;
         }
         if (entries.items.len == 0) return false;
         const pinned = try self.alloc.alloc(bool, entries.items.len);
@@ -730,6 +821,8 @@ pub const Stream = struct {
         self.owns_work = false;
     }
     pub fn deinit(self: *Stream) void {
+        if (self.enumeration_lookahead) |warm| warm.deinit();
+        self.enumeration_lookahead = null;
         self.clearFile();
         if (self.source.scanner.shared_reader) |reader| reader.drain(true);
         self.releaseWork();
@@ -973,7 +1066,7 @@ pub const Stream = struct {
             return;
         }
     }
-    fn loadFile(self: *Stream, index: usize) !void {
+    fn pinFileVersion(self: *Stream, index: usize) !void {
         // Metadata and partition pruning happen before statting data objects.
         // Pin each surviving file once, before any footer or payload read.
         if (self.source.lazy_versions and !self.source.isFilePinned(index)) {
@@ -1019,6 +1112,9 @@ pub const Stream = struct {
                 self.source.pinned_files[index] = true;
             }
         }
+    }
+    fn loadFile(self: *Stream, index: usize) !void {
+        try self.pinFileVersion(index);
         // Candidate hydration windows share immutable projected file readers.
         // Fresh version pinning above and delete preparation below remain
         // request-owned; cached plans contain only fully owned metadata.

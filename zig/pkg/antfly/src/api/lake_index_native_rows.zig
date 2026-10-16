@@ -244,6 +244,8 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
             for (slot_names.items, slot_hashes.items) |file, *digest| if (!files.contains(file)) {
                 digest.* = @splat(0);
             };
+            var retired: std.ArrayList(u32) = .empty;
+            for (keep, 0..) |retained_slot, slot| if (!retained_slot) try retired.append(ca, @intCast(slot));
             const built_hashes = try ca.alloc([32]u8, slot_names.items.len);
             @memset(built_hashes, @splat(0));
             if (prior) |root| for (root.file_fingerprints, 0..) |digest, slot| {
@@ -251,7 +253,7 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
             };
             const retained = try a.alloc(bool, slot_names.items.len);
             errdefer a.free(retained);
-            try entries.append(a, .{ .tuple = tuple, .predicate = predicate, .binding = binding, .name = name, .cover = cover, .sort = spill.Sort.init(a, &manager, &orders, sort_workspace_bytes / (end - first)), .changed = changed, .slots = slots, .built_hashes = built_hashes, .retained = retained, .root_arena = .init(a), .initial_build = prior == null or prior.?.building, .delta = .{ .previous = prior, .keep = keep, .files = slot_names.items, .fingerprints = slot_hashes.items, .public_navigation = if (input.native_delta) |delta| delta.public_navigation else null } });
+            try entries.append(a, .{ .tuple = tuple, .predicate = predicate, .binding = binding, .name = name, .cover = cover, .sort = spill.Sort.init(a, &manager, &orders, sort_workspace_bytes / (end - first)), .changed = changed, .slots = slots, .built_hashes = built_hashes, .retained = retained, .root_arena = .init(a), .initial_build = prior == null or prior.?.building, .delta = .{ .previous = prior, .keep = keep, .retired_slots = retired.items, .files = slot_names.items, .fingerprints = slot_hashes.items, .public_navigation = if (input.native_delta) |delta| delta.public_navigation else null } });
             entries.items[entries.items.len - 1].sort.shared_runs = true;
             entries.items[entries.items.len - 1].sort.encoded_bytes = true;
         }
@@ -281,7 +283,7 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
             defer base_sort.deinit();
             base_sort.encoded_bytes = true;
             base_sort.shared_runs = true;
-            const ref = try ordered.publishIncremental(a, ca, store, &base_sort, entry.name, fingerprint(entry.tuple, entry.predicate, entry.cover), source.inventory, entry.cover, cancellation, .{ .public_navigation = entry.delta.public_navigation, .run_only = true, .previous = prior, .keep = entry.delta.keep, .files = entry.delta.files, .fingerprints = entry.built_hashes });
+            const ref = try ordered.publishIncremental(a, ca, store, &base_sort, entry.name, fingerprint(entry.tuple, entry.predicate, entry.cover), source.inventory, entry.cover, cancellation, .{ .public_navigation = entry.delta.public_navigation, .run_only = true, .previous = prior, .keep = entry.delta.keep, .retired_slots = entry.delta.retired_slots, .files = entry.delta.files, .fingerprints = entry.built_hashes });
             entry.published = ref;
             try input.checkpoint(.{ .name = entry.name, .binding = entry.binding, .artifact = ref });
             entry.delta.previous = try ordered.loadRootLazy(entry.root_arena.allocator(), store.*, ref, cancellation, null);
@@ -378,7 +380,7 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
                 const keep = if (first_checkpoint) try a.dupe(bool, entry.delta.keep) else entry.retained;
                 defer if (first_checkpoint) a.free(keep);
                 if (slot < keep.len) keep[slot] = false;
-                var delta: ordered.Delta = .{ .previous = entry.delta.previous, .keep = keep, .files = entry.delta.files, .fingerprints = entry.built_hashes, .public_navigation = entry.delta.public_navigation, .dictionary_slots = if (entry.published != null) &.{slot} else null };
+                var delta: ordered.Delta = .{ .previous = entry.delta.previous, .keep = keep, .retired_slots = if (first_checkpoint) entry.delta.retired_slots else &.{slot}, .files = entry.delta.files, .fingerprints = entry.built_hashes, .public_navigation = entry.delta.public_navigation, .dictionary_slots = if (entry.published != null) &.{slot} else null };
                 if (entry.reverse) |reverse| {
                     delta.built_reverse = try reverse.finish();
                     delta.reverse_built = true;
@@ -404,6 +406,7 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
                 if (first_checkpoint) @memset(entry.retained, true) else entry.retained[slot] = true;
                 entry.delta.keep = entry.retained;
                 entry.delta.dictionary_slots = &.{};
+                entry.delta.retired_slots = &.{};
                 entry.sort.deinit();
                 entry.sort = spill.Sort.init(a, &manager, &orders, sort_workspace_bytes / entries.items.len);
                 entry.sort.shared_runs = true;
