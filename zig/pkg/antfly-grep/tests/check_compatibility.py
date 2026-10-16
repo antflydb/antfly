@@ -30,14 +30,18 @@ for area in manifest["areas"]:
             raise ValueError(f"missing compatibility evidence: {path}")
 counts = {
     name: len(json.loads((root / "tests" / name).read_text())["cases"])
-    for name in ("local_fixtures.json", "pcre2_dialect_fixtures.json")
+    for name in (
+        "local_fixtures.json",
+        "pcre2_dialect_fixtures.json",
+        "generated_fixtures.json",
+    )
 }
 lines = [
     "# Compatibility",
     "",
     "Target: ripgrep 15.2.0 / PCRE2 10.45. Implementation: native Zig.",
     "",
-    f"Checked-in differential contracts: {counts['local_fixtures.json']} local-search cases and {counts['pcre2_dialect_fixtures.json']} PCRE2 dialect cases. Normal tests require no oracle executable.",
+    f"Checked-in differential contracts: {counts['local_fixtures.json']} local-search cases and {counts['pcre2_dialect_fixtures.json']} PCRE2 dialect cases, plus {counts['generated_fixtures.json']} generated cases. Normal tests require no oracle executable.",
     "",
     "| Area | Status | Evidence and limits |",
     "|---|---|---|",

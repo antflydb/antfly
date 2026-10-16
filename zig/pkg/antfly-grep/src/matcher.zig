@@ -18,7 +18,7 @@ const regex = @import("antfly_regex").search;
 const Options = @import("options.zig").Options;
 const Allocator = std.mem.Allocator;
 pub const Span = regex.Span;
-pub const Match = struct { span: Span, captures: []const ?Span, names: []const regex.CaptureName };
+pub const Match = struct { span: Span, captures: []const ?Span, names: []const regex.CaptureName, capture_text: ?[]const u8 = null };
 const Literal = struct { bytes: []const u8, insensitive: bool, order: usize };
 const Regular = struct { pattern: regex.Pattern, order: usize };
 const Advanced = struct { pattern: @import("pcre2.zig").Pattern, order: usize };
@@ -256,7 +256,33 @@ pub const Matcher = struct {
         for (self.runners.items) |*runner| runner.vm.absolute_start_allowed = allowed;
         for (self.advanced.items) |*runner| runner.runner.absolute_start_allowed = allowed;
     }
+    /// Conservative sum covers nested assertions and subprograms. Admission is
+    /// explicit; an accepted pattern never silently loses rendering context.
+    pub fn renderContextBytes(self: *const Matcher) !usize {
+        var bytes: usize = 0;
+        for (self.program.advanced.items) |item| if (regex.hasLineAnchors(item.pattern.pattern.states)) {
+            bytes = 1;
+            break;
+        };
+        for (self.program.advanced.items) |item| for (item.pattern.pattern.states) |state| {
+            if (state.tag == .look_shift) {
+                bytes += @as(usize, state.second) * 4;
+                if (bytes > 1024 * 1024) return error.RegexContextTooLarge;
+            }
+        };
+        return bytes;
+    }
+    pub fn multilineUsesMatches(self: *const Matcher) bool {
+        if (self.program.advanced.items.len > 0) return true;
+        const terminator: u6 = if (self.options.null_data) 0 else 10;
+        for (self.program.direct.items) |item| if (std.mem.indexOfScalar(u8, item.bytes, terminator) != null) return true;
+        for (self.program.regular.items) |item| for (item.pattern.states) |state| {
+            if ((state.tag == .consume or state.tag == .repeat_consume) and state.ascii_mask[0] & (@as(u64, 1) << terminator) != 0) return true;
+        };
+        return false;
+    }
     pub fn joinsMultilineJson(self: *const Matcher) bool {
+        if (self.multilineUsesMatches()) return true;
         for (self.program.regular.items) |item| if (regex.hasLineAnchors(item.pattern.states)) return true;
         for (self.program.advanced.items) |item| if (regex.hasLineAnchors(item.pattern.pattern.states)) return true;
         return false;
@@ -358,11 +384,11 @@ pub const Matcher = struct {
             if (braced) i += 1;
             var group: ?usize = std.fmt.parseInt(usize, key, 10) catch null;
             if (group == null) for (m.names) |name| if (std.mem.eql(u8, key, name.name)) {
+                // PCRE2 capture-name lookup exposes the final duplicate slot.
                 group = name.index;
-                break;
             };
             if (group) |g| if (g < m.captures.len) {
-                if (m.captures[g]) |span| try out.appendSlice(a, text[span.start..span.end]);
+                if (m.captures[g]) |span| try out.appendSlice(a, (m.capture_text orelse text)[span.start..span.end]);
             };
         }
         return out.toOwnedSlice(a);

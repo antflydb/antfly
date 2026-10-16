@@ -25,6 +25,7 @@ pub const Context = extern struct {
     pc: u32,
     slow: *const fn (*Context, u32) callconv(.c) u32,
     user: *const anyopaque,
+    captures: [*]usize,
 };
 pub const Result = enum(u32) { fallback, fail, limit };
 const stride = if (builtin.cpu.arch == .aarch64) 192 else 256;
@@ -37,6 +38,11 @@ pub const Program = struct {
     }
     pub fn compile(states: anytype) ?Program {
         if (comptime !supported()) return null;
+        comptime {
+            std.debug.assert(@offsetOf(Context, "pc") == 32);
+            std.debug.assert(@offsetOf(Context, "slow") == 40);
+            std.debug.assert(@offsetOf(Context, "captures") == 56);
+        }
         if (states.len == 0 or states.len * stride > 1024 * 1024) return null;
         var consumes: usize = 0;
         for (states) |state| if (state.tag == .consume) {
@@ -110,6 +116,20 @@ fn relative(from: usize, to: usize, bits: comptime_int) u32 {
     return @as(@Int(.unsigned, bits), @bitCast(signed));
 }
 fn arm64(block: []u8, pc: usize, state: anytype) void {
+    if (state.tag == .reset or (state.tag == .save and state.slot < 4096)) {
+        const slot: u32 = if (state.tag == .reset) 0 else @intCast(state.slot);
+        word(block, 0, 0xf9400c01); // ldr x1,[x0,#24] steps
+        word(block, 1, 0xb4000001 | (relative(4, 36, 19) << 5)); // cbz limit
+        word(block, 2, 0xd1000421); // sub x1,#1
+        word(block, 3, 0xf9000c01); // str steps
+        word(block, 4, 0xf9400802); // ldr x2,[x0,#16] position
+        word(block, 5, 0xf9401c05); // ldr x5,[x0,#56] captures
+        word(block, 6, 0xf90000a2 | (slot << 10)); // str x2,[x5,#slot*8]
+        word(block, 7, 0x14000000 | relative(pc * stride + 28, state.first * stride, 26));
+        word(block, 9, 0x52800040); // limit
+        word(block, 10, 0xd65f03c0);
+        return;
+    }
     if (state.tag != .consume) {
         word(block, 0, 0x52800004 | (@as(u32, @intCast(pc)) << 5)); // mov w4, pc
         word(block, 1, 0xb9002004); // str w4, [x0,#32]
@@ -182,6 +202,21 @@ const X86 = struct {
 fn x86(block: []u8, pc: usize, state: anytype) void {
     var out = X86{ .block = block };
     out.emit(&.{ 0x49, 0x89, if (builtin.os.tag == .windows) 0xca else 0xfa }); // r10 = context
+    if (state.tag == .reset or (state.tag == .save and state.slot < 4096)) {
+        out.emit(&.{ 0x49, 0x8b, 0x42, 0x18, 0x48, 0x85, 0xc0 }); // steps
+        const limit = out.jump(&.{ 0x0f, 0x84 });
+        out.emit(&.{ 0x48, 0xff, 0xc8, 0x49, 0x89, 0x42, 0x18 });
+        out.emit(&.{ 0x4d, 0x8b, 0x42, 0x10, 0x4d, 0x8b, 0x4a, 0x38 }); // position, captures
+        out.emit(&.{ 0x4d, 0x89, 0x81 }); // mov [r9+slot*8],r8
+        out.u32le(if (state.tag == .reset) 0 else @intCast(state.slot * 8));
+        const next = out.jump(&.{0xe9});
+        out.patch(next, @as(i64, @intCast(state.first)) * stride - @as(i64, @intCast(pc)) * stride);
+        out.patch(limit, @intCast(out.at));
+        out.emit(&.{0xb8});
+        out.u32le(2);
+        out.emit(&.{0xc3});
+        return;
+    }
     if (state.tag != .consume) {
         out.fallback(pc);
         return;

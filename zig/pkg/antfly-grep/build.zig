@@ -40,6 +40,10 @@ pub fn add(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.lang.O
     lib.addImport("antfly_syntax", syntax);
     lib.addImport("antfly_regex", regex);
     lib.addImport("httpx", http);
+    const profile_mod = b.createModule(.{ .root_source_file = b.path("pkg/antfly-grep/bench/regex_profile.zig"), .target = target, .optimize = optimize, .link_libc = true });
+    profile_mod.addImport("antfly_regex", regex);
+    const profile = b.addExecutable(.{ .name = "antfly-grep-regex-profile", .root_module = profile_mod });
+    b.step("grep-profile", "Build in-process VM/JIT profiling utility").dependOn(&b.addInstallArtifact(profile, .{}).step);
     const main = b.createModule(.{ .root_source_file = b.path("pkg/antfly-grep/src/main.zig"), .target = target, .optimize = optimize });
     main.addImport("antfly-grep", lib);
     main.link_libc = true;
@@ -70,6 +74,31 @@ pub fn add(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.lang.O
     unit_step.dependOn(&b.addRunArtifact(grammar_tests).step);
     const dictionary_tests = b.addTest(.{ .root_module = b.createModule(.{ .root_source_file = b.path("lib/compress/src/brotli/shared_dictionary.zig"), .target = target, .optimize = optimize }) });
     unit_step.dependOn(&b.addRunArtifact(dictionary_tests).step);
+    const harden_mod = b.createModule(.{ .root_source_file = b.path("pkg/antfly-grep/tests/harden.zig"), .target = target, .optimize = .safe, .link_libc = true });
+    const harden_regex = b.createModule(.{ .root_source_file = b.path("lib/regex/src/mod.zig"), .target = target, .optimize = .safe, .link_libc = true });
+    harden_regex.addImport("antfly_fst", fst);
+    harden_regex.addImport("antfly_grapheme", b.createModule(.{ .root_source_file = b.path("lib/tokenizer/src/grapheme.zig"), .target = target, .optimize = .safe }));
+    const harden_syntax = b.createModule(.{ .root_source_file = b.path("lib/syntax/src/root.zig"), .target = target, .optimize = .safe });
+    harden_syntax.addImport("util", b.createModule(.{ .root_source_file = b.path("lib/syntax/src/vendor/yuku/util/root.zig"), .target = target, .optimize = .safe }));
+    harden_syntax.addImport("dialect", b.addOptions().createModule());
+    harden_syntax.addImport("codegen_options", syntax_codegen.createModule());
+    const harden_compress = b.createModule(.{ .root_source_file = b.path("lib/compress/src/mod.zig"), .target = target, .optimize = .safe });
+    harden_compress.addImport("antfly_hash", b.createModule(.{ .root_source_file = b.path("lib/hash/src/mod.zig"), .target = target, .optimize = .safe, .link_libc = true }));
+    harden_mod.addImport("antfly_regex", harden_regex);
+    harden_mod.addImport("antfly_syntax", harden_syntax);
+    harden_mod.addImport("antfly_compress", harden_compress);
+    const fuzz_target = b.option(enum { regex, parsers, dictionaries }, "grep-fuzz-target", "Select one coverage-guided hardening target");
+    const fuzz_filters: []const []const u8 = if (fuzz_target) |value| switch (value) {
+        .regex => &.{"coverage fuzz regex"},
+        .parsers => &.{"coverage fuzz pinned"},
+        .dictionaries => &.{"coverage fuzz dictionaries"},
+    } else &.{};
+    const harden = b.addTest(.{ .name = "antfly-grep-harden-test", .root_module = harden_mod, .filters = fuzz_filters });
+    b.step("grep-harden-build", "Build portable hardening test executable without running it").dependOn(&b.addInstallArtifact(harden, .{}).step);
+    const harden_run = b.addRunArtifact(harden);
+    const harden_step = b.step("grep-harden", "Run bounded malformed-input mutation and coverage fuzz seeds");
+    harden_step.dependOn(&harden_run.step);
+    test_step.dependOn(harden_step);
     const integration = b.addSystemCommand(&.{"python3"});
     integration.addFileArg(b.path("pkg/antfly-grep/tests/test_cli.py"));
     integration.addArtifactArg(exe);
@@ -77,6 +106,9 @@ pub fn add(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.lang.O
     const fixture = b.addLibrary(.{ .name = "antfly-grep-inference-fixture", .linkage = .dynamic, .root_module = fixture_mod });
     integration.addArtifactArg(fixture);
     test_step.dependOn(&integration.step);
+    const differential_tools = b.addSystemCommand(&.{"python3"});
+    differential_tools.addFileArg(b.path("pkg/antfly-grep/tests/test_differential_tools.py"));
+    test_step.dependOn(&differential_tools.step);
     const compatibility = b.addSystemCommand(&.{"python3"});
     compatibility.addFileArg(b.path("pkg/antfly-grep/tests/check_compatibility.py"));
     compatibility.addArg("--check");

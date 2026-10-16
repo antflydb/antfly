@@ -669,6 +669,33 @@ class CliTests(unittest.TestCase):
             ),
         )
 
+    def test_generated_differential_goldens(self):
+        import differential
+        import platform
+
+        manifest = json.loads(
+            Path(__file__).with_name("generated_fixtures.json").read_text()
+        )
+        host = platform.system().lower() + "-" + platform.machine()
+        for index, case in enumerate(manifest["cases"]):
+            source = base64.b64decode(case["input"])
+            # Pinned Linux x86 PCRE2 JIT visits intermediate UTF bytes on empty
+            # matches; native ARM references advance characters. Replay portable
+            # ASCII cases everywhere, and the full corpus on its oracle platform.
+            if (
+                manifest.get("platform", "linux-x86_64") != host
+                and not source.isascii()
+            ):
+                continue
+            with self.subTest(index=index, args=case["args"]):
+                result = self.raw_cli(*case["args"], input=source, code=case["code"])
+                actual = (
+                    differential.normalized_output(case["args"], result.stdout)
+                    if case["code"] in (0, 1)
+                    else b""
+                )
+                self.assertEqual(actual, base64.b64decode(case["stdout"]))
+
     def test_pinned_pcre2_dialect_fixtures(self):
         fixtures = json.loads(
             Path(__file__).with_name("pcre2_dialect_fixtures.json").read_text()
@@ -970,6 +997,12 @@ class CliTests(unittest.TestCase):
             bytes.fromhex("02214c18") + len(block).to_bytes(4, "little") + block,
         )
         self.assertEqual(self.raw_cli("-z", "hit", "legacy.lz4").stdout, plain)
+
+    def test_empty_config_environment_is_ignored(self):
+        self.env["RIPGREP_CONFIG_PATH"] = ""
+        self.assertEqual(self.raw_cli("-P", "-o", "-e", "a", input=b"a").stdout, b"a\n")
+        self.env["ANTFLY_GREP_CONFIG_PATH"] = ""
+        self.assertEqual(self.raw_cli("-o", "-e", "a", input=b"a").stdout, b"a\n")
 
     @unittest.skipUnless(shutil.which("rg"), "optional multiline JSON oracle")
     def test_multiline_json_counts_and_limits(self):

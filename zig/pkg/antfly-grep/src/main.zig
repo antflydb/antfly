@@ -156,11 +156,13 @@ fn run(init: std.process.Init) !u8 {
         no_config = true;
     };
     if (!no_config) if (init.environ_map.get("ANTFLY_GREP_CONFIG_PATH") orelse init.environ_map.get("RIPGREP_CONFIG_PATH")) |path| {
-        const bytes = try std.Io.Dir.cwd().readFileAlloc(init.io, path, persistent, .limited(1024 * 1024));
-        var lines = std.mem.splitScalar(u8, bytes, '\n');
-        while (lines.next()) |raw| {
-            const line = std.mem.trim(u8, raw, " \t\r");
-            if (line.len > 0 and line[0] != '#') try configured.append(a, line);
+        if (path.len != 0) {
+            const bytes = try std.Io.Dir.cwd().readFileAlloc(init.io, path, persistent, .limited(1024 * 1024));
+            var lines = std.mem.splitScalar(u8, bytes, '\n');
+            while (lines.next()) |raw| {
+                const line = std.mem.trim(u8, raw, " \t\r");
+                if (line.len > 0 and line[0] != '#') try configured.append(a, line);
+            }
         }
     };
     if (args.items.len > 0 and std.mem.eql(u8, args.items[0], "ask")) {

@@ -1049,6 +1049,12 @@ pub const Search = struct {
         const delimiter: u8 = if (self.options.null_data) 0 else '\n';
         var storage: std.Io.Writer.Allocating = .init(self.a);
         defer storage.deinit();
+        const context_output = !self.options.count and !self.options.count_matches and !self.options.quiet and !self.options.files_with_matches and !self.options.files_without_match and (self.options.json or self.options.only_matching or self.options.replacement != null or self.options.column or self.options.vimgrep or self.color_enabled);
+        const context_limit = if (self.options.ask == null and (context_output or self.options.count_matches or (self.options.count and self.options.only_matching) or self.options.stats)) try self.matcher.renderContextBytes() else 0;
+        var previous: std.ArrayList(u8) = .empty;
+        defer previous.deinit(self.a);
+        var render_subject: std.Io.Writer.Allocating = .init(self.a);
+        defer render_subject.deinit();
         var hit_arena = std.heap.ArenaAllocator.init(self.a);
         defer hit_arena.deinit();
         defer self.current_hits = null;
@@ -1165,6 +1171,45 @@ pub const Search = struct {
                     matched = hit_found != self.options.invert;
                 }
             }
+            if (matched and !self.options.invert and !self.replacement_absolute_start and context_limit > 0 and previous.items.len > 0) {
+                // Selection uses an isolated record. Capture rendering uses the
+                // bounded preceding source window, as ripgrep's capture iterator
+                // does, so assertions at the start of selected records see context.
+                const base = if (self.replacement_file_context and !self.transcoding) previous.items.len else @min(previous.items.len, record_buffer_start);
+                // Borrow contiguous input while the reader window is stable.
+                // This also avoids copying large explicitly mapped records.
+                const subject = if (base <= record_buffer_start and raw.len <= record_buffer_available and record_buffer_start + text.len <= reader.end)
+                    reader.buffer[record_buffer_start - base .. record_buffer_start + text.len]
+                else copy: {
+                    render_subject.clearRetainingCapacity();
+                    try render_subject.writer.writeAll(previous.items[previous.items.len - base ..]);
+                    try render_subject.writer.writeAll(text);
+                    break :copy render_subject.written();
+                };
+                self.matcher.allowAbsoluteStart(offset == base);
+                defer self.matcher.allowAbsoluteStart(true);
+                const ha = hit_arena.allocator();
+                var contextual: std.ArrayList(@import("matcher.zig").Match) = .empty;
+                var cursor = base;
+                var prior_end: ?usize = null;
+                var total: usize = 0;
+                while (self.matcher.find(subject, cursor)) |hit| {
+                    const duplicate = hit.span.start == hit.span.end and prior_end != null and prior_end.? == hit.span.end;
+                    if (!duplicate and !(peek == null and hit.span.start == subject.len and hit.span.end == subject.len)) {
+                        total += 1;
+                        if (context_output) try contextual.append(ha, .{ .span = .{ .start = hit.span.start - base, .end = hit.span.end - base }, .captures = if (self.options.replacement != null) try ha.dupe(?@import("matcher.zig").Span, hit.captures) else &.{}, .names = hit.names, .capture_text = subject });
+                        prior_end = hit.span.end;
+                    }
+                    cursor = if (hit.span.start == hit.span.end) self.matcher.advance(subject, hit.span.end) else hit.span.end;
+                    if (cursor > subject.len or (peek == null and cursor == subject.len)) break;
+                }
+                if (self.matcher.failure) |err| return err;
+                exact_occurrences = total;
+                if (context_output) {
+                    self.current_hits = contextual.items;
+                    self.current_hit_text = text;
+                }
+            }
             if (matched) {
                 count += 1;
                 if (count == 1) self.summary.files_with_matches += 1;
@@ -1210,6 +1255,17 @@ pub const Search = struct {
                     try self.emit(path_name, text, line, offset, false, probability);
                     shown = line;
                     after -|= 1;
+                }
+            }
+            if (context_limit > 0) {
+                if (raw.len >= context_limit) {
+                    previous.clearRetainingCapacity();
+                    try previous.appendSlice(self.a, raw[raw.len - context_limit ..]);
+                } else {
+                    const remove = (previous.items.len + raw.len) -| context_limit;
+                    std.mem.copyForwards(u8, previous.items[0 .. previous.items.len - remove], previous.items[remove..]);
+                    previous.shrinkRetainingCapacity(previous.items.len - remove);
+                    try previous.appendSlice(self.a, raw);
                 }
             }
             offset += raw.len;
@@ -1290,6 +1346,7 @@ pub const Search = struct {
         var multiline_occurrences: usize = 0;
         const retain_multiline_hits = !self.options.count and !self.options.count_matches and !self.options.quiet and !self.options.files_with_matches and !self.options.files_without_match;
         if (self.options.multiline and self.options.ask == null) {
+            const count_each_match = self.matcher.multilineUsesMatches();
             var offset: usize = 0;
             var last_line: ?usize = null;
             var previous_end: ?usize = null;
@@ -1302,7 +1359,7 @@ pub const Search = struct {
                 }
                 const first = lineIndex(lines, hit.span.start);
                 const last = lineIndex(lines, if (hit.span.end > hit.span.start) hit.span.end - 1 else hit.span.end);
-                if (last_line == null or first > last_line.?) {
+                if (count_each_match or last_line == null or first > last_line.?) {
                     if (multiline_groups == self.options.max_count) break;
                     multiline_groups += 1;
                 }
@@ -1399,7 +1456,7 @@ pub const Search = struct {
         }
         if (self.options.multiline and self.options.only_matching and !self.options.invert) {
             for (multiline_hits.items) |hit| {
-                if (hit.span.start == hit.span.end) continue;
+                if (hit.span.start == hit.span.end and self.options.replacement == null) continue;
                 var line_no = lineIndex(lines, hit.span.start) + 1;
                 const rendered = if (self.options.replacement) |template| try Matcher.replacement(a, template, bytes, hit) else bytes[hit.span.start..hit.span.end];
                 var split = std.mem.splitScalar(u8, rendered, '\n');
@@ -1836,7 +1893,7 @@ pub const Search = struct {
             try self.write(if (self.options.null_data) "\x00" else "\n");
             return;
         }
-        if (self.options.only_matching and !self.options.json and self.options.replacement == null and !self.color_enabled and !self.render_filename and !self.options.line_numbers and !self.options.column and !self.options.byte_offset and !self.options.vimgrep and std.math.isNan(probability) and !self.options.invert and self.current_hits != null and self.current_hit_text.ptr == text.ptr and self.current_hit_text.len == text.len) {
+        if (self.options.only_matching and !self.options.json and self.options.replacement == null and !self.color_enabled and !self.render_filename and !self.options.line_numbers and !self.options.column and !self.options.byte_offset and !self.options.vimgrep and std.math.isNan(probability) and !self.options.invert and self.current_hits != null and self.current_hits.?.len > 0 and self.current_hit_text.ptr == text.ptr and self.current_hit_text.len == text.len) {
             if (!matched) return;
             const delimiter: u8 = if (self.options.null_data) 0 else '\n';
             for (self.current_hits.?) |hit| {
@@ -1915,7 +1972,7 @@ pub const Search = struct {
         }
         if (self.options.only_matching and p == null) {
             if (!matched) return;
-            if (replacement_context and hits.items.len == 0) {
+            if (hits.items.len == 0) {
                 var output: std.Io.Writer.Allocating = .init(a);
                 try self.prefix(&output.writer, path_name, line, byte_offset, 1, true);
                 try output.writer.writeAll(text);

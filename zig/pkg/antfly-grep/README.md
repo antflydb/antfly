@@ -470,3 +470,129 @@ Build for a dynamically linked libc (for example, `x86_64-linux-gnu`); a static
 musl executable supports lexical/HTTP searches and reports
 `DynamicInferenceRequiresDynamicLibc` for local inference. `--version` records
 the compilation target and linkage.
+
+## Generated conformance, hardening and profiling
+
+`tests/differential.py` generates reproducible PCRE2 patterns, malformed syntax,
+Unicode subjects and option combinations from a seed. It compares syntax
+acceptance, selected output, JSON byte spans and capture replacements against
+**ripgrep 15.2.0 with runtime PCRE2 10.45**, recording executable hashes. Mismatches
+are reduced by deleting argument units, pattern fragments and subject characters
+under an explicit evaluation budget; UTF-8 subjects remain UTF-8 during reduction.
+Malformed JSON and process failures become replayable failures. Timeouts fail the
+campaign. This oracle is a test dependency only.
+
+```sh
+# From zig/; run the oracle and native binary on the same platform.
+python3 pkg/antfly-grep/tests/differential.py zig-out/bin/antfly-grep /path/to/rg \
+  --seed 1151 --cases 1500 --output .zig-cache/differential.json \
+  --goldens pkg/antfly-grep/tests/generated_fixtures.json
+# Fast repeat using frozen outputs, after verifying the oracle executable hash.
+python3 pkg/antfly-grep/tests/differential.py zig-out/bin/antfly-grep /path/to/rg \
+  --replay pkg/antfly-grep/tests/generated_fixtures.json --frozen-oracle \
+  --output .zig-cache/replay.json
+```
+
+The generated fixtures add 1,500 contracts to the existing 368. The complete
+corpus runs on Linux x86_64; portable ASCII inputs also replay on other hosts.
+Upstream empty UTF matching differs between Linux x86_64 and ARM64 references,
+so non-ASCII generated inputs retain their oracle-platform scope. Six categories
+of fixes cover empty config paths, multiline counting/grouping, duplicate capture
+names, empty-match rendering, line-anchor EOF semantics and bounded source context
+for capture rendering. Context is retained only for patterns/output that need it,
+with explicit 1 MiB admission; counting does not retain output spans.
+
+`grep-harden` runs 1,024 deterministic malformed-input mutations, coverage seed
+replays, and allocation-failure injection. Native regex/parser/dictionary modules
+use ReleaseSafe. Regex compilation/execution has a 1 MiB allocator quota and a
+4,096-step match budget; pinned Python/Go/Rust and JavaScript/TypeScript parsers
+and dictionaries have 512 KiB allocator quotas in the harness. Decoder output is
+limited to 4 KiB. The suite checks leaks, source ranges and VM/JIT agreement for
+captures, spans, marks, error outcomes and step accounting. `grep-harden-build`
+builds a portable test executable for runtime checks on another platform.
+
+```sh
+zig build -Dgrep-only=true grep-harden
+# Each target is selected explicitly; otherwise the build fuzzer may run only
+# its first discovered fuzz test. Keep each campaign finite and retain reports.
+python3 pkg/antfly-grep/tests/fuzz.py --zig /path/to/zig --iterations 50000 \
+  --output pkg/antfly-grep/bench/results/macos-arm64-hardening.json
+```
+
+`grep-profile` builds `antfly-grep-regex-profile`. It measures VM dispatch counts
+outside timing, then runs the VM and JIT over identical in-memory subjects with
+reused scratch. `bench/profile.py` alternates executables and execution modes,
+checks result checksums and records corpus/executable hashes, samples and host
+load. Compilation, source reads and warmups are excluded from kernel timing;
+`bench/compare.py` measures the actual CLI including startup, I/O, output and RSS.
+The new `pcre-captures` and `pcre-reset` extended cases exercise the measured
+capture-save/reset bottleneck. Native ARM64/x86_64 JIT chains now handle capture
+saves and `\K`, with the same step accounting and W^X/code-size limits. Entry
+remains on consuming states; saves/resets execute inside native chains. Dispatch
+counters and their pointer are compiled out of production executables; only the
+profiling utility explicitly opts in. Complex
+control flow continues through the bounded VM. CPU-stack sampling of late-prefix
+log searches also identified capture-buffer cloning at every failed candidate.
+The runner now initializes a pooled, owned frame directly, removing that copy and
+the separate initial capture allocation; branch snapshots retain their ownership
+and memory limits.
+
+```sh
+zig build -Dgrep-only=true -Doptimize=ReleaseFast grep grep-profile
+python3 pkg/antfly-grep/bench/profile.py zig-out/bin/antfly-grep-regex-profile \
+  --output .zig-cache/kernels.json
+python3 pkg/antfly-grep/bench/compare.py zig-out/bin/antfly-grep --extended \
+  --mib 32 --rounds 7 --repository pkg/antfly-grep/src \
+  --case pcre-captures --case pcre-reset --case literal-miss \
+  --case repository-files --case repository-search --output .zig-cache/cli.json
+```
+
+Final validation passed **112 CLI tests on macOS and Linux** (two and one
+platform-specific skips), all **1,500 live generated oracle comparisons** with no
+failures/timeouts, and **153,992 additional coverage fuzz executions** across the
+three targets. Windows x86_64 cross-compilation passed; runtime checks remain
+scoped to macOS/Linux. Reports retain executable identities and hardening source
+hashes: [live differential](bench/results/linux-x86_64-generated-differential.json),
+[fuzz campaigns](bench/results/macos-arm64-hardening.json).
+
+The final [paired CLI measurements](bench/results/macos-arm64-profile-local.json)
+compare the original PR binary with the updated binary, using seven alternating
+rounds. Times include startup and I/O. These warm-cache macOS ARM64 measurements
+record host load and raw runs; they establish gains for specific workloads.
+
+| Workload | Original PR ms | Updated ms | ripgrep ms | Original / updated |
+|---|---:|---:|---:|---:|
+| Capture count, 32 MiB | 154.92 | 70.97 | 127.62 | 2.18× |
+| Capture/reset count, 32 MiB | 698.98 | 558.12 | 84.92 | 1.25× |
+| Repeat count, 32 MiB | 62.64 | 59.91 | 38.02 | 1.05× |
+| Monorepo file discovery | 193.88 | 192.61 | 22.95 | 1.01× |
+| Monorepo file search | 1048.29 | 1060.07 | 183.49 | 0.99× |
+
+Capture/reset counts peak at approximately 3.3 MiB RSS. Startup, literal, and
+repository workloads remain broadly unchanged. The complete
+[monorepo run](bench/results/macos-arm64-profile-monorepo.json) covers 10,119 files
+and approximately 534 MiB; [Go SDK](bench/results/macos-arm64-profile-go-sdk.json)
+and [TypeScript SDK](bench/results/macos-arm64-profile-ts-sdk.json) runs cover
+additional source trees. Repository discovery/search and late-prefix reset search
+remain substantially slower than ripgrep in these measurements.
+
+[VM/JIT kernel profiles](bench/results/macos-arm64-capture-jit.json) record dispatch
+mixes and matching result checksums. Raw CLI CPU traces accompany the
+[capture log](bench/results/macos-arm64-cli-capture-sample.json),
+[reset log before owned-frame reuse](bench/results/macos-arm64-cli-reset-before.json),
+[final reset log](bench/results/macos-arm64-cli-reset-sample.json), and
+[repository search](bench/results/macos-arm64-cli-monorepo-sample.json) reports.
+The repository trace exposes ignore/glob matching during discovery and parallel
+file scanning; further broad JIT expansion would not address that entire cost.
+The sampling adapter supports directories, count/file modes and the default or
+PCRE-style engine, collects symbols before short-lived processes exit, and
+records failed/time-limited runs explicitly.
+
+```sh
+python3 pkg/antfly-grep/bench/sample_cli.py zig-out/bin/antfly-grep /path/to/repo \
+  'TODO|FIXME|retry' --engine default --files-with-matches \
+  --output .zig-cache/repository-sample.json
+```
+
+Fuzz campaigns and generated suites are finite evidence. They do not establish
+universal PCRE2/JIT parity, parser correctness, or performance parity.

@@ -272,6 +272,16 @@ def main():
             cases.update(
                 {
                     "pcre-repeat": ["-Pc", "a+z", "repeat.log"],
+                    "pcre-captures": [
+                        "-Pc",
+                        r"(2026)-(10)-(15) (info) (worker) (processed) (request) id=(123456) status=(success)",
+                        "large.log",
+                    ],
+                    "pcre-reset": [
+                        "-Pc",
+                        r"(id)=(123)(456)\K status=(success)",
+                        "large.log",
+                    ],
                     "pcre-unicode-chain": ["-Pic", "é[a-z]{8}\\d+", "pcre-unicode.log"],
                     "pcre-subroutine": ["-Pc", "(?<n>a)(?&n){16}", "subroutine.log"],
                 }

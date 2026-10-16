@@ -674,7 +674,7 @@ fn assertion(n: *const Node, text: []const u8, pos: usize, utf8: bool) bool {
         .absolute_end => pos == text.len,
         .soft_end => pos == text.len or (pos + 1 == text.len and next == '\n'),
         .previous_match => pos == 0,
-        .start => pos == 0 or (n.flags.multiline and prev == '\n'),
+        .start => pos == 0 or (n.flags.multiline and prev == '\n' and !(n.flags.pcre and pos == text.len)),
         .end => pos == text.len or (n.flags.multiline and (next == '\n' or (n.flags.crlf and next == '\r' and pos + 1 < text.len and text[pos + 1] == '\n'))),
         .word => before != after,
         .not_word => before == after,
@@ -1805,7 +1805,15 @@ fn jitConsume(context: *native_jit.Context, pc: u32) callconv(.c) u32 {
     return 1;
 }
 
+pub const ExecutionProfile = struct {
+    states: [256]u64 = @splat(0),
+    jit_entries: u64 = 0,
+};
+// Instrumentation is an explicit executable opt-in. Production runners carry
+// neither a profiling pointer nor a conditional in the dispatch loop.
+pub const execution_profiling = if (@hasDecl(@import("root"), "antfly_regex_profiling")) @import("root").antfly_regex_profiling else false;
 pub const BacktrackingRunner = struct {
+    profile: if (execution_profiling) ?*ExecutionProfile else void = if (execution_profiling) null else {},
     a: Allocator,
     p: *const BacktrackingPattern,
     result: []?Span,
@@ -1822,7 +1830,6 @@ pub const BacktrackingRunner = struct {
     mark: ?[]const u8 = null,
     marks: std.ArrayList(Mark) = .empty,
     alternatives: std.ArrayList(Alternative) = .empty,
-    initial: []usize = &.{},
     free_caps: std.ArrayList([]usize) = .empty,
     cached_bytes: usize = 0,
     call_links: std.ArrayList(CallLink) = .empty,
@@ -1846,7 +1853,6 @@ pub const BacktrackingRunner = struct {
         self.alternatives.deinit(self.a);
         for (self.free_caps.items) |caps| self.a.free(caps);
         self.free_caps.deinit(self.a);
-        self.a.free(self.initial);
         self.a.free(self.result);
         for (self.call_links.items) |link| if (link.references != 0) self.a.free(link.snapshot);
         self.call_links.deinit(self.a);
@@ -1956,14 +1962,19 @@ pub const BacktrackingRunner = struct {
         }
         return true;
     }
-    fn clone(self: *BacktrackingRunner, caps: []const usize) Failure![]usize {
-        if (self.live_bytes + caps.len * @sizeOf(usize) > 64 * 1024 * 1024) return error.MatchLimitExceeded;
+    fn acquire(self: *BacktrackingRunner, slots: usize) Failure![]usize {
+        const bytes = slots * @sizeOf(usize);
+        if (self.live_bytes + bytes > 64 * 1024 * 1024) return error.MatchLimitExceeded;
         const copy = if (self.free_caps.pop()) |cached| blk: {
             self.cached_bytes -= cached.len * @sizeOf(usize);
             break :blk cached;
-        } else try self.a.alloc(usize, caps.len);
+        } else try self.a.alloc(usize, slots);
+        self.live_bytes += bytes;
+        return copy;
+    }
+    fn clone(self: *BacktrackingRunner, caps: []const usize) Failure![]usize {
+        const copy = try self.acquire(caps.len);
         @memcpy(copy, caps);
-        self.live_bytes += caps.len * @sizeOf(usize);
         return copy;
     }
     fn release(self: *BacktrackingRunner, caps: []usize) void {
@@ -1986,8 +1997,7 @@ pub const BacktrackingRunner = struct {
         self.marks.clearRetainingCapacity();
         self.alternatives.clearRetainingCapacity();
         self.steps = self.max_steps;
-        if (self.initial.len == 0) self.initial = try self.a.alloc(usize, (self.p.groups + 1) * 2 + self.p.scratch_slots);
-        const initial = self.initial;
+        const slots = (self.p.groups + 1) * 2 + self.p.scratch_slots;
         var pos = offset;
         while (pos <= text.len) {
             // PCRE2's match limit bounds each candidate start, rather than the
@@ -1996,9 +2006,12 @@ pub const BacktrackingRunner = struct {
             self.steps = self.max_steps;
             self.marks.clearRetainingCapacity();
             self.alternatives.clearRetainingCapacity();
+            // Initialize the owned frame directly. Failed candidate starts reuse
+            // this buffer without filling and then cloning a second scratch copy.
+            const initial = try self.acquire(slots);
             @memset(initial, std.math.maxInt(usize));
             initial[0] = pos;
-            if (try self.execute(text, self.p.start, pos, initial, null, null, 0)) |found| {
+            if (try self.executeFrame(text, .{ .pc = self.p.start, .pos = pos, .caps = initial }, null, 0, 0, null, false, false)) |found| {
                 defer self.releaseFrame(found);
                 self.mark = if (found.mark) |i| self.marks.items[i].name else null;
                 found.caps[1] = found.pos;
@@ -2015,9 +2028,6 @@ pub const BacktrackingRunner = struct {
     }
     fn evaluateLookWith(self: *BacktrackingRunner, text: []const u8, start: u32, frame: Frame, node: *const Node, depth: usize, scope_depth: usize, conditional: bool, continuation: ?*const Continuation) Failure!?Frame {
         return self.executeFrame(text, try self.lookFrame(frame, start, frame.pos), if (node.behind) frame.pos else null, depth + 1, scope_depth + 1, continuation, true, conditional or node.negative);
-    }
-    fn execute(self: *BacktrackingRunner, text: []const u8, start: u32, at: usize, initial: []const usize, required_end: ?usize, initial_mark: ?usize, depth: usize) Failure!?Frame {
-        return self.executeFrame(text, .{ .pc = start, .pos = at, .caps = try self.clone(initial), .mark = initial_mark }, required_end, depth, 0, null, false, false);
     }
     // Owns initial.caps even on admission failure. Assertion continuations retain
     // their caller's position/progress and copy only successful capture values.
@@ -2039,7 +2049,10 @@ pub const BacktrackingRunner = struct {
             frame.branch_marker = null;
             var state = self.p.states[frame.pc];
             if (self.jit_enabled and state.tag == .consume) if (self.p.jit) |*program| {
-                var context = native_jit.Context{ .text = text.ptr, .length = text.len, .position = frame.pos, .steps = self.steps, .pc = frame.pc, .slow = jitConsume, .user = @ptrCast(self.p) };
+                if (comptime execution_profiling) {
+                    if (self.profile) |profile| profile.jit_entries += 1;
+                }
+                var context = native_jit.Context{ .text = text.ptr, .length = text.len, .position = frame.pos, .steps = self.steps, .pc = frame.pc, .slow = jitConsume, .user = @ptrCast(self.p), .captures = frame.caps.ptr };
                 const result = program.run(&context);
                 self.steps = context.steps;
                 frame.pos = context.position;
@@ -2060,6 +2073,9 @@ pub const BacktrackingRunner = struct {
             };
             if (self.steps == 0) return error.MatchLimitExceeded;
             self.steps -= 1;
+            if (comptime execution_profiling) {
+                if (self.profile) |profile| profile.states[@backingInt(state.tag)] += 1;
+            }
             switch (state.tag) {
                 .alt_start => {
                     if ((self.alternatives.items.len + 1) * @sizeOf(Alternative) > 8 * 1024 * 1024) return error.MatchLimitExceeded;
@@ -2559,7 +2575,7 @@ test "positive lookarounds inherit and return named marks to callouts" {
 test "native JIT agrees with the VM for spans, captures, Unicode chains and step budgets" {
     if (!native_jit.Program.supported()) return error.SkipZigTest;
     const a = std.testing.allocator;
-    for ([_][]const u8{ "(abc|ab)+(?=!)", "(?i)x[a-z]+(\\d+)\\1", "a{0,4}b", "(?<n>é|abc)\\k<n>", "abc(*MARK:ok)(?C7)(*ACCEPT)" }) |expression| {
+    for ([_][]const u8{ "(abc|ab)+(?=!)", "(?i)x[a-z]+(\\d+)\\1", "a{0,4}b", "(?<n>é|abc)\\k<n>", "abc(*MARK:ok)(?C7)(*ACCEPT)", "((a)(b))\\K(?<n>é|c)", "(a)?(b)?(c)?", "(?=(a))a\\K(b)", "(?<=(a))(b)", "(?:(a)|(b))(*THEN)c" }) |expression| {
         var pattern = try BacktrackingPattern.init(a, expression, .{});
         defer pattern.deinit();
         try std.testing.expect(pattern.jit != null);
