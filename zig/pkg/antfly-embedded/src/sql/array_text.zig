@@ -23,6 +23,7 @@ const uuid = @import("../common/uuid.zig");
 const MemoryBudget = @import("memory_budget.zig");
 const A = std.mem.Allocator;
 pub const Options = struct {
+    compact: bool = false,
     values: arrays.Limits = .{},
     wire_bytes: usize = 8 * 1024 * 1024,
     /// Borrowed invocation identity, retained across both parsing passes and
@@ -166,6 +167,9 @@ const Reader = struct {
     at: usize = 0,
     count: usize = 0,
     max_escape: usize = 0,
+    non_null: usize = 0,
+    text_bytes: usize = 0,
+    compact: ?*@import("array_compact.zig").Builder = null,
     limit: usize,
     cells: ?[]arrays.Element = null,
     scratch: []u8 = &.{},
@@ -268,7 +272,15 @@ const Reader = struct {
                 try self.work.consume(1);
                 if (self.count >= self.limit) return error.SqlProgramLimitExceeded;
                 if (cell.escaped) self.max_escape = @max(self.max_escape, cell.decoded_len);
+                if (!cell.sql_null) {
+                    self.non_null += 1;
+                    self.text_bytes = try std.math.add(usize, self.text_bytes, cell.decoded_len);
+                }
                 if (self.cells) |cells| cells[self.count] = if (cell.sql_null) .{} else try decodeElement(self.alloc, self.kind, cell.text(self.scratch), self.work);
+                if (self.compact) |builder| {
+                    const value: arrays.Element = if (cell.sql_null) .{} else if (self.kind == .text) .json(.{ .string = cell.text(self.scratch) }) else try decodeElement(self.alloc, self.kind, cell.text(self.scratch), self.work);
+                    try builder.append(value);
+                }
                 self.count += 1;
             }
             result.lengths[0] = std.math.add(u32, result.lengths[0], 1) catch return error.SqlProgramLimitExceeded;
@@ -360,6 +372,9 @@ fn decodeLeakyInner(a: A, kind: arrays.ElementType, bytes: []const u8, options: 
         for (declared[0..rank], shape.lengths[0..rank]) |*dimension, length| dimension.* = .{ .length = length };
     }
     var budget: MemoryBudget = .{ .backing = a, .limit = options.values.bytes };
+    if (options.compact and @import("array_compact.zig").supported(kind)) {
+        return decodeCompact(&budget, kind, bytes, options, body, declared[0..rank], reader.count, reader.non_null, reader.text_bytes, reader.max_escape, &work) catch |err| return quotaError(&budget, err);
+    }
     return decodeAdmitted(&budget, kind, bytes, options, body, declared[0..rank], reader.count, reader.max_escape, &work) catch |err| {
         const mapped = quotaError(&budget, err);
         return if (mapped == error.SqlProgramLimitExceeded and options.context != null) options.context.?.limit() else mapped;
@@ -415,6 +430,19 @@ test "SQL array text shared work owner distinguishes real OOM from sticky quota 
     const remaining = context.remaining;
     try std.testing.expectError(error.SqlProgramLimitExceeded, decodeLeaky(none.allocator(), .int64, "{1}", .{ .context = &context }));
     try std.testing.expectEqual(remaining, context.remaining);
+}
+
+fn decodeCompact(budget: *MemoryBudget, kind: arrays.ElementType, bytes: []const u8, options: Options, body: usize, axes: []const arrays.Dimension, count: usize, non_null: usize, text_bytes: usize, escaped: usize, work: *arrays.Budget) !Decoded {
+    const a = budget.allocator();
+    var builder = try @import("array_compact.zig").Builder.init(a, kind, axes, count, non_null, text_bytes, options.values);
+    const scratch = try a.alloc(u8, escaped);
+    defer a.free(scratch);
+    var reader: Reader = .{ .bytes = bytes, .at = body, .accounted = body, .limit = options.values.elements, .compact = &builder, .scratch = scratch, .alloc = a, .kind = kind, .work = work };
+    _ = try reader.array(0);
+    try reader.account(true);
+    try work.consume(builder.bytes.len + count);
+    const value = try builder.finish(a, options.values);
+    return .{ .value = value, .allocated_bytes = budget.live, .work = options.values.work - work.remaining };
 }
 
 fn decodeAdmitted(budget: *MemoryBudget, kind: arrays.ElementType, bytes: []const u8, options: Options, body: usize, dimensions: []const arrays.Dimension, count: usize, escape_bytes: usize, work: *arrays.Budget) !Decoded {

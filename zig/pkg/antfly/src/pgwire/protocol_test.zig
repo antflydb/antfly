@@ -308,6 +308,7 @@ const Mock = struct {
                 try std.testing.expectEqual(@as(?@import("antfly_local_sources").sql_array_value.ElementType, .int64), request.parameter_descriptors[0].element_type);
                 if (request.parameter_cells) |cells| {
                     self.native_parameter_checks += 1;
+                    try std.testing.expect(request.parameter_owner != null);
                     try std.testing.expect(request.parameters[0] == .null);
                     if (!cells[0].sql_null) {
                         const array = cells[0].array orelse return error.ExpectedNativeArray;
@@ -325,6 +326,9 @@ const Mock = struct {
             } else if (self.expected_text_parameter) |expected| {
                 try std.testing.expectEqualStrings(expected, request.parameters[0].string);
                 self.saw_text_parameter = true;
+            } else if (request.parameter_cells) |cells| {
+                try std.testing.expect(request.parameter_owner == null);
+                self.seen_parameter = cells[0].value.integer;
             } else self.seen_parameter = request.parameters[0].integer;
         }
         if (self.expected_result_tag) |tag| return .{ .command_tag = tag, .mutation_outcome = .committed };
@@ -1990,19 +1994,21 @@ test "pgwire extended typed bind describes without execution and resumes once" {
     try execute(&input.writer, "p", 1);
     try frame(&input.writer, 'S', "");
     try frame(&input.writer, 'X', "");
-    var mock = Mock{};
-    var output = try run(&mock, input.written(), .{});
-    defer output.deinit();
-    try std.testing.expectEqual(@as(usize, 4), mock.describes);
-    try std.testing.expectEqual(@as(usize, 1), mock.executions);
-    try std.testing.expect(mock.saw_statement_unchanged);
-    try std.testing.expect(mock.saw_binding_guard);
-    try std.testing.expectEqual(@as(i64, 9007199254740993), mock.seen_parameter.?);
-    const observed_tags = try tags(std.testing.allocator, output.written());
-    defer std.testing.allocator.free(observed_tags);
-    try std.testing.expect(std.mem.endsWith(u8, observed_tags, "1tT23TDsDCZ"));
-    try std.testing.expectEqual(@as(usize, 1), mock.releases);
-    try std.testing.expectEqual(@as(usize, 1), mock.disconnects);
+    for ([_]bool{ false, true }) |native| {
+        var mock: Mock = .{ .native_parameters = native };
+        var output = try run(&mock, input.written(), .{});
+        defer output.deinit();
+        try std.testing.expectEqual(@as(usize, 4), mock.describes);
+        try std.testing.expectEqual(@as(usize, 1), mock.executions);
+        try std.testing.expect(mock.saw_statement_unchanged);
+        try std.testing.expect(mock.saw_binding_guard);
+        try std.testing.expectEqual(@as(i64, 9007199254740993), mock.seen_parameter.?);
+        const observed_tags = try tags(std.testing.allocator, output.written());
+        defer std.testing.allocator.free(observed_tags);
+        try std.testing.expect(std.mem.endsWith(u8, observed_tags, "1tT23TDsDCZ"));
+        try std.testing.expectEqual(@as(usize, 1), mock.releases);
+        try std.testing.expectEqual(@as(usize, 1), mock.disconnects);
+    }
 }
 
 test "pgwire failed extended pipeline ignores queued execute until sync" {

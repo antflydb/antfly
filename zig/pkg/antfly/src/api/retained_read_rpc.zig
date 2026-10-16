@@ -79,6 +79,9 @@ pub fn execute(alloc: std.mem.Allocator, owner: owner_mod.Owner, scope: registry
 }
 
 pub fn executeWithPageFormat(alloc: std.mem.Allocator, owner: owner_mod.Owner, scope: registry.Scope, table: []const u8, input: Request, native: bool) ![]u8 {
+    return executeWithCodec(alloc, owner, scope, table, input, if (native) .v1 else .json);
+}
+pub fn executeWithCodec(alloc: std.mem.Allocator, owner: owner_mod.Owner, scope: registry.Scope, table: []const u8, input: Request, format: native_page.Format) ![]u8 {
     if (input.schema_version != scope.schema_version) return error.RetainedReadScopeChanged;
     if (input.lease_ms == 0 or input.lease_ms > max_lease_ms) return error.InvalidRetainedReadLease;
     const deadline = time.monotonicNs() +| @as(u64, input.lease_ms) * std.time.ns_per_ms;
@@ -152,7 +155,7 @@ pub fn executeWithPageFormat(alloc: std.mem.Allocator, owner: owner_mod.Owner, s
             // Cursor has advanced. Encoding failure poisons it instead of
             // allowing a retry to omit a page without an explicit failure.
             errdefer owner.registry.close(token, scope) catch {};
-            if (native) return native_page.encode(alloc, input.sequence, page.rows, page.after);
+            if (format != .json) return native_page.encodeVersion(alloc, input.sequence, page.rows, page.after, if (format == .v2) .v2 else .v1);
             return encodeLegacyPage(alloc, input.sequence, page.rows, page.after);
         },
         .range_proofs => {
@@ -224,7 +227,7 @@ pub fn encode(alloc: std.mem.Allocator, response: Response) ![]u8 {
 /// A response owns all strings and exact number lexemes. SQL-null metadata is
 /// mandatory and aligned; otherwise a JSON null could silently become SQL NULL.
 pub fn decodePage(alloc: std.mem.Allocator, bytes: []const u8, sequence: u64, schema_version: u32, limit: u32) !reads.RelationalReadView.Page {
-    if (std.mem.startsWith(u8, bytes, native_page.magic)) return native_page.decode(alloc, bytes, sequence, schema_version, limit);
+    if (native_page.isNative(bytes)) return native_page.decode(alloc, bytes, sequence, schema_version, limit);
     if (limit == 0 or limit > 4096 or bytes.len > max_response_bytes) return error.InvalidRetainedReadPage;
     var arena = std.heap.ArenaAllocator.init(alloc);
     errdefer arena.deinit();
@@ -252,7 +255,7 @@ fn consumerTests() type {
     return struct {
         test "retained read RPC native pages preserve typed payloads and legacy negotiation" {
             const Probe = struct {
-                fn run(a: std.mem.Allocator) !void {
+                fn run(a: std.mem.Allocator, version: @import("antfly_local_sources").sql_spill.ColumnarVersion) !void {
                     const src = @import("antfly_local_sources");
                     var arena = std.heap.ArenaAllocator.init(a);
                     defer arena.deinit();
@@ -265,16 +268,17 @@ fn consumerTests() type {
                     const layout = try src.sql_catalog.Row.TypedLayout.init(owned, &.{ "a", "n", "j", "z", "missing", "f", "_id" });
                     const values = [_]src.sql_catalog.Row.Cell{ .typedArray(&array.value), .typedNumeric(&number.value), .json(.null), .{}, .{}, .json(.{ .float = std.math.nan(f64) }), .json(.{ .string = "payload-id" }) };
                     const rows = [_]reads.RelationalReadView.Row{.{ .id = "row", .version = std.math.maxInt(u64), .schema_version = 3, .value = .null, .typed_cells = .{ .layout = layout, .values = &values, .presence = &.{ true, true, true, true, false, true, true } }, .expected_content_digest = @splat(7) }};
-                    const bytes = try native_page.encode(a, 4, &rows, "next");
+                    const bytes = try native_page.encodeVersion(a, 4, &rows, "next", version);
                     defer a.free(bytes);
                     var page = try decodePage(a, bytes, 4, 3, 1);
                     defer page.deinit();
                     const row: src.sql_catalog.Row = .{ .id = page.rows[0].id, .version = page.rows[0].version, .value = page.rows[0].value, .typed_cells = page.rows[0].typed_cells };
                     try std.testing.expectEqual(@as(u64, std.math.maxInt(u64)), row.version);
                     try std.testing.expectEqual(@as([32]u8, @splat(7)), page.rows[0].expected_content_digest.?);
-                    try std.testing.expectEqual(@as(i64, 9007199254740993), (try row.cell("a")).array.?.elements[0].value.integer);
+                    try std.testing.expectEqual(@as(i64, 9007199254740993), (try row.cell("a")).array.?.flatCell(0).value.integer);
                     try std.testing.expectEqual(@as(i32, 0), (try row.cell("a")).array.?.dimensions[0].lower);
-                    try std.testing.expect((try row.cell("a")).array.?.elements[1].sql_null);
+                    try std.testing.expect((try row.cell("a")).array.?.flatCell(1).sql_null);
+                    try std.testing.expectEqual(version == .v2, (try row.cell("a")).array.?.stored != null);
                     const text = try src.sql_numeric_value.format(&context, (try row.cell("n")).numeric.?.*);
                     defer a.free(text);
                     try std.testing.expectEqualStrings("9007199254740993.1200", text);
@@ -294,27 +298,29 @@ fn consumerTests() type {
                     try std.testing.expect(std.math.isNan(legacy_float.value.float));
                     @memset(bytes, 0);
                     try std.testing.expectEqualStrings("row", row.id);
-                    try std.testing.expectEqual(@as(i64, -7), (try row.cell("a")).array.?.elements[2].value.integer);
+                    try std.testing.expectEqual(@as(i64, -7), (try row.cell("a")).array.?.flatCell(2).value.integer);
                 }
             };
-            try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Probe.run, .{});
+            for ([_]@import("antfly_local_sources").sql_spill.ColumnarVersion{ .v1, .v2 }) |version| try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Probe.run, .{version});
         }
 
         test "retained read RPC native pages reject truncation identity and invalid framing" {
             const a = std.testing.allocator;
             const row: reads.RelationalReadView.Row = .{ .id = "a", .version = 2, .schema_version = 3, .value = .{ .object = .empty }, .sql_nulls = &.{} };
-            const bytes = try native_page.encode(a, 4, &.{row}, null);
-            defer a.free(bytes);
-            for (0..bytes.len) |length| {
-                if (native_page.decode(a, bytes[0..length], 4, 3, 1)) |value| {
-                    var page = value;
-                    page.deinit();
-                    return error.AcceptedTruncatedNativePage;
-                } else |_| {}
+            for ([_]@import("antfly_local_sources").sql_spill.ColumnarVersion{ .v1, .v2 }) |version| {
+                const bytes = try native_page.encodeVersion(a, 4, &.{row}, null, version);
+                defer a.free(bytes);
+                for (0..bytes.len) |length| {
+                    if (native_page.decode(a, bytes[0..length], 4, 3, 1)) |value| {
+                        var page = value;
+                        page.deinit();
+                        return error.AcceptedTruncatedNativePage;
+                    } else |_| {}
+                }
+                try std.testing.expectError(error.InvalidRetainedReadPage, native_page.decode(a, bytes, 5, 3, 1));
+                try std.testing.expectError(error.InvalidRetainedReadPage, native_page.decode(a, bytes, 4, 2, 1));
+                try std.testing.expectError(error.InvalidRetainedReadPage, native_page.decode(a, bytes, 4, 3, 0));
             }
-            try std.testing.expectError(error.InvalidRetainedReadPage, native_page.decode(a, bytes, 5, 3, 1));
-            try std.testing.expectError(error.InvalidRetainedReadPage, native_page.decode(a, bytes, 4, 2, 1));
-            try std.testing.expectError(error.InvalidRetainedReadPage, native_page.decode(a, bytes, 4, 3, 0));
         }
 
         test "retained read RPC native pages tile both axes without losing presence" {
@@ -330,18 +336,20 @@ fn consumerTests() type {
             for (cells, 0..) |*cell, index| cell.* = .json(.{ .integer = @intCast(index) });
             const rows = try owned.alloc(reads.RelationalReadView.Row, 257);
             for (rows, 0..) |*row, index| row.* = .{ .id = try std.fmt.allocPrint(owned, "r{d}", .{index}), .version = index, .schema_version = 3, .value = .null, .typed_cells = .{ .layout = layout, .values = cells } };
-            const bytes = try native_page.encode(a, 4, rows, "next");
-            defer a.free(bytes);
-            var page = try decodePage(a, bytes, 4, 3, 257);
-            defer page.deinit();
-            try std.testing.expectEqual(@as(usize, 257), page.rows.len);
-            try std.testing.expectEqualStrings("r256", page.rows[256].id);
-            try std.testing.expect(page.rows[256].typed_cells.?.columnar != null);
-            try std.testing.expectEqual(@as(usize, 0), page.rows[256].typed_cells.?.values.len);
-            const value = try page.rows[256].typed_cells.?.at(1024);
-            try std.testing.expectEqual(@as(i64, 1024), value.value.integer);
-            try std.testing.expect(!value.sql_null);
-            try std.testing.expectEqualStrings("next", page.after.?);
+            for ([_]@import("antfly_local_sources").sql_spill.ColumnarVersion{ .v1, .v2 }) |version| {
+                const bytes = try native_page.encodeVersion(a, 4, rows, "next", version);
+                defer a.free(bytes);
+                var page = try decodePage(a, bytes, 4, 3, 257);
+                defer page.deinit();
+                try std.testing.expectEqual(@as(usize, 257), page.rows.len);
+                try std.testing.expectEqualStrings("r256", page.rows[256].id);
+                try std.testing.expect(page.rows[256].typed_cells.?.columnar != null);
+                try std.testing.expectEqual(@as(usize, 0), page.rows[256].typed_cells.?.values.len);
+                const value = try page.rows[256].typed_cells.?.at(1024);
+                try std.testing.expectEqual(@as(i64, 1024), value.value.integer);
+                try std.testing.expect(!value.sql_null);
+                try std.testing.expectEqualStrings("next", page.after.?);
+            }
         }
 
         test "retained read RPC validates exact typed page identity and null metadata" {

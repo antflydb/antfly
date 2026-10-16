@@ -347,6 +347,18 @@ pub fn viewLeaky(a: A, expected: arrays.ElementType, bytes: []const u8, options:
     return .{ .element_type = expected, .dimensions = dimensions, .stored = owned_view };
 }
 
+/// Validated immutable payload already owned by the caller's region or lease.
+/// Only shape/view metadata is allocated; payload bytes are never copied.
+pub fn borrowLeaky(a: A, expected: arrays.ElementType, bytes: []const u8, options: Options) !arrays.Value {
+    if (!@import("array_compact.zig").supported(expected)) return (try decodeLeaky(a, expected, bytes, options)).value;
+    const view = try validateCanonical(a, expected, bytes, options);
+    const axes = try a.alloc(arrays.Dimension, view.rank);
+    for (axes, 0..) |*axis, index| axis.* = try view.dimension(index);
+    const owned = try a.create(layout.View);
+    owned.* = view;
+    return .{ .element_type = expected, .dimensions = axes, .stored = owned };
+}
+
 /// Owns all decoded payloads in the caller's region; no scratch-allocator
 /// references escape in nested JSON arrays. Callers destroy the region on error.
 pub fn decodeLeaky(backing: A, expected: arrays.ElementType, bytes: []const u8, options: Options) !Decoded {

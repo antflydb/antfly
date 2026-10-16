@@ -32,6 +32,7 @@ pub const Limits = struct {
     native_result: bool = false,
     /// Prepared transport cells; execution takes one owned typed copy.
     parameter_cells: ?[]const Datum = null,
+    parameter_owner: ?@import("parameter_frame.zig").PayloadLease = null,
     error_context: ?*@import("errors.zig").Context = null,
     result_rows: usize = 128,
     mutation_rows: usize = 4096,
@@ -44,6 +45,12 @@ pub const Limits = struct {
     scan_pages: usize = 65_536,
     spill_bytes: u64 = 1024 * 1024 * 1024,
     spill_root: []const u8 = "/tmp",
+    pub fn workingMemory(self: Limits) !usize {
+        const bytes = if (self.parameter_owner) |owner| owner.bytes else 0;
+        if (self.parameter_owner != null and self.parameter_cells == null) return error.InvalidSqlParameters;
+        if (bytes >= self.retained_bytes) return error.SqlWorkingMemoryLimitExceeded;
+        return self.retained_bytes - bytes;
+    }
     pub fn executionRows(self: Limits) u32 {
         return @intCast(@min(self.execution_batch_rows, @max(@as(usize, 1), self.retained_bytes / (16 * 1024))));
     }
@@ -142,8 +149,9 @@ pub fn execute(alloc: std.mem.Allocator, backend: catalog.Backend, compiled: *co
         pinned_settings = try @import("setting_catalog.zig").View.capture(alloc, capture.owner, capture.scope, capture.overlay);
         statement_backend.settings_view = &pinned_settings.?;
     }
+    const memory = try limits.workingMemory();
     const state = try alloc.create(Result.State);
-    state.budget = .{ .backing = alloc, .limit = limits.retained_bytes };
+    state.budget = .{ .backing = alloc, .limit = memory };
     state.regex_execution = .init(state.budget.allocator(), @min(16 * 1024 * 1024, limits.retained_bytes));
     statement_backend.regex_execution = &state.regex_execution;
     state.arena = std.heap.ArenaAllocator.init(state.budget.allocator());
@@ -212,7 +220,7 @@ fn runBound(alloc: std.mem.Allocator, arena: std.mem.Allocator, backend: catalog
     var statement_backend = backend;
     statement_backend.execution_binding_validator = null;
     statement_backend.parameter_invocation = binding.parameter_invocation;
-    if (binding.parameter_invocation) |invocation| try invocation.prepareNativeOrJson(alloc, parameters, limits.parameter_cells, .{ .bytes = limits.retained_bytes, .wire_bytes = limits.retained_bytes, .error_context = backend.error_context });
+    if (binding.parameter_invocation) |invocation| try invocation.prepareNativeOrJson(alloc, parameters, limits.parameter_cells, .{ .bytes = limits.retained_bytes, .wire_bytes = limits.retained_bytes, .error_context = backend.error_context, .payload_owner = limits.parameter_owner });
     defer if (binding.parameter_invocation) |invocation| invocation.deinitFrame();
     const prepared_parameters = if (binding.parameter_invocation) |invocation| try invocation.compatibilityValues(arena) else parameters;
     var manager: ?@import("spill.zig").Manager = null;
@@ -5763,12 +5771,13 @@ test "SQL native transport does not retain execution pattern callbacks" {
 test "SQL native transport parameters retain arrays numeric JSON null and source ownership" {
     const Probe = struct {
         fn checkpoint(_: *anyopaque) !void {}
-        fn run(a: std.mem.Allocator) !void {
-            var inputs = std.heap.ArenaAllocator.init(a);
-            defer inputs.deinit();
+        fn run(a: std.mem.Allocator, leased: bool) !void {
+            const inputs = try @import("parameter_frame.zig").Ingress.create(a, 1024 * 1024);
+            var live = true;
+            defer if (live) inputs.release();
             const owned = inputs.allocator();
             const array = try owned.create(@import("array_value.zig").Value);
-            array.* = (try @import("array_text.zig").decodeLeaky(owned, .int64, "[-1:1]={9007199254740993,NULL,-7}", .{})).value;
+            array.* = (try @import("array_text.zig").decodeLeaky(owned, .int64, "[-1:1]={9007199254740993,NULL,-7}", .{ .compact = leased })).value;
             var ctx: @import("numeric_value.zig").Context = .{ .alloc = owned };
             const number = try @import("numeric_value.zig").parse(&ctx, "9007199254740993.1200");
             const cells = [_]Datum{ .typedArray(array), .typedNumeric(&number.value), .json(.null), .{} };
@@ -5776,9 +5785,10 @@ test "SQL native transport parameters retain arrays numeric JSON null and source
             const backend: catalog.Backend = .{ .ptr = &marker, .vtable = &.{ .resolve = undefined, .scan = undefined, .mutate = undefined, .checkpoint = checkpoint } };
             var compiled = try compiler.compile(a, "SELECT $1::bigint[], $2::numeric, $3::jsonb, $4::numeric", .{});
             defer compiled.deinit();
-            var result = try execute(a, backend, &compiled, &.{ .null, .null, .null, .null }, .{ .native_result = true, .parameter_cells = &cells });
+            var result = try execute(a, backend, &compiled, &.{ .null, .null, .null, .null }, .{ .native_result = true, .parameter_cells = &cells, .parameter_owner = if (leased) inputs.lease() else null });
             defer result.deinit();
-            _ = inputs.reset(.free_all);
+            inputs.release();
+            live = false;
             const row = result.output.native_rows.?[0];
             try std.testing.expectEqual(@as(i64, 9007199254740993), row[0].array.?.flatCell(0).value.integer);
             try std.testing.expectEqual(@as(i32, -1), row[0].array.?.dimensions[0].lower);
@@ -5791,5 +5801,5 @@ test "SQL native transport parameters retain arrays numeric JSON null and source
             try std.testing.expect(row[3].sql_null);
         }
     };
-    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Probe.run, .{});
+    for ([_]bool{ false, true }) |leased| try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Probe.run, .{leased});
 }

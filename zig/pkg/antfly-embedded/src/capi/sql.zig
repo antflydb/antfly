@@ -609,40 +609,51 @@ pub fn Adapter(comptime native: type) type {
                 const count = @min(self.result.hits.len - self.position, limit);
                 const rows = try a.alloc(catalog.Row, count);
                 const layout = try self.layout.clone(a);
-                var source_layout: ?catalog.Row.TypedLayout = null;
+                const score_slot = layout.ordinals.get("score");
+                const highlight_slot = layout.ordinals.get("_highlights");
                 var produced: usize = 0;
                 var bytes: usize = 0;
-                for (self.result.hits[self.position..][0..count], rows) |hit, *out| {
+                while (produced < count and bytes < 256 * 1024) {
                     if (self.reader) |*reader| {
-                        const row = (try reader.lookupSqlRowWithLayout(a, hit.id, &source_layout)) orelse return error.SqlStatementReadUnavailable;
-                        const source: catalog.Row = .{ .id = row.key, .version = row.version, .value = .null, .typed_cells = row.typed_cells, .expected_content_digest = row.expected_content_digest };
-                        const values = try a.alloc(catalog.Row.Cell, layout.names.len);
-                        const presence = try a.alloc(bool, values.len);
-                        for (layout.names, values, presence) |field, *cell, *present| {
-                            if (std.mem.eql(u8, field, "score")) {
-                                cell.* = if (hit.score) |score| catalog.Row.Cell.json(.{ .float = score }) else .{};
-                                present.* = true;
-                            } else if (std.mem.eql(u8, field, "_highlights")) {
-                                const highlights = try highlightsValueLeaky(a, hit.highlights);
-                                cell.* = if (highlights) |value| catalog.Row.Cell.json(value) else .{};
-                                present.* = highlights != null;
-                            } else {
-                                cell.* = try source.cell(field);
-                                present.* = try source.hasField(field);
+                        // Large highlight JSON is hydrated one row at a time;
+                        // ordinary rank metadata fits the native row budget.
+                        const n = @min(count - produced, if (highlight_slot != null) @as(usize, 1) else 64);
+                        var ids: [64][]const u8 = undefined;
+                        for (self.result.hits[self.position + produced ..][0..n], 0..) |hit, i| ids[i] = hit.id;
+                        const batch = try reader.lookupSqlBatch(a, ids[0..n], layout, 256 * 1024 - bytes);
+                        for (batch.rows, self.result.hits[self.position + produced ..][0..batch.consumed], rows[produced..][0..batch.consumed]) |candidate, hit, *out| {
+                            const row = candidate orelse return error.SqlStatementReadUnavailable;
+                            const cells = row.typed_cells.?;
+                            // These newly allocated page cells are unpublished
+                            // and exclusively owned until this method returns.
+                            const values = @constCast(cells.values);
+                            const presence = @constCast(cells.presence.?);
+                            if (score_slot) |slot| {
+                                values[slot] = if (hit.score) |score| catalog.Row.Cell.json(.{ .float = score }) else .{};
+                                presence[slot] = true;
                             }
+                            if (highlight_slot) |slot| {
+                                const highlights = try highlightsValueLeaky(a, hit.highlights);
+                                values[slot] = if (highlights) |value| catalog.Row.Cell.json(value) else .{};
+                                presence[slot] = highlights != null;
+                            }
+                            out.* = .{ .id = row.key, .version = row.version, .value = .null, .typed_cells = cells, .expected_content_digest = row.expected_content_digest };
+                            bytes +|= out.id.len;
+                            for (values) |value| bytes +|= try dependencies.sql_operators.datumBytes(value);
                         }
-                        out.* = .{ .id = row.key, .version = row.version, .value = .null, .typed_cells = .{ .layout = layout, .values = values, .presence = presence }, .expected_content_digest = row.expected_content_digest };
+                        produced += batch.consumed;
                     } else {
+                        const hit = self.result.hits[self.position + produced];
                         var document = if (hit.source_value) |value| try types.cloneJsonValue(a, value) else if (hit.stored_data) |data| try std.json.parseFromSliceLeaky(std.json.Value, a, data, .{ .parse_numbers = false }) else return error.InvalidSqlBackendResponse;
                         if (document != .object) return error.InvalidSqlBackendResponse;
                         try document.object.put(a, "score", if (hit.score) |score| .{ .float = score } else .null);
                         if (try highlightsValueLeaky(a, hit.highlights)) |value| try document.object.put(a, "_highlights", value) else _ = document.object.swapRemove("_highlights");
+                        const out = &rows[produced];
                         out.* = try self.projection.projectValue(a, hit.id, 0, document);
+                        bytes +|= out.id.len;
+                        for (try out.fieldNames()) |name| bytes +|= try dependencies.sql_operators.datumBytes(try out.cell(name));
+                        produced += 1;
                     }
-                    produced += 1;
-                    bytes +|= out.id.len;
-                    for (try out.fieldNames()) |name| bytes +|= try dependencies.sql_operators.datumBytes(try out.cell(name));
-                    if (bytes >= 256 * 1024) break;
                 }
                 const end = self.position + produced;
                 const after = if (end < self.result.hits.len) try std.fmt.allocPrint(a, "{d}", .{end}) else null;

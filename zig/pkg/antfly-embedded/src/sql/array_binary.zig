@@ -21,7 +21,7 @@ const arrays = @import("array_value.zig");
 const uuid = @import("../common/uuid.zig");
 const MemoryBudget = @import("memory_budget.zig");
 const A = std.mem.Allocator;
-pub const Options = struct { values: arrays.Limits = .{}, wire_bytes: usize = 8 * 1024 * 1024 };
+pub const Options = struct { compact: bool = false, values: arrays.Limits = .{}, wire_bytes: usize = 8 * 1024 * 1024 };
 
 fn jsonSize(value: std.json.Value) !usize {
     var counter: std.Io.Writer.Discarding = .init(&.{});
@@ -207,6 +207,37 @@ fn decodeAdmitted(a: A, owner: A, expected: arrays.ElementType, bytes: []const u
     // Each cell requires at least its signed length prefix. Reject impossible
     // shapes before attempting a count-sized allocation.
     if (count > (bytes.len - reader.position) / 4) return error.InvalidSqlBinaryRepresentation;
+    if (options.compact and @import("array_compact.zig").supported(expected)) {
+        var probe = reader;
+        var non_null: usize = 0;
+        var payload: usize = 0;
+        for (0..count) |_| {
+            const length = try probe.int(i32);
+            if (length == -1) continue;
+            if (length < -1) return error.InvalidSqlBinaryRepresentation;
+            const raw = try probe.take(@intCast(length));
+            non_null += 1;
+            payload = try std.math.add(usize, payload, raw.len);
+        }
+        if (probe.position != bytes.len) return error.InvalidSqlBinaryRepresentation;
+        var builder = try @import("array_compact.zig").Builder.init(a, expected, dimensions[0..@intCast(rank)], count, non_null, payload, options.values);
+        for (0..count) |_| {
+            const length = try reader.int(i32);
+            if (length == -1) {
+                try builder.append(.{});
+                continue;
+            }
+            const raw = try reader.take(@intCast(length));
+            if (expected == .text) {
+                try work.consume(raw.len);
+                if (!std.unicode.utf8ValidateSlice(raw)) return error.SqlInvalidTextEncoding;
+                if (std.mem.indexOfScalar(u8, raw, 0) != null) return error.SqlUntranslatableCharacter;
+                try builder.append(.json(.{ .string = raw }));
+            } else try builder.append(try decodeElementLeaky(a, expected, raw, &work));
+        }
+        try work.consume(builder.bytes.len + count);
+        return .{ .value = try builder.finish(a, options.values), .work = options.values.work - work.remaining };
+    }
     const cells = try a.alloc(arrays.Element, count);
     for (cells) |*cell| {
         const length = try reader.int(i32);

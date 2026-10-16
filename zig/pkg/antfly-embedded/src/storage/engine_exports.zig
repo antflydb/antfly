@@ -733,6 +733,10 @@ fn relationalReaderNextTypedPage(self: *@import("db/relational_rows.zig").Reader
     return .{ .value = self.nextTypedPage(alloc, received_io, budget) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
 
+fn relationalReaderLookupSqlBatch(self: *@import("db/relational_rows.zig").Reader, alloc: Allocator, documents: []const []const u8, layout: @import("../sql/catalog.zig").Row.TypedLayout, max_bytes: usize) engine.Outcome(@import("db/relational_rows.zig").Reader.Hydrated) {
+    return .{ .value = self.lookupSqlBatch(alloc, documents, layout, max_bytes) catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
+
 fn relationalReaderLookupTypedRow(self: *@import("db/relational_rows.zig").Reader, alloc: Allocator, document: []const u8, native_cells: bool, shared: ?*?@import("../sql/catalog.zig").Row.TypedLayout) engine.Outcome(?@import("db/relational_rows.zig").Row) {
     return .{ .value = (if (native_cells) if (shared) |layout| self.lookupSqlRowWithLayout(alloc, document, layout) else self.lookupSqlRow(alloc, document) else self.lookupTypedRow(alloc, document)) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }

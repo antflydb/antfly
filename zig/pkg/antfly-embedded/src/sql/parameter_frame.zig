@@ -273,7 +273,58 @@ test "SQL prepared parameter frames match PostgreSQL descriptors values and diag
         return error.ExpectedPostgresRejection;
     }
 }
+/// Immutable ingress payload ownership. A frame may borrow compact arrays
+/// only with an explicit lease, charged against its retained-memory budget.
+pub const PayloadLease = struct {
+    ptr: *anyopaque,
+    bytes: usize,
+    retain_fn: *const fn (*anyopaque) void,
+    release_fn: *const fn (*anyopaque) void,
+    pub fn retain(self: PayloadLease) void {
+        self.retain_fn(self.ptr);
+    }
+    pub fn release(self: PayloadLease) void {
+        self.release_fn(self.ptr);
+    }
+};
+
+/// Stable arena identity for transport decoding, independent of portal moves.
+/// After publishing lease(), callers must treat this region as immutable.
+pub const Ingress = struct {
+    alloc: A,
+    budget: MemoryBudget,
+    arena: std.heap.ArenaAllocator,
+    refs: std.atomic.Value(usize) = .init(1),
+    pub fn create(a: A, bytes: usize) !*Ingress {
+        const self = try a.create(Ingress);
+        self.* = .{ .alloc = a, .budget = .{ .backing = a, .limit = bytes }, .arena = undefined };
+        self.arena = .init(self.budget.allocator());
+        return self;
+    }
+    pub fn allocator(self: *Ingress) A {
+        return self.arena.allocator();
+    }
+    pub fn lease(self: *Ingress) PayloadLease {
+        return .{ .ptr = self, .bytes = self.budget.live, .retain_fn = retainRaw, .release_fn = releaseRaw };
+    }
+    fn retainRaw(raw: *anyopaque) void {
+        const self: *Ingress = @ptrCast(@alignCast(raw));
+        _ = self.refs.fetchAdd(1, .monotonic);
+    }
+    fn releaseRaw(raw: *anyopaque) void {
+        const self: *Ingress = @ptrCast(@alignCast(raw));
+        self.release();
+    }
+    pub fn release(self: *Ingress) void {
+        if (self.refs.fetchSub(1, .acq_rel) != 1) return;
+        self.arena.deinit();
+        std.debug.assert(self.budget.live == 0);
+        self.alloc.destroy(self);
+    }
+};
+
 pub const Limits = struct {
+    payload_owner: ?PayloadLease = null,
     error_context: ?*@import("errors.zig").Context = null,
     bytes: usize = @import("resource_limits.zig").default_memory_bytes,
     wire_bytes: usize = @import("resource_limits.zig").request_bytes,
@@ -426,6 +477,7 @@ test "SQL datetime parameters preserve signed epoch instants across JSON and tex
 }
 
 pub const Frame = struct {
+    payload_owner: ?PayloadLease = null,
     arena: *std.heap.ArenaAllocator,
     budget: *MemoryBudget,
     descriptors: []const scalar.Type,
@@ -457,6 +509,7 @@ pub const Frame = struct {
         self.budget.allocator().destroy(self.arena);
         std.debug.assert(self.budget.live == 0);
         backing.destroy(self.budget);
+        if (self.payload_owner) |owner| owner.release();
         self.* = undefined;
     }
 
@@ -466,15 +519,18 @@ pub const Frame = struct {
             try scalar.validateParameterType(descriptor);
             if (descriptor.kind == null) return error.UnknownSqlParameterType;
         }
+        const leased_bytes = if (limits.payload_owner) |owner| owner.bytes else 0;
+        if (leased_bytes > limits.bytes) return error.SqlProgramLimitExceeded;
         const budget = try backing.create(MemoryBudget);
         errdefer backing.destroy(budget);
-        budget.* = .{ .backing = backing, .limit = limits.bytes };
+        budget.* = .{ .backing = backing, .limit = limits.bytes - leased_bytes };
         const arena = budget.allocator().create(std.heap.ArenaAllocator) catch |err| return if (err == error.OutOfMemory and budget.exhausted) error.SqlProgramLimitExceeded else err;
         errdefer budget.allocator().destroy(arena);
         arena.* = std.heap.ArenaAllocator.init(budget.allocator());
         errdefer arena.deinit();
         const decoded = prepareLeaky(arena.allocator(), descriptors, inputs, limits) catch |err| return if (err == error.OutOfMemory and budget.exhausted) error.SqlProgramLimitExceeded else err;
-        return .{ .arena = arena, .budget = budget, .descriptors = decoded.descriptors, .values = decoded.values, .work = decoded.work };
+        if (limits.payload_owner) |owner| owner.retain();
+        return .{ .payload_owner = limits.payload_owner, .arena = arena, .budget = budget, .descriptors = decoded.descriptors, .values = decoded.values, .work = decoded.work };
     }
 };
 
@@ -531,6 +587,7 @@ fn decodeInput(a: A, descriptor: scalar.Type, input: Input, limits: Limits, work
             if (array.element_type != kind) return error.ConflictingSqlParameterTypes;
             if (value.patterns != null or value.value != .null) return error.SqlTypeMismatch;
             _ = try array.validateWithBudget(.{ .bytes = limits.bytes, .elements = limits.elements }, work);
+            if (array.stored != null and limits.payload_owner != null) return value;
             return operators.cloneDatum(a, value);
         }
         const value = try a.create(arrays.Value);
@@ -618,4 +675,61 @@ test "SQL NUL parameters retain position for nested JSONB strings keys and TEXT"
         try std.testing.expectEqual(@as(?usize, 2), diagnostic.parameter_index);
         try std.testing.expect(std.mem.indexOf(u8, diagnostic.message, "parameter $2") != null);
     }
+}
+
+test "SQL native parameter payload leases survive transport release and every allocation failure" {
+    const Probe = struct {
+        fn run(a: A) !void {
+            const ingress = try Ingress.create(a, 1024 * 1024);
+            var transport_live = true;
+            defer if (transport_live) ingress.release();
+            const input = try ingress.allocator().create(arrays.Value);
+            input.* = (try text.decodeLeaky(ingress.allocator(), .text, "[-1:1]={\"é\",NULL,\"retained\"}", .{ .compact = true })).value;
+            const descriptor = [_]scalar.Type{.{ .kind = .array, .element_type = .text }};
+            var first = try Frame.prepare(a, &descriptor, &.{.{ .datum = .typedArray(input) }}, .{ .payload_owner = ingress.lease() });
+            var first_live = true;
+            defer if (first_live) first.deinit();
+            var second = try Frame.prepare(a, &descriptor, &.{.{ .datum = .typedArray(input) }}, .{ .payload_owner = ingress.lease() });
+            defer second.deinit();
+            try std.testing.expectEqual(@intFromPtr(input), @intFromPtr(second.values[0].array.?));
+            try std.testing.expectError(error.SqlProgramLimitExceeded, Frame.prepare(a, &descriptor, &.{.{ .datum = .typedArray(input) }}, .{ .payload_owner = ingress.lease(), .bytes = ingress.lease().bytes - 1 }));
+            ingress.release();
+            transport_live = false;
+            first.deinit();
+            first_live = false;
+            try std.testing.expectEqualStrings("retained", second.values[0].array.?.flatCell(2).value.string);
+            try std.testing.expect(second.values[0].array.?.flatCell(1).sql_null);
+            try std.testing.expectEqual(@as(i32, -1), second.values[0].array.?.dimensions[0].lower);
+        }
+    };
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Probe.run, .{});
+}
+
+test "SQL native parameter payload leases avoid compact frame copies" {
+    const a = std.testing.allocator;
+    const test_alloc = @import("../storage/lite/test_allocator.zig");
+    const ingress = try Ingress.create(a, 1024 * 1024);
+    defer ingress.release();
+    const elements = try a.alloc(arrays.Element, 32768);
+    defer a.free(elements);
+    @memset(elements, .json(.{ .integer = 42 }));
+    const value = try arrays.Value.init(.int64, &.{.{ .length = 32768 }}, elements, .{});
+    const bytes = try @import("array_storage.zig").encodeAlloc(a, value, .{});
+    defer a.free(bytes);
+    const compact = try ingress.allocator().create(arrays.Value);
+    compact.* = try @import("array_storage.zig").viewLeaky(ingress.allocator(), .int64, bytes, .{});
+    var peaks: [2]usize = undefined;
+    for ([_]bool{ false, true }, 0..) |leased, i| {
+        var nr: test_alloc.NoResizeAllocator = .{ .backing = a };
+        var budget: test_alloc.BudgetAllocator = .{ .backing = nr.allocator() };
+        {
+            var frame = try Frame.prepare(budget.allocator(), &.{.{ .kind = .array, .element_type = .int64 }}, &.{.{ .datum = .typedArray(compact) }}, .{ .payload_owner = if (leased) ingress.lease() else null });
+            defer frame.deinit();
+            try std.testing.expectEqual(@as(i64, 42), frame.values[0].array.?.flatCell(32767).value.integer);
+            peaks[i] = budget.peak;
+        }
+        try std.testing.expectEqual(@as(usize, 0), budget.live);
+    }
+    try std.testing.expect(peaks[1] < peaks[0] / 8);
+    std.debug.print("SQL native leased parameter frame: copied_peak={} leased_peak={} retained_payload={}\n", .{ peaks[0], peaks[1], ingress.lease().bytes });
 }

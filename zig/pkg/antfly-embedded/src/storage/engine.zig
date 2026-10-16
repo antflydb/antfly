@@ -327,6 +327,7 @@ pub const VTable = struct {
     relationalReaderDeinit: *const fn (self: *@import("db/relational_rows.zig").Reader) Outcome(void),
     relationalReaderNextPage: *const fn (self: *@import("db/relational_rows.zig").Reader, alloc: Allocator, io: ?native.IoBorrow, budget: @import("db/relational_rows.zig").Budget) Outcome(@import("db/relational_rows.zig").Page),
     relationalReaderNextTypedPage: *const fn (self: *@import("db/relational_rows.zig").Reader, alloc: Allocator, io: ?native.IoBorrow, budget: @import("db/relational_rows.zig").Budget) Outcome(@import("db/relational_rows.zig").Page),
+    relationalReaderLookupSqlBatch: *const fn (self: *@import("db/relational_rows.zig").Reader, alloc: Allocator, documents: []const []const u8, layout: @import("../sql/catalog.zig").Row.TypedLayout, max_bytes: usize) Outcome(@import("db/relational_rows.zig").Reader.Hydrated),
     relationalReaderLookupTypedRow: *const fn (self: *@import("db/relational_rows.zig").Reader, alloc: Allocator, document: []const u8, native_cells: bool, shared: ?*?@import("../sql/catalog.zig").Row.TypedLayout) Outcome(?@import("db/relational_rows.zig").Row),
     relationalSessionDeinit: *const fn (session: *@import("db/relational_read_session.zig").Session) Outcome(void),
     relationalSessionCheckpoint: *const fn (session: *const @import("db/relational_read_session.zig").Session) Outcome(void),

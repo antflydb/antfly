@@ -41,6 +41,7 @@ pub const Request = struct {
     scratch_allocator: ?std.mem.Allocator = null,
     parameters: []const std.json.Value = &.{},
     parameter_cells: ?[]const @import("antfly_local_sources").sql_scalar.Datum = null,
+    parameter_owner: ?@import("antfly_local_sources").sql_parameter_frame.PayloadLease = null,
     parameter_types: []const Type = &.{},
     parameter_descriptors: []const Parameter = &.{},
     database: ?[]const u8 = null,

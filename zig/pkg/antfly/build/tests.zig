@@ -596,6 +596,13 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
     b.step("antfly-relational-index-system-test", "Run LSM index lifecycle, standby replay, and work-count benchmarks").dependOn(&addCuratedTestRunArtifact(b, relational_index_system_tests, relational_index_system_tests.filters).step);
+    const native_ranked_hydration_tests = b.addTest(.{
+        .root_module = relational_index_system_mod,
+        .filters = &.{"relational index system query lease typed point hydration"},
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("antfly-native-ranked-hydration-test", "Verify ranked batch hydration ownership, quotas, snapshots and allocations")
+        .dependOn(&addFilteredTestRunArtifact(b, native_ranked_hydration_tests).step);
     const native_row_projection_tests = b.addTest(.{
         .root_module = relational_index_system_mod,
         .filters = &.{ "ordinal native SQL", "ordinal typed projection" },

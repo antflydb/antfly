@@ -1431,11 +1431,25 @@ pub const OrdinalRowView = struct {
     /// directly, without public JSON envelopes or decimal formatting. All
     /// payloads belong to the caller's page arena before the cursor advances.
     pub fn projectSqlDatumsAlloc(self: OrdinalRowView, alloc: Allocator, plan: OrdinalProjectionPlan) !DatumProjection {
+        return self.projectSqlDatumsMappedAlloc(alloc, plan, null);
+    }
+
+    /// Write directly in the requested output layout. Slots absent from this
+    /// historical schema (or reserved for ranking metadata) stay absent NULLs.
+    pub fn projectSqlDatumsMappedAlloc(self: OrdinalRowView, alloc: Allocator, plan: OrdinalProjectionPlan, output: ?@import("../../../sql/catalog.zig").Row.TypedLayout) !DatumProjection {
         if (plan.schema_version != self.table_schema.version) return error.RelationalRowSchemaMismatch;
         const Datum = @import("../../../sql/scalar.zig").Datum;
-        const values = try alloc.alloc(Datum, plan.ordinals.len);
-        const presence = try alloc.alloc(bool, plan.ordinals.len);
-        for (plan.ordinals, values, presence) |ordinal, *value, *present| {
+        const width = if (output) |layout| layout.names.len else plan.ordinals.len;
+        const values = try alloc.alloc(Datum, width);
+        const presence = try alloc.alloc(bool, width);
+        if (output != null) {
+            @memset(values, .{});
+            @memset(presence, false);
+        }
+        for (plan.ordinals, 0..) |ordinal, index| {
+            const slot = if (output) |layout| layout.ordinals.get(self.table_schema.relational_columns[ordinal].name) orelse continue else index;
+            const value = &values[slot];
+            const present = &presence[slot];
             const cell = (try self.findCell(ordinal)) orelse {
                 value.* = .{};
                 present.* = false;

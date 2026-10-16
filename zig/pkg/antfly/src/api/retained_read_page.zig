@@ -24,6 +24,17 @@ const Datum = catalog.Row.Cell;
 const A = std.mem.Allocator;
 pub const media_type = "application/vnd.antfly.sql-page.v1";
 pub const magic = "ARP\x01";
+pub const compact_magic = "ARP\x02";
+pub const compact_media_type = "application/vnd.antfly.sql-page.v2";
+pub const Format = enum { json, v1, v2 };
+pub fn formatForAccept(accept: []const u8) Format {
+    if (std.mem.eql(u8, accept, compact_media_type)) return .v2;
+    if (std.mem.eql(u8, accept, media_type)) return .v1;
+    return .json;
+}
+pub fn isNative(bytes: []const u8) bool {
+    return std.mem.startsWith(u8, bytes, magic) or std.mem.startsWith(u8, bytes, compact_magic);
+}
 // ARP1 freezes NCB1, including its native value encodings. Incompatible spill
 // or cell codec changes require a new media type, not silent wire evolution.
 const block_magic = "NCB\x01";
@@ -35,8 +46,11 @@ fn blob(w: *std.Io.Writer, bytes: []const u8) !void {
 }
 
 pub fn encode(alloc: A, sequence: u64, rows: []const View.Row, after: ?[]const u8) ![]u8 {
+    return encodeVersion(alloc, sequence, rows, after, .v1);
+}
+pub fn encodeVersion(alloc: A, sequence: u64, rows: []const View.Row, after: ?[]const u8, version: spill.ColumnarVersion) ![]u8 {
     var output_budget: sources.sql_memory_budget = .{ .backing = alloc, .limit = max_bytes };
-    return encodeBounded(alloc, &output_budget, sequence, rows, after) catch |err| {
+    return encodeBounded(alloc, &output_budget, sequence, rows, after, version) catch |err| {
         if (output_budget.exhausted) return error.RetainedReadPageTooLarge;
         // Every writer in this memory-only codec is allocating. Preserve the
         // allocator failure identity rather than leaking Writer.WriteFailed.
@@ -70,7 +84,7 @@ const RowPlan = struct {
     }
 };
 
-fn encodeBounded(alloc: A, output_budget: *sources.sql_memory_budget, sequence: u64, rows: []const View.Row, after: ?[]const u8) ![]u8 {
+fn encodeBounded(alloc: A, output_budget: *sources.sql_memory_budget, sequence: u64, rows: []const View.Row, after: ?[]const u8, version: spill.ColumnarVersion) ![]u8 {
     if (rows.len > 4096) return error.InvalidRetainedReadPage;
     var out: std.Io.Writer.Allocating = .init(output_budget.allocator());
     defer out.deinit();
@@ -109,7 +123,7 @@ fn encodeBounded(alloc: A, output_budget: *sources.sql_memory_budget, sequence: 
     }
 
     const w = &out.writer;
-    try w.writeAll(magic);
+    try w.writeAll(if (version == .v1) magic else compact_magic);
     try w.writeInt(u64, sequence, .little);
     try w.writeInt(u32, @intCast(rows.len), .little);
     try w.writeInt(u32, @intCast(names.count()), .little);
@@ -144,8 +158,8 @@ fn encodeBounded(alloc: A, output_budget: *sources.sql_memory_budget, sequence: 
                 for (values, column..) |*value, ordinal| value.* = try plan.value(names.keys(), ordinal);
                 target.* = .{ .values = values, .keys = &.{}, .ordinal = first + index };
             }
-            const bytes = try spill.encodeColumnarBlockAlloc(b, block, max_bytes);
-            if (!std.mem.startsWith(u8, bytes, block_magic)) return error.InvalidRetainedReadPage;
+            const bytes = try spill.encodeColumnarBlockVersionAlloc(b, block, max_bytes, version);
+            if (!std.mem.startsWith(u8, bytes, if (version == .v1) block_magic else "NCB\x02")) return error.InvalidRetainedReadPage;
             try blob(w, bytes);
             column += width;
         }
@@ -187,7 +201,9 @@ pub fn decode(alloc: A, bytes: []const u8, sequence: u64, schema_version: u32, l
     const a = budget.allocator();
     const owned = try a.dupe(u8, bytes);
     var r: Reader = .{ .bytes = owned };
-    if (!std.mem.eql(u8, try r.take(magic.len), magic) or try r.int(u64) != sequence) return error.InvalidRetainedReadPage;
+    const format = try r.take(magic.len);
+    const compact = std.mem.eql(u8, format, compact_magic);
+    if ((!compact and !std.mem.eql(u8, format, magic)) or try r.int(u64) != sequence) return error.InvalidRetainedReadPage;
     const count = try r.int(u32);
     const width = try r.int(u32);
     if (count > limit or width > 65536 or (count == 0 and width != 0)) return error.InvalidRetainedReadPage;
@@ -223,7 +239,7 @@ pub fn decode(alloc: A, bytes: []const u8, sequence: u64, schema_version: u32, l
         for (blocks) |*block| {
             const k = @min(1024, width - column);
             const encoded = try r.required();
-            if (!std.mem.startsWith(u8, encoded, block_magic)) return error.InvalidRetainedReadPage;
+            if (!std.mem.startsWith(u8, encoded, if (compact) "NCB\x02" else block_magic)) return error.InvalidRetainedReadPage;
             block.* = try spill.decodeColumnarBlockInArena(a, encoded, max_bytes);
             if (block.count() != n or block.values.len != k or block.keys.len != 0) return error.InvalidRetainedReadPage;
             for (rows[first..][0..n], 0..) |row, index| {

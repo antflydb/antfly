@@ -227,7 +227,7 @@ envelope. Materialized SELECT and mutation RETURNING results use the same typed
 sink as blocking SQL operators. The result owner keeps cells alive until the
 protocol releases the result. HTTP SQL continues to request public JSON results.
 
-Private retained-read paging negotiates `application/vnd.antfly.sql-page.v1`
+Private retained-read paging negotiates `application/vnd.antfly.sql-page.v2`
 through Accept. New peers exchange bounded native column blocks, preserving
 array bounds, exact NUMERIC, missing fields, SQL NULL, JSON null, schema epochs,
 sequence numbers, and primary digests. Control messages and authentication are
@@ -239,28 +239,52 @@ HTTP scan support alone cannot provide statement snapshot semantics.
 
 Bind parameters and SQL EXECUTE arguments now carry typed Datums into one
 execution-owned frame. Array envelopes and NUMERIC formatting remain at public
-JSON compatibility boundaries. Parameter frames own their payloads before a
+JSON compatibility boundaries. Parameter frames own or lease their payloads before a
 stream can outlive its opening request.
 
 Retained pages keep decoded column blocks behind cell accessors. Coordinated
 merging leases source pages instead of deep-copying their payloads; output pages
 can survive cursor closure. Field mappings are compiled once per source layout.
+Peers negotiate ARP2/NCB2 for compact array payloads. ARP1/NCB1 is unchanged for
+old clients; a new client accepts the existing JSON response when an old owner
+ignores its v2 Accept header. Internal temporary spill records use compact
+arrays too, borrowing only leased/page-owned input bytes.
 
 Primitive and text SQL arrays retain canonical storage bytes, with
 `cardinality()` and `flatCell()` accessors. Cloning preserves the compact form;
-encoders and operators accept both representations. NUMERIC, UUID and JSONB
+encoders and operators accept both representations. Native Bind decodes these
+arrays directly into compact buffers. Its immutable, reference-counted ingress
+region gives execution frames an explicit payload lease; frame and statement
+admission include retained payload capacity, and portal/cursor closure release
+their references independently. NUMERIC, UUID and JSONB
 arrays retain their existing decoded representation. Lite ranked cursors capture
 ranking and a primary snapshot together, release the writer-excluding lease,
 and hydrate requested pages bounded by row demand and a 256 KiB payload target.
+Sorted primary microbatches contain at most 64 identities, restore ranking
+order, and project directly into one final cell/presence vector per row.
+Highlight-heavy delivery uses one-row batches. Source read scopes start with a
+2 MiB allocation limit and shrink the batch on quota exhaustion; a single
+oversized row may use a 32 MiB source scope. Predicate scratch resets per row
+and retains at most 256 KiB.
 A single row retains the existing native row-size ceiling.
 
 The native Bind allocation regression uses a 32,768-element bigint array and
 an arena over a non-resizing allocator: public-envelope decoding peaks at
-17,106,262 bytes versus 3,932,232 bytes for native cells (77% lower). The compact
+17,106,262 bytes versus 399,446 bytes for compact native cells (97.7% lower).
+The previous expanded native path used 3,932,232 bytes. The compact
 stored-array regression peaks at 399,446 bytes versus 3,932,392 bytes for expanded
 elements (90% lower). These are isolated ReleaseFast allocation measurements;
-fixture inputs and final pgwire frames are excluded. Page bytes, ownership
-copies, actual JSON/JSONB payloads, and wire output still have costs.
+fixture inputs and final pgwire frames are excluded. A leased parameter frame
+adds 494 bytes in
+Debug, compared with 400,342 bytes when copying the compact payload; its
+399,770-byte ingress region remains retained and counted. NCB2 decoding adds
+928 bytes of metadata over an already owned 266,312-byte input, compared with
+3,933,016 bytes of expanded decoding for the 327,760-byte NCB1 input in
+ReleaseFast. The encoded input buffers are excluded from those decoder figures.
+Page bytes, ownership copies, actual JSON/JSONB payloads, and wire output still
+have costs. The Debug 64-row hydration fixture reduces backing allocations
+from 76 to 13, while peak backing increases from 29,252 to 87,094 bytes for the
+bounded source scope. These fixtures do not establish server RSS or throughput.
 
 Focused regression gates (from `zig/`, with the repository's Zig version):
 
@@ -269,5 +293,5 @@ zig build sql-test pgwire-test -Doptimize=ReleaseFast
 zig build sql-test -Dtest-filter='SQL compact stored array' -Dtest-filter='SQL native transport' -Doptimize=Debug
 zig build antfly-api-sql-native-cells-test antfly-api-table-read-test -Doptimize=Debug
 zig build antfly-coordinated-read-set-test antfly-storage-owner-test -Doptimize=Debug
-zig build antfly-native-row-projection-test -Doptimize=Debug
+zig build antfly-native-row-projection-test antfly-native-ranked-hydration-test -Doptimize=Debug
 ```
