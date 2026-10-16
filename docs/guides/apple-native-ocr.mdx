@@ -117,7 +117,8 @@ borrowed buffers until the native task actually finishes.
 ## Try OCR in Antfarm
 
 With a server built using `-Dapple-providers=true`, open **Inference → Reader
-Playground** and select **Apple Vision OCR**. Upload PNG/JPEG images or choose
+Playground**, select the **Local inference** connection, and choose **Apple Vision OCR**.
+Configured remote connections do not offer native OCR. Upload PNG/JPEG images or choose
 **Load Sample**, then **Read Images**. Select accurate or fast recognition and
 enter comma-separated language codes, such as `en-US, fr-FR`. Accurate mode is
 the default. Results include text, confidence, and pixel-coordinate regions.

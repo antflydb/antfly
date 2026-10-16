@@ -162,8 +162,10 @@ const ChunkingPlaygroundPage: React.FC = () => {
     [connectedModels]
   );
   const availableModels = useMemo(
-    () => Array.from(new Set(["fixed", ...connectionModels])),
-    [connectionModels]
+    // Do not treat the built-in fallback as the complete inventory before
+    // discovery finishes: it would replace a valid model deep link.
+    () => (modelsLoading ? [] : Array.from(new Set(["fixed", ...connectionModels]))),
+    [connectionModels, modelsLoading]
   );
   const modelsLoaded = !modelsLoading;
   const { model: selectedModel, setModel: setSelectedModel } = useModelSelection({
@@ -194,6 +196,7 @@ const ChunkingPlaygroundPage: React.FC = () => {
   }, [config.model, selectedModel]);
 
   const handleChunk = useCallback(async () => {
+    if (!modelsLoaded) return;
     if (!inputText.trim()) {
       setError("Please enter some text to chunk");
       return;
@@ -247,7 +250,7 @@ const ChunkingPlaygroundPage: React.FC = () => {
     } finally {
       if (finishAbortableRequest(abortControllerRef, controller)) setIsLoading(false);
     }
-  }, [inputText, config, inferenceUrl]);
+  }, [inputText, config, inferenceUrl, modelsLoaded]);
 
   // Cmd+Enter shortcut
   useEffect(() => {
@@ -517,7 +520,7 @@ const ChunkingPlaygroundPage: React.FC = () => {
           <FormActions>
             <AIWorkflowSubmitButton
               onClick={handleChunk}
-              disabled={isLoading || !inputText.trim()}
+              disabled={isLoading || !modelsLoaded || !inputText.trim()}
               running={isLoading}
               runningLabel="Processing"
               onCancel={() => {

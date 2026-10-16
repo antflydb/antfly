@@ -20429,6 +20429,7 @@ pub const Node = struct {
         return stripRuntimeTaskPrefix(identifier);
     }
 
+    /// Build the response graph and temporary identifiers in a caller-owned arena.
     fn runtimeModelsAlloc(
         self: *Node,
         allocator: std.mem.Allocator,
@@ -20502,7 +20503,9 @@ pub const Node = struct {
     }
 
     pub fn listModelRuntimes(self: *Node, ctx: *httpx.Context) !httpx.Response {
-        const models = try self.runtimeModelsAlloc(ctx.allocator, ctx.io, null, null);
+        var arena = std.heap.ArenaAllocator.init(ctx.allocator);
+        defer arena.deinit();
+        const models = try self.runtimeModelsAlloc(arena.allocator(), ctx.io, null, null);
         return ctx.json(antfarm_models.ModelRuntimeResponse{ .object = "model_runtime", .models = models });
     }
 
@@ -20566,7 +20569,9 @@ pub const Node = struct {
             handle.release();
         }
 
-        const models = try self.runtimeModelsAlloc(ctx.allocator, ctx.io, runtime_id, request.task);
+        var arena = std.heap.ArenaAllocator.init(ctx.allocator);
+        defer arena.deinit();
+        const models = try self.runtimeModelsAlloc(arena.allocator(), ctx.io, runtime_id, request.task);
         if (models.len == 0) {
             return ctx.json(antfarm_models.ModelRuntimeLoadResponse{
                 .outcome = "loaded",
@@ -28349,7 +28354,7 @@ test "runtime unload bypasses inference admission while load remains admitted" {
     try std.testing.expectEqual(InferenceHttpRouteAdmission.none, inferenceHttpRouteAdmission("GET", "/_antfarm/models/status"));
 }
 
-test "runtime model snapshot keeps a published runtime visible after its manifest disappears" {
+test "runtime model status releases allocations and keeps a published runtime visible after its manifest disappears" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -28419,6 +28424,23 @@ test "runtime model snapshot keeps a published runtime visible after its manifes
     try std.testing.expectEqualStrings("owner/removed", models[0].model);
     try std.testing.expectEqual(@as(usize, 1), models[0].runtimes.len);
     try std.testing.expectEqualStrings("00000000000000000000000000001234", models[0].runtimes[0].runtime_id);
+
+    // Exercise the HTTP handler with a leak-checking allocator, rather than
+    // letting the fixture's arena hide allocations retained by status polling.
+    for (0..3) |_| {
+        var request = try httpx.Request.init(allocator, .GET, "/ai/v1/_antfarm/models/status");
+        defer request.deinit();
+        var ctx = httpx.Context.init(allocator, std.testing.io, &request);
+        defer ctx.deinit();
+        var response = try node.listModelRuntimes(&ctx);
+        defer response.deinit();
+        try std.testing.expectEqual(@as(u16, 200), response.status.code);
+        const parsed = try std.json.parseFromSlice(antfarm_models.ModelRuntimeResponse, allocator, response.body.?, .{});
+        defer parsed.deinit();
+        try std.testing.expectEqual(@as(usize, 1), parsed.value.models.len);
+        try std.testing.expectEqualStrings("owner/removed", parsed.value.models[0].model);
+        try std.testing.expectEqualStrings("00000000000000000000000000001234", parsed.value.models[0].runtimes[0].runtime_id);
+    }
 }
 
 test "read model resolution falls back to generators and keeps reader precedence" {

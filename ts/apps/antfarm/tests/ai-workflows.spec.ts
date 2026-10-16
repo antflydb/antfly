@@ -397,6 +397,31 @@ test.describe("AI workflow routes", () => {
     }
   });
 
+  test("chunker deep links survive delayed model discovery", async ({ page }) => {
+    let release!: () => void;
+    const catalogReady = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    await page.route("**/db/v1/connections?**", async (route) => {
+      await catalogReady;
+      await route.fulfill({ json: connections });
+    });
+    try {
+      await page.goto(
+        "/inference/playground/chunk?model=mock-semantic-chunker-second&connection=local-inference&table=docs&index=semantic"
+      );
+      await expect(page.getByRole("heading", { name: "Chunking Playground" })).toBeVisible();
+      await expect(page.getByRole("button", { name: "Chunk", exact: true })).toBeDisabled();
+      expect(new URL(page.url()).searchParams.get("model")).toBe("mock-semantic-chunker-second");
+    } finally {
+      release();
+    }
+    await expect(
+      page.getByText("mock-semantic-chunker-second", { exact: true }).first()
+    ).toBeVisible();
+    expect(new URL(page.url()).searchParams.get("model")).toBe("mock-semantic-chunker-second");
+  });
+
   test("Models opens the selected model in its connection-aware playground", async ({ page }) => {
     await page.goto("/inference/models");
     await page.getByRole("button", { name: "View details for mock-reader-second" }).click();
@@ -479,6 +504,36 @@ test.describe("AI workflow routes", () => {
     await page.getByRole("button", { name: "Read Images" }).click();
     await expect(page.getByText("Invoice 12345", { exact: true }).first()).toBeVisible();
     await expect(page.getByRole("tab", { name: /Regions/ })).toBeVisible();
+  });
+
+  test("Apple OCR is only offered on the local inference connection", async ({ page }) => {
+    const remote = {
+      ...connections.connections[0],
+      id: "remote-inference",
+      name: "remote-inference",
+      display_name: "Remote inference",
+    };
+    await page.route("**/db/v1/connections?**", (route) =>
+      route.fulfill({
+        json: { connections: [connections.connections[0], remote], supported: true },
+      })
+    );
+    await page.route("**/ai/v1/_antfarm/readers", (route) =>
+      route.fulfill({ json: { apple_ocr: { available: true } } })
+    );
+    await page.goto(
+      "/inference/playground/read?connection=remote-inference&model=apple-vision-ocr"
+    );
+    await expect(page.getByLabel("Inference connection")).toHaveValue("remote-inference");
+    await expect(page.getByLabel("Reader", { exact: true })).toBeEnabled();
+    await page.getByLabel("Reader", { exact: true }).click();
+    await expect(page.getByRole("option", { name: "Apple Vision OCR" })).toHaveCount(0);
+    await expect(page.getByRole("option", { name: "mock-reader", exact: true })).toBeVisible();
+    await page.keyboard.press("Escape");
+    await page.getByLabel("Inference connection").selectOption("local-inference");
+    await expect(page.getByLabel("Reader", { exact: true })).toBeEnabled();
+    await page.getByLabel("Reader", { exact: true }).click();
+    await expect(page.getByRole("option", { name: "Apple Vision OCR" })).toBeVisible();
   });
 
   test("unavailable Apple OCR never becomes a selectable reader", async ({ page }) => {

@@ -7,10 +7,16 @@ export const APPLE_OCR_READER = "apple-vision-ocr";
 /** Availability belongs to the selected server, never the browser's OS. */
 export function useAppleOcr() {
   const { inferenceApiUrl, inferenceConnectionId } = useApiConfig();
+  const localConnection = inferenceConnectionId === "local-inference";
   const endpoint = `${inferenceApiUrl}/ai/v1/_antfarm/readers`;
   const identity = `${inferenceConnectionId}:${endpoint}`;
   const [state, setState] = useState({ identity: "", available: false, loading: true });
   useEffect(() => {
+    // Connection proxies do not expose the private Apple OCR routes.
+    if (!localConnection) {
+      setState({ identity, available: false, loading: false });
+      return;
+    }
     const controller = new AbortController();
     setState({ identity, available: false, loading: true });
     void fetchInferenceJson<{ apple_ocr?: { available: boolean } }>(endpoint, {
@@ -25,6 +31,7 @@ export function useAppleOcr() {
         if (!controller.signal.aborted) setState({ identity, available: false, loading: false });
       });
     return () => controller.abort();
-  }, [endpoint, identity]);
+  }, [endpoint, identity, localConnection]);
+  if (!localConnection) return { available: false, loading: false };
   return state.identity === identity ? state : { available: false, loading: true };
 }
