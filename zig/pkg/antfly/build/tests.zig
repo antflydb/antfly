@@ -2952,6 +2952,15 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         },
     });
     const lib_storage_test_step = b.step("antfly-storage-test", "Run local and server storage tests");
+    const graph_ttl_migration_tests = b.addTest(.{
+        .name = "graph-ttl-migration-tests",
+        .root_module = antfly_test_mod,
+        .filters = selectTestFilters(b, &.{ "graph ttl migration", "db graph ttl shared GC" }),
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("graph-ttl-migration-test", "Run bounded graph expiry namespace migration and reader fences")
+        .dependOn(&addFilteredTestRunArtifact(b, graph_ttl_migration_tests).step);
+
     const coordinated_read_set_tests = b.addTest(.{
         .root_module = antfly_test_mod,
         .filters = &.{"relational index system coordinated read set"},

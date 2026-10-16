@@ -4237,7 +4237,13 @@ pub const DB = struct {
                 if (opts.defer_index_backfill_on_open) try db.core.loadIndexesDeferredBackfill() else try db.core.loadIndexes();
                 profile.load_indexes_ns = elapsedSince(load_indexes_started_ns);
             }
-            if (!openModeRequiresReadOnlyBackends(opts.open_mode)) try finishGraphMergeImport(&db, null);
+            if (!openModeRequiresReadOnlyBackends(opts.open_mode)) {
+                for (db.core.index_manager.graph_indexes.items) |entry| if (entry.ttl_duration_ns != 0) {
+                    try db.core.index_manager.aggregateAuthoritativeReaderVersion(db.core.store, resolver_catalog_mod.graph_expiration_namespace_reader_version);
+                    break;
+                };
+                try finishGraphMergeImport(&db, null);
+            }
             // Validate the physical snapshot while the opened generation is
             // still untouched by replay and background workers. Status can
             // then retain this proof as live writes advance past the durable
@@ -115191,6 +115197,77 @@ test "db graph ttl direct cleanup cannot delete a replaced artifact" {
     var edge = try enrichment_artifact_codec.decodeGraphEdgeAlloc(alloc, artifact);
     defer edge.deinit(alloc);
     try std.testing.expectEqual(@as(f64, 3), edge.weight);
+}
+
+test "db graph ttl migration cold writer fences legacy expiry without changing readonly files" {
+    const alloc = std.testing.allocator;
+    const resolver_catalog = @import("catalog/resolver_catalog.zig");
+    const migration = @import("maintenance/graph_ttl_migration.zig");
+    var path_tmp = try TestDirectory.init("db-graph-ttl-legacy-namespace");
+    defer path_tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    const resolution = try internal_keys.resolutionArtifactKeyAlloc(scratch, "doc:a", "resolver");
+    var promotion: std.ArrayList(u8) = .empty;
+    try promotion.appendSlice(scratch, &internal_keys.promoted_keys_state_prefix);
+    try internal_keys.appendEncodedComponent(&promotion, scratch, resolution);
+    var deadline: u64 = 0;
+    {
+        var db = try DB.open(alloc, path_tmp.path(), .{ .start_optional_runtimes = false });
+        defer db.close();
+        try db.addIndex(.{ .name = "g", .kind = .graph, .config_json = "{\"ttl\":{\"duration\":\"1h\"}}" });
+        try db.batch(.{ .writes = &.{.{ .key = "doc:a", .value = "{\"_edges\":{\"g\":{\"links\":[{\"target\":\"doc:b\"}]}}}" }}, .sync_level = .full_index });
+        const rows = try db.core.store.scanPrefix(alloc, &internal_keys.graph_edge_expiration_index_prefix);
+        defer docstore_mod.DocStore.freeResults(alloc, rows);
+        try std.testing.expectEqual(@as(usize, 1), rows.len);
+        deadline = try graph_edge_ttl_expiration.deadlineFromKey(rows[0].key);
+        const legacy = try scratch.dupe(u8, rows[0].key);
+        @memcpy(legacy[0..internal_keys.legacy_graph_edge_expiration_index_prefix.len], &internal_keys.legacy_graph_edge_expiration_index_prefix);
+        // Reconstruct the old writer's durable representation, including the
+        // mixed family and pre-migration reader fence. No worker is running.
+        var txn = try db.core.store.beginWriteTxn();
+        errdefer txn.abort();
+        try txn.put(legacy, rows[0].value);
+        try txn.delete(rows[0].key);
+        try txn.put(promotion.items, "promotion state");
+        try txn.put(resolver_catalog.minimum_reader_key, "3");
+        try txn.delete("\x00\x00__metadata__:resolvers");
+        try txn.delete(migration.progress_key);
+        try txn.commit();
+    }
+    {
+        var db = try DB.open(alloc, path_tmp.path(), .{ .open_mode = .query_readonly, .start_optional_runtimes = false });
+        defer db.close();
+        const floor = try db.core.store.get(alloc, resolver_catalog.minimum_reader_key);
+        defer alloc.free(floor);
+        try std.testing.expectEqualStrings("3", floor);
+        const rows = try db.core.store.scanPrefix(alloc, &internal_keys.legacy_graph_edge_expiration_index_prefix);
+        defer docstore_mod.DocStore.freeResults(alloc, rows);
+        try std.testing.expectEqual(@as(usize, 2), rows.len);
+        try std.testing.expectError(error.NotFound, db.core.store.get(alloc, migration.progress_key));
+    }
+    {
+        var db = try DB.open(alloc, path_tmp.path(), .{ .start_optional_runtimes = false });
+        defer db.close();
+        {
+            var read = try db.core.store.beginReadTxn();
+            defer read.abort();
+            try std.testing.expectError(error.UnsupportedDatabaseReaderVersion, resolver_catalog.readMinimumReaderVersion(&read, 3));
+        }
+        var clock = platform_clock.ManualClock{};
+        clock.setRealtimeNs(deadline + 1);
+        try initStoppedTtlRuntimeForTest(&db, .{ .enabled = true, .grace_period_ns = 0, .clock = clock.clock() });
+        try db.ttl_runtime.?.runOnce();
+        try std.testing.expectEqual(@as(u64, 1), db.ttl_runtime.?.stats().expired_graph_artifacts);
+        try std.testing.expectEqual(@as(u64, 0), db.ttl_runtime.?.stats().error_count);
+        const preserved = try db.core.store.get(alloc, promotion.items);
+        defer alloc.free(preserved);
+        try std.testing.expectEqualStrings("promotion state", preserved);
+        const edges = try db.getEdges(alloc, "g", "doc:a", "links", .out);
+        defer graph_mod.GraphIndex.freeEdges(alloc, edges);
+        try std.testing.expectEqual(@as(usize, 0), edges.len);
+    }
 }
 
 test "db graph ttl due index rebuild resumes after reopen" {

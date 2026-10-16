@@ -377,6 +377,7 @@ pub const storage_db_maintenance_sparse_compaction_runtime = @import("storage/db
 pub const storage_db_maintenance_text_merge_runtime = @import("storage/db/maintenance/text_merge_runtime.zig");
 pub const storage_db_maintenance_transaction_recovery_driver = @import("storage/db/maintenance/transaction_recovery_driver.zig");
 pub const storage_db_maintenance_transaction_runtime = @import("storage/db/maintenance/transaction_runtime.zig");
+pub const storage_db_maintenance_graph_ttl_migration = @import("storage/db/maintenance/graph_ttl_migration.zig");
 pub const storage_db_maintenance_ttl_runtime = @import("storage/db/maintenance/ttl_runtime.zig");
 pub const storage_db_merge_artifact_catalog = @import("storage/db/merge_artifact_catalog.zig");
 pub const storage_db_merge_cardinality = @import("storage/db/merge_cardinality.zig");

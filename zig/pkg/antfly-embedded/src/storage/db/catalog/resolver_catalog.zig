@@ -63,7 +63,30 @@ fn cloneLabels(alloc: Allocator, labels: []const []const u8) ![]const []const u8
 
 /// Monotonic feature epoch, published with catalog mutations and checked before parsing.
 pub const minimum_reader_key = "\x00\x00__metadata__:minimum_reader_version";
-pub const supported_reader_version: u32 = 3;
+pub const replacement_reader_base_key = "\x00\x00__metadata__:replacement_reader_base_v1";
+pub const graph_expiration_namespace_reader_version: u32 = 4;
+pub const supported_reader_version: u32 = graph_expiration_namespace_reader_version;
+
+pub fn readerVersionBytes(version: u32) ![]const u8 {
+    return switch (version) {
+        1 => "1",
+        2 => "2",
+        3 => "3",
+        4 => "4",
+        else => error.UnsupportedDatabaseReaderVersion,
+    };
+}
+
+pub fn versionedCatalog(a: Allocator, data: []const u8, version: u32) ![]u8 {
+    var parsed = try std.json.parseFromSlice(std.json.Value, a, data, .{});
+    defer parsed.deinit();
+    if (parsed.value == .array) {
+        return try std.fmt.allocPrint(a, "{{\"version\":{d},\"resolvers\":{s}}}", .{ version, data });
+    }
+    if (parsed.value != .object) return error.InvalidResolverConfig;
+    try parsed.value.object.put(parsed.arena.allocator(), "version", .{ .integer = version });
+    return try std.json.Stringify.valueAlloc(a, parsed.value, .{});
+}
 
 pub fn catalogReaderVersion(a: Allocator, data: []const u8) !u32 {
     const parsed = try std.json.parseFromSlice(std.json.Value, a, data, .{});
@@ -72,7 +95,7 @@ pub fn catalogReaderVersion(a: Allocator, data: []const u8) !u32 {
     var required: u32 = if (parsed.value == .object) @intCast(parsed.value.object.get("version").?.integer) else 1;
     for (rows.array.items) |entry| {
         if (entry != .object) return error.InvalidResolverConfig;
-        if (entry.object.contains("replacement_index") or entry.object.contains("replacement_resolver")) return 3;
+        if (entry.object.contains("replacement_index") or entry.object.contains("replacement_resolver")) required = @max(required, 3);
         for ([_][]const u8{ "inline_managed", "retired", "aliases", "promote", "merge_generation", "merge_state_version", "resolution_generation", "namespace_generation", "retain_work", "max_work_bytes" }) |field| {
             if (entry.object.contains(field)) required = @max(required, 2);
         }
@@ -90,9 +113,21 @@ pub fn readMinimumReaderVersion(txn: anytype, supported: u32) !u32 {
     return version;
 }
 
+/// Exclude temporary replacement reservations when proving a permanent format
+/// upgrade. A migration completion marker must outlive cancellation of a job.
+pub fn readAuthoritativeReaderVersion(txn: anytype, supported: u32) !u32 {
+    const raw = txn.get(replacement_reader_base_key) catch |err| switch (err) {
+        error.NotFound => return readMinimumReaderVersion(txn, supported),
+        else => return err,
+    };
+    const version = try std.fmt.parseInt(u32, raw, 10);
+    if (version == 0 or version > supported) return error.UnsupportedDatabaseReaderVersion;
+    return version;
+}
+
 pub fn stampMinimumReaderVersion(a: Allocator, txn: anytype, catalog: []const u8) !u32 {
     const version = @max(try readMinimumReaderVersion(txn, supported_reader_version), try catalogReaderVersion(a, catalog));
-    try txn.put(minimum_reader_key, if (version == 1) "1" else if (version == 2) "2" else "3");
+    try txn.put(minimum_reader_key, try readerVersionBytes(version));
     return version;
 }
 
@@ -864,4 +899,14 @@ test "capi resolver reader epochs fence older readers and remain monotonic" {
     try std.testing.expectEqual(@as(u32, 2), try stampMinimumReaderVersion(a, &txn, "[]"));
     txn.value = "3";
     try std.testing.expectError(error.UnsupportedDatabaseReaderVersion, readMinimumReaderVersion(&txn, 2));
+}
+
+test "graph ttl migration catalog epoch remains authoritative with replacement fields" {
+    const a = std.testing.allocator;
+    const old = "{\"version\":3,\"resolvers\":[{\"replacement_index\":\"shadow\"}]}";
+    const fenced = try versionedCatalog(a, old, 4);
+    defer a.free(fenced);
+    try std.testing.expectEqual(@as(u32, 4), try catalogReaderVersion(a, fenced));
+    try std.testing.expectEqualStrings("4", try readerVersionBytes(4));
+    try std.testing.expectError(error.UnsupportedDatabaseReaderVersion, readerVersionBytes(5));
 }

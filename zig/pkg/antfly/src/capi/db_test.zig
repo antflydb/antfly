@@ -6276,6 +6276,7 @@ fn testNativeIdleResolverDebt(notified_tail: bool, ttl_failure: bool) !void {
             try db_mod.enrichment_state.saveRuntimeStatus(database.core.store, "generated", .{ .target_sequence = target });
         }
         if (ttl_failure) {
+            try database.core.index_manager.aggregateAuthoritativeReaderVersion(database.core.store, 4);
             // A bad independent expiry page must remain visible without
             // preventing resolver/promotion replay from advancing.
             const keys = @import("antfly_local_sources").storage_internal_keys;

@@ -226,6 +226,7 @@ comptime {
     _ = @import("antfly_local_sources").storage_db_maintenance_sparse_compaction_runtime;
     _ = @import("antfly_local_sources").storage_db_maintenance_text_merge_runtime;
     _ = @import("antfly_local_sources").storage_db_maintenance_transaction_runtime;
+    _ = @import("antfly_local_sources").storage_db_maintenance_graph_ttl_migration;
     _ = @import("antfly_local_sources").storage_db_maintenance_ttl_runtime;
     _ = @import("antfly_local_sources").storage_db_merge_contract;
     _ = @import("antfly_local_sources").storage_db_merge_page_system_test;

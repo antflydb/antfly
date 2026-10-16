@@ -463,6 +463,7 @@ pub const Owner = struct {
         live: bool = true,
         ttl: h.db_mod.types.TTLCleanupStats = .{},
         last_ttl_error: ?anyerror = null,
+        next_ttl_ns: i96 = 0,
     };
     const ttl_counter_fields = .{ "acquisition_count", "runs", "scanned_timestamps", "deleted_docs", "scanned_graph_candidates", "expired_graph_sources", "expired_graph_artifacts", "error_count", "lease_acquire_failures", "lost_leases" };
 
@@ -494,13 +495,13 @@ pub const Owner = struct {
     // Owner lifetime, rather than DB-runtime lifetime: snapshot refreshes must
     // not reset a table's replay/construction alternation.
     maintenance_schedules: std.AutoHashMapUnmanaged(MaintenanceKey, MaintenanceSchedule) = .empty,
-    next_ttl_ns: i96 = 0,
     wake: std.Io.Event = .unset,
     current: ?*h.Handle = null,
     retired: std.ArrayList(*h.Handle) = .empty,
     maintenance_snapshot: ?*h.Handle = null,
     maintenance_table_cursor: usize = 0,
     maintenance_round_pending: bool = false,
+    maintenance_round_ttl_pending: bool = false,
     maintenance_capture_misses: u8 = 0,
     // Connection-owner lifetime totals, protected by the path gate. They survive
     // foreground runtime refreshes and distinguish conflicts from a moving tip.
@@ -934,15 +935,16 @@ pub const Owner = struct {
         // TTL is a short publication for the selected table, never a drain of
         // every namespace under one file lease.
         const now = std.Io.Clock.awake.now(io).nanoseconds;
-        if (now >= self.next_ttl_ns) {
-            // A failed last-table pass still completes this TTL scheduling
-            // round. Propagate its error and let the next capture reconcile
-            // authority, but do not run the same failing cleanup before every
-            // producer/resolver turn until it permanently starves replay.
-            defer if (self.maintenance_table_cursor == 0) {
+        var ttl_more = false;
+        if (now >= schedule.next_ttl_ns) {
+            // Each namespace owns its cleanup cadence. Failure still consumes
+            // this slot and propagates for authority reconciliation; bounded
+            // successful pages yield briefly without delaying other tables.
+            defer {
                 const config = self.options.ttl_cleanup orelse h.db_mod.ttl_runtime.Config{};
-                self.next_ttl_ns = now + @as(i96, config.interval_ms) * std.time.ns_per_ms;
-            };
+                const delay = if (ttl_more) config.page_interval_ms else config.interval_ms;
+                schedule.next_ttl_ns = now + @as(i96, @max(1, delay)) * std.time.ns_per_ms;
+            }
             if (database.ttl_runtime) |ttl| {
                 const before = ttl.stats();
                 defer recordTtlTurn(&schedule.ttl, before, ttl.stats());
@@ -954,8 +956,10 @@ pub const Owner = struct {
                     return err;
                 };
                 schedule.last_ttl_error = null;
+                ttl_more = ttl.needsAnotherPage();
             }
         }
+        self.maintenance_round_ttl_pending = self.maintenance_round_ttl_pending or ttl_more;
         const run_database = self.maintenance_pending;
         var turn_arena = std.heap.ArenaAllocator.init(alloc);
         defer turn_arena.deinit();
@@ -1079,14 +1083,16 @@ pub const Owner = struct {
         // even when its cached replay target looked complete this turn.
         pending = pending or publication.index_inputs_changed;
         self.maintenance_round_pending = self.maintenance_round_pending or pending;
+        const ttl_pending = self.maintenance_round_ttl_pending;
         if (self.maintenance_table_cursor == 0) {
+            self.maintenance_round_ttl_pending = false;
             // Mutations arriving during the detached turn still wake the owner;
             // replay debt is inspected again under the next capture fence.
             self.maintenance_pending = self.maintenance_round_pending;
             self.maintenance_round_pending = false;
         }
         self.collectRetired();
-        return self.maintenance_pending or self.maintenance_table_cursor != 0 or changed;
+        return self.maintenance_pending or self.maintenance_table_cursor != 0 or changed or ttl_pending;
     }
 
     pub fn maintenanceTurnForTest(self: *Owner) !bool {
