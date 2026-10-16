@@ -693,6 +693,28 @@ pub fn tableIndexesJsonFromPortableMetadata(
         var parsed = try std.json.parseFromSlice(std.json.Value, allocator, enrichments_json, .{});
         defer parsed.deinit();
         if (parsed.value != .array) return error.InvalidBackupRequest;
+        // Persisted enrichment catalogs use internal selector names and JSON
+        // strings for nested policy. Table catalogs consume the public shape.
+        // Preserve public-shaped inputs too; reject ambiguous mixed records.
+        const arena = parsed.arena.allocator();
+        for (parsed.value.array.items) |*item| {
+            if (item.* != .object) return error.InvalidBackupRequest;
+            inline for (.{ .{ "source_field", "field" }, .{ "source_template", "template" } }) |names| {
+                if (item.object.fetchOrderedRemove(names[0])) |entry| {
+                    if (item.object.contains(names[1])) return error.InvalidBackupRequest;
+                    try item.object.put(arena, names[1], entry.value);
+                }
+            }
+            inline for (.{ .{ "neighbor_context_json", "neighbor_context" }, .{ "execution_json", "execution" } }) |names| {
+                if (item.object.fetchOrderedRemove(names[0])) |entry| {
+                    if (entry.value != .string or item.object.contains(names[1])) return error.InvalidBackupRequest;
+                    if (entry.value.string.len > 0) {
+                        const nested = try std.json.parseFromSlice(std.json.Value, arena, entry.value.string, .{});
+                        try item.object.put(arena, names[1], nested.value);
+                    }
+                }
+            }
+        }
         try appendJsonObjectField(allocator, &out, &first, "enrichments", parsed.value);
     }
 
@@ -1280,6 +1302,9 @@ test "lite restore staging preserves portable afb schema index and enrichment me
     const enrichments = parsed_indexes.value.object.get("enrichments") orelse return error.TestExpectedEqual;
     try std.testing.expect(enrichments == .array);
     try std.testing.expectEqual(@as(usize, 1), enrichments.array.items.len);
+    const chunk = enrichments.array.items[0].object;
+    try std.testing.expectEqualStrings("body", chunk.get("field").?.string);
+    try std.testing.expect(chunk.get("source_field") == null);
 }
 
 test "lite restore staging preflights afb before publishing staged files" {

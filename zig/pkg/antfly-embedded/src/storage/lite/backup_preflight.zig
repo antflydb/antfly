@@ -440,6 +440,11 @@ pub const Inspector = struct {
             const key = entry.key_ptr.*;
             const v = entry.value_ptr.*;
             if (eq(key, "api_url") or eq(key, "base_url") or eq(key, "endpoint") or eq(key, "url") or eq(key, "uri") or eq(key, "source_url") or eq(key, "model_path") or eq(key, "credentials_path")) {
+                // This is a typed inference identity, not a media URI. Its
+                // exact model contract still requires destination evidence.
+                if (eq(key, "endpoint") and eq(str(v), "antfly:embedded") and
+                    eq(str(get(value, "provider")), "antfly") and number(get(value, "version")) == 2 and
+                    str(get(value, "model")).len > 0) continue;
                 if (v == .string and v.string.len > 0) try self.locator(v.string, "", key);
             } else if (eq(key, "connection") or eq(key, "credential") or eq(key, "credential_name") or eq(key, "credentials") or eq(key, "connection_id") or eq(key, "connection_name")) {
                 if (v == .string and v.string.len > 0) try self.report.add(self.options, .connection, v.string, "", key, 0);
@@ -723,6 +728,23 @@ fn count(report: Report, kind: Kind) u64 {
         n += r.count;
     };
     return n;
+}
+
+test "backup preflight embedded inference identity retains model requirements without a media locator" {
+    const a = std.testing.allocator;
+    var report: Report = .{ .allocator = a };
+    defer report.deinit();
+    var inspector: Inspector = .{ .allocator = a, .report = &report, .options = .{} };
+    defer inspector.deinit();
+    try inspector.metadataJson(
+        \\{"kind":"embedding","name":"dense","field":"body","expected_dims":384,"producer":{"version":2,"provider":"antfly","model":"BAAI/bge-small-en-v1.5","endpoint":"antfly:embedded"}}
+    );
+    try std.testing.expectEqual(@as(u64, 1), count(report, .model));
+    try std.testing.expectEqual(@as(u64, 1), count(report, .producer_model));
+    try std.testing.expectEqual(@as(u64, 0), count(report, .source_unresolved));
+    // The same token in actual source content is still an unsupported URI.
+    try inspector.locator("antfly:embedded", "doc", "media");
+    try std.testing.expectEqual(@as(u64, 1), count(report, .source_unresolved));
 }
 
 test "backup preflight active sources incidental text and bounded examples" {

@@ -2169,6 +2169,22 @@ const LocalStandaloneMetadata = struct {
         return binding;
     }
 
+    fn nativeOwnerBindingRequiredOnOpen(self: *LocalStandaloneMetadata) !bool {
+        if (self.storage_engine != .lite) return true;
+        // Plain Lite files must remain self-contained. Bind directory-owned
+        // FK authority only when a publication actually requests it. Existing
+        // bindings still require the original physical root on every reopen.
+        const store = self.catalog_store orelse return error.MissingCatalogStore;
+        var txn = try store.beginRead();
+        defer txn.abort();
+        var key_buf: [160]u8 = undefined;
+        _ = txn.get(try @import("../metadata/standalone_native_owner.zig").key(&key_buf, group_ids.main_metadata_group_id)) catch |err| switch (err) {
+            error.NotFound => return false,
+            else => return err,
+        };
+        return true;
+    }
+
     /// First registration is a standalone catalog CAS before any FK plan is
     /// accepted. Reopens prove the same physical root; a seed or replacement
     /// root cannot acquire the predecessor's hidden-owner authority.
@@ -3190,12 +3206,16 @@ const LocalStandaloneMetadata = struct {
         };
         try verifyAdoptedLiteIdentity(self.alloc, backend, namespace, target_identity);
 
+        var definition = try embeddedLiteDefinition(self.alloc, try backend.runtimeStoreForNamespace(namespace));
+        defer definition.deinit(self.alloc);
+        const adopted_table = try deriveStandaloneTableRecord(.lite, "default", definition);
+
         var locked = try self.lockMutation();
         defer locked.deinit();
         if (self.findTableByNameLocked("default") != null) return;
         var mutation = try self.beginCatalogMutationLocked();
         defer mutation.deinit(self);
-        try mutation.upsertTable(self, table);
+        try mutation.upsertTable(self, adopted_table);
         for (ranges) |range| try mutation.upsertRange(self, range);
         self.epoch +|= 1;
         try mutation.commit(self);
@@ -3228,13 +3248,19 @@ const LocalStandaloneMetadata = struct {
             .identity_range_id = ranges[0].range_id,
         });
 
+        var store = try context.systemStore(self.alloc, namespace);
+        defer store.deinit();
+        var definition = try embeddedLiteDefinition(self.alloc, &store);
+        defer definition.deinit(self.alloc);
+        const adopted_table = try deriveStandaloneTableRecord(.lite, "default", definition);
+
         lockAtomic(&self.mutex);
         defer self.mutex.unlock();
         if (self.findTableByNameLocked("default") != null) return;
         var mutation = try self.beginCatalogMutationLocked();
         defer mutation.deinit(self);
-        try self.manager.upsertTable(table);
-        for (ranges) |range| try self.manager.upsertRange(range);
+        try mutation.upsertTable(self, adopted_table);
+        for (ranges) |range| try mutation.upsertRange(self, range);
         self.epoch +|= 1;
         try mutation.commit(self);
     }
@@ -3985,11 +4011,6 @@ const LocalStandaloneMetadata = struct {
 
         var locked = try self.lockMutation();
         defer locked.deinit();
-        const native_owner_proof = if (self.localFkPublicationSupported())
-            try self.ensureNativeOwnerBindingLocked()
-        else
-            null;
-
         // The native catalog uses the same durable owner-progress predicate as
         // the replicated table writer. Publish only observations for the exact
         // table cut collected above before asking that writer to retire the
@@ -4010,6 +4031,11 @@ const LocalStandaloneMetadata = struct {
             }
             try ready_progress.append(self.alloc, record);
         }
+        if (ready_progress.items.len == 0) return;
+        const native_owner_proof = if (self.localFkPublicationSupported())
+            try self.ensureNativeOwnerBindingLocked()
+        else
+            null;
         if (self.lifecycle_store != null) {
             const batch_size = antfly.metadata.table_manager.max_schema_progress_batch;
             for (0..std.math.divCeil(usize, ready_progress.items.len, batch_size) catch unreachable) |batch| {
@@ -4564,6 +4590,62 @@ fn verifyAdoptedLiteIdentity(
     var adopted_db = try antfly.db.DB.open(alloc, namespace, db_opts);
     defer adopted_db.close();
     if (!adopted_db.core.identity_namespace.eql(target_identity)) return error.InvalidEmbeddedLiteIdentity;
+}
+
+// Adoption must publish the embedded definitions before reconciliation opens
+// the table. Defaults here would replace its schema and drop its producers.
+fn embeddedLiteDefinition(
+    alloc: std.mem.Allocator,
+    store: *@import("antfly_local_sources").storage_backend_erased.Store,
+) !antfly.public_api.tables.CreateTableRequest {
+    var txn = try store.beginRead();
+    defer txn.abort();
+    var definition: antfly.public_api.tables.CreateTableRequest = .{};
+    errdefer definition.deinit(alloc);
+    const schema = txn.get("\x00\x00__metadata__:schema_json") catch |err| switch (err) {
+        error.NotFound => null,
+        else => return err,
+    };
+    if (schema) |value| definition.schema_json = try alloc.dupe(u8, value);
+    const indexes = txn.get("\x00\x00__metadata__:indexes") catch |err| switch (err) {
+        error.NotFound => null,
+        else => return err,
+    };
+    const enrichments = txn.get("\x00\x00__metadata__:enrichments") catch |err| switch (err) {
+        error.NotFound => null,
+        else => return err,
+    };
+    if (indexes != null or enrichments != null) {
+        const stored = try @import("antfly_local_sources").storage_lite_restore_staging.tableIndexesJsonFromPortableMetadata(alloc, indexes, enrichments);
+        defer alloc.free(stored);
+        var parsed = try std.json.parseFromSlice(std.json.Value, alloc, stored, .{});
+        defer parsed.deinit();
+        const arena = parsed.arena.allocator();
+        var it = parsed.value.object.iterator();
+        while (it.next()) |entry| {
+            if (std.mem.eql(u8, entry.key_ptr.*, "enrichments")) continue;
+            const value = entry.value_ptr.*;
+            if (value != .object) return error.InvalidEmbeddedLiteIndex;
+            const kind = value.object.get("kind") orelse return error.InvalidEmbeddedLiteIndex;
+            // Native vector/graph configs need an explicit public catalog
+            // translation. Fail closed until that translation is qualified;
+            // never reinterpret a native index as the default full-text kind.
+            if (kind != .string or !std.mem.eql(u8, kind.string, "full_text")) {
+                std.log.err("embedded Lite adoption cannot translate index {s}; serve a supported full-text fixture or prepare an explicitly supported public catalog before transfer", .{entry.key_ptr.*});
+                return error.UnsupportedEmbeddedLiteIndex;
+            }
+            const raw = value.object.get("config_json") orelse return error.InvalidEmbeddedLiteIndex;
+            if (raw != .string) return error.InvalidEmbeddedLiteIndex;
+            var config = try std.json.parseFromSliceLeaky(std.json.Value, arena, raw.string, .{});
+            if (config != .object) return error.InvalidEmbeddedLiteIndex;
+            try config.object.put(arena, "type", .{ .string = "full_text" });
+            if (value.object.get("coverage_generation")) |generation|
+                try config.object.put(arena, "_index_incarnation", generation);
+            entry.value_ptr.* = config;
+        }
+        definition.indexes_json = try std.json.Stringify.valueAlloc(alloc, parsed.value, .{});
+    }
+    return definition;
 }
 
 fn deriveStandaloneTableRecord(
@@ -5599,7 +5681,7 @@ pub fn runFromIterator(
     }
     try data_server.initApiServer();
     local_metadata.data_server = &data_server;
-    if (local_metadata.localFkPublicationSupported()) {
+    if (local_metadata.localFkPublicationSupported() and try local_metadata.nativeOwnerBindingRequiredOnOpen()) {
         var binding_lock = try local_metadata.lockMutation();
         defer binding_lock.deinit();
         _ = try local_metadata.ensureNativeOwnerBindingLocked();
