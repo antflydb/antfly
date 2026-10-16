@@ -499,6 +499,17 @@ fn upsertBatch(ptr: *anyopaque, allocator: std.mem.Allocator, entries: []const c
     const handle: *h.Handle = @ptrCast(@alignCast(ptr));
     if (!h.liteOpenModeCanWrite(handle.open_mode)) return error.ReadOnly;
     if (entries.len == 0) return;
+    const admission = if (handle.owned_lite_backend) |backend|
+        if (backend.native_docstore) |store| store.writer_admission else null
+    else
+        null;
+    // A detached promoter must retain the database fence across the entire
+    // local two-phase commit. Between individual native writes, a refreshed
+    // coordinator could otherwise mistake its active preparation for an
+    // abandoned transaction and recover/abort it. Nested writes borrow this
+    // admission; extraction and candidate computation have already finished.
+    if (admission) |guard| try guard.enter(guard.ptr, .primary);
+    defer if (admission) |guard| guard.leave(guard.ptr);
     // Source-table workers share one destination coordinator. Serialize only
     // canonical read/merge/commit, never extraction, embedding or candidate work.
     handle.promotion_commit_mutex.lockUncancelable(h.handleLockIo());
@@ -693,6 +704,51 @@ test "capi ANN hydration keeps missing vectors local and honors scorer fields" {
     defer mixed_parsed.deinit();
     try std.testing.expectEqual(@as(i64, 0), mixed_parsed.value.object.get("canonical_vector").?.array.items[0].integer);
     try std.testing.expectEqual(@as(i64, 1), mixed_parsed.value.object.get("missing_vector").?.array.items[0].integer);
+}
+
+test "capi Lite promotion retains writer admission across coordinator and participant commits" {
+    const api = @import("db.zig");
+    const a = std.testing.allocator;
+    var tmp = try api.TestDirectory.init("promotion-admission");
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(a, "{s}.aflite", .{tmp.path()});
+    defer a.free(path);
+    const handle = try api.openLiteHandleAllocWithRuntime(std.heap.c_allocator, path, .{ .profile = .hosted, .externally_locked = true }, true, null, null);
+    defer h.closeHandle(handle);
+    try tables.create(handle, "entities", "{}", false);
+    try @import("sql_commit.zig").recover(handle);
+    const Admission = struct {
+        handle: *h.Handle,
+        depth: usize = 0,
+        acquisitions: usize = 0,
+        fn enter(ptr: *anyopaque, _: @import("../storage/lite/docstore.zig").PublicationScope) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.depth += 1;
+            errdefer self.depth -= 1;
+            if (self.depth != 1) return;
+            self.acquisitions += 1;
+            // A new path owner may recover this SQL record. Inject refusal
+            // if the promoter drops admission while its commit is active;
+            // nested writes under the retained fence remain admissible.
+            if (self.handle.sql_commit_recovery_needed) return error.PromotionWriterFenceReleased;
+        }
+        fn leave(ptr: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            std.debug.assert(self.depth > 0);
+            self.depth -= 1;
+        }
+    };
+    var admission: Admission = .{ .handle = handle };
+    const store = handle.owned_lite_backend.?.native_docstore.?;
+    store.writer_admission = .{ .ptr = &admission, .enter = Admission.enter, .leave = Admission.leave };
+    defer store.writer_admission = null;
+    try handle.db.entity_sink.?.upsertBatch(a, &.{.{ .table = "entities", .key = "person/ada", .doc_json = "{\"canonical_name\":\"Ada\",\"aliases\":[\"Ada\"]}" }});
+    try std.testing.expectEqual(@as(usize, 0), admission.depth);
+    try std.testing.expectEqual(@as(usize, 1), admission.acquisitions);
+    var row = (try (try tables.get(handle, "entities")).lookup(a, "person/ada", .{})) orelse return error.TestUnexpectedResult;
+    defer row.deinit(a);
+    try @import("antfly-json").testing.expectSubsetJsonText(a, "{\"canonical_name\":\"Ada\"}", row.json);
+    try std.testing.expect(!handle.sql_commit_recovery_needed);
 }
 
 test "capi Lite promotion atomically merges across tables and survives reopen" {

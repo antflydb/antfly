@@ -885,18 +885,37 @@ test "provisioned batch lookup scan and query share one opaque live storage owne
     }
     // A storage transition can outlive a request. Admission must stop waiting
     // on the request's controls, without altering the transition's ownership.
+    const Admission = struct {
+        fn expectTimeout(outcome: anytype) !void {
+            // One deadline covers catalog projection and owner admission. A
+            // busy host can exhaust it in either phase; retain each phase's
+            // diagnostic identity rather than assuming catalog capture fits
+            // inside this deliberately short real-time budget. Fake-clock
+            // tests separately verify the exact catalog error and budget.
+            if (outcome) |_| return error.TestExpectedError else |err| switch (err) {
+                error.Timeout, error.CatalogRoutingSnapshotTimeout => {},
+                else => return err,
+            }
+        }
+        fn expectCancellation(outcome: anytype) !void {
+            if (outcome) |_| return error.TestExpectedError else |err| switch (err) {
+                error.Cancelled, error.Canceled => {},
+                else => return err,
+            }
+        }
+    };
     {
         const time = @import("antfly_platform").time;
         const entry = owner_source.entries.items[0];
         entry.exclusive_active = true;
         defer entry.exclusive_active = false;
         const started = time.monotonicNs();
-        try std.testing.expectError(error.Timeout, owner_source.readSource().queryGroupLocal(alloc, 7001, "articles", .{
+        try Admission.expectTimeout(owner_source.readSource().queryGroupLocal(alloc, 7001, "articles", .{
             .execution_deadline_ns = started + 20 * std.time.ns_per_ms,
         }, .stale));
         try std.testing.expect(time.monotonicNs() - started < 4 * std.time.ns_per_s);
         try std.testing.expect(entry.exclusive_active);
-        try std.testing.expectError(error.Timeout, owner_source.readSource().lookupGroupLocal(alloc, 7001, "articles", "doc:1", .{
+        try Admission.expectTimeout(owner_source.readSource().lookupGroupLocal(alloc, 7001, "articles", "doc:1", .{
             .execution_deadline_ns = time.monotonicNs() + 20 * std.time.ns_per_ms,
         }, .stale));
         try std.testing.expect(entry.exclusive_active);
@@ -908,7 +927,7 @@ test "provisioned batch lookup scan and query share one opaque live storage owne
             }
         };
         const cancel = CancelAfter{ .at = time.monotonicNs() + 20 * std.time.ns_per_ms };
-        try std.testing.expectError(error.Cancelled, owner_source.readSource().queryGroupLocal(alloc, 7001, "articles", .{
+        try Admission.expectCancellation(owner_source.readSource().queryGroupLocal(alloc, 7001, "articles", .{
             .cancellation = .{ .ptr = &cancel, .is_cancelled_fn = CancelAfter.requested },
         }, .stale));
         try std.testing.expect(entry.exclusive_active);
@@ -918,7 +937,7 @@ test "provisioned batch lookup scan and query share one opaque live storage owne
     {
         try std.testing.expect(owner_source.mutex.tryLock());
         defer owner_source.mutex.unlock();
-        try std.testing.expectError(error.Timeout, owner_source.readSource().queryGroupLocal(alloc, 7001, "articles", .{
+        try Admission.expectTimeout(owner_source.readSource().queryGroupLocal(alloc, 7001, "articles", .{
             .execution_deadline_ns = @import("antfly_platform").time.monotonicNs() + 20 * std.time.ns_per_ms,
         }, .stale));
     }

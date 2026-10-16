@@ -20155,11 +20155,12 @@ pub const DB = struct {
         // so an external write stream cannot keep this loop alive forever.
         while (true) {
             const target_sequence = self.currentMaintenanceTargetSequence();
-            self.runMaintenanceUntilWithCancellation(
+            self.runMaintenanceUntilWithEnrichmentCompletion(
                 target_sequence,
                 .{},
                 cancellation,
                 maintenance_deadline_ns orelse std.math.maxInt(u64),
+                if (query_cut != null) .settled_requests else .successful_requests,
             ) catch |err| switch (err) {
                 error.Cancelled => return error.Canceled,
                 else => return err,
@@ -31040,6 +31041,19 @@ pub const DB = struct {
         cancellation: types.CancellationToken,
         deadline_ns: u64,
     ) !void {
+        return self.runMaintenanceUntilWithEnrichmentCompletion(sequence, sync_targets, cancellation, deadline_ns, .successful_requests);
+    }
+
+    const EnrichmentCompletion = enum { successful_requests, settled_requests };
+
+    fn runMaintenanceUntilWithEnrichmentCompletion(
+        self: *DB,
+        sequence: u64,
+        sync_targets: ManagedSyncTargets,
+        cancellation: types.CancellationToken,
+        deadline_ns: u64,
+        completion: EnrichmentCompletion,
+    ) !void {
         const wait = derived_executor_mod.VisibilityWait{
             .cancellation = cancellation,
             .deadline_ns = deadline_ns,
@@ -31047,7 +31061,14 @@ pub const DB = struct {
         };
         var stable_target = sequence;
         while (true) {
-            try self.runEnrichmentUntilWithVisibilityDeadline(stable_target, cancellation, deadline_ns);
+            const outcome = self.runEnrichmentUntilWithVisibilityDeadline(stable_target, cancellation, deadline_ns);
+            outcome catch |err| {
+                if (completion != .settled_requests or err != error.EnrichmentWorkerFailed) return err;
+            };
+            // A completed watermark alone does not prove owner health. This
+            // also runs when the visibility wait took its already-applied path.
+            if (completion == .settled_requests) if (self.enrichment_runtime) |runtime|
+                try runtime.requireSettledForQueryCapture(stable_target);
             try self.runDerivedUntilWithVisibilityWait(stable_target, wait);
 
             const next_target = self.core.nextDerivedSequence();
@@ -70623,6 +70644,68 @@ test "db index catalog barrier canceled query capture unwinds staging and permit
     try std.testing.expect(!db.indexCatalogBarrierActive());
 }
 
+test "db query capture retains settled terminal repair debt without acknowledging visibility" {
+    const Fixture = struct {
+        fn produce(_: *anyopaque, _: Allocator, _: asset_producer_mod.Request) ![]u8 {
+            return error.InvalidExtractorResponse;
+        }
+    };
+    const alloc = std.testing.allocator;
+    var tmp = try TestDirectory.init("query-terminal-debt");
+    defer tmp.cleanup();
+    const pins = try std.fmt.allocPrint(alloc, "{s}.query-pins", .{tmp.path()});
+    defer alloc.free(pins);
+    defer std.Io.Dir.cwd().deleteTree(std.testing.io, pins) catch {};
+    var db = try DB.open(alloc, tmp.path(), .{
+        .identity_namespace = .{ .table_id = 7, .shard_id = 1, .range_id = 1 },
+        .start_optional_runtimes = false,
+        .start_optional_runtime_workers = false,
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer db.close();
+    try db.addEnrichment(.{ .name = "broken", .kind = .asset, .field = "body", .producer_json = "{\"type\":\"generator\",\"config\":{\"provider\":\"mock\"}}" });
+    var fixture: u8 = 0;
+    var config: enrichment_runtime_mod.Config = .{ .asset_producer = .{ .ptr = &fixture, .vtable = &.{ .produce = Fixture.produce, .invocation_memory_for_requests = GateAssetProducer.invocationMemory } } };
+    try db.initOptionalEnrichmentRuntime(&config);
+    try db.batch(.{ .writes = &.{.{ .key = "doc", .value = "{\"body\":\"broken input\"}" }}, .sync_level = .write });
+    const runtime = db.enrichment_runtime.?;
+    const sequence = db.core.nextDerivedSequence();
+    try std.testing.expectError(error.EnrichmentWorkerFailed, runtime.catchUpUntilForDrain(sequence));
+    try std.testing.expect(runtime.stats().applied_sequence >= sequence);
+    try std.testing.expectError(error.EnrichmentWorkerFailed, db.runMaintenanceUntilWithCancellation(sequence, .{}, .none, std.math.maxInt(u64)));
+
+    const id: [64]u8 = @splat('b');
+    const request: @import("native_query_cut.zig").Request = .{
+        .id = &id,
+        .table_id = 7,
+        .expires_ms = @import("native_query_cut.zig").nowMs() + 300_000,
+        .create = true,
+    };
+    // An applied watermark is insufficient when the owner itself is unhealthy.
+    try runtime.catchUpUntil(db.core.nextDerivedSequence());
+    try std.testing.expect(runtime.stats().applied_sequence >= db.core.nextDerivedSequence());
+    runtime.worker_failed = true;
+    try std.testing.expectError(error.EnrichmentWorkerFailed, db.captureQueryCut(request, .none));
+    runtime.worker_failed = false;
+    runtime.retrying = true;
+    try std.testing.expectError(error.EnrichmentRetryInProgress, db.captureQueryCut(request, .none));
+    runtime.retrying = false;
+
+    var retained = try db.openQueryCut(request, .none);
+    defer retained.close();
+    var document = (try retained.getDocument(alloc, "doc", .{})) orelse return error.TestUnexpectedResult;
+    defer document.deinit(alloc);
+    try ant_json.testing.expectSubsetJsonText(alloc, "{\"body\":\"broken input\"}", document.json);
+    const issues = try retained.listArtifactRepairIssues(alloc, .asset, null, 0);
+    defer types.freeArtifactRepairIssues(alloc, issues);
+    try std.testing.expectEqual(@as(usize, 1), issues.len);
+    try std.testing.expectEqualStrings("broken", issues[0].artifact_name);
+    // Capturing reads must neither clear the debt nor turn a later write
+    // visibility acknowledgement into success.
+    try std.testing.expectError(error.EnrichmentWorkerFailed, runtime.catchUpUntilForDrain(sequence));
+}
+
 test "db published dense admission cannot overflow into catalog closure" {
     const alloc = std.testing.allocator;
     var path_tmp = try TestDirectory.init("db");
@@ -98609,7 +98692,8 @@ test "db repair queue reprocesses corrupt generated dense embedding artifacts" {
     defer alloc.free(artifact_key);
     const artifact_value = try reopened.core.store.get(alloc, artifact_key);
     defer alloc.free(artifact_value);
-    try expectDenseEmbeddingArtifactValue(alloc, artifact_value, enrichment_artifact_codec.hashSource("repair target text"), 3);
+    // Forced repair advances the generation so cached corrupt work cannot be reused.
+    try expectDenseEmbeddingArtifactValue(alloc, artifact_value, enrichment_artifact_codec.hashEmbeddingSourceForGeneration("repair target text", "", 1), 3);
 }
 
 test "db repair queue reprocesses corrupt chunk generated dense embedding artifacts from parent document" {
@@ -98696,7 +98780,8 @@ test "db repair queue reprocesses corrupt chunk generated dense embedding artifa
     defer alloc.free(artifact_key);
     const artifact_value = try reopened.core.store.get(alloc, artifact_key);
     defer alloc.free(artifact_value);
-    try expectDenseEmbeddingArtifactValue(alloc, artifact_value, enrichment_artifact_codec.hashSource("abcdefgh"), 3);
+    // Forced repair advances the generation so cached corrupt work cannot be reused.
+    try expectDenseEmbeddingArtifactValue(alloc, artifact_value, enrichment_artifact_codec.hashEmbeddingSourceForGeneration("abcdefgh", "", 1), 3);
 }
 
 test "db replay applies sparse embeddings from artifact payloads" {

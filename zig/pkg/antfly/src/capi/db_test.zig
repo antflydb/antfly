@@ -6070,6 +6070,69 @@ test "capi SQL runtime refresh fences serving inputs while reusing lease and sha
     }
 }
 
+test "capi native replacement wait observes its background owner without rebuilding" {
+    if (builtin.single_threaded or builtin.os.tag == .freestanding) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var directory = try TestDirectory.init("native-replacement-observer");
+    defer directory.cleanup();
+    const path = try tempTestAflitePath(a, directory.path(), "database");
+    defer a.free(path);
+    defer cleanupTestFile(path);
+    var options: capi.OpenOptions = .{};
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_open_options_init(&options));
+    options.storage_kind = capi.storage_kind_lite;
+    options.profile = capi.profile_native;
+    var handle: ?*anyopaque = null;
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_create_with_options(path, &options, &handle));
+    defer antfly_db_close(handle);
+    const owner = blk: {
+        const guard = public.enterHandle(handle, .exclusive).?;
+        defer guard.leave();
+        break :blk guard.connection.?.owner;
+    };
+    owner.stopping.store(true, .release);
+    owner.wake.set(shared.handleLockIo());
+    owner.worker.?.join();
+    // Simulate a paused native builder while preserving its ownership. Only
+    // explicit scheduler turns below may mutate its reservation.
+    defer owner.worker = null;
+    owner.stopping.store(false, .release);
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_add_index_json(handle, .fromSlice(
+        \\{"name":"old","type":"graph","edge_types":[{"name":"R","field":"links"}]}
+    )));
+    var inserted: capi.Buffer = .{};
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_batch_json(handle, .fromSlice(
+        \\{"inserts":{"source":{"links":["target"]}}}
+    ), &inserted));
+    freeRawBuffer(inserted.ptr, inserted.len);
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_run_until_idle(handle));
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_add_index_json(handle, .fromSlice(
+        \\{"name":"new","type":"graph","replaces":"old","edge_types":[{"name":"R","field":"links"}]}
+    )));
+    const Reservation = struct {
+        fn bytes(allocator: std.mem.Allocator, id: ?*anyopaque) ![]u8 {
+            const guard = public.enterHandle(id, .read).?;
+            defer guard.leave();
+            const jobs = try guard.handle.database().graphReplacementStatusAlloc(allocator);
+            defer jobs.deinit();
+            try std.testing.expectEqual(@as(usize, 1), jobs.value.len);
+            return std.json.Stringify.valueAlloc(allocator, jobs.value, .{});
+        }
+    };
+    const before = try Reservation.bytes(a, handle);
+    defer a.free(before);
+    try std.testing.expectEqual(capi.ErrorCode.busy, antfly_db_add_index_json(handle, .fromSlice(
+        \\{"name":"new","type":"graph","replaces":"old","wait":{"timeout_ms":1000},"edge_types":[{"name":"R","field":"links"}]}
+    )));
+    const after = try Reservation.bytes(a, handle);
+    defer a.free(after);
+    try std.testing.expectEqualStrings(before, after);
+    for (0..32) |_| if (!try owner.maintenanceTurnForTest()) break;
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_add_index_json(handle, .fromSlice(
+        \\{"name":"new","type":"graph","replaces":"old","wait":{"timeout_ms":0},"edge_types":[{"name":"R","field":"links"}]}
+    )));
+}
+
 test "capi SQL idle native maintenance avoids runtime construction and resumes work" {
     if (builtin.single_threaded or builtin.os.tag == .freestanding) return error.SkipZigTest;
     const a = std.testing.allocator;
