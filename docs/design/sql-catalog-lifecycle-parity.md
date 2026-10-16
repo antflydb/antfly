@@ -9,12 +9,12 @@ a completion claim. PostgreSQL is the SQL standard and independent test oracle.
 ## Baseline and priorities
 
 The [original inventory](sql/parity-inventory.md) remains authoritative:
-526 implemented / 132 rejected / 113 superseded / 815 unresolved. Counts below
+529 implemented / 132 rejected / 113 superseded / 812 unresolved. Counts below
 are unresolved family pools, not promises that one implementation closes them.
 
 | Priority | Pool | Cases | Shared delivery boundary |
 | --- | --- | ---: | --- |
-| 1 | DDL, catalog and sessions | 308 | Public relation ownership, schema/index activation and retirement, session lifecycle and recovery |
+| 1 | DDL, catalog and sessions | 305 | Public relation ownership, schema/index activation and retirement, session lifecycle and recovery |
 | 2 | Source/joined mutations and MERGE/recursion | 128 | Captured source ownership, bounded selection, atomic commit and distributed failure evidence |
 | 3 | Read and query | 113 | Faithful typed fixtures, binding/correlation, endpoint results and diagnostics |
 | 4 | Document writes | 70 | Document-specific schema/index profiles, complete postimages and integrity admission |
@@ -22,8 +22,8 @@ are unresolved family pools, not promises that one implementation closes them.
 
 ## First delivery: catalog and index lifecycle
 
-Within the 308-case DDL/catalog/session pool, the largest unresolved statement
-groups currently include 38 ALTER TABLE, 27 CREATE FUNCTION, 26 CREATE INDEX /
+Within the 305-case DDL/catalog/session pool, the largest unresolved statement
+groups currently include 35 ALTER TABLE, 27 CREATE FUNCTION, 26 CREATE INDEX /
 CREATE UNIQUE INDEX, 19 CREATE TABLE, and 12 COPY cases. These are statement
 counts, not implementation estimates: CREATE FUNCTION needs a separate routine
 execution architecture, while ALTER TABLE and index/table DDL share the current
@@ -9620,3 +9620,67 @@ The PostgreSQL oracle, inventory and Apache-boundary audits pass in
 `/private/tmp/antfly-sql-search-cursor-final-apache.log`. Staged license headers,
 scoped Python checks, Zig formatting and diff whitespace checks also pass.
 Unrelated changes remain unstaged; this checkpoint is local and unpushed.
+
+### Real-owner default DDL and publication acknowledgement
+
+The next catalog cohort uses unchanged sql-0741, sql-0742 and sql-0743 through
+the existing mounted metadata/data-owner fixture. It owns CREATE, original
+ALTER statements, omitted/explicit NULL/DEFAULT inserts, complete postimages,
+the serving schema observation and a cold data-owner restart. Existing primary
+bytes and write versions must remain unchanged across default alterations;
+future inserts and UPDATE DEFAULT must use the newly committed declarations.
+Unknown-column rejection must preserve both schema version and table rows.
+The independent PostgreSQL oracle is `scripts/test_sql_default_lifecycle.py`,
+available through `make sql-default-lifecycle-oracle-check`.
+
+The real-owner run exposed a production acknowledgement race, not a missing
+scalar default evaluator: migration finalization could clear the predecessor
+read layout after a successful schema CAS but before its acknowledgement read.
+Exact transient-descriptor comparison then reported an unknown mutation outcome.
+The reproducer is `/private/tmp/antfly-sql-default-lifecycle-read-cut-debug.log`;
+the fixture does not replay that DDL or reinterpret the error as success.
+
+Acknowledgement now reuses the finalizer's deterministic transformation. It
+accepts the exact replacement or that exact finalized successor, preserving
+the original ordered stamp. Owner, active schema and read-layout mismatches
+reject before candidate allocation; all remaining descriptor fields compare
+exactly after transformation. Arbitrary later DDL, named-index changes and
+other supersessions remain unknown. This is narrowly scoped logical-publication
+evidence, not a durable per-command outcome journal or a solution for a wholly
+lost public response. It introduces neither replay nor an unbounded receipt log.
+
+The Debug gate `antfly-api-sql-default-lifecycle-test` selects the real-owner
+campaign plus strict successor/rejection, ordered-stamp and exhaustive
+allocation-failure regressions. Pure reads and definitely unadmitted write
+preparation may repeat only the specific statement-read rejection within one
+15-second deadline. SQLSTATE 53300 alone is insufficient: it also represents
+post-commit visibility waits. The fixture requires the exact read-admission
+diagnostic, explicit retry permission, idle state and absence of every mutation,
+admission or transaction receipt. DDL, admitted writes, malformed diagnostics
+and other failures never receive that retry. Regression gates include the
+production mutation-receipt classifier and the fixture's stricter predicate.
+The initial sandbox run failed at loopback bind before running the campaign;
+the mounted validation requires local socket access.
+
+Final Debug qualification passes five selected tests and 74/74 build steps,
+with zero skips/failures/leaks, in
+`/private/tmp/antfly-sql-default-lifecycle-admission-debug.log`. Three additional
+independent native lifecycle runs pass in
+`/private/tmp/antfly-sql-default-lifecycle-soak-1-debug.log`,
+`/private/tmp/antfly-sql-default-lifecycle-soak-2-debug.log` and
+`/private/tmp/antfly-sql-default-lifecycle-soak-3-debug.log`.
+The PostgreSQL oracle passes in
+`/private/tmp/antfly-sql-default-lifecycle-final-oracle.log` and the Apache
+boundary audit passes in
+`/private/tmp/antfly-sql-default-lifecycle-final-apache.log`.
+The mounted test also checks ALTER TABLE command tags, committed outcomes,
+empty result shapes, string labels/types and SQL-null flags. Its three originals
+are now qualified: 529 implemented / 132 rejected / 113 superseded / 812 unresolved.
+No quorum-failover, standalone reporter activation or wholly lost-response
+reconciliation completion is claimed. Standalone's immediate native replacement
+already holds its metadata mutation lane through acknowledgement; the observed
+asynchronous Raft projection race is fixed in the shared service path.
+
+GC was previewed, not run globally. Three obsolete owned failed-run executables
+were verified unused and removed (about 1.3 GiB); source and test data remain
+intact, and those executables are rebuildable. Unrelated edits remain unstaged.

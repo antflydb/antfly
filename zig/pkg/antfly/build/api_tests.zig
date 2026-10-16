@@ -2158,7 +2158,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     // own runtime campaign and independently requires no skips.
     const sql_owner_lifecycle_tests = b.addTest(.{
         .root_module = sql_owner_lifecycle_test_mod,
-        .filters = &.{ "mounted SQL ADD PRIMARY KEY publishes only validated fresh generation", "mounted SQL original unique indexes enforce exact postimages across owner restart", "mounted SQL regular unique index build failure is atomic" },
+        .filters = &.{ "mounted SQL ADD PRIMARY KEY publishes only validated fresh generation", "mounted SQL original unique indexes enforce exact postimages across owner restart", "mounted SQL regular unique index build failure is atomic", "mounted SQL original column defaults preserve old rows and recover future mutation semantics", "schema publication acknowledgement accepts only exact deterministic finalization", "table definition stamp distinguishes rejection from post-admission ambiguity", "SQL unknown mutation keeps native reconciliation receipt without allocation", "SQL default lifecycle retries only definite read admission" },
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
         .max_rss = @as(usize, if (target.result.os.tag == .macos) 12 else 7) * 1024 * 1024 * 1024,
     });
@@ -2174,6 +2174,13 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     sql_index_atomicity_run.addArg("--require-no-skips");
     b.step("antfly-api-sql-index-build-atomicity-test", "Run regular unique-index build rejection and repaired resubmission qualification")
         .dependOn(&sql_index_atomicity_run.step);
+    const sql_default_lifecycle_run = addFilteredTestRunArtifactWithRuntimeFilters(b, sql_owner_lifecycle_tests, &.{"mounted SQL original column defaults preserve old rows and recover future mutation semantics"});
+    sql_default_lifecycle_run.addArg("--require-no-skips");
+    const sql_default_lifecycle_step = b.step("antfly-api-sql-default-lifecycle-test", "Run original default DDL with real owner propagation, complete postimages and restart");
+    sql_default_lifecycle_step.dependOn(&sql_default_lifecycle_run.step);
+    const sql_schema_ack_run = addFilteredTestRunArtifactWithRuntimeFilters(b, sql_owner_lifecycle_tests, &.{ "schema publication acknowledgement accepts only exact deterministic finalization", "table definition stamp distinguishes rejection from post-admission ambiguity", "SQL unknown mutation keeps native reconciliation receipt without allocation", "SQL default lifecycle retries only definite read admission" });
+    sql_schema_ack_run.addArg("--require-no-skips");
+    sql_default_lifecycle_step.dependOn(&sql_schema_ack_run.step);
     const hosted_initial_fk_test_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/api_hosted_initial_fk_test_root.zig"),
         .target = target,

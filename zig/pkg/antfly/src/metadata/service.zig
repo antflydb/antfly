@@ -607,15 +607,19 @@ fn replaceTableDefinitionGuardedWithContextReceipt(
         return error.MetadataMutationOutcomeUnknown;
     };
     defer metadata_table_manager.freeTable(service.alloc, current);
-    if (metadata_table_manager.tableDefinitionsEqual(current, replacement)) return .{
+    const acknowledged = @import("schema_migration_finalization.zig").matchesPublishedDefinition(service.alloc, current, replacement) catch |err| {
+        std.log.warn("table definition mutation acknowledgement failed table={s} table_id={} term={} index={} err={s}", .{ expected.name, expected.table_id, receipt.term, receipt.index, @errorName(err) });
+        return error.MetadataMutationOutcomeUnknown;
+    };
+    if (acknowledged) return .{
         .metadata_group_id = service.metadata_group_id,
         .metadata_incarnation = metadata_incarnation,
         .term = receipt.term,
         .index = receipt.index,
     };
-    // A later command may already have superseded or even reverted this exact
-    // definition. Without a durable per-command apply result, any non-exact
-    // projection is ambiguous; never turn it back into a replayable conflict.
+    // Only the exact replacement or its deterministic migration finalization
+    // proves the published logical state. Any other supersession remains
+    // ambiguous; never turn it back into a replayable conflict.
     std.log.warn(
         "table definition mutation applied but exact replacement is no longer projected table={s} table_id={} term={} index={}",
         .{ expected.name, expected.table_id, receipt.term, receipt.index },
@@ -827,6 +831,24 @@ test "table definition stamp distinguishes rejection from post-admission ambigui
     try std.testing.expect(canceled_before_admission.proposed_guard == null);
     committed.wait_error = error.NotLeader;
     try std.testing.expectError(error.MetadataMutationOutcomeUnknown, replaceTableDefinitionGuardedWithReceipt(&committed, expected, replacement, guard));
+    // Read-layout retirement may win the response-observation race without
+    // changing the just-published logical definition. Preserve the original
+    // ordered stamp; no second proposal or leadership read is necessary.
+    var schema_before = expected;
+    schema_before.schema_json = "{\"version\":1}";
+    var schema_after = schema_before;
+    schema_after.schema_json = "{\"version\":2}";
+    schema_after.read_schema_json = schema_before.schema_json;
+    schema_after.indexes_json = "{\"full_text_index_v1\":{},\"full_text_index_v2\":{}}";
+    var finalized = try metadata_table_manager.cloneTable(std.testing.allocator, schema_after);
+    defer metadata_table_manager.freeTable(std.testing.allocator, finalized);
+    try @import("schema_migration_finalization.zig").apply(std.testing.allocator, &finalized);
+    var settled: FakeService = .{ .alloc = std.testing.allocator, .store = .{ .current = finalized } };
+    const settled_stamp = try replaceTableDefinitionStampedWithReceipt(&settled, schema_before, schema_after);
+    try std.testing.expectEqual(stamp.term, settled_stamp.term);
+    try std.testing.expectEqual(stamp.index, settled_stamp.index);
+    try std.testing.expectEqual(@as(usize, 1), settled.wait_calls);
+    try std.testing.expectEqual(@as(usize, 1), settled.store.reads);
 }
 
 /// A compact drop command derived from one coherent storage read transaction.

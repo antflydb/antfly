@@ -2,6 +2,8 @@
   "ledger_format": 1,
   "inventory_sha256": "c203a4dcf0094b75e1d3764e90beebddaf844a9ce604543c0a4dbc0ffe8ae173",
   "gates": {
+    "sql-original-default-lifecycle-native-debug": {"command":["zig","build","antfly-api-sql-default-lifecycle-test","-Doptimize=Debug","-j1"],"cwd":"zig","timeout_seconds":1800},
+    "sql-original-default-lifecycle-postgres": {"command":["uv","run","--no-project","--with","psycopg[binary]==3.3.6","python","-m","unittest","discover","-s","scripts","-p","test_sql_default_lifecycle.py"],"cwd":".","timeout_seconds":180},
     "sql-original-numeric-windows-native-debug": {"command":["zig","build","public-api-parity-test","-Doptimize=Debug","-j1","-Dtest-filter=httpx SQL PostgreSQL original numeric windows preserve exact averages and ordering","-Dtest-filter=SQL parity exact NUMERIC references reject lost bits scale and builtin identity"],"cwd":"zig","timeout_seconds":1800},
     "sql-original-numeric-windows-postgres": {"command":["uv","run","--project","scripts","--with","psycopg[binary]==3.3.6","python","scripts/generate_sql_postgres_reference.py","numeric_window","--check","zig/pkg/antfly-embedded/src/sql/fixtures/sql_numeric_window_reference.json"],"cwd":".","timeout_seconds":180},
     "sql-original-text-reads-native-debug": {"command":["zig","build","public-api-parity-test","-Doptimize=Debug","-j1","-Dtest-filter=httpx SQL PostgreSQL original text reads preserve escapes unicode and ordering","-Dtest-filter=SQL parity described parameter transport preserves JSON identity and NULLs"],"cwd":"zig","timeout_seconds":1800},
@@ -7459,18 +7461,30 @@
     },
     {
       "id": "sql-0741",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "Unchanged original ALTER executes through real metadata/data owners with exact PostgreSQL completion, unchanged old primary bytes, explicit NULL versus DEFAULT probes, full postimages and cold owner restart. Canonical publication acknowledgement and no-admission-only retries have independent regressions.",
+      "evidence": [
+        {"path":"zig/pkg/antfly/src/api/sql_default_lifecycle_integration_test.zig","test":"mounted SQL original column defaults preserve old rows and recover future mutation semantics","gate":"sql-original-default-lifecycle-native-debug"},
+        {"path":"zig/pkg/antfly/src/api/sql_default_lifecycle_integration_test.zig","test":"mounted SQL original column defaults preserve old rows and recover future mutation semantics","gate":"sql-original-default-lifecycle-postgres"}
+      ]
     },
     {
       "id": "sql-0742",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "Unchanged original NUMERIC default ALTER executes through real metadata/data owners with PostgreSQL numeric display scale, exact completion, unchanged old primary bytes, full postimages and cold owner restart. Future inserts and UPDATE DEFAULT use the persisted declaration.",
+      "evidence": [
+        {"path":"zig/pkg/antfly/src/api/sql_default_lifecycle_integration_test.zig","test":"mounted SQL original column defaults preserve old rows and recover future mutation semantics","gate":"sql-original-default-lifecycle-native-debug"},
+        {"path":"zig/pkg/antfly/src/api/sql_default_lifecycle_integration_test.zig","test":"mounted SQL original column defaults preserve old rows and recover future mutation semantics","gate":"sql-original-default-lifecycle-postgres"}
+      ]
     },
     {
       "id": "sql-0743",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "Unchanged original DROP DEFAULT executes through real metadata/data owners with exact PostgreSQL completion, unchanged old primary bytes, full postimages and cold owner restart. Omitted inserts and UPDATE DEFAULT become SQL NULL while explicit prior values remain unchanged.",
+      "evidence": [
+        {"path":"zig/pkg/antfly/src/api/sql_default_lifecycle_integration_test.zig","test":"mounted SQL original column defaults preserve old rows and recover future mutation semantics","gate":"sql-original-default-lifecycle-native-debug"},
+        {"path":"zig/pkg/antfly/src/api/sql_default_lifecycle_integration_test.zig","test":"mounted SQL original column defaults preserve old rows and recover future mutation semantics","gate":"sql-original-default-lifecycle-postgres"}
+      ]
     },
     {
       "id": "sql-0744",
