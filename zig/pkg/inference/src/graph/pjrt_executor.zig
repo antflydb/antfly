@@ -641,12 +641,12 @@ pub fn runtimeCapabilitiesForInputMaterialization(input_materialization: PjrtInp
         .host_assisted_graph_inputs => .{
             .supports_decode = true,
             .state_ownership = .host_assisted_inputs,
-            .interruption = .process_required,
+            .interruption = .uninterruptible,
         },
         .backend_owned_state => .{
             .supports_decode = true,
             .state_ownership = .backend_owned,
-            .interruption = .process_required,
+            .interruption = .uninterruptible,
         },
     };
 }
@@ -867,7 +867,7 @@ const PjrtModelRuntime = struct {
             return .{
                 .supports_decode = true,
                 .state_ownership = if (backend_owned_decode) .backend_owned else .host_assisted_inputs,
-                .interruption = .process_required,
+                .interruption = .uninterruptible,
             };
         }
         return runtimeCapabilitiesForInputMaterialization(self.input_materialization);

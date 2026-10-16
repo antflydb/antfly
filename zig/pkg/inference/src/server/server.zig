@@ -147,6 +147,7 @@ fn httpInferenceExecutionControl(node: *Node, ctx: *httpx.Context) InferenceExec
     };
     return .{
         .io = ctx.io,
+        .native_call_policy = node.session_manager.native_call_policy,
         .deadline_ns = ctx.application_deadline_ns,
         .cancellation_grace_ns = native_call_cancellation_grace_ns,
         .ptr = ctx,
@@ -1289,6 +1290,7 @@ pub const NodeConfig = struct {
     /// disposable CLI tools may opt in directly. Embedded database nodes must
     /// remain false because termination would also kill their owner.
     process_termination_available: bool = false,
+    native_call_policy: execution_control_mod.NativeCallPolicy = .require_supervision,
     /// Metadata/routing node only: execution is delegated to a supervised worker.
     inference_proxy: bool = false,
 };
@@ -4026,7 +4028,8 @@ pub const Node = struct {
         try config.kernel_jit.validate();
         try config.prompt_cache.validate();
         var session_manager = backends_mod.SessionManager.init(allocator);
-        session_manager.process_isolation_available = config.process_termination_available;
+        session_manager.process_termination_available = config.process_termination_available;
+        session_manager.native_call_policy = config.native_call_policy;
         if (!config.inference_proxy) try session_manager.validateRequiredBackendPolicy();
         session_manager.kernel_jit = config.kernel_jit;
         try graph_mod.kernel_jit.validateMetalProfileBackend(
@@ -4436,6 +4439,7 @@ pub const Node = struct {
         supplied: InferenceExecutionControl,
     ) InferenceExecutionControl {
         var control = supplied;
+        control.native_call_policy = self.session_manager.native_call_policy;
         if (control.cancellation_grace_ns == null)
             control.cancellation_grace_ns = native_call_cancellation_grace_ns;
         if (control.io == null) control.io = io orelse self.session_manager.io;
@@ -21906,7 +21910,7 @@ test "gliner boundary v2 direct control binds cold and cached Metal process guar
     for (supplied_controls) |supplied| {
         const control = embedded.extractionExecutionControl(supplied);
         // Cold construction and cached compute use these same boundaries.
-        try std.testing.expectError(error.ProcessIsolationRequired, control.enterUninterruptible(.process_required));
+        try std.testing.expectError(error.ProcessIsolationRequired, control.enterUninterruptible(.uninterruptible));
         try std.testing.expectError(error.ProcessIsolationRequired, session_factory.getManagedComputeBackend(session, std.testing.allocator, null, control));
     }
     var supervised = try Node.init(std.testing.allocator, .{ .process_termination_available = true });
@@ -21916,7 +21920,7 @@ test "gliner boundary v2 direct control binds cold and cached Metal process guar
         const control = supervised.extractionExecutionControl(supplied);
         try std.testing.expect(control.io != null);
         try std.testing.expect(control.hard_cancellation != null);
-        var cold_guard = try control.enterUninterruptible(.process_required);
+        var cold_guard = try control.enterUninterruptible(.uninterruptible);
         cold_guard.deinit();
         // The deliberately non-architecture session reaches construction only
         // after arming; constructor failure must release that watchdog lease.
@@ -28467,14 +28471,14 @@ test "supervised node owns and joins the hard cancellation watchdog" {
         error.HardCancellationWatchdogNotStarted,
         (InferenceExecutionControl{
             .hard_cancellation = node.hard_cancellation_watchdog.?.boundary(),
-        }).enterUninterruptible(.process_required),
+        }).enterUninterruptible(.uninterruptible),
     );
     try node.attachIo(std.testing.io);
 
     const control = node.bindExecutionControl(null, .{});
     try std.testing.expect(control.io != null);
     try std.testing.expect(control.hard_cancellation != null);
-    var guard = try control.enterUninterruptible(.process_required);
+    var guard = try control.enterUninterruptible(.uninterruptible);
     guard.deinit();
 }
 
@@ -28489,7 +28493,7 @@ test "direct generation admission binds preload control without granting embedde
     const preload_control = try admission.boundExecutionControl();
     try std.testing.expect(preload_control.io != null);
     try std.testing.expect(preload_control.hard_cancellation != null);
-    var guard = try preload_control.enterUninterruptible(.process_required);
+    var guard = try preload_control.enterUninterruptible(.uninterruptible);
     guard.deinit();
 
     admission.execution_control = .{ .deadline_ns = 0 };
@@ -28512,7 +28516,7 @@ test "direct generation admission binds preload control without granting embedde
     defer embedded_admission.deinit();
     const embedded_control = try embedded_admission.boundExecutionControl();
     try std.testing.expect(embedded_control.hard_cancellation == null);
-    try std.testing.expectError(error.ProcessIsolationRequired, embedded_control.enterUninterruptible(.process_required));
+    try std.testing.expectError(error.ProcessIsolationRequired, embedded_control.enterUninterruptible(.uninterruptible));
 }
 
 test "supervised node drains load task guards before destroying watchdog" {
@@ -28524,7 +28528,7 @@ test "supervised node drains load task guards before destroying watchdog" {
 
         fn run(self: *@This(), io: std.Io, control: InferenceExecutionControl) std.Io.Cancelable!void {
             defer self.finished = true;
-            var guard = control.enterUninterruptible(.process_required) catch |err| {
+            var guard = control.enterUninterruptible(.uninterruptible) catch |err| {
                 self.err = err;
                 self.ready.set(io);
                 return;

@@ -134,10 +134,16 @@ pub fn startLiteEmbeddedInference(
     const models_dir = if (budget_options.models_dir) |directory| try alloc.dupe(u8, directory) else null;
     errdefer if (models_dir) |directory| alloc.free(directory);
     owned_options.models_dir = models_dir;
+    const service = try alloc.create(handles.SharedLiteInference);
+    errdefer alloc.destroy(service);
     const created = try inference_provider.createEmbeddedInferenceNode(data_dir, io_impl.io(), owned_options);
-    handle.lite_inference_models_dir = models_dir;
-    handle.lite_inference_io = io_impl;
-    handle.lite_inference_lifetime = .{ .handle = created.handle, .resource_owner = created.resource_owner };
+    service.* = .{
+        .alloc = alloc,
+        .io = io_impl,
+        .models_dir = models_dir,
+        .lifetime = .{ .handle = created.handle, .resource_owner = created.resource_owner },
+    };
+    handle.lite_inference = service;
     // Report the policy the node actually resolved (host-detected by
     // default, or the caller's explicit override) rather than leaving
     // `lite_inference_status` at the pre-open placeholder values.
@@ -2402,6 +2408,8 @@ pub const LiteResolvedOpenOptions = struct {
     /// Internal: the connection boundary owns the cross-process path lease.
     externally_locked: bool = false,
     artifact_reader_fence: bool = false,
+    /// Borrowed only during open, under the connection's publication fence.
+    allocator_verification_owner: ?*lite_backend.native.NativeFile = null,
 };
 
 pub fn optionFieldType(comptime Options: type, comptime field_name: []const u8) type {
@@ -2608,14 +2616,27 @@ pub fn openLiteHandleAllocWithRuntime(
     borrowed_io: ?std.Io,
     backend_runtime: ?*db_mod.background_runtime.BackendRuntime,
 ) !*Handle {
+    return openLiteHandleAllocWithSharedInference(alloc, path, resolved, create, borrowed_io, backend_runtime, null);
+}
+
+pub fn openLiteHandleAllocWithSharedInference(
+    alloc: Allocator,
+    path: []const u8,
+    resolved: LiteResolvedOpenOptions,
+    create: bool,
+    borrowed_io: ?std.Io,
+    backend_runtime: ?*db_mod.background_runtime.BackendRuntime,
+    inference_source: ?*Handle,
+) !*Handle {
     if (create and !liteOpenModeCanWrite(resolved.open_mode)) return error.InvalidArgument;
+    var handle_owns_resources = false;
     // Each cached generation owns its storage pool. Retired cursors may keep
     // an older generation alive while the same index roots reopen in this one.
     var owned_runtime: ?db_mod.background_runtime.BackendRuntimeHandle = if (resolved.externally_locked and backend_runtime == null)
         try db_mod.background_runtime.BackendRuntimeHandle.initManualWithOwnedIo(alloc)
     else
         null;
-    errdefer if (owned_runtime) |*runtime| runtime.deinit();
+    errdefer if (!handle_owns_resources) if (owned_runtime) |*runtime| runtime.deinit();
     var backend = if (create)
         try lite_backend.Handle.createWithOptions(alloc, path, .{
             .externally_locked = resolved.externally_locked,
@@ -2630,7 +2651,11 @@ pub fn openLiteHandleAllocWithRuntime(
             .no_sync = resolved.no_sync,
             .io = borrowed_io,
         });
-    errdefer backend.deinit();
+    errdefer if (!handle_owns_resources) backend.deinit();
+    if (resolved.allocator_verification_owner) |verified| {
+        if (!resolved.externally_locked) return error.InvalidArgument;
+        try backend.native_docstore.?.file.inheritAllocatorVerification(verified);
+    }
     if (resolved.externally_locked) {
         backend.native_docstore.?.file.externally_locked = true;
         backend.native_docstore.?.maintenance_start_suppressed = true;
@@ -2677,7 +2702,7 @@ pub fn openLiteHandleAllocWithRuntime(
     opts.identity_namespace = identity.identity_namespace;
     opts.prefer_existing_identity_namespace = identity.prefer_existing_identity_namespace;
     var db = try db_mod.DB.open(alloc, path, opts);
-    errdefer db.close();
+    errdefer if (!handle_owns_resources) db.close();
 
     if (create) {
         // Antfly Lite databases provision the same default full-text index
@@ -2687,7 +2712,7 @@ pub fn openLiteHandleAllocWithRuntime(
     }
 
     const handle = alloc.create(Handle) catch return error.OutOfMemory;
-    errdefer alloc.destroy(handle);
+    errdefer if (!handle_owns_resources) alloc.destroy(handle);
     handle.* = .{
         .alloc = alloc,
         .db = db,
@@ -2700,22 +2725,27 @@ pub fn openLiteHandleAllocWithRuntime(
         .lite_inference_status = lite_backend.inferenceStatusForProfileWithOptions(resolved.profile, resolved.inference),
         .lite_generated_enrichment_replay = resolved.generated_enrichment_replay,
     };
-    // Only the native profile runs background enrichment automatically;
-    // only builds that both advertise (lite-local-inference-runtime) and
-    // actually link (capi_build_options.inference_enabled) the local
-    // inference runtime may construct one. Every other combination -- flag
-    // unset, default build, hosted profile -- leaves the handle exactly as
-    // it was before this feature existed.
+    // Transfer the complete generation before configuring producers. From this
+    // point even a failed open must drain the actual DB stored in the handle,
+    // then release inference, storage and IO in the ordinary close order.
+    handle_owns_resources = true;
+    errdefer {
+        handle.lease_snapshot = true;
+        handles.closeHandle(handle);
+    }
+    // Native builds link local inference. The native profile starts a service
+    // only when the caller requests it and the target advertises support;
+    // hosted/freestanding surfaces retain caller-supplied inference.
     if (resolved.profile == .native and
         resolved.inference.local_runtime_configured and
         capi_build_options.inference_enabled and
         lite_backend.capabilitiesForProfile(.native).local_inference_runtime)
     {
-        // `backend.deinit()`, `db.close()`, and `alloc.destroy(handle)` are
-        // already registered as `errdefer`s above (in that unwind order);
-        // adding any of that cleanup here too would run it twice on this
-        // error path. Only unwind the state this function itself owns.
-        try startLiteEmbeddedInference(handle, alloc, path, .{
+        if (if (inference_source) |source| source.lite_inference else null) |service| {
+            service.retain();
+            handle.lite_inference = service;
+            handle.lite_inference_status = inference_source.?.lite_inference_status;
+        } else try startLiteEmbeddedInference(handle, alloc, path, .{
             .models_dir = resolved.inference.models_dir,
             .host_budget_mb = resolved.inference.host_budget_mb,
             .backend_budget_mb = resolved.inference.backend_budget_mb,
@@ -2730,16 +2760,9 @@ pub fn openLiteHandleAllocWithRuntime(
     // default full-text index, so this is a no-op there). Must run after
     // `startLiteEmbeddedInference` so an embedded local provider is already
     // attached to the handle when this reads it.
-    refreshLiteManagedEmbeddingRuntime(handle) catch |err| {
-        stopLiteEmbeddedInference(handle);
-        return err;
-    };
+    try refreshLiteManagedEmbeddingRuntime(handle);
     @import("entity_sink.zig").attach(handle, &handle.db);
-    @import("tables.zig").loadCatalog(handle) catch |err| {
-        stopLiteEmbeddedInference(handle);
-        alloc.free(handle.embedded_path.?);
-        return err;
-    };
+    try @import("tables.zig").loadCatalog(handle);
     if (!resolved.externally_locked) handle.database().*.startQuarantineRetryWorkerIfNeeded();
     return handle;
 }
@@ -3014,8 +3037,18 @@ pub fn antfly_db_status_json(handle_ptr: ?*anyopaque, out_buf: ?*capi.Buffer) ca
         .capabilities = capabilities,
     };
 
-    const bytes = std.fmt.allocPrint(handle.alloc, "{f}", .{std.json.fmt(status, .{})}) catch |err| return capi.mapErrorContext(err, @src().fn_name);
-    out.* = .{ .ptr = bytes.ptr, .len = bytes.len };
+    var arena = std.heap.ArenaAllocator.init(handle.alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const status_json = std.json.Stringify.valueAlloc(a, status, .{}) catch |err| return capi.mapError(err);
+    var value = std.json.parseFromSliceLeaky(std.json.Value, a, status_json, .{}) catch |err| return capi.mapError(err);
+    if (comptime capi_build_options.inference_enabled) if (handle.lite_inference) |service| {
+        const admission = inference_provider.embeddedMemoryAdmissionStats(service.lifetime.handle) catch |err| return capi.mapError(err);
+        const bytes = std.json.Stringify.valueAlloc(a, admission, .{}) catch |err| return capi.mapError(err);
+        const admission_value = std.json.parseFromSliceLeaky(std.json.Value, a, bytes, .{}) catch |err| return capi.mapError(err);
+        value.object.getPtr("inference").?.object.put(a, "memory_admission", admission_value) catch |err| return capi.mapError(err);
+    };
+    out.* = stringifyJson(value) catch |err| return capi.mapErrorContext(err, @src().fn_name);
     return .ok;
 }
 
@@ -4715,6 +4748,16 @@ fn pendingNamespaceStatsValue(a: Allocator, database: *db_mod.DB) !std.json.Valu
     defer jobs.deinit();
     var rows: std.ArrayList(std.json.Value) = .empty;
     for (jobs.value) |job| {
+        const upstream = if (database.enrichment_runtime) |runtime| runtime.stats() else db_mod.types.EnrichmentStats{};
+        const replaying = job.phase != .failed and !job.producer_replay_complete;
+        const waiting = job.phase != .failed and job.producer_replay_target > upstream.applied_sequence;
+        const producer_pending = replaying or waiting;
+        const blocked_reason: ?[]const u8 = if (replaying) "replaying_producer_sources" else if (waiting) "waiting_for_producer_enrichment" else null;
+        // A malformed failed declaration must not hide its retry/error status.
+        const producers = database.graphReplacementProducerNamesAlloc(a, job) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => try a.alloc([]u8, 0),
+        };
         const status = try std.json.Stringify.valueAlloc(a, .{
             .name = job.name,
             .replaces = job.old,
@@ -4723,6 +4766,13 @@ fn pendingNamespaceStatsValue(a: Allocator, database: *db_mod.DB) !std.json.Valu
             .applied_sequence = job.applied_sequence,
             .target_sequence = database.core.nextDerivedSequence(),
             .last_error = job.last_error,
+            .blocked_reason = blocked_reason,
+            .producer_artifacts = producers,
+            .producer_replay_target = job.producer_replay_target,
+            .producer_applied_sequence = upstream.applied_sequence,
+            .upstream_last_error = if (producer_pending and upstream.last_error_code.len > 0) upstream.last_error_code.slice() else @as(?[]const u8, null),
+            .upstream_retrying = producer_pending and upstream.retrying,
+            .upstream_next_retry_at_ms = if (producer_pending) upstream.next_retry_at_ms else 0,
             .retry_count = job.retry_count,
             .total_retry_count = job.total_retry_count,
             .max_total_retries = db_mod.DB.replacement_total_retry_limit,

@@ -137,6 +137,24 @@ export interface StorageStatus {
   page_count?: number;
 }
 
+/** Historical snapshot of the local runtime's last denied memory admission. */
+export interface MemoryAdmissionStats {
+  pressure: string;
+  denied_count: number;
+  last_denied_ns: number;
+  request_count: number;
+  requested_host_bytes: number;
+  requested_backend_bytes: number;
+  requested_kv_bytes: number;
+  requested_scratch_bytes: number;
+  admitted_host_bytes: number;
+  admitted_backend_bytes: number;
+  host_limit_bytes: number;
+  backend_limit_bytes: number;
+  combined_limit_bytes: number;
+  available_memory_bytes: number;
+}
+
 export interface InferenceStatus {
   mode: string;
   available_modes: string[];
@@ -154,6 +172,7 @@ export interface InferenceStatus {
   process_memory_budget_mb: number;
   process_memory_limit_bytes: number;
   process_memory_limit_source: string;
+  memory_admission?: MemoryAdmissionStats;
 }
 
 export interface Capabilities {
@@ -205,6 +224,7 @@ export interface PendingWorkStatus {
   resolution: unknown;
   promotion: unknown;
   text_merge: unknown;
+  replacements?: unknown[];
 }
 
 export interface Status {

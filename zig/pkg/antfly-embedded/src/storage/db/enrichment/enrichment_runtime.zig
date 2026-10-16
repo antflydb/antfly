@@ -2321,6 +2321,7 @@ fn enrichmentErrorDisposition(err: anyerror) EnrichmentErrorDisposition {
         // cause; keep RuntimeBoundaryFailure terminal as a fail-closed guard
         // for every other boundary.
         error.InferenceProviderFailure,
+        error.InferenceWorkerExecutableNotConfigured,
         error.KernelJitRequiredDynamicLoad,
         error.RuntimeBoundaryFailure,
         error.UnboundedEnrichmentProvider,
@@ -2737,6 +2738,8 @@ fn isEnrichmentControlError(err: anyerror) bool {
 
 test "enrichment distinguishes transient capacity from permanent resource limits" {
     try std.testing.expect(!isRetryableEnrichmentError(error.ModelNotFound));
+    try std.testing.expect(!isRetryableEnrichmentError(error.InferenceWorkerExecutableNotConfigured));
+    try std.testing.expect(isRetryableEnrichmentError(error.InferenceWorkerUnavailable));
     try std.testing.expect(isRetryableEnrichmentError(error.ResourceTemporarilyUnavailable));
     try std.testing.expect(!isRetryableEnrichmentError(error.ResourceLimitExceeded));
 }
