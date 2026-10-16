@@ -685,7 +685,8 @@ pub fn executeWithAllocators(server: *server_mod.ApiHttpServer, identity: ?serve
         const table_id = std.fmt.allocPrint(alloc, "{d}", .{resource_record.id}) catch return error.SqlMutationOutcomeUnknown;
         alloc.free(receipt.table_id);
         receipt.table_id = table_id;
-        awaitActivation(server, context, alloc, request.physical_name.?, receipt) catch {
+        awaitActivation(server, context, alloc, request.physical_name.?, receipt) catch |err| {
+            std.log.warn("SQL table creation committed but activation observation failed table_id={s} err={s}", .{ receipt.table_id, @errorName(err) });
             receipt.state = .pending;
             receipt.diagnostic = "Table creation committed; constraints are still being validated. Inspect table constraint status; do not replay the DDL.";
         };
@@ -706,7 +707,21 @@ fn awaitActivation(server: *server_mod.ApiHttpServer, context: operation.Request
     while (true) {
         try bounded.ensureActive();
         const bytes = @import("relational_constraint_status.zig").collect(alloc, server.source, reader, physical, bounded) catch |err| switch (err) {
-            error.ConstraintActivationPending, error.PreparedGenerationChanged, error.TopologyChanged => {
+            // The declaration is already durable, but its new owner/route may
+            // not be readable yet. Retry only the observation within the same
+            // deadline; never resubmit the DDL or infer coverage from absence.
+            error.ConstraintActivationPending,
+            error.PreparedGenerationChanged,
+            error.TopologyChanged,
+            error.StorageReadTemporarilyUnavailable,
+            error.StorageKernelOwnerUnavailable,
+            error.NotLeader,
+            error.GroupLeaderUnavailable,
+            error.LeaderUnavailable,
+            error.UnknownGroup,
+            error.ReadIndexTimeout,
+            error.CatalogRoutingSnapshotTimeout,
+            => {
                 try activationPause(server, bounded);
                 continue;
             },
@@ -738,6 +753,58 @@ fn awaitActivation(server: *server_mod.ApiHttpServer, context: operation.Request
             .validating => {},
         }
         try activationPause(server, bounded);
+    }
+}
+
+test "SQL DDL readiness retries transient observations without replaying the declaration" {
+    const metadata_api = @import("../metadata/api.zig");
+    const Fixture = struct {
+        failure: anyerror,
+        calls: usize = 0,
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{} };
+        }
+        fn snapshot(ptr: *anyopaque) !metadata_api.AdminSnapshot {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            if (self.calls == 1) return self.failure;
+            return .{
+                .status = try status(ptr),
+                .tables = @constCast(&[_]@import("../metadata/table_manager.zig").TableRecord{.{
+                    .table_id = 7,
+                    .name = "new_table",
+                    .schema_json =
+                    \\{"version":0,"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"}},"additionalProperties":false}}}}
+                    ,
+                }}),
+                .ranges = &.{},
+                .stores = &.{},
+                .placement_intents = &.{},
+                .split_transitions = &.{},
+                .merge_transitions = &.{},
+            };
+        }
+        fn free(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+    };
+    const alloc = std.testing.allocator;
+    for ([_]anyerror{ error.StorageReadTemporarilyUnavailable, error.StorageKernelOwnerUnavailable, error.NotLeader, error.ReadIndexTimeout }) |failure| {
+        var fixture: Fixture = .{ .failure = failure };
+        var server = server_mod.ApiHttpServer.init(alloc, .{}, .{ .ptr = &fixture, .vtable = &.{ .status = Fixture.status, .admin_snapshot = Fixture.snapshot, .free_admin_snapshot = Fixture.free } }, null, null);
+        defer server.deinit();
+        // No owner read is needed for a declaration without constraints.
+        server.table_reads = .{ .ptr = &fixture, .vtable = &.{ .lookup = undefined, .scan = undefined, .query = undefined } };
+        var receipt: catalog.DdlReceipt = .{ .database = "default", .namespace = "public", .table = "new_table", .table_id = "7", .schema_version = 0, .state = .pending };
+        try awaitActivation(&server, .{ .deadline_io = @import("antfly_runtime_abi").io_abi.Borrow.init(&std.testing.io) }, alloc, "new_table", &receipt);
+        try std.testing.expectEqual(.ready, receipt.state);
+        try std.testing.expectEqual(@as(usize, 2), fixture.calls);
+        // Invalid data remains a terminal observation error, not a retry.
+        fixture.failure = error.InvalidIntegrityDefinition;
+        fixture.calls = 0;
+        try std.testing.expectError(error.InvalidIntegrityDefinition, awaitActivation(&server, .{}, alloc, "new_table", &receipt));
+        try std.testing.expectEqual(@as(usize, 1), fixture.calls);
+        fixture.calls = 0;
+        try std.testing.expectError(error.DeadlineExceeded, awaitActivation(&server, .{ .deadline_ns = 0 }, alloc, "new_table", &receipt));
+        try std.testing.expectEqual(@as(usize, 0), fixture.calls);
     }
 }
 

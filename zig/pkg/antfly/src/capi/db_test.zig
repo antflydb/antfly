@@ -1016,6 +1016,28 @@ test "capi lite merged indexes JSON discovers a standalone asset extractor and c
     try std.testing.expect(try local_write.indexesJsonNeedsAssetProducer(alloc, merged_json));
 }
 
+const EnrichmentDrainStats = struct {
+    enrichment: struct {
+        error_count: u64,
+        fatal_error_count: u64,
+        stalled: bool,
+        target_sequence: u64,
+        applied_sequence: u64,
+    },
+};
+
+fn enrichmentDrainStats(handle: ?*anyopaque) !EnrichmentDrainStats {
+    // Maintenance may replace and retire the resident Lite runtime. Inspect
+    // the current runtime through a guarded public call rather than retaining
+    // an internal Handle/DB pointer across mutations or run-until-idle.
+    var output: capi.Buffer = .{};
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_pending_work_stats_json(handle, &output));
+    defer freeRawBuffer(output.ptr, output.len);
+    var parsed = try std.json.parseFromSlice(EnrichmentDrainStats, std.testing.allocator, output.ptr.?[0..output.len], .{ .ignore_unknown_fields = true });
+    defer parsed.deinit();
+    return parsed.value;
+}
+
 test "capi lite run until idle drains a standalone chunk enrichment with no owning index" {
     // End-to-end reproduction of the same gap: before the fix, a standalone
     // `kind:"chunk"` catalog enrichment left `generated=false` in
@@ -1060,8 +1082,7 @@ test "capi lite run until idle drains a standalone chunk enrichment with no owni
 
     try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_run_until_idle(handle));
 
-    const owned_handle = asHandle(handle).?;
-    const drained = owned_handle.db.pendingWorkStats();
+    const drained = try enrichmentDrainStats(handle);
     try std.testing.expectEqual(@as(u64, 0), drained.enrichment.error_count);
     try std.testing.expectEqual(@as(u64, 0), drained.enrichment.fatal_error_count);
     try std.testing.expect(!drained.enrichment.stalled);
@@ -4468,8 +4489,7 @@ test "capi lite drains an antfly embedder with no api_url through the embedded i
     var handle: ?*anyopaque = null;
     try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_create_with_options(path, &options, &handle));
     defer antfly_db_close(handle);
-    const owned_handle = asHandle(handle).?;
-    try std.testing.expect(owned_handle.lite_inference_lifetime != null);
+    try std.testing.expect(asHandle(handle).?.lite_inference_lifetime != null);
 
     const index_json =
         \\{"name":"body_embedding","kind":"dense_vector","config_json":"{\"type\":\"embeddings\",\"embedder\":{\"provider\":\"antfly\",\"model\":\"Qwen/Qwen3-Embedding-0.6B-GGUF\"}}"}
@@ -4497,7 +4517,7 @@ test "capi lite drains an antfly embedder with no api_url through the embedded i
 
     try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_run_until_idle(handle));
 
-    const drained = owned_handle.db.pendingWorkStats();
+    const drained = try enrichmentDrainStats(handle);
     try std.testing.expectEqual(@as(u64, 0), drained.enrichment.error_count);
     try std.testing.expectEqual(@as(u64, 0), drained.enrichment.fatal_error_count);
     try std.testing.expect(!drained.enrichment.stalled);
