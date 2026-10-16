@@ -1519,6 +1519,9 @@ artifacts, preserving test selection and coverage.
 The broad Raft fixture root also measured 14,420,606,976 bytes against its
 former 12 GiB claim. Its `raft-unit-tests` artifact uses a 17 GiB native Darwin
 Debug floor, retaining the existing `antfly-raft-test` target and ownership selection.
+The shared API table-write implementation test object measured 13,252,476,928
+bytes against its former 12 GiB claim. Its native Darwin Debug floor is 16 GiB;
+its existing name and all other profiles retain their scheduling behavior.
 
 The production smoke reproduces Lite table creation returning HTTP 202 with
 committed repair debt. Erased storage read/probe/batch and namespace handles

@@ -183,13 +183,23 @@ pub fn testCompileMaxRss(name: []const u8, host: std.Target, target: std.Target,
     // public-api-parity/api-docid-tests/api-auth-tests/api-derived-coverage-tests
     // peaked at 18,029,035,520/14,373,978,112/13,895,155,712/14,097,039,360
     // bytes respectively; raft-unit-tests peaked at 14,420,606,976 bytes.
+    // api-table-write-implementation-tests peaked at 13,252,476,928 bytes.
     // Reserve >25% headroom
     // without changing cross-host, release or other test-object reservations.
     if (host.os.tag == .macos and host.cpu.arch == .aarch64 and
         target.os.tag == .macos and target.cpu.arch == .aarch64 and optimize == .debug)
     {
-        const gib: usize = if (std.mem.eql(u8, name, "public-api-parity")) 22 else if (std.mem.eql(u8, name, "api-docid-tests")) 18 else if (std.mem.eql(u8, name, "api-auth-tests") or std.mem.eql(u8, name, "api-derived-coverage-tests") or std.mem.eql(u8, name, "raft-unit-tests")) 17 else return authored;
-        return @max(authored, gib * 1024 * 1024 * 1024);
+        const floors = [_]struct { name: []const u8, gib: usize }{
+            .{ .name = "public-api-parity", .gib = 22 },
+            .{ .name = "api-docid-tests", .gib = 18 },
+            .{ .name = "api-auth-tests", .gib = 17 },
+            .{ .name = "api-derived-coverage-tests", .gib = 17 },
+            .{ .name = "raft-unit-tests", .gib = 17 },
+            .{ .name = "api-table-write-implementation-tests", .gib = 16 },
+        };
+        for (floors) |floor| if (std.mem.eql(u8, name, floor.name))
+            return @max(authored, floor.gib * 1024 * 1024 * 1024);
+        return authored;
     }
     if (host.os.tag != .linux or host.cpu.arch != .x86_64 or
         target.os.tag != .linux or target.cpu.arch != .x86_64 or target.abi != .gnu or optimize != .debug)
@@ -385,7 +395,7 @@ test "linked LLVM Debug test reservations cover native peaks without lowering au
     try std.testing.expectEqual(7 * gib, testCompileMaxRss("unmeasured", linux, linux, .debug, 7 * gib));
 }
 
-test "native Darwin Debug API reservations cover measured peaks without unsafe overlap" {
+test "native Darwin Debug test reservations cover measured peaks without unsafe overlap" {
     const macos = try std.zig.system.resolveTargetQuery(std.testing.io, .{ .cpu_arch = .aarch64, .os_tag = .macos });
     const linux = try std.zig.system.resolveTargetQuery(std.testing.io, .{ .cpu_arch = .x86_64, .os_tag = .linux, .abi = .gnu });
     const gib = 1024 * 1024 * 1024;
@@ -411,8 +421,8 @@ test "native Darwin Debug API reservations cover measured peaks without unsafe o
     try std.testing.expectEqual(12 * gib, testCompileMaxRss("api-docid-tests", macos, linux, .debug, 12 * gib));
     try std.testing.expectEqual(12 * gib, testCompileMaxRss("api-docid-tests", linux, macos, .debug, 12 * gib));
     try std.testing.expectEqual(7 * gib, testCompileMaxRss("api-docid-tests", linux, linux, .debug, 7 * gib));
-    const names = [_][]const u8{ "api-auth-tests", "api-derived-coverage-tests", "raft-unit-tests" };
-    const peaks = [_]usize{ 13_895_155_712, 14_097_039_360, 14_420_606_976 };
+    const names = [_][]const u8{ "api-auth-tests", "api-derived-coverage-tests", "raft-unit-tests", "api-table-write-implementation-tests" };
+    const peaks = [_]usize{ 13_895_155_712, 14_097_039_360, 14_420_606_976, 13_252_476_928 };
     for (names, peaks) |name, measured| {
         const floor = testCompileMaxRss(name, macos, macos, .debug, 12 * gib);
         try std.testing.expect(floor >= measured + measured / 4);
