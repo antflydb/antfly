@@ -177,6 +177,7 @@ pub fn describe(err: anyerror) Diagnostic {
         error.RelationalIndexColumnNotFound, error.UndefinedColumn, error.UnknownColumn => .{ .code = "42703", .message = "A referenced column does not exist.", .hint = "Check column names against the current table schema." },
         error.DuplicateColumn, error.DuplicateSqlColumn => .{ .code = "42701", .message = "A column was specified more than once.", .hint = "Remove the duplicate column reference." },
         error.AmbiguousSqlColumn => .{ .code = "42702", .message = "A column reference is ambiguous.", .hint = "Use an unambiguous column name or alias." },
+        error.DuplicateSqlAlias => .{ .code = "42712", .message = "A relation alias was specified more than once.", .hint = "Use a distinct alias for the merged USING columns." },
         error.InvalidSqlParameter => .{ .code = "42P02", .message = "A SQL parameter reference is invalid.", .hint = "Use positional parameters starting at $1 and supply every referenced position." },
         error.ConflictingSqlParameterTypes => .{ .code = "42P08", .message = "A parameter is used with incompatible types.", .hint = "Use separate parameters for incompatible column types." },
         error.SqlGeneratedColumnWrite => .{ .code = "428C9", .message = "A generated column cannot be assigned directly.", .hint = "Omit the generated column and let the server compute its value." },

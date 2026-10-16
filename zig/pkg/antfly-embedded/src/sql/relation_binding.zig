@@ -35,6 +35,8 @@ pub const Column = struct {
     numeric_modifier: ?scalar.NumericModifier = null,
     nullable: bool,
     visible: bool = true,
+    /// Original USING keys remain available to qualified names and stars.
+    unqualified_visible: bool = true,
     untyped_null: bool = false,
     /// Symbolic lineage exists only during the pre-emission constraint pass.
     origin: ?*const ast.Scalar = null,
@@ -88,7 +90,7 @@ pub fn expandWildcards(alloc: Allocator, columns: []const Column, projections: [
 
 fn wildcardMatches(columns: []const Column, column: Column, projection: ast.Projection, default_qualifier: ?[]const u8) bool {
     if (!column.visible) return false;
-    const qualifier = if (projection.field.len != 0) projection.field else default_qualifier orelse return column.outer_level == 0;
+    const qualifier = if (projection.field.len != 0) projection.field else default_qualifier orelse return column.outer_level == 0 and column.unqualified_visible;
     for (columns) |other| if (other.outer_level < column.outer_level and qualifierMatches(other, qualifier)) return false;
     return qualifierMatches(column, qualifier);
 }
@@ -116,7 +118,16 @@ pub const Node = struct {
         scan: struct { index: usize, source_columns: []const []const u8 },
         join: struct { kind: ast.JoinKind, left: *const Node, right: *const Node, condition: ?scalar.Program, left_keys: []const scalar.Program, right_keys: []const scalar.Program, correlation: bool = false, membership: ?struct { correlations: usize } = null },
         apply: struct { id: usize, kind: ast.JoinKind, left: *const Node, right: *const Node, condition: ?scalar.Program, demand: ?scalar.Program = null, single_row: bool = false },
-        query: struct { source: *const Node, statement: ast.Select, binding: describe.BoundStatement, preserve_scope: bool = false, constant_refs: []const ConstantRef = &.{} },
+        query: struct {
+            source: *const Node,
+            statement: ast.Select,
+            binding: describe.BoundStatement,
+            preserve_scope: bool = false,
+            /// Validated pure projection; no filter, bounds or effects. It
+            /// may disappear only when none of its new identities is used.
+            elidable_projection: bool = false,
+            constant_refs: []const ConstantRef = &.{},
+        },
         set: struct { kind: ast.SetKind, all: bool, left: *const Node, right: *const Node },
         /// Compiler-generated INSERT VALUES arms in input order. Each arm
         /// retains its own captured source dependencies, but execution opens
@@ -760,6 +771,7 @@ const Builder = struct {
     fn field(columns: []const Column, name: []const u8) !Column {
         var found: ?Column = null;
         for (columns) |column| {
+            if (std.mem.eql(u8, column.name, name) and !column.unqualified_visible) continue;
             // Compiler-owned mutation metadata names themselves begin with
             // NUL. Match the complete bound column suffix before splitting
             // qualification; splitting at the last NUL would lose provenance.
@@ -1528,7 +1540,11 @@ const Builder = struct {
                     if (join.kind != .left or join.condition != null or join.demand != null or lateral) return error.InvalidSqlBackendResponse;
                     break :blk try self.membershipNode(left, right, membership.probes, membership.correlations, membership.alias);
                 }
-                for (left.columns) |a| for (right.columns) |b| if (std.mem.eql(u8, a.qualifier, b.qualifier)) return error.AmbiguousSqlColumn;
+                for (left.columns) |a| for (right.columns) |b| if (a.qualifier.len != 0 and std.mem.eql(u8, a.qualifier, b.qualifier)) return error.AmbiguousSqlColumn;
+                if (join.keys != .none) {
+                    if (join.condition != null or join.membership != null or join.demand != null or join.single_row or join.kind == .cross) return error.InvalidSqlBackendResponse;
+                    break :blk try self.keyJoin(left, right, join.kind, join.keys, join.using_alias, apply_id);
+                }
                 const columns = try self.joinColumns(left, right, join.kind);
                 const expression_ = if (join.condition) |condition| try self.expression(columns, condition, &.{}) else null;
                 var demand: ?scalar.Program = null;
@@ -1553,6 +1569,78 @@ const Builder = struct {
             },
         };
     }
+    fn keyColumn(columns: []const Column, name: []const u8, visible_only: bool) !Column {
+        var found: ?Column = null;
+        for (columns) |column| {
+            // Explicit USING can name an addressable hidden metadata column;
+            // NATURAL discovery, like plain *, only considers visible cells.
+            if ((visible_only and !column.visible) or !column.unqualified_visible or !std.mem.eql(u8, column.name, name)) continue;
+            if (found != null) return error.AmbiguousSqlColumn;
+            found = column;
+        }
+        return found orelse error.UndefinedColumn;
+    }
+
+    fn keyJoin(self: *Builder, left: *const Node, right: *const Node, kind: ast.JoinKind, keys: @FieldType(@FieldType(ast.Relation, "join"), "keys"), alias: ?[]const u8, apply_id: ?usize) !*const Node {
+        if (alias) |name| {
+            for (left.columns) |column| if (std.mem.eql(u8, column.qualifier, name)) return error.DuplicateSqlAlias;
+            for (right.columns) |column| if (std.mem.eql(u8, column.qualifier, name)) return error.DuplicateSqlAlias;
+        }
+        var natural: std.ArrayList([]const u8) = .empty;
+        const names = switch (keys) {
+            .none => unreachable,
+            .using => |names| names,
+            .natural => blk: {
+                for (left.columns) |column| {
+                    if (!column.visible or !column.unqualified_visible) continue;
+                    _ = keyColumn(right.columns, column.name, true) catch |err| {
+                        if (err == error.UndefinedColumn) continue;
+                        return err;
+                    };
+                    try natural.append(self.alloc, column.name);
+                }
+                break :blk natural.items;
+            },
+        };
+        var condition: ?*const ast.Scalar = null;
+        const merged = try self.alloc.alloc(*const ast.Scalar, names.len);
+        for (names, merged, 0..) |name, *value, index| {
+            for (names[0..index]) |prior| if (std.mem.eql(u8, prior, name)) return error.DuplicateSqlColumn;
+            const l = try keyColumn(left.columns, name, keys == .natural);
+            const r = try keyColumn(right.columns, name, keys == .natural);
+            const l_expr = try self.scalarNode(.{ .column = l.internal });
+            const r_expr = try self.scalarNode(.{ .column = r.internal });
+            const equal = try self.scalarNode(.{ .binary = .{ .op = .eq, .left = l_expr, .right = r_expr } });
+            condition = if (condition) |prior| try self.scalarNode(.{ .binary = .{ .op = .@"and", .left = prior, .right = equal } }) else equal;
+            value.* = try self.scalarNode(.{ .call = .{ .name = "coalesce", .args = try self.alloc.dupe(*const ast.Scalar, &.{ l_expr, r_expr }) } });
+        }
+        const source = try self.joinNode(left, right, kind, condition, apply_id);
+        if (names.len == 0) return source;
+        const columns = try self.alloc.alloc(Column, names.len + source.columns.len);
+        const projections = try self.alloc.alloc(ast.Projection, columns.len);
+        const types = try self.scalarColumns(source.columns);
+        for (names, merged, columns[0..names.len], projections[0..names.len]) |name, expression_, *column, *projection| {
+            const symbolic = if (self.shape_only) try self.inferenceExpression(expression_, source.columns) else expression_;
+            const output = try scalar.inferOutputWithInvocation(self.alloc, symbolic, if (self.shape_only) self.shape_columns.items else types, self.parameters, self.backend.parameter_invocation);
+            column.* = .{ .name = name, .internal = try self.internal(), .qualifier = alias orelse "", .type = output.kind orelse .string, .element_type = output.element_type, .numeric_modifier = output.numeric_modifier, .nullable = true, .origin = if (self.shape_only) symbolic else null };
+            projection.* = .{ .expression = expression_, .alias = column.internal };
+        }
+        for (source.columns, columns[names.len..], projections[names.len..]) |input, *column, *projection| {
+            column.* = input;
+            for (names) |name| if (std.mem.eql(u8, input.name, name)) {
+                column.unqualified_visible = false;
+                break;
+            };
+            projection.* = .{ .field = input.internal, .alias = input.internal };
+        }
+        if (self.shape_only) return self.node(columns, .singleton);
+        const statement: ast.Select = .{ .table = .{ .table = "$sql_relation" }, .columns = projections, .internal_projection = true };
+        var adapter: ResolveAdapter = .{ .backend = self.backend, .table = try self.virtualTable(source.columns) };
+        const compiled: compiler.Compiled = .{ .arena = undefined, .statement = .{ .select = statement }, .parameter_count = @intCast(self.parameters.len) };
+        const bound = try describe.bindInternal(self.alloc, adapter.iface(), &compiled, self.parameters);
+        return self.node(columns, .{ .query = .{ .source = source, .statement = statement, .binding = bound, .preserve_scope = true, .elidable_projection = true } });
+    }
+
     fn joinColumns(self: *Builder, left: *const Node, right: *const Node, kind: ast.JoinKind) ![]Column {
         const columns = try self.alloc.alloc(Column, left.columns.len + right.columns.len);
         @memcpy(columns[0..left.columns.len], left.columns);
@@ -1813,7 +1901,13 @@ fn projectScans(builder: *Builder, node: *const Node, needed: *std.StringHashMap
             var required = query.statement;
             // Transparent outputs retain ordinal slots, but cold forwarded
             // columns must not become physical scan dependencies.
-            if (query.preserve_scope) required.columns = &.{};
+            if (query.preserve_scope) {
+                for (query.statement.columns, node.columns) |projection, column| {
+                    if (!needed.contains(column.internal)) continue;
+                    if (projection.expression) |expression_| try markExpression(builder.alloc, needed, expression_);
+                }
+                required.columns = &.{};
+            }
             try markSelect(builder.alloc, needed, required);
             try projectScans(builder, query.source, needed);
         },
@@ -1892,10 +1986,21 @@ fn bindWithPreparedScope(alloc: Allocator, backend: catalog.Backend, statement: 
         try shape.inferShape(normalized, &.{});
         builder.identities = shape.identities;
     }
-    const root = try builder.querySource(normalized, &.{}, 0);
+    var root = try builder.querySource(normalized, &.{}, 0);
     const lowered = try builder.lower(root, normalized);
     var needed: std.StringHashMapUnmanaged(void) = .empty;
     try markSelect(alloc, &needed, lowered);
+    // At the statement boundary all scalar names have already been bound.
+    // Discard unused synthetic USING cells for count/qualified-only queries
+    // without altering any nested join's ordinal layout or skipping binding.
+    while (root.operation == .query and root.operation.query.elidable_projection) {
+        const source = root.operation.query.source;
+        const required = for (root.columns) |column| {
+            if (needed.contains(column.internal) and !hasInternal(source.columns, column.internal)) break true;
+        } else false;
+        if (required) break;
+        root = source;
+    }
     try projectScans(&builder, root, &needed);
     const prepared_fields = try alloc.alloc([]const u8, builder.prepared_demands.count());
     var iterator = builder.prepared_demands.keyIterator();

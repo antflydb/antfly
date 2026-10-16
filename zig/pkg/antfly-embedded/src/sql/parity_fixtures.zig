@@ -37,6 +37,7 @@ pub const name_resolution_campaign = @embedFile("fixtures/sql_name_resolution_ca
 pub const digest_read_reference = @embedFile("fixtures/sql_digest_read_campaign_reference.json");
 pub const typed_array_read_reference = @embedFile("fixtures/sql_typed_array_read_reference.json");
 pub const aggregate_read_reference = @embedFile("fixtures/sql_aggregate_read_reference.json");
+pub const join_read_reference = @embedFile("fixtures/sql_join_read_reference.json");
 pub const joined_returning_reference = @embedFile("fixtures/sql_joined_returning_reference.json");
 pub const joined_returning_subquery_reference = @embedFile("fixtures/sql_joined_returning_subquery_reference.json");
 pub const lateral_campaign_reference = @embedFile("fixtures/sql_lateral_campaign_reference.json");

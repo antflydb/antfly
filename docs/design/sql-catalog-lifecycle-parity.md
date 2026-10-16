@@ -9,7 +9,7 @@ a completion claim. PostgreSQL is the SQL standard and independent test oracle.
 ## Baseline and priorities
 
 The [original inventory](sql/parity-inventory.md) remains authoritative:
-483 implemented / 136 rejected / 113 superseded / 854 unresolved. Counts below
+505 implemented / 136 rejected / 113 superseded / 832 unresolved. Counts below
 are unresolved family pools, not promises that one implementation closes them.
 
 | Priority | Pool | Cases | Shared delivery boundary |
@@ -8977,3 +8977,49 @@ implemented features or as product-specific unsupported-case rejections.
 Inventory is now 483 implemented / 136 rejected / 113 superseded / 854 unresolved.
 Production reporter namespace switching/retirement remains disabled pending the
 requested explicit approval; broader SQL execution gaps remain open.
+
+### Original join cohort: schema-bound USING/NATURAL and native bag semantics
+
+The 22-original `sql_join_read_campaign.json` executes unchanged source SQL
+through mounted HTTP handlers over two immutable typed local tables. A fresh
+PostgreSQL 18+ process independently verifies column names/OIDs, values, SQL
+NULL flags and complete ordered peer frontiers. Distinct physical keys preserve
+duplicate logical rows; the witness includes missing customers, NULL keys,
+missing amounts, nullable Boolean cells and cross-table unmatched customers.
+OFFSET cuts are independently checked not to split a peer group. Golden output
+generation fails closed rather than overwriting a reference with exclusions.
+
+This campaign found actual parser gaps in `JOIN ... USING` and `NATURAL JOIN`.
+The AST now preserves declarative keys until catalog binding. Binding produces
+ordinary equality predicates through shared composite hash-key extraction,
+plus typed merged-key projections. Unqualified keys and plain stars expose one
+merged cell; qualified names/stars retain each original input key and order.
+INNER/LEFT/RIGHT/FULL, composite keys, chained joins and USING aliases share
+this machinery. NATURAL discovers only visible keys on both inputs, never an
+implicit physical row ID. An explicitly named hidden ID remains addressable.
+Missing, duplicate and ambiguous keys, and colliding USING aliases, fail before
+capture; alias collisions use PostgreSQL SQLSTATE 42712.
+
+Merged projections participate in cold-column dependency propagation. At the
+statement boundary, a validated pure merged projection is eliminated if no new
+identity is consumed (for example COUNT(*) or qualified-only projections).
+This occurs after binding and does not change nested join ordinal layouts or
+skip validation. A 256-by-256 duplicate-key work-limit test proves composite
+hash extraction remains enabled and allocation counts stay below 4096 and
+within twice the equivalent ON-join count plus 512. This is an allocation-work
+regression, not a throughput/latency benchmark claim. Exhaustive allocator-fault
+coverage checks coordinated-capture release, alongside existing outer-join,
+CTE, snapshot and residual-predicate regressions in Debug.
+
+Only these 22 exact originals receive implemented credit: inventory is now
+505 implemented / 136 rejected / 113 superseded / 832 unresolved. The scope is
+local SQL semantics and capture ownership; it does not qualify concurrent
+distributed publication or close broader activation/SQL architectural gaps.
+
+Validation records: `/private/tmp/antfly-sql-using-regressions-debug-closed.log`
+(14 selected tests, no skips/failures/leaks),
+`/private/tmp/antfly-sql-original-joins-evidence-closed.log` (registered mounted
+native and fresh PostgreSQL gates), and
+`/private/tmp/antfly-sql-join-reference-guards-final.log` (three oracle guards).
+Inventory integrity, license headers, Apache product boundary and storage/
+control-catalog compilation-boundary audits are separate from release readiness.

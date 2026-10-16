@@ -1348,19 +1348,37 @@ const Parser = struct {
         var depth: usize = 1;
         while (true) {
             var kind: ast.JoinKind = .inner;
+            const natural = self.keyword(.natural);
             if (self.take(.comma)) kind = .cross else if (self.keyword(.join)) {} else {
-                if (self.keyword(.inner)) kind = .inner else if (self.keyword(.left)) kind = .left else if (self.keyword(.right)) kind = .right else if (self.keyword(.full)) kind = .full else if (self.keyword(.cross)) kind = .cross else break;
+                if (self.keyword(.inner)) kind = .inner else if (self.keyword(.left)) kind = .left else if (self.keyword(.right)) kind = .right else if (self.keyword(.full)) kind = .full else if (self.keyword(.cross)) kind = .cross else {
+                    if (natural) return self.fail(error.InvalidSqlSyntax, "NATURAL requires JOIN");
+                    break;
+                }
                 _ = self.keyword(.outer);
                 try self.expectKeyword(.join);
             }
+            if (natural and kind == .cross) return self.fail(error.InvalidSqlSyntax, "NATURAL CROSS JOIN is not allowed");
             depth += 1;
             if (depth >= self.limits.max_depth) return self.fail(error.SqlLimitExceeded, "SQL join nesting limit exceeded");
             const right = try self.relationAtom();
-            const condition = if (kind == .cross) null else blk: {
+            var keys: @FieldType(@FieldType(ast.Relation, "join"), "keys") = if (natural) .natural else .none;
+            var using_alias: ?[]const u8 = null;
+            const condition = if (kind == .cross or natural) null else if (self.keyword(.using)) blk: {
+                try self.expect(.lparen);
+                var names: std.ArrayList([]const u8) = .empty;
+                while (true) {
+                    try names.append(self.alloc, try self.identifier());
+                    if (!self.take(.comma)) break;
+                }
+                try self.expect(.rparen);
+                keys = .{ .using = try names.toOwnedSlice(self.alloc) };
+                if (self.keyword(.as)) using_alias = try self.identifier();
+                break :blk null;
+            } else blk: {
                 try self.expectKeyword(.on);
                 break :blk try self.scalar(0, 0);
             };
-            left = try self.relationNode(.{ .join = .{ .kind = kind, .left = left, .right = right, .condition = condition } });
+            left = try self.relationNode(.{ .join = .{ .kind = kind, .left = left, .right = right, .condition = condition, .keys = keys, .using_alias = using_alias } });
         }
         return left;
     }
@@ -3066,10 +3084,36 @@ test "compiler pagination normalizes bounds and rejects duplicate or incomplete 
     try std.testing.expectError(error.UnsupportedSqlShape, compile(std.testing.allocator, "SELECT 1 ORDER BY 1 FETCH FIRST ROW WITH TIES", .{}));
 }
 
+test "compiler preserves declarative composite and natural join keys" {
+    var compiled = try compile(std.testing.allocator, "SELECT * FROM t FULL OUTER JOIN u USING (b, a) AS merged NATURAL LEFT JOIN v", .{});
+    defer compiled.deinit();
+    const outer = compiled.statement.select.source.?.join;
+    try std.testing.expectEqual(ast.JoinKind.left, outer.kind);
+    try std.testing.expect(outer.keys == .natural);
+    const inner = outer.left.join;
+    try std.testing.expectEqual(ast.JoinKind.full, inner.kind);
+    try std.testing.expectEqualStrings("b", inner.keys.using[0]);
+    try std.testing.expectEqualStrings("a", inner.keys.using[1]);
+    try std.testing.expectEqualStrings("merged", inner.using_alias.?);
+    try std.testing.expect(inner.condition == null);
+    for ([_][]const u8{
+        "SELECT * FROM t JOIN u USING ()",
+        "SELECT * FROM t JOIN u USING (a,)",
+        "SELECT * FROM t NATURAL CROSS JOIN u",
+        "SELECT * FROM t NATURAL JOIN u ON true",
+        "SELECT * FROM t NATURAL JOIN u USING (a)",
+    }) |sql| {
+        if (compile(std.testing.allocator, sql, .{})) |value_| {
+            var value = value_;
+            value.deinit();
+            return error.TestUnexpectedResult;
+        } else |_| {}
+    }
+}
+
 test "compiler rejects unsupported clauses and additional statements atomically" {
     const cases = [_][]const u8{
         "SELECT * FROM t; DELETE FROM t",
-        "SELECT * FROM t JOIN u USING (x)",
         "INSERT INTO t (x) VALUES (1) ON CONFLICT DO UPDATE SET x=2",
         "DELETE FROM t RETURNING *; INSERT INTO t (x) VALUES (1)",
     };

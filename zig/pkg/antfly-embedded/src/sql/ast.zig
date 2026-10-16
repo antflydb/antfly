@@ -208,6 +208,10 @@ pub const Relation = union(enum) {
         left: *const Relation,
         right: *const Relation,
         condition: ?*const Scalar = null,
+        /// Schema-bound keys, lowered to equality predicates and a merged
+        /// projection by relation binding. Never combined with an ON clause.
+        keys: union(enum) { none, using: []const []const u8, natural } = .none,
+        using_alias: ?[]const u8 = null,
         /// Compiler-only left-domain demand. A masked LEFT LATERAL producer
         /// is not opened or evaluated for an undemanded row.
         demand: ?*const Scalar = null,

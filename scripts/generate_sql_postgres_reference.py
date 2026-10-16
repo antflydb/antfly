@@ -1062,6 +1062,31 @@ def aggregate_order_observer(case):
     )
 
 
+def join_order_observer(case, retain_offset=True):
+    """Expose original join peers without inventing a deterministic tie order.
+
+    The original executes unchanged. Only the independent witness drops LIMIT
+    and exposes its existing key. OFFSET is retained after separately proving
+    that its cut does not split a peer group.
+    """
+    if case.get("family") != "join":
+        raise ValueError("join witness requires an original join")
+    match = re.fullmatch(
+        r"(.+) ORDER BY (order_id|1|3) (ASC|DESC|USING >)( NULLS FIRST)? LIMIT ([0-9]+)(?: OFFSET ([0-9]+))?",
+        case["sql"],
+    )
+    if not match:
+        raise ValueError("original join witness shape changed")
+    body, key, direction, nulls, _, offset = match.groups()
+    if not body.startswith(("SELECT ", "WITH ")):
+        raise ValueError("original join witness source changed")
+    expression = "join_witness.amount" if key == "3" else "join_witness.order_id"
+    suffix = f" OFFSET {offset}" if retain_offset and offset else ""
+    # A wrapper preserves the body, including CTEs and IS DISTINCT FROM. Never
+    # splice at a textual FROM that could belong to a predicate or subquery.
+    return f"SELECT join_witness.*, {expression} AS order_key FROM ({body}) AS join_witness ORDER BY {expression} {direction}{nulls or ''}{suffix}"
+
+
 def read_reference(db, cases, profile):
     import psycopg
 
@@ -1080,6 +1105,24 @@ def read_reference(db, cases, profile):
                     observer_sql = ORDER_OBSERVERS.get(
                         case["id"]
                     ) or aggregate_order_observer(case)
+                    if profile.get("original_join_witnesses"):
+                        observer_sql = join_order_observer(case)
+                        offset = re.search(r" OFFSET ([0-9]+)$", case["sql"])
+                        if offset:
+                            full = execute(
+                                db,
+                                {**case, "sql": join_order_observer(case, False)},
+                                read=True,
+                            )
+                            cut = int(offset.group(1))
+                            if (
+                                cut <= 0
+                                or cut >= len(full["rows"])
+                                or full["rows"][cut - 1][-1] == full["rows"][cut][-1]
+                            ):
+                                raise ValueError(
+                                    "join OFFSET witness splits a peer group or has no following row"
+                                )
                     if "sql-1345" <= case["id"] <= "sql-1365":
                         # These originals sort by their projected amount. The
                         # observer exposes the full peer frontier, not a second
@@ -1118,6 +1161,80 @@ def read_reference(db, cases, profile):
         "entries": entries,
         "excluded": excluded,
     }
+
+
+def join_read_profile():
+    """Typed join witnesses with real duplicate rows, NULLs and missing peers."""
+    profile = json.loads((FIXTURES / "sql_read_campaign_profile.json").read_text())
+    props = properties(profile["schema"])
+    props["scope"] = {"type": "keyword", "nullable": True}
+    props["amount"]["nullable"] = True
+    props["enabled"]["nullable"] = True
+    profile["original_join_witnesses"] = True
+    for row in profile["rows"]:
+        value = row["value"]
+        value["scope"] = "read write"
+        if value["kind"] == "order":
+            value["metadata"]["source"] = "orders"
+        elif value["id"] == "c1":
+            value["name"] = "Ada"
+            value.pop("enabled")
+            value["metadata"]["source"] = "external"
+        else:
+            value["name"] = "ad_user"
+            value["scope"] = "write"
+
+    def row(key, identity, customer, name, *, kind="order", tenant="t3", amount=-2):
+        value = deepcopy(profile["rows"][0]["value"])
+        value.update(
+            id=identity,
+            customer_id=customer,
+            name=name,
+            kind=kind,
+            tenant_id=tenant,
+            amount=amount,
+            enabled=True,
+        )
+        value["metadata"] = {
+            "source": "orders" if kind == "order" else "external",
+            "flags": [],
+        }
+        return {"key": key, "value": value}
+
+    duplicate = row("duplicate-order-a", "00-dup", "dup", "Duplicate order")
+    duplicate_copy = deepcopy(duplicate)
+    duplicate_copy["key"] = "duplicate-order-b"
+    null_key = row("null-key", "00-null-key", "unused", "Null key", tenant="t1")
+    null_key["value"].pop("customer_id")
+    null_amount = row("null-amount", "99-null-amount", "c1", "Null amount", tenant="t1")
+    null_amount["value"].pop("amount")
+    profile["rows"].extend(
+        [
+            row("bot", "bot", "bot", "bot_automaton", kind="customer"),
+            row("duplicate-customer-a", "dup", "dup", "Dupe A", kind="customer"),
+            row("duplicate-customer-b", "dup", "dup", "Dupe B", kind="customer"),
+            row("shadow", "c1", "c1", "Shadow", kind="customer", tenant="other"),
+            duplicate,
+            duplicate_copy,
+            row("missing", "00-missing", "missing", "Missing customer", tenant="t1"),
+            null_key,
+            null_amount,
+        ]
+    )
+    customers = [
+        deepcopy(row) for row in profile["rows"] if row["value"]["kind"] == "customer"
+    ]
+    customers.append(
+        row("orphan", "orphan", "orphan", "Orphan", kind="customer", tenant="t1")
+    )
+    profile["additional_tables"] = [
+        {
+            "name": "customer_records",
+            "schema": deepcopy(profile["schema"]),
+            "rows": customers,
+        }
+    ]
+    return profile
 
 
 def set_read_profile():
@@ -1413,6 +1530,7 @@ def main():
             "typed_array_read",
             "aggregate_read",
             "set_read",
+            "join_read",
             "document",
             "lateral",
             "mutation",
@@ -1442,7 +1560,14 @@ def main():
         default=[],
         help="generate an explicit unchanged source cohort; cannot narrow a checked golden",
     )
+    parser.add_argument(
+        "--output",
+        type=Path,
+        help="write generated reference JSON instead of stdout; incompatible with --check",
+    )
     args = parser.parse_args()
+    if args.output and args.check:
+        parser.error("--output cannot overwrite a checked golden")
     if args.only_id and (args.check or args.include):
         parser.error("--only-id cannot narrow a checked golden")
     if args.constraint_profile != "base" and args.campaign != "mutation":
@@ -1478,11 +1603,14 @@ def main():
             "aggregate_read",
             "set_read",
             "lateral",
+            "join_read",
             "mutation",
             "correlated_mutation",
         }:
             profile = (
-                set_read_profile()
+                join_read_profile()
+                if args.campaign == "join_read"
+                else set_read_profile()
                 if args.campaign == "set_read"
                 else typed_array_read_profile()
                 if args.campaign == "typed_array_read"
@@ -1531,7 +1659,18 @@ def main():
             f"Verified {len(result['entries'])} exact PostgreSQL {args.campaign} contracts"
         )
     else:
-        print(json.dumps(result, indent=2, allow_nan=False))
+        rendered = json.dumps(result, indent=2, allow_nan=False) + "\n"
+        if args.output:
+            if result["excluded"] or len(result["entries"]) != len(requested):
+                parser.error(
+                    f"reference not written: requested source contracts failed: {result['excluded']}"
+                )
+            args.output.write_text(rendered)
+            print(
+                f"Wrote {len(result['entries'])} exact PostgreSQL contracts to {args.output}"
+            )
+        else:
+            print(rendered, end="")
 
 
 if __name__ == "__main__":

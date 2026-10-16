@@ -3153,6 +3153,152 @@ test "SQL derived joins preserve JSON null independently of outer SQL null" {
     try std.testing.expect(result.output.rows[1][1] == .null);
 }
 
+test "SQL USING joins merge outer keys while preserving qualified input columns" {
+    for ([_]struct { kind: []const u8, expected: []const []const u8 }{
+        .{ .kind = "INNER", .expected = &.{"1"} },
+        .{ .kind = "LEFT", .expected = &.{ "0", "1" } },
+        .{ .kind = "RIGHT", .expected = &.{ "1", "2" } },
+        .{ .kind = "FULL", .expected = &.{ "0", "1", "2" } },
+    }) |case| {
+        var backend: TestBackend = .{ .row_count = 3 };
+        const sql = try std.fmt.allocPrint(std.testing.allocator, "SELECT k, a.k, b.k, m.k FROM (SELECT _id AS k FROM things WHERE _id != '2') a {s} JOIN (SELECT _id AS k FROM things WHERE _id != '0') b USING (k) AS m ORDER BY 1", .{case.kind});
+        defer std.testing.allocator.free(sql);
+        var compiled = try compiler.compile(std.testing.allocator, sql, .{});
+        defer compiled.deinit();
+        var result = try execute(std.testing.allocator, backend.coordinated(), &compiled, &.{}, .{ .page_rows = 1 });
+        defer result.deinit();
+        try std.testing.expectEqual(case.expected.len, result.output.rows.len);
+        for (result.output.rows, result.output.sql_nulls.?, case.expected) |row, flags, expected| {
+            try std.testing.expectEqualStrings(expected, row[0].string);
+            try std.testing.expectEqualStrings(expected, row[3].string);
+            try std.testing.expectEqual(std.mem.eql(u8, expected, "2"), flags[1]);
+            try std.testing.expectEqual(std.mem.eql(u8, expected, "0"), flags[2]);
+        }
+        try std.testing.expectEqual(@as(usize, 1), backend.statement_opens);
+        try std.testing.expectEqual(@as(usize, 1), backend.statement_closes);
+    }
+}
+
+test "SQL USING and NATURAL retain star order composite keys bags and empty key products" {
+    for ([_][]const u8{
+        "SELECT count(*) FROM (SELECT id AS k, id AS z FROM things) a JOIN (SELECT id AS k, id AS z FROM things) b USING (z, k)",
+        "SELECT count(*) FROM things a NATURAL JOIN things b",
+        "SELECT count(*) FROM (SELECT _id FROM things) a NATURAL JOIN things b",
+    }) |sql| {
+        var backend: TestBackend = .{ .row_count = 2 };
+        var compiled = try compiler.compile(std.testing.allocator, sql, .{});
+        defer compiled.deinit();
+        var result = try execute(std.testing.allocator, backend.coordinated(), &compiled, &.{}, .{});
+        defer result.deinit();
+        // All visible logical cells are equal; hidden physical _id differs.
+        try std.testing.expectEqualStrings("4", result.output.rows[0][0].string);
+    }
+    {
+        var backend: TestBackend = .{ .row_count = 2 };
+        var compiled = try compiler.compile(std.testing.allocator, "SELECT *, a.*, b.* FROM (SELECT _id AS k, id AS x FROM things) a JOIN (SELECT _id AS k, id AS y FROM things) b USING (k) ORDER BY 1", .{});
+        defer compiled.deinit();
+        var result = try execute(std.testing.allocator, backend.coordinated(), &compiled, &.{}, .{ .page_rows = 1 });
+        defer result.deinit();
+        const names = [_][]const u8{ "k", "x", "y", "k", "x", "k", "y" };
+        try std.testing.expectEqual(names.len, result.output.columns.len);
+        for (result.output.columns, names) |column, name| try std.testing.expectEqualStrings(name, column.name);
+        for (result.output.rows) |row| {
+            try std.testing.expectEqualStrings(row[0].string, row[3].string);
+            try std.testing.expectEqualStrings(row[0].string, row[5].string);
+        }
+    }
+    {
+        var backend: TestBackend = .{ .row_count = 2 };
+        var compiled = try compiler.compile(std.testing.allocator, "SELECT count(*) FROM (SELECT _id AS x FROM things) a NATURAL FULL JOIN (SELECT _id AS y FROM things) b", .{});
+        defer compiled.deinit();
+        var result = try execute(std.testing.allocator, backend.coordinated(), &compiled, &.{}, .{});
+        defer result.deinit();
+        try std.testing.expectEqualStrings("4", result.output.rows[0][0].string);
+    }
+}
+
+test "SQL USING rejects missing ambiguous and duplicate keys before capture" {
+    for ([_]struct { sql: []const u8, failure: anyerror }{
+        .{ .sql = "SELECT * FROM things a JOIN things b USING (absent)", .failure = error.UndefinedColumn },
+        .{ .sql = "SELECT * FROM things a JOIN things b USING (id, id)", .failure = error.DuplicateSqlColumn },
+        .{ .sql = "SELECT * FROM things a JOIN things b USING (id) AS a", .failure = error.DuplicateSqlAlias },
+        .{ .sql = "SELECT * FROM (SELECT id AS k, id AS k FROM things) a JOIN (SELECT id AS k FROM things) b USING (k)", .failure = error.AmbiguousSqlColumn },
+    }) |case| {
+        var backend: TestBackend = .{};
+        var compiled = try compiler.compile(std.testing.allocator, case.sql, .{});
+        defer compiled.deinit();
+        try std.testing.expectError(case.failure, execute(std.testing.allocator, backend.coordinated(), &compiled, &.{}, .{}));
+        try std.testing.expectEqual(@as(usize, 0), backend.statement_opens);
+    }
+}
+
+test "SQL USING common types null keys and chained merged namespaces" {
+    const Case = struct { sql: []const u8, expected: []const u8 };
+    for ([_]Case{
+        .{ .sql = "SELECT k FROM (SELECT 1::integer AS k) a FULL JOIN (SELECT 2::bigint AS k) b USING(k) ORDER BY k", .expected = "[[\"1\"],[\"2\"]]" },
+        .{ .sql = "SELECT k, a.k, b.k FROM (SELECT NULL::bigint AS k) a FULL JOIN (SELECT NULL::bigint AS k) b USING(k)", .expected = "[[null,null,null],[null,null,null]]" },
+        .{ .sql = "SELECT k, a.k, b.k, c.k FROM (SELECT 1 AS k) a FULL JOIN (SELECT 2 AS k) b USING(k) FULL JOIN (SELECT 2 AS k) c USING(k) ORDER BY 1", .expected = "[[\"1\",\"1\",null,null],[\"2\",null,\"2\",\"2\"]]" },
+    }) |case| {
+        var backend: TestBackend = .{};
+        var compiled = try compiler.compile(std.testing.allocator, case.sql, .{});
+        defer compiled.deinit();
+        var result = try execute(std.testing.allocator, backend.coordinated(), &compiled, &.{}, .{ .page_rows = 1 });
+        defer result.deinit();
+        const json = try std.json.Stringify.valueAlloc(std.testing.allocator, result.output.rows, .{});
+        defer std.testing.allocator.free(json);
+        try std.testing.expectEqualStrings(case.expected, json);
+    }
+}
+
+test "SQL USING closes one coordinated capture across every allocation failure" {
+    const Check = struct {
+        fn run(alloc: std.mem.Allocator, compiled: *const compiler.Compiled) !void {
+            var backend: TestBackend = .{ .row_count = 3 };
+            defer std.debug.assert(backend.statement_opens == backend.statement_closes);
+            var result = try execute(alloc, backend.coordinated(), compiled, &.{}, .{ .page_rows = 1 });
+            defer result.deinit();
+            try std.testing.expectEqual(@as(usize, 1), result.output.rows.len);
+            try std.testing.expectEqualStrings("0", result.output.rows[0][0].string);
+        }
+    };
+    var compiled = try compiler.compile(std.testing.allocator, "SELECT k, a.k, b.k FROM (SELECT _id AS k FROM things WHERE _id != '2') a FULL JOIN (SELECT _id AS k FROM things WHERE _id != '0') b USING(k) ORDER BY 1 LIMIT 1", .{});
+    defer compiled.deinit();
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Check.run, .{&compiled});
+}
+
+test "SQL USING retains composite hash extraction and bounded fanout allocations" {
+    {
+        var backend: TestBackend = .{};
+        var compiled = try compiler.compile(std.testing.allocator, "SELECT k FROM (SELECT id AS k, id AS z FROM things) a JOIN (SELECT id AS k, id AS z FROM things) b USING(z, k)", .{});
+        defer compiled.deinit();
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        var parameters: [0]?ast.ColumnType = .{};
+        const bound = try @import("relation_binding.zig").bind(arena.allocator(), backend.coordinated(), compiled.statement.select, &parameters);
+        try std.testing.expect(bound.root.operation == .query);
+        const join = bound.root.operation.query.source.operation.join;
+        try std.testing.expectEqual(@as(usize, 2), join.left_keys.len);
+        try std.testing.expectEqual(@as(usize, 2), join.right_keys.len);
+    }
+    var allocations: [2]usize = undefined;
+    for ([_][]const u8{
+        "SELECT count(*) FROM things a JOIN things b ON a.id = b.id",
+        "SELECT count(*) FROM things a JOIN things b USING(id)",
+    }, &allocations) |sql, *count| {
+        var backend: TestBackend = .{ .row_count = 256 };
+        var compiled = try compiler.compile(std.testing.allocator, sql, .{});
+        defer compiled.deinit();
+        var counting = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+        var result = try execute(counting.allocator(), backend.coordinated(), &compiled, &.{}, .{});
+        defer result.deinit();
+        try std.testing.expectEqualStrings("65536", result.output.rows[0][0].string);
+        count.* = counting.allocations;
+    }
+    // The extra projection is batched, not a per-pair arena allocation.
+    try std.testing.expect(allocations[1] < 4096);
+    try std.testing.expect(allocations[1] <= allocations[0] * 2 + 512);
+}
+
 test "SQL relation cursors close on early limit quota failure and every allocation failure" {
     const Check = struct {
         fn run(alloc: std.mem.Allocator, compiled: *const compiler.Compiled) !void {

@@ -2,6 +2,8 @@
   "ledger_format": 1,
   "inventory_sha256": "c203a4dcf0094b75e1d3764e90beebddaf844a9ce604543c0a4dbc0ffe8ae173",
   "gates": {
+    "sql-original-joins-native-debug": {"command":["zig","build","public-api-parity-test","-Doptimize=Debug","-j1","-Dtest-filter=httpx SQL PostgreSQL original joins preserve match scopes nulls and bags"],"cwd":"zig","timeout_seconds":1800},
+    "sql-original-joins-postgres": {"command":["uv","run","--project","scripts","--with","psycopg[binary]==3.3.6","python","scripts/generate_sql_postgres_reference.py","join_read","--check","zig/pkg/antfly-embedded/src/sql/fixtures/sql_join_read_reference.json"],"cwd":".","timeout_seconds":180},
     "sql-original-name-resolution-native-debug": {"command":["zig","build","public-api-parity-test","-Doptimize=Debug","-j1","-Dtest-filter=httpx SQL original PostgreSQL name resolution rejects aliases before data reads","-Dtest-filter=httpx SQL PostgreSQL original aggregate reads preserve filters captures and nulls"],"cwd":"zig","timeout_seconds":1800},
     "sql-original-name-resolution-postgres": {"command":["uv","run","--project","scripts","--with","psycopg[binary]==3.3.6","python","-m","unittest","discover","-s","scripts","-p","test_sql_name_resolution.py"],"cwd":".","timeout_seconds":180},
     "sql-original-noop-mutations-debug": {"command":["zig","build","public-api-parity-test","-Doptimize=Debug","-j2","-Dtest-filter=httpx SQL PostgreSQL no-op conflicts preserve primary versions and retain one source read"],"cwd":"zig","timeout_seconds":1800},
@@ -12911,68 +12913,120 @@
     },
     {
       "id": "sql-1320",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "Exact original SQL matches fresh PostgreSQL columns, types, null flags and complete ordered peer groups through mounted native HTTP execution over immutable typed local tables, including duplicate logical rows and missing/NULL witnesses. Retains one native capture per statement without fallback reads. This qualifies local query semantics, not concurrent distributed snapshot publication.",
+      "evidence": [
+        {"path":"zig/pkg/antfly/src/api/sql_join_campaign_test.zig","test":"httpx SQL PostgreSQL original joins preserve match scopes nulls and bags","gate":"sql-original-joins-native-debug"},
+        {"path":"zig/pkg/antfly/src/api/sql_join_campaign_test.zig","test":"httpx SQL PostgreSQL original joins preserve match scopes nulls and bags","gate":"sql-original-joins-postgres"}
+      ]
     },
     {
       "id": "sql-1321",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "Exact original SQL matches fresh PostgreSQL columns, types, null flags and complete ordered peer groups through mounted native HTTP execution over immutable typed local tables, including duplicate logical rows and missing/NULL witnesses. Retains one native capture per statement without fallback reads. This qualifies local query semantics, not concurrent distributed snapshot publication.",
+      "evidence": [
+        {"path":"zig/pkg/antfly/src/api/sql_join_campaign_test.zig","test":"httpx SQL PostgreSQL original joins preserve match scopes nulls and bags","gate":"sql-original-joins-native-debug"},
+        {"path":"zig/pkg/antfly/src/api/sql_join_campaign_test.zig","test":"httpx SQL PostgreSQL original joins preserve match scopes nulls and bags","gate":"sql-original-joins-postgres"}
+      ]
     },
     {
       "id": "sql-1322",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "Exact original SQL matches fresh PostgreSQL columns, types, null flags and complete ordered peer groups through mounted native HTTP execution over immutable typed local tables, including duplicate logical rows and missing/NULL witnesses. Retains one native capture per statement without fallback reads. This qualifies local query semantics, not concurrent distributed snapshot publication.",
+      "evidence": [
+        {"path":"zig/pkg/antfly/src/api/sql_join_campaign_test.zig","test":"httpx SQL PostgreSQL original joins preserve match scopes nulls and bags","gate":"sql-original-joins-native-debug"},
+        {"path":"zig/pkg/antfly/src/api/sql_join_campaign_test.zig","test":"httpx SQL PostgreSQL original joins preserve match scopes nulls and bags","gate":"sql-original-joins-postgres"}
+      ]
     },
     {
       "id": "sql-1323",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "Exact original SQL matches fresh PostgreSQL columns, types, null flags and complete ordered peer groups through mounted native HTTP execution over immutable typed local tables, including duplicate logical rows and missing/NULL witnesses. Retains one native capture per statement without fallback reads. This qualifies local query semantics, not concurrent distributed snapshot publication.",
+      "evidence": [
+        {"path":"zig/pkg/antfly/src/api/sql_join_campaign_test.zig","test":"httpx SQL PostgreSQL original joins preserve match scopes nulls and bags","gate":"sql-original-joins-native-debug"},
+        {"path":"zig/pkg/antfly/src/api/sql_join_campaign_test.zig","test":"httpx SQL PostgreSQL original joins preserve match scopes nulls and bags","gate":"sql-original-joins-postgres"}
+      ]
     },
     {
       "id": "sql-1324",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "Exact original SQL matches fresh PostgreSQL columns, types, null flags and complete ordered peer groups through mounted native HTTP execution over immutable typed local tables, including duplicate logical rows and missing/NULL witnesses. Retains one native capture per statement without fallback reads. This qualifies local query semantics, not concurrent distributed snapshot publication.",
+      "evidence": [
+        {"path":"zig/pkg/antfly/src/api/sql_join_campaign_test.zig","test":"httpx SQL PostgreSQL original joins preserve match scopes nulls and bags","gate":"sql-original-joins-native-debug"},
+        {"path":"zig/pkg/antfly/src/api/sql_join_campaign_test.zig","test":"httpx SQL PostgreSQL original joins preserve match scopes nulls and bags","gate":"sql-original-joins-postgres"}
+      ]
     },
     {
       "id": "sql-1325",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "Exact original SQL matches fresh PostgreSQL columns, types, null flags and complete ordered peer groups through mounted native HTTP execution over immutable typed local tables, including duplicate logical rows and missing/NULL witnesses. Retains one native capture per statement without fallback reads. This qualifies local query semantics, not concurrent distributed snapshot publication.",
+      "evidence": [
+        {"path":"zig/pkg/antfly/src/api/sql_join_campaign_test.zig","test":"httpx SQL PostgreSQL original joins preserve match scopes nulls and bags","gate":"sql-original-joins-native-debug"},
+        {"path":"zig/pkg/antfly/src/api/sql_join_campaign_test.zig","test":"httpx SQL PostgreSQL original joins preserve match scopes nulls and bags","gate":"sql-original-joins-postgres"}
+      ]
     },
     {
       "id": "sql-1326",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "Exact original SQL matches fresh PostgreSQL columns, types, null flags and complete ordered peer groups through mounted native HTTP execution over immutable typed local tables, including duplicate logical rows and missing/NULL witnesses. Retains one native capture per statement without fallback reads. This qualifies local query semantics, not concurrent distributed snapshot publication.",
+      "evidence": [
+        {"path":"zig/pkg/antfly/src/api/sql_join_campaign_test.zig","test":"httpx SQL PostgreSQL original joins preserve match scopes nulls and bags","gate":"sql-original-joins-native-debug"},
+        {"path":"zig/pkg/antfly/src/api/sql_join_campaign_test.zig","test":"httpx SQL PostgreSQL original joins preserve match scopes nulls and bags","gate":"sql-original-joins-postgres"}
+      ]
     },
     {
       "id": "sql-1327",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "Exact original SQL matches fresh PostgreSQL columns, types, null flags and complete ordered peer groups through mounted native HTTP execution over immutable typed local tables, including duplicate logical rows and missing/NULL witnesses. Retains one native capture per statement without fallback reads. This qualifies local query semantics, not concurrent distributed snapshot publication.",
+      "evidence": [
+        {"path":"zig/pkg/antfly/src/api/sql_join_campaign_test.zig","test":"httpx SQL PostgreSQL original joins preserve match scopes nulls and bags","gate":"sql-original-joins-native-debug"},
+        {"path":"zig/pkg/antfly/src/api/sql_join_campaign_test.zig","test":"httpx SQL PostgreSQL original joins preserve match scopes nulls and bags","gate":"sql-original-joins-postgres"}
+      ]
     },
     {
       "id": "sql-1328",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "Exact original SQL matches fresh PostgreSQL columns, types, null flags and complete ordered peer groups through mounted native HTTP execution over immutable typed local tables, including duplicate logical rows and missing/NULL witnesses. Retains one native capture per statement without fallback reads. This qualifies local query semantics, not concurrent distributed snapshot publication.",
+      "evidence": [
+        {"path":"zig/pkg/antfly/src/api/sql_join_campaign_test.zig","test":"httpx SQL PostgreSQL original joins preserve match scopes nulls and bags","gate":"sql-original-joins-native-debug"},
+        {"path":"zig/pkg/antfly/src/api/sql_join_campaign_test.zig","test":"httpx SQL PostgreSQL original joins preserve match scopes nulls and bags","gate":"sql-original-joins-postgres"}
+      ]
     },
     {
       "id": "sql-1329",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "Exact original SQL matches fresh PostgreSQL columns, types, null flags and complete ordered peer groups through mounted native HTTP execution over immutable typed local tables, including duplicate logical rows and missing/NULL witnesses. Retains one native capture per statement without fallback reads. This qualifies local query semantics, not concurrent distributed snapshot publication.",
+      "evidence": [
+        {"path":"zig/pkg/antfly/src/api/sql_join_campaign_test.zig","test":"httpx SQL PostgreSQL original joins preserve match scopes nulls and bags","gate":"sql-original-joins-native-debug"},
+        {"path":"zig/pkg/antfly/src/api/sql_join_campaign_test.zig","test":"httpx SQL PostgreSQL original joins preserve match scopes nulls and bags","gate":"sql-original-joins-postgres"}
+      ]
     },
     {
       "id": "sql-1330",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "Exact original SQL matches fresh PostgreSQL columns, types, null flags and complete ordered peer groups through mounted native HTTP execution over immutable typed local tables, including duplicate logical rows and missing/NULL witnesses. Retains one native capture per statement without fallback reads. This qualifies local query semantics, not concurrent distributed snapshot publication.",
+      "evidence": [
+        {"path":"zig/pkg/antfly/src/api/sql_join_campaign_test.zig","test":"httpx SQL PostgreSQL original joins preserve match scopes nulls and bags","gate":"sql-original-joins-native-debug"},
+        {"path":"zig/pkg/antfly/src/api/sql_join_campaign_test.zig","test":"httpx SQL PostgreSQL original joins preserve match scopes nulls and bags","gate":"sql-original-joins-postgres"}
+      ]
     },
     {
       "id": "sql-1331",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "Exact original SQL matches fresh PostgreSQL columns, types, null flags and complete ordered peer groups through mounted native HTTP execution over immutable typed local tables, including duplicate logical rows and missing/NULL witnesses. Retains one native capture per statement without fallback reads. This qualifies local query semantics, not concurrent distributed snapshot publication.",
+      "evidence": [
+        {"path":"zig/pkg/antfly/src/api/sql_join_campaign_test.zig","test":"httpx SQL PostgreSQL original joins preserve match scopes nulls and bags","gate":"sql-original-joins-native-debug"},
+        {"path":"zig/pkg/antfly/src/api/sql_join_campaign_test.zig","test":"httpx SQL PostgreSQL original joins preserve match scopes nulls and bags","gate":"sql-original-joins-postgres"}
+      ]
     },
     {
       "id": "sql-1332",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "Exact original SQL matches fresh PostgreSQL columns, types, null flags and complete ordered peer groups through mounted native HTTP execution over immutable typed local tables, including duplicate logical rows and missing/NULL witnesses. Retains one native capture per statement without fallback reads. This qualifies local query semantics, not concurrent distributed snapshot publication.",
+      "evidence": [
+        {"path":"zig/pkg/antfly/src/api/sql_join_campaign_test.zig","test":"httpx SQL PostgreSQL original joins preserve match scopes nulls and bags","gate":"sql-original-joins-native-debug"},
+        {"path":"zig/pkg/antfly/src/api/sql_join_campaign_test.zig","test":"httpx SQL PostgreSQL original joins preserve match scopes nulls and bags","gate":"sql-original-joins-postgres"}
+      ]
     },
     {
       "id": "sql-1333",
@@ -12985,18 +13039,30 @@
     },
     {
       "id": "sql-1334",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "Exact original SQL matches fresh PostgreSQL columns, types, null flags and complete ordered peer groups through mounted native HTTP execution over immutable typed local tables, including duplicate logical rows and missing/NULL witnesses. Retains one native capture per statement without fallback reads. This qualifies local query semantics, not concurrent distributed snapshot publication.",
+      "evidence": [
+        {"path":"zig/pkg/antfly/src/api/sql_join_campaign_test.zig","test":"httpx SQL PostgreSQL original joins preserve match scopes nulls and bags","gate":"sql-original-joins-native-debug"},
+        {"path":"zig/pkg/antfly/src/api/sql_join_campaign_test.zig","test":"httpx SQL PostgreSQL original joins preserve match scopes nulls and bags","gate":"sql-original-joins-postgres"}
+      ]
     },
     {
       "id": "sql-1335",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "Exact original SQL matches fresh PostgreSQL columns, types, null flags and complete ordered peer groups through mounted native HTTP execution over immutable typed local tables, including duplicate logical rows and missing/NULL witnesses. Retains one native capture per statement without fallback reads. This qualifies local query semantics, not concurrent distributed snapshot publication.",
+      "evidence": [
+        {"path":"zig/pkg/antfly/src/api/sql_join_campaign_test.zig","test":"httpx SQL PostgreSQL original joins preserve match scopes nulls and bags","gate":"sql-original-joins-native-debug"},
+        {"path":"zig/pkg/antfly/src/api/sql_join_campaign_test.zig","test":"httpx SQL PostgreSQL original joins preserve match scopes nulls and bags","gate":"sql-original-joins-postgres"}
+      ]
     },
     {
       "id": "sql-1336",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "Exact original SQL matches fresh PostgreSQL columns, types, null flags and complete ordered peer groups through mounted native HTTP execution over immutable typed local tables, including duplicate logical rows and missing/NULL witnesses. Retains one native capture per statement without fallback reads. This qualifies local query semantics, not concurrent distributed snapshot publication.",
+      "evidence": [
+        {"path":"zig/pkg/antfly/src/api/sql_join_campaign_test.zig","test":"httpx SQL PostgreSQL original joins preserve match scopes nulls and bags","gate":"sql-original-joins-native-debug"},
+        {"path":"zig/pkg/antfly/src/api/sql_join_campaign_test.zig","test":"httpx SQL PostgreSQL original joins preserve match scopes nulls and bags","gate":"sql-original-joins-postgres"}
+      ]
     },
     {
       "id": "sql-1337",
@@ -13017,13 +13083,21 @@
     },
     {
       "id": "sql-1338",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "Exact original SQL matches fresh PostgreSQL columns, types, null flags and complete ordered peer groups through mounted native HTTP execution over immutable typed local tables, including duplicate logical rows and missing/NULL witnesses. Retains one native capture per statement without fallback reads. This qualifies local query semantics, not concurrent distributed snapshot publication.",
+      "evidence": [
+        {"path":"zig/pkg/antfly/src/api/sql_join_campaign_test.zig","test":"httpx SQL PostgreSQL original joins preserve match scopes nulls and bags","gate":"sql-original-joins-native-debug"},
+        {"path":"zig/pkg/antfly/src/api/sql_join_campaign_test.zig","test":"httpx SQL PostgreSQL original joins preserve match scopes nulls and bags","gate":"sql-original-joins-postgres"}
+      ]
     },
     {
       "id": "sql-1339",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "Exact original SQL matches fresh PostgreSQL columns, types, null flags and complete ordered peer groups through mounted native HTTP execution over immutable typed local tables, including duplicate logical rows and missing/NULL witnesses. Retains one native capture per statement without fallback reads. This qualifies local query semantics, not concurrent distributed snapshot publication.",
+      "evidence": [
+        {"path":"zig/pkg/antfly/src/api/sql_join_campaign_test.zig","test":"httpx SQL PostgreSQL original joins preserve match scopes nulls and bags","gate":"sql-original-joins-native-debug"},
+        {"path":"zig/pkg/antfly/src/api/sql_join_campaign_test.zig","test":"httpx SQL PostgreSQL original joins preserve match scopes nulls and bags","gate":"sql-original-joins-postgres"}
+      ]
     },
     {
       "id": "sql-1340",
@@ -13033,23 +13107,39 @@
     },
     {
       "id": "sql-1341",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "Exact original SQL matches fresh PostgreSQL columns, types, null flags and complete ordered peer groups through mounted native HTTP execution over immutable typed local tables, including duplicate logical rows and missing/NULL witnesses. Retains one native capture per statement without fallback reads. This qualifies local query semantics, not concurrent distributed snapshot publication.",
+      "evidence": [
+        {"path":"zig/pkg/antfly/src/api/sql_join_campaign_test.zig","test":"httpx SQL PostgreSQL original joins preserve match scopes nulls and bags","gate":"sql-original-joins-native-debug"},
+        {"path":"zig/pkg/antfly/src/api/sql_join_campaign_test.zig","test":"httpx SQL PostgreSQL original joins preserve match scopes nulls and bags","gate":"sql-original-joins-postgres"}
+      ]
     },
     {
       "id": "sql-1342",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "Exact original SQL matches fresh PostgreSQL columns, types, null flags and complete ordered peer groups through mounted native HTTP execution over immutable typed local tables, including duplicate logical rows and missing/NULL witnesses. Retains one native capture per statement without fallback reads. This qualifies local query semantics, not concurrent distributed snapshot publication.",
+      "evidence": [
+        {"path":"zig/pkg/antfly/src/api/sql_join_campaign_test.zig","test":"httpx SQL PostgreSQL original joins preserve match scopes nulls and bags","gate":"sql-original-joins-native-debug"},
+        {"path":"zig/pkg/antfly/src/api/sql_join_campaign_test.zig","test":"httpx SQL PostgreSQL original joins preserve match scopes nulls and bags","gate":"sql-original-joins-postgres"}
+      ]
     },
     {
       "id": "sql-1343",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "Exact original SQL matches fresh PostgreSQL columns, types, null flags and complete ordered peer groups through mounted native HTTP execution over immutable typed local tables, including duplicate logical rows and missing/NULL witnesses. Retains one native capture per statement without fallback reads. This qualifies local query semantics, not concurrent distributed snapshot publication.",
+      "evidence": [
+        {"path":"zig/pkg/antfly/src/api/sql_join_campaign_test.zig","test":"httpx SQL PostgreSQL original joins preserve match scopes nulls and bags","gate":"sql-original-joins-native-debug"},
+        {"path":"zig/pkg/antfly/src/api/sql_join_campaign_test.zig","test":"httpx SQL PostgreSQL original joins preserve match scopes nulls and bags","gate":"sql-original-joins-postgres"}
+      ]
     },
     {
       "id": "sql-1344",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "Exact original SQL matches fresh PostgreSQL columns, types, null flags and complete ordered peer groups through mounted native HTTP execution over immutable typed local tables, including duplicate logical rows and missing/NULL witnesses. Retains one native capture per statement without fallback reads. This qualifies local query semantics, not concurrent distributed snapshot publication.",
+      "evidence": [
+        {"path":"zig/pkg/antfly/src/api/sql_join_campaign_test.zig","test":"httpx SQL PostgreSQL original joins preserve match scopes nulls and bags","gate":"sql-original-joins-native-debug"},
+        {"path":"zig/pkg/antfly/src/api/sql_join_campaign_test.zig","test":"httpx SQL PostgreSQL original joins preserve match scopes nulls and bags","gate":"sql-original-joins-postgres"}
+      ]
     },
     {
       "id": "sql-1345",
