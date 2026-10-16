@@ -75,8 +75,6 @@ pub const ListedModel = struct {
     dimensions: ?u32 = null,
     capabilities: [][]u8 = &.{},
     inputs: [][]u8 = &.{},
-    qualified_limits_json: ?[]u8 = null,
-    allow_downloads: ?bool = null,
 
     pub fn deinit(self: *ListedModel, alloc: std.mem.Allocator) void {
         alloc.free(self.name);
@@ -85,7 +83,6 @@ pub const ListedModel = struct {
         if (self.capabilities.len > 0) alloc.free(self.capabilities);
         for (self.inputs) |value| alloc.free(value);
         if (self.inputs.len > 0) alloc.free(self.inputs);
-        if (self.qualified_limits_json) |value| alloc.free(value);
         self.* = undefined;
     }
 };
@@ -311,7 +308,6 @@ const ResultBuilder = struct {
         kind: ModelKind,
         dimensions: ?u32,
         info: ?*const std.json.Value,
-        allow_downloads: ?bool,
     ) !void {
         try self.append(name, null, kind, dimensions);
         errdefer {
@@ -319,7 +315,6 @@ const ResultBuilder = struct {
             model.deinit(self.alloc);
         }
         const model = &self.models.items[self.models.items.len - 1];
-        model.allow_downloads = allow_downloads;
         const object = if (info) |value| switch (value.*) {
             .object => |*object| object,
             else => return,
@@ -342,11 +337,6 @@ const ResultBuilder = struct {
                 model.capabilities = try values.toOwnedSlice(self.alloc);
             } else {
                 model.inputs = try values.toOwnedSlice(self.alloc);
-            }
-        }
-        if (object.get("qualified_limits")) |limits| {
-            if (limits == .object) {
-                model.qualified_limits_json = try std.json.Stringify.valueAlloc(self.alloc, limits, .{});
             }
         }
     }
@@ -545,10 +535,6 @@ pub fn parseAntflyModels(alloc: std.mem.Allocator, body: []const u8) !ListResult
     var builder = ResultBuilder.init(alloc);
     errdefer builder.deinit();
 
-    const allow_downloads = if (parsed.value.object.get("allow_downloads")) |value|
-        if (value == .bool) value.bool else null
-    else
-        null;
     const groups = [_]struct { ModelKind, []const u8 }{
         .{ .embedder, "embedders" },
         .{ .generator, "generators" },
@@ -573,7 +559,7 @@ pub fn parseAntflyModels(alloc: std.mem.Allocator, body: []const u8) !ListResult
                     if (dims == .integer and dims.integer > 0) dimensions = @intCast(dims.integer);
                 }
             }
-            try builder.appendAntfly(entry.key_ptr.*, kind, dimensions, entry.value_ptr, allow_downloads);
+            try builder.appendAntfly(entry.key_ptr.*, kind, dimensions, entry.value_ptr);
         }
     }
     return try builder.toOwned();
@@ -726,8 +712,6 @@ test "parse antfly metadata remains valid across every allocation failure" {
             try std.testing.expectEqual(@as(usize, 2), result.models.len);
             try std.testing.expectEqualStrings("sparse", result.models[0].capabilities[1]);
             try std.testing.expectEqualStrings("image", result.models[0].inputs[1]);
-            try std.testing.expectEqualStrings("{\"max_tokens\":256}", result.models[0].qualified_limits_json.?);
-            try std.testing.expectEqual(@as(?bool, false), result.models[0].allow_downloads);
             try std.testing.expectEqual(ModelKind.classifier, result.models[1].kind);
         }
     };

@@ -17,7 +17,6 @@ class InferenceError:
     """
     Attributes:
         error (str): Stable machine-readable error code
-        active_requests (int | Unset): Active runtime users when a lifecycle operation returns a busy conflict.
         message (str | Unset): Human-readable error description
         reason (InferenceErrorReason | Unset): Machine-readable capacity source when the failure is retryable
         retryable (bool | Unset): Whether retrying the request may succeed
@@ -27,7 +26,6 @@ class InferenceError:
     """
 
     error: str
-    active_requests: int | Unset = UNSET
     message: str | Unset = UNSET
     reason: InferenceErrorReason | Unset = UNSET
     retryable: bool | Unset = UNSET
@@ -38,8 +36,6 @@ class InferenceError:
 
     def to_dict(self) -> dict[str, Any]:
         error = self.error
-
-        active_requests = self.active_requests
 
         message = self.message
 
@@ -62,8 +58,6 @@ class InferenceError:
                 "error": error,
             }
         )
-        if active_requests is not UNSET:
-            field_dict["active_requests"] = active_requests
         if message is not UNSET:
             field_dict["message"] = message
         if reason is not UNSET:
@@ -84,8 +78,6 @@ class InferenceError:
         d = dict(src_dict)
         error = d.pop("error")
 
-        active_requests = d.pop("active_requests", UNSET)
-
         message = d.pop("message", UNSET)
 
         _reason = d.pop("reason", UNSET)
@@ -105,7 +97,6 @@ class InferenceError:
 
         inference_error = cls(
             error=error,
-            active_requests=active_requests,
             message=message,
             reason=reason,
             retryable=retryable,

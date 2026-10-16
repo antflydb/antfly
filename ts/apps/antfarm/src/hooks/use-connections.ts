@@ -276,11 +276,9 @@ export function useConnectionsWithModels(): ConnectionsState {
 interface DirectModelInfo {
   capabilities?: string[];
   inputs?: string[];
-  qualified_limits?: Record<string, unknown>;
 }
 
 interface DirectModelsResponse {
-  allow_downloads?: boolean;
   embedders?: Record<string, DirectModelInfo>;
   rerankers?: Record<string, DirectModelInfo>;
   chunkers?: Record<string, DirectModelInfo>;
@@ -291,16 +289,11 @@ interface DirectModelsResponse {
   transcribers?: Record<string, DirectModelInfo>;
 }
 
-function directModelEntries(
-  models: Record<string, DirectModelInfo> | undefined,
-  allowDownloads: boolean | undefined
-): ConnectedModel[] {
+function directModelEntries(models: Record<string, DirectModelInfo> | undefined): ConnectedModel[] {
   return Object.entries(models ?? {}).map(([name, info]) => ({
     name,
     capabilities: info.capabilities,
     inputs: info.inputs,
-    qualified_limits: info.qualified_limits,
-    allow_downloads: allowDownloads,
   }));
 }
 
@@ -336,14 +329,14 @@ function useDirectInferenceModels(enabled: boolean): ConnectedModelsState {
         const body = (await response.json()) as DirectModelsResponse;
         if (generation !== generationRef.current || request !== requestRef.current) return;
         const groups = {
-          embedders: directModelEntries(body.embedders, body.allow_downloads),
-          rerankers: directModelEntries(body.rerankers, body.allow_downloads),
-          chunkers: directModelEntries(body.chunkers, body.allow_downloads),
-          generators: directModelEntries(body.generators, body.allow_downloads),
-          extractors: directModelEntries(body.extractors, body.allow_downloads),
-          rewriters: directModelEntries(body.rewriters, body.allow_downloads),
-          readers: directModelEntries(body.readers, body.allow_downloads),
-          transcribers: directModelEntries(body.transcribers, body.allow_downloads),
+          embedders: directModelEntries(body.embedders),
+          rerankers: directModelEntries(body.rerankers),
+          chunkers: directModelEntries(body.chunkers),
+          generators: directModelEntries(body.generators),
+          extractors: directModelEntries(body.extractors),
+          rewriters: directModelEntries(body.rewriters),
+          readers: directModelEntries(body.readers),
+          transcribers: directModelEntries(body.transcribers),
         };
         const modelKinds = Object.entries(groups)
           .filter(([, entries]) => entries.length > 0)
@@ -434,8 +427,6 @@ export interface SelectedInferenceModel {
   configured?: boolean;
   capabilities?: string[];
   inputs?: string[];
-  qualified_limits?: Record<string, unknown>;
-  allow_downloads?: boolean;
 }
 
 export function useSelectedInferenceModels(kind: ConnectedModelType): {

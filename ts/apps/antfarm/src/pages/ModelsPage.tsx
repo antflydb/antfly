@@ -783,17 +783,9 @@ const ModelDetailSheet: React.FC<{
           {!canShowDownloadCommand ? (
             <div className="rounded-none border border-border bg-muted/30 px-4 py-3">
               <p className="text-xs text-muted-foreground">
-                {model.sourceUrl ? (
-                  <>
-                    Use{" "}
-                    <code className="font-mono bg-muted px-1 py-0.5 rounded-none">
-                      antfly inference pull
-                    </code>{" "}
-                    CLI or the Antfly inference operator to manage models in production deployments.
-                  </>
-                ) : (
-                  "This model is provided by the running Antfly inference runtime and does not need a download command."
-                )}
+                {model.provider === "antfly"
+                  ? "This model is provided by the running Antfly inference runtime and does not need a download command."
+                  : `Manage this model through ${model.connectionName}. Antfly CLI downloads are only available for Antfly inference models.`}
               </p>
             </div>
           ) : (

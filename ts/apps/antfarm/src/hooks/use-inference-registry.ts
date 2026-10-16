@@ -180,8 +180,7 @@ export function transformConnectionModels(connections: Connection[]): InferenceM
           description: `${MODEL_TYPE_NAMES[type][0]?.toUpperCase()}${MODEL_TYPE_NAMES[type].slice(1)} model available through ${connectionName}.`,
           capabilities: listed.capabilities,
           inputs: listed.inputs,
-          qualifiedLimits: listed.qualified_limits,
-          allowDownloads: listed.allow_downloads,
+          allowDownloads: inference.provider === "antfly",
           variants: [],
           inRegistry: connection.status === "connected",
         });

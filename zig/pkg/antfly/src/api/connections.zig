@@ -67,8 +67,6 @@ pub const ConnectedModel = struct {
     configured: ?bool = null,
     capabilities: ?[]const []const u8 = null,
     inputs: ?[]const []const u8 = null,
-    qualified_limits: ?std.json.Value = null,
-    allow_downloads: ?bool = null,
 };
 
 pub const InferenceConnection = struct {
@@ -527,13 +525,11 @@ pub const Cache = struct {
                 .name = try alloc.dupe(u8, model.name),
                 .kind = model.kind,
                 .dimensions = model.dimensions,
-                .allow_downloads = model.allow_downloads,
             };
             errdefer copied_model.deinit(alloc);
             copied_model.display_name = if (model.display_name) |value| try alloc.dupe(u8, value) else null;
             copied_model.capabilities = try dupeStringList(alloc, model.capabilities);
             copied_model.inputs = try dupeStringList(alloc, model.inputs);
-            copied_model.qualified_limits_json = if (model.qualified_limits_json) |value| try alloc.dupe(u8, value) else null;
             models[i] = copied_model;
             copied = i + 1;
         }
@@ -1094,11 +1090,6 @@ fn modelsMapAlloc(arena: Allocator, models: []const list_models.ListedModel, ins
             .configured = if (instance.configured_models.contains(model.name)) true else null,
             .capabilities = if (model.capabilities.len > 0) try dupeStringListConst(arena, model.capabilities) else null,
             .inputs = if (model.inputs.len > 0) try dupeStringListConst(arena, model.inputs) else null,
-            .qualified_limits = if (model.qualified_limits_json) |json|
-                try std.json.parseFromSliceLeaky(std.json.Value, arena, json, .{})
-            else
-                null,
-            .allow_downloads = model.allow_downloads,
         });
     }
     var map = std.json.ArrayHashMap([]const ConnectedModel){};
@@ -1728,8 +1719,18 @@ test "connection cache remains valid across every allocation failure" {
             try std.testing.expectEqualStrings("Model", model.display_name.?);
             try std.testing.expectEqualStrings("dense", model.capabilities[0]);
             try std.testing.expectEqualStrings("image", model.inputs[1]);
-            try std.testing.expectEqualStrings("{\"max_tokens\":256}", model.qualified_limits_json.?);
-            try std.testing.expectEqual(@as(?bool, false), model.allow_downloads);
+
+            var arena = std.heap.ArenaAllocator.init(alloc);
+            defer arena.deinit();
+            const models = try modelsMapAlloc(arena.allocator(), owned.models, &.{ .provider = .antfly });
+            const json = try std.json.Stringify.valueAlloc(alloc, models, .{ .emit_null_optional_fields = false });
+            defer alloc.free(json);
+            try std.testing.expect(std.mem.indexOf(u8, json, "\"capabilities\":[\"dense\",\"sparse\"]") != null);
+            try std.testing.expect(std.mem.indexOf(u8, json, "\"inputs\":[\"text\",\"image\"]") != null);
+            // Artifact qualification and download policy are inference details,
+            // not fields of the provider-neutral connection model contract.
+            try std.testing.expect(std.mem.indexOf(u8, json, "qualified_limits") == null);
+            try std.testing.expect(std.mem.indexOf(u8, json, "allow_downloads") == null);
         }
     };
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Runner.run, .{});

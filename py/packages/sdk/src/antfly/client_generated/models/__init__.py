@@ -150,7 +150,6 @@ from .confidence_step_config import ConfidenceStepConfig
 from .configure_extension_request import ConfigureExtensionRequest
 from .conjunction_query import ConjunctionQuery
 from .connected_model import ConnectedModel
-from .connected_model_qualified_limits import ConnectedModelQualifiedLimits
 from .connected_model_type import ConnectedModelType
 from .connection import Connection
 from .connection_kind import ConnectionKind
@@ -1664,7 +1663,6 @@ __all__ = (
     "ConfigureExtensionRequest",
     "ConjunctionQuery",
     "ConnectedModel",
-    "ConnectedModelQualifiedLimits",
     "ConnectedModelType",
     "Connection",
     "ConnectionKind",

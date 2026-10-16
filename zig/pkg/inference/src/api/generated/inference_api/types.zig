@@ -1660,8 +1660,6 @@ pub const EmbeddingUsage = struct {
 };
 
 pub const Error = struct {
-    /// Active runtime users when a lifecycle operation returns a busy conflict.
-    active_requests: ?i64 = null,
     /// Stable machine-readable error code
     @"error": []const u8,
     /// Human-readable error description
@@ -1679,7 +1677,6 @@ pub const Error = struct {
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
-        .{ "active_requests", "active_requests", true },
         .{ "error", "error", false },
         .{ "message", "message", true },
         .{ "reason", "reason", true },
@@ -1699,10 +1696,6 @@ pub const Error = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
-        if (self.active_requests) |value| {
-            try jw.objectField("active_requests");
-            try jw.write(value);
-        }
         try jw.objectField("error");
         try jw.write(self.@"error");
         if (self.message) |value| {

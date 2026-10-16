@@ -159,7 +159,7 @@ export interface InferenceModel {
   capabilities?: string[];
   /** Server-advertised accepted input modalities. */
   inputs?: string[];
-  qualifiedLimits?: Record<string, unknown>;
+  /** Antfly CLI download guidance is only applicable to the Antfly provider. */
   allowDownloads?: boolean;
   variants: QuantizationType[];
   backends?: Backend[];

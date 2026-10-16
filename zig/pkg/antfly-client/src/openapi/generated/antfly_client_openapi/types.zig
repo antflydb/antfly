@@ -5073,10 +5073,6 @@ pub const ConnectedModel = struct {
     capabilities: ?[]const []const u8 = null,
     /// Input modalities accepted by the provider's resolved executor.
     inputs: ?[]const []const u8 = null,
-    /// Pull-time qualified request profile for this exact artifact, when available.
-    qualified_limits: ?std.json.ArrayHashMap(std.json.Value) = null,
-    /// Whether this provider permits clients to show model download commands.
-    allow_downloads: ?bool = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
@@ -5086,8 +5082,6 @@ pub const ConnectedModel = struct {
         .{ "configured", "configured", true },
         .{ "capabilities", "capabilities", true },
         .{ "inputs", "inputs", true },
-        .{ "qualified_limits", "qualified_limits", true },
-        .{ "allow_downloads", "allow_downloads", true },
     };
 
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
@@ -5120,14 +5114,6 @@ pub const ConnectedModel = struct {
         }
         if (self.inputs) |value| {
             try jw.objectField("inputs");
-            try jw.write(value);
-        }
-        if (self.qualified_limits) |value| {
-            try jw.objectField("qualified_limits");
-            try jw.write(value);
-        }
-        if (self.allow_downloads) |value| {
-            try jw.objectField("allow_downloads");
             try jw.write(value);
         }
         try jw.endObject();
@@ -24443,8 +24429,6 @@ pub const InferenceEmbeddingUsage = struct {
 };
 
 pub const InferenceError = struct {
-    /// Active runtime users when a lifecycle operation returns a busy conflict.
-    active_requests: ?i64 = null,
     /// Stable machine-readable error code
     @"error": []const u8,
     /// Human-readable error description
@@ -24462,7 +24446,6 @@ pub const InferenceError = struct {
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
-        .{ "active_requests", "active_requests", true },
         .{ "error", "error", false },
         .{ "message", "message", true },
         .{ "reason", "reason", true },
@@ -24482,10 +24465,6 @@ pub const InferenceError = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
-        if (self.active_requests) |value| {
-            try jw.objectField("active_requests");
-            try jw.write(value);
-        }
         try jw.objectField("error");
         try jw.write(self.@"error");
         if (self.message) |value| {

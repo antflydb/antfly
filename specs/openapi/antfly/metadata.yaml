@@ -2999,13 +2999,6 @@ components:
           items:
             type: string
           description: Input modalities accepted by the provider's resolved executor.
-        qualified_limits:
-          type: object
-          additionalProperties: true
-          description: Pull-time qualified request profile for this exact artifact, when available.
-        allow_downloads:
-          type: boolean
-          description: Whether this provider permits clients to show model download commands.
     InferenceConnection:
       type: object
       required:

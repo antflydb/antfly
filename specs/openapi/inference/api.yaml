@@ -1462,10 +1462,6 @@ components:
       required:
         - error
       properties:
-        active_requests:
-          type: integer
-          minimum: 0
-          description: Active runtime users when a lifecycle operation returns a busy conflict.
         error:
           type: string
           description: Stable machine-readable error code

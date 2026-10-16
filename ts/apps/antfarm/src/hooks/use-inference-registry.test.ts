@@ -70,8 +70,6 @@ describe("transformConnectionModels", () => {
                 name: "acme/extract",
                 capabilities: ["relations", "answers"],
                 inputs: ["text"],
-                qualified_limits: { max_tokens: 512 },
-                allow_downloads: true,
               },
             ],
           },
@@ -82,7 +80,6 @@ describe("transformConnectionModels", () => {
     expect(models[0]).toMatchObject({
       capabilities: ["relations", "answers"],
       inputs: ["text"],
-      qualifiedLimits: { max_tokens: 512 },
       allowDownloads: true,
     });
   });
@@ -103,5 +100,29 @@ describe("transformConnectionModels", () => {
     ]);
 
     expect(models).toEqual([]);
+  });
+
+  it.each([
+    "antfly",
+    "openrouter",
+    "openai",
+    "ollama",
+  ] as const)("only offers Antfly CLI download guidance for the Antfly provider (%s)", (provider) => {
+    const models = transformConnectionModels([
+      {
+        id: provider,
+        name: provider,
+        kind: "inference",
+        status: "connected",
+        capabilities: [],
+        sources: [],
+        inference: {
+          provider,
+          models: { generators: [{ name: "acme/chat" }] },
+        },
+      },
+    ]);
+
+    expect(models[0].allowDownloads).toBe(provider === "antfly");
   });
 });

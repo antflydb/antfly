@@ -408,6 +408,42 @@ test.describe("AI workflow routes", () => {
     await expect(page.getByText("mock-reader-second", { exact: true }).first()).toBeVisible();
   });
 
+  for (const provider of ["antfly", "openrouter"] as const) {
+    test(`Models download guidance follows the provider (${provider})`, async ({ page }) => {
+      await page.route("**/db/v1/connections?**", (route) =>
+        route.fulfill({
+          json: {
+            connections: [
+              {
+                ...connections.connections[0],
+                inference: {
+                  provider,
+                  models: { generators: [{ name: "acme/chat" }] },
+                },
+              },
+            ],
+          },
+        })
+      );
+      await page.route("https://huggingface.co/api/models/**", (route) =>
+        route.fulfill({ json: { downloads: 0, likes: 0 } })
+      );
+      await page.goto("/inference/models");
+      await page.getByRole("button", { name: "View details for acme/chat" }).click();
+      if (provider === "antfly") {
+        await expect(
+          page.getByText("antfly inference pull acme/chat", { exact: true })
+        ).toBeVisible();
+      } else {
+        await expect(page.getByText(/Manage this model through Local inference/)).toBeVisible();
+        await expect(
+          page.getByText("antfly inference pull acme/chat", { exact: true })
+        ).toHaveCount(0);
+        await expect(page.getByText("Download variant", { exact: true })).toHaveCount(0);
+      }
+    });
+  }
+
   test("Apple OCR uses native controls and preserves text regions", async ({ page }) => {
     await page.route("**/ai/v1/_antfarm/readers", (route) =>
       route.fulfill({ json: { apple_ocr: { available: true } } })

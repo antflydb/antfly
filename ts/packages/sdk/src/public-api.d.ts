@@ -5987,12 +5987,6 @@ export interface components {
             capabilities?: string[];
             /** @description Input modalities accepted by the provider's resolved executor. */
             inputs?: string[];
-            /** @description Pull-time qualified request profile for this exact artifact, when available. */
-            qualified_limits?: {
-                [key: string]: unknown;
-            };
-            /** @description Whether this provider permits clients to show model download commands. */
-            allow_downloads?: boolean;
         };
         InferenceConnection: {
             provider: components["schemas"]["InferenceProviderType"];
@@ -18544,8 +18538,6 @@ export interface components {
             acknowledged_groups: string[];
         };
         InferenceError: {
-            /** @description Active runtime users when a lifecycle operation returns a busy conflict. */
-            active_requests?: number;
             /** @description Stable machine-readable error code */
             error: string;
             /** @description Human-readable error description */
