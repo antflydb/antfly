@@ -2538,10 +2538,48 @@ const LocalStandaloneMetadata = struct {
         return reply;
     }
 
+    fn beginRelationalIndexPublication(self: *LocalStandaloneMetadata, alloc: std.mem.Allocator, context: antfly.public_api.operation.RequestContext, request: @import("../metadata/relational_index_publication.zig").BeginRequest) ![]u8 {
+        const publication = @import("../metadata/relational_index_publication.zig");
+        if (!context.setting_admin or !context.index_publication_authority) return error.Forbidden;
+        try context.ensureActive();
+        var prepared = try request.begin.plan.prepare(alloc);
+        defer prepared.deinit();
+        const observation = try request.observation(&prepared);
+        const bytes = try std.json.Stringify.valueAlloc(alloc, request.begin, .{});
+        defer alloc.free(bytes);
+        if (bytes.len > publication.max_command_bytes) return error.CatalogCommandTooLarge;
+        if (self.hot_standby_catalog_server) |server| try server.hot_standby_public_gate_state.checkWrite(server.hot_standby_public_gate_state.currentGeneration());
+        var lease = if (self.hot_standby_catalog_server) |server| server.hot_standby_mutation_barrier.acquireShared() else null;
+        defer if (lease) |*value| value.release();
+        if (self.hot_standby_catalog_server) |server| try server.hot_standby_public_gate_state.checkWrite(server.hot_standby_public_gate_state.currentGeneration());
+        if (!lockAtomicUntil(&self.mutex, (try context.platformDeadline()).deadline_ns)) return error.DeadlineExceeded;
+        defer self.mutex.unlock();
+        if (self.catalog_durability_failed) return error.MetadataMutationOutcomeUnknown;
+        try self.refreshLifecycleProjectionLocked();
+        const store = self.lifecycle_store orelse return error.UnsupportedOperation;
+        try store.validateRelationalIndexBegin(group_ids.main_metadata_group_id, request, &prepared);
+        try context.ensureActive();
+        const previous = self.durable_revision;
+        store.applyStandaloneCommand(group_ids.main_metadata_group_id, .{ .begin_relational_index_publication = bytes }) catch return error.MetadataMutationOutcomeUnknown;
+        const revision = store.standaloneRevision() catch return error.MetadataMutationOutcomeUnknown;
+        // Begin reserves the namespace but does not publish the successor table.
+        if (previous != 0 and previous != std.math.maxInt(u64) and revision == previous + 1) {
+            self.epoch = revision;
+            self.durable_revision = revision;
+        } else self.reloadLifecycleProjectionLocked() catch return error.MetadataMutationOutcomeUnknown;
+        const observed = store.relationalIndexAdmissionStatusJson(alloc, group_ids.main_metadata_group_id, observation) catch return error.MetadataMutationOutcomeUnknown;
+        errdefer alloc.free(observed);
+        var parsed = std.json.parseFromSlice(publication.AdmissionStatus, alloc, observed, .{}) catch return error.MetadataMutationOutcomeUnknown;
+        defer parsed.deinit();
+        if (!(parsed.value.isAdmitted(observation) catch return error.MetadataMutationOutcomeUnknown)) return error.MetadataMutationOutcomeUnknown;
+        return observed;
+    }
+
     fn systemCatalogAdmitted(ptr: *anyopaque, alloc: std.mem.Allocator, context: antfly.public_api.operation.RequestContext, call: @import("../system_catalog/server_call.zig").Call) anyerror![]u8 {
         const self: *LocalStandaloneMetadata = @ptrCast(@alignCast(ptr));
         try context.ensureActive();
         if (call.isRelationalIndexOwnerCall() and !context.index_publication_authority) return error.Forbidden;
+        if (call == .relational_index_begin) return self.beginRelationalIndexPublication(alloc, context, call.relational_index_begin);
         if ((call == .store_root_enroll or call == .store_root_enrollment_status) and !context.setting_admin) return error.Forbidden;
         if (call == .lake_index_lifecycle_read) return getLakeIndexLifecycle(ptr, alloc, call.lake_index_lifecycle_read, context);
         if (call == .lake_index_lifecycle_work) {
@@ -2582,7 +2620,7 @@ const LocalStandaloneMetadata = struct {
             return std.json.Stringify.valueAlloc(alloc, capture.value, .{});
         }
         switch (call) {
-            .lake_index_lifecycle_read, .lake_index_lifecycle_work, .lake_index_lifecycle_mutate => unreachable,
+            .lake_index_lifecycle_read, .lake_index_lifecycle_work, .lake_index_lifecycle_mutate, .relational_index_begin => unreachable,
             .relational_index_owner_decision => |request| {
                 const store = self.lifecycle_store orelse return error.UnsupportedOperation;
                 return store.relationalIndexOwnerDecisionJson(alloc, group_ids.main_metadata_group_id, request);

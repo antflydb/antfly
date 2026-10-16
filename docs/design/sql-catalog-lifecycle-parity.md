@@ -8565,3 +8565,39 @@ test, without failures or leaks. The direct-store lane additionally verifies
 successful read-only preflight, definite namespace conflict, foreign incarnation,
 and rejection after the job was already admitted. Licensing, Apache boundary,
 control-catalog, formatting/diff and original inventory checks pass.
+
+### Mounted coordinator admission and exact uncertain-outcome recovery
+
+`relational_index_begin` now uses the existing private system-catalog envelope,
+with administrator and index-publication authority required together. Metadata
+prepares and encodes the immutable candidate before taking the catalog mutation
+gate, validates decoder readiness and read-only admission at the admitted cut,
+and proposes one existing durable begin command. It releases the gate before
+waiting for apply. A lost reply, changed job, malformed observation or pending
+metadata outbox returns an unknown mutation outcome; no automatic begin replay
+or apparent success is synthesized. The recovery request is retained before
+submission and uses the previously mounted exact admission-status read.
+
+Standalone uses the same preflight, durable command and exact observation, with
+the shared hot-standby mutation lease and write gate. Candidate preparation is
+outside its projection mutex; an exact revision advance updates only its epoch,
+since admission has not published the successor table. Both ingress paths return
+compact admission status, not physical execution permission or ready-index state.
+Transport enforces the body-bound administrator grant and 2 KiB response cap.
+
+This mounts coordinator admission, not public SQL/REST online-index activation.
+The trusted plan builder still needs to capture the actual physical predecessor
+catalog and owner identities, including burned allocations, and public recovery
+receipts must be connected before activating the original statement cases.
+Replacement-root adoption and hosted/Raft execution also remain unfinished.
+
+The final frozen-source Debug gate passed 117/117 steps in
+`/private/tmp/antfly-index-admission-mounted-debug.log`: 60 metadata, four ACK
+transport, one decoder-barrier, four standalone coordinator and one actual
+compiled metadata-owner tests, without failures or leaks. The new admission
+dispatch test uses a synthetic service to qualify authority, definite preflight
+conflict, gate release before waiting, lost-reply status recovery with exactly
+one proposal, and withholding confirmation while replication is pending. Direct
+durable admission and compiled storage projection are qualified separately;
+this is not a complete public or hosted online-index execution test. All static
+checks pass; original inventory remains 483 implemented / 862 unresolved.

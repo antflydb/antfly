@@ -4668,7 +4668,7 @@ test "store-root enrollment status is a body-bound admin read and preserves abse
 fn catalogResponseLimit(input: @import("../system_catalog/server_call.zig").Call) ?usize {
     const publication = @import("relational_index_publication.zig");
     return switch (input) {
-        .relational_index_admission_status => publication.AdmissionStatus.max_wire_bytes,
+        .relational_index_begin, .relational_index_admission_status => publication.AdmissionStatus.max_wire_bytes,
         .relational_index_publish_decide, .relational_index_publish_status => publication.DecisionStatus.max_wire_bytes,
         .relational_index_cancel, .relational_index_cancel_status => publication.CancellationStatus.max_wire_bytes,
         .relational_index_source_accept, .relational_index_source_accept_status, .relational_index_source_complete => 16 * 1024,
@@ -4689,13 +4689,13 @@ test "relational index publication ACK client binds read grants and never retrie
         fn execute(ptr: *anyopaque, a: std.mem.Allocator, request: http_common.HttpRequest) !http_common.HttpResponse {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.calls += 1;
-            try authority.verify("index-ack-secret", "index-ack", .read, request.body, @intCast(@divFloor(platform_time.realtimeNs(), std.time.ns_per_s)), request.header(authority.header_name) orelse return error.TestUnexpectedResult);
             try std.testing.expect(request.header(internal_service_auth.header_name) != null);
             var call = try std.json.parseFromSlice(@import("../system_catalog/server_call.zig").Call, a, request.body, .{});
             defer call.deinit();
+            try authority.verify("index-ack-secret", "index-ack", if (call.value.requiresAdministrativeGrant()) .admin else .read, request.body, @intCast(@divFloor(platform_time.realtimeNs(), std.time.ns_per_s)), request.header(authority.header_name) orelse return error.TestUnexpectedResult);
             const mutation = call.value.isMutation();
             try std.testing.expect(call.value.isRelationalIndexOwnerCall());
-            if (call.value == .relational_index_admission_status) try std.testing.expectEqual(@as(?usize, publication.AdmissionStatus.max_wire_bytes), request.max_response_bytes);
+            if (call.value == .relational_index_begin or call.value == .relational_index_admission_status) try std.testing.expectEqual(@as(?usize, publication.AdmissionStatus.max_wire_bytes), request.max_response_bytes);
             if (call.value == .relational_index_source_accept_status or call.value == .relational_index_source_accept or call.value == .relational_index_source_complete) try std.testing.expectEqual(@as(?usize, 16 * 1024), request.max_response_bytes);
             if (call.value == .relational_index_publish_status or call.value == .relational_index_publish_decide) try std.testing.expectEqual(@as(?usize, publication.DecisionStatus.max_wire_bytes), request.max_response_bytes);
             if (call.value == .relational_index_cancel_status or call.value == .relational_index_cancel) try std.testing.expectEqual(@as(?usize, publication.CancellationStatus.max_wire_bytes), request.max_response_bytes);
@@ -4801,6 +4801,15 @@ test "relational index publication ACK client binds read grants and never retrie
     defer cancel_status.deinit(alloc);
     const cancel_reply = try client.forwardSystemCatalogControlled("http://metadata.invalid", .{ .relational_index_cancel = cancel }, .{ .remaining_ms = 25, .forwards_remaining = 2, .campaign_allowed = true }, false, null);
     defer alloc.free(cancel_reply);
+    var plan_arena = std.heap.ArenaAllocator.init(alloc);
+    defer plan_arena.deinit();
+    const beginning: publication.BeginRequest = .{ .metadata_incarnation = @splat('1'), .begin = .{ .plan = try publication.testing.plan(plan_arena.allocator()) } };
+    const begin_call: @import("../system_catalog/server_call.zig").Call = .{ .relational_index_begin = beginning };
+    const begin_calls_before = executor.calls;
+    try std.testing.expectError(error.Forbidden, client.forwardSystemCatalogControlled("http://metadata.invalid", begin_call, .{ .remaining_ms = 25, .forwards_remaining = 2, .campaign_allowed = true }, false, null));
+    try std.testing.expectEqual(begin_calls_before, executor.calls);
+    const begin_reply = try client.forwardSystemCatalogControlled("http://metadata.invalid", begin_call, .{ .remaining_ms = 25, .forwards_remaining = 2, .campaign_allowed = true }, true, null);
+    defer alloc.free(begin_reply);
     executor.status = 409;
     executor.body = "MetadataReplicationPending";
     executor.outcome = routes.Routes.raft_mutation_outcome_not_proposed;
