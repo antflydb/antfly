@@ -1150,3 +1150,145 @@ def test_cypher_mutations_preserve_external_vectors_after_reopen(require_native,
     with af.open_hosted(aflite_path) as database:
         with database.open_table("docs") as table:
             verify(table)
+
+
+def test_timestamp_mutations_use_lossless_native_graph_values(require_native, aflite_path):
+    epoch = 1577934245000000000
+    with af.create_hosted(aflite_path) as database:
+        database.sql("CREATE TABLE docs (id TEXT, ts TIMESTAMPTZ)")
+        database.graph_catalog_json(
+            {"action": "put", "name": "g", "definition": {"labels": [{"name": "D", "table": "docs"}]}}
+        )
+        for query in (
+            "CREATE (:D {id:'bad',ts:'2020-01-02T03:04:05Z'})",
+            "MERGE (:D {ts:'2020-01-02T04:04:05+01:00'})",
+        ):
+            with pytest.raises(af.GraphError) as failed:
+                database.cypher_json("g", {"query": query})
+            assert failed.value.graph_code == "CypherTypeMismatch"
+            assert database.sql("SELECT count(*) FROM docs")["rows"] == [["0"]]
+        for _ in range(2):
+            result = database.cypher_json(
+                "g", {"query": "MERGE (n:D {id:'a',ts:$epoch}) RETURN n.ts", "parameters": {"epoch": epoch}}
+            )
+            assert result["rows"] == [[{"type": "integer", "value": str(epoch)}]]
+        assert database.sql("SELECT count(*) FROM docs")["rows"] == [["1"]]
+        database.sql("CREATE TABLE clock (ts TIMESTAMPTZ DEFAULT '2020-01-02T03:04:05Z')")
+        database.graph_catalog_json(
+            {"action": "put", "name": "clock_graph", "definition": {"labels": [{"name": "Clock", "table": "clock"}]}}
+        )
+        assert database.cypher_json("clock_graph", {"query": "CREATE (n:Clock) RETURN n.ts"})["rows"] == [
+            [{"type": "integer", "value": str(epoch)}]
+        ]
+        assert database.cypher_json("clock_graph", {"query": "MATCH (n:Clock) RETURN n.ts"})["rows"] == [
+            [{"type": "integer", "value": str(epoch)}]
+        ]
+        for assignment in ("n.ts='2021-01-02T03:04:05Z'", "n += {ts:'2021-01-02T03:04:05Z'}"):
+            with pytest.raises(af.GraphError):
+                database.cypher_json("g", {"query": "MATCH (n:D) SET " + assignment})
+        assert database.cypher_json("g", {"query": "MATCH (n:D) RETURN n.ts"})["rows"] == [
+            [{"type": "integer", "value": str(epoch)}]
+        ]
+        assert database.sql("SELECT g.ts FROM GRAPH_TABLE(g MATCH (n IS D) COLUMNS(n.ts AS ts)) g")["rows"] == [
+            ["2020-01-02T03:04:05.000000000Z"]
+        ]
+    with af.open_hosted(aflite_path) as database:
+        assert database.cypher_json("g", {"query": "MATCH (n:D) RETURN n.ts"})["rows"] == [
+            [{"type": "integer", "value": str(epoch)}]
+        ]
+
+
+@pytest.mark.parametrize("control", ["_edges", "_embeddings"])
+def test_native_ingestion_controls_are_not_cypher_properties(require_native, aflite_path, control):
+    with af.create_hosted(aflite_path) as database:
+        database.create_table("docs", {})
+        database.graph_catalog_json(
+            {"action": "put", "name": "g", "definition": {"labels": [{"name": "D", "table": "docs"}]}}
+        )
+        with pytest.raises(af.GraphError) as failed:
+            database.cypher_json("g", {"query": f"CREATE (:D {{id:'bad',{control}:{{}}}})"})
+        assert failed.value.graph_code == "CypherInvalidPropertyValue"
+        assert database.cypher_json("g", {"query": "MATCH (n:D) RETURN count(n)"})["rows"][0][0]["value"] == "0"
+
+
+def test_native_metadata_and_prefixed_edge_ids_survive_cypher_updates(require_native, aflite_path):
+    with af.create_hosted(aflite_path) as database:
+        database.sql("CREATE TABLE docs(id TEXT)")
+        database.sql("INSERT INTO docs(_id,id) VALUES('a','a'),('b','b'),('c','c')")
+        with database.open_table("docs") as table:
+            table.add_index({"name": "links", "kind": "graph", "config_json": "{}"})
+            table.batch_json(
+                {
+                    "graph_writes": [
+                        {
+                            "index_name": "links",
+                            "source": "a",
+                            "target": key,
+                            "edge_type": "link",
+                            "edge_id": "cypher:0123456789abcdef0123456789abcdef",
+                            "metadata_json": json.dumps({"antfly_cypher": "customer-value", "tag": tag}),
+                            "weight": 3.5 + tag,
+                            "created_at": 123 + tag,
+                            "updated_at": 456 + tag,
+                        }
+                        for tag, key in enumerate(("b", "c"))
+                    ],
+                    "sync_level": "full_index",
+                }
+            )
+        database.graph_catalog_json(
+            {
+                "action": "put",
+                "name": "g",
+                "definition": {
+                    "labels": [{"name": "D", "table": "docs"}],
+                    "relationships": [
+                        {"name": "R", "index": "links", "source_label": "D", "target_label": "D", "stored_type": "link"}
+                    ],
+                },
+            }
+        )
+        query = "MATCH (a:D)-[r:R]->(b:D) RETURN elementId(r),r.antfly_cypher,r.tag ORDER BY b.id"
+        before = database.cypher_json("g", {"query": query})["rows"]
+        assert len(before) == 2 and before[0][0] != before[1][0]
+        assert [row[1]["value"] for row in before] == ["customer-value"] * 2
+        changed = database.cypher_json(
+            "g",
+            {
+                "query": "MATCH (a:D)-[r:R]->(b:D) SET r.tag=r.tag+10 RETURN elementId(r),r.antfly_cypher,r.tag ORDER BY b.id"
+            },
+        )["rows"]
+        assert [row[0] for row in changed] == [row[0] for row in before]
+        assert [row[2]["value"] for row in changed] == ["10", "11"]
+        assert database.cypher_json("g", {"query": query})["rows"] == changed
+        sql_rows = database.sql("SELECT g.r FROM GRAPH_TABLE(g MATCH (a IS D)-[r IS R]->(b IS D) COLUMNS(r AS r)) g")[
+            "rows"
+        ]
+        assert len(sql_rows) == 2
+
+    def native_attributes(database):
+        with database.open_table("docs") as table:
+            # Native adjacency reads use the published derived index. The
+            # empty full-index batch is its explicit visibility barrier.
+            table.batch_json({"sync_level": "full_index"})
+            return sorted(
+                (edge["weight"], edge["created_at"], edge["updated_at"])
+                for edge in table.edges("links", "a", "link", 0)
+            )
+
+    with af.open_hosted(aflite_path) as database:
+        assert database.cypher_json("g", {"query": query})["rows"] == changed
+        assert native_attributes(database) == [(3.5, 123, 456), (4.5, 124, 457)]
+        database.cypher_json("g", {"query": "MATCH ()-[r:R]->() SET r.weight=r.weight+1"})
+    with af.open_hosted(aflite_path) as database:
+        assert native_attributes(database) == [(4.5, 123, 456), (5.5, 124, 457)]
+        database.cypher_json("g", {"query": "MATCH ()-[r:R]->() REMOVE r.weight"})
+        database.cypher_json("g", {"query": "MATCH ()-[r:R]->() SET r.note='kept'"})
+        assert database.cypher_json("g", {"query": "MATCH ()-[r:R]->() SET r.weight=-1 RETURN r.weight"})["rows"] == [
+            [{"type": "integer", "value": "-1"}],
+            [{"type": "integer", "value": "-1"}],
+        ]
+    with af.open_hosted(aflite_path) as database:
+        assert native_attributes(database) == [(4.5, 123, 456), (5.5, 124, 457)]
+        database.cypher_json("g", {"query": "MATCH ()-[r:R]->() DELETE r"})
+        assert database.cypher_json("g", {"query": "MATCH ()-[r:R]->() RETURN count(r)"})["rows"][0][0]["value"] == "0"

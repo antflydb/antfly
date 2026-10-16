@@ -1658,7 +1658,9 @@ const Engine = struct {
                     const target = nodes[if (pattern.direction == .out) i + 1 else i];
                     if (!try self.graph.admits(source, mapping.source_label, &self.values) or !try self.graph.admits(target, mapping.target_label, &self.values)) return error.CypherRelationshipEndpointMismatch;
                     const rel = try self.a.create(v.Relationship);
-                    rel.* = .{ .identity = try self.backend.vtable.new_identity.?(self.backend.ptr, self.a, source.identity.table, true), .index = mapping.index, .type = mapping.name, .source = source.identity, .target = target.identity, .properties = try v.entityProperties(self.a, try self.creationProperties(pattern.properties, row, merge)) };
+                    const generated = try self.backend.vtable.new_identity.?(self.backend.ptr, self.a, source.identity.table, true);
+                    const identity: v.Identity = .{ .table = source.identity.table, .key = try std.json.Stringify.valueAlloc(self.a, .{ source.identity.key, target.identity.key, mapping.stored_type, generated.key, "" }, .{}) };
+                    rel.* = .{ .identity = identity, .index = mapping.index, .type = mapping.name, .source = source.identity, .target = target.identity, .properties = try v.entityProperties(self.a, try self.creationProperties(pattern.properties, row, merge)) };
                     try self.mutate(.{ .create_relationship = rel });
                     relationship.* = if (self.backend.vtable.get_relationship) |get_relationship|
                         (try get_relationship(self.backend.ptr, self.a, .{ .identity = rel.identity, .index = rel.index })) orelse return error.CypherDeletedEntity

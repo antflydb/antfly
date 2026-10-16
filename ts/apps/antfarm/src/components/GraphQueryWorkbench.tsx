@@ -331,6 +331,8 @@ export default function GraphQueryWorkbench({
         setMessage("The server reported an incomplete result.");
     } catch (error) {
       if (sequence.current === token) {
+        // A reason code cannot prove that a distributed write aborted.
+        // Only the server's explicit outcome permits another submission.
         if (
           writeId &&
           error instanceof GraphExecutionError &&
@@ -348,13 +350,7 @@ export default function GraphQueryWorkbench({
           writeId &&
           error instanceof GraphExecutionError &&
           (error.diagnostic.write_outcome === "not_started" ||
-            error.diagnostic.write_outcome === "aborted" ||
-            [
-              "Forbidden",
-              "RowPolicyDenied",
-              "RowPolicyAuthenticationRequired",
-              "CypherTransactionConflict",
-            ].includes(error.diagnostic.code))
+            error.diagnostic.write_outcome === "aborted")
         ) {
           setWriteRecovery({
             id: writeId,
@@ -412,12 +408,13 @@ export default function GraphQueryWorkbench({
     const selectedScope = recoveryKey;
     try {
       const status = await client.graphs.writeStatus(selected.id);
-      if (recoveryScope.current !== selectedScope) return;
-      if (recoveryRef.current?.id === selected.id)
-        setWriteRecovery({ ...selected, disposition: status.disposition });
+      if (recoveryScope.current !== selectedScope || recoveryRef.current?.id !== selected.id)
+        return;
+      setWriteRecovery({ ...selected, disposition: status.disposition });
       setMessage(`Transaction ${selected.id}: ${status.disposition}.`);
     } catch (error) {
-      if (recoveryScope.current !== selectedScope) return;
+      if (recoveryScope.current !== selectedScope || recoveryRef.current?.id !== selected.id)
+        return;
       setMessage(
         `The transaction receipt is not available yet. Keep its ID and inspect it again before replaying the statement. ${String(error)}`
       );

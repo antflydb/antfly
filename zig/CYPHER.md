@@ -303,6 +303,17 @@ including negative zero and subnormal values.
 
 Property values are validated before overlay changes or normalization: graph
 handles, even inside maps/lists, raise `CypherInvalidPropertyValue` and roll back.
+Top-level node properties `_edges` and `_embeddings` are native ingestion
+commands and reject nonnull Cypher assignments with `CypherInvalidPropertyValue`.
+Use relationship patterns for graph writes and the native batch API for external
+embeddings. These names remain valid inside user maps and on relationships;
+assigning null or removing them from a node is allowed.
+Relational SQL datetime columns are exposed as signed integer epoch nanoseconds
+in graph values, including mutation postimages and MERGE keys. Cypher writes
+must use that integer representation; SQL timestamp strings raise
+`CypherTypeMismatch` before commit. SQL retains its timestamp string input and
+formatted timestamp output. No implicit temporal type conversion happens during
+a graph mutation, so repeated MERGE uses the same value before and after storage.
 Self-loop endpoint predicates follow the selected traversal orientation. CREATE
 and MERGE reject already-bound relationship or path declarations before storage
 admission, including EXPLAIN and empty inputs. Final wildcard column schemas are
@@ -819,6 +830,34 @@ artifact assertions. Updating a producer rebuilds its field projections; unrelat
 updates preserve manually owned facts and the last published artifact assertions.
 Field projections have a distinct identity from artifact assertions, including
 when both share a producer and traversal endpoints.
+Relationship identity is derived from the full stored endpoint/type/edge-ID/
+producer tuple, with an additional field-projection discriminator. Native edge
+IDs, including ones beginning with `cypher:`, are scoped to that tuple. Updating
+metadata never changes identity, and parallel native edges on distinct endpoints
+remain distinct. New Cypher relationships use this same identity immediately,
+before commit. Treat public `elementId()` values as opaque.
+Relationship property updates retain the native creation/update timestamps and
+physical weight from the captured storage cut. Nonnegative numeric `weight` properties also
+set the native weight; removing or assigning a nonnumeric or negative property preserves the
+captured physical weight. These storage attributes travel only on authenticated
+owner RPCs and are omitted from public graph values. Existing native TTL origins
+are preserved by the storage layer when the same explicit edge is updated.
+Algebraic path conversion preserves per-node table qualifiers, including
+same-table tags and cross-table endpoints, through native and HTTP path results.
+Graph preflight advances bounded receiver-local producer readiness bookkeeping
+before waiting for enrichment, so a replica with no optional producer worker can
+publish its readiness registry. Retryable enrichment admission failures retain
+their typed diagnostic and HTTP 503 status through retained-owner RPCs.
+Direct native adjacency reads use the native `full_index` visibility barrier;
+Cypher captures drain maintenance before freezing their coherent cut.
+Snapshot capture reuses the vertex identity index when checking producers and
+allocates a separate lookup cache only for off-graph producers.
+Native metadata uses the private Cypher wire envelope only when the entire
+object has exactly `source_table`, `target_table`, and `antfly_cypher`, the table
+names are strings, and the marker contains exactly version 1 and valid tagged
+map properties. That complete shape is reserved for the storage protocol.
+Ordinary, partial, malformed, and unsupported-version marker values remain user
+metadata, so a user property named `antfly_cypher` does not make an edge unreadable.
 Postimage read authority applies to producers independently of graph label
 membership. Referenced producers are captured under the same snapshot fences,
 including nonvertices, with budgeted, deduplicated lookups and indexed identity
@@ -1030,3 +1069,28 @@ Normalization reuses validated overlay nodes when the schema has no expression
 bindings or numeric modifiers, avoiding JSON round trips for ordinary bulk
 updates while retaining normalization for defaults, generated columns, and
 numeric constraints.
+
+Retained graph RPC ingress and clients share one explicit diagnostic vocabulary.
+Owner-side type/property validation keeps its client error identity and status,
+including relational timestamp normalization; it must not masquerade as a
+retryable cursor restart. Producer/readiness changes before capture report a
+retryable graph snapshot failure. SQL `GRAPH_TABLE` reports these temporary
+readiness failures as SQLSTATE `53300`, permitting a bounded retry of the whole
+stateless read while preserving transaction and write-receipt rules.
+
+Managed dense-vector configs may name the generator's own embedding output at
+both generator and index scope. Ordered publication accepts that exact match;
+foreign selectors and mixed source lists remain excluded. This prevents
+replicated semantic producers from repeatedly computing outputs that their
+publication gate would reject. `antfly-generated-vector-contract-test` covers
+selector isolation and native publication planning, with the replicated
+owner-loss fixture exercising provider completion and durable receipt recovery.
+Provisioning snapshot races and pending Raft capability barriers retain stable
+availability errors across runtime archives; availability does not establish
+that a preceding mutation was never admitted.
+
+The workbench releases an unresolved write only after an explicit server outcome
+or transaction receipt proves its disposition. Permission/conflict reason codes
+alone never override an unknown outcome. Receipt inspections also fence their
+responses by principal scope and write ID so an older inspection cannot replace
+a newer write's recovery state or message.

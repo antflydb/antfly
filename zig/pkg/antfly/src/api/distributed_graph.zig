@@ -5696,10 +5696,7 @@ fn executeDistributedShortestPath(
 
     var output_retained_bytes: usize = 0;
     if (path_result) |result| {
-        output_retained_bytes = graphResultNodeFromPathRetainedBytes(alloc, result.path, request_work_budget) catch |err| switch (err) {
-            error.Overflow => return request_work_budget.exhaust(.retained_state_bytes, request_work_budget.max_retained_state_bytes),
-            else => return err,
-        };
+        output_retained_bytes = graphResultNodeFromPathRetainedBytes(result.path) catch return request_work_budget.exhaust(.retained_state_bytes, request_work_budget.max_retained_state_bytes);
         output_retained_bytes = std.math.add(
             usize,
             output_retained_bytes,
@@ -6000,10 +5997,7 @@ fn executeDistributedKShortestPaths(
         out_nodes_retained_bytes = std.math.add(
             usize,
             out_nodes_retained_bytes,
-            graphResultNodeFromPathRetainedBytes(alloc, result.path, request_work_budget) catch |err| switch (err) {
-                error.Overflow => return request_work_budget.exhaust(.retained_state_bytes, request_work_budget.max_retained_state_bytes),
-                else => return err,
-            },
+            graphResultNodeFromPathRetainedBytes(result.path) catch return request_work_budget.exhaust(.retained_state_bytes, request_work_budget.max_retained_state_bytes),
         ) catch return request_work_budget.exhaust(.retained_state_bytes, request_work_budget.max_retained_state_bytes);
     }
     var out_nodes_lease = try graph_work_budget.RetainedLease.init(request_work_budget, out_nodes_retained_bytes);
@@ -9216,18 +9210,12 @@ fn edgeWeightFromNode(node: graph_query_mod.GraphResultNode) f64 {
 fn graphPathToResultNode(
     alloc: std.mem.Allocator,
     path: db_mod.types.GraphPath,
-    work_budget: ?*graph_work_budget.WorkBudget,
+    _: ?*graph_work_budget.WorkBudget,
 ) !graph_query_mod.GraphResultNode {
-    var table_scratch = graph_traversal_mod.MetadataScratch.init(alloc, work_budget);
-    defer table_scratch.deinit();
     const target_key = if (path.nodes.len > 0) path.nodes[path.nodes.len - 1] else "";
-    const target_table = if (path.nodes.len > 0 and path.node_tables.len == path.nodes.len)
-        path.node_tables[path.node_tables.len - 1]
-    else if (path.edges.len > 0 and
-        std.mem.eql(u8, path.edges[path.edges.len - 1].target, target_key))
-        try graph_traversal_mod.metadataTargetTable(&table_scratch, path.edges[path.edges.len - 1].metadata)
-    else
-        null;
+    // Path provenance is authoritative. Empty node_tables means every node
+    // is local; native edge metadata may still explicitly tag that same table.
+    const target_table = if (path.nodes.len > 0) graphPathNodeTable(path, path.nodes.len - 1) else null;
     const nodes = try dupPath(alloc, path.nodes);
     errdefer freePathArray(alloc, nodes);
     const node_tables = if (path.node_tables.len > 0)
@@ -9253,19 +9241,12 @@ fn graphPathToResultNode(
     );
 }
 
-fn graphResultNodeFromPathRetainedBytes(alloc: std.mem.Allocator, path: db_mod.types.GraphPath, work_budget: ?*graph_work_budget.WorkBudget) !usize {
-    var table_scratch = graph_traversal_mod.MetadataScratch.init(alloc, work_budget);
-    defer table_scratch.deinit();
+fn graphResultNodeFromPathRetainedBytes(path: db_mod.types.GraphPath) error{Overflow}!usize {
     var total: usize = @sizeOf(graph_query_mod.GraphResultNode);
     if (path.nodes.len > 0) {
         const target_key = path.nodes[path.nodes.len - 1];
         total = try std.math.add(usize, total, target_key.len);
-        const target_table: ?[]const u8 = if (graphPathNodeTable(path, path.nodes.len - 1)) |table|
-            table
-        else if (path.edges.len > 0 and std.mem.eql(u8, path.edges[path.edges.len - 1].target, target_key))
-            try graph_traversal_mod.metadataTargetTable(&table_scratch, path.edges[path.edges.len - 1].metadata)
-        else
-            null;
+        const target_table = graphPathNodeTable(path, path.nodes.len - 1);
         if (target_table) |table|
             total = try std.math.add(usize, total, table.len);
     }
@@ -9961,6 +9942,21 @@ test "distributed graph identities are length framed" {
     const edge_b = try compositeIdentityAlloc(alloc, &.{ "A", "B->C", "kind" });
     defer alloc.free(edge_b);
     try std.testing.expect(!std.mem.eql(u8, edge_a, edge_b));
+}
+
+test "distributed shortest path keeps local identity despite explicit native table tags" {
+    const a = std.testing.allocator;
+    var nodes = [_][]const u8{ "a", "b" };
+    var tables = [_]?[]const u8{ null, null };
+    var edges = [_]graph_paths_mod.PathEdge{.{ .source = "a", .target = "b", .edge_type = "R", .weight = 3.5, .metadata = "{\"source_table\":\"docs\",\"target_table\":\"docs\"}" }};
+    for ([_][]?[]const u8{ &.{}, &tables }) |provenance| {
+        const path: db_mod.types.GraphPath = .{ .nodes = &nodes, .node_tables = provenance, .edges = &edges, .total_weight = 3.5, .length = 1 };
+        var node = try graphPathToResultNode(a, path, null);
+        defer node.deinit(a);
+        try std.testing.expect(node.table == null);
+        try std.testing.expect(graph_query_mod.isCanonicalResultNode(node));
+        _ = try graphResultNodeFromPathRetainedBytes(path);
+    }
 }
 
 test "distributed shortest path identity and endpoint retain table provenance" {

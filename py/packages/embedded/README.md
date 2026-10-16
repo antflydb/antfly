@@ -389,6 +389,12 @@ return a commit receipt. Retain the request ID and resolve an unknown outcome
 through the status method instead of replaying the query. `GraphError` preserves
 the diagnostic code, span, outcome, and transaction ID when available.
 
+SQL datetime properties use integer epoch nanoseconds in Cypher; pass integers
+for CREATE, MERGE, and SET. Timestamp strings remain available through SQL.
+Cypher node writes reject native ingestion controls `_edges` and `_embeddings`;
+use relationship patterns and the native batch API respectively. Relationship
+IDs are opaque and remain stable across property updates and reopening.
+
 Local SQL supports `GRAPH_TABLE` over these catalogs, including ordinary-table
 joins and staged SQL rows in an explicit transaction. Graph definitions pin
 local table and graph-index identities across reopen. Raw embedded calls reject

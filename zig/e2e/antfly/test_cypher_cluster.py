@@ -85,6 +85,38 @@ def test_authenticated_cypher_postimage_policy_on_replicated_owners(
         assert expected in result.stdout
 
 
+def test_authenticated_cypher_storage_contract_on_replicated_owners(
+    three_by_three_backup_cluster,
+):
+    cluster = three_by_three_backup_cluster
+    leader = urlsplit(cluster.metadata_leader_public_url())
+    script = (
+        Path(__file__).resolve().parents[2]
+        / "scripts"
+        / "verify_cypher_storage_contract.py"
+    )
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(script),
+            "--url",
+            f"{leader.scheme}://{leader.hostname}:{leader.port}",
+        ],
+        env={
+            **os.environ,
+            "ANTFLY_CYPHER_TEST_AUTH": f"admin:{AUTH_BOOTSTRAP_PASSWORD}",
+        },
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=240,
+    )
+    assert result.returncode == 0, (
+        result.stdout + result.stderr + "\n" + cluster.debug_logs()
+    )
+    assert "Authenticated lossless Cypher storage contract passed" in result.stdout
+
+
 @pytest.mark.parametrize("preexisting_producers", [False, True])
 def test_authenticated_cypher_producer_postimages_on_replicated_owners(
     preexisting_producers,

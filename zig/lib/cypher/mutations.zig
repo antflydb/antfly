@@ -19,7 +19,7 @@ const root = @import("root.zig");
 const A = std.mem.Allocator;
 const v = root.value;
 pub const Write = struct { key: []const u8, value: []const u8 };
-pub const Edge = struct { edge_id: []const u8, index_name: []const u8, source: []const u8, target: []const u8, edge_type: []const u8, metadata_json: []const u8 = "" };
+pub const Edge = struct { weight: f64 = 1, created_at: u64 = 0, updated_at: u64 = 0, edge_id: []const u8, index_name: []const u8, source: []const u8, target: []const u8, edge_type: []const u8, metadata_json: []const u8 = "" };
 pub const Plan = struct {
     table: []const u8,
     writes: std.ArrayList(Write) = .empty,
@@ -81,7 +81,11 @@ pub fn build(a: A, graph: root.catalog.Graph, overlay: *root.transaction.Overlay
         const entry = try plan(plans.items, relationship.source.table);
         const mapping = graph.relationship(relationship.type) orelse return error.UndefinedGraphRelationship;
         if (!std.mem.eql(u8, relationship.source.table, graph.label(mapping.source_label).?.table) or !std.mem.eql(u8, relationship.target.table, graph.label(mapping.target_label).?.table)) return error.CypherInvalidRelationship;
-        var edge: Edge = .{ .edge_id = try edgeId(a, relationship), .index_name = relationship.index, .source = relationship.source.key, .target = relationship.target.key, .edge_type = mapping.stored_type };
+        const weight = (v.Value{ .relationship = relationship }).property("weight");
+        const numeric_weight = if (weight == .integer or weight == .number) try weight.numeric() else relationship.native.weight;
+        // Arbitrary Cypher property data must not narrow the native storage
+        // domain. Only a valid native cost overrides the captured weight.
+        var edge: Edge = .{ .weight = if (numeric_weight >= 0) numeric_weight else relationship.native.weight, .created_at = relationship.native.created_at, .updated_at = relationship.native.updated_at, .edge_id = try edgeId(a, relationship), .index_name = relationship.index, .source = relationship.source.key, .target = relationship.target.key, .edge_type = mapping.stored_type };
         if (item.deleted) {
             if (item.created) continue;
             try entry.removed_edges.append(a, edge);

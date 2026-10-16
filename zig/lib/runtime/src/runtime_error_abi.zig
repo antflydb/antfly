@@ -1086,7 +1086,7 @@ pub fn statusFromError(err: anyerror) Status {
         error.UnknownMergeRuntime => status(.not_found, .unknown_merge_runtime),
         error.MissingSplitRuntime => status(.not_found, .missing_split_runtime),
         error.MissingMergeRuntime => status(.not_found, .missing_merge_runtime),
-        error.MetadataSnapshotUnavailable => status(.retryable, .metadata_snapshot_unavailable),
+        error.MetadataSnapshotUnavailable, error.MetadataSnapshotHeadMismatch => status(.retryable, .metadata_snapshot_unavailable),
         error.SplitSourceProjectionNotReady => status(.retryable, .split_source_projection_not_ready),
         error.SplitSourceProjectionAdvanced => status(.retryable, .split_source_projection_advanced),
         error.DurableRootIncarnationUnavailable => status(.retryable, .durable_root_incarnation_unavailable),
@@ -1279,7 +1279,9 @@ pub fn statusFromError(err: anyerror) Status {
         error.RestoreIntentConflict => status(.conflict, .restore_intent_conflict),
         error.Unauthorized => status(.unauthorized, .unauthorized),
         error.Forbidden => status(.forbidden, .forbidden),
-        error.Unavailable => status(.unavailable, .unavailable),
+        // Capability barriers can be unavailable during provisioning or a
+        // rolling upgrade. They fail before batch proposal admission.
+        error.Unavailable, error.RaftBatchMergeProtocolUnavailable, error.RaftBatchSplitDeltaProtocolUnavailable => status(.unavailable, .unavailable),
         error.WriteUnavailable => status(.unavailable, .write_unavailable),
         error.ReadUnavailable => status(.unavailable, .read_unavailable),
         error.ReadRequiresPrimary => status(.unavailable, .read_requires_primary),
@@ -2760,4 +2762,15 @@ test "temporary SQL statement capture failure preserves retryable boundary ident
     try std.testing.expectEqual(@backingInt(Code.unavailable), transported.code);
     try std.testing.expectEqual(error.SqlStatementReadUnavailable, errorFromStatus(transported));
     try std.testing.expect(errorHasStableDetail(error.SqlStatementReadUnavailable));
+}
+
+test "provisioning races retain canonical availability across runtime archives" {
+    const metadata = statusFromError(error.MetadataSnapshotHeadMismatch);
+    try std.testing.expectEqual(@backingInt(Code.retryable), metadata.code);
+    try std.testing.expectEqual(error.MetadataSnapshotUnavailable, errorFromStatus(metadata));
+    for ([_]anyerror{ error.RaftBatchMergeProtocolUnavailable, error.RaftBatchSplitDeltaProtocolUnavailable }) |err| {
+        const wire = statusFromError(err);
+        try std.testing.expectEqual(@backingInt(Code.unavailable), wire.code);
+        try std.testing.expectEqual(error.Unavailable, errorFromStatus(wire));
+    }
 }

@@ -21,6 +21,18 @@ pub fn normalize(self: anytype, a: A, _: cypher.catalog.Graph, node: *const cyph
     try cypher.value.validatePropertyValue(.{ .map = node.properties });
     var schema_view = self.core.acquireSchemaView();
     defer if (schema_view) |*view| view.release();
+    // A graph has no temporal scalar tag: native relational reads expose
+    // datetimes as integer epoch nanoseconds. Reject SQL ingestion spellings
+    // instead of silently changing the property's value/type at commit. In
+    // particular MERGE must not repeatedly create a string key stored as i64.
+    if (schema_view) |view| if (view.validator()) |validator| {
+        for (node.properties) |entry| {
+            if (entry.value == .null or entry.value == .integer) continue;
+            if (validator.execution.relationalFieldType(entry.name)) |kind| {
+                if (std.mem.eql(u8, kind, "datetime")) return error.CypherTypeMismatch;
+            }
+        }
+    };
     // With no schema expressions the overlay already is the normalized
     // postimage. Avoid a JSON round trip and another retained entity per row.
     const expressions = if (schema_view) |view|
@@ -55,9 +67,10 @@ pub fn relationships(self: anytype, a: A, graph: cypher.catalog.Graph, node: *co
     defer extracted.deinit(temporary);
     self.core.lockApplyShared();
     defer self.core.unlockApplyShared();
+    const inline_edges = extracted.graph_writes.len;
     try @import("graph_field_plan.zig").fromCatalog(self.core, temporary, node.identity.key, document, &extracted);
     var result: std.ArrayList(*const cypher.value.Relationship) = .empty;
-    for (extracted.graph_writes) |edge| for (graph.relationships) |mapping| {
+    for (extracted.graph_writes, 0..) |edge, edge_index| for (graph.relationships) |mapping| {
         const source_table = graph.label(mapping.source_label).?.table;
         if (!std.mem.eql(u8, source_table, node.identity.table) or !std.mem.eql(u8, edge.index_name, mapping.index) or !std.mem.eql(u8, edge.edge_type, mapping.stored_type)) continue;
         const target_table = graph.label(mapping.target_label).?.table;
@@ -70,14 +83,22 @@ pub fn relationships(self: anytype, a: A, graph: cypher.catalog.Graph, node: *co
         var properties: std.ArrayList(cypher.value.Entry) = .empty;
         for (metadata.map) |entry| if (!std.mem.eql(u8, entry.name, "weight") and !std.mem.eql(u8, entry.name, "source_table") and !std.mem.eql(u8, entry.name, "target_table")) try properties.append(temporary, entry);
         try properties.append(temporary, .{ .name = "weight", .value = .{ .number = edge.weight } });
+        // Native inline ingestion contributes explicit assertions. Only edges
+        // appended by graph_field_plan carry field ownership/provenance.
+        const field_derived = edge_index >= inline_edges;
+        const key = if (field_derived)
+            try std.json.Stringify.valueAlloc(temporary, .{ edge.source, edge.target, edge.edge_type, edge.edge_id, node.identity.key, "field" }, .{})
+        else
+            try std.json.Stringify.valueAlloc(temporary, .{ edge.source, edge.target, edge.edge_type, edge.edge_id, "" }, .{});
         const relationship: cypher.value.Relationship = .{
-            .identity = .{ .table = source_table, .key = try std.json.Stringify.valueAlloc(temporary, .{ edge.source, edge.target, edge.edge_type, edge.edge_id, node.identity.key, "field" }, .{}) },
+            .native = .{ .weight = edge.weight, .created_at = edge.created_at, .updated_at = edge.updated_at },
+            .identity = .{ .table = source_table, .key = key },
             .index = mapping.index,
             .type = mapping.name,
             .source = .{ .table = source_table, .key = edge.source },
             .target = .{ .table = target_table, .key = edge.target },
-            .ownership = .field,
-            .producer = node.identity,
+            .ownership = if (field_derived) .field else .explicit,
+            .producer = if (field_derived) node.identity else null,
             .properties = try cypher.value.entityProperties(temporary, properties.items),
         };
         try result.append(a, (try (cypher.value.Value{ .relationship = &relationship }).clone(a)).relationship);

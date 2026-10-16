@@ -79,6 +79,17 @@ pub const Mutation = union(enum) {
             else => return,
         };
         try v.validatePropertyValue(.{ .map = entries });
+        const node = switch (self) {
+            .create_node => true,
+            .set_properties => |update| update.target == .node,
+            else => false,
+        };
+        if (node) for (entries) |entry| {
+            // These are native ingestion commands, never persistent node data.
+            // Interpreting SET as a side-channel graph/vector write would make
+            // its overlay disagree with the durable entity and its ownership.
+            if (entry.value != .null and (std.mem.eql(u8, entry.name, "_edges") or std.mem.eql(u8, entry.name, "_embeddings"))) return error.CypherInvalidPropertyValue;
+        };
     }
 };
 /// All returned values are allocated in the supplied execution allocator and

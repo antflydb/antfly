@@ -81,7 +81,7 @@ pub const Provider = struct {
             const entry = try plan(plans, postimage.table);
             for (postimage.writes.items) |write| try entry.writes.append(a, .{ .key = write.key, .value = write.value });
             try entry.deletes.appendSlice(a, postimage.deletes.items);
-            for (postimage.edges.items) |edge| try entry.edges.append(a, .{ .edge_id = edge.edge_id, .index_name = edge.index_name, .source = edge.source, .target = edge.target, .edge_type = edge.edge_type, .metadata_json = edge.metadata_json });
+            for (postimage.edges.items) |edge| try entry.edges.append(a, .{ .edge_id = edge.edge_id, .index_name = edge.index_name, .source = edge.source, .target = edge.target, .edge_type = edge.edge_type, .metadata_json = edge.metadata_json, .weight = edge.weight, .created_at = edge.created_at, .updated_at = edge.updated_at });
             for (postimage.removed_edges.items) |edge| try entry.removed_edges.append(a, .{ .edge_id = edge.edge_id, .index_name = edge.index_name, .source = edge.source, .target = edge.target, .edge_type = edge.edge_type });
         }
         const requests = try a.alloc(contract.TableCommitRequest, plans.len);

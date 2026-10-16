@@ -129,11 +129,9 @@ pub const Client = struct {
             self.poisoned = true;
             return error.ReadUnavailable;
         }
-        if (response.status != 200) inline for (.{ "CypherAnchorBudgetExceeded", "CypherEdgeBudgetExceeded", "CypherStateBudgetExceeded", "CypherMemoryBudgetExceeded", "CypherResponseTooLarge", "RowPolicyDenied", "RowPolicyAuthenticationRequired", "RowPolicyCatalogChanged", "CatalogGenerationChanged", "Forbidden", "Canceled", "DeadlineExceeded" }) |name| {
-            if (std.mem.eql(u8, response.body, name)) {
-                self.poisoned = true;
-                return @field(anyerror, name);
-            }
+        if (response.status != 200) if (rpc.graph_errors.get(response.body)) |err| {
+            self.poisoned = true;
+            return err;
         };
         if (response.status != 200 or !std.mem.eql(u8, response.header(metadata.catalog_route_fence_ack_header) orelse "", metadata.catalog_route_fence_ack_value)) {
             const reason = if (response.status != 200 and response.body.len <= 96) known_error: {
@@ -335,6 +333,29 @@ fn consumerTests() type {
             try std.testing.expectError(error.ConnectionResetByPeer, Client.next(client, alloc, 1));
             try std.testing.expectError(error.RetainedReadRestartRequired, Client.next(client, alloc, 1));
             try std.testing.expectEqual(@as(usize, 1), fixture.calls);
+        }
+
+        test "retained read client preserves graph owner diagnostics and retry failures" {
+            const Fixture = struct {
+                calls: usize = 0,
+                failure: anyerror,
+                fn execute(raw: *anyopaque, a: std.mem.Allocator, _: http.HttpRequest) !http.HttpResponse {
+                    const self: *@This() = @ptrCast(@alignCast(raw));
+                    self.calls += 1;
+                    return .{ .status = rpc.errorStatus(self.failure), .body = try a.dupe(u8, @errorName(self.failure)), .headers = &.{} };
+                }
+            };
+            for (rpc.graph_errors.values()) |failure| {
+                var fixture: Fixture = .{ .failure = failure };
+                const a = std.testing.allocator;
+                const client = try Client.create(a, .{ .ptr = &fixture, .clock_io = @import("antfly_runtime_abi").io_abi.Borrow.init(&std.testing.io), .vtable = &.{ .execute = Fixture.execute } }, "http://peer", "rows", .{ .metadata_group_id = 1, .catalog_revision = 1, .table_id = 2, .topology_epoch = 4, .route = .{ .group_id = 3, .range_id = 3, .identity_namespace = .{ .table_id = 2, .shard_id = 3, .range_id = 3 } } }, 5, null);
+                defer client.destroy();
+                try std.testing.expectError(failure, client.call(.{ .operation = .admit_graph, .schema_version = 5 }));
+                try std.testing.expectError(error.RetainedReadRestartRequired, client.call(.{ .operation = .admit_graph, .schema_version = 5 }));
+                try std.testing.expectEqual(@as(usize, 1), fixture.calls);
+            }
+            try std.testing.expectEqual(@as(u16, 400), rpc.errorStatus(error.CypherTypeMismatch));
+            try std.testing.expectEqual(@as(u16, 503), rpc.errorStatus(error.EnrichmentRetryInProgress));
         }
 
         test "retained read client round trips owned snapshots and exact typed pages" {

@@ -32109,7 +32109,12 @@ pub fn onlineBaseGeneratedVectorConfig(alloc: Allocator, cfg: types.IndexConfig,
         const config = try parseDenseConfig(alloc, cfg.config_json);
         defer config.deinit(alloc);
         if (config.external) return false;
-        if (generator != null) return config.embedding_names.len == 0 and config.embedding_name == null;
+        if (generator) |value| {
+            // Managed translation also names the generator's own output at
+            // index scope. That selector is redundant, not another producer.
+            const output = value.embedding_name orelse cfg.name;
+            return config.embedding_names.len == 0 and (if (config.embedding_name) |name| std.mem.eql(u8, name, output) else true);
+        }
         const names: []const []const u8 = if (config.embedding_names.len != 0) config.embedding_names else if (config.embedding_name) |name| &.{name} else return false;
         for (names) |name| {
             const found = for (producers) |producer| {
@@ -32122,7 +32127,12 @@ pub fn onlineBaseGeneratedVectorConfig(alloc: Allocator, cfg: types.IndexConfig,
     const config = try parseSparseConfig(alloc, cfg.config_json);
     defer config.deinit(alloc);
     if (config.external) return false;
-    if (generator != null) return config.embedding_names.len == 0 and config.embedding_name == null;
+    if (generator) |value| {
+        // Managed translation also names the generator's own output at
+        // index scope. That selector is redundant, not another producer.
+        const output = value.embedding_name orelse cfg.name;
+        return config.embedding_names.len == 0 and (if (config.embedding_name) |name| std.mem.eql(u8, name, output) else true);
+    }
     const names: []const []const u8 = if (config.embedding_names.len != 0) config.embedding_names else if (config.embedding_name) |name| &.{name} else return false;
     for (names) |name| {
         const found = for (producers) |producer| {
@@ -33637,6 +33647,19 @@ test "embedding input kind is explicit at the catalog boundary" {
         enrichment_types.EmbeddingInputKind.materialized_chunks,
         embeddingInputKind(&manager, .{ .source_field = @constCast("body"), .artifact_name = @constCast("materialized_chunks") }),
     );
+}
+
+test "embedding input kind generated selectors bind only their own output" {
+    const a = std.testing.allocator;
+    for ([_]types.IndexKind{ .dense_vector, .sparse_vector }) |kind| {
+        for ([_]?[]const u8{ null, "own", "other" }) |selector| {
+            const json = try std.json.Stringify.valueAlloc(a, .{ .field = "body", .dims = 2, .embedding_name = selector, .generator = .{ .kind = if (kind == .dense_vector) "dense_embedding" else "sparse_embedding", .source_field = "body", .embedding_name = "own" } }, .{ .emit_null_optional_fields = false });
+            defer a.free(json);
+            try std.testing.expectEqual(selector == null or std.mem.eql(u8, selector.?, "own"), try onlineBaseGeneratedVectorConfig(a, .{ .name = "index", .kind = kind, .config_json = json }, &.{}));
+        }
+        const foreign = "{\"field\":\"body\",\"dims\":2,\"sources\":[{\"artifact\":\"other\"}],\"generator\":{\"source_field\":\"body\",\"embedding_name\":\"own\"}}";
+        try std.testing.expect(!try onlineBaseGeneratedVectorConfig(a, .{ .name = "index", .kind = kind, .config_json = foreign }, &.{}));
+    }
 }
 
 fn generatorHasChunking(generator: GeneratorConfig) bool {

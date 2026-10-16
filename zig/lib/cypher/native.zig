@@ -210,10 +210,10 @@ pub fn Adapter(comptime DB: type, comptime GraphIndex: type, comptime EdgeScanCu
             defer page.deinit(a);
             var result: std.ArrayList(*const v.Relationship) = .empty;
             for (page.edges) |edge| {
-                const metadata = if (edge.metadata.len == 0) v.Value{ .map = &.{} } else try v.Value.fromJson(a, try std.json.parseFromSliceLeaky(std.json.Value, a, edge.metadata, .{}));
-                if (metadata != .map) return error.CypherInvalidRelationshipMetadata;
-                const actual_source = metadata.property("source_table");
-                const actual_target = metadata.property("target_table");
+                const metadata = if (edge.metadata.len == 0) std.json.Value{ .object = .empty } else try std.json.parseFromSliceLeaky(std.json.Value, a, edge.metadata, .{ .parse_numbers = false });
+                if (metadata != .object) return error.CypherInvalidRelationshipMetadata;
+                const actual_source = metadata.object.get("source_table") orelse .null;
+                const actual_target = metadata.object.get("target_table") orelse .null;
                 if (actual_source != .null and (actual_source != .string or !self.matchesStorageTable(source_table, actual_source.string))) continue;
                 if (actual_target != .null and (actual_target != .string or !self.matchesStorageTable(target_table, actual_target.string))) continue;
                 const source: v.Identity = .{ .table = source_table, .key = edge.source };
@@ -224,24 +224,23 @@ pub fn Adapter(comptime DB: type, comptime GraphIndex: type, comptime EdgeScanCu
                 if (position.incoming and outgoing_possible and source.eql(target)) continue;
                 const relationship = try a.create(v.Relationship);
                 var properties: std.ArrayList(v.Entry) = .empty;
-                const raw_metadata = if (edge.metadata.len == 0) std.json.Value{ .null = {} } else try std.json.parseFromSliceLeaky(std.json.Value, a, edge.metadata, .{});
-                const marker = if (raw_metadata == .object) raw_metadata.object.get("antfly_cypher") else null;
-                if (marker) |payload| {
-                    if (payload != .object) return error.CypherInvalidRelationshipMetadata;
-                    const version = payload.object.get("version") orelse return error.CypherInvalidRelationshipMetadata;
-                    if (version != .integer or version.integer != 1) return error.CypherInvalidRelationshipMetadata;
-                    const decoded = try root.wire.parameter(a, payload.object.get("properties") orelse return error.CypherInvalidRelationshipMetadata);
-                    if (decoded != .map) return error.CypherInvalidRelationshipMetadata;
-                    try properties.appendSlice(a, decoded.map);
+                const encoded_properties = try root.wire.relationshipProperties(a, metadata);
+                if (encoded_properties) |decoded| {
+                    try properties.appendSlice(a, decoded);
                 } else {
-                    for (metadata.map) |entry| if (!std.mem.eql(u8, entry.name, "weight") and !std.mem.eql(u8, entry.name, "source_table") and !std.mem.eql(u8, entry.name, "target_table")) try properties.append(a, entry);
+                    var entries = metadata.object.iterator();
+                    while (entries.next()) |entry| {
+                        const name = entry.key_ptr.*;
+                        if (!std.mem.eql(u8, name, "weight") and !std.mem.eql(u8, name, "source_table") and !std.mem.eql(u8, name, "target_table"))
+                            try properties.append(a, .{ .name = try a.dupe(u8, name), .value = try v.Value.fromJson(a, entry.value_ptr.*) });
+                    }
                     try properties.append(a, .{ .name = "weight", .value = .{ .number = edge.weight } });
                 }
                 const field_derived = if (comptime @hasField(@TypeOf(edge), "field_derived")) edge.field_derived else edge.edge_id.len == 0 and if (comptime @hasDecl(DB, "cypherFieldDerivedEdgeType")) db.cypherFieldDerivedEdgeType(mapping.index, mapping.stored_type) else false;
                 const artifact_derived = if (comptime @hasField(@TypeOf(edge), "artifact_derived")) edge.artifact_derived else false;
                 const producer = if (edge.owner_document.len != 0) edge.owner_document else if (field_derived or artifact_derived) edge.source else "";
-                const key = if (marker != null and producer.len == 0 and std.mem.startsWith(u8, edge.edge_id, "cypher:")) try a.dupe(u8, edge.edge_id) else if (field_derived) try std.json.Stringify.valueAlloc(a, .{ edge.source, edge.target, edge.edge_type, edge.edge_id, producer, "field" }, .{}) else try std.json.Stringify.valueAlloc(a, .{ edge.source, edge.target, edge.edge_type, edge.edge_id, producer }, .{});
-                relationship.* = .{ .identity = .{ .table = try a.dupe(u8, source_table), .key = key }, .index = mapping.index, .type = mapping.name, .source = .{ .table = source_table, .key = try a.dupe(u8, source.key) }, .target = .{ .table = target_table, .key = try a.dupe(u8, target.key) }, .properties = try v.entityProperties(a, try properties.toOwnedSlice(a)), .ownership = if (artifact_derived) .artifact else if (field_derived) .field else if (producer.len == 0) .explicit else .document, .producer = if (producer.len == 0) null else .{ .table = source_table, .key = try a.dupe(u8, producer) } };
+                const key = if (field_derived) try std.json.Stringify.valueAlloc(a, .{ edge.source, edge.target, edge.edge_type, edge.edge_id, producer, "field" }, .{}) else try std.json.Stringify.valueAlloc(a, .{ edge.source, edge.target, edge.edge_type, edge.edge_id, producer }, .{});
+                relationship.* = .{ .native = .{ .weight = edge.weight, .created_at = if (comptime @hasField(@TypeOf(edge), "created_at")) edge.created_at else 0, .updated_at = if (comptime @hasField(@TypeOf(edge), "updated_at")) edge.updated_at else 0 }, .identity = .{ .table = try a.dupe(u8, source_table), .key = key }, .index = mapping.index, .type = mapping.name, .source = .{ .table = source_table, .key = try a.dupe(u8, source.key) }, .target = .{ .table = target_table, .key = try a.dupe(u8, target.key) }, .properties = try v.entityProperties(a, try properties.toOwnedSlice(a)), .ownership = if (artifact_derived) .artifact else if (field_derived) .field else if (producer.len == 0) .explicit else .document, .producer = if (producer.len == 0) null else .{ .table = source_table, .key = try a.dupe(u8, producer) } };
                 if (try self.authority.project_relationship(self.authority.ptr, a, relationship)) |authorized| try result.append(a, authorized);
             }
             const next: ?[]const u8 = if (page.next_cursor) |cursor| try std.json.Stringify.valueAlloc(a, Resume{ .incoming = position.incoming, .cursor = cursor }, .{}) else if (!position.incoming and incoming_possible) blk: {

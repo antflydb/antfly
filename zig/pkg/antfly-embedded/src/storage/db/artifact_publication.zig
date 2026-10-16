@@ -1321,10 +1321,11 @@ test "ordered artifact inventory publication projects every shared consumer and 
         .{ .name = "first", .kind = .dense_vector, .config_json = "{\"field\":\"body\",\"dims\":2,\"embedding_name\":\"model\"}", .coverage_generation = 7 },
         .{ .name = "second", .kind = .dense_vector, .config_json = "{\"field\":\"body\",\"dims\":2,\"embedding_name\":\"model\"}", .coverage_generation = 9 },
         .{ .name = "other", .kind = .dense_vector, .config_json = "{\"field\":\"body\",\"dims\":2,\"embedding_name\":\"other-model\"}", .coverage_generation = 11 },
+        .{ .name = "legacy", .kind = .dense_vector, .config_json = "{\"field\":\"body\",\"dims\":2,\"embedding_name\":\"legacy\",\"generator\":{\"kind\":\"dense_embedding\",\"source_field\":\"body\",\"embedding_name\":\"legacy\"}}", .coverage_generation = 13 },
     };
     var catalog: std.ArrayList(u8) = .empty;
     defer catalog.deinit(alloc);
-    try catalog.appendSlice(alloc, "AIDX\x02\x00\x00\x00\x03\x00\x00\x00");
+    try catalog.appendSlice(alloc, "AIDX\x02\x00\x00\x00\x04\x00\x00\x00");
     for (configs) |config| {
         var length: [4]u8 = undefined;
         std.mem.writeInt(u32, &length, @intCast(config.name.len), .little);
@@ -1358,6 +1359,17 @@ test "ordered artifact inventory publication projects every shared consumer and 
     command.producer_artifact_name = "other-model";
     command.publication_digest = command.digest();
     try std.testing.expectError(error.InvalidBatchRequest, prepareBaseVectors(alloc, command, catalogs));
+    const legacy_key = try keys.embeddingArtifactKeyForDocumentAlloc(alloc, "doc", "legacy");
+    defer alloc.free(legacy_key);
+    command.producer_name = "legacy";
+    command.producer_generation = 13;
+    command.producer_artifact_name = "legacy";
+    command.mutations = &.{.{ .family = .base_vector, .key = legacy_key, .value = payload, .source_index = 0 }};
+    command.publication_digest = command.digest();
+    var legacy = try prepareBaseVectors(alloc, command, catalogs);
+    defer legacy.deinit();
+    try std.testing.expectEqual(@as(usize, 1), legacy.batch.dense_embeddings.len);
+    try std.testing.expectEqualStrings("legacy", legacy.batch.dense_embeddings[0].index_name);
 }
 
 test "ordered artifact inventory final materialization observes activation in its write snapshot" {

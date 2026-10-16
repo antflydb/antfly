@@ -2035,7 +2035,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     });
     b.step("antfly-api-catalog-authority-test", "Run configured remote catalog publication authority regression")
         .dependOn(&addFilteredTestRunArtifactWithRuntimeFilters(b, catalog_authority_tests, &.{"unconfigured remote catalog authority skips background work without borrowing internal credentials"}).step);
-    const cypher_transport_filters = &.{ "api http client preserves group query capability errors", "typed internal query workers preserve identity generation validation", "row policy publication Raft codec carries immutable owner-fetched bytes privately", "relational row query errors preserve exact remote reasons and HTTP classes", "relational row query remote transaction prepare preserves scalar validation failures", "distributed txn internal operations preserve every semantic participant rejection" };
+    const cypher_transport_filters = &.{ "api http client preserves group query capability errors", "row policy publication Raft codec carries immutable owner-fetched bytes privately", "relational row query errors preserve exact remote reasons and HTTP classes", "relational row query remote transaction prepare preserves scalar validation failures", "distributed txn internal operations preserve every semantic participant rejection", "distributed shortest path" };
     const cypher_transport_tests = b.addTest(.{
         .root_module = api_http_runtime_test_mod,
         .filters = cypher_transport_filters,
@@ -6048,6 +6048,15 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     });
     const relational_index_lifecycle_step = b.step("antfly-relational-index-lifecycle-test", "Run relational index dependency and retirement admission tests");
     relational_index_lifecycle_step.dependOn(&addFilteredTestRunArtifact(b, relational_index_lifecycle_tests).step);
+
+    const generated_vector_contract_filters = &.{ "ordered artifact inventory publication projects every shared consumer", "embedding input kind generated selectors" };
+    const generated_vector_contract_tests = b.addTest(.{
+        .root_module = db_test_mod,
+        .filters = generated_vector_contract_filters,
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("antfly-generated-vector-contract-test", "Verify generated vector publication selectors and producer isolation")
+        .dependOn(&addFilteredTestRunArtifactWithRuntimeFilters(b, generated_vector_contract_tests, generated_vector_contract_filters).step);
 
     const graph_runtime_filters = [_][]const u8{
         "graph endpoint cleanup bulk retirement mask releases ownership on decoding failure",

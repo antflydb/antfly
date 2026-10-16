@@ -190,9 +190,12 @@ pub const Overlay = struct {
         // storage. Deduplicate lookups independently of contribution fan-in.
         var producers: std.HashMapUnmanaged(v.Identity, bool, v.Identity.Context, std.hash_map.default_max_load_percentage) = .empty;
         defer producers.deinit(a);
-        for (self.nodes.items) |node| try producers.put(a, node.value.identity, true);
         for (self.relationships.items) |*relationship| {
             const identity = (try relationship.value.producingDocument(a)) orelse continue;
+            // Admitted vertices already have a deduplicated identity index.
+            // Only off-graph producer lookups need a second map; preloading
+            // all vertices wastes retained memory even on edgeless graphs.
+            if (self.node_positions.contains(identity)) continue;
             const seen = try producers.getOrPut(a, identity);
             if (seen.found_existing) {
                 if (!seen.value_ptr.*) relationship.deleted = true;

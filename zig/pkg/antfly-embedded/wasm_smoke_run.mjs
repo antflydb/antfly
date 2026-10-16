@@ -100,6 +100,10 @@ api.graphCatalog({ action: "put", name: "knowledge", definition: {
     labels: [{ name: "Document", table: "docs" }],
     relationships: [{ name: "KNOWS", index: "links", source_label: "Document", target_label: "Document", stored_type: "knows" }],
 } });
+for (const control of ["_edges", "_embeddings"]) {
+    try { api.cypher("knowledge", {query: `CREATE (:Document {${control}:{}})`}); throw new Error("WASM accepted a native ingestion control as a node property"); }
+    catch (error) { if (error.diagnostic?.code !== "CypherInvalidPropertyValue") throw error; }
+}
 const graphWrite = { query: "MATCH (a:Document {id:'a'}),(b:Document {id:'b'}) CREATE (a)-[r:KNOWS {since:2020}]->(b) RETURN r.since", write_request_id: "00112233445566778899aabbccddeeff" };
 const committed = api.cypher("knowledge", graphWrite);
 if (committed.commit.status !== "committed") throw new Error("WASM graph write did not commit");

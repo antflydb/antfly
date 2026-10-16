@@ -18681,6 +18681,20 @@ pub const DB = struct {
                 if (monotonicTimeNs() >= deadline) return error.Timeout;
                 if (!try self.drainStandaloneGraphEndpointCleanupWithOptions(.{}, 1)) break;
             }
+            // Share the producer worker's flight guard without changing its
+            // cadence/backoff. Read preflight only updates local readiness;
+            // it neither overlaps nor postpones authoritative producer work.
+            if (!self.artifact_producer_scheduler.running.swap(true, .acq_rel)) {
+                defer self.artifact_producer_scheduler.running.store(false, .release);
+                var scratch = std.heap.ArenaAllocator.init(@import("antfly_platform").allocator.reclaimingScratch(alloc));
+                defer scratch.deinit();
+                var plan = try self.core.index_manager.acquireWritePlanSnapshot();
+                defer plan.release();
+                _ = self.advanceArtifactProducerReadiness(scratch.allocator(), plan.plan()) catch |err| switch (err) {
+                    error.ArtifactCatalogDrift, error.EnrichmentSourceChanged => return error.CypherSnapshotNotReady,
+                    else => return err,
+                };
+            }
             try self.runMaintenanceUntilWithCancellation(self.currentMaintenanceTargetSequence(), .{}, opts.cancellation orelse .none, deadline);
             try self.flushAppliedSequencesForIdle();
             return null;
@@ -26020,6 +26034,7 @@ pub const DB = struct {
         var txn = try self.core.store.beginWriteTxn();
         errdefer txn.abort();
         try @import("artifact_publication.zig").stageRejection(&txn, command, entry.index, reason);
+        std.log.debug("artifact publication rejected mode={s} producer={s} index={d} reason={s}", .{ @tagName(command.mode), command.producer_name, entry.index, @tagName(reason) });
         // Baseline readiness is temporary: keep the immutable upload so the
         // same logical publication can finalize after reconciliation. A
         // terminal upload record here would strand its retry forever.
@@ -26160,6 +26175,7 @@ pub const DB = struct {
                 }
                 if (self.core.index_manager.resource_manager) |manager| reservation = try manager.reserveWithoutReclaim(.shard_transition_working_set, working_bytes);
                 prepared = publication.prepareEffects(self.alloc, command, anticipated.?.value.command.catalogs) catch |err| blk: {
+                    std.log.debug("artifact publication preparation rejected producer={s} error={s}", .{ command.producer_name, @errorName(err) });
                     preparation_error = err;
                     break :blk null;
                 };
@@ -27728,6 +27744,17 @@ pub const DB = struct {
             initialized_nodes += 1;
         }
 
+        const tables = node.path_tables orelse &.{};
+        if (tables.len != 0 and tables.len != node_path.len) return error.InvalidQueryRequest;
+        const node_tables = try alloc.alloc(?[]const u8, tables.len);
+        @memset(node_tables, null);
+        errdefer {
+            for (node_tables) |table| if (table) |name| alloc.free(name);
+            alloc.free(node_tables);
+        }
+        for (tables, node_tables) |table, *copy| if (table) |name| {
+            copy.* = try alloc.dupe(u8, name);
+        };
         const edges = try alloc.alloc(paths_mod.PathEdge, edge_path.len);
         var initialized_edges: usize = 0;
         errdefer {
@@ -27749,6 +27776,7 @@ pub const DB = struct {
 
         return .{
             .nodes = nodes,
+            .node_tables = node_tables,
             .edges = edges,
             .total_weight = total_weight,
             .length = @intCast(edges.len),
@@ -32128,6 +32156,17 @@ pub const DB = struct {
         return true;
     }
 
+    fn advanceArtifactProducerReadiness(self: *DB, scratch: Allocator, plan: *const index_manager_mod.IndexManager.WritePlanSnapshot) !bool {
+        const revision = self.core.store.query_generation_revision.load(.acquire);
+        const progress = try @import("artifact_producer_readiness.zig").advance(scratch, self.core.store, self.root_incarnation, plan);
+        // This is receiver-local completion bookkeeping, not authoritative
+        // producer execution. It is safe before a retained read fence, also
+        // when optional producer workers are unavailable on this replica.
+        if (progress or self.core.store.query_generation_revision.load(.acquire) != revision)
+            notifyQueryVisibilityHook(self.async_context, .status);
+        return progress;
+    }
+
     fn advanceArtifactProducerWorkPageWithAllocator(self: *DB, scratch: Allocator) !bool {
         const has_ordered_authority = blk: {
             var read = try self.core.store.beginReadTxn();
@@ -32143,13 +32182,7 @@ pub const DB = struct {
         }
         var plan = try self.core.index_manager.acquireWritePlanSnapshot();
         defer plan.release();
-        const readiness_revision = self.core.store.query_generation_revision.load(.acquire);
-        const readiness_progress = try @import("artifact_producer_readiness.zig").advance(scratch, self.core.store, self.root_incarnation, plan.plan());
-        // Receiver-local completion changes do not append replay records.
-        // Publish their status after commit, including an empty baseline that
-        // completes without leaving a work page or advancing a replay target.
-        if (readiness_progress or self.core.store.query_generation_revision.load(.acquire) != readiness_revision)
-            notifyQueryVisibilityHook(self.async_context, .status);
+        const readiness_progress = try self.advanceArtifactProducerReadiness(scratch, plan.plan());
         const obligations = @import("artifact_producer_obligations.zig");
         var page = blk: {
             var read = try self.core.store.beginReadTxnWithBlockCacheAdmission(.transient);
@@ -131508,8 +131541,10 @@ test "db algebraic path conversion preserves provenance under allocation failure
     };
     const Case = struct {
         fn convert(alloc: Allocator, item: graph_query_mod.PathEdgeInfo) !void {
-            const path = (try DB.graphResultNodePathAlloc(alloc, .{ .key = "b", .depth = 1, .distance = 1, .path = &.{ "a", "b" }, .path_edges = &.{item} })).?;
+            const path = (try DB.graphResultNodePathAlloc(alloc, .{ .key = "b", .table = "entities", .depth = 1, .distance = 1, .path = &.{ "a", "b" }, .path_tables = &.{ null, "entities" }, .path_edges = &.{item} })).?;
             defer paths_mod.freePath(alloc, path);
+            try std.testing.expect(path.node_tables[0] == null);
+            try std.testing.expectEqualStrings("entities", path.node_tables[1].?);
             try std.testing.expectEqualStrings(item.metadata, path.edges[0].metadata);
             try std.testing.expectEqualStrings(item.edge_id, path.edges[0].edge_id);
             try std.testing.expectEqualStrings(item.owner_document, path.edges[0].owner_document);

@@ -225,7 +225,7 @@ pub const Owner = struct {
                 const mapping = self.graph.relationship(request.relationship) orelse return error.UndefinedGraphRelationship;
                 if (!self.permitsTable(self.graph.label(mapping.source_label).?.table)) return error.Forbidden;
                 const page = try self.backend.vtable.expand(self.backend.ptr, scratch, mapping, request.identity orelse return error.InvalidCypherWireValue, request.direction, request.after, request.limit);
-                for (page.items) |relationship| try values.append(scratch, .{ .value = .{ .relationship = relationship } });
+                for (page.items) |relationship| try values.append(scratch, .{ .value = .{ .relationship = relationship }, .include_native = true });
                 next = page.next;
                 examined = page.examined;
             },

@@ -58,7 +58,7 @@ pub const Writer = struct {
             const writes = try a.alloc(types.TransactionWrite, plan.writes.items.len);
             for (plan.writes.items, writes) |write, *out| out.* = .{ .key = write.key, .value = write.value };
             const edges = try a.alloc(types.GraphEdgeWrite, plan.edges.items.len);
-            for (plan.edges.items, edges) |edge, *out| out.* = .{ .edge_id = edge.edge_id, .index_name = edge.index_name, .source = edge.source, .target = edge.target, .edge_type = edge.edge_type, .metadata_json = edge.metadata_json };
+            for (plan.edges.items, edges) |edge, *out| out.* = .{ .edge_id = edge.edge_id, .index_name = edge.index_name, .source = edge.source, .target = edge.target, .edge_type = edge.edge_type, .metadata_json = edge.metadata_json, .weight = edge.weight, .created_at = edge.created_at, .updated_at = edge.updated_at };
             const removed = try a.alloc(types.GraphEdgeDelete, plan.removed_edges.items.len);
             for (plan.removed_edges.items, removed) |edge, *out| out.* = .{ .edge_id = edge.edge_id, .index_name = edge.index_name, .source = edge.source, .target = edge.target, .edge_type = edge.edge_type };
             request.* = .{ .normalized_graph_rows = true, .table_name = plan.table, .schema_version = if (guard.schema_version == 0) null else guard.schema_version, .writes = writes, .deletes = plan.deletes.items, .graph_writes = edges, .graph_deletes = removed };

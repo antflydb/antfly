@@ -1141,3 +1141,29 @@ test "shared retained entities resolve postimages with linear mutation work" {
     try std.testing.expectEqual(@as(i64, 640000), result.rows[0][1].integer);
     try std.testing.expectEqual(@as(i64, 640000), result.rows[0][2].integer);
 }
+
+test "Cypher node properties cannot invoke native ingestion controls" {
+    for ([_][]const u8{
+        "CREATE (:Person {_edges:{links:{knows:[{target:'b'}]}}})",
+        "CREATE (:Person {_embeddings:{dense:[1,0]}})",
+        "MATCH (n:Person) SET n._edges={links:{knows:[]}}",
+        "MATCH (n:Person) SET n += {_embeddings:{dense:[1,0]}}",
+        "MERGE (:Person {name:'other',_edges:{}})",
+        "CALL { MATCH (n:Person) SET n={_embeddings:{}} }",
+    }) |query| {
+        var fixture = Fixture.init();
+        defer fixture.arena.deinit();
+        var seeded = try fixture.run("CREATE (:Person {name:'kept'})");
+        seeded.deinit();
+        try std.testing.expectError(error.CypherInvalidPropertyValue, fixture.run(query));
+        var result = try fixture.run("MATCH (n:Person) RETURN n.name");
+        defer result.deinit();
+        try std.testing.expectEqual(@as(usize, 1), result.rows.len);
+        try std.testing.expectEqualStrings("kept", result.rows[0][0].string);
+    }
+    var fixture = Fixture.init();
+    defer fixture.arena.deinit();
+    var result = try fixture.run("CREATE (a:Person {payload:{_edges:{kept:true}}})-[r:KNOWS {_embeddings:{kept:true}}]->(:Person) RETURN a.payload._edges.kept,r._embeddings.kept");
+    defer result.deinit();
+    try std.testing.expect(result.rows[0][0].boolean and result.rows[0][1].boolean);
+}

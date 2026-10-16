@@ -186,12 +186,14 @@ ROLLBACK;
         # Explicit graph effects staged through the transaction API participate
         # in the same SQL graph cut as document postimages.
         edge = {
-            "edge_id": "explicit:" + uuid.uuid4().hex,
+            "edge_id": "cypher:" + uuid.uuid4().hex,
             "index_name": "links",
             "source": keys["b"],
             "target": keys["c"],
             "edge_type": "cites",
-            "metadata_json": json.dumps({"note": "staged"}),
+            "metadata_json": json.dumps(
+                {"note": "staged", "antfly_cypher": "customer-value"}
+            ),
         }
         session_id = sql("BEGIN")["session_id"]
         try:
@@ -214,8 +216,23 @@ ROLLBACK;
                 session_id,
             )
             assert count["rows"] == [["2"]], count
+            identity_query = f"SELECT g.edge FROM GRAPH_TABLE({graph} MATCH ()-[r IS CITES]->() WHERE r.note='staged' COLUMNS(r AS edge)) g"
+            staged_edges = sql(identity_query, session_id)["rows"]
+            assert len(staged_edges) == 1, staged_edges
+            staged_edge = staged_edges[0][0]
+            if isinstance(staged_edge, str):
+                staged_edge = json.loads(staged_edge)
+            assert (
+                staged_edge["value"]["properties"]["value"]["antfly_cypher"]["value"]
+                == "customer-value"
+            ), staged_edge
             sql("COMMIT", session_id)
             session_id = None
+            committed_edges = sql(identity_query)["rows"]
+            committed_edge = committed_edges[0][0]
+            if isinstance(committed_edge, str):
+                committed_edge = json.loads(committed_edge)
+            assert committed_edge == staged_edge, (committed_edge, staged_edge)
         finally:
             if session_id is not None:
                 sql("ROLLBACK", session_id)

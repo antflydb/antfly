@@ -3420,12 +3420,7 @@ pub const AntflyApiHandler = struct {
             .group_id = route.route.group_id,
             .topology_revision = route.topology_epoch,
             .schema_version = parsed.value.schema_version,
-        }, params.table_name, parsed.value) catch |err| return textResponse(ctx, switch (err) {
-            error.InvalidRetainedReadLease, error.InvalidRetainedReadToken, error.InvalidRetainedReadQuery, error.InvalidRetainedReadPageLimit => 400,
-            error.RetainedReadAdmissionExceeded, error.RetainedReadBusy => 429,
-            error.RetainedReadNotFound, error.RetainedReadExpired, error.RetainedReadScopeChanged, error.RetainedReadSequenceMismatch, error.SqlRangeTrackingRequired => 409,
-            else => 503,
-        }, @errorName(err));
+        }, params.table_name, parsed.value) catch |err| return textResponse(ctx, rpc.errorStatus(err), @errorName(err));
         defer ctx.allocator.free(encoded);
         try ctx.setHeader("content-type", "application/json");
         try ctx.setHeader(metadata_api.catalog_route_fence_ack_header, metadata_api.catalog_route_fence_ack_value);

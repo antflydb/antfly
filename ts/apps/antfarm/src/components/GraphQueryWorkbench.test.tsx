@@ -316,7 +316,11 @@ describe("graph query workbench", () => {
     mocks.client.graphs.execute
       .mockResolvedValueOnce({ ...response(), read_only: false })
       .mockRejectedValueOnce(
-        new GraphExecutionError(403, { code: "Forbidden", message: "Write permission denied" })
+        new GraphExecutionError(403, {
+          code: "Forbidden",
+          message: "Write permission denied",
+          write_outcome: "not_started",
+        })
       );
     render(show());
     fireEvent.change(screen.getByLabelText("Cypher statement"), {
@@ -345,6 +349,64 @@ describe("graph query workbench", () => {
     fireEvent.click(screen.getByRole("button", { name: "Run" }));
     await screen.findByText("Owners busy");
     expect((screen.getByRole("button", { name: "Run" }) as HTMLButtonElement).disabled).toBe(false);
+  });
+
+  it.each([
+    "Forbidden",
+    "RowPolicyDenied",
+    "RowPolicyAuthenticationRequired",
+    "CypherTransactionConflict",
+  ])("retains an unknown write outcome despite a %s diagnostic", async (code) => {
+    mocks.client.graphs.execute
+      .mockResolvedValueOnce({ ...response(), read_only: false })
+      .mockRejectedValueOnce(
+        new GraphExecutionError(409, {
+          code,
+          message: "Decision unresolved",
+          write_outcome: "unknown",
+        })
+      );
+    render(show());
+    fireEvent.change(screen.getByLabelText("Cypher statement"), {
+      target: { value: "CREATE (:Document)" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Run" }));
+    await screen.findByText(/Write result delivery stopped/);
+    expect((screen.getByRole("button", { name: "Run" }) as HTMLButtonElement).disabled).toBe(true);
+    const stored = JSON.parse(
+      localStorage.getItem(`antfly:graph-write:${window.location.origin}`) ?? "{}"
+    );
+    expect(stored.disposition).toBe("outcome_unknown");
+    expect(stored.id).toBe(mocks.client.graphs.execute.mock.calls[1][1].write_request_id);
+    expect(mocks.client.graphs.execute).toHaveBeenCalledTimes(2);
+  });
+
+  it("ignores an old receipt inspection failure after a new write starts", async () => {
+    localStorage.setItem(
+      `antfly:graph-write:${window.location.origin}`,
+      JSON.stringify({ id: "a".repeat(32), graph: "knowledge", disposition: "committed" })
+    );
+    let rejectInspection!: (error: Error) => void;
+    mocks.client.graphs.writeStatus.mockImplementationOnce(
+      () =>
+        new Promise((_resolve, reject) => {
+          rejectInspection = reject;
+        })
+    );
+    mocks.client.graphs.execute
+      .mockResolvedValueOnce({ ...response(), read_only: false })
+      .mockRejectedValueOnce(new Error("Connection closed"));
+    render(show());
+    fireEvent.click(screen.getByRole("button", { name: "Inspect transaction" }));
+    fireEvent.change(screen.getByLabelText("Cypher statement"), {
+      target: { value: "CREATE (:Document)" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Run" }));
+    await screen.findByText(/Write result delivery stopped/);
+    await act(async () => rejectInspection(new Error("Old receipt unavailable")));
+    expect(screen.getByText(/Write result delivery stopped/)).toBeTruthy();
+    expect(screen.queryByText(/receipt is not available yet/)).toBeNull();
+    expect(mocks.client.graphs.execute).toHaveBeenCalledTimes(2);
   });
 
   it("retains a committed outcome when result encoding fails", async () => {

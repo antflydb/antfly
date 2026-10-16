@@ -27,6 +27,46 @@ const time = @import("antfly_platform").time;
 pub const max_request_bytes = 4 << 20;
 pub const max_response_bytes = 32 << 20;
 pub const max_lease_ms: u32 = 30_000;
+/// Stable graph-owner failures cross retained transport without becoming a
+/// cursor restart. Both ingress and the client consume this one vocabulary.
+pub const graph_errors = std.StaticStringMap(anyerror).initComptime(.{
+    .{ "CypherAnchorBudgetExceeded", error.CypherAnchorBudgetExceeded },
+    .{ "CypherEdgeBudgetExceeded", error.CypherEdgeBudgetExceeded },
+    .{ "CypherStateBudgetExceeded", error.CypherStateBudgetExceeded },
+    .{ "CypherMemoryBudgetExceeded", error.CypherMemoryBudgetExceeded },
+    .{ "CypherResponseTooLarge", error.CypherResponseTooLarge },
+    .{ "CypherTypeMismatch", error.CypherTypeMismatch },
+    .{ "CypherInvalidPropertyValue", error.CypherInvalidPropertyValue },
+    .{ "CypherNumericOverflow", error.CypherNumericOverflow },
+    .{ "CypherValueDepthExceeded", error.CypherValueDepthExceeded },
+    .{ "CypherLabelPredicateMismatch", error.CypherLabelPredicateMismatch },
+    .{ "CypherInvalidDocument", error.CypherInvalidDocument },
+    .{ "CypherInvalidRelationshipMetadata", error.CypherInvalidRelationshipMetadata },
+    .{ "CypherRowPolicyUnsupported", error.CypherRowPolicyUnsupported },
+    .{ "CypherSearchUnavailable", error.CypherSearchUnavailable },
+    .{ "CypherSnapshotRequired", error.CypherSnapshotRequired },
+    .{ "CypherSnapshotNotReady", error.CypherSnapshotNotReady },
+    .{ "EnrichmentRetryInProgress", error.EnrichmentRetryInProgress },
+    .{ "RowPolicyDenied", error.RowPolicyDenied },
+    .{ "RowPolicyAuthenticationRequired", error.RowPolicyAuthenticationRequired },
+    .{ "RowPolicyCatalogChanged", error.RowPolicyCatalogChanged },
+    .{ "CatalogGenerationChanged", error.CatalogGenerationChanged },
+    .{ "SchemaVersionChanged", error.SchemaVersionChanged },
+    .{ "Forbidden", error.Forbidden },
+    .{ "Canceled", error.Canceled },
+    .{ "DeadlineExceeded", error.DeadlineExceeded },
+});
+
+pub fn errorStatus(err: anyerror) u16 {
+    if (graph_errors.has(@errorName(err))) return @import("graph_execution.zig").httpStatus(err);
+    return switch (err) {
+        error.InvalidRetainedReadLease, error.InvalidRetainedReadToken, error.InvalidRetainedReadQuery, error.InvalidRetainedReadPageLimit => 400,
+        error.RetainedReadAdmissionExceeded, error.RetainedReadBusy => 429,
+        error.RetainedReadNotFound, error.RetainedReadExpired, error.RetainedReadScopeChanged, error.RetainedReadSequenceMismatch, error.SqlRangeTrackingRequired => 409,
+        else => 503,
+    };
+}
+
 pub const Request = struct {
     operation: enum { admit, capture, validate, snapshot, open, open_snapshot, next, normalize, range_proofs, close, cancel, graph_snapshot, graph_invoke, admit_graph, graph_open },
     schema_version: u32,

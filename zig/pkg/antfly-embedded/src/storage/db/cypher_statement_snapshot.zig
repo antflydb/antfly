@@ -258,7 +258,7 @@ pub fn Snapshot(comptime DB: type) type {
                 }
                 const derived = try self.db.cypherDocumentRelationships(scratch.allocator(), selected, &projected);
                 const relationships = try scratch.allocator().alloc(cypher.wire.Value, derived.len);
-                for (derived, relationships) |edge, *out| out.* = .{ .value = .{ .relationship = edge } };
+                for (derived, relationships) |edge, *out| out.* = .{ .value = .{ .relationship = edge }, .include_native = true };
                 try checkpoint(ptr);
                 return std.json.Stringify.valueAlloc(a, .{ .work = meter.units, .values = &.{cypher.wire.Value{ .value = .{ .node = &projected } }}, .relationships = relationships }, .{});
             }

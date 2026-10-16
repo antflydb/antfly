@@ -142,31 +142,25 @@ pub const View = struct {
                 const actual_target = metadata.property("target_table");
                 if (actual_source != .null and (actual_source != .string or !std.mem.eql(u8, actual_source.string, source.table))) continue;
                 if (actual_target != .null and (actual_target != .string or !std.mem.eql(u8, actual_target.string, target.table))) continue;
-                const marker = raw.object.get("antfly_cypher");
                 var properties: std.ArrayList(cypher.value.Entry) = .empty;
-                if (marker) |payload| {
-                    if (payload != .object) return error.CypherInvalidRelationshipMetadata;
-                    const version = payload.object.get("version") orelse return error.CypherInvalidRelationshipMetadata;
-                    if (version != .integer or version.integer != 1) return error.CypherInvalidRelationshipMetadata;
-                    const decoded = try cypher.wire.parameter(a, payload.object.get("properties") orelse return error.CypherInvalidRelationshipMetadata);
-                    if (decoded != .map) return error.CypherInvalidRelationshipMetadata;
-                    try properties.appendSlice(a, decoded.map);
+                if (try cypher.wire.relationshipProperties(a, raw)) |decoded| {
+                    try properties.appendSlice(a, decoded);
                 } else {
                     for (metadata.map) |entry| if (!std.mem.eql(u8, entry.name, "weight") and !std.mem.eql(u8, entry.name, "source_table") and !std.mem.eql(u8, entry.name, "target_table")) try properties.append(a, entry);
                     try properties.append(a, .{ .name = "weight", .value = .{ .number = edge.weight } });
                 }
-                const key = if (marker != null and producer(edge).len == 0 and std.mem.startsWith(u8, edge.edge_id, "cypher:")) edge.edge_id else try std.json.Stringify.valueAlloc(a, .{ edge.source, edge.target, edge.edge_type, edge.edge_id, producer(edge) }, .{});
+                const key = try std.json.Stringify.valueAlloc(a, .{ edge.source, edge.target, edge.edge_type, edge.edge_id, producer(edge) }, .{});
                 if (self.inner.relationship_positions.get(.{ .identity = .{ .table = effects.table, .key = key }, .index = mapping.index })) |position| {
                     const relationship = &self.inner.relationships.items[position];
                     const field_derived = relationship.value.ownership == .field;
-                    relationship.value.* = .{ .identity = .{ .table = effects.table, .key = key }, .index = mapping.index, .type = mapping.name, .source = source, .target = target, .properties = try cypher.value.entityProperties(a, properties.items), .ownership = if (producer(edge).len == 0) .explicit else .document, .producer = if (producer(edge).len == 0) null else .{ .table = effects.table, .key = producer(edge) } };
+                    relationship.value.* = .{ .identity = .{ .table = effects.table, .key = key }, .index = mapping.index, .type = mapping.name, .source = source, .target = target, .native = .{ .weight = edge.weight, .created_at = edge.created_at, .updated_at = edge.updated_at }, .properties = try cypher.value.entityProperties(a, properties.items), .ownership = if (producer(edge).len == 0) .explicit else .document, .producer = if (producer(edge).len == 0) null else .{ .table = effects.table, .key = producer(edge) } };
                     if (field_derived) relationship.value.ownership = .field;
                     relationship.deleted = false;
                     try self.inner.indexRelationship(a, position);
                 } else {
                     try self.capacity();
                     const relationship = try a.create(cypher.value.Relationship);
-                    relationship.* = .{ .identity = .{ .table = effects.table, .key = key }, .index = mapping.index, .type = mapping.name, .source = source, .target = target, .properties = try cypher.value.entityProperties(a, properties.items), .ownership = if (producer(edge).len == 0) .explicit else .document, .producer = if (producer(edge).len == 0) null else .{ .table = effects.table, .key = producer(edge) } };
+                    relationship.* = .{ .identity = .{ .table = effects.table, .key = key }, .index = mapping.index, .type = mapping.name, .source = source, .target = target, .native = .{ .weight = edge.weight, .created_at = edge.created_at, .updated_at = edge.updated_at }, .properties = try cypher.value.entityProperties(a, properties.items), .ownership = if (producer(edge).len == 0) .explicit else .document, .producer = if (producer(edge).len == 0) null else .{ .table = effects.table, .key = producer(edge) } };
                     try self.inner.appendRelationship(a, .{ .value = relationship });
                 }
                 self.inner.captured.explored_edges +|= 1;

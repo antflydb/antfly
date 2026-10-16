@@ -71,7 +71,20 @@ pub const EntityIdentity = union(enum) {
     }
 };
 pub const Node = struct { identity: Identity, labels: []const []const u8 = &.{}, properties: []const Entry = &.{} };
+/// Physical attributes retained across property-only mutations. These belong
+/// to the trusted storage cut and are omitted from the public graph wire value.
+pub const NativeRelationshipAttributes = struct {
+    weight: f64 = 1,
+    created_at: u64 = 0,
+    updated_at: u64 = 0,
+    pub fn jsonStringify(self: @This(), writer: anytype) !void {
+        var created: [20]u8 = undefined;
+        var updated: [20]u8 = undefined;
+        try writer.write(.{ .weight = self.weight, .created_at = (std.fmt.bufPrint(&created, "{d}", .{self.created_at}) catch unreachable), .updated_at = (std.fmt.bufPrint(&updated, "{d}", .{self.updated_at}) catch unreachable) });
+    }
+};
 pub const Relationship = struct {
+    native: NativeRelationshipAttributes = .{},
     // Identity includes index, physical source table, and durable edge key.
     identity: Identity,
     index: []const u8,
