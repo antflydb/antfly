@@ -3591,6 +3591,58 @@ test "opaque metadata compound rewrite admission preserves job and source reserv
     }
 }
 
+test "opaque metadata relational index controls cross compiled projection without mutation" {
+    const alloc = std.testing.allocator;
+    const publication = @import("../metadata/relational_index_publication.zig");
+    const protocol = @import("../metadata/topology_protocol.zig");
+    const group = @import("antfly_local_sources").common_group_ids.main_metadata_group_id;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmp.dir.realPathFileAlloc(std.testing.io, ".", alloc);
+    defer alloc.free(path);
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const plan = try publication.testing.plan(arena.allocator());
+    var prepared = try plan.prepare(alloc);
+    defer prepared.deinit();
+    const incarnation = "11111111111111111111111111111111".*;
+    const begin: publication.BeginRequest = .{ .metadata_incarnation = incarnation, .begin = .{ .plan = plan } };
+    const observation = try begin.observation(&prepared);
+    {
+        var store = try metadata_apply_client.RaftApplyStore.init(alloc, .{ .root_dir = path, .no_sync = true });
+        defer store.deinit();
+        try store.applyStandaloneCommand(group, .{ .initialize_metadata_incarnation = incarnation });
+        try std.testing.expectError(error.TableTopologyProtocolUpgradeRequired, store.relationalIndexAdmissionStatusJson(alloc, group, observation));
+        const activation = try std.json.Stringify.valueAlloc(alloc, protocol.Activation{ .version = protocol.index_publication_head_version, .incarnation = incarnation, .member_count = 1, .membership_fingerprint = @splat(7) }, .{});
+        defer alloc.free(activation);
+        try store.applyStandaloneCommand(group, .{ .activate_topology_protocol = activation });
+        const revision = try store.standaloneRevision();
+        const bytes = try store.relationalIndexAdmissionStatusJson(alloc, group, observation);
+        defer alloc.free(bytes);
+        var status = try std.json.parseFromSlice(publication.AdmissionStatus, alloc, bytes, .{});
+        defer status.deinit();
+        try std.testing.expect(!try status.value.isAdmitted(observation));
+        const decide: publication.DecidePublish = .{ .table_id = observation.table_id, .id = observation.id, .expected_revision = 1 };
+        const cancel: publication.CancelDecision = .{ .table_id = decide.table_id, .id = decide.id, .expected_revision = 1, .failure = .requested };
+        try std.testing.expectError(error.GenerationPublicationNotFound, store.relationalIndexPublicationDecisionStatusJson(alloc, group, decide));
+        try std.testing.expectError(error.GenerationPublicationNotFound, store.relationalIndexCancellationStatusJson(alloc, group, cancel));
+        try std.testing.expectError(error.CatalogOccupancyNotReady, store.validateRelationalIndexPublicationDecision(group, decide));
+        try std.testing.expectError(error.CatalogOccupancyNotReady, store.validateRelationalIndexCancellation(group, cancel));
+        try std.testing.expectError(error.CatalogOccupancyNotReady, store.validateRelationalIndexBegin(group, begin, &prepared));
+        var foreign = begin;
+        foreign.metadata_incarnation[0] = '2';
+        try std.testing.expectError(error.MetadataIncarnationMismatch, store.validateRelationalIndexBegin(group, foreign, &prepared));
+        try std.testing.expectEqual(revision, try store.standaloneRevision());
+    }
+    var recovered = try metadata_apply_client.RaftApplyStore.init(alloc, .{ .root_dir = path, .no_sync = true });
+    defer recovered.deinit();
+    const bytes = try recovered.relationalIndexAdmissionStatusJson(alloc, group, observation);
+    defer alloc.free(bytes);
+    var status = try std.json.parseFromSlice(publication.AdmissionStatus, alloc, bytes, .{});
+    defer status.deinit();
+    try std.testing.expect(!try status.value.isAdmitted(observation));
+}
+
 test "opaque metadata relation reconciliation work retains owned cuts across progress and reopen" {
     const a = std.testing.allocator;
     const r = @import("antfly_local_sources").system_catalog_relation_reconciliation;

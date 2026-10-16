@@ -1949,6 +1949,32 @@ pub fn metadataApplyStoreProjection(
                     const value = handle.store.relationalIndexOwnerDecisionJson(a, group_id, input) catch |err| break :blk storageOwnerStatusFromError(err);
                     break :blk metadataProjectionJson(alloc, out_json, value);
                 },
+                .relational_index_admission_status => |input| {
+                    const value = handle.store.relationalIndexAdmissionStatusJson(a, group_id, input) catch |err| break :blk storageOwnerStatusFromError(err);
+                    break :blk metadataProjectionJson(alloc, out_json, value);
+                },
+                .relational_index_begin_preflight => |input| {
+                    var prepared = input.begin.plan.prepare(a) catch |err| break :blk storageOwnerStatusFromError(err);
+                    defer prepared.deinit();
+                    handle.store.validateRelationalIndexBegin(group_id, input, &prepared) catch |err| break :blk storageOwnerStatusFromError(err);
+                    break :blk metadataProjectionJson(alloc, out_json, true);
+                },
+                .relational_index_publish_preflight => |input| {
+                    handle.store.validateRelationalIndexPublicationDecision(group_id, input) catch |err| break :blk storageOwnerStatusFromError(err);
+                    break :blk metadataProjectionJson(alloc, out_json, true);
+                },
+                .relational_index_publish_status => |input| {
+                    const value = handle.store.relationalIndexPublicationDecisionStatusJson(a, group_id, input) catch |err| break :blk storageOwnerStatusFromError(err);
+                    break :blk metadataProjectionJson(alloc, out_json, value);
+                },
+                .relational_index_cancel_preflight => |input| {
+                    handle.store.validateRelationalIndexCancellation(group_id, input) catch |err| break :blk storageOwnerStatusFromError(err);
+                    break :blk metadataProjectionJson(alloc, out_json, true);
+                },
+                .relational_index_cancel_status => |input| {
+                    const value = handle.store.relationalIndexCancellationStatusJson(a, group_id, input) catch |err| break :blk storageOwnerStatusFromError(err);
+                    break :blk metadataProjectionJson(alloc, out_json, value);
+                },
                 .relational_index_owner_ack_status => |input| {
                     const value = handle.store.relationalIndexOwnerAckStatusJson(a, group_id, input) catch |err| break :blk storageOwnerStatusFromError(err);
                     break :blk metadataProjectionJson(alloc, out_json, value);

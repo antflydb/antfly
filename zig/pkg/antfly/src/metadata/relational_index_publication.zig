@@ -1356,6 +1356,21 @@ pub const Begin = struct {
     plan: Plan,
 };
 
+/// Private coordinator admission. Ingress must own this recovery identity
+/// before submission; an ambiguous begin is resolved by admission_status.
+pub const BeginRequest = struct {
+    metadata_incarnation: [32]u8,
+    begin: Begin,
+
+    pub fn observation(self: @This(), prepared: *const Prepared) !AdmissionRequest {
+        const request: AdmissionRequest = .{ .metadata_incarnation = self.metadata_incarnation, .table_id = self.begin.plan.before.table_id, .id = self.begin.plan.id, .plan_digest = prepared.head.plan_digest };
+        try request.validate();
+        if (prepared.head.table_id != request.table_id or !std.mem.eql(u8, &prepared.head.plan_id, &request.id))
+            return error.InvalidGenerationPublication;
+        return request;
+    }
+};
+
 /// Namespace readers need definitions, not owner receipt arrays. Allocate the
 /// projected strings independently: a subsequent transactional point read may
 /// invalidate a borrowed store value.
@@ -1802,7 +1817,11 @@ pub const Prepared = struct {
     /// The caller must first revalidate the live table/name guard, complete
     /// range cut and protocol admission in this SAME transaction. Any error
     /// during staging requires abort; this helper never independently commits.
-    pub fn stageBegin(self: *const Prepared, txn: anytype, group: u64, expected_head: ?[progress.Head.encoded_len]u8) !void {
+    const Predecessor = struct { count: u16, id: Id };
+
+    /// Shared read-only CAS/exclusion checks. Preflight is not a lease: stage
+    /// repeats these checks in the transaction that reserves the namespace.
+    pub fn requireBegin(self: *const Prepared, txn: anytype, group: u64, expected_head: ?[progress.Head.encoded_len]u8) !Predecessor {
         var buf: [160]u8 = undefined;
         const prior_bytes = txn.get(try headKey(&buf, group, self.head.table_id)) catch |err| switch (err) {
             error.NotFound => null,
@@ -1831,6 +1850,15 @@ pub const Prepared = struct {
             if (try txn.hasPrefix(proofs_prefix)) return error.InvalidCatalogRecord;
         }
         if (try optionalGet(txn, try activeKey(&buf, group, self.head.table_id)) != null) return error.GenerationPublicationChanged;
+        if (try lifecycle.read(txn, group, self.head.table_id) != null) return error.GenerationPublicationChanged;
+        return .{ .count = old_count, .id = old_id };
+    }
+
+    pub fn stageBegin(self: *const Prepared, txn: anytype, group: u64, expected_head: ?[progress.Head.encoded_len]u8) !void {
+        const prior = try self.requireBegin(txn, group, expected_head);
+        const old_count = prior.count;
+        const old_id = prior.id;
+        var buf: [160]u8 = undefined;
         try lifecycle.acquire(txn, group, self.head.table_id, .{ .kind = .index_build, .id = self.head.plan_id });
         // Remove the predecessor's group directory before overwriting ordinal
         // rows. Its cohort may have changed completely during terminal DDL.

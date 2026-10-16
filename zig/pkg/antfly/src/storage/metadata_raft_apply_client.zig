@@ -552,6 +552,31 @@ pub const RaftApplyStore = struct {
     pub fn fkGenerationPublicationSourceDecisionJson(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, request: fk_generation_publication.SourceDecisionRequest) ![]u8 {
         return self.catalogProjection([]u8, alloc, group_id, .{ .fk_generation_publication_source_decision = request });
     }
+    pub fn relationalIndexAdmissionStatusJson(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, request: @import("../metadata/relational_index_publication.zig").AdmissionRequest) ![]u8 {
+        try request.validate();
+        return self.catalogProjection([]u8, alloc, group_id, .{ .relational_index_admission_status = request });
+    }
+    pub fn validateRelationalIndexBegin(self: *RaftApplyStore, group_id: u64, request: @import("../metadata/relational_index_publication.zig").BeginRequest, prepared: *const @import("../metadata/relational_index_publication.zig").Prepared) !void {
+        _ = try request.observation(prepared);
+        if (!try self.catalogProjection(bool, self.alloc, group_id, .{ .relational_index_begin_preflight = request })) return error.InvalidGenerationPublication;
+    }
+    pub fn validateRelationalIndexPublicationDecision(self: *RaftApplyStore, group_id: u64, request: @import("../metadata/relational_index_publication.zig").DecidePublish) !void {
+        try request.validate();
+        if (!try self.catalogProjection(bool, self.alloc, group_id, .{ .relational_index_publish_preflight = request })) return error.InvalidGenerationPublication;
+    }
+    pub fn relationalIndexPublicationDecisionStatusJson(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, request: @import("../metadata/relational_index_publication.zig").DecidePublish) ![]u8 {
+        try request.validate();
+        return self.catalogProjection([]u8, alloc, group_id, .{ .relational_index_publish_status = request });
+    }
+    pub fn validateRelationalIndexCancellation(self: *RaftApplyStore, group_id: u64, request: @import("../metadata/relational_index_publication.zig").CancelDecision) !void {
+        try request.validate();
+        if (!try self.catalogProjection(bool, self.alloc, group_id, .{ .relational_index_cancel_preflight = request })) return error.InvalidGenerationPublication;
+    }
+    pub fn relationalIndexCancellationStatusJson(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, request: @import("../metadata/relational_index_publication.zig").CancelDecision) ![]u8 {
+        try request.validate();
+        return self.catalogProjection([]u8, alloc, group_id, .{ .relational_index_cancel_status = request });
+    }
+
     pub fn relationalIndexOwnerDecisionJson(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, request: @import("../metadata/relational_index_publication.zig").OwnerRequest) ![]u8 {
         return self.catalogProjection([]u8, alloc, group_id, .{ .relational_index_owner_decision = request });
     }

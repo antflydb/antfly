@@ -8531,3 +8531,37 @@ and foreign transport identity rejection. An intermediate transport test exposed
 the generic reader's lack of request-incarnation comparison; the typed client
 now performs that comparison instead of weakening the test. Original inventory
 remains 483 implemented / 862 unresolved.
+
+### Compiled metadata-owner controls and read-only admission preflight
+
+The production metadata facade previously lacked the new admission-status,
+publication decision/status and cancellation preflight/status methods even though
+the direct-storage lanes passed. These now cross the existing owned JSON catalog
+projection boundary, with matching receiver cases and exact semantic errors.
+The new compiled-owner fixture exercises those methods, including decoder
+readiness, absent jobs, missing occupancy, foreign incarnation, unchanged durable
+revision and reopen. It is not evidence of a complete hosted publication job.
+
+Admission preflight shares durable apply's schema, logical owner, namespace,
+policy and complete range-cohort checks. Immutable candidate preparation stays
+outside that read. The shared read-only head/exclusion check is repeated in
+`stageBegin`; successful preflight is never a lease or permission to skip apply
+validation. Preflight additionally checks namespace occupancy without staging a
+job, advancing a source clock or attaching a mutable command outcome/journal.
+Durable apply retains its shared transactional namespace publisher and rollback.
+
+An intermediate compiled-owner test exposed `CatalogSourceUntracked` collapsing
+to a generic storage failure. Begin now checks writer readiness first and returns
+the existing registered `CatalogOccupancyNotReady` precondition, consistently with
+publication and cancellation. No broad ABI error alias or weakened expectation
+was introduced. Public online-index plan production/admission, replacement-root
+adoption and hosted/Raft execution remain unfinished; original case dispositions
+are unchanged.
+
+The frozen-source Debug gate passed 103/103 steps in
+`/private/tmp/antfly-index-admission-compiled-final-debug.log`: 59 metadata,
+four ACK transport, one decoder-barrier and one actual compiled metadata-owner
+test, without failures or leaks. The direct-store lane additionally verifies
+successful read-only preflight, definite namespace conflict, foreign incarnation,
+and rejection after the job was already admitted. Licensing, Apache boundary,
+control-catalog, formatting/diff and original inventory checks pass.

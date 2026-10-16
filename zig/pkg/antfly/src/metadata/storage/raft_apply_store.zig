@@ -6659,6 +6659,9 @@ test "relational index publication admission reserves names atomically and survi
         }
         const begin = try std.json.Stringify.valueAlloc(a, index_publication.Begin{ .plan = plan }, .{});
         defer a.free(begin);
+        var admission_prepared = try plan.prepare(a);
+        defer admission_prepared.deinit();
+        const begin_request: index_publication.BeginRequest = .{ .metadata_incarnation = identity, .begin = .{ .plan = plan } };
         {
             // Equal cardinality is not equality of the indexed owner set.
             var txn = try store.store.beginWriteTxn();
@@ -6677,6 +6680,7 @@ test "relational index publication admission reserves names atomically and survi
             defer read.abort();
             break :blk try RaftApplyStore.relationSourceEpochTxn(&read, group);
         };
+        try std.testing.expectError(error.CatalogAlreadyExists, store.validateRelationalIndexBegin(group, begin_request, &admission_prepared));
         try std.testing.expectError(error.CatalogAlreadyExists, store.applyStandaloneCommand(group, .{ .begin_relational_index_publication = begin }));
         {
             var read = try store.store.beginReadTxn();
@@ -6688,6 +6692,12 @@ test "relational index publication admission reserves names atomically and survi
             try std.testing.expectError(error.NotFound, read.get(try index_publication.ownerKey(&buf, group, plan.before.table_id, 0)));
         }
         try store.applyStandaloneCommand(group, .{ .remove_table = .{ .table_id = 999, .expected_transition_generation = 0 } });
+        const preflight_revision = try store.standaloneRevision();
+        try store.validateRelationalIndexBegin(group, begin_request, &admission_prepared);
+        try std.testing.expectEqual(preflight_revision, try store.standaloneRevision());
+        var foreign_begin = begin_request;
+        foreign_begin.metadata_incarnation[0] = '2';
+        try std.testing.expectError(error.MetadataIncarnationMismatch, store.validateRelationalIndexBegin(group, foreign_begin, &admission_prepared));
         const encoded = try encodeTransitionCommand(a, .{ .begin_relational_index_publication = begin });
         defer a.free(encoded);
         var decoded = (try decodeTransitionCommand(a, encoded)).?;
@@ -6721,6 +6731,7 @@ test "relational index publication admission reserves names atomically and survi
             try std.testing.expectError(error.GenerationPublicationChanged, store.relationalIndexAdmissionStatusJson(a, group, substituted));
         }
         try std.testing.expectError(error.GenerationPublicationChanged, store.applyStandaloneCommand(group, decoded));
+        try std.testing.expectError(error.GenerationPublicationChanged, store.validateRelationalIndexBegin(group, begin_request, &admission_prepared));
         {
             var txn = try store.store.beginWriteTxn();
             defer txn.abort();
@@ -18849,14 +18860,26 @@ pub const RaftApplyStore = struct {
         try txn.delete(try index_publication.activeKey(&buf, group_id, decision.table_id));
     }
 
-    fn beginRelationalIndexPublicationTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group_id: u64, bytes: []const u8) !void {
-        if (bytes.len == 0 or bytes.len > index_publication.max_command_bytes) return error.InvalidGenerationPublication;
+    /// Uses a pinned indexed read; neither stages job rows nor installs a
+    /// command journal/outcome. Preparation belongs outside the catalog gate.
+    pub fn validateRelationalIndexBegin(self: *RaftApplyStore, group_id: u64, request: index_publication.BeginRequest, prepared: *const index_publication.Prepared) !void {
+        const observation = try request.observation(prepared);
+        var txn = try self.beginIndexedReportRead(group_id);
+        defer txn.abort();
+        var buf: [192]u8 = undefined;
+        const incarnation = (try decodeMetadataIncarnationRecord(try txn.get(try metadataIncarnationKeyForGroup(&buf, group_id)))).incarnation;
+        if (!std.mem.eql(u8, &incarnation, &observation.metadata_incarnation)) return error.MetadataIncarnationMismatch;
+        if (try stagingGet(&txn, metadata_hot_standby.outbox_key) != null) return error.MetadataReplicationPending;
+        try self.validateRelationalIndexBeginTxn(&txn, group_id, request.begin);
+        _ = try prepared.requireBegin(&txn, group_id, request.begin.expected_head);
+        var live = (try relation_reconciliation.LiveStore(docstore.DocStore.Txn).open(&txn, group_id)) orelse return error.CatalogPublicationProofPending;
+        if (try live.nameOccupied(request.begin.plan.namespace_id, request.begin.plan.index_name, true)) return error.CatalogAlreadyExists;
+    }
+
+    fn validateRelationalIndexBeginTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group_id: u64, request: index_publication.Begin) !void {
         _ = try self.standbyRelationActivationTxn(txn, group_id, topology_protocol.index_publication_head_version);
-        var parsed = try std.json.parseFromSlice(index_publication.Begin, self.alloc, bytes, .{ .allocate = .alloc_always });
-        defer parsed.deinit();
-        const plan = parsed.value.plan;
-        var prepared = try plan.prepare(self.alloc);
-        defer prepared.deinit();
+        if (!try relationWriterEnabledTxn(txn, group_id)) return error.CatalogOccupancyNotReady;
+        const plan = request.plan;
         // Readiness at proposal time is not durable decoder activation. Once
         // a marked plan is retained, ordinary later commands must keep every
         // metadata member capable of decoding it, even before native install.
@@ -18872,7 +18895,17 @@ pub const RaftApplyStore = struct {
         defer self.alloc.free(ranges);
         for (plan.owners, ranges) |owner, *range| range.* = owner.range;
         try self.validateFkGenerationTableTxn(txn, group_id, plan.before, ranges);
-        if (parsed.value.expected_head != null) _ = try index_publication.verifyJob(self.alloc, txn, group_id, plan.before.table_id);
+        if (request.expected_head != null) _ = try index_publication.verifyJob(self.alloc, txn, group_id, plan.before.table_id);
+    }
+
+    fn beginRelationalIndexPublicationTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group_id: u64, bytes: []const u8) !void {
+        if (bytes.len == 0 or bytes.len > index_publication.max_command_bytes) return error.InvalidGenerationPublication;
+        _ = try self.standbyRelationActivationTxn(txn, group_id, topology_protocol.index_publication_head_version);
+        var parsed = try std.json.parseFromSlice(index_publication.Begin, self.alloc, bytes, .{ .allocate = .alloc_always });
+        defer parsed.deinit();
+        var prepared = try parsed.value.plan.prepare(self.alloc);
+        defer prepared.deinit();
+        try self.validateRelationalIndexBeginTxn(txn, group_id, parsed.value);
         try prepared.stageBegin(txn, group_id, parsed.value.expected_head);
         if (try relation_reconciliation.readSourceRevision(txn, group_id) != 0) try relation_reconciliation.advanceSource(txn, group_id);
     }
