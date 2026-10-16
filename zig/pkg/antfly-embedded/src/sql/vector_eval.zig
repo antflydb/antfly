@@ -143,6 +143,26 @@ pub fn evaluateColumnsEncodedMany(a: std.mem.Allocator, programs: []const *const
     const visited = try a.alloc(bool, programs.len);
     defer a.free(visited);
     @memset(visited, false);
+    // Identity column expressions borrow native vectors all the way into
+    // aggregate kernels. Coercing/effectful expressions keep fused evaluation.
+    for (programs, 0..) |program, index| {
+        if (program.root != 0 or program.instructions.len != 1) continue;
+        const ordinal = switch (program.instructions[0].operation) {
+            .column => |column| column,
+            else => continue,
+        };
+        if (ordinal >= columns.len) return error.InvalidSqlBackendResponse;
+        const definitions = try a.dupe(scalar.Column, &.{columns[ordinal]});
+        var published = false;
+        defer if (!published) a.free(definitions);
+        const physical: Batch = .{ .columns = .{ .page = page, .definitions = definitions } };
+        var scratch = std.heap.ArenaAllocator.init(a);
+        defer scratch.deinit();
+        if (try physical.physicalColumn(scratch.allocator(), 0) == null) continue;
+        outputs[index] = physical;
+        visited[index] = true;
+        published = true;
+    }
     var group: std.ArrayList(*const scalar.Program) = .empty;
     defer group.deinit(a);
     var group_positions: std.ArrayList(usize) = .empty;
@@ -205,6 +225,7 @@ pub fn freeEncodedMany(a: std.mem.Allocator, outputs: []const ?@import("executio
             for (vectors.values) |values| a.free(values);
             a.free(vectors.values);
         },
+        .columns => |physical| a.free(physical.definitions),
         else => unreachable,
     };
     a.free(outputs);
@@ -1049,4 +1070,32 @@ test "external lake NUMERIC column evaluation preserves physical and native exac
     const batch: @import("execution_batch.zig").Batch = .{ .rows = &.{&.{number}} };
     const native: ColumnInput = .{ .page = .{ .native = .{ .values = &batch, .names = &.{"n"} }, .selection = &.{0} }, .columns = &columns, .count = 1 };
     try std.testing.expect((try native.cell(ca, 0, 0)).numeric == number.numeric);
+}
+
+fn physicalExpressionScenario(a: std.mem.Allocator) !void {
+    const definitions = [_]scalar.Column{.{ .name = "n", .type = .integer }};
+    const refs: [4]@import("../storage/rowsource/types.zig").RowRef = @splat(.{ .relational_key = "r" });
+    const page: @import("catalog.zig").ColumnPage = .{ .batch = .{
+        .snapshot = .{ .table_id = "t", .snapshot_id = "s" },
+        .row_refs = &refs,
+        .columns = &.{.{ .name = "n", .values = .{ .dictionary_i64 = .{ .values = &.{ 7, -3 }, .indices = &.{ 0, 1, 99, 0 } } }, .nulls = .{ .bytes = &.{ 0, 0, 1, 0 } } }},
+    }, .selection = &.{ 3, 2, 1, 0 } };
+    var compiled = try @import("compiler.zig").compileScalar(a, "n", .{});
+    defer compiled.deinit();
+    var program = try scalar.bind(a, compiled.expression, &definitions, &.{}, .{});
+    defer program.deinit();
+    const outputs = try evaluateColumnsEncodedMany(a, &.{&program}, page, &definitions, &.{}, null);
+    defer freeEncodedMany(a, outputs);
+    try std.testing.expect(outputs[0].? == .columns);
+    const physical = (try outputs[0].?.physicalColumn(a, 0)).?;
+    try std.testing.expect(physical.vector.values.dictionary_i64.indices.ptr == page.batch.columns[0].values.dictionary_i64.indices.ptr);
+    var state = @import("aggregate_state.zig").Column.init(.{ .kind = .sum, .input_type = .integer });
+    defer state.clear(a);
+    try state.append(a);
+    try state.updateEncoded(a, &.{ 0, 0, 0, 0 }, outputs[0].?);
+    try std.testing.expectEqual(@as(i64, 11), (try state.finish(0)).value.integer);
+}
+test "SQL physical identity expressions reach aggregate kernels without vector expansion" {
+    try physicalExpressionScenario(std.testing.allocator);
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, physicalExpressionScenario, .{});
 }

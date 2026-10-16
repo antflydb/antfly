@@ -19,13 +19,58 @@
 const std = @import("std");
 const scalar = @import("scalar.zig");
 const A = std.mem.Allocator;
+/// A borrowed physical column plus its logical row mapping. The declaration
+/// proves scalar boundary coercion is an identity; unsupported coercions decline.
+pub const PhysicalColumn = struct {
+    vector: @import("../storage/rowsource/types.zig").ColumnVector,
+    selection: []const usize,
+    kind: @import("ast.zig").ColumnType,
+    element: ?@import("array_value.zig").ElementType = null,
+    pub fn select(self: @This(), a: A, selected: []const usize) !@This() {
+        const rows = try a.alloc(usize, selected.len);
+        errdefer a.free(rows);
+        for (rows, selected) |*row, index| {
+            if (index >= self.selection.len) return error.InvalidSqlBackendResponse;
+            row.* = self.selection[index];
+        }
+        var view = self;
+        view.selection = rows;
+        return view;
+    }
+    pub fn validate(self: @This()) !void {
+        const compatible = switch (self.vector.values) {
+            .i64, .dictionary_i64 => self.kind == .integer,
+            .f64, .dictionary_f64 => self.kind == .number,
+            .bool => self.kind == .boolean,
+            .bytes, .dictionary_bytes => self.kind == .string,
+            else => false,
+        };
+        if (!compatible or (self.vector.nulls.bytes.len != 0 and self.vector.nulls.bytes.len != self.vector.rowCount())) return error.InvalidSqlBackendResponse;
+        for (self.selection) |row| {
+            if (row >= self.vector.rowCount()) return error.InvalidSqlBackendResponse;
+            if (self.vector.nulls.isNull(row)) continue;
+            switch (self.vector.values) {
+                inline .dictionary_i64, .dictionary_f64, .dictionary_bytes => |values| if (values.indices[row] >= values.values.len) return error.InvalidSqlBackendResponse,
+                else => {},
+            }
+            if (self.kind == .number and self.element == null) {
+                const number = switch (self.vector.values) {
+                    .f64 => |values| values[row],
+                    .dictionary_f64 => |values| values.at(row),
+                    else => unreachable,
+                };
+                if (!std.math.isFinite(number)) return error.SqlTypeMismatch;
+            }
+        }
+    }
+};
 pub const Batch = union(enum) {
     /// One expression over page-local dictionary entries, including a NULL lane.
     dictionary: struct { values: []const scalar.Datum, indices: []const u32 },
     /// Stable retained columns; ownership belongs to the enclosing lease.
     retained: struct { store: *const @import("typed_store.zig").Store, begin: usize = 0, count: usize },
     /// Operator-specific column access without constructing a row matrix.
-    reader: struct { ptr: *anyopaque, read: *const fn (*anyopaque, A, usize, usize) anyerror!scalar.Datum, read_dictionary: ?*const fn (*anyopaque, A, usize) anyerror!?Batch = null, read_identity: ?*const fn (*anyopaque, usize, usize) anyerror!?u64 = null, count: usize, width: usize },
+    reader: struct { ptr: *anyopaque, read: *const fn (*anyopaque, A, usize, usize) anyerror!scalar.Datum, read_physical: ?*const fn (*anyopaque, A, usize) anyerror!?PhysicalColumn = null, read_dictionary: ?*const fn (*anyopaque, A, usize) anyerror!?Batch = null, read_identity: ?*const fn (*anyopaque, usize, usize) anyerror!?u64 = null, count: usize, width: usize },
     columns: struct { page: @import("catalog.zig").ColumnPage, definitions: []const scalar.Column },
     rows: []const []const scalar.Datum,
     vectors: struct { values: []const []const scalar.Datum, count: usize },
@@ -55,13 +100,23 @@ pub const Batch = union(enum) {
     /// A single borrowed column retains physical dictionary identities.
     pub fn project(self: *const Batch, a: A, column: usize) !Batch {
         if (column >= self.width()) return error.InvalidSqlBackendResponse;
-        if (try self.dictionaryColumn(a, column)) |encoded| return encoded;
+        const physical = try self.physicalColumn(a, column);
+        if (physical == null) if (try self.dictionaryColumn(a, column)) |encoded| return encoded;
         const View = struct {
             source: *const Batch,
             column: usize,
+            physical: ?PhysicalColumn,
+            fn physicalView(raw: *anyopaque, _: A, _: usize) !?PhysicalColumn {
+                const view: *@This() = @ptrCast(@alignCast(raw));
+                return view.physical;
+            }
             fn read(raw: *anyopaque, alloc: A, row_index: usize, _: usize) !scalar.Datum {
                 const view: *@This() = @ptrCast(@alignCast(raw));
                 return view.source.cell(alloc, row_index, view.column);
+            }
+            fn dictionary(raw: *anyopaque, alloc: A, _: usize) !?Batch {
+                const view: *@This() = @ptrCast(@alignCast(raw));
+                return view.source.dictionaryColumn(alloc, view.column);
             }
             fn identity(raw: *anyopaque, row_index: usize, _: usize) !?u64 {
                 const view: *@This() = @ptrCast(@alignCast(raw));
@@ -69,8 +124,46 @@ pub const Batch = union(enum) {
             }
         };
         const view = try a.create(View);
-        view.* = .{ .source = self, .column = column };
-        return .{ .reader = .{ .ptr = view, .read = View.read, .read_identity = View.identity, .count = self.len(), .width = 1 } };
+        view.* = .{ .source = self, .column = column, .physical = physical };
+        return .{ .reader = .{ .ptr = view, .read = View.read, .read_physical = View.physicalView, .read_dictionary = View.dictionary, .read_identity = View.identity, .count = self.len(), .width = 1 } };
+    }
+    pub fn physicalColumn(self: Batch, a: A, column: usize) anyerror!?PhysicalColumn {
+        if (column >= self.width()) return error.InvalidSqlBackendResponse;
+        // Empty derived producers may retain schema names without physical
+        // columns. There is no payload to borrow or normalize at EOF.
+        if (self.len() == 0) return null;
+        return switch (self) {
+            .reader => |v| if (v.read_physical) |read| try read(v.ptr, a, column) else null,
+            .mapped => |v| blk: {
+                if (v.ordinals[column] == std.math.maxInt(usize) or column >= v.types.len) break :blk null;
+                const source = (try v.source.physicalColumn(a, v.ordinals[column])) orelse break :blk null;
+                if (v.types[column].kind != source.kind or v.types[column].element_type != source.element) break :blk null;
+                break :blk try source.select(a, v.selection);
+            },
+            .columns => |v| blk: {
+                const definition = v.definitions[column];
+                if (v.page.native) |native| {
+                    for (native.names, 0..) |name, ordinal| if (std.mem.eql(u8, name, definition.name)) {
+                        const source = (try native.values.physicalColumn(a, ordinal)) orelse break :blk null;
+                        if (definition.type != source.kind or definition.element_type != source.element) break :blk null;
+                        break :blk try source.select(a, v.page.selection);
+                    };
+                    break :blk null;
+                }
+                if (std.mem.eql(u8, definition.name, "_id")) break :blk null;
+                const vector = v.page.batch.findColumn(definition.name) orelse break :blk null;
+                const compatible = switch (vector.values) {
+                    .i64, .dictionary_i64 => definition.type == .integer and (definition.element_type == null or definition.element_type == .int64),
+                    .f64, .dictionary_f64 => definition.type == .number and (definition.element_type == null or definition.element_type == .float64),
+                    .bool => definition.type == .boolean and (definition.element_type == null or definition.element_type == .boolean),
+                    .bytes, .dictionary_bytes => definition.type == .string and (definition.element_type == null or definition.element_type == .text),
+                    else => false,
+                };
+                if (!compatible) break :blk null;
+                break :blk PhysicalColumn{ .vector = vector, .selection = v.page.selection, .kind = definition.type, .element = definition.element_type };
+            },
+            else => null,
+        };
     }
     /// Optional physical representation, with the same cells and row order.
     /// Producers decline when normalization or effects require scalar access.
@@ -141,6 +234,11 @@ pub const Batch = union(enum) {
                 const view: *@This() = @ptrCast(@alignCast(raw));
                 return view.source.cell(alloc, view.selection[row_index], column);
             }
+            fn physical(raw: *anyopaque, alloc: A, column: usize) !?PhysicalColumn {
+                const view: *@This() = @ptrCast(@alignCast(raw));
+                const source = (try view.source.physicalColumn(alloc, column)) orelse return null;
+                return try source.select(alloc, view.selection);
+            }
             fn dictionary(raw: *anyopaque, alloc: A, column: usize) !?Batch {
                 const view: *@This() = @ptrCast(@alignCast(raw));
                 var ids: std.AutoHashMapUnmanaged(u64, u32) = .empty;
@@ -172,7 +270,7 @@ pub const Batch = union(enum) {
         for (selection) |index| if (index >= self.len()) return error.InvalidSqlBackendResponse;
         const view = try a.create(View);
         view.* = .{ .source = self, .selection = selection };
-        return .{ .reader = .{ .ptr = view, .count = selection.len, .width = self.width(), .read = View.read, .read_dictionary = View.dictionary, .read_identity = View.identity } };
+        return .{ .reader = .{ .ptr = view, .count = selection.len, .width = self.width(), .read = View.read, .read_physical = View.physical, .read_dictionary = View.dictionary, .read_identity = View.identity } };
     }
     pub fn cell(self: Batch, a: A, index: usize, column: usize) anyerror!scalar.Datum {
         if (index >= self.len() or column >= self.width()) return error.InvalidSqlBackendResponse;
@@ -263,4 +361,15 @@ test "external lake mapped batches retain exact NUMERIC declarations before coer
         try std.testing.expectEqualStrings(text, try @import("numeric_value.zig").format(&context, value.numeric.?.*));
     }
     try std.testing.expect((try mapped.cell(a, 2, 0)).sql_null);
+}
+
+test "SQL physical views decline empty derived producers with retained schema names" {
+    const source: Batch = .{ .rows = &.{} };
+    const definitions = [_]scalar.Column{.{ .name = "n", .type = .integer }};
+    const batch: Batch = .{ .columns = .{ .definitions = &definitions, .page = .{
+        .native = .{ .values = &source, .names = &.{"n"} },
+        .selection = &.{},
+    } } };
+    var none = std.heap.FixedBufferAllocator.init(&.{});
+    try std.testing.expect((try batch.physicalColumn(none.allocator(), 0)) == null);
 }

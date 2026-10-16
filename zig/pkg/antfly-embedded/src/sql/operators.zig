@@ -1217,6 +1217,13 @@ pub const Grouped = struct {
         const ids = try a.alloc(usize, count);
         self.key_count = keys.len;
         errdefer self.failed = true;
+        if (keys.len == 0) {
+            try self.ensureGlobalGroup();
+            @memset(ids, 0);
+            for (self.state_columns, inputs) |*column, values| try column.updateEncoded(self.budget.allocator(), ids, values);
+            self.rows_seen = std.math.add(u64, self.rows_seen, count) catch return error.SqlNumericOutOfRange;
+            return;
+        }
         const hashes = if (identity) |ids_| ids_.hashes else try @import("batch_hash.zig").encodedColumns(a, keys, count, true);
         for (ids, 0..) |*id, index| {
             for (keys, row_keys) |column, *cell| cell.* = try column.cell(a, index, 0);
@@ -1496,6 +1503,9 @@ pub const Grouped = struct {
         }
     }
     pub fn exportPartial(self: *Grouped, external: *@import("spill_grouped.zig").Grouped) !void {
+        return self.exportPartialAt(external, 0);
+    }
+    pub fn exportPartialAt(self: *Grouped, external: *@import("spill_grouped.zig").Grouped, ordinal_base: u64) !void {
         var scratch = std.heap.ArenaAllocator.init(self.backing);
         defer scratch.deinit();
         for (self.groups.items, 0..) |group, index| {
@@ -1503,7 +1513,7 @@ pub const Grouped = struct {
             const a = scratch.allocator();
             const states = try a.alloc(Aggregate, self.specs.len);
             for (self.state_columns, states) |column, *state| state.* = try column.snapshot(a, index);
-            try external.partial(try self.key_columns.row(a, index), states, group.ordinal);
+            try external.partial(try self.key_columns.row(a, index), states, try std.math.add(u64, ordinal_base, group.ordinal));
         }
     }
 
@@ -2850,4 +2860,25 @@ fn selectedGroupReduction(a: Allocator, group_limit: usize) !void {
 test "SQL hash owned final reducers preserve typed state ordinals and lifetime" {
     try std.testing.checkAllAllocationFailures(std.testing.allocator, selectedGroupReduction, .{67});
     try std.testing.expectError(error.SqlProgramLimitExceeded, selectedGroupReduction(std.testing.allocator, 66));
+}
+
+test "SQL global encoded aggregates consume physical vectors without hash probes" {
+    const a = std.testing.allocator;
+    const Batch = @import("execution_batch.zig").Batch;
+    const definitions = [_]@import("scalar.zig").Column{.{ .name = "n", .type = .integer }};
+    const batch: Batch = .{ .columns = .{ .definitions = &definitions, .page = .{
+        .batch = .{ .snapshot = .{ .table_id = "t", .snapshot_id = "s" }, .row_refs = &.{ .{ .relational_key = "a" }, .{ .relational_key = "b" }, .{ .relational_key = "c" } }, .columns = &.{.{ .name = "n", .values = .{ .i64 = &.{ 9, 0, -2 } }, .nulls = .{ .bytes = &.{ 0, 1, 0 } } }} },
+        .selection = &.{ 2, 1, 0, 2 },
+    } } };
+    const group = try Grouped.create(a, &.{ .{ .kind = .sum, .input_type = .integer }, .{ .kind = .count }, .{ .kind = .min, .input_type = .integer } }, .{});
+    defer group.deinit();
+    try group.addEncodedColumns(&.{}, &.{ batch, batch, batch }, 4);
+    try std.testing.expectEqual(@as(usize, 0), group.hash_probes);
+    try std.testing.expectEqual(@as(u64, 4), group.rows_seen);
+    var scratch = std.heap.ArenaAllocator.init(a);
+    defer scratch.deinit();
+    const result = (try group.nextResult(scratch.allocator())).?;
+    try std.testing.expectEqual(@as(i64, 5), result.aggregates[0].value.integer);
+    try std.testing.expectEqual(@as(i64, 3), result.aggregates[1].value.integer);
+    try std.testing.expectEqual(@as(i64, -2), result.aggregates[2].value.integer);
 }

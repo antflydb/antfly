@@ -201,6 +201,14 @@ pub const Cursor = struct {
                     }
                 }
             }
+            if (try self.cachedIndexedPage(column)) |lease| {
+                column.cached = lease;
+                const parsed = lease.item.parquet_page_header.?;
+                column.offset += parsed.header_len + parsed.header.compressed_page_size;
+                column.count = parsed.header.value_count;
+                column.consumed = @intCast(self.position - column.first);
+                return;
+            }
             const probe = try self.headerRead(column);
             var probe_held = true;
             defer if (probe_held) probe.lease.release();
@@ -225,7 +233,7 @@ pub const Cursor = struct {
             if (self.shared_reader) |reader| if (parsed.header.page_type == .data_page or parsed.header.page_type == .data_page_v2) {
                 // Resource policy is checked for each consumer, independently
                 // of the immutable physical interpretation of a page.
-                const interpretation = try std.json.Stringify.valueAlloc(self.a, .{ .version = "decoded-page-v3", .chunk = column.chunk, .decimal_representation = "exact_string", .preserve_dictionary = true }, .{});
+                const interpretation = try std.json.Stringify.valueAlloc(self.a, .{ .version = "decoded-page-v4", .chunk = column.chunk, .decimal_representation = "exact_string", .preserve_dictionary = true }, .{});
                 defer self.a.free(interpretation);
                 cache_key = try reader.objectKey(self.a, .{ .object = try ranges.objectRefForExternalFileUri(self.file), .range = .{ .offset = column.offset, .len = len }, .purpose = .parquet_column_chunk }, interpretation);
                 if (reader.cache.decoded.lookup(cache_key.?)) |lease| {
@@ -307,14 +315,16 @@ pub const Cursor = struct {
                     input: []const parquet.ColumnChunkInput,
                     limits: parquet.MaterializationLimits,
                     dictionary: ?@import("lake_decoded_cache.zig").Lease,
+                    parsed: page.ParsedHeader,
                     fn load(raw: *anyopaque, item: *@import("lake_decoded_cache.zig").Item) !void {
                         const value: *@This() = @ptrCast(@alignCast(raw));
                         const cursor = value.cursor;
                         const decoded = try parquet.buildSupportedColumnsAllocWithLimits(item.arena.allocator(), cursor.inventory, cursor.file.file_id, cursor.group.ordinal, value.input, value.limits);
                         item.payload = .{ .columns = decoded.columns };
+                        item.parquet_page_header = value.parsed;
                         if (value.dictionary) |dictionary| dictionary.cache.depend(.{ .cache = dictionary.cache, .item = item }, dictionary);
                     }
-                }{ .cursor = self, .input = &input, .limits = limits, .dictionary = column.dictionary_lease };
+                }{ .cursor = self, .input = &input, .limits = limits, .dictionary = column.dictionary_lease, .parsed = parsed };
                 const lease = try cache.acquire(key, @min(cache.max_loading_bytes, self.limits.max_decoded_bytes / share *| 4 +| self.limits.max_struct_allocation_bytes), self.shared_reader.?.context, .{ .ptr = &loader, .load = @TypeOf(loader).load });
                 column.cached = lease;
             } else {
@@ -332,6 +342,10 @@ pub const Cursor = struct {
         return error.ParquetRowGroupRowCountMismatch;
     }
     fn header(self: *Cursor, column: *const Column) !page.ParsedHeader {
+        if (try self.cachedIndexedPage(column)) |lease| {
+            defer lease.release();
+            return lease.item.parquet_page_header.?;
+        }
         const probe = try self.headerRead(column);
         defer probe.lease.release();
         return probe.parsed;
@@ -343,6 +357,39 @@ pub const Cursor = struct {
         var index = column.directory_index;
         while (index < directory.pages.len and directory.pages[index].offset < column.offset) index += 1;
         return if (index < directory.pages.len and directory.pages[index].offset == column.offset) directory.pages[index] else null;
+    }
+    /// Only a validated exact-range cache entry may bypass encoded I/O.
+    /// Reapply all request-specific admission and directory checks on each hit.
+    fn cachedIndexedPage(self: *Cursor, column: *const Column) !?@import("lake_decoded_cache.zig").Lease {
+        const reader = self.shared_reader orelse return null;
+        try reader.context.ensureActive();
+        const entry = self.indexedPage(column) orelse return null;
+        const end = std.math.add(u64, column.chunk.file_offset, column.chunk.compressed_len) catch return error.InvalidParquetPage;
+        if (column.offset >= end or entry.len > end - column.offset) return error.InvalidParquetMetadata;
+        const interpretation = try std.json.Stringify.valueAlloc(self.a, .{ .version = "decoded-page-v4", .chunk = column.chunk, .decimal_representation = "exact_string", .preserve_dictionary = true }, .{});
+        defer self.a.free(interpretation);
+        const key = try reader.objectKey(self.a, .{ .object = try ranges.objectRefForExternalFileUri(self.file), .range = .{ .offset = column.offset, .len = entry.len }, .purpose = .parquet_column_chunk }, interpretation);
+        const lease = reader.cache.decoded.lookup(key) orelse return null;
+        errdefer lease.release();
+        const parsed = lease.item.parquet_page_header orelse {
+            lease.release();
+            return null;
+        };
+        try parsed.header.validateResourceLimits();
+        if ((parsed.header.page_type != .data_page and parsed.header.page_type != .data_page_v2) or
+            parsed.header_len + parsed.header.compressed_page_size != entry.len or parsed.header.value_count != entry.rows) return error.InvalidParquetMetadata;
+        const count = parsed.header.value_count;
+        const row_end = std.math.add(u64, entry.first, count) catch return error.ParquetRowGroupRowCountMismatch;
+        if (count == 0 or row_end > self.group.row_count or
+            (row_end == self.group.row_count and column.offset + entry.len != end)) return error.ParquetRowGroupRowCountMismatch;
+        const share = @max(@as(usize, 1), self.columns.len);
+        const dictionary_bytes = if (column.dictionary) |dictionary| dictionary.retainedBytes() else 0;
+        if (entry.len > self.limits.max_input_bytes / share or parsed.header.uncompressed_page_size +| dictionary_bytes > self.limits.max_decoded_bytes / share) return error.ParquetPageTooLarge;
+        var admission = self.limits;
+        admission.max_rows = @max(admission.max_rows, count);
+        admission.max_struct_allocation_bytes /= share;
+        _ = try parquet.admitColumnMaterialization(count, 1, admission);
+        return lease;
     }
     fn headerRead(self: *Cursor, column: *const Column) !HeaderRead {
         const end = std.math.add(u64, column.chunk.file_offset, column.chunk.compressed_len) catch return error.InvalidParquetPage;
@@ -417,6 +464,10 @@ pub const Cursor = struct {
             if (column.consumed != column.count) continue;
             const end = std.math.add(u64, column.chunk.file_offset, column.chunk.compressed_len) catch return error.InvalidParquetPage;
             if (column.offset >= end) continue;
+            if (try self.cachedIndexedPage(column)) |lease| {
+                lease.release();
+                continue;
+            }
             planned += 1;
             const limit = self.limits.max_input_bytes / @max(@as(usize, 1), self.columns.len);
             if (self.indexedPage(column)) |entry| {

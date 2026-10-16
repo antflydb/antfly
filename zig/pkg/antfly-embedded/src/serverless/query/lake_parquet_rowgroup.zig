@@ -10386,12 +10386,15 @@ test "external lake OffsetIndex reads large pages once and validates lengths and
             base: storage.ObjectStorage,
             vtable: storage.ObjectStorage.VTable,
             calls: usize = 0,
+            bytes: usize = 0,
             fn get(raw: *anyopaque, alloc: Allocator, bucket: []const u8, key: []const u8, options: storage.GetOptions) !storage.GetResult {
                 const self: *@This() = @ptrCast(@alignCast(raw));
                 self.calls += 1;
                 var base = self.base;
                 base.allocator = alloc;
-                return base.getObject(bucket, key, options);
+                const result = try base.getObject(bucket, key, options);
+                self.bytes += result.body.len;
+                return result;
             }
         };
         var provider: Provider = .{ .base = client, .vtable = client.vtable.* };
@@ -10415,6 +10418,37 @@ test "external lake OffsetIndex reads large pages once and validates lengths and
         try std.testing.expectEqual(@as(usize, 256), rows);
         try std.testing.expectEqual(if (fault == 3) @as(usize, if (dictionary) 3 else 4) else @as(usize, 3) + @intFromBool(dictionary), provider.calls);
         try std.testing.expectEqual(@as(usize, 2), cursor.pages_decoded);
+        if (fault != 0) continue;
+        // Evict all encoded residency while retaining immutable decoded pages.
+        // Warm scans must not refetch payloads, including async lookahead.
+        const shared = @import("lake_serving_cache.zig");
+        var cache = shared.Cache.initWithMemoryLimit(a, 0);
+        defer cache.deinit();
+        var shared_reader: shared.Reader = .{ .cache = &cache, .base = reader, .scope = @splat(0), .context = .{} };
+        for (0..3) |pass| {
+            if (pass == 2) shared_reader.context.io = std.testing.io;
+            const before = provider.bytes;
+            var warm = try @import("lake_parquet_cursor.zig").Cursor.init(a, shared_reader.reader(), inventory, "data", 0, &.{"n"}, .{ .max_input_bytes = 2048 });
+            defer warm.deinit();
+            warm.shared_reader = &shared_reader;
+            var warm_rows: usize = 0;
+            while (try warm.next()) |batch| {
+                warm_rows += batch.rowCount();
+                for (0..batch.rowCount()) |index| try std.testing.expectEqual(@as(i64, 20), try batch.columns[0].integerAt(index));
+            }
+            shared_reader.drain(false);
+            try std.testing.expectEqual(@as(usize, 256), warm_rows);
+            if (pass != 0) {
+                try std.testing.expectEqual(@as(usize, 0), warm.pages_decoded);
+                // A dictionary prelude can still require its bounded probe.
+                try std.testing.expect(provider.bytes - before <= (if (dictionary) @as(usize, 512) else 0));
+            }
+        }
+        shared_reader.context.io = null;
+        var strict = try @import("lake_parquet_cursor.zig").Cursor.init(a, shared_reader.reader(), inventory, "data", 0, &.{"n"}, .{ .max_decoded_bytes = 8 });
+        defer strict.deinit();
+        strict.shared_reader = &shared_reader;
+        try std.testing.expectError(error.ParquetPageTooLarge, strict.next());
     };
 }
 

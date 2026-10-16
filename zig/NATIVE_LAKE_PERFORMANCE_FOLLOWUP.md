@@ -5118,3 +5118,64 @@ safeguards enabled. The final Debug CLI, source/license boundaries, generated
 error parity, formatting, and lint checks passed. Latest fetched `origin/main`
 `9dd098d773` is included. The final CLI also passed the indexed Parquet
 cold-restart/grouping flow again (12.08 seconds) after the last guards.
+
+
+### Decoded-page hits, global spill exchange, and physical aggregate kernels
+
+Indexed decoded-page entries now retain validated Parquet header evidence under
+an immutable object-version/range/interpretation key. Readers consult that entry
+before encoded I/O or speculative prefetch and reapply their own input, decoded,
+structure, row-count, directory, and cancellation checks. Dictionary dependencies
+remain pinned; dictionary preludes and unindexed files retain bounded header
+discovery. With encoded residency disabled, warm scans decode no pages and fetch
+no indexed data-page payloads, including when asynchronous lookahead is enabled.
+
+Final exact aggregation can transfer unreduced worker spill partition files to
+global hash owners. The existing native block codec and AGS checkpoints cross the
+exchange unchanged; in-memory workers export a compact checkpoint once. This
+removes the serial worker-finalization and partial re-encoding bridge for compatible
+fresh spill streams. All files are sealed and destination capacity is reserved
+before ownership moves. After the first transfer, adoption is infallible. Source
+ordinal bases, semantic key ownership, wide integer cancellation, shared scheduler
+admission, disk quotas, cancellation, and sorted skew fallback are preserved.
+Already consumed or incompatible partition layouts retain the established bridge.
+
+Identity SQL column expressions now retain borrowed native vectors through encoded
+cohort evaluation, projection, and selection. Aggregate kernels dispatch on the
+state/vector pair and consume selections, null masks, and dictionary IDs directly.
+COUNT, integer SUM/AVG, floating SUM/AVG, boolean reductions, and primitive MIN/MAX avoid
+per-row Datum construction. Global unfiltered aggregation uses this path without
+per-row hash probes. Floating transitions preserve source update order, compensated
+sums, SQL NaN ordering, and first-occurrence signed-zero ties. Only winning text
+extrema are copied. Coercions and representations without a proven physical view,
+exact NUMERIC, DISTINCT, pattern sets, and filtered expression cohorts preserve
+their established typed/scalar evaluation and admission paths. Temporary composed
+selections are scoped to the update; retained aggregate state owns its payloads.
+Computed dictionary expressions retain their existing fused dictionary kernels.
+
+Regex and fuzzy posting traversals lease exclusive mutable DFA state from the
+query-owned program cache. Up to four executions per program can retain tables
+between segments; each execution has at most 256 KiB within the shared 2 MiB
+query cache. Traversal and provider I/O never hold the cache mutex. Saturation uses
+private execution, and cache-budget exhaustion retries private execution without
+changing matching results or execution statistics. Actual allocation failures
+propagate. Regex and fuzzy DFA columns publish states only after all allocations
+succeed. Query teardown requires all execution leases to be returned.
+
+Regressions cover decoded-only warm reads and stricter consumers, concurrent and
+sequential pattern state reuse, saturated and exhausted execution pools, mixed
+memory/disk global reducers, transfer without additional writes, ordinal offsets,
+wide integer cancellation, allocation-failure cleanup, physical identity expression
+ownership, selection/null/dictionary kernels, zero-allocation primitive updates,
+winning text ownership, NaN ordering, and global aggregation without hash probes.
+Representative archive latency/RSS benchmarks and live-provider retention
+qualification remain deferred.
+
+
+Qualification (2026-10-16, after merging `origin/main` `b79c65538f`): all 502
+full native lake tests (188 shared-engine and 314 server), 29 focused SQL tests,
+and 31 runtime ABI tests passed with zero native failures or leaks. All 50 real
+Parquet/Iceberg E2Es passed against the final Debug CLI in 626.48 seconds with
+production disk safeguards enabled. Generated error parity, Zig formatting,
+whitespace, licenses, and the Apache boundary (2,066 source files) passed. The
+private error-name table includes main's new promotion-writer fencing error.

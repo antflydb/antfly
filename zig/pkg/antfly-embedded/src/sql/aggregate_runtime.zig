@@ -115,9 +115,10 @@ pub fn addColumns(context: anytype, bound: *const binding.Bound, grouped: anytyp
     }
     var accepted = page;
     accepted.selection = selection.items;
-    // Unfiltered grouped cohorts preserve physical expression vectors all the
-    // way into typed state. Filtered cohorts below retain lazy evaluation.
-    if (bound.group_count != 0 and for (bound.filters) |filter| {
+    // Unfiltered cohorts preserve physical expression vectors all the way
+    // into typed state, including global aggregates without hash probes.
+    // Filtered cohorts below retain lazy evaluation.
+    if (for (bound.filters) |filter| {
         if (filter != null) break false;
     } else true) {
         const Batch = @import("execution_batch.zig").Batch;

@@ -22,6 +22,7 @@ const spill = @import("spill.zig");
 const Datum = scalar.Datum;
 const Allocator = std.mem.Allocator;
 pub const Grouped = struct {
+    const PartitionInput = struct { file: spill.Sequential, ordinal_base: u64, closed: bool = false };
     const Reduction = struct {
         child: Grouped,
         exact: bool,
@@ -69,6 +70,9 @@ pub const Grouped = struct {
     output_count: usize = 0,
     partitioned: bool = false,
     partitions: [8]?spill.Sequential = @splat(null),
+    /// Transferred checkpoint streams retain their existing typed block codec
+    /// and extents. Global hash owners reduce all source streams together.
+    partition_inputs: [8]std.ArrayList(PartitionInput) = @splat(.empty),
     partition_count: usize,
     partition_index: usize = 0,
     local: ?*operators.Grouped = null,
@@ -96,6 +100,10 @@ pub const Grouped = struct {
             slot.* = null;
         };
         for (&self.partitions) |*file| if (file.*) |*open| open.close();
+        for (&self.partition_inputs) |*inputs| {
+            for (inputs.items) |*input| if (!input.closed) input.file.close();
+            inputs.deinit(self.a);
+        }
         if (self.local) |local| local.deinit();
         if (self.fallback) |fallback| {
             fallback.deinit();
@@ -105,6 +113,45 @@ pub const Grouped = struct {
         self.sort.deinit();
         self.state_arena.deinit();
         self.read_arena.deinit();
+    }
+    pub fn canTransferPartitions(self: *const Grouped) bool {
+        return self.partitioned and self.partition_index == 0 and self.reduction_lanes == 0 and self.local == null and self.fallback == null and self.output_count == 0;
+    }
+    /// Reserve and seal before moving ownership. Failures leave every source
+    /// readable; transfer itself cannot allocate or consume source rows.
+    pub fn preparePartitionTransfer(self: *Grouped, sources: []const *Grouped, bases: []const u64) !void {
+        if (!self.canTransferPartitions()) return error.InvalidSqlBackendResponse;
+        if (bases.len != sources.len) return error.InvalidSqlBackendResponse;
+        for (sources, bases, 0..) |source, base, ordinal| {
+            if (source == self) return error.InvalidSqlBackendResponse;
+            for (sources[0..ordinal]) |previous| if (previous == source) return error.InvalidSqlBackendResponse;
+            for (source.partition_inputs) |inputs| for (inputs.items) |input| {
+                _ = try std.math.add(u64, base, input.ordinal_base);
+            };
+            if (!source.canTransferPartitions() or source.partition_count != self.partition_count or source.sort.manager != self.sort.manager or source.sort.orders.len != self.sort.orders.len or source.specs.len != self.specs.len) return error.InvalidSqlBackendResponse;
+            for (source.specs, self.specs) |left, right| if (!std.meta.eql(left, right)) return error.InvalidSqlBackendResponse;
+        }
+        for (0..self.partition_count) |index| {
+            var count: usize = 0;
+            for (sources) |source| {
+                count += @intFromBool(source.partitions[index] != null) + source.partition_inputs[index].items.len;
+                if (source.partitions[index]) |*file| try file.seal();
+                for (source.partition_inputs[index].items) |*input| try input.file.seal();
+            }
+            try self.partition_inputs[index].ensureUnusedCapacity(self.a, count);
+        }
+    }
+    pub fn transferPartitions(self: *Grouped, source: *Grouped, ordinal_base: u64) void {
+        std.debug.assert(source.canTransferPartitions() and source.partition_count == self.partition_count);
+        for (0..self.partition_count) |index| {
+            const target = &self.partition_inputs[index];
+            if (source.partitions[index]) |file| {
+                target.appendAssumeCapacity(.{ .file = file, .ordinal_base = ordinal_base });
+                source.partitions[index] = null;
+            }
+            for (source.partition_inputs[index].items) |input| target.appendAssumeCapacity(.{ .file = input.file, .ordinal_base = ordinal_base + input.ordinal_base });
+            source.partition_inputs[index].clearRetainingCapacity();
+        }
     }
     pub fn partial(self: *Grouped, keys: []const Datum, states: []const operators.Aggregate, ordinal: u64) !void {
         var arena = std.heap.ArenaAllocator.init(self.a);
@@ -190,8 +237,8 @@ pub const Grouped = struct {
             while (self.partition_index < self.partitions.len) {
                 const index = self.partition_index;
                 self.partition_index += 1;
-                if (self.partitions[index] == null) continue;
-                try self.partitions[index].?.seal();
+                if (self.partitions[index] == null and self.partition_inputs[index].items.len == 0) continue;
+                if (self.partitions[index]) |*file| try file.seal();
                 const job = try self.a.create(Reduction);
                 job.* = .{ .child = Grouped.init(self.a, self.sort.manager, self.specs, self.sort.orders.len, workspace) catch |err| {
                     self.a.destroy(job);
@@ -203,6 +250,8 @@ pub const Grouped = struct {
                 job.child.sort.parallel_runs = false;
                 job.child.partitions[0] = self.partitions[index];
                 self.partitions[index] = null;
+                job.child.partition_inputs[0] = self.partition_inputs[index];
+                self.partition_inputs[index] = .empty;
                 job.output = try @import("parallel_output.zig").Pipe.create(self.sort.manager, self.bytes / 128);
                 job.task = @import("parallel_scheduler.zig").global().submit(self.sort.manager.io, workspace, Reduction.run, .{job});
                 if (job.task == null) {
@@ -263,60 +312,71 @@ pub const Grouped = struct {
         }
     }
     fn loadPartition(self: *Grouped) !bool {
-        while (true) {
-            if (self.partition_index == self.partitions.len) return false;
+        while (self.partition_index < self.partition_count) {
             const index = self.partition_index;
             self.partition_index += 1;
-            const file = if (self.partitions[index]) |*open| open else continue;
-            try file.seal();
+            if (self.partitions[index] == null and self.partition_inputs[index].items.len == 0) continue;
             self.local = try operators.Grouped.create(self.a, self.specs, .{ .bytes = self.bytes / 2, .groups = std.math.maxInt(usize) });
-            var offset: u64 = 0;
-            while (offset < file.size) {
-                try self.sort.manager.check();
-                var input = try file.readInputBlock(offset);
-                defer input.deinit();
-                const block = input.view();
-                var values_storage: [1024]Datum = undefined;
-                var keys_storage: [256]Datum = undefined;
-                const values = values_storage[0..block.width()];
-                const keys = keys_storage[0..block.keyWidth()];
-                for (0..block.count()) |lane| {
-                    for (values, 0..) |*value, column| value.* = try block.cell(lane, column);
-                    for (keys, 0..) |*key, column| key.* = try block.keyCell(lane, column);
-                    const row: operators.Row = .{ .values = values, .keys = keys, .ordinal = block.ordinal(lane) };
-                    if (row.values.len == 0 or row.values[0].value != .bool) return error.InvalidSqlSpill;
-                    const partial_state = row.values[0].value.bool;
-                    const fits = if (self.fallback != null) false else if (partial_state)
-                        try self.local.?.tryImportPartial(row.keys, row.values[1..], row.ordinal)
-                    else
-                        self.nativeInputs(row.values[1..]) and try self.local.?.canRetain(row.keys, row.values[1..]);
-                    if (self.fallback == null and !fits) {
-                        const fallback = try self.a.create(Grouped);
-                        errdefer self.a.destroy(fallback);
-                        fallback.* = try Grouped.init(self.a, self.sort.manager, self.specs, self.sort.orders.len, self.bytes);
-                        fallback.partitioned = false;
-                        fallback.sort.parallel_runs = self.parallel;
-                        // Logical sorted runs share reusable extents in one
-                        // anonymous file, preserving descriptor headroom for
-                        // other live partitions and their merge outputs.
-                        fallback.sort.shared_runs = true;
-                        errdefer fallback.deinit();
-                        try self.local.?.exportPartial(fallback);
-                        self.local.?.deinit();
-                        self.local = null;
-                        self.fallback = fallback;
-                    }
-                    if (self.fallback) |fallback| {
-                        try fallback.append(row);
-                    } else if (!partial_state) {
-                        try self.local.?.addOrdered(row.keys, row.values[1..], row.ordinal);
-                    }
-                }
-                offset += block.count();
+            if (self.partitions[index]) |*file| {
+                try self.loadFile(file, 0);
+                file.close();
+                self.partitions[index] = null;
             }
-            file.close();
-            self.partitions[index] = null;
+            for (self.partition_inputs[index].items) |*input| {
+                try self.loadFile(&input.file, input.ordinal_base);
+                input.file.close();
+                input.closed = true;
+            }
+            self.partition_inputs[index].clearRetainingCapacity();
             return true;
+        }
+        return false;
+    }
+    fn loadFile(self: *Grouped, file: *spill.Sequential, ordinal_base: u64) !void {
+        try file.seal();
+        var offset: u64 = 0;
+        while (offset < file.size) {
+            try self.sort.manager.check();
+            var input = try file.readInputBlock(offset);
+            defer input.deinit();
+            const block = input.view();
+            var values_storage: [1024]Datum = undefined;
+            var keys_storage: [256]Datum = undefined;
+            const values = values_storage[0..block.width()];
+            const keys = keys_storage[0..block.keyWidth()];
+            for (0..block.count()) |lane| {
+                for (values, 0..) |*value, column| value.* = try block.cell(lane, column);
+                for (keys, 0..) |*key, column| key.* = try block.keyCell(lane, column);
+                const row: operators.Row = .{ .values = values, .keys = keys, .ordinal = try std.math.add(u64, ordinal_base, block.ordinal(lane)) };
+                if (row.values.len == 0 or row.values[0].value != .bool) return error.InvalidSqlSpill;
+                const partial_state = row.values[0].value.bool;
+                const fits = if (self.fallback != null) false else if (partial_state)
+                    try self.local.?.tryImportPartial(row.keys, row.values[1..], row.ordinal)
+                else
+                    self.nativeInputs(row.values[1..]) and try self.local.?.canRetain(row.keys, row.values[1..]);
+                if (self.fallback == null and !fits) {
+                    const fallback = try self.a.create(Grouped);
+                    errdefer self.a.destroy(fallback);
+                    fallback.* = try Grouped.init(self.a, self.sort.manager, self.specs, self.sort.orders.len, self.bytes);
+                    fallback.partitioned = false;
+                    fallback.sort.parallel_runs = self.parallel;
+                    // Logical sorted runs share reusable extents in one
+                    // anonymous file, preserving descriptor headroom for
+                    // other live partitions and their merge outputs.
+                    fallback.sort.shared_runs = true;
+                    errdefer fallback.deinit();
+                    try self.local.?.exportPartial(fallback);
+                    self.local.?.deinit();
+                    self.local = null;
+                    self.fallback = fallback;
+                }
+                if (self.fallback) |fallback| {
+                    try fallback.append(row);
+                } else if (!partial_state) {
+                    try self.local.?.addOrdered(row.keys, row.values[1..], row.ordinal);
+                }
+            }
+            offset += block.count();
         }
     }
     pub fn nextBatch(self: *Grouped, a: Allocator, maximum: usize, exact: bool) anyerror!?operators.GroupBatch {
@@ -645,4 +705,57 @@ test "SQL parallel aggregate keys remain owned after output blocks and workers c
         seen[index] = true;
     }
     for (seen) |present| try std.testing.expect(present);
+}
+
+fn transferredPartitionScenario(a: Allocator, bytes: usize) !void {
+    var context: u8 = 0;
+    var manager: spill.Manager = .{ .alloc = a, .io = std.testing.io, .context = &context, .checkpoint = struct {
+        fn check(_: *anyopaque) !void {}
+    }.check };
+    defer manager.deinit();
+    const specs = [_]operators.AggregateSpec{ .{ .kind = .sum, .input_type = .integer }, .{ .kind = .count } };
+    var sources: [3]Grouped = undefined;
+    var initialized: usize = 0;
+    defer for (sources[0..initialized]) |*source| source.deinit();
+    for (&sources, 0..) |*source, lane| {
+        source.* = try Grouped.init(a, &manager, &specs, 1, 512 * 1024);
+        initialized += 1;
+        for (0..17) |index| {
+            const key: Datum = if (index == 0) .{} else Datum.json(.{ .integer = @intCast(index) });
+            const wide: i128 = @as(i128, std.math.maxInt(i64)) * 2;
+            const states = [_]operators.Aggregate{
+                .{ .alloc = a, .kind = .sum, .input_type = .integer, .count = 1, .integer_sum = if (lane == 0) wide else if (lane == 1) -wide else 7 },
+                .{ .alloc = a, .kind = .count, .input_type = null, .count = 1 },
+            };
+            try source.partial(&.{key}, &states, index);
+        }
+    }
+    var target = try Grouped.init(a, &manager, &specs, 1, bytes);
+    defer target.deinit();
+    target.partition_count = 2;
+    const pointers = [_]*Grouped{ &sources[0], &sources[1], &sources[2] };
+    const bases = [_]u64{ 0, 1000, 2000 };
+    try target.preparePartitionTransfer(&pointers, &bases);
+    const written = manager.written_bytes;
+    for (pointers, bases) |source, base| target.transferPartitions(source, base);
+    try std.testing.expectEqual(written, manager.written_bytes);
+    for (pointers) |source| for (source.partitions) |file| try std.testing.expect(file == null);
+    var scratch = std.heap.ArenaAllocator.init(a);
+    defer scratch.deinit();
+    var seen: usize = 0;
+    while (true) {
+        _ = scratch.reset(.free_all);
+        const result = (try target.next(scratch.allocator())) orelse break;
+        try std.testing.expectEqual(@as(i64, 7), result.aggregates[0].value.integer);
+        try std.testing.expectEqual(@as(i64, 3), result.aggregates[1].value.integer);
+        const index: u64 = if (result.keys[0].sql_null) 0 else @intCast(result.keys[0].value.integer);
+        try std.testing.expectEqual(index, result.ordinal);
+        seen += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 17), seen);
+}
+test "SQL spilled final hash owners transfer typed checkpoint extents and wide states" {
+    try transferredPartitionScenario(std.testing.allocator, 1024 * 1024);
+    try transferredPartitionScenario(std.testing.allocator, 64 * 1024);
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, transferredPartitionScenario, .{@as(usize, 64 * 1024)});
 }

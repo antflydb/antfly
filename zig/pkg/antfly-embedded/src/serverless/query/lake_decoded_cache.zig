@@ -36,6 +36,9 @@ pub const Item = struct {
     budget: Budget,
     arena: std.heap.ArenaAllocator,
     payload: Payload = .{ .columns = &.{} },
+    /// Validated physical header for a decoded page, keyed by immutable object
+    /// version, exact range and interpretation. Consumer quotas are not cached.
+    parquet_page_header: ?@import("lake_parquet_page.zig").ParsedHeader = null,
     /// Close extension resources while its immutable dependencies are pinned.
     extension_deinit: ?*const fn (*anyopaque) void = null,
     // Snapshot-local canonical row-ID ordering and totals, computed once.

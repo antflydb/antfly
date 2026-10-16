@@ -66,13 +66,55 @@ const ReduceWork = struct {
         return result;
     }
 };
+/// Hand unreduced spill streams to global hash owners without a serial
+/// local-finalize / decode / re-encode pass. In-memory locals export compact
+/// checkpoints once; on-disk locals move their existing extents unchanged.
+fn reduceSpilled(manager: *@import("spill.zig").Manager, grouped: *operators.Grouped, locals: []const ?*Result, workspace: usize) !bool {
+    var key_count: ?usize = null;
+    var sources: [4]*@import("spill_grouped.zig").Grouped = undefined;
+    var count: usize = 0;
+    var source_bases: [4]u64 = undefined;
+    var partitions: ?usize = null;
+    var rows: u64 = 0;
+    var bases: [4]u64 = undefined;
+    for (locals, 0..) |local, index| {
+        if (local.?.grouped.?.key_count) |width| {
+            if (key_count) |known| {
+                if (width != known) return error.InvalidSqlBackendResponse;
+            } else key_count = width;
+        }
+        bases[index] = rows;
+        rows = try std.math.add(u64, rows, local.?.grouped.?.rows_seen);
+        if (local.?.grouped.?.external) |source| {
+            if (!source.canTransferPartitions()) return false;
+            if (partitions) |n| {
+                if (n != source.partition_count) return false;
+            } else partitions = source.partition_count;
+            sources[count] = source;
+            source_bases[count] = bases[index];
+            count += 1;
+        }
+    }
+    const external = try grouped.backing.create(@import("spill_grouped.zig").Grouped);
+    errdefer grouped.backing.destroy(external);
+    external.* = try @import("spill_grouped.zig").Grouped.init(grouped.backing, manager, grouped.specs, key_count orelse return error.InvalidSqlBackendResponse, workspace * locals.len);
+    errdefer external.deinit();
+    external.partition_count = partitions.?;
+    for (locals, 0..) |local, index| if (local.?.grouped.?.external == null) try local.?.grouped.?.exportPartialAt(external, bases[index]);
+    try external.preparePartitionTransfer(sources[0..count], source_bases[0..count]);
+    // No fallible operation follows the first ownership transfer.
+    for (locals, 0..) |local, index| if (local.?.grouped.?.external) |source| external.transferPartitions(source, bases[index]);
+    grouped.external = external;
+    grouped.key_count = key_count;
+    grouped.finished = true;
+    grouped.rows_seen = rows;
+    return true;
+}
 fn reduce(context: runtime.Context, grouped: *operators.Grouped, locals: []const ?*Result, workspace: usize) !bool {
     var partials: usize = 0;
     for (locals) |local| {
         const source = local.?.grouped.?;
-        // Spilled partial streams already use bounded partition reduction.
-        // Retain the existing serial bridge for those streams and tiny groups.
-        if (source.external != null) return false;
+        if (source.external != null) return reduceSpilled(context.spill orelse return false, grouped, locals, workspace);
         partials +|= source.groupCount();
     }
     if (partials < 4096 or grouped.key_count == 0) return false;
@@ -255,4 +297,47 @@ pub fn execute(context: runtime.Context, bound: *const binding.Bound, grouped: *
         ordinal = try std.math.add(u64, ordinal, source.rows_seen);
     }
     return true;
+}
+
+test "SQL final spill exchange combines disk and memory locals without serial finalization" {
+    const a = std.testing.allocator;
+    var marker: u8 = 0;
+    var manager: @import("spill.zig").Manager = .{ .alloc = a, .io = std.testing.io, .context = &marker, .checkpoint = struct {
+        fn check(_: *anyopaque) !void {}
+    }.check };
+    defer manager.deinit();
+    var locals: [3]?*Result = @splat(null);
+    defer for (locals) |local| if (local) |owned| owned.deinit();
+    const specs = [_]operators.AggregateSpec{ .{ .kind = .sum, .input_type = .integer }, .{ .kind = .count } };
+    for (&locals, 0..) |*slot, lane| {
+        const result = try a.create(Result);
+        result.* = .{ .backing = a, .budget = .{ .backing = a, .limit = 1024 * 1024 } };
+        slot.* = result;
+        result.grouped = try operators.Grouped.create(result.budget.allocator(), &specs, .{ .bytes = 128 * 1024, .spill = &manager });
+        for (0..(if (lane == 2) @as(usize, 3) else 2048)) |index| {
+            const key = @import("scalar.zig").Datum.json(.{ .integer = @intCast(index) });
+            const value = @import("scalar.zig").Datum.json(.{ .integer = if (lane == 0) @intCast(index) else if (lane == 1) -@as(i64, @intCast(index)) else 7 });
+            try result.grouped.?.add(&.{key}, &.{ value, value });
+        }
+        try std.testing.expect((result.grouped.?.external != null) == (lane != 2));
+    }
+    const target = try operators.Grouped.create(a, &specs, .{ .bytes = 512 * 1024, .spill = &manager });
+    defer target.deinit();
+    try std.testing.expect(try reduceSpilled(&manager, target, &locals, 512 * 1024));
+    try std.testing.expectEqual(@as(u64, 4099), target.rows_seen);
+    for (locals[0..2]) |local| for (local.?.grouped.?.external.?.partitions) |file| try std.testing.expect(file == null);
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    var seen: [2048]bool = @splat(false);
+    while (true) {
+        _ = arena.reset(.free_all);
+        const result = (try target.nextResult(arena.allocator())) orelse break;
+        const key: usize = @intCast(result.keys[0].value.integer);
+        try std.testing.expect(!seen[key]);
+        seen[key] = true;
+        try std.testing.expectEqual(@as(i64, if (key < 3) 7 else 0), result.aggregates[0].value.integer);
+        try std.testing.expectEqual(@as(i64, if (key < 3) 3 else 2), result.aggregates[1].value.integer);
+        try std.testing.expectEqual(@as(u64, key), result.ordinal);
+    }
+    for (seen) |present| try std.testing.expect(present);
 }

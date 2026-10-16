@@ -142,36 +142,98 @@ pub const Filter = union(enum) {
 /// dictionary I/O and private DFA execution never hold it. Full/oversized
 /// caches decline reuse and preserve the ordinary per-consumer execution path.
 pub const PatternPrograms = struct {
-    const Kind = enum { regexp, wildcard };
+    const Kind = enum { regexp, wildcard, fuzzy };
     const Entry = struct {
         key: [32]u8,
         pattern: []u8,
-        program: union(Kind) { regexp: regex_mod.RegexAutomaton, wildcard: wildcard_mod.SearchPlan },
+        program: union(Kind) { regexp: regex_mod.RegexAutomaton, wildcard: wildcard_mod.SearchPlan, fuzzy: levenshtein.LevenshteinAutomaton },
+        executions: [4]?*Execution = @splat(null),
     };
+    const Execution = struct {
+        budget: @import("../sql/memory_budget.zig"),
+        program: union(enum) { regexp: regex_mod.RegexAutomaton, fuzzy: levenshtein.LevenshteinAutomaton },
+        busy: bool = false,
+        fn deinit(self: *@This()) void {
+            switch (self.program) {
+                inline else => |*program| program.deinit(),
+            }
+            std.debug.assert(self.budget.live == 0);
+        }
+    };
+    const ExecutionLease = struct {
+        owner: *PatternPrograms,
+        execution: *Execution,
+        fn release(self: @This()) void {
+            @import("antfly_platform").sync.lockYielding(&self.owner.mutex);
+            defer self.owner.mutex.unlock();
+            self.execution.busy = false;
+        }
+    };
+    /// Mutable DFA tables are exclusive to one traversal, but survive between
+    /// segments. Slots and their allocations belong to this bounded query owner.
+    fn checkout(self: *@This(), entry: *Entry, control: ExecutionControl) !?ExecutionLease {
+        try control.check();
+        @import("antfly_platform").sync.lockYielding(&self.mutex);
+        defer self.mutex.unlock();
+        for (entry.executions) |slot| if (slot) |execution| if (!execution.busy and !execution.budget.isExhausted()) {
+            execution.busy = true;
+            self.execution_hits += 1;
+            return .{ .owner = self, .execution = execution };
+        };
+        const slot = for (&entry.executions) |*candidate| {
+            if (candidate.* == null) break candidate;
+        } else return null;
+        const a = self.budget.allocator();
+        const execution = a.create(Execution) catch |err| {
+            if (self.budget.isExhausted()) return null;
+            return err;
+        };
+        execution.* = .{ .budget = .{ .backing = a, .limit = @min(256 * 1024, self.budget.limit / 4) }, .program = undefined, .busy = true };
+        execution.program = switch (entry.program) {
+            .regexp => |*program| .{ .regexp = program.fork(execution.budget.allocator()) },
+            .fuzzy => |program| .{ .fuzzy = .{ .term = program.term, .max_distance = program.max_distance, .alloc = execution.budget.allocator() } },
+            .wildcard => unreachable,
+        };
+        slot.* = execution;
+        self.execution_builds += 1;
+        return .{ .owner = self, .execution = execution };
+    }
     budget: @import("../sql/memory_budget.zig"),
     entries: [16]?*Entry = @splat(null),
     mutex: std.atomic.Mutex = .unlocked,
     builds: usize = 0,
     hits: usize = 0,
+    execution_builds: usize = 0,
+    execution_hits: usize = 0,
     pub fn init(a: Allocator, bytes: usize) @This() {
         return .{ .budget = .{ .backing = a, .limit = bytes } };
     }
     pub fn deinit(self: *@This()) void {
         const a = self.budget.allocator();
         for (self.entries) |entry| if (entry) |held| {
+            for (held.executions) |slot| if (slot) |execution| {
+                std.debug.assert(!execution.busy);
+                execution.deinit();
+                a.destroy(execution);
+            };
             switch (held.program) {
                 .regexp => |*program| program.deinit(),
                 .wildcard => |*program| program.deinit(a),
+                .fuzzy => |*program| program.deinit(),
             }
             a.free(held.pattern);
             a.destroy(held);
         };
         std.debug.assert(self.budget.live == 0);
     }
-    fn get(self: *@This(), kind: Kind, pattern: []const u8, control: ExecutionControl) !?*const Entry {
+    fn get(self: *@This(), kind: Kind, pattern: []const u8, control: ExecutionControl) !?*Entry {
+        return self.getDistance(kind, pattern, 0, control);
+    }
+    fn getDistance(self: *@This(), kind: Kind, pattern: []const u8, distance: u8, control: ExecutionControl) !?*Entry {
         try control.check();
         var hasher = std.crypto.hash.sha2.Sha256.init(.{});
         hasher.update(@tagName(kind));
+        if (kind == .fuzzy) hasher.update(&.{distance});
         hasher.update(pattern);
         var key: [32]u8 = undefined;
         hasher.final(&key);
@@ -184,9 +246,8 @@ pub const PatternPrograms = struct {
         const slot = for (&self.entries) |*entry| {
             if (entry.* == null) break entry;
         } else return null;
-        self.budget.exhausted = false;
-        const built = self.build(kind, pattern, key) catch |err| {
-            if (err == error.OutOfMemory and self.budget.exhausted) return null;
+        const built = self.build(kind, pattern, key, distance) catch |err| {
+            if (err == error.OutOfMemory and self.budget.isExhausted()) return null;
             return err;
         };
         slot.* = built;
@@ -194,7 +255,7 @@ pub const PatternPrograms = struct {
         try control.check();
         return built;
     }
-    fn build(self: *@This(), kind: Kind, pattern: []const u8, key: [32]u8) !*Entry {
+    fn build(self: *@This(), kind: Kind, pattern: []const u8, key: [32]u8, distance: u8) !*Entry {
         const a = self.budget.allocator();
         const entry = try a.create(Entry);
         errdefer a.destroy(entry);
@@ -203,6 +264,7 @@ pub const PatternPrograms = struct {
         entry.* = .{ .key = key, .pattern = owned, .program = switch (kind) {
             .regexp => .{ .regexp = try regex_mod.compile(a, owned) },
             .wildcard => .{ .wildcard = try wildcard_mod.searchPlanAlloc(a, owned) },
+            .fuzzy => .{ .fuzzy = .{ .term = owned, .max_distance = distance } },
         } };
         return entry;
     }
@@ -886,14 +948,30 @@ pub const FuzzyFilter = struct {
         // shared prefix is already more than `max_edits` away are skipped
         // without decoding, and each decoded term only feeds its front-coded
         // leaf bytes through the DFA.
-        var lev = levenshtein.LevenshteinAutomaton{ .term = self.term, .max_distance = self.max_edits, .alloc = alloc };
-        defer lev.deinit();
+        const cached = if (self.control.pattern_programs) |programs| try programs.getDistance(.fuzzy, self.term, self.max_edits, self.control) else null;
+        const execution = if (cached) |entry| try self.control.pattern_programs.?.checkout(entry, self.control) else null;
+        defer if (execution) |lease| lease.release();
+        var local = levenshtein.LevenshteinAutomaton{ .term = self.term, .max_distance = self.max_edits, .alloc = alloc };
+        defer local.deinit();
+        const lev = if (execution) |lease| &lease.execution.program.fuzzy else &local;
         var term_iter = try inv_reader.fstSearchIterator(lev.automaton());
         defer term_iter.deinit();
 
         var result = roaring.RoaringBitmap.init(alloc);
         errdefer result.deinit();
+        const original_stats = if (stats) |value| value.* else null;
         try collectAutomatonTerms(alloc, &term_iter, &result, self, acceptTerm, collect_stats, stats);
+        if (lev.allocation_failed) {
+            if (execution) |lease| if (lease.execution.budget.isExhausted() or lease.owner.budget.isExhausted()) {
+                result.deinit();
+                result = roaring.RoaringBitmap.init(alloc);
+                var fallback = self;
+                fallback.control.pattern_programs = null;
+                if (stats) |value| value.* = original_stats.?;
+                return fallback.executeInternal(alloc, seg, collect_stats, stats);
+            };
+            return error.OutOfMemory;
+        }
         return result;
     }
 };
@@ -964,19 +1042,33 @@ pub const RegexpFilter = struct {
             error.InvalidRegex => return roaring.RoaringBitmap.init(alloc),
             else => return err,
         } else null;
-        var regex = if (cached) |entry| entry.program.regexp.fork(alloc) else regex_mod.compile(alloc, self.pattern) catch |err| switch (err) {
+        const execution = if (cached) |entry| try self.control.pattern_programs.?.checkout(entry, self.control) else null;
+        defer if (execution) |lease| lease.release();
+        var local = if (execution != null) null else if (cached) |entry| entry.program.regexp.fork(alloc) else regex_mod.compile(alloc, self.pattern) catch |err| switch (err) {
             error.OutOfMemory => return err,
             else => return roaring.RoaringBitmap.init(alloc),
         };
-        defer regex.deinit();
+        defer if (local) |*program| program.deinit();
+        const regex = if (execution) |lease| &lease.execution.program.regexp else &local.?;
 
         var term_iter = try inv_reader.fstSearchIterator(regex.automaton());
         defer term_iter.deinit();
 
         var result = roaring.RoaringBitmap.init(alloc);
         errdefer result.deinit();
+        const original_stats = if (stats) |value| value.* else null;
         try collectAutomatonTerms(alloc, &term_iter, &result, self, acceptTerm, collect_stats, stats);
-        if (regex.allocation_failed) return error.OutOfMemory;
+        if (regex.allocation_failed) {
+            if (execution) |lease| if (lease.execution.budget.isExhausted() or lease.owner.budget.isExhausted()) {
+                result.deinit();
+                result = roaring.RoaringBitmap.init(alloc);
+                var fallback = self;
+                fallback.control.pattern_programs = null;
+                if (stats) |value| value.* = original_stats.?;
+                return fallback.executeInternal(alloc, seg, collect_stats, stats);
+            };
+            return error.OutOfMemory;
+        }
         return result;
     }
 };
@@ -1791,7 +1883,10 @@ fn collectFuzzyCandidateTerms(
     defer term_iter.deinit();
 
     var out = std.ArrayListUnmanaged([]const u8).empty;
-    errdefer out.deinit(alloc);
+    errdefer {
+        for (out.items) |text| alloc.free(text);
+        out.deinit(alloc);
+    }
 
     while (try term_iter.next()) |entry| {
         if (!fuzzyPrefixMatches(term, entry.term, prefix_len)) continue;
@@ -1802,10 +1897,17 @@ fn collectFuzzyCandidateTerms(
                 break;
             }
         }
-        if (!seen) try out.append(alloc, try alloc.dupe(u8, entry.term));
+        if (!seen) {
+            try out.ensureUnusedCapacity(alloc, 1);
+            out.appendAssumeCapacity(try alloc.dupe(u8, entry.term));
+        }
     }
 
-    if (out.items.len == 0) try out.append(alloc, try alloc.dupe(u8, term));
+    if (lev.allocation_failed) return error.OutOfMemory;
+    if (out.items.len == 0) {
+        try out.ensureUnusedCapacity(alloc, 1);
+        out.appendAssumeCapacity(try alloc.dupe(u8, term));
+    }
     return out.toOwnedSlice(alloc);
 }
 
@@ -4163,6 +4265,7 @@ test "external lake metadata navigation compiled programs share immutable plans 
     const leaves = [_]Filter{
         .{ .regexp = .{ .field = "body", .pattern = "alp.*" } },
         .{ .wildcard = .{ .field = "body", .pattern = "al\\p*" } },
+        .{ .fuzzy = .{ .field = "body", .term = "alpina", .max_edits = 1 } },
     };
     const Worker = struct {
         fn run(alloc: Allocator, leaf: Filter, segment: *const index_mod.SegmentEntry) anyerror!void {
@@ -4183,8 +4286,32 @@ test "external lake metadata navigation compiled programs share immutable plans 
         if (failure) |err| return err;
         try testing.expectError(error.Timeout, leaf.withControl(.{ .pattern_programs = &programs, .deadline_ns = 0 }).execute(a, &writer.snapshot().segments[0]));
     }
-    try testing.expectEqual(@as(usize, 2), programs.builds);
-    try testing.expectEqual(@as(usize, 6), programs.hits);
+    try testing.expectEqual(@as(usize, 3), programs.builds);
+    try testing.expectEqual(@as(usize, 9), programs.hits);
+    const built = programs.execution_builds;
+    for (leaves) |leaf| for (writer.snapshot().segments) |*segment| try Worker.run(a, leaf.withControl(.{ .pattern_programs = &programs }), segment);
+    try testing.expectEqual(built, programs.execution_builds);
+    try testing.expect(programs.execution_hits >= 8);
+    const entry = (try programs.get(.regexp, "alp.*", .{})).?;
+    var leases: [4]?PatternPrograms.ExecutionLease = @splat(null);
+    defer for (leases) |lease| if (lease) |held| held.release();
+    for (&leases) |*lease| lease.* = (try programs.checkout(entry, .{})).?;
+    try testing.expect((try programs.checkout(entry, .{})) == null);
+    try Worker.run(a, leaves[0].withControl(.{ .pattern_programs = &programs }), &writer.snapshot().segments[0]);
+    for (&leases) |*lease| {
+        lease.*.?.release();
+        lease.* = null;
+    }
+    for ([_]bool{ false, true }) |fuzzy| {
+        var bounded = PatternPrograms.init(a, 1024 * 1024);
+        defer bounded.deinit();
+        const plan = (try bounded.getDistance(if (fuzzy) .fuzzy else .regexp, if (fuzzy) "alpina" else "alp.*", if (fuzzy) 1 else 0, .{})).?;
+        const lease = (try bounded.checkout(plan, .{})).?;
+        lease.execution.budget.limit = 0;
+        lease.release();
+        try Worker.run(a, leaves[if (fuzzy) 2 else 0].withControl(.{ .pattern_programs = &bounded }), &writer.snapshot().segments[0]);
+        try testing.expect(lease.execution.budget.isExhausted());
+    }
     // Optional cache admission never makes a valid pattern disappear.
     var tiny = PatternPrograms.init(a, 0);
     defer tiny.deinit();
