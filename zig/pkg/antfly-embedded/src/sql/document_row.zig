@@ -146,6 +146,8 @@ pub fn declaredCell(alloc: std.mem.Allocator, column: catalog.Column, raw: catal
 pub const Projection = struct {
     columns: []const catalog.Column,
     has_typed_cells: bool = false,
+    source_slots: std.StringHashMapUnmanaged(usize) = .empty,
+    next_source: []usize = &.{},
 
     pub fn init(alloc: std.mem.Allocator, table: catalog.Table, fields: []const []const u8) !Projection {
         var declared: std.StringHashMapUnmanaged(catalog.Column) = .empty;
@@ -180,7 +182,24 @@ pub const Projection = struct {
         return .{ .columns = columns, .has_typed_cells = has_typed_cells };
     }
 
+    /// Ranked hits need a root-member routing plan; ordinary scan projections
+    /// keep their existing initialization cost and do not build this directory.
+    pub fn initSearch(alloc: std.mem.Allocator, table: catalog.Table, fields: []const []const u8) !Projection {
+        var result = try init(alloc, table, fields);
+        errdefer result.deinit(alloc);
+        result.next_source = try alloc.alloc(usize, result.columns.len);
+        for (result.columns, result.next_source, 0..) |column, *next, slot| {
+            const entry = try result.source_slots.getOrPut(alloc, column.path);
+            next.* = if (entry.found_existing) entry.value_ptr.* else std.math.maxInt(usize);
+            entry.value_ptr.* = slot;
+        }
+        return result;
+    }
+
     pub fn deinit(self: Projection, alloc: std.mem.Allocator) void {
+        var slots = self.source_slots;
+        slots.deinit(alloc);
+        alloc.free(self.next_source);
         for (self.columns) |column| {
             if (column.path.ptr != column.name.ptr) alloc.free(column.path);
             alloc.free(column.name);
@@ -239,6 +258,73 @@ pub const Projection = struct {
         result.pattern_sources = null;
         result.typed_cells = .{ .layout = directory, .values = cells, .presence = presence };
         return result;
+    }
+
+    pub const SearchSource = union(enum) { value: Json, bytes: []const u8 };
+    pub const SearchMetadata = struct { score: ?f64 = null, highlights: ?Json = null };
+
+    /// Copy only selected payloads into their final native cells. Raw stored
+    /// hits validate every subtree/duplicate key while materializing selected
+    /// root members only. Metadata overrides never mutate or copy the hit tree.
+    pub fn projectSearch(self: Projection, alloc: std.mem.Allocator, scratch: std.mem.Allocator, layout: catalog.Row.TypedLayout, id: []const u8, source: SearchSource, metadata: SearchMetadata) !catalog.Row {
+        if (layout.names.len != self.columns.len or self.next_source.len != self.columns.len) return error.InvalidSqlBackendResponse;
+        const cells = try alloc.alloc(catalog.Row.Cell, self.columns.len);
+        @memset(cells, .{});
+        const presence = try alloc.alloc(bool, self.columns.len);
+        @memset(presence, false);
+        const Sink = struct {
+            projection: Projection,
+            alloc: std.mem.Allocator,
+            scratch: std.mem.Allocator,
+            cells: []catalog.Row.Cell,
+            presence: []bool,
+            fn put(target: *@This(), name: []const u8, value: Json) !void {
+                var slot = target.projection.source_slots.get(name) orelse return;
+                while (slot != std.math.maxInt(usize)) {
+                    const column = target.projection.columns[slot];
+                    const sql_null = value == .null and column.type != .json;
+                    if (sql_null and !column.nullable) return error.InvalidSqlBackendResponse;
+                    const owned = if (sql_null) Json.null else if (column.type == .array) try typed_json.clone(target.alloc, value) else if (column.element_type == .numeric and column.type == .number) value else try coerce(target.alloc, value, column.type);
+                    target.cells[slot] = try declaredCell(target.alloc, column, .{ .value = owned, .sql_null = sql_null });
+                    target.presence[slot] = true;
+                    slot = target.projection.next_source[slot];
+                }
+            }
+            fn member(raw: *anyopaque, name: []const u8, bytes: []const u8) !void {
+                const target: *@This() = @ptrCast(@alignCast(raw));
+                if (std.mem.eql(u8, name, "score") or std.mem.eql(u8, name, "_highlights") or !target.projection.source_slots.contains(name)) return;
+                // The temporary DOM dies after this selected field; put owns
+                // all returned payloads, including exact NUMERIC coefficients.
+                var parsed = try std.json.parseFromSlice(Json, target.scratch, bytes, .{ .parse_numbers = false });
+                defer parsed.deinit();
+                try target.put(name, parsed.value);
+            }
+        };
+        var sink: Sink = .{ .projection = self, .alloc = alloc, .scratch = scratch, .cells = cells, .presence = presence };
+        switch (source) {
+            .value => |root| {
+                if (root != .object) return error.InvalidSqlBackendResponse;
+                var fields = self.source_slots.iterator();
+                while (fields.next()) |entry| {
+                    const name = entry.key_ptr.*;
+                    if (std.mem.eql(u8, name, "score") or std.mem.eql(u8, name, "_highlights")) continue;
+                    if (root.object.get(name)) |value| try sink.put(name, value);
+                }
+            },
+            .bytes => |bytes| {
+                var scanner = std.json.Scanner.initCompleteInput(scratch, bytes);
+                defer scanner.deinit();
+                if (try scanner.peekNextTokenType() != .object_begin) return error.InvalidSqlBackendResponse;
+                try @import("antfly-json").scanValue(scratch, &scanner, bytes.len, .{ .ctx = &sink, .member_fn = Sink.member });
+                if (try scanner.next() != .end_of_document) return error.InvalidSqlBackendResponse;
+            },
+        }
+        try sink.put("score", if (metadata.score) |score| .{ .float = score } else .null);
+        if (metadata.highlights) |value| try sink.put("_highlights", value);
+        for (self.columns, layout.names, cells, presence) |column, name, cell, present| {
+            if (!std.mem.eql(u8, column.name, name) or (!present and !column.nullable) or (cell.sql_null and !column.nullable)) return error.InvalidSqlBackendResponse;
+        }
+        return .{ .id = try alloc.dupe(u8, id), .version = 0, .value = .null, .typed_cells = .{ .layout = layout, .values = cells, .presence = presence } };
     }
 
     pub fn decode(self: Projection, alloc: std.mem.Allocator, id: []const u8, version: u64, bytes: []const u8) !catalog.Row {
@@ -563,4 +649,61 @@ test "SQL document declared shape and projection clean up allocation failures" {
         }
     };
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Fixture.run, .{});
+}
+
+test "SQL document search projection owns only selected payloads with metadata and strict raw validation" {
+    const Probe = struct {
+        fn run(a: std.mem.Allocator, large: bool) !void {
+            var source = std.heap.ArenaAllocator.init(a);
+            defer source.deinit();
+            const sa = source.allocator();
+            const ignored = try sa.alloc(u8, if (large) 1024 * 1024 else 16);
+            @memset(ignored, 'x');
+            const bytes = try std.fmt.allocPrint(sa, "{{\"ignored\":\"{s}\",\"i\":9007199254740993,\"n\":9007199254740993.1200,\"a\":{{\"dimensions\":[{{\"length\":1,\"lower_bound\":-3}}],\"values\":[\"owned\"],\"sql_nulls\":[false]}},\"j\":[null,{{\"s\":\"kept\"}}],\"z\":null,\"score\":100,\"_highlights\":\"ignored\"}}", .{ignored});
+            const root = try std.json.parseFromSliceLeaky(Json, sa, bytes, .{ .parse_numbers = false });
+            const table: catalog.Table = .{ .id = 1, .physical_name = "rows", .schema_version = 1, .columns = &.{
+                .{ .name = "i", .path = "i", .type = .integer },
+                .{ .name = "n", .path = "n", .type = .number, .element_type = .numeric },
+                .{ .name = "a", .path = "a", .type = .array, .element_type = .text },
+                .{ .name = "j", .path = "j", .type = .json },
+                .{ .name = "z", .path = "z", .type = .json },
+                .{ .name = "missing", .path = "missing", .type = .string },
+                .{ .name = "score", .path = "score", .type = .number },
+                .{ .name = "_highlights", .path = "_highlights", .type = .json },
+            } };
+            const names = &[_][]const u8{ "i", "n", "a", "j", "z", "missing", "score", "_highlights" };
+            const projection = try Projection.initSearch(a, table, names);
+            defer projection.deinit(a);
+            for ([_]bool{ false, true }) |raw| {
+                var budget: @import("memory_budget.zig") = .{ .backing = a, .limit = 64 * 1024 };
+                var output = std.heap.ArenaAllocator.init(budget.allocator());
+                defer output.deinit();
+                var scratch = std.heap.ArenaAllocator.init(a);
+                defer scratch.deinit();
+                const oa = output.allocator();
+                const layout = try catalog.Row.TypedLayout.init(oa, names);
+                const row = try projection.projectSearch(oa, scratch.allocator(), layout, "row", if (raw) .{ .bytes = bytes } else .{ .value = root }, .{ .score = 0.5, .highlights = .{ .string = "actual" } });
+                _ = scratch.reset(.free_all);
+                try std.testing.expect(row.typed_cells != null and row.value == .null);
+                try std.testing.expectEqual(@as(i64, 9007199254740993), (try row.cell("i")).value.integer);
+                try std.testing.expectEqualStrings("owned", (try row.cell("a")).array.?.flatCell(0).value.string);
+                try std.testing.expectEqual(@as(u16, 4), (try row.cell("n")).numeric.?.scale);
+                try std.testing.expectEqualStrings("kept", (try row.cell("j")).value.array.items[1].object.get("s").?.string);
+                try std.testing.expect(!(try row.cell("z")).sql_null);
+                try std.testing.expect(!try row.hasField("missing"));
+                try std.testing.expectEqual(@as(f64, 0.5), (try row.cell("score")).value.float);
+                try std.testing.expectEqualStrings("actual", (try row.cell("_highlights")).value.string);
+                if (large) std.debug.print("document search {s}: output peak {d} bytes for {d}-byte hit\n", .{ if (raw) "raw" else "parsed", budget.peak, bytes.len });
+                for ([_][]const u8{ "{\"ignored\":{\"x\":0,\"\\u0078\":1}}", "{\"ignored\":[1,]}", "{} trailing", "[]" }) |invalid| {
+                    if (projection.projectSearch(oa, scratch.allocator(), layout, "row", .{ .bytes = invalid }, .{})) |_| return error.ExpectedInvalidDocument else |err| switch (err) {
+                        error.OutOfMemory => return err,
+                        else => {},
+                    }
+                }
+            }
+        }
+    };
+    try Probe.run(std.testing.allocator, true);
+    var stable = std.testing.FailingAllocator.init(std.testing.allocator, .{ .resize_fail_index = 0 });
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(stable.allocator(), Probe.run, .{false});
 }

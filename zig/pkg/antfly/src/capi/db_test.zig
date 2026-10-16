@@ -6695,3 +6695,33 @@ test "capi lite inference failed open drains the configured generation before re
     // Exercise final-service destruction through the same failed-open path.
     try std.testing.expectError(error.UnexpectedEndOfInput, public.openLiteHandleAllocWithRuntime(a, path, options, false, shared.handleLockIo(), null));
 }
+
+test "capi SQL document search projects native cells without copying unselected bodies" {
+    const a = std.testing.allocator;
+    var directory = try TestDirectory.init("capi-sql-document-search");
+    defer directory.cleanup();
+    var database = try db_mod.DB.open(a, directory.path(), .{ .start_optional_runtimes = false, .start_index_workers = false });
+    defer database.close();
+    try database.setSchemaJson(a,
+        \\{"version":1,"storage_mode":"document","default_type":"doc","document_schemas":{"doc":{"schema":{"type":"object","properties":{"body":{"type":"string"},"payload":{"type":"object","properties":{"amount":{"type":"integer"}}},"ignored":{"type":"string"}},"additionalProperties":false}}}}
+    );
+    try database.addIndex(.{ .name = "ft_v1", .kind = .full_text, .config_json = "{\"field\":\"body\"}" });
+    const ignored = try a.alloc(u8, 1024 * 1024);
+    defer a.free(ignored);
+    @memset(ignored, 'x');
+    const document = try std.fmt.allocPrint(a, "{{\"body\":\"alpha\",\"payload\":{{\"amount\":9007199254740993}},\"ignored\":\"{s}\"}}", .{ignored});
+    defer a.free(document);
+    try database.batch(.{ .writes = &.{.{ .key = "a", .value = document }} });
+    try database.runUntilIdle();
+    const sql = @import("antfly_local_sources").capi_sql;
+    var adapter = sql.Adapter(antfly){ .db = &database, .table_name = "rows" };
+    var searched = try sql.compiler.compile(a, "SELECT _id,body,payload->>'amount',score FROM antfly_search('rows','body:alpha')", .{});
+    defer searched.deinit();
+    var hits = try sql.runtime.execute(a, adapter.backend(), &searched, &.{}, .{ .page_rows = 1 });
+    defer hits.deinit();
+    try std.testing.expectEqual(@as(usize, 1), hits.output.rows.len);
+    try std.testing.expectEqualStrings("a", hits.output.rows[0][0].string);
+    try std.testing.expectEqualStrings("alpha", hits.output.rows[0][1].string);
+    try std.testing.expectEqualStrings("9007199254740993", hits.output.rows[0][2].string);
+    try std.testing.expect(!hits.output.sql_nulls.?[0][3]);
+}

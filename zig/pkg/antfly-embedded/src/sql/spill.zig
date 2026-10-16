@@ -799,6 +799,21 @@ pub fn encodeColumnarBlockVersionAlloc(a: Allocator, rows: []const Row, max_byte
     try Sequential.encodeColumns(&encoder, rows, true);
     return bytes.toOwnedSlice(a);
 }
+/// Encode a borrowed batch one bounded column at a time. The encoded bytes
+/// are identical to the row API; neither payloads nor a row matrix are staged.
+pub fn encodeColumnarBatchVersionAlloc(a: Allocator, values: @import("execution_batch.zig").Batch, ordinals: []const u64, max_bytes: usize, version: ColumnarVersion) ![]u8 {
+    if (values.len() == 0 or values.len() > 256 or values.width() > 1024 or ordinals.len != values.len()) return error.InvalidSqlSpill;
+    var bytes: std.ArrayList(u8) = .empty;
+    errdefer bytes.deinit(a);
+    var encoder: Encoder = .{ .compact_arrays = version == .v2, .a = a, .bytes = &bytes, .limit = max_bytes };
+    try encoder.append(if (version == .v1) columnar_v1_magic else columnar_v2_magic);
+    try encoder.word(values.len());
+    try encoder.word(values.width());
+    try encoder.word(0);
+    for (ordinals) |ordinal| try encoder.word(ordinal);
+    try Sequential.encodeBatchColumns(&encoder, values, 0, values.len());
+    return bytes.toOwnedSlice(a);
+}
 /// Payload bytes and decoded metadata borrow the caller's page arena. Fetch
 /// authenticated artifact bytes into that same arena before decoding, so no
 /// payload copy or per-row cell array is needed. The caller resets the arena
@@ -914,22 +929,29 @@ pub const Sequential = struct {
         }
     }
     fn encodeBatchColumns(encoder: *Encoder, batch: @import("execution_batch.zig").Batch, begin: usize, end: usize) !void {
+        var scratch = std.heap.ArenaAllocator.init(encoder.a);
+        defer scratch.deinit();
+        const temporary = scratch.allocator();
         // One bounded column of borrowed cells feeds the shared physical codec.
         // Dictionary choice, SQL NULL and JSON null retain exactly one format.
         var cells: [256]Datum = undefined;
         var rows: [256]Row = undefined;
         var positions: [256]usize = undefined;
         for (positions[0 .. end - begin], begin..) |*position, index| position.* = index;
-        const selected = try batch.select(encoder.a, positions[0 .. end - begin]);
+        const selected = try batch.select(temporary, positions[0 .. end - begin]);
+        var column_scratch = std.heap.ArenaAllocator.init(encoder.a);
+        defer column_scratch.deinit();
         for (0..batch.width()) |column| {
-            const dictionary = try selected.dictionaryColumn(encoder.a, column);
-            defer if (dictionary) |physical| {
-                encoder.a.free(physical.dictionary.values);
-                encoder.a.free(physical.dictionary.indices);
-            };
+            if (!column_scratch.reset(.{ .retain_with_limit = 256 * 1024 })) return error.OutOfMemory;
+            const column_alloc = column_scratch.allocator();
+            const dictionary = try selected.dictionaryColumn(column_alloc, column);
             if (dictionary) |physical| if (physical != .dictionary or physical.len() != end - begin) return error.InvalidSqlSpill;
+            defer if (dictionary) |physical| {
+                column_alloc.free(physical.dictionary.values);
+                column_alloc.free(physical.dictionary.indices);
+            };
             for (begin..end, 0..) |index, lane| {
-                cells[lane] = if (dictionary) |physical| try physical.cell(encoder.a, lane, 0) else try batch.cell(encoder.a, index, column);
+                cells[lane] = if (dictionary) |physical| try physical.cell(column_alloc, lane, 0) else try batch.cell(column_alloc, index, column);
                 rows[lane] = .{ .values = cells[lane..][0..1], .keys = &.{}, .ordinal = 0 };
             }
             try encodeColumns(encoder, rows[0 .. end - begin], false);
@@ -1180,11 +1202,70 @@ pub const Sequential = struct {
         read_first: u64 = 0,
         read_offset: u64 = 0,
 
+        compact: ?*OwnedBlock = null,
+        compact_first: u64 = 0,
+        compact_offset: u64 = 0,
+        compact_values: []Datum = &.{},
+        compact_keys: []Datum = &.{},
+
+        fn prepareCurrent(self: *ReplayReader, offset: u64) !void {
+            if (offset >= self.source.size) return error.InvalidSqlSpill;
+            const cached = if (self.compact) |block| offset >= self.compact_first and offset - self.compact_first < block.count() else false;
+            if (!cached) {
+                var physical: u64 = if (offset == 0) 0 else self.compact_offset;
+                if (offset != 0 and (self.compact == null or offset != self.compact_first + self.compact.?.count())) return error.InvalidSqlSpill;
+                const a = self.source.file.manager.allocator();
+                const block = try a.create(OwnedBlock);
+                errdefer a.destroy(block);
+                block.* = .{ .a = a, .arena = .init(a) };
+                errdefer block.arena.deinit();
+                const owned = block.arena.allocator();
+                try decodeCompactAt(&self.source.file, self.source.size, &physical, block, owned, offset);
+                if (self.compact) |old| old.release();
+                self.compact = block;
+                self.compact_first = offset;
+                self.compact_offset = physical;
+                self.compact_values = &.{};
+                self.compact_keys = &.{};
+            }
+        }
+        /// One-row adapter over retained compact columns. Payloads borrow the
+        /// current block; the descriptor slices expire on this reader's next
+        /// readCurrent call. Other replay readers have independent storage.
+        pub fn readCurrent(self: *ReplayReader, offset: u64) !Decoded {
+            try self.prepareCurrent(offset);
+            const block = self.compact.?;
+            const owned = block.arena.allocator();
+            if (self.compact_values.len != block.width()) self.compact_values = try owned.alloc(Datum, block.width());
+            if (self.compact_keys.len != block.keyWidth()) self.compact_keys = try owned.alloc(Datum, block.keyWidth());
+            const lane: usize = @intCast(offset - self.compact_first);
+            for (self.compact_values, 0..) |*value, column| value.* = try block.cell(lane, column);
+            for (self.compact_keys, 0..) |*value, column| value.* = try block.keyCell(lane, column);
+            return .{ .row = .{ .values = self.compact_values, .keys = self.compact_keys, .ordinal = block.ordinal(lane) }, .next = none, .matched = false, .following = offset + 1 };
+        }
+
+        /// Keep compact columns through batch consumers. The borrowed block
+        /// expires on the next block load; only selection descriptors use a.
+        pub fn readBatchCurrent(self: *ReplayReader, a: Allocator, offset: u64, maximum: usize) !struct { values: @import("execution_batch.zig").Batch, following: u64 } {
+            if (maximum == 0) return error.InvalidSqlLimit;
+            try self.prepareCurrent(offset);
+            const block = self.compact.?;
+            const begin: usize = @intCast(offset - self.compact_first);
+            const count = @min(maximum, block.count() - begin);
+            const Batch = @import("execution_batch.zig").Batch;
+            const source = try a.create(Batch);
+            source.* = try block.batch(a, false);
+            const selection = try a.alloc(usize, count);
+            for (selection, begin..) |*position, index| position.* = index;
+            return .{ .values = try source.select(a, selection), .following = offset + count };
+        }
+
         pub fn readBorrowed(self: *ReplayReader, offset: u64) !Decoded {
             return readState(self, &self.source.file, self.source.size, offset);
         }
 
         pub fn deinit(self: *ReplayReader) void {
+            if (self.compact) |block| block.release();
             self.read_arena.deinit();
             self.source.readers -= 1;
             self.* = undefined;
@@ -1640,29 +1721,35 @@ pub const Sequential = struct {
     fn decodeCompactBlock(self: *Sequential, owner: *OwnedBlock, owned: Allocator, offset: u64) !void {
         try self.seal();
         if (offset >= self.size) return error.InvalidSqlSpill;
+        try decodeCompactAt(&self.file, self.size, &self.read_offset, owner, owned, offset);
+        self.read_first = offset + owner.count();
+        self.read_single_offset = null;
+    }
+    fn decodeCompactAt(file: *File, size: u64, physical: *u64, owner: *OwnedBlock, owned: Allocator, offset: u64) !void {
+        if (offset >= size) return error.InvalidSqlSpill;
         var header: [17]u8 = undefined;
-        try self.file.readRaw(self.read_offset, &header);
+        try file.readRaw(physical.*, &header);
         if (header[16] == 255) {
-            var decoded = try self.file.read(owned, self.read_offset);
+            var decoded = try file.read(owned, physical.*);
             if (decoded.next != none or decoded.matched) return error.InvalidSqlSpill;
-            self.read_offset = decoded.following;
+            physical.* = decoded.following;
             decoded.following = offset + 1;
             owner.rows = try owned.dupe(Row, &.{decoded.row});
         } else {
             const len = std.mem.readInt(u64, header[0..8], .little);
-            if (header[16] > 1 or len > self.file.manager.max_record_bytes or len > self.file.size -| (self.read_offset + header.len)) return error.InvalidSqlSpill;
+            if (header[16] > 1 or len > file.manager.max_record_bytes or len > file.size -| (physical.* + header.len)) return error.InvalidSqlSpill;
             const encoded = try owned.alloc(u8, @intCast(len));
-            try self.file.readRaw(self.read_offset + header.len, encoded);
+            try file.readRaw(physical.* + header.len, encoded);
             const payload = if (header[16] == 1) blk: {
-                if (try snappy.decodedLen(encoded) > self.file.manager.max_record_bytes) return error.InvalidSqlSpill;
+                if (try snappy.decodedLen(encoded) > file.manager.max_record_bytes) return error.InvalidSqlSpill;
                 break :blk try snappy.decode(owned, encoded);
             } else encoded;
             if (std.hash.Wyhash.hash(0, payload) != std.mem.readInt(u64, header[8..16], .little)) return error.InvalidSqlSpill;
-            var decoder: Decoder = .{ .borrow_compact = true, .manager = self.file.manager, .a = owned, .bytes = payload };
+            var decoder: Decoder = .{ .borrow_compact = true, .manager = file.manager, .a = owned, .bytes = payload };
             const count_rows = try decoder.count();
             const width_values = try decoder.count();
             const width_keys = try decoder.count();
-            if (count_rows == 0 or count_rows > 256 or count_rows > self.size - offset or width_values > 1024 or width_keys > 256) return error.InvalidSqlSpill;
+            if (count_rows == 0 or count_rows > 256 or count_rows > size - offset or width_values > 1024 or width_keys > 256) return error.InvalidSqlSpill;
             const ordinals = try owned.alloc(u64, count_rows);
             for (ordinals) |*ordinal| ordinal.* = try decoder.word();
             const values = try owned.alloc(EncodedColumn, width_values);
@@ -1671,10 +1758,8 @@ pub const Sequential = struct {
             for (keys) |*column| column.* = try EncodedColumn.decode(&decoder, count_rows);
             if (decoder.position != payload.len) return error.InvalidSqlSpill;
             owner.encoded = .{ .values = values, .keys = keys, .ordinals = ordinals };
-            self.read_offset += header.len + len;
+            physical.* += header.len + len;
         }
-        self.read_first = offset + owner.count();
-        self.read_single_offset = null;
     }
     /// Transfer a decoded arena without copying its cell payloads. The file
     /// retains only its forward physical offset; the lease owns this block.
@@ -3767,4 +3852,113 @@ test "SQL compact columnar arrays reject truncation and unwind allocation failur
         }
     };
     try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Probe.run, .{});
+}
+
+test "SQL column batch encoding preserves both frozen codecs without a row matrix" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const owned = arena.allocator();
+    const rows = try owned.alloc(Row, 256);
+    const ordinals = try owned.alloc(u64, rows.len);
+    const vectors = try owned.alloc([]const Datum, 24);
+    for (vectors, 0..) |*column, c| {
+        const cells = try owned.alloc(Datum, rows.len);
+        for (cells, 0..) |*cell, r| cell.* = if (r % 7 == 0) .{} else if (r % 11 == 0) Datum.json(.null) else if (c % 2 == 0) Datum.json(.{ .integer = @intCast(r % 3) }) else Datum.json(.{ .string = "dictionary string" });
+        column.* = cells;
+    }
+    for (rows, ordinals, 0..) |*row, *ordinal, r| {
+        const values = try owned.alloc(Datum, vectors.len);
+        for (values, vectors) |*value, column| value.* = column[r];
+        ordinal.* = r + 42;
+        row.* = .{ .values = values, .keys = &.{}, .ordinal = ordinal.* };
+    }
+    const batch: @import("execution_batch.zig").Batch = .{ .vectors = .{ .values = vectors, .count = rows.len } };
+    for ([_]ColumnarVersion{ .v1, .v2 }) |version| {
+        const old = try encodeColumnarBlockVersionAlloc(a, rows, 8 << 20, version);
+        defer a.free(old);
+        const direct = try encodeColumnarBatchVersionAlloc(a, batch, ordinals, 8 << 20, version);
+        defer a.free(direct);
+        try std.testing.expectEqualSlices(u8, old, direct);
+    }
+}
+
+test "SQL compact replay keeps one row of descriptors across independent readers and rewind" {
+    const Probe = struct {
+        fn run(a: Allocator, count_rows: usize) !void {
+            const Hook = struct {
+                fn check(_: *anyopaque) !void {}
+            };
+            var dummy: u8 = 0;
+            var manager: Manager = .{ .alloc = a, .io = std.testing.io, .context = &dummy, .checkpoint = Hook.check, .compression = .snappy, .async_writes = false };
+            defer manager.deinit();
+            var file = try Sequential.init(&manager, 1024 * 1024);
+            defer file.close();
+            var cells: [32]Datum = undefined;
+            for (0..count_rows) |r| {
+                for (&cells, 0..) |*cell, c| cell.* = Datum.json(.{ .integer = @intCast(r * 32 + c) });
+                _ = try file.append(.{ .values = &cells, .keys = &.{Datum.json(.{ .integer = @intCast(r) })}, .ordinal = r }, none);
+            }
+            var first = try file.openReader();
+            defer first.deinit();
+            var second = try file.openReader();
+            defer second.deinit();
+            const pinned = try first.readCurrent(0);
+            for (0..count_rows) |r| {
+                const row = (try second.readCurrent(r)).row;
+                try std.testing.expectEqual(@as(u64, r), row.ordinal);
+                try std.testing.expectEqual(@as(i64, @intCast(r * 32 + 31)), row.values[31].value.integer);
+                try std.testing.expectEqual(@as(usize, 32), second.compact_values.len);
+                try std.testing.expect(second.compact.?.encoded != null);
+            }
+            try std.testing.expectEqual(@as(i64, 0), pinned.row.values[0].value.integer);
+            const rewind = (try second.readCurrent(0)).row;
+            try std.testing.expectEqual(@as(i64, 31), rewind.values[31].value.integer);
+            try std.testing.expectError(error.InvalidSqlSpill, second.readCurrent(count_rows));
+            var batch_reader = try file.openReader();
+            defer batch_reader.deinit();
+            var scratch = std.heap.ArenaAllocator.init(a);
+            defer scratch.deinit();
+            var offset: u64 = 0;
+            while (offset < count_rows) {
+                _ = scratch.reset(.free_all);
+                const batch = try batch_reader.readBatchCurrent(scratch.allocator(), offset, 17);
+                try std.testing.expect(batch.values != .rows);
+                try std.testing.expectEqual(@as(usize, 0), batch_reader.compact_values.len);
+                for (0..batch.values.len()) |lane| try std.testing.expectEqual(@as(i64, @intCast((offset + lane) * 32 + 31)), (try batch.values.cell(scratch.allocator(), lane, 31)).value.integer);
+                offset = batch.following;
+            }
+        }
+    };
+    try Probe.run(std.testing.allocator, 300);
+    var stable = std.testing.FailingAllocator.init(std.testing.allocator, .{ .resize_fail_index = 0 });
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(stable.allocator(), Probe.run, .{9});
+}
+
+test "SQL column batch encoding retires allocating reader payloads per column" {
+    const Probe = struct {
+        fn run(backing: Allocator) !void {
+            const Source = struct {
+                fn cell(_: *anyopaque, a: Allocator, _: usize, _: usize) !Datum {
+                    const text = try a.alloc(u8, 1024);
+                    @memset(text, 'x');
+                    return Datum.json(.{ .string = text });
+                }
+            };
+            var dummy: u8 = 0;
+            var budget: @import("memory_budget.zig") = .{ .backing = backing, .limit = 512 * 1024 };
+            const a = budget.allocator();
+            const batch: @import("execution_batch.zig").Batch = .{ .reader = .{ .ptr = &dummy, .read = Source.cell, .count = 16, .width = 128 } };
+            var ordinals: [16]u64 = undefined;
+            for (&ordinals, 0..) |*ordinal, i| ordinal.* = i;
+            const bytes = try encodeColumnarBatchVersionAlloc(a, batch, &ordinals, 2 << 20, .v2);
+            a.free(bytes);
+            // Gathering every reader payload would retain 2 MiB before
+            // encoding a 137 KiB dictionary block. Only one column stays live.
+            try std.testing.expectEqual(@as(usize, 0), budget.live);
+        }
+    };
+    try Probe.run(std.testing.allocator);
+    var stable = std.testing.FailingAllocator.init(std.testing.allocator, .{ .resize_fail_index = 0 });
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(stable.allocator(), Probe.run, .{});
 }

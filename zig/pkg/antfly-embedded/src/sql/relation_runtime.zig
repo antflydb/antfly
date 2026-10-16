@@ -995,6 +995,7 @@ fn Engine(comptime Context: type) type {
                 self.engine.context.alloc.destroy(self);
             }
             pub fn nextBatch(self: *Iterator, a: Allocator, maximum: usize, failure: ?*?anyerror) anyerror!@import("execution_batch.zig").Batch {
+                if (maximum == 0) return .{ .rows = &.{} };
                 if (self.sampled) |sample| {
                     const count = @min(maximum, sample.len() - self.sampled_index);
                     if (count != 0) {
@@ -1011,6 +1012,13 @@ fn Engine(comptime Context: type) type {
                 self.batch_demand = if (previous_demand) |prior| @min(prior, maximum) else maximum;
                 defer self.batch_demand = previous_demand;
                 try self.engine.checkpoint();
+                if (self.cached_reader) |reader| return reader.nextBatch(a, maximum) catch |err| {
+                    if (failure) |out| {
+                        out.* = err;
+                        return .{ .rows = &.{} };
+                    }
+                    return err;
+                };
                 if (self.join_view) |view| {
                     view.deinit();
                     self.join_view = null;

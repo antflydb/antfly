@@ -268,8 +268,8 @@ oversized row may use a 32 MiB source scope. Predicate scratch resets per row
 and retains at most 256 KiB.
 A single row retains the existing native row-size ceiling.
 
-The native Bind allocation regression uses a 32,768-element bigint array and
-an arena over a non-resizing allocator: public-envelope decoding peaks at
+The baseline measurements in PR #1149, before cached validation summaries,
+use a 32,768-element bigint Bind and an arena over a non-resizing allocator: public-envelope decoding peaks at
 17,106,262 bytes versus 399,446 bytes for compact native cells (97.7% lower).
 The previous expanded native path used 3,932,232 bytes. The compact
 stored-array regression peaks at 399,446 bytes versus 3,932,392 bytes for expanded
@@ -295,3 +295,41 @@ zig build antfly-api-sql-native-cells-test antfly-api-table-read-test -Doptimize
 zig build antfly-coordinated-read-set-test antfly-storage-owner-test -Doptimize=Debug
 zig build antfly-native-row-projection-test antfly-native-ranked-hydration-test -Doptimize=Debug
 ```
+
+### Selected document hits and compact replay
+
+Ranked document SQL prepares a literal root-member routing directory once per
+cursor. It copies selected payloads into final native cells and supplies score
+and highlights separately. Parsed hits are never cloned wholesale. Raw stored
+hits receive complete syntax and duplicate-key validation, including unselected
+subtrees, while only selected members acquire a temporary DOM. The captured
+search result still owns its original hit payloads until the cursor closes.
+
+Retained-page encoding feeds the frozen v1/v2 block codecs one bounded column
+at a time. Cached relation replay passes borrowed compact batches directly to
+operators; scalar consumers use one reusable row of descriptors per reader.
+Batch payloads expire when their reader loads a different block; scalar adapter
+descriptors expire on that reader's next scalar read. Independent readers cannot
+retire one another's blocks. Retaining consumers copy at their ownership boundary.
+
+Canonical primitive/text arrays carry validation work, NULL cardinality, and
+binary wire-size summaries in their immutable view. Strict admission constructs
+these summaries; header/authentication-only views do not. Later consumers still
+charge their own work quotas and check cancellation. Text output retains its
+escaping/sizing pass. These summaries are process-local metadata, not a disk or
+wire-format change; NUMERIC, UUID, and JSONB arrays retain their existing codecs.
+
+Run the paired microbenchmarks with the repository Zig toolchain:
+
+```sh
+zig build sql-native-projection-bench -Doptimize=ReleaseFast -j1
+```
+
+The fixture compares a selected eight-byte field beside a 1 MiB unselected
+field (64 iterations), a 256-row/1,024-column encoding tile, a 32,768-element
+bigint array (64 admission/encoding iterations), and a 256-row/128-column spill
+block. Five paired samples alternate order after warming each path. Inputs,
+prebuilt immutable array metadata, and spill creation are excluded from the
+measured working sets. Array timing includes an actual fixed output buffer;
+column encoding compares complete output hashes. These are microbenchmarks,
+not server RSS, throughput, or zero-cost claims.

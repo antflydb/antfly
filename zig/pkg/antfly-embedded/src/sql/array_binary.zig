@@ -56,7 +56,10 @@ pub fn encode(value: arrays.Value, writer: *std.Io.Writer, options: Options) !vo
     for (value.dimensions) |dimension| if (dimension.length > std.math.maxInt(i32)) return error.SqlProgramLimitExceeded;
     var size: usize = 12 + value.dimensions.len * 8;
     var has_null = false;
-    for (0..value.cardinality()) |array_cell_0| {
+    if (if (value.stored) |view| view.validation else null) |proof| {
+        size = proof.binary_wire_bytes;
+        has_null = proof.non_null != value.cardinality();
+    } else for (0..value.cardinality()) |array_cell_0| {
         const element = value.flatCell(array_cell_0);
         has_null = has_null or element.sql_null;
         const length = try elementSize(value.element_type, element);

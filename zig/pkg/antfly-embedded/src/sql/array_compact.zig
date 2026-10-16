@@ -170,3 +170,54 @@ test "SQL compact ingress rejects truncation and unwinds allocation failures" {
     };
     try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Probe.run, .{});
 }
+
+test "SQL compact validation proof preserves quota work cancellation and binary wire size" {
+    const a = std.testing.allocator;
+    const binary = @import("array_binary.zig");
+    for ([_]struct { kind: arrays.ElementType, text: []const u8 }{
+        .{ .kind = .text, .text = "[-1:1]={\"é\\\"x\",NULL,\"kept\"}" },
+        .{ .kind = .int64, .text = "{1,NULL,9007199254740993}" },
+        .{ .kind = .float32, .text = "{NaN,Infinity,NULL,1.25}" },
+        .{ .kind = .boolean, .text = "{t,NULL,f}" },
+        .{ .kind = .int16, .text = "{}" },
+    }) |case| {
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        const value = (try @import("array_text.zig").decodeLeaky(arena.allocator(), case.kind, case.text, .{ .compact = true })).value;
+        const proof = value.stored.?.validation.?;
+        var copy = value.stored.?.*;
+        copy.validation = null;
+        var fallback = value;
+        fallback.stored = &copy;
+        var fast_work: arrays.Budget = .{ .remaining = 10000 };
+        var slow_work = fast_work;
+        _ = try value.validateWithBudget(.{}, &fast_work);
+        _ = try fallback.validateWithBudget(.{}, &slow_work);
+        try std.testing.expectEqual(slow_work.remaining, fast_work.remaining);
+        if (proof.element_work > 0) {
+            var denied: arrays.Budget = .{ .remaining = proof.element_work - 1 };
+            try std.testing.expectError(error.SqlProgramLimitExceeded, value.validateWithBudget(.{}, &denied));
+        }
+        const Cancel = struct {
+            fn poll(_: ?*anyopaque) !void {
+                return error.Canceled;
+            }
+        };
+        var parent: @import("numeric_value.zig").Context = .{ .alloc = a, .checkpoint = Cancel.poll };
+        var canceled: arrays.Budget = .{ .remaining = 10000, .shared = &parent };
+        try std.testing.expectError(error.Canceled, value.validateWithBudget(.{}, &canceled));
+        var fast: std.Io.Writer.Allocating = .init(a);
+        defer fast.deinit();
+        var slow: std.Io.Writer.Allocating = .init(a);
+        defer slow.deinit();
+        try binary.encode(value, &fast.writer, .{});
+        try binary.encode(fallback, &slow.writer, .{});
+        try std.testing.expectEqualSlices(u8, slow.written(), fast.written());
+        try std.testing.expectEqual(proof.binary_wire_bytes, fast.written().len);
+        var denied_output: std.Io.Writer = .fixed(&.{});
+        try std.testing.expectError(error.SqlProgramLimitExceeded, binary.encode(value, &denied_output, .{ .wire_bytes = proof.binary_wire_bytes - 1 }));
+        try std.testing.expectEqual(@as(usize, 0), denied_output.end);
+        const authenticated = try layout.View.openAuthenticated(case.kind, value.stored.?.bytes, .{});
+        try std.testing.expect(authenticated.validation == null);
+    }
+}

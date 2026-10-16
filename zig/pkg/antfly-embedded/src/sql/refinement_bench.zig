@@ -817,3 +817,151 @@ test "native pipeline refinements benchmark dictionary spill decoding" {
         std.debug.print("native_refinement {{\"case\":\"dictionary_spill_decode\",\"rows\":4096,\"width\":32,\"sample\":{d},\"expanded_ns\":{d},\"compact_ns\":{d},\"expanded_peak_bytes\":{d},\"compact_peak_bytes\":{d}}}\n", .{ sample, expanded.ns, compact.ns, expanded.peak, compact.peak });
     }
 }
+
+const ProjectionStats = struct { ns: i96, peak: usize, allocations: usize, checksum: u64 };
+const ProjectionCase = enum { document, columns, array, replay, replay_batch };
+const ProjectionFixture = struct {
+    projection: @import("document_row.zig").Projection,
+    layout: @import("catalog.zig").Row.TypedLayout,
+    root: std.json.Value,
+    array: @import("array_value.zig").Value,
+    output: []u8,
+    replay: *spill.Sequential,
+    counted: *CountingAllocator,
+    budget: *@import("memory_budget.zig"),
+    fn measure(self: ProjectionFixture, case: ProjectionCase, direct: bool) !ProjectionStats {
+        var counted: CountingAllocator = .{};
+        var budget: @import("memory_budget.zig") = .{ .backing = counted.allocator(), .limit = 128 << 20 };
+        var result: ProjectionStats = .{ .ns = 0, .peak = 0, .allocations = 0, .checksum = 0 };
+        const started = now();
+        switch (case) {
+            .document => for (0..64) |_| {
+                var arena = std.heap.ArenaAllocator.init(budget.allocator());
+                defer arena.deinit();
+                const a = arena.allocator();
+                const row = if (direct) try self.projection.projectSearch(a, a, self.layout, "row", .{ .value = self.root }, .{}) else blk: {
+                    const document = try @import("../storage/typed_json.zig").clone(a, self.root);
+                    break :blk try self.projection.projectValue(a, "row", 0, document);
+                };
+                result.checksum += (try row.cell("body")).value.string.len;
+            },
+            .columns => {
+                const Source = struct {
+                    fn cell(_: *anyopaque, _: std.mem.Allocator, row: usize, column: usize) !Datum {
+                        return Datum.json(.{ .integer = @intCast(row * 1024 + column) });
+                    }
+                };
+                var dummy: u8 = 0;
+                const batch: @import("execution_batch.zig").Batch = .{ .reader = .{ .ptr = &dummy, .read = Source.cell, .count = 256, .width = 1024 } };
+                var ordinals: [256]u64 = undefined;
+                for (&ordinals, 0..) |*ordinal, i| ordinal.* = i;
+                var arena = std.heap.ArenaAllocator.init(budget.allocator());
+                defer arena.deinit();
+                const a = arena.allocator();
+                const encoded = if (direct) try spill.encodeColumnarBatchVersionAlloc(a, batch, &ordinals, 32 << 20, .v2) else blk: {
+                    const rows = try a.alloc(operators.Row, batch.len());
+                    for (rows, 0..) |*row, r| {
+                        const values = try a.alloc(Datum, batch.width());
+                        for (values, 0..) |*value, c| value.* = try batch.cell(a, r, c);
+                        row.* = .{ .values = values, .keys = &.{}, .ordinal = r };
+                    }
+                    break :blk try spill.encodeColumnarBlockVersionAlloc(a, rows, 32 << 20, .v2);
+                };
+                result.checksum = std.hash.Wyhash.hash(0, encoded);
+            },
+            .array => {
+                var view = self.array.stored.?.*;
+                if (!direct) view.validation = null;
+                var input = self.array;
+                input.stored = &view;
+                for (0..64) |_| {
+                    _ = try input.validate(.{});
+                    var writer: std.Io.Writer = .fixed(self.output);
+                    try @import("array_binary.zig").encode(input, &writer, .{});
+                    result.checksum += writer.end;
+                }
+                result.checksum +%= std.hash.Wyhash.hash(0, self.output);
+            },
+            .replay, .replay_batch => {
+                const base_live = self.budget.live;
+                self.budget.peak = base_live;
+                self.counted.allocations = 0;
+                var reader = try self.replay.openReader();
+                defer reader.deinit();
+                if (case == .replay_batch and direct) {
+                    var scratch = std.heap.ArenaAllocator.init(self.budget.allocator());
+                    defer scratch.deinit();
+                    var offset: u64 = 0;
+                    while (offset < 256) {
+                        _ = scratch.reset(.free_all);
+                        const batch = try reader.readBatchCurrent(scratch.allocator(), offset, 256);
+                        for (0..batch.values.len()) |lane| result.checksum += @intCast((try batch.values.cell(scratch.allocator(), lane, 127)).value.integer);
+                        offset = batch.following;
+                    }
+                } else for (0..256) |r| {
+                    const row = if (direct) (try reader.readCurrent(r)).row else (try reader.readBorrowed(r)).row;
+                    result.checksum += @intCast(row.values[127].value.integer);
+                }
+                result.peak = self.budget.peak - base_live;
+                result.allocations = self.counted.allocations;
+            },
+        }
+        result.ns = now() - started;
+        if (case != .replay and case != .replay_batch) {
+            result.peak = budget.peak;
+            result.allocations = counted.allocations;
+        }
+        return result;
+    }
+};
+
+test "native projection refinements benchmark" {
+    const a = std.testing.allocator;
+    var source = std.heap.ArenaAllocator.init(a);
+    defer source.deinit();
+    const sa = source.allocator();
+    const ignored = try sa.alloc(u8, 1024 * 1024);
+    @memset(ignored, 'x');
+    var root: std.json.Value = .{ .object = .empty };
+    try root.object.put(sa, "ignored", .{ .string = ignored });
+    try root.object.put(sa, "body", .{ .string = "retained" });
+    const table: @import("catalog.zig").Table = .{ .id = 1, .physical_name = "rows", .schema_version = 1, .columns = &.{.{ .name = "body", .path = "body", .type = .string }} };
+    const projection = try @import("document_row.zig").Projection.initSearch(sa, table, &.{"body"});
+    const layout = try @import("catalog.zig").Row.TypedLayout.init(sa, &.{"body"});
+    const arrays = @import("array_value.zig");
+    const cells = try sa.alloc(Datum, 32768);
+    for (cells, 0..) |*cell, i| cell.* = if (i % 7 == 0) .{} else Datum.json(.{ .integer = @intCast(i) });
+    const array = try arrays.Value.init(.int64, &.{.{ .length = 32768 }}, cells, .{});
+    const storage = try @import("array_storage.zig").encodeAlloc(sa, array, .{});
+    const compact = try @import("array_storage.zig").borrowLeaky(sa, .int64, storage, .{});
+    const output = try sa.alloc(u8, compact.stored.?.validation.?.binary_wire_bytes);
+    const Hook = struct {
+        fn check(_: *anyopaque) !void {}
+    };
+    var dummy: u8 = 0;
+    var counted: CountingAllocator = .{};
+    var budget: @import("memory_budget.zig") = .{ .backing = counted.allocator(), .limit = 128 << 20 };
+    var manager: spill.Manager = .{ .alloc = budget.allocator(), .io = std.testing.io, .context = &dummy, .checkpoint = Hook.check, .compression = .none, .async_writes = false };
+    defer manager.deinit();
+    var file = try spill.Sequential.init(&manager, 8 << 20);
+    defer file.close();
+    var row_cells: [128]Datum = undefined;
+    for (0..256) |r| {
+        for (&row_cells, 0..) |*cell, c| cell.* = Datum.json(.{ .integer = @intCast(r * 128 + c) });
+        _ = try file.append(.{ .values = &row_cells, .keys = &.{}, .ordinal = r }, spill.none);
+    }
+    try file.seal();
+    const fixture: ProjectionFixture = .{ .projection = projection, .layout = layout, .root = root, .array = compact, .output = output, .replay = &file, .counted = &counted, .budget = &budget };
+    for (std.enums.values(ProjectionCase)) |case| {
+        _ = try fixture.measure(case, false);
+        _ = try fixture.measure(case, true);
+        for (0..5) |sample| {
+            const first = try fixture.measure(case, sample % 2 != 0);
+            const second = try fixture.measure(case, sample % 2 == 0);
+            const before = if (sample % 2 == 0) first else second;
+            const after = if (sample % 2 == 0) second else first;
+            try std.testing.expectEqual(before.checksum, after.checksum);
+            std.debug.print("projection_refinement case={s} sample={d} old_ns={d} new_ns={d} old_peak={d} new_peak={d} old_allocs={d} new_allocs={d}\n", .{ @tagName(case), sample, before.ns, after.ns, before.peak, after.peak, before.allocations, after.allocations });
+        }
+    }
+}

@@ -1302,6 +1302,7 @@ pub fn create(b: *std.Build, comptime asking_build_zig: type) ?Shared {
     antfly_imports.configureRuntimeContracts(usermgr_mod);
     antfly_imports.storage_boundary.configureSources(sql_test_mod, false, false);
     sql_test_mod.addImport("sql_parser", sql_parser_mod);
+    sql_test_mod.addImport("antfly-json", json_mod);
     sql_test_mod.addImport("antfly_platform", platform_mod);
     sql_test_mod.addImport("antfly_schema_openapi", schema_openapi_mod);
     sql_test_mod.addImport("antfly_regex", regex_mod);
@@ -1316,6 +1317,7 @@ pub fn create(b: *std.Build, comptime asking_build_zig: type) ?Shared {
     });
     antfly_imports.storage_boundary.configureSources(refinement_bench_mod, false, false);
     refinement_bench_mod.addImport("sql_parser", sql_parser_mod);
+    refinement_bench_mod.addImport("antfly-json", json_mod);
     refinement_bench_mod.addImport("antfly_platform", platform_mod);
     refinement_bench_mod.addImport("antfly_schema_openapi", schema_openapi_mod);
     refinement_bench_mod.addImport("antfly_regex", regex_mod);
@@ -1325,6 +1327,8 @@ pub fn create(b: *std.Build, comptime asking_build_zig: type) ?Shared {
     refinement_bench_mod.link_libc = link_libc;
     const refinement_bench = b.addTest(.{ .root_module = refinement_bench_mod, .filters = &.{"native refinements benchmark"} });
     b.step("sql-native-refinement-bench", "Compare native expression, aggregate and window spill refinements").dependOn(&b.addRunArtifact(refinement_bench).step);
+    const projection_bench = b.addTest(.{ .root_module = refinement_bench_mod, .filters = &.{"native projection refinements benchmark"} });
+    b.step("sql-native-projection-bench", "Compare selected document, columnar replay and validated array costs").dependOn(&b.addRunArtifact(projection_bench).step);
     const pipeline_bench = b.addTest(.{ .root_module = refinement_bench_mod, .filters = &.{"native pipeline refinements benchmark"} });
     b.step("sql-native-pipeline-bench", "Compare shared typed DAGs and block result delivery").dependOn(&b.addRunArtifact(pipeline_bench).step);
 

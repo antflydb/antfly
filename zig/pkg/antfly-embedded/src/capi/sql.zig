@@ -613,6 +613,8 @@ pub fn Adapter(comptime native: type) type {
                 const highlight_slot = layout.ordinals.get("_highlights");
                 var produced: usize = 0;
                 var bytes: usize = 0;
+                var document_scratch = std.heap.ArenaAllocator.init(self.alloc);
+                defer document_scratch.deinit();
                 while (produced < count and bytes < 256 * 1024) {
                     if (self.reader) |*reader| {
                         // Large highlight JSON is hydrated one row at a time;
@@ -644,12 +646,11 @@ pub fn Adapter(comptime native: type) type {
                         produced += batch.consumed;
                     } else {
                         const hit = self.result.hits[self.position + produced];
-                        var document = if (hit.source_value) |value| try types.cloneJsonValue(a, value) else if (hit.stored_data) |data| try std.json.parseFromSliceLeaky(std.json.Value, a, data, .{ .parse_numbers = false }) else return error.InvalidSqlBackendResponse;
-                        if (document != .object) return error.InvalidSqlBackendResponse;
-                        try document.object.put(a, "score", if (hit.score) |score| .{ .float = score } else .null);
-                        if (try highlightsValueLeaky(a, hit.highlights)) |value| try document.object.put(a, "_highlights", value) else _ = document.object.swapRemove("_highlights");
+                        if (!document_scratch.reset(.{ .retain_with_limit = 256 * 1024 })) return error.OutOfMemory;
+                        const source: dependencies.sql_document_row.Projection.SearchSource = if (hit.source_value) |value| .{ .value = value } else if (hit.stored_data) |data| .{ .bytes = data } else return error.InvalidSqlBackendResponse;
+                        const highlights = if (highlight_slot != null) try highlightsValueLeaky(document_scratch.allocator(), hit.highlights) else null;
                         const out = &rows[produced];
-                        out.* = try self.projection.projectValue(a, hit.id, 0, document);
+                        out.* = try self.projection.projectSearch(a, document_scratch.allocator(), layout, hit.id, source, .{ .score = if (hit.score) |score| @as(f64, score) else null, .highlights = highlights });
                         bytes +|= out.id.len;
                         for (try out.fieldNames()) |name| bytes +|= try dependencies.sql_operators.datumBytes(try out.cell(name));
                         produced += 1;
@@ -700,7 +701,7 @@ pub fn Adapter(comptime native: type) type {
             var reader: ?DB.RelationalRows.Reader = if (table.storage_mode == .relational) try lease.relationalRows(alloc, fields.items, table.schema_version) else null;
             errdefer if (reader) |*value| value.deinit();
             const layout = try catalog.Row.TypedLayout.init(a, output_names.keys());
-            const projection: dependencies.sql_document_row.Projection = if (reader == null) try dependencies.sql_document_row.Projection.init(a, table, request.fields) else .{ .columns = &.{} };
+            const projection: dependencies.sql_document_row.Projection = if (reader == null) try dependencies.sql_document_row.Projection.initSearch(a, table, request.fields) else .{ .columns = &.{} };
             // Finish allocating before moving the arena: a later allocation
             // could add a chunk that the cursor's earlier copy would not own.
             cursor.* = .{ .alloc = alloc, .arena = arena, .result = captured.result, .reader = reader, .layout = layout, .projection = projection };

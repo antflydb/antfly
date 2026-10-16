@@ -152,13 +152,20 @@ fn encodeBounded(alloc: A, output_budget: *sources.sql_memory_budget, sequence: 
             defer block_arena.deinit();
             var block_budget: sources.sql_memory_budget = .{ .backing = block_arena.allocator(), .limit = max_bytes * 4 };
             const b = block_budget.allocator();
-            const block = try b.alloc(sources.sql_operators.Row, count);
-            for (block, plans[first..][0..count], 0..) |*target, plan, index| {
-                const values = try b.alloc(Datum, width);
-                for (values, column..) |*value, ordinal| value.* = try plan.value(names.keys(), ordinal);
-                target.* = .{ .values = values, .keys = &.{}, .ordinal = first + index };
-            }
-            const bytes = try spill.encodeColumnarBlockVersionAlloc(b, block, max_bytes, version);
+            const Columns = struct {
+                plans: []const RowPlan,
+                names: []const []const u8,
+                column: usize,
+                fn cell(raw: *anyopaque, _: A, row: usize, ordinal: usize) !Datum {
+                    const self: *@This() = @ptrCast(@alignCast(raw));
+                    return self.plans[row].value(self.names, self.column + ordinal);
+                }
+            };
+            var columns: Columns = .{ .plans = plans[first..][0..count], .names = names.keys(), .column = column };
+            var ordinals: [256]u64 = undefined;
+            for (ordinals[0..count], first..) |*ordinal, index| ordinal.* = index;
+            const batch: sources.sql_execution_batch.Batch = .{ .reader = .{ .ptr = &columns, .read = Columns.cell, .count = count, .width = width } };
+            const bytes = try spill.encodeColumnarBatchVersionAlloc(b, batch, ordinals[0..count], max_bytes, version);
             if (!std.mem.startsWith(u8, bytes, if (version == .v1) block_magic else "NCB\x02")) return error.InvalidRetainedReadPage;
             try blob(w, bytes);
             column += width;
@@ -256,4 +263,38 @@ pub fn decode(alloc: A, bytes: []const u8, sequence: u64, schema_version: u32, l
     }
     if (r.at != bytes.len) return error.InvalidRetainedReadPage;
     return .{ .arena = arena, .rows = rows, .after = after };
+}
+
+test {
+    _ = consumerTests();
+}
+fn consumerTests() type {
+    if (!@import("builtin").is_test) return struct {};
+    const root = @import("antfly_source_root");
+    if (@hasDecl(root, "implementation_tests_only") and root.implementation_tests_only) return struct {};
+    return struct {
+        test "retained read RPC native wide encoding bounds scratch below a row matrix" {
+            const a = std.testing.allocator;
+            var source = std.heap.ArenaAllocator.init(a);
+            defer source.deinit();
+            const sa = source.allocator();
+            const names = try sa.alloc([]const u8, 1024);
+            for (names, 0..) |*name, i| name.* = try std.fmt.allocPrint(sa, "c{d}", .{i});
+            const layout = try catalog.Row.TypedLayout.init(sa, names);
+            const values = try sa.alloc(Datum, names.len);
+            for (values) |*value| value.* = Datum.json(.{ .integer = 42 });
+            const rows = try sa.alloc(View.Row, 256);
+            for (rows) |*row| row.* = .{ .id = "row", .version = 1, .schema_version = 3, .value = .null, .typed_cells = .{ .layout = layout, .values = values } };
+            var budget: sources.sql_memory_budget = .{ .backing = a, .limit = 8 << 20 };
+            const bytes = try encodeVersion(budget.allocator(), 1, rows, null, .v2);
+            defer budget.allocator().free(bytes);
+            // Inputs and the returned wire are accounted separately. The old tile's
+            // temporary cells alone exceeded this complete encoder allocation budget.
+            try std.testing.expect(256 * 1024 * @sizeOf(Datum) > budget.limit);
+            std.debug.print("retained wide encoding: {d} peak bytes, {d} wire bytes, avoided {d}-byte row matrix\n", .{ budget.peak, bytes.len, 256 * 1024 * @sizeOf(Datum) });
+            var page = try decode(a, bytes, 1, 3, 256);
+            defer page.deinit();
+            try std.testing.expectEqual(@as(i64, 42), (try page.rows[255].typed_cells.?.at(1023)).value.integer);
+        }
+    };
 }

@@ -185,7 +185,9 @@ pub const Cursor = struct {
             self.index += 1;
             return row.values;
         }
-        const values = try a.alloc(@import("scalar.zig").Datum, row.values.len);
+        // Compact spill rows already allocated their descriptor span in a.
+        // Own the payloads in place; resident/sorted spans remain borrowed.
+        const values = if (self.block != null and self.block.?.encoded != null and self.sorted == null and self.memory == null) @constCast(row.values) else try a.alloc(@import("scalar.zig").Datum, row.values.len);
         for (row.values, values) |value, *out| out.* = try @import("operators.zig").cloneDatum(a, value);
         if (!self.sealed and !self.memory_leased) if (self.sorted) |top| if (top.external == null) top.releaseFinishedRow(self.sorted_offset + self.index);
         self.index += 1;
@@ -283,11 +285,8 @@ pub const Cursor = struct {
             self.memory_reader.?.index = self.index;
             return .{ .values = (try self.memory_reader.?.next()) orelse return error.InvalidSqlBackendResponse, .keys = &.{}, .ordinal = self.index };
         }
-        if (self.block != null) {
-            try self.loadBlock();
-            return self.block.?.row(a, self.index - self.block_begin);
-        }
-        return (try self.rows.readBorrowed(self.index)).row;
+        try self.loadBlock();
+        return self.block.?.row(a, self.index - self.block_begin);
     }
     pub fn append(raw: *anyopaque, values: []const @import("scalar.zig").Datum) !void {
         const self: *Cursor = @ptrCast(@alignCast(raw));
@@ -360,7 +359,7 @@ pub const Cursor = struct {
     }
 
     /// Stable-address reader owned by the cursor allocator. Borrowed values
-    /// survive reads by other readers, but not this reader's next block load
+    /// survive reads by other readers, but not this reader's next read
     /// or close. Consumers retaining a value must copy at their owned boundary.
     pub const ReplayReader = struct {
         owner: *Cursor,
@@ -376,11 +375,35 @@ pub const Cursor = struct {
             const values = switch (self.storage) {
                 .sorted => self.owner.sorted_rows[self.owner.sorted_offset + self.index].values,
                 .memory => |reader| (try reader.next()) orelse return error.InvalidSqlBackendResponse,
-                .disk => |*reader| (try reader.readBorrowed(self.index)).row.values,
+                .disk => |*reader| (try reader.readCurrent(self.index)).row.values,
             };
             if (values.len != self.owner.width) return error.InvalidSqlBackendResponse;
             self.index += 1;
             return values;
+        }
+
+        pub fn nextBatch(self: *ReplayReader, a: std.mem.Allocator, maximum: usize) !@import("execution_batch.zig").Batch {
+            if (maximum == 0) return error.InvalidSqlLimit;
+            if (self.index == self.owner.count()) return .{ .rows = &.{} };
+            return switch (self.storage) {
+                .disk => |*reader| blk: {
+                    const batch = try reader.readBatchCurrent(a, self.index, maximum);
+                    self.index = @intCast(batch.following);
+                    break :blk batch.values;
+                },
+                .memory => |reader| blk: {
+                    const batch = try reader.nextBatch(a, maximum);
+                    self.index += batch.len();
+                    break :blk batch;
+                },
+                .sorted => blk: {
+                    const count_rows = @min(maximum, self.owner.count() - self.index);
+                    const rows = try a.alloc([]const @import("scalar.zig").Datum, count_rows);
+                    for (rows, self.owner.sorted_rows[self.owner.sorted_offset + self.index ..][0..count_rows]) |*row, stored| row.* = stored.values;
+                    self.index += count_rows;
+                    break :blk .{ .rows = rows };
+                },
+            };
         }
 
         pub fn rewind(self: *ReplayReader) void {
