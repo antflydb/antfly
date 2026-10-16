@@ -42,6 +42,21 @@ def reply(start, stop, error=None, plan="plan"):
 
 
 class AdmissionRetryTests(unittest.TestCase):
+    def test_provider_queue_pressure_resumes_acknowledged_prefix(self):
+        replies = iter([reply(0, 2, "QueueFull"), reply(2, 4)])
+        retries = []
+        with (
+            patch.object(load, "chunk_response", lambda *_: next(replies)),
+            patch.object(load.time, "sleep"),
+        ):
+            result = load.complete_request(
+                "local", {"input": "immutable"}, retries.append
+            )
+        self.assertEqual(retries, ["QueueFull"])
+        self.assertEqual(
+            [r["descriptor"]["ordinal"] for r in result["data"]], [0, 1, 2, 3]
+        )
+
     def test_retains_acknowledged_prefix_and_resumes_without_duplicates(self):
         replies = iter([reply(0, 2, "ResourceTemporarilyUnavailable"), reply(2, 4)])
         calls = []

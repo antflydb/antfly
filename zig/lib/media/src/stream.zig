@@ -35,6 +35,8 @@ pub const Snapshot = struct {
     input: source.Source,
     bytes: []u8,
     reservation: admission.Token,
+    /// Spools retain capacity so finalization never copies the complete input.
+    backing: ?[]u8 = null,
     pub fn copy(allocator: std.mem.Allocator, identity: []const u8, parts: []const []const u8, options: Options) !*Snapshot {
         var size: usize = 0;
         for (parts) |part| size = try std.math.add(usize, size, part.len);
@@ -67,7 +69,7 @@ pub const Snapshot = struct {
     pub fn deinit(self: *Snapshot) void {
         std.debug.assert(self.input.retained_bytes == 0);
         const allocator = self.input.allocator;
-        allocator.free(self.bytes);
+        allocator.free(self.backing orelse self.bytes);
         self.reservation.deinit();
         allocator.destroy(self);
     }
@@ -94,7 +96,25 @@ pub fn collect(allocator: std.mem.Allocator, identity: []const u8, provider: Seq
             break;
         }
         const requested = @min(options.chunk_bytes, options.max_bytes - bytes.items.len);
-        try bytes.ensureTotalCapacityPrecise(allocator, bytes.items.len + requested);
+        const needed = bytes.items.len + requested;
+        if (needed > bytes.capacity) {
+            // Geometric, capped growth bounds aggregate copying to O(input).
+            // Account old + new storage before a moving allocation; in-place
+            // growth needs only the final capacity already reserved above.
+            const capacity = @min(options.max_bytes, @max(needed, bytes.capacity +| @max(bytes.capacity, options.chunk_bytes)));
+            const old = bytes.allocatedSlice();
+            if (allocator.resize(old, capacity)) {
+                bytes.capacity = capacity;
+            } else {
+                try reservation.resize(.{ .host_bytes = try std.math.add(usize, @max(options.max_bytes, try std.math.add(usize, old.len, capacity)), @sizeOf(Snapshot)) });
+                const replacement = try allocator.alloc(u8, capacity);
+                @memcpy(replacement[0..bytes.items.len], bytes.items);
+                allocator.free(old);
+                bytes.items = replacement[0..bytes.items.len];
+                bytes.capacity = capacity;
+                try reservation.resize(.{ .host_bytes = try std.math.add(usize, options.max_bytes, @sizeOf(Snapshot)) });
+            }
+        }
         const target = bytes.allocatedSlice()[bytes.items.len..][0..requested];
         const count = try provider.read(provider.context, target, options.control);
         try options.control.check();
@@ -104,10 +124,10 @@ pub fn collect(allocator: std.mem.Allocator, identity: []const u8, provider: Seq
     }
     const self = try allocator.create(Snapshot);
     errdefer allocator.destroy(self);
-    const owned = try bytes.toOwnedSlice(allocator);
-    errdefer allocator.free(owned);
-    try reservation.resize(.{ .host_bytes = owned.len + @sizeOf(Snapshot) });
-    self.* = .{ .bytes = owned, .reservation = reservation, .input = .{ .allocator = allocator, .identity = identity, .storage = .{ .borrowed = owned }, .limits = options.source_limits, .control = options.control, .admission_pool = options.admission_pool } };
+    const owned = bytes.items;
+    const backing = bytes.allocatedSlice();
+    try reservation.resize(.{ .host_bytes = backing.len + @sizeOf(Snapshot) });
+    self.* = .{ .bytes = owned, .backing = backing, .reservation = reservation, .input = .{ .allocator = allocator, .identity = identity, .storage = .{ .borrowed = owned }, .limits = options.source_limits, .control = options.control, .admission_pool = options.admission_pool } };
     return self;
 }
 test "sequential spool handles short reads, exact EOF, limits and retained leases" {
@@ -192,4 +212,35 @@ test "sequential snapshots feed portable MP4 and WebM indexing" {
             try std.testing.expect(reader.packets.len > 0);
         }
     }
+}
+
+test "sequential spool moving allocator has linear copying and accounts peak capacity" {
+    const Provider = struct {
+        remaining: usize,
+        fn read(raw: *anyopaque, out: []u8, _: source.Control) !usize {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const n = @min(out.len, self.remaining);
+            @memset(out[0..n], 42);
+            self.remaining -= n;
+            return n;
+        }
+    };
+    var moving = std.testing.FailingAllocator.init(std.testing.allocator, .{ .resize_fail_index = 0 });
+    var provider = Provider{ .remaining = 1024 * 1024 };
+    var pool = admission.Pool{ .limits = .{ .host_bytes = 2 * provider.remaining + @sizeOf(Snapshot) } };
+    const result = try collect(moving.allocator(), "linear-spool", .{ .context = &provider, .read = Provider.read }, .{ .max_bytes = provider.remaining, .chunk_bytes = 1024, .admission_pool = &pool });
+    try std.testing.expectEqual(@as(usize, 1024 * 1024), result.bytes.len);
+    // Ten doublings, rather than 1024 moving allocations/final shrink copy.
+    try std.testing.expect(moving.allocations <= 12);
+    try std.testing.expect(moving.allocated_bytes < 3 * result.bytes.len);
+    try std.testing.expectEqual(@as(u64, result.backing.?.len + @sizeOf(Snapshot)), pool.snapshot().host_bytes);
+    result.deinit();
+    try std.testing.expectEqual(moving.allocated_bytes, moving.freed_bytes);
+    try std.testing.expectEqual(admission.Resources{}, pool.snapshot());
+    // A denied moving-growth peak must release both ownership and admission.
+    provider.remaining = 1024 * 1024;
+    pool.limits.host_bytes = provider.remaining + @sizeOf(Snapshot);
+    try std.testing.expectError(error.SharedAdmissionExceeded, collect(moving.allocator(), "bounded-spool", .{ .context = &provider, .read = Provider.read }, .{ .max_bytes = provider.remaining, .chunk_bytes = 1024, .admission_pool = &pool }));
+    try std.testing.expectEqual(admission.Resources{}, pool.snapshot());
+    try std.testing.expectEqual(moving.allocated_bytes, moving.freed_bytes);
 }

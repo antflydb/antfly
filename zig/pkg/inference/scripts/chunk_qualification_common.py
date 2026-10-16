@@ -32,6 +32,7 @@ def complete_request(url, body, request_chunk, on_retry):
         "ResourceTemporarilyUnavailable",
         "ConcurrencyUnavailable",
         "InferenceAdmissionQueueFull",
+        "QueueFull",
         "SharedAdmissionExceeded",
         "MemoryBudgetExceeded",
     }

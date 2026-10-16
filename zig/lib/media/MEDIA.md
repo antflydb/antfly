@@ -52,7 +52,11 @@ read-ahead. Nearby header/packet reads can share one provider request; leases
 survive cache eviction. A failed/cancelled fill invalidates its window. Logical
 source bytes/reads remain distinct from wire bytes/provider requests. Sequential
 sources use bounded spool/scan policy; they do not pretend to offer cheap random
-access or silently replace uniform sampling with initial frames.
+access or silently replace uniform sampling with initial frames. Spool capacity
+grows geometrically up to the declared maximum. A moving allocation reserves
+old and new storage before copying, and EOF transfers the existing allocation
+without a final full-input copy. Retained spare capacity remains admitted until
+the snapshot is destroyed; a tight pool may deny the transient growth peak.
 
 [timeline.zig](src/timeline.zig) uses checked signed rational clocks and explicit
 rounding. Media DTS/PTS and source presentation time remain distinct. Preserve

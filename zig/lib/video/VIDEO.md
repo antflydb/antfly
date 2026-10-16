@@ -208,15 +208,29 @@ unknown-duration semantics in O(log N), rather than scanning the whole clip.
 MP4 also indexes logical packet intervals for field/partition closure and keeps a
 request-owned nearest-verified-IDR cache. The cache stores indexes, not packet
 leases, and requires immutable source identity, track configuration and metadata.
+Finite advanced AVC uses transport header assembly for its logical picture index:
+field parity/identity, independent colour planes, partition packet spans and
+configuration epochs are indexed without reconstructing the clip's pixels.
+Selected dependency decoding still validates entropy, coverage and references.
+Live publication retains the reconstruction-based index so incomplete pictures
+cannot become visible. Both indexes have differential fixture coverage.
 All retained metadata participates in request admission. The next window's
 selection, dependency planning and preparation run off the current backbone's
 critical path after its decoder drains. Every exit joins that planning worker.
+Busy model-provider queues yield retryable admission pressure. Unexecuted chunks
+do not advance acknowledged coverage or become permanent per-chunk failures,
+including when partial results are enabled.
 
 Known text/video input shapes derive sequence, host and workspace reservations
 from inspected geometry, preparation concurrency and conservative attention/
 activation bounds. Host allocation enforces the advertised ceiling; rendered
 sequence length is checked before backbone execution. Uninspected image/audio
-inputs retain the conservative reservation. Bounds do not alter sampling policy.
+inputs retain the conservative initial reservation. After rendering, every media
+type reduces its execution permit using the actual sequence, retained host
+owners and projected inputs before starting the next window. Prepared image and
+audio cohorts also derive sequence/output and host allowances from their known
+rows. Reductions reapply the session's workspace profile and cannot grow a lease.
+The allocator enforces the reduced host ceiling. Bounds do not alter sampling policy.
 
 Descriptors, model identity, gaps and terminal coverage travel with the vectors.
 Overview sampling remains distinct from retrieval coverage; audio inclusion stays
@@ -231,7 +245,17 @@ embedded. Equal-geometry frames form cohorts of up to eight, bounded by the
 vision scratch estimate (384 MiB native, 768 MiB Metal). Queue capacity also
 respects admitted preparation slots and total selected pictures. Consumers take
 available work without waiting to fill a cohort; incompatible geometry flushes
-separately. Metal concatenation uses one destination and linear row copies.
+separately. A bounded process-local calibration table measures completed cost per
+frame separately by backend and geometry. It explores 1/2/4/8-frame candidates,
+then prefers smaller allocations unless a larger cohort improves measured
+throughput by more than five percent. Paired minima exclude isolated cold setup
+or scheduling stalls, and smoothed periodic probes adapt to sustained contention.
+Calibration never overrides admission or waits for work. Metal concatenation uses
+one destination and linear row copies. Gemma 2 vision owns at most two layers per
+Metal command frame, retaining activation leases until completion/cancellation.
+Scratch estimates include both layers; large image geometries retain single-layer
+frames to preserve their existing memory envelope. External frame ownership is
+preserved.
 
 Metal retains vision/projector results, token composition, backbone inputs and
 final pooling/normalization until response readback. EmbeddingGemma 2 selects
@@ -338,3 +362,9 @@ and macOS releases below 15 are not release-qualified here.
 compares 256 windows over a 108,000-picture timeline with the linear oracle.
 It reports index construction and lookup separately and verifies matching
 checksums. This measures metadata selection, not decode or model throughput.
+
+`zig build --build-file zig/lib/video/build.zig bench-picture-index -Doptimize=ReleaseFast`
+alternates header and reconstruction indexing on the same advanced AVC fixtures,
+checks complete picture metadata equality, and reports aggregate elapsed time for
+eight runs per case. This isolates indexing cost; full-pipeline throughput still
+requires the pretrained/load qualification tools.

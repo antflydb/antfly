@@ -270,8 +270,21 @@ caches avoid repeated IDR packet probes across windows. Compatible projection
 cohorts grow to eight within geometry-derived scratch and queue limits. Consumers
 do not wait for a full cohort. Known video/text shapes use derived admission
 bounds with enforced host ceilings and a final rendered-sequence guard;
-uninspected image/audio retains conservative bounds. Owned live windows fill one
-final snapshot allocation, eliminating the second full encoded-byte copy.
+uninspected image/audio retains conservative initial bounds. Prepared image/audio
+cohorts use known row counts, and every rendered group shrinks its execution lease
+before backbone/next-window overlap while retaining live inputs and required
+workspace. Finite advanced AVC planning assembles slice headers, fields, planes,
+partitions and configuration epochs without whole-clip pixel reconstruction;
+entropy/reference validation remains in selected dependency decoding and live
+publication. Cohort calibration uses completed backend/geometry measurements and
+bounded exploration within admission, rather than assuming the largest fitting
+batch wins. Metal vision frames group at most two layers and charge their retained
+temporaries. Owned live windows fill one final snapshot allocation, and sequential
+spools use admitted geometric growth with no full-input copy at EOF.
+Busy provider queues normalize to retryable capacity errors at chunk execution;
+responses preserve the acknowledged prefix and an exact continuation, including
+with partial-result delivery enabled. Speculative preparation yields on that
+pressure instead of making a successful serial request fail.
 
 
 Database chunk artifacts store the `_chunk` reconstruction descriptor; vectors

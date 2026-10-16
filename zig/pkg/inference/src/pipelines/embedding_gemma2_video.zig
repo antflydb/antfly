@@ -15,6 +15,8 @@
 
 //! Ordered, bounded video frames using the pinned EmbeddingGemma 2 processor.
 const std = @import("std");
+const batch_policy = @import("media_batch_policy.zig");
+const batch_clock = @import("antfly_platform").time;
 const media = @import("antfly_media");
 const video = @import("antfly_video");
 const projector = @import("../architectures/gemma4_projector.zig");
@@ -1445,6 +1447,7 @@ const Capture = struct {
     native_batching: bool = false,
     native_pending: [8]NativeProjectionJob = undefined,
     native_count: usize = 0,
+    native_limit: usize = 1,
     claimed: [32]bool = @splat(false),
     apple_published: usize = 0,
     fn loadCached(self: *Capture, slot: usize, ticket: CacheTicket) !void {
@@ -1498,12 +1501,15 @@ const Capture = struct {
         const count = self.native_count;
         if (count == 0) return;
         defer self.discardNativePending();
+        const started = batch_clock.monotonicNs();
         const pending = self.native_pending[0];
         try self.control.check();
         if (count == 1) {
             const encoded = try projector.encodeEmbeddingGemma2VideoPatches(self.cb, self.a, pending.patches, pending.options.width, pending.options.height);
             defer self.a.free(encoded.embeddings);
-            return self.commitNative(pending.slot, encoded.embeddings, encoded.tokens);
+            try self.commitNative(pending.slot, encoded.embeddings, encoded.tokens);
+            batch_policy.completed(false, pending.options.width, pending.options.height, count, batch_clock.monotonicNs() -| started);
+            return;
         }
         const combined = try self.a.alloc(f32, pending.patches.len * count);
         defer self.a.free(combined);
@@ -1517,17 +1523,18 @@ const Capture = struct {
         if (encoded.tokens % count != 0 or embeddings.len != encoded.tokens * 512) return error.InvalidTensorShape;
         const per_frame = encoded.tokens / count;
         for (self.native_pending[0..count], 0..) |job, i| try self.commitNative(job.slot, embeddings[i * per_frame * 512 ..][0 .. per_frame * 512], per_frame);
+        batch_policy.completed(false, pending.options.width, pending.options.height, count, batch_clock.monotonicNs() -| started);
     }
     fn projectNativeBatch(self: *Capture, slot: usize, patches: []const f32, options: video.preparation.Options) !void {
         if (self.native_count != 0) {
             const pending = self.native_pending[0];
             if (pending.options.width != options.width or pending.options.height != options.height or pending.patches.len != patches.len) try self.flushNativePending();
         }
-        const capacity = try projector.embeddingGemma2VideoBatchCapacity(options.width, options.height, 384 * 1024 * 1024);
+        if (self.native_count == 0) self.native_limit = batch_policy.capacity(false, options.width, options.height, try projector.embeddingGemma2VideoBatchCapacityForBackend(options.width, options.height, 384 * 1024 * 1024, false));
         self.native_pending[self.native_count] = .{ .slot = slot, .patches = try self.a.dupe(f32, patches), .options = options };
         self.native_count += 1;
         self.claimed[slot] = true;
-        if (self.native_count >= capacity) try self.flushNativePending();
+        if (self.native_count >= self.native_limit) try self.flushNativePending();
     }
     fn project(self: *Capture, slot: usize, patches: []const f32, options: video.preparation.Options) !void {
         try self.control.check();
@@ -1542,10 +1549,12 @@ const Capture = struct {
         if (self.resident) |tensors| {
             const input = try self.cb.fromFloat32Shape(patches, &.{ @intCast(patches.len / 768), 768 });
             defer self.cb.free(input);
+            const started = batch_clock.monotonicNs();
             const encoded = try projector.encodeEmbeddingGemma2VideoTensorResident(self.cb, self.a, input, options.width, options.height);
             tensors[slot] = encoded.tensor;
             self.frame_tokens[slot] = encoded.tokens;
             self.storeDevice(slot, encoded.tensor, encoded.tokens);
+            batch_policy.completed(self.cb.kind() == .metal, options.width, options.height, 1, batch_clock.monotonicNs() -| started);
             return;
         }
         const encoded = try projector.encodeEmbeddingGemma2VideoPatches(self.cb, self.a, patches, options.width, options.height);
@@ -1584,7 +1593,7 @@ const Capture = struct {
         while (consumed < jobs.len) {
             const first = consumed;
             const options = jobs[first].options;
-            const capacity = try projector.embeddingGemma2VideoBatchCapacity(options.width, options.height, 768 * 1024 * 1024);
+            const capacity = batch_policy.capacity(true, options.width, options.height, try projector.embeddingGemma2VideoBatchCapacity(options.width, options.height, 768 * 1024 * 1024));
             var stop = first + 1;
             while (stop < jobs.len and stop - first < capacity and jobs[stop].options.width == options.width and jobs[stop].options.height == options.height) : (stop += 1) {}
             consumed = stop; // Cohort consumes all its leases, including on failure.
@@ -1614,6 +1623,7 @@ const Capture = struct {
             const input = (try self.cb.allocUninitF32Shape(&.{ @intCast(rows * jobs.len), 768 })) orelse return error.UnsupportedPrimitiveOp;
             defer self.cb.free(input);
             for (inputs[0..jobs.len], 0..) |part, i| if (!try self.cb.copyRows2D(self.a, input, i * rows, part, 0, rows, 768)) return error.UnsupportedPrimitiveOp;
+            const started = batch_clock.monotonicNs();
             const encoded = try projector.encodeEmbeddingGemma2VideoBatchTensorResident(self.cb, self.a, input, options.width, options.height, jobs.len);
             defer self.cb.free(encoded.tensor);
             if (encoded.tokens % jobs.len != 0) return error.InvalidTensorShape;
@@ -1634,6 +1644,7 @@ const Capture = struct {
                 self.frame_tokens[job.slot] = per_frame;
                 self.storeDevice(job.slot, outputs[i], per_frame);
             }
+            batch_policy.completed(true, options.width, options.height, jobs.len, batch_clock.monotonicNs() -| started);
         } else return error.UnsupportedVideoBackend;
     }
     fn projectGpuNow(self: *Capture, slot: usize, value: video.preparation.Prepared, options: video.preparation.Options) !void {
@@ -1648,6 +1659,7 @@ const Capture = struct {
             // Give sole ownership to inference before runtime reuse can occur.
             prepared.deinit();
             live = false;
+            const started = batch_clock.monotonicNs();
             const encoded = try projector.encodeEmbeddingGemma2VideoTensorResident(self.cb, self.a, input, options.width, options.height);
             if (self.resident) |tensors| {
                 tensors[slot] = encoded.tensor;
@@ -1659,6 +1671,7 @@ const Capture = struct {
                 defer self.a.free(embeddings);
                 try self.save(slot, .{ .embeddings = embeddings, .tokens = encoded.tokens });
             }
+            batch_policy.completed(true, options.width, options.height, 1, batch_clock.monotonicNs() -| started);
         } else return error.UnsupportedVideoBackend;
     }
     fn validateRange(self: *const Capture, full: bool) !void {
@@ -3051,6 +3064,7 @@ test "embeddinggemma2 video cohort capacity adapts to geometry and scratch budge
     const scratch = try projector.embeddingGemma2VideoScratch(480, 480);
     try std.testing.expectEqual(@as(usize, 1), try projector.embeddingGemma2VideoBatchCapacity(480, 480, scratch));
     try std.testing.expectEqual(@as(usize, 4), try projector.embeddingGemma2VideoBatchCapacity(480, 480, scratch * 4));
+    try std.testing.expectEqual(@as(usize, 8), try projector.embeddingGemma2VideoBatchCapacityForBackend(480, 480, scratch * 4, false));
     try std.testing.expectError(error.ImageBatchBudgetExceeded, projector.embeddingGemma2VideoBatchCapacity(480, 480, scratch - 1));
 }
 

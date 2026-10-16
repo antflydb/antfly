@@ -365,6 +365,17 @@ fn codedEnds(reader: *media.mp4.Reader, begin: usize, end: usize, max_packet: us
     return if (first) |packet_index| .{ packet_index, last } else null;
 }
 fn discard(_: *anyopaque, _: usize, _: *const h264.Frame) !void {}
+/// Transport-only immutable planning index. Pixel/entropy validity is checked
+/// when selected dependency spans are decoded. Live ingestion keeps the strict
+/// reconstruction index because publication requires completed pictures.
+pub fn planning(a: std.mem.Allocator, reader: *media.mp4.Reader, options: Options, registry: ?*dynamic.Session) !Index {
+    const owned = if (registry == null and reader.track.inband_parameter_sets) try dynamic.Session.init(a, reader, options.decode) else null;
+    defer if (owned) |owner| owner.deinit();
+    var result = try @import("h264_headers.zig").planning(a, reader, options, registry orelse owned);
+    errdefer result.deinit();
+    try result.reservation.resize(.{ .host_bytes = result.pictures.len * @sizeOf(h264.Picture) });
+    return result;
+}
 pub fn index(a: std.mem.Allocator, reader: *media.mp4.Reader, options: Options) !Index {
     return indexMode(a, reader, options, false);
 }
@@ -438,6 +449,10 @@ test "AVC logical picture index counts field pairs partitions and configuration 
         var pictures = try index(a, &reader, .{});
         defer pictures.deinit();
         try std.testing.expect(pictures.pictures.len > 0);
+        var planned = try planning(a, &reader, .{}, null);
+        defer planned.deinit();
+        try std.testing.expectEqual(@as(usize, 0), planned.decoded_packets);
+        try std.testing.expectEqualSlices(h264.Picture, pictures.pictures, planned.pictures);
         var live = try streaming(a, &reader, .{});
         defer live.deinit();
         try std.testing.expectEqual(@as(?i64, null), live.pending_pts);
@@ -735,4 +750,35 @@ fn bootstrapSuffixRun(fixture_bytes: []const u8, comptime independent_reset: boo
 test "AVC parameter bootstrap reconstructs reset suffixes and preserves non-IDR reference requirements" {
     try bootstrapSuffixRun(@embedFile("../testdata/h264-dynamic-geometry.mp4"), true);
     try bootstrapSuffixRun(@embedFile("../testdata/h264-dynamic-pps.mp4"), false);
+}
+
+test "AVC header planning matches reconstructed fields planes partitions and epochs" {
+    const a = std.testing.allocator;
+    inline for (.{ "h264-paff-adaptive-packets-8-1", "h264-paff-interleaved-fragments-10-2", "h264-paff-adaptive-packets-14-3", "h264-paff-b-10-2-spatial", "h264-jm-partitions", "h264-jm-separate", "h264-dynamic-geometry", "h264-baseline-p" }) |name| {
+        var input = media.source.Source{ .allocator = a, .identity = name, .storage = .{ .borrowed = @embedFile("../testdata/" ++ name ++ ".mp4") } };
+        var reader = try media.mp4.Reader.init(a, &input, .{});
+        defer reader.deinit();
+        var decoded = try index(a, &reader, .{});
+        defer decoded.deinit();
+        var headers = try planning(a, &reader, .{}, null);
+        defer headers.deinit();
+        try std.testing.expectEqual(@as(usize, 0), headers.decoded_packets);
+        try std.testing.expectEqualSlices(h264.Picture, decoded.pictures, headers.pictures);
+    }
+}
+
+test "AVC header planning releases admission across allocation and resource failures" {
+    const Harness = struct {
+        fn run(a: std.mem.Allocator) !void {
+            var pool = media.admission.Pool{ .limits = .{ .host_bytes = 64 * 1024 * 1024 } };
+            defer std.debug.assert(std.meta.eql(pool.snapshot(), media.admission.Resources{}));
+            var input = media.source.Source{ .allocator = a, .identity = "header-failures", .storage = .{ .borrowed = @embedFile("../testdata/h264-paff-interleaved-fragments-10-2.mp4") }, .admission_pool = &pool };
+            var reader = try media.mp4.Reader.init(a, &input, .{});
+            defer reader.deinit();
+            var headers = try planning(a, &reader, .{}, null);
+            defer headers.deinit();
+            try std.testing.expectError(error.ResourceLimitExceeded, planning(a, &reader, .{ .max_packets = 1 }, null));
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Harness.run, .{});
 }

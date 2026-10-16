@@ -170,8 +170,12 @@ pub const Runner = struct {
         defer if (result) |value| self.allocator.free(value.vector);
         if (self.request.execute) {
             result = self.executor.embed(self.executor.context, self.allocator, payload) catch |err| blk: {
-                if (!self.request.allow_partial or abort(err)) return err;
-                item.failure = err;
+                // A busy provider is admission pressure, including after an
+                // acknowledged prefix. Never publish it as a failed chunk or
+                // lose the cursor needed to resume that exact ordinal.
+                const failure = if (err == error.QueueFull) error.ResourceTemporarilyUnavailable else err;
+                if (!self.request.allow_partial or abort(failure)) return failure;
+                item.failure = failure;
                 break :blk null;
             };
             if (result) |value| {
@@ -672,7 +676,7 @@ pub const Runner = struct {
 };
 pub fn abort(err: anyerror) bool {
     return switch (err) {
-        error.Cancelled, error.Canceled, error.Timeout, error.DeadlineExceeded, error.OutOfMemory, error.MemoryBudgetExceeded, error.SharedAdmissionExceeded, error.ResourceTemporarilyUnavailable, error.ConcurrencyUnavailable, error.InferenceAdmissionQueueFull, error.ResourceLimitExceeded, error.AudioTooLarge, error.StreamTooLong, error.RemoteReadBudgetExceeded, error.RemoteRequestBudgetExceeded, error.ChunkWorkingBudgetExceeded, error.ChunkDependencyBudgetExceeded, error.ChunkCodedWindowBudgetExceeded, error.ChunkEventBudgetExceeded => true,
+        error.Cancelled, error.Canceled, error.Timeout, error.DeadlineExceeded, error.OutOfMemory, error.MemoryBudgetExceeded, error.SharedAdmissionExceeded, error.ResourceTemporarilyUnavailable, error.ConcurrencyUnavailable, error.InferenceAdmissionQueueFull, error.QueueFull, error.ResourceLimitExceeded, error.AudioTooLarge, error.StreamTooLong, error.RemoteReadBudgetExceeded, error.RemoteRequestBudgetExceeded, error.ChunkWorkingBudgetExceeded, error.ChunkDependencyBudgetExceeded, error.ChunkCodedWindowBudgetExceeded, error.ChunkEventBudgetExceeded => true,
         else => false,
     };
 }
@@ -1041,7 +1045,7 @@ test "model aware media video yields speculative pressure and schedules only one
                 try std.Io.sleep(std.testing.io, .fromMilliseconds(1), .awake);
             }
             self.starts += 1;
-            return error.ResourceTemporarilyUnavailable;
+            return error.QueueFull;
         }
         fn embed(raw: *anyopaque, allocator: std.mem.Allocator, payload: Payload) !Output {
             const self: *@This() = @ptrCast(@alignCast(raw));
@@ -1077,4 +1081,37 @@ fn videoOwnerAllocationCheck(a: std.mem.Allocator) !void {
 }
 test "model aware media presentation index releases every allocation and admission on failure" {
     try std.testing.checkAllAllocationFailures(std.testing.allocator, videoOwnerAllocationCheck, .{});
+}
+
+test "model aware media busy provider preserves acknowledged prefix even with partial results" {
+    const Busy = struct {
+        calls: usize = 0,
+        fn embed(raw: *anyopaque, a: std.mem.Allocator, payload: Payload) !Output {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            if (self.calls == 2) return error.QueueFull;
+            return Qualification.embed(raw, a, payload);
+        }
+    };
+    const a = std.testing.allocator;
+    for ([_]bool{ false, true }) |allow_partial| {
+        var result = Qualification{};
+        var busy = Busy{};
+        var executor = result.executor();
+        executor.context = &busy;
+        executor.embed = Busy.embed;
+        var request = Request{ .input = .{ .text = "hello world across chunks" }, .allow_partial = allow_partial, .policy = .{ .target_tokens = 5, .overlap_tokens = 1 } };
+        var runner = try Runner.init(a, request, executor, .{}, .{ .context = &result, .accept = Qualification.accept });
+        try std.testing.expectError(error.ResourceTemporarilyUnavailable, runner.run());
+        try std.testing.expectEqual(@as(usize, 1), result.seen);
+        try std.testing.expectEqual(@as(u64, 1), runner.summary.next_ordinal);
+        try std.testing.expectEqual(@as(usize, 0), runner.summary.failed);
+        var bytes: [85]u8 = undefined;
+        request.continuation = runner.summary.identity.cursor(runner.summary.next_ordinal, &bytes);
+        var resumed = try Runner.init(a, request, result.executor(), .{}, .{ .context = &result, .accept = Qualification.accept });
+        try std.testing.expect((try resumed.run()).complete);
+        for (result.ordinals[0..result.seen], 0..) |ordinal, expected| try std.testing.expectEqual(expected, ordinal);
+        try std.testing.expectEqual(media.admission.Resources{}, runner.pool.snapshot());
+    }
+    try std.testing.expect(abort(error.QueueFull));
 }

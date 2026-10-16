@@ -47,4 +47,13 @@ pub fn build(b: *std.Build) void {
     sampling_root.addImport("antfly_media", b.modules.get("antfly_video").?.import_table.get("antfly_media").?);
     const sampling_bench = b.addExecutable(.{ .name = "video-sampling-benchmark", .root_module = sampling_root });
     b.step("bench-sampling", "Compare immutable timeline lookup with the linear sampling oracle").dependOn(&b.addRunArtifact(sampling_bench).step);
+    const index_root = b.createModule(.{ .root_source_file = b.path("picture_index_benchmark.zig"), .target = target, .optimize = optimize });
+    index_root.addImport("antfly_media", b.modules.get("antfly_video").?.import_table.get("antfly_media").?);
+    const index_bench = b.addExecutable(.{ .name = "video-picture-index-benchmark", .root_module = index_root });
+    b.step("bench-picture-index", "Compare transport header assembly with reconstructed AVC picture indexing").dependOn(&b.addRunArtifact(index_bench).step);
+    const index_tests_root = b.createModule(.{ .root_source_file = b.path("picture_index_test_root.zig"), .target = target, .optimize = optimize });
+    index_tests_root.addImport("antfly_media", b.modules.get("antfly_video").?.import_table.get("antfly_media").?);
+    const index_tests = b.addTest(.{ .root_module = index_tests_root, .filters = &.{"AVC header"} });
+    b.step("test-picture-index", "Differential AVC transport index qualification across maintained fixtures").dependOn(&b.addRunArtifact(index_tests).step);
+    b.step("install-picture-index-tests", "Install portable AVC index qualification for another host").dependOn(&b.addInstallArtifact(index_tests, .{ .dest_sub_path = "picture-index-tests" }).step);
 }

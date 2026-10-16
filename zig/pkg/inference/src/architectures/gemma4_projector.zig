@@ -428,7 +428,7 @@ pub fn encodeEmbeddingGemma2VideoTensorResident(cb: *const ComputeBackend, alloc
 
 /// Frames share projection/FFN dispatches; SDPA has an independent batch axis.
 /// Input rows are frame-major NHWC patches. The returned tensor is frame-major.
-/// A two-frame bound keeps transformer workspace within request admission.
+/// Workspace includes bounded groups of two Metal vision layers.
 pub fn embeddingGemma2VideoScratch(width: u32, height: u32) !usize {
     if (width == 0 or height == 0 or width % 48 != 0 or height % 48 != 0) return error.InvalidTensorShape;
     return imageScratchBytes(embeddingGemma2ImageConfig(), @as(usize, width / 16) * (height / 16));
@@ -436,8 +436,14 @@ pub fn embeddingGemma2VideoScratch(width: u32, height: u32) !usize {
 
 /// Geometry-aware cohort limit. Includes conservative dense-attention scratch.
 pub fn embeddingGemma2VideoBatchCapacity(width: u32, height: u32, budget: usize) !usize {
+    return embeddingGemma2VideoBatchCapacityForBackend(width, height, budget, true);
+}
+pub fn embeddingGemma2VideoBatchCapacityForBackend(width: u32, height: u32, budget: usize, metal: bool) !usize {
     if (width == 0 or height == 0 or width % 48 != 0 or height % 48 != 0) return error.InvalidTensorShape;
-    const scratch = try imageScratchBytes(embeddingGemma2ImageConfig(), @as(usize, width / 16) * (height / 16));
+    const patches = @as(usize, width / 16) * (height / 16);
+    // CPU completes each layer synchronously and retains no command-frame
+    // intermediates. Its cohort ceiling must not pay Metal's two-layer cost.
+    const scratch = if (metal) try imageScratchBytes(embeddingGemma2ImageConfig(), patches) else try imageLayerScratchBytes(embeddingGemma2ImageConfig(), patches);
     if (scratch > budget) return error.ImageBatchBudgetExceeded;
     return @min(@as(usize, 8), budget / @max(@as(usize, 1), scratch));
 }
@@ -1617,10 +1623,19 @@ fn validatePreparedImage(cfg: Config, prepared: PreparedImage) !void {
     if (prepared.pixels.len != (std.math.mul(usize, area, 3) catch return error.InvalidImageBatch)) return error.InvalidImageBatch;
 }
 
-fn imageScratchBytes(cfg: Config, patches: usize) !usize {
+fn imageLayerScratchBytes(cfg: Config, patches: usize) !usize {
     const attention = std.math.mul(usize, std.math.mul(usize, patches, patches) catch return error.InvalidImageBatch, cfg.head_count) catch return error.InvalidImageBatch;
     const activations_count = std.math.mul(usize, patches, (std.math.add(usize, std.math.mul(usize, cfg.vision_hidden, 12) catch return error.InvalidImageBatch, std.math.mul(usize, cfg.intermediate_size, 3) catch return error.InvalidImageBatch) catch return error.InvalidImageBatch)) catch return error.InvalidImageBatch;
     return std.math.mul(usize, std.math.add(usize, attention, activations_count) catch return error.InvalidImageBatch, 4) catch return error.InvalidImageBatch;
+}
+
+fn visionLayerGroup(cfg: Config, patches: usize) !usize {
+    // Preserve large-image support: grouping must not turn a fitting single
+    // layer into a mandatory >512-MiB per-image reservation.
+    return if (cfg.embedding_gemma2_f32_attention and try imageLayerScratchBytes(cfg, patches) <= 256 * 1024 * 1024) 2 else 1;
+}
+fn imageScratchBytes(cfg: Config, patches: usize) !usize {
+    return std.math.mul(usize, try imageLayerScratchBytes(cfg, patches), try visionLayerGroup(cfg, patches)) catch return error.InvalidImageBatch;
 }
 
 /// Conservative per-image estimate available before decoding for broker admission.
@@ -1829,11 +1844,25 @@ fn encodePositionedBatchResident(cb: *const ComputeBackend, allocator: std.mem.A
     var hidden_live = true;
     errdefer if (hidden_live) cb.free(hidden);
 
+    // Group only our own frames. External frame owners keep their lifetime
+    // boundary; stage diagnostics keep their synchronized per-layer behavior.
+    const grouped = cb.kind() == .metal and try visionLayerGroup(cfg, geometry.grid_x * geometry.grid_y) == 2 and
+        !platform.env.getenvBool("TERMITE_METAL_DISABLE_GEMMA4_VISION_FRAMES") and
+        platform.env.getenv("ANTFLY_EMBEDDINGGEMMA2_STAGES") == null and
+        !cb.decoderRuntimeHasActiveFrame();
+    var frame = false;
+    defer if (frame) cb.decoderRuntimeCancelFrame() catch {};
     for (0..cfg.block_count) |layer| {
         try cb.checkExecutionControl();
+        if (grouped and !frame) frame = try cb.decoderRuntimeBeginFrame();
         const next = try encoderBlockBatch(cb, allocator, store, cfg, hidden, geometry, layer, batch);
         cb.free(hidden);
         hidden = next;
+        if (frame and ((layer + 1) % 2 == 0 or layer + 1 == cfg.block_count)) {
+            try cb.decoderRuntimeSubmitAndWaitFrame();
+            frame = false;
+            if (store.gguf == null) try @import("../ops/metal_compute.zig").MetalCompute.releaseEmbeddingGemma2ActivationViews(cb);
+        }
         store.releaseCompletedNativeLayer();
         if (store.gguf == null) {
             var name_buf: [128]u8 = undefined;
