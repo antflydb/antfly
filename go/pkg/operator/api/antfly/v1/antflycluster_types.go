@@ -1555,6 +1555,14 @@ type StorageSpec struct {
 	// +optional
 	LiteFileName string `json:"liteFileName,omitempty"`
 
+	// StandaloneAccessMode selects the standalone PVC's writer isolation.
+	// ReadWriteOncePod requires a compatible CSI driver and allows only one
+	// pod to mount the claim. Omitted preserves the existing ReadWriteOnce
+	// behavior. Changing this after creation requires a new volume.
+	// +optional
+	// +kubebuilder:validation:Enum=ReadWriteOnce;ReadWriteOncePod
+	StandaloneAccessMode corev1.PersistentVolumeAccessMode `json:"standaloneAccessMode,omitempty"`
+
 	// PVCRetentionPolicy controls what happens to PVCs when the cluster is deleted or scaled down.
 	// Maps to StatefulSet's persistentVolumeClaimRetentionPolicy (beta in K8s 1.27, GA in 1.32).
 	// On clusters < 1.27, this field is silently ignored by the StatefulSet controller;
@@ -1567,6 +1575,14 @@ type StorageSpec struct {
 	// mode applies it to the standalone PVC.
 	// +optional
 	StorageAutoGrow *StorageAutoGrowSpec `json:"storageAutoGrow,omitempty"`
+}
+
+// EffectiveStandaloneAccessMode preserves the mode used by existing volumes.
+func (s StorageSpec) EffectiveStandaloneAccessMode() corev1.PersistentVolumeAccessMode {
+	if s.StandaloneAccessMode == "" {
+		return corev1.ReadWriteOnce
+	}
+	return s.StandaloneAccessMode
 }
 
 // StorageAutoGrowSpec configures automatic grow-only PVC expansion.

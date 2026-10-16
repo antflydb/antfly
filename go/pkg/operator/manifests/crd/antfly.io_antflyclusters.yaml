@@ -4303,6 +4303,11 @@ spec:
                         - Delete
                         type: string
                     type: object
+                  standaloneAccessMode:
+                    enum:
+                    - ReadWriteOnce
+                    - ReadWriteOncePod
+                    type: string
                   standaloneStorage:
                     type: string
                   storageAutoGrow:

@@ -428,7 +428,7 @@ func (r *AntflyClusterReconciler) reconcileHAStartupTargetPVC(ctx context.Contex
 		created := &corev1.PersistentVolumeClaim{
 			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: cluster.Namespace, Labels: persistentVolumeClaimLabels(cluster, standaloneComponent(cluster))},
 			Spec: corev1.PersistentVolumeClaimSpec{
-				AccessModes:      []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce},
+				AccessModes:      []corev1.PersistentVolumeAccessMode{cluster.Spec.Storage.EffectiveStandaloneAccessMode()},
 				StorageClassName: storageClassName,
 				Resources: corev1.VolumeResourceRequirements{Requests: corev1.ResourceList{
 					corev1.ResourceStorage: resource.MustParse(storageSize),
@@ -442,6 +442,9 @@ func (r *AntflyClusterReconciler) reconcileHAStartupTargetPVC(ctx context.Contex
 	}
 	if existing.DeletionTimestamp != nil {
 		return nil, fmt.Errorf("HA startup target PVC %s is terminating", name)
+	}
+	if err := validateExplicitStandalonePVCAccessMode(existing, cluster); err != nil {
+		return nil, err
 	}
 	if owner := metav1.GetControllerOf(existing); owner != nil {
 		return nil, fmt.Errorf("HA startup target PVC %s must be independently retained, but is controlled by %s %s", name, owner.Kind, owner.Name)
@@ -1766,9 +1769,32 @@ func standaloneStorageIdentity(cluster *antflyv1.AntflyCluster) (engine, liteFil
 	return engine, liteFileName
 }
 
+func validateExplicitStandalonePVCAccessMode(pvc *corev1.PersistentVolumeClaim, cluster *antflyv1.AntflyCluster) error {
+	// Existing HA deployments predate this optional contract. Once requested,
+	// an explicit seed claim must provide the same fence as a claim template.
+	if cluster.Spec.Storage.StandaloneAccessMode != "" && (len(pvc.Spec.AccessModes) != 1 || pvc.Spec.AccessModes[0] != cluster.Spec.Storage.EffectiveStandaloneAccessMode()) {
+		return fmt.Errorf("standalone PVC %s access mode migration requires a new volume: existing %v, requested %s", pvc.Name, pvc.Spec.AccessModes, cluster.Spec.Storage.EffectiveStandaloneAccessMode())
+	}
+	return nil
+}
+
 func validateAndSetStandaloneStorageIdentity(statefulSet *appsv1.StatefulSet, cluster *antflyv1.AntflyCluster) error {
 	engine, liteFileName := standaloneStorageIdentity(cluster)
 	if statefulSet.ResourceVersion != "" {
+		// Claim templates are immutable. A webhook outage must not turn an
+		// existing RWO volume into an apparently pod-exclusive deployment.
+		for _, claim := range statefulSet.Spec.VolumeClaimTemplates {
+			if claim.Name != standaloneStorageVolumeName(cluster) {
+				continue
+			}
+			modes := claim.Spec.AccessModes
+			if len(modes) == 0 { // Legacy objects omitted the RWO default.
+				modes = []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce}
+			}
+			if len(modes) != 1 || modes[0] != cluster.Spec.Storage.EffectiveStandaloneAccessMode() {
+				return fmt.Errorf("standalone PVC access mode migration requires a new volume: existing StatefulSet %s uses %v, requested %s", statefulSet.Name, modes, cluster.Spec.Storage.EffectiveStandaloneAccessMode())
+			}
+		}
 		persistedEngine, ok := statefulSet.Annotations[annotationStorageEngine]
 		if !ok {
 			if standaloneUsesLegacySwarmIdentity(cluster) && engine == "local" && statefulSet.Name == cluster.Name+"-swarm" && metav1.IsControlledBy(statefulSet, cluster) {
@@ -4847,7 +4873,7 @@ func (r *AntflyClusterReconciler) reconcileStandaloneStatefulSet(ctx context.Con
 			},
 			Spec: corev1.PersistentVolumeClaimSpec{
 				AccessModes: []corev1.PersistentVolumeAccessMode{
-					corev1.ReadWriteOnce,
+					cluster.Spec.Storage.EffectiveStandaloneAccessMode(),
 				},
 				StorageClassName: storageClassName,
 				Resources: corev1.VolumeResourceRequirements{
@@ -4888,6 +4914,15 @@ func (r *AntflyClusterReconciler) reconcileStandaloneStatefulSet(ctx context.Con
 			preservedSeedStorage = existingActivatedStandaloneStorageBinding(statefulSet, storageVolumeName)
 			if preservedSeedStorage == nil && hasExplicitStandaloneStoragePVC(statefulSet, storageVolumeName) {
 				return fmt.Errorf("existing StatefulSet %s has an explicit standalone storage PVC without a complete activated-seed binding; refusing to reinterpret its on-disk layout", statefulSet.Name)
+			}
+			if preservedSeedStorage != nil && cluster.Spec.Storage.StandaloneAccessMode != "" {
+				claim := &corev1.PersistentVolumeClaim{}
+				if err := r.Get(ctx, types.NamespacedName{Namespace: cluster.Namespace, Name: preservedSeedStorage.claimName}, claim); err != nil {
+					return err
+				}
+				if err := validateExplicitStandalonePVCAccessMode(claim, cluster); err != nil {
+					return err
+				}
 			}
 		}
 		if err := validateAndSetStandaloneStorageIdentity(statefulSet, cluster); err != nil {
