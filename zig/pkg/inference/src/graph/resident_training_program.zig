@@ -455,7 +455,7 @@ test "resident program preserves backend and request controls without GPU dispat
             try std.testing.expectEqual(@as(*anyopaque, @ptrCast(self.carrier)), active.hard_cancellation.?.ptr);
             try std.testing.expectEqual(@as(?*anyopaque, @ptrCast(self.original)), active.progress.?.ptr);
             active.progress.?.update(.{ .phase = .executing });
-            var guard = try active.enterUninterruptible(.process_required);
+            var guard = try active.enterUninterruptible(.uninterruptible);
             defer guard.deinit();
             const monitor = self.carrier.monitor.?;
             try std.testing.expectEqual(self.expected_deadline, monitor.deadline_ns.?);
