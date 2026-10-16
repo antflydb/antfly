@@ -30826,6 +30826,17 @@ pub const DB = struct {
         try self.executor.waitForAllWithVisibilityWait(sequence, wait);
     }
 
+    /// Resolve through the loaded-index selector used by filter execution.
+    /// Copy the name while the owning engine holds its schema/apply fence;
+    /// callers across archives must never borrow physical index handles.
+    pub fn resolvedFilterTextIndexNameAlloc(self: *DB, alloc: Allocator, primary: ?[]const u8, singleton: ?[]const u8) !?[]u8 {
+        if (comptime storage_engine.enabled) return storage_engine.call("resolvedFilterTextIndexNameAlloc", .{ self, alloc, primary, singleton });
+        try self.lockApplySharedForPortableRuntime();
+        defer self.core.unlockApplyShared();
+        const entry = try db_query_search.resolveFilterTextIndexEntry(.{ .ctx = self, .text_index_entry = textIndexEntryCallback }, primary, singleton) orelse return null;
+        return try alloc.dupe(u8, entry.config.name);
+    }
+
     /// Wait only for the selected indexes, before acquiring statement fences.
     /// The returned primary sequence lets the caller retry capture if a write
     /// arrived between replay completion and its multi-table read fence.
