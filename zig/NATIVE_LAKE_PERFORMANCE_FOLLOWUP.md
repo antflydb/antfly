@@ -5231,3 +5231,15 @@ fixture now also checks mixed computed FILTER cohorts and wide global counts.
 These are bounded execution improvements, not an archive-scale latency claim.
 Representative latency/RSS benchmarking and live cloud retention qualification
 remain deferred.
+
+
+Qualification after merging `origin/main` `ce578d9033` (2026-10-16): all 503
+full native lake tests (189 shared-engine and 314 server), 43 focused SQL
+tests, and 31 runtime ABI tests passed with zero native failures or leaks. All
+50 real Parquet/Iceberg E2Es passed against the final merged Debug CLI in
+632.59 seconds with production disk safeguards enabled. The expanded Parquet
+restart fixture also passed separately. Merge coverage includes compact spill
+arrays, native parameter ownership, and leased array projections. Generated error
+parity, Zig/Python formatting, Python lint, whitespace, license headers, and the
+Apache product boundary (2,073 source files) passed. The private error table
+includes the combined branch/main names; public runtime ABI values remain pinned.
