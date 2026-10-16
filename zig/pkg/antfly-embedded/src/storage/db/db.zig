@@ -29001,7 +29001,10 @@ pub const DB = struct {
             }
             if (saved.retry_after_ns > retry_now) continue;
             const pending = blk: {
-                const admission = self.graph_replacement_admission;
+                // Detached shadow turns use generation-scoped, per-write
+                // publication admission. Holding the connection lease across
+                // producer append would reenter GeneratedPublication.commit.
+                const admission = if (bounded_replay) null else self.graph_replacement_admission;
                 if (admission) |lease| try GraphReplacementAdmissionBoundary.call("enter", lease.dispatch, lease.enter, .{lease.ptr});
                 defer if (admission) |lease| lease.leave(lease.ptr);
                 break :blk self.advanceGraphReplacementOnce(deadline, saved, bounded_replay);

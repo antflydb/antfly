@@ -463,11 +463,9 @@ const Engine = struct {
             for (projection.items) |item| if (!try self.collectStreamingAggregates(item.expression, &calls)) return null;
             for (projection.order) |order| if (!try self.collectStreamingAggregates(order.expression, &calls)) return null;
         } else if (projection.limit == null or (projection.order.len == 0 and projection.predicate != null)) return null;
-        const count_shortest = path.selector != .all;
-        if (count_shortest) {
-            if (!grouped or middle.len != 0 or operation.predicate != null or path.edges.len != 1 or path.edges[0].min_hops > 1) return null;
-            for (projection.items) |item| if (!aggregates(item.expression)) return null;
-            for (calls.items) |expression| if (!expression.value.call.star or !std.ascii.eqlIgnoreCase(expression.value.call.name, "count")) return null;
+        const selected_path = path.selector != .all;
+        if (selected_path) {
+            if (path.edges.len != 1 or path.edges[0].min_hops > 1) return null;
             for (input) |row| {
                 if (path.alias) |alias| if (lookup(row, alias) != null) return null;
                 if (path.edges[0].alias) |alias| if (lookup(row, alias) != null) return null;
@@ -477,6 +475,11 @@ const Engine = struct {
                 for (path.edges[0].properties) |entry| if (self.constant(entry.value, row) == null) return null;
             }
         }
+        const count_shortest = selected_path and grouped and middle.len == 0 and operation.predicate == null and blk: {
+            for (projection.items) |item| if (!aggregates(item.expression)) break :blk false;
+            for (calls.items) |expression| if (!expression.value.call.star or !std.ascii.eqlIgnoreCase(expression.value.call.name, "count")) break :blk false;
+            break :blk true;
+        };
         var shape: std.ArrayList(v.Entry) = .empty;
         if (input.len != 0) try shape.appendSlice(self.a, input[0]);
         for (path.nodes) |node| if (node.alias) |name| try shape.append(self.a, .{ .name = name, .value = .null });
@@ -1191,18 +1194,25 @@ const Engine = struct {
                 if (try self.bind(input.row, path.nodes[1].alias, .{ .node = current.node })) |row| {
                     candidate.row = row;
                     if (try self.constrain(candidate, .{ .node = current.node }, path.nodes[1].properties)) |constrained| {
-                        if (self.shortest_count) |count_paths| {
+                        var selected = true;
+                        if (self.shortest_count != null or self.stream_fold != null) {
                             const entry = try counted.getOrPut(self.a, current.node.identity);
-                            const ways: u64 = if (!entry.found_existing) blk: {
-                                entry.value_ptr.* = current.depth;
-                                break :blk if (path.selector == .shortest) 1 else current.ways;
-                            } else if (entry.value_ptr.* == current.depth and path.selector == .all_shortest) current.ways else 0;
-                            count_paths.* = std.math.add(u64, count_paths.*, ways) catch return error.CypherNumericOverflow;
-                            if (count_paths.* > std.math.maxInt(i64)) return error.CypherNumericOverflow;
-                        } else {
-                            const nodes = try self.a.alloc(*const v.Node, current.depth + 1);
-                            const relationships = try self.a.alloc(*const v.Relationship, current.depth);
-                            try self.emitBreadthPaths(queue.items, head, constrained, path, mode, nodes, relationships, output);
+                            if (!entry.found_existing) entry.value_ptr.* = current.depth else selected = entry.value_ptr.* == current.depth and path.selector == .all_shortest;
+                        }
+                        if (selected) {
+                            if (self.shortest_count) |count_paths| {
+                                const ways: u64 = if (path.selector == .shortest) 1 else current.ways;
+                                count_paths.* = std.math.add(u64, count_paths.*, ways) catch return error.CypherNumericOverflow;
+                                if (count_paths.* > std.math.maxInt(i64)) return error.CypherNumericOverflow;
+                            } else {
+                                var endpoint_arena = std.heap.ArenaAllocator.init(self.scratch_allocator);
+                                defer endpoint_arena.deinit();
+                                const endpoint_scope = if (self.stream_fold != null) EvalScope.enter(self, endpoint_arena.allocator()) else null;
+                                defer if (endpoint_scope) |scope| scope.leave(self);
+                                const nodes = try self.a.alloc(*const v.Node, current.depth + 1);
+                                const relationships = try self.a.alloc(*const v.Relationship, current.depth);
+                                try self.emitBreadthPaths(queue.items, head, constrained, path, mode, nodes, relationships, output);
+                            }
                         }
                     }
                 }
@@ -1294,6 +1304,10 @@ const Engine = struct {
             }
             return;
         }
+        var route_arena = std.heap.ArenaAllocator.init(self.scratch_allocator);
+        defer route_arena.deinit();
+        const route_scope = if (self.stream_fold != null) EvalScope.enter(self, route_arena.allocator()) else null;
+        defer if (route_scope) |scope| scope.leave(self);
         const values = try self.a.alloc(v.Value, relationships.len);
         for (relationships, values) |relationship, *value| value.* = .{ .relationship = relationship };
         const edge = path.edges[0];

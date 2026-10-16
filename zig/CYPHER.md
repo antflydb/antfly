@@ -64,7 +64,11 @@ read-your-writes after a key moves, composite-index and empty-page continuations
 2 MiB local grouped/compound aggregate pipelines, and shared shortest-path
 expansion with every result tie preserved. Authenticated HTTP tests compare
 2,000 and 10,000 inputs under the same 8 MiB execution budget, including RPC
-page/decode overhead. SQL overlay tests reject any adjacency callback for a
+page/decode overhead. Traversal regressions require a one-edge LIMIT, bounded
+grouping/top-k, and a 32,768-route shortest-path count within 2 MiB without
+materializing those routes. Shortest-path LIMIT releases reconstructed routes
+after feeding its consumer; count overflow is reported only for qualifying
+endpoints. SQL overlay tests reject any adjacency callback for a
 node-only staged query and qualify explicit/derived edges, rollback and row
 policies through HTTP and pgwire.
 

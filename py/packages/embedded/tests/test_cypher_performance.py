@@ -385,6 +385,15 @@ def test_shortest_operator_uses_bound_comma_inputs_and_counts_the_dag(graph_db):
             },
         )
         assert result["rows"] == [[{"type": "integer", "value": str(expected)}]]
+    limited = db.cypher_json(
+        "g",
+        {
+            "query": "MATCH (s:D) WHERE antfly.documentKey(s)=$s MATCH (z:D) WHERE antfly.documentKey(z)=$z MATCH p=allShortestPaths((s)-[:R*1..32]->(z)) RETURN length(p) LIMIT 1",
+            "parameters": {"s": keys[0], "z": keys[2]},
+            "limits": {"explored_edges": edges, "memory_bytes": 2 << 20, "intermediate_states": 2000},
+        },
+    )
+    assert limited["rows"] == [[{"type": "integer", "value": str(layers)}]]
     result = db.cypher_json(
         "g",
         {
@@ -412,3 +421,29 @@ def test_range_seeks_do_not_round_integer_bounds_on_float_columns(graph_db):
     )
     result = db.cypher_json("float_graph", {"query": "MATCH (n:F) WHERE n.n<9007199254740993 RETURN count(*)"})
     assert result["rows"] == [[{"type": "integer", "value": "1"}]]
+
+
+def test_dag_count_reports_overflow_only_for_qualifying_endpoints(graph_db):
+    db = graph_db
+    layers = 64
+    patterns = ["(s:D)", "(z:D)"] + [f"(v{i}_{j}:D)" for i in range(layers) for j in range(2)]
+    patterns += [f"(s)-[:R]->(v0_{j})" for j in range(2)]
+    patterns += [f"(v{i}_{j})-[:R]->(v{i + 1}_{k})" for i in range(layers - 1) for j in range(2) for k in range(2)]
+    keys = [
+        cell["value"]
+        for cell in db.cypher_json(
+            "g",
+            {
+                "query": "CREATE "
+                + ",".join(patterns)
+                + f" RETURN antfly.documentKey(s),antfly.documentKey(z),antfly.documentKey(v{layers - 1}_0)"
+            },
+        )["rows"][0]
+    ]
+    query = "MATCH (s:D) WHERE antfly.documentKey(s)=$s MATCH (z:D) WHERE antfly.documentKey(z)=$z MATCH p=allShortestPaths((s)-[:R*1..64]->(z)) RETURN count(*)"
+    request = {"query": query, "parameters": {"s": keys[0], "z": keys[1]}, "limits": {"intermediate_states": 10000}}
+    assert db.cypher_json("g", request)["rows"] == [[{"type": "integer", "value": "0"}]]
+    request["parameters"]["z"] = keys[2]
+    with pytest.raises(af.GraphError) as overflow:
+        db.cypher_json("g", request)
+    assert overflow.value.graph_code == "CypherNumericOverflow"

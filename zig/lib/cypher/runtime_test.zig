@@ -855,6 +855,12 @@ test "streamed traversal reductions preserve bags, scopes, ordering and limits" 
     try check("MATCH (a:Document {id:'c'})-[:CITES]->(b) RETURN count(*),sum(b.rank)", "[[0,0]]");
 }
 
+test "shortest routes stream bounded projections and compound reductions" {
+    try check("MATCH p=allShortestPaths((a:Document {id:'a'})-[:CITES*1..4]->(b)) RETURN min(length(p)),count(*)", "[[1,6]]");
+    try check("MATCH p=shortestPath((a:Document {id:'a'})-[:CITES*1..4]-(b)) RETURN b.id,length(p) ORDER BY b.id LIMIT 3", "[[\"a\",2],[\"b\",1],[\"c\",2]]");
+    try check("MATCH p=allShortestPaths((a:Document {id:'a'})-[:CITES*1..4]->(b)) RETURN length(p) LIMIT 1", "[[1]]");
+}
+
 test "DAG count agrees with materialized selectors for directed and undirected cycles" {
     for ([_][]const u8{ "shortestPath", "allShortestPaths" }) |selector| {
         for ([_][]const u8{ "->", "-" }) |direction| {
