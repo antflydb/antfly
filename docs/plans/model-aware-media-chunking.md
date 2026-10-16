@@ -257,11 +257,22 @@ Contiguous image/PDF decoders also use a bounded source/decode allocation;
 unsupported sizes fail without claiming completion. Model calls reuse the
 request's projected-frame cache and bounded CPU/Metal preparation queue. Device
 projections assemble in one allocation. One separately admitted following window
-can decode/prepare during the current backbone; decoder access stays serialized,
+can plan/decode/prepare during the current backbone; decoder access stays serialized,
 resource pressure retries serially, and abandonment joins before freeing source
 storage. Execution
 admission includes source ownership, transport/cache allowance, output retention
 and existing model resource permits. Resource limits never alter chunk identity.
+
+Finite video selection uses one admitted augmented presentation index, retaining
+exact VFR/hold and stable tie semantics. H.264 packet-interval queries bound
+field/partition closure work to relevant pictures; immutable request-owned seek
+caches avoid repeated IDR packet probes across windows. Compatible projection
+cohorts grow to eight within geometry-derived scratch and queue limits. Consumers
+do not wait for a full cohort. Known video/text shapes use derived admission
+bounds with enforced host ceilings and a final rendered-sequence guard;
+uninspected image/audio retains conservative bounds. Owned live windows fill one
+final snapshot allocation, eliminating the second full encoded-byte copy.
+
 
 Database chunk artifacts store the `_chunk` reconstruction descriptor; vectors
 remain in the existing embedding artifact family. Compatible fused vectors enter

@@ -418,3 +418,23 @@ test "video Metal imports and preparations outlive their creating cache and prep
     for (expected, actual) |want, got| try std.testing.expectApproxEqAbs(want, got, 2.01 / 255.0);
     try prepared.releaseSource();
 }
+
+test "video dependency immutable seek cache reuses verified anchors without retaining payloads" {
+    var src = source();
+    var reader = try media.mp4.Reader.init(a, &src, .{});
+    defer reader.deinit();
+    var cache = try video.decode_plan.SeekCache.init(a, &reader, false);
+    defer cache.deinit();
+    var cold = try video.decode_plan.create(a, &reader, &.{19}, .{ .seek_cache = &cache });
+    const anchor = cold.runs[0].first;
+    try std.testing.expect(cold.probe_candidates > 0);
+    cold.deinit();
+    const reads = src.reads;
+    var warm = try video.decode_plan.create(a, &reader, &.{ 19, 18 }, .{ .seek_cache = &cache, .max_probe_candidates = 0 });
+    defer warm.deinit();
+    try std.testing.expectEqual(anchor, warm.runs[0].first);
+    try std.testing.expectEqual(@as(usize, 0), warm.probe_candidates);
+    try std.testing.expectEqual(reads, src.reads);
+    src.identity = "different-source";
+    try std.testing.expectError(error.InvalidVideoReaderSelection, video.decode_plan.create(a, &reader, &.{19}, .{ .seek_cache = &cache }));
+}

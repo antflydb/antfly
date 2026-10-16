@@ -38,6 +38,20 @@ pub const Snapshot = struct {
     pub fn copy(allocator: std.mem.Allocator, identity: []const u8, parts: []const []const u8, options: Options) !*Snapshot {
         var size: usize = 0;
         for (parts) |part| size = try std.math.add(usize, size, part.len);
+        const self = try allocate(allocator, identity, size, options);
+        errdefer self.deinit();
+        const bytes = self.bytes;
+        var cursor: usize = 0;
+        for (parts) |part| {
+            try options.control.check();
+            @memcpy(bytes[cursor..][0..part.len], part);
+            cursor += part.len;
+        }
+        return self;
+    }
+    /// Allocate final owned storage once. Fill every byte before publishing input.
+    /// Admission is acquired before allocation; failure retains no ownership.
+    pub fn allocate(allocator: std.mem.Allocator, identity: []const u8, size: usize, options: Options) !*Snapshot {
         if (size > options.max_bytes) return error.ResourceLimitExceeded;
         try options.control.check();
         var reservation = if (options.admission_pool) |pool| try pool.acquire(.{ .host_bytes = try std.math.add(usize, size, @sizeOf(Snapshot)) }) else admission.Token{};
@@ -46,12 +60,6 @@ pub const Snapshot = struct {
         errdefer allocator.destroy(self);
         const bytes = try allocator.alloc(u8, size);
         errdefer allocator.free(bytes);
-        var cursor: usize = 0;
-        for (parts) |part| {
-            try options.control.check();
-            @memcpy(bytes[cursor..][0..part.len], part);
-            cursor += part.len;
-        }
         self.* = .{ .bytes = bytes, .reservation = reservation, .input = .{ .allocator = allocator, .identity = identity, .storage = .{ .borrowed = bytes }, .limits = options.source_limits, .control = options.control, .admission_pool = options.admission_pool } };
         return self;
     }

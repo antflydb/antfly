@@ -43,4 +43,8 @@ pub fn build(b: *std.Build) void {
     run.has_side_effects = true;
     b.step("test-transport-http", "Qualify authenticated TS HLS packet/decoder integration").dependOn(&run.step);
     b.step("install-transport-http-tests", "Install TS HTTP qualification for another host").dependOn(&b.addInstallArtifact(tests, .{ .dest_sub_path = "transport-http-tests" }).step);
+    const sampling_root = b.createModule(.{ .root_source_file = b.path("sampling_benchmark.zig"), .target = target, .optimize = optimize });
+    sampling_root.addImport("antfly_media", b.modules.get("antfly_video").?.import_table.get("antfly_media").?);
+    const sampling_bench = b.addExecutable(.{ .name = "video-sampling-benchmark", .root_module = sampling_root });
+    b.step("bench-sampling", "Compare immutable timeline lookup with the linear sampling oracle").dependOn(&b.addRunArtifact(sampling_bench).step);
 }

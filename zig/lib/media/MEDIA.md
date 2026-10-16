@@ -196,12 +196,17 @@ remain demand-read from the original source. Source storage, provider context an
 track metadata must outlive every window and preparation worker. Container
 identity must name immutable content, such as a digest or pinned object version.
 Owned live snapshots remain available when storage must outlive its producer.
+Live joins and parameter-prefixed windows fill the final admitted snapshot backing
+allocation directly. They retain no second full encoded-byte staging allocation;
+packet indexes, identity and retained metadata leases are admitted separately.
 
 Model chunk selection binds this immutable capability and absolute picture IDs,
 avoiding coded payload copies and repeated payload hashing. Untrusted standalone
 selection APIs retain full content validation. Speculative preparation is limited
 to one next window, holds separate request/session host and device reservations,
-and starts only after the current decoder has drained. Admission pressure falls
+and starts only after the current decoder has drained. Next-window metadata
+planning runs in that wave as well, rather than delaying the current backbone.
+The planning worker is joined before its slot, source or request is released. Admission pressure falls
 back to serial execution; cancellation joins workers before releasing sources.
 
 ## Verification

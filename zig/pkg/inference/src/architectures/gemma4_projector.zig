@@ -429,10 +429,23 @@ pub fn encodeEmbeddingGemma2VideoTensorResident(cb: *const ComputeBackend, alloc
 /// Frames share projection/FFN dispatches; SDPA has an independent batch axis.
 /// Input rows are frame-major NHWC patches. The returned tensor is frame-major.
 /// A two-frame bound keeps transformer workspace within request admission.
+pub fn embeddingGemma2VideoScratch(width: u32, height: u32) !usize {
+    if (width == 0 or height == 0 or width % 48 != 0 or height % 48 != 0) return error.InvalidTensorShape;
+    return imageScratchBytes(embeddingGemma2ImageConfig(), @as(usize, width / 16) * (height / 16));
+}
+
+/// Geometry-aware cohort limit. Includes conservative dense-attention scratch.
+pub fn embeddingGemma2VideoBatchCapacity(width: u32, height: u32, budget: usize) !usize {
+    if (width == 0 or height == 0 or width % 48 != 0 or height % 48 != 0) return error.InvalidTensorShape;
+    const scratch = try imageScratchBytes(embeddingGemma2ImageConfig(), @as(usize, width / 16) * (height / 16));
+    if (scratch > budget) return error.ImageBatchBudgetExceeded;
+    return @min(@as(usize, 8), budget / @max(@as(usize, 1), scratch));
+}
+
 pub fn encodeEmbeddingGemma2VideoBatchTensorResident(cb: *const ComputeBackend, allocator: std.mem.Allocator, input: CT, width: u32, height: u32, frames: usize) !EncodedDeviceImage {
     var cfg = embeddingGemma2ImageConfig();
     cfg.max_image_tokens = 140;
-    if (frames == 0 or frames > 2) return error.InvalidTensorShape;
+    if (frames == 0 or frames > 8) return error.InvalidTensorShape;
     if (width == 0 or height == 0 or width % 48 != 0 or height % 48 != 0) return error.InvalidTensorShape;
     const g = Geometry{ .batches = frames, .width = width, .height = height, .grid_x = width / 16, .grid_y = height / 16, .pooled_x = width / 48, .pooled_y = height / 48 };
     if (g.tokenCount() / frames > 140) return error.InvalidTensorShape;

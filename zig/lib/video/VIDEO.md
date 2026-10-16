@@ -201,6 +201,23 @@ per window even when reconstruction reuses references. Native decoder callbacks
 drain before window release; retained Apple surfaces keep their admission until
 decoder destruction. Request-local projected reuse and bounded preparation overlap
 apply on CPU/Metal.
+
+Finite MP4/WebM requests build one augmented presentation index. Each timestamp
+query preserves decode-order ties, reordered PTS, overlapping VFR holds, gaps and
+unknown-duration semantics in O(log N), rather than scanning the whole clip.
+MP4 also indexes logical packet intervals for field/partition closure and keeps a
+request-owned nearest-verified-IDR cache. The cache stores indexes, not packet
+leases, and requires immutable source identity, track configuration and metadata.
+All retained metadata participates in request admission. The next window's
+selection, dependency planning and preparation run off the current backbone's
+critical path after its decoder drains. Every exit joins that planning worker.
+
+Known text/video input shapes derive sequence, host and workspace reservations
+from inspected geometry, preparation concurrency and conservative attention/
+activation bounds. Host allocation enforces the advertised ceiling; rendered
+sequence length is checked before backbone execution. Uninspected image/audio
+inputs retain the conservative reservation. Bounds do not alter sampling policy.
+
 Descriptors, model identity, gaps and terminal coverage travel with the vectors.
 Overview sampling remains distinct from retrieval coverage; audio inclusion stays
 opt-in. See the design for source references, admission bounds and qualification.
@@ -210,7 +227,11 @@ pictures to the pinned default 1 FPS, uniform 32-frame policy and explicit sampl
 windows. Video uses 140 pooled 16x16/3x3 soft tokens per frame, distinct from image
 geometry. Mixed text/image/audio/video preserves order and one embedding per
 group; the total sequence bound is 8192 tokens. Video audio is not implicitly
-embedded. Equal-geometry frames batch in pairs with bounded projected reuse.
+embedded. Equal-geometry frames form cohorts of up to eight, bounded by the
+vision scratch estimate (384 MiB native, 768 MiB Metal). Queue capacity also
+respects admitted preparation slots and total selected pictures. Consumers take
+available work without waiting to fill a cohort; incompatible geometry flushes
+separately. Metal concatenation uses one destination and linear row copies.
 
 Metal retains vision/projector results, token composition, backbone inputs and
 final pooling/normalization until response readback. EmbeddingGemma 2 selects
@@ -310,3 +331,10 @@ qualification on those hosts; local hardware results establish only the tested
 Mac. Hosted VM capability skips do not establish GPU qualification; a manually
 selected self-hosted Apple Silicon job executes the full Metal suite. Intel builds
 and macOS releases below 15 are not release-qualified here.
+
+### Sampling benchmark
+
+`zig build --build-file zig/lib/video/build.zig bench-sampling -Doptimize=ReleaseFast`
+compares 256 windows over a 108,000-picture timeline with the linear oracle.
+It reports index construction and lookup separately and verifies matching
+checksums. This measures metadata selection, not decode or model throughput.

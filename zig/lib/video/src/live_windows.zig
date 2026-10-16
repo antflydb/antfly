@@ -163,7 +163,7 @@ pub fn join(a: std.mem.Allocator, identity: []const u8, segments: []const media.
         }
     }
     if (count == 0 or size > options.stream.max_bytes) return error.EmptyVideo;
-    var reservation = if (options.stream.admission_pool) |pool| try pool.acquire(.{ .host_bytes = try std.math.add(usize, size, try std.math.mul(usize, count, @sizeOf(media.mp4.Packet))) }) else media.admission.Token{};
+    var reservation = if (options.stream.admission_pool) |pool| try pool.acquire(.{ .host_bytes = try std.math.mul(usize, count, @sizeOf(media.mp4.Packet)) }) else media.admission.Token{};
     errdefer reservation.deinit();
     var identity_reservation = if (options.stream.admission_pool) |pool| try pool.acquire(.{ .host_bytes = identity.len }) else media.admission.Token{};
     errdefer identity_reservation.deinit();
@@ -171,9 +171,9 @@ pub fn join(a: std.mem.Allocator, identity: []const u8, segments: []const media.
     errdefer a.free(owned_identity);
     const packets = try a.alloc(media.mp4.Packet, count);
     errdefer a.free(packets);
-    const bytes = try a.alloc(u8, size);
-    var bytes_live = true;
-    defer if (bytes_live) a.free(bytes);
+    const snapshot = try media.stream.Snapshot.allocate(a, owned_identity, size, options.stream);
+    errdefer snapshot.deinit();
+    const bytes = snapshot.bytes;
     @memcpy(bytes[0..first.reader.track.avcc.len], first.reader.track.avcc);
     @memcpy(bytes[first.reader.track.avcc.len..][0..first.reader.track.color_info.len], first.reader.track.color_info);
     var cursor = metadata_size;
@@ -191,15 +191,11 @@ pub fn join(a: std.mem.Allocator, identity: []const u8, segments: []const media.
             index += 1;
         }
     }
-    const snapshot = try media.stream.Snapshot.copy(a, owned_identity, &.{bytes}, options.stream);
-    errdefer snapshot.deinit();
     var metadata = try snapshot.input.read(0, metadata_size);
     errdefer metadata.deinit();
     var track = first.reader.track;
     track.avcc = metadata.bytes[0..track.avcc.len];
     track.color_info = metadata.bytes[track.avcc.len..];
-    a.free(bytes);
-    bytes_live = false;
     try reservation.resize(.{ .host_bytes = packets.len * @sizeOf(media.mp4.Packet) });
     return .{ .snapshot = snapshot, .epoch = first.epoch, .identity = owned_identity, .identity_reservation = identity_reservation, .reader = .{ .allocator = a, .input = &snapshot.input, .metadata = metadata, .track = track, .packets = packets, .index_reservation = reservation, .limits = .{} } };
 }
@@ -214,7 +210,7 @@ pub fn copyWithParameters(a: std.mem.Allocator, identity: []const u8, reader: *m
     for (reader.packets) |packet| size = try std.math.add(usize, size, packet.size);
     if (size > options.stream.max_bytes) return error.ResourceLimitExceeded;
     const count = reader.packets.len;
-    var reservation = if (options.stream.admission_pool) |pool| try pool.acquire(.{ .host_bytes = try std.math.add(usize, size, try std.math.mul(usize, count, @sizeOf(media.mp4.Packet))) }) else media.admission.Token{};
+    var reservation = if (options.stream.admission_pool) |pool| try pool.acquire(.{ .host_bytes = try std.math.mul(usize, count, @sizeOf(media.mp4.Packet)) }) else media.admission.Token{};
     errdefer reservation.deinit();
     var identity_reservation = if (options.stream.admission_pool) |pool| try pool.acquire(.{ .host_bytes = identity.len }) else media.admission.Token{};
     errdefer identity_reservation.deinit();
@@ -222,8 +218,9 @@ pub fn copyWithParameters(a: std.mem.Allocator, identity: []const u8, reader: *m
     errdefer a.free(owned_identity);
     const packets = try a.dupe(media.mp4.Packet, reader.packets);
     errdefer a.free(packets);
-    const bytes = try a.alloc(u8, size);
-    defer a.free(bytes);
+    const snapshot = try media.stream.Snapshot.allocate(a, owned_identity, size, options.stream);
+    errdefer snapshot.deinit();
+    const bytes = snapshot.bytes;
     @memcpy(bytes[0..reader.track.avcc.len], reader.track.avcc);
     @memcpy(bytes[reader.track.avcc.len..][0..reader.track.color_info.len], reader.track.color_info);
     var cursor = metadata_size;
@@ -240,8 +237,6 @@ pub fn copyWithParameters(a: std.mem.Allocator, identity: []const u8, reader: *m
         @memcpy(bytes[cursor..][0..payload.bytes.len], payload.bytes);
         cursor += payload.bytes.len;
     }
-    const snapshot = try media.stream.Snapshot.copy(a, owned_identity, &.{bytes}, options.stream);
-    errdefer snapshot.deinit();
     var metadata = try snapshot.input.read(0, metadata_size);
     errdefer metadata.deinit();
     var track = reader.track;
@@ -343,4 +338,23 @@ fn borrowedOverlayAllocationRun(a: std.mem.Allocator) !void {
 test "live packet window borrowed bootstrap matches materialization and releases every failed allocation" {
     try borrowedOverlayAllocationRun(std.testing.allocator);
     try std.testing.checkAllAllocationFailures(std.testing.allocator, borrowedOverlayAllocationRun, .{});
+}
+
+test "live packet window fills one final backing allocation within exact admission" {
+    const a = std.testing.allocator;
+    const file = @embedFile("../testdata/live/fragmented.mp4");
+    var ingest = try media.live_mp4.Ingest.init(a, "window", file[0..797], .{});
+    defer ingest.deinit();
+    try ingest.push(file[797..11206]);
+    var one = try ingest.finishSegment();
+    defer one.deinit();
+    const identity = "single-backing";
+    var size: usize = one.reader.track.avcc.len + one.reader.track.color_info.len;
+    for (one.reader.packets) |packet| size += packet.size;
+    const exact = size + @sizeOf(media.stream.Snapshot) + identity.len + one.reader.packets.len * @sizeOf(media.mp4.Packet) + one.reader.track.avcc.len + one.reader.track.color_info.len;
+    var pool = media.admission.Pool{ .limits = .{ .host_bytes = exact } };
+    var window = try join(a, identity, &.{one}, .{ .stream = .{ .admission_pool = &pool } });
+    try std.testing.expectEqual(@as(u64, @intCast(exact)), pool.high_water.host_bytes);
+    window.deinit();
+    try std.testing.expectEqual(media.admission.Resources{}, pool.snapshot());
 }

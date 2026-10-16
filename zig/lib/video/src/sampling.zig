@@ -99,6 +99,119 @@ pub const TimestampPolicy = struct {
     }
 };
 pub const TimedPicture = struct { pts: i64, duration: ?u64 };
+/// Immutable presentation index. Build once per source; selections are O(K log N).
+/// The augmented tree retains overlapping holds and stable decode-order ties.
+pub const Timeline = struct {
+    const Entry = struct { id: usize, pts: i64, stop: i128 };
+    allocator: std.mem.Allocator,
+    entries: []Entry,
+    maxima: []i128,
+    base: usize,
+    first: i64,
+    last: i128,
+    pub fn storageBytes(count: usize) !usize {
+        const base = try std.math.ceilPowerOfTwo(usize, @max(@as(usize, 1), count));
+        return std.math.add(usize, try std.math.mul(usize, count, @sizeOf(Entry)), try std.math.mul(usize, base, 2 * @sizeOf(i128)));
+    }
+    pub fn init(a: std.mem.Allocator, pictures: []const TimedPicture, control: media.source.Control) !Timeline {
+        if (pictures.len == 0) return error.EmptyVideo;
+        const entries = try a.alloc(Entry, pictures.len);
+        errdefer a.free(entries);
+        var first = pictures[0].pts;
+        var latest = first;
+        var last: i128 = first;
+        for (pictures, entries, 0..) |picture, *entry, id| {
+            if (id % 256 == 0) try control.check();
+            first = @min(first, picture.pts);
+            latest = @max(latest, picture.pts);
+            last = @max(last, @as(i128, picture.pts) + (picture.duration orelse 0));
+            entry.* = .{ .id = id, .pts = picture.pts, .stop = if (picture.duration) |d| @as(i128, picture.pts) + d else std.math.maxInt(i128) };
+        }
+        var previous: ?i64 = null;
+        var unknown_tail = false;
+        for (pictures) |picture| {
+            if (picture.pts < latest and (previous == null or picture.pts > previous.?)) previous = picture.pts;
+            if (picture.pts == latest and picture.duration == null) unknown_tail = true;
+        }
+        if (unknown_tail and previous != null) last = @max(last, @as(i128, latest) + (@as(i128, latest) - previous.?));
+        std.mem.sort(Entry, entries, {}, struct {
+            fn less(_: void, x: Entry, y: Entry) bool {
+                return x.pts < y.pts or (x.pts == y.pts and x.id > y.id);
+            }
+        }.less);
+        try control.check();
+        const base = try std.math.ceilPowerOfTwo(usize, entries.len);
+        const maxima = try a.alloc(i128, try std.math.mul(usize, base, 2));
+        @memset(maxima, std.math.minInt(i128));
+        for (entries, 0..) |entry, i| maxima[base + i] = entry.stop;
+        var node = base;
+        while (node > 1) {
+            node -= 1;
+            maxima[node] = @max(maxima[node * 2], maxima[node * 2 + 1]);
+        }
+        return .{ .allocator = a, .entries = entries, .maxima = maxima, .base = base, .first = first, .last = last };
+    }
+    pub fn deinit(self: *Timeline) void {
+        self.allocator.free(self.entries);
+        self.allocator.free(self.maxima);
+    }
+    fn active(self: *const Timeline, node: usize, lo: usize, hi: usize, bound: usize, target: i128) ?usize {
+        if (lo >= bound or self.maxima[node] <= target) return null;
+        if (hi - lo == 1) return lo;
+        const mid = lo + (hi - lo) / 2;
+        return self.active(node * 2 + 1, mid, hi, bound, target) orelse self.active(node * 2, lo, mid, bound, target);
+    }
+    pub fn select(self: *const Timeline, a: std.mem.Allocator, timescale: u32, policy: TimestampPolicy, control: media.source.Control, relative: bool) ![]usize {
+        try policy.validate();
+        if (timescale == 0) return error.EmptyVideo;
+        const origin: i128 = if (relative) self.first else 0;
+        const inferred = @divFloor((self.last - origin) * 1_000_000_000 + timescale - 1, timescale);
+        const end: i128 = policy.end_ns orelse (std.math.cast(i64, inferred) orelse return error.TimestampOverflow);
+        if (end <= policy.start_ns) return error.EmptyVideoWindow;
+        const candidates: u128 = @intCast(@divFloor(end - policy.start_ns + policy.step_ns - 1, policy.step_ns));
+        const count: usize = @intCast(@min(candidates, policy.max_frames));
+        var output: std.ArrayList(usize) = .empty;
+        errdefer output.deinit(a);
+        for (0..count) |i| {
+            try control.check();
+            const ordinal: u128 = if (policy.overflow == .uniform and count > 1 and candidates > count) @as(u128, i) * (candidates - 1) / (count - 1) else i;
+            const target_ns: i128 = policy.start_ns + @as(i128, @intCast(ordinal * policy.step_ns));
+            const target = origin * 1_000_000_000 + target_ns * timescale;
+            var lo: usize = 0;
+            var hi = self.entries.len;
+            while (lo < hi) {
+                const mid = lo + (hi - lo) / 2;
+                if (@as(i128, self.entries[mid].pts) * 1_000_000_000 <= target) lo = mid + 1 else hi = mid;
+            }
+            var chosen: ?usize = null;
+            if (policy.hold) chosen = self.active(1, 0, self.base, lo, @divFloor(target, 1_000_000_000));
+            if (chosen == null) {
+                lo = 0;
+                hi = self.entries.len;
+                while (lo < hi) {
+                    const mid = lo + (hi - lo) / 2;
+                    if (@as(i128, self.entries[mid].pts) * 1_000_000_000 < target) lo = mid + 1 else hi = mid;
+                }
+                if (lo < self.entries.len and (@as(i128, self.entries[lo].pts) - origin) * 1_000_000_000 < end * timescale) {
+                    const pts = self.entries[lo].pts;
+                    hi = self.entries.len;
+                    while (lo < hi) {
+                        const mid = lo + (hi - lo) / 2;
+                        if (self.entries[mid].pts <= pts) lo = mid + 1 else hi = mid;
+                    }
+                    chosen = lo - 1;
+                }
+            }
+            if (chosen) |index| {
+                const id = self.entries[index].id;
+                if (output.items.len == 0 or output.items[output.items.len - 1] != id) try output.append(a, id);
+            }
+        }
+        if (output.items.len == 0) return error.EmptyVideoWindow;
+        return output.toOwnedSlice(a);
+    }
+};
+
 /// Select logical IDs with exact rational time comparisons. A sparse VFR source
 /// can map multiple targets to one picture; duplicates are omitted. Uniform caps
 /// span the entire interval without allocating every target of a long video.
@@ -318,4 +431,37 @@ test "model aware media VFR sampling retains displayed pictures across window bo
     const boundary = try cappedTimestamps(a, &pictures, 1, .{ .start_ns = 59_000_000_000, .end_ns = 61_000_000_000, .hold = true }, .{});
     defer a.free(boundary);
     try std.testing.expectEqualSlices(usize, &.{ 0, 1 }, boundary);
+}
+
+test "indexed timestamp selection matches linear oracle for reordered overlapping VFR and unknown durations" {
+    const a = std.testing.allocator;
+    var rng = std.Random.DefaultPrng.init(87931);
+    const random = rng.random();
+    var pictures: [73]TimedPicture = undefined;
+    for (0..100) |_| {
+        for (&pictures) |*picture| picture.* = .{ .pts = random.intRangeLessThan(i64, -20, 100), .duration = if (random.boolean()) random.intRangeLessThan(u64, 0, 40) else null };
+        var timeline = try Timeline.init(a, &pictures, .{});
+        defer timeline.deinit();
+        for ([_]bool{ false, true }) |hold| for ([_]bool{ false, true }) |relative| for ([_]Overflow{ .uniform, .truncate }) |overflow| {
+            const policy = TimestampPolicy{ .start_ns = random.intRangeLessThan(i64, 0, 20_000_000_000), .end_ns = 50_000_000_000, .step_ns = 123456789, .max_frames = 32, .hold = hold, .overflow = overflow };
+            const expected = cappedAtOrigin(a, &pictures, 3, policy, .{}, relative) catch |err| {
+                try std.testing.expectError(err, timeline.select(a, 3, policy, .{}, relative));
+                continue;
+            };
+            defer a.free(expected);
+            const actual = try timeline.select(a, 3, policy, .{}, relative);
+            defer a.free(actual);
+            try std.testing.expectEqualSlices(usize, expected, actual);
+        };
+    }
+}
+fn timelineAllocationCheck(a: std.mem.Allocator) !void {
+    const pictures = [_]TimedPicture{ .{ .pts = -3, .duration = 2 }, .{ .pts = 1, .duration = null }, .{ .pts = -3, .duration = 40 } };
+    var timeline = try Timeline.init(a, &pictures, .{});
+    defer timeline.deinit();
+    const selected = try timeline.select(a, 3, .{ .hold = true }, .{}, true);
+    defer a.free(selected);
+}
+test "indexed timestamp ownership releases every partial allocation" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, timelineAllocationCheck, .{});
 }

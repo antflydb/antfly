@@ -544,11 +544,19 @@ pub const Runner = struct {
             end = @max(end, @as(i128, origin) + @as(i128, @intFromFloat(duration * std.time.ns_per_s)));
         } else if (last_duration == null or last_duration.? <= 0) return error.UnknownVideoDuration;
         if (end <= origin) return error.UnknownVideoDuration;
+        const timeline_bytes = try std.math.add(usize, try video.sampling.Timeline.storageBytes(indexed.pictures.len), try std.math.mul(usize, indexed.pictures.len, @sizeOf(video.sampling.TimedPicture)));
+        var timeline_reservation = try self.pool.acquire(.{ .host_bytes = timeline_bytes });
+        defer timeline_reservation.deinit();
+        const timed = try self.allocator.alloc(video.sampling.TimedPicture, indexed.pictures.len);
+        defer self.allocator.free(timed);
+        for (timed, indexed.pictures) |*dest, picture| dest.* = .{ .pts = picture.pts, .duration = picture.duration };
+        var timeline = try video.sampling.Timeline.init(self.allocator, timed, reader.input.control);
+        defer timeline.deinit();
         var continuation = video.webm_pictures.Continuation{ .allocator = self.allocator, .reader = reader };
         defer continuation.deinit();
         var apple_continuation = @import("embedding_gemma2_video.zig").WebmDecoderContinuation{ .allocator = self.allocator, .reader = reader };
         defer apple_continuation.deinit();
-        try self.videoWindows(&.{}, null, end - origin, origin, 1_000_000_000, null, .{ .reader = reader, .index = &indexed, .continuation = &continuation, .apple_continuation = &apple_continuation });
+        try self.videoWindows(&.{}, null, end - origin, origin, 1_000_000_000, null, .{ .reader = reader, .index = &indexed, .timeline = &timeline, .continuation = &continuation, .apple_continuation = &apple_continuation });
     }
     const VideoSource = struct { bytes: []const u8, reader: ?*const media.mp4.Reader, origin: i64, timescale: u32, owner: ?*@import("media_chunking_video.zig").Owner, webm: ?@import("embedding_gemma2_video.zig").WebmInput };
     const VideoSlot = struct {
@@ -590,10 +598,26 @@ pub const Runner = struct {
         runner: *Runner,
         source: VideoSource,
         next: ?*VideoSlot,
+        work: ?*VideoSlot = null,
+        thread: ?std.Thread = null,
+        fn join(self: *@This()) void {
+            if (self.thread) |thread| thread.join();
+            self.thread = null;
+        }
         fn ready(raw: *anyopaque) !void {
             const self: *@This() = @ptrCast(@alignCast(raw));
             const next = self.next orelse return;
             self.next = null; // At most one wave, even for a multi-part executor.
+            self.work = next;
+            if (comptime @import("builtin").single_threaded or @import("builtin").cpu.arch.isWasm() or @import("builtin").os.tag == .freestanding) return self.perform();
+            self.thread = std.Thread.spawn(.{}, perform, .{self}) catch {
+                // A missing speculative worker must not deny serial progress.
+                self.work = null;
+                return;
+            };
+        }
+        fn perform(self: *@This()) void {
+            const next = self.work orelse return;
             self.runner.prepareVideoSlot(self.source, next) catch |err| {
                 if (@import("embedding_gemma2.zig").videoSpeculationPressure(err)) return;
                 next.failure = err;
@@ -634,6 +658,7 @@ pub const Runner = struct {
             const next = &slots[active ^ 1];
             if (next_shape) |shape| next.shape = shape;
             var schedule = VideoSchedule{ .runner = self, .source = source, .next = if (next_shape != null) next else null };
+            defer schedule.join(); // Includes failure, cancellation and early sink termination.
             if (self.request.execute and self.executor.start_video != null) current.payload.video.prepared = .{ .context = &schedule, .ready = VideoSchedule.ready };
             if (!try self.emit(current.shape, current.payload, self.request.input.binary.mime_type)) break;
             current.deinit();
@@ -1006,14 +1031,24 @@ test "model aware media video yields speculative pressure and schedules only one
     const Scheduled = struct {
         output: Qualification = .{},
         starts: usize = 0,
+        backbone_started: std.atomic.Value(bool) = .init(false),
         fn start(raw: *anyopaque, payload: Payload, _: *media.admission.Pool) !?*@import("embedding_gemma2.zig").VideoAhead {
             const self: *@This() = @ptrCast(@alignCast(raw));
             try std.testing.expect(payload == .video);
+            const deadline = @import("antfly_platform").time.monotonicNs() + 5 * std.time.ns_per_s;
+            while (!self.backbone_started.load(.acquire)) {
+                if (@import("antfly_platform").time.monotonicNs() >= deadline) return error.TestUnexpectedResult;
+                try std.Io.sleep(std.testing.io, .fromMilliseconds(1), .awake);
+            }
             self.starts += 1;
             return error.ResourceTemporarilyUnavailable;
         }
         fn embed(raw: *anyopaque, allocator: std.mem.Allocator, payload: Payload) !Output {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.backbone_started.store(false, .release);
             if (payload.video.prepared) |hook| try hook.ready(hook.context);
+            // A synchronous planning/start callback would time out above.
+            self.backbone_started.store(true, .release);
             return Qualification.embed(raw, allocator, payload);
         }
     };
@@ -1027,4 +1062,19 @@ test "model aware media video yields speculative pressure and schedules only one
     try std.testing.expect(summary.complete);
     try std.testing.expect(summary.emitted > 1);
     try std.testing.expectEqual(summary.emitted - 1, state.starts);
+}
+
+fn videoOwnerAllocationCheck(a: std.mem.Allocator) !void {
+    var pool = media.admission.Pool{ .limits = .{ .host_bytes = 128 * 1024 * 1024 } };
+    defer std.debug.assert(std.meta.eql(pool.snapshot(), media.admission.Resources{}));
+    var source = media.source.Source{ .allocator = a, .identity = "immutable-index-allocation", .storage = .{ .borrowed = @embedFile("../testdata/video/mjpeg-vfr.mov") }, .admission_pool = &pool };
+    var reader = try media.mp4.Reader.init(a, &source, .{});
+    defer reader.deinit();
+    var owner = try @import("media_chunking_video.zig").Owner.init(a, &reader, &pool, .{});
+    defer owner.deinit();
+    var window = try owner.prepare(.{ .end_ns = 500 * std.time.ns_per_ms, .step_ns = 250 * std.time.ns_per_ms });
+    defer window.deinit();
+}
+test "model aware media presentation index releases every allocation and admission on failure" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, videoOwnerAllocationCheck, .{});
 }

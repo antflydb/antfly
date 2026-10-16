@@ -293,12 +293,12 @@ pub fn embedCached(out: std.mem.Allocator, session: Session, tokenizer: Tokenize
     }
     var bounded = @import("../runtime/bounded_allocator.zig").BoundedAllocator{ .backing = workspaceBackingAllocator(session.backend()), .limit = 512 * 1024 * 1024 };
     defer std.debug.assert(bounded.live == 0);
-    const result = embedScoped(bounded.allocator(), session, tokenizer, group, options, lock, control, cache) catch |err| blk: {
+    const result = embedScoped(&bounded, session, tokenizer, group, options, lock, control, cache) catch |err| blk: {
         if (err == error.SpeculativeVideoAdmissionDenied) {
             options.video_ahead.?.abandon();
             var serial = options;
             serial.video_ahead = null;
-            break :blk try embedScoped(bounded.allocator(), session, tokenizer, group, serial, lock, control, cache);
+            break :blk try embedScoped(&bounded, session, tokenizer, group, serial, lock, control, cache);
         }
         return if ((err == error.OutOfMemory and bounded.denied) or err == error.SharedAdmissionExceeded) error.MemoryBudgetExceeded else err;
     };
@@ -306,7 +306,43 @@ pub fn embedCached(out: std.mem.Allocator, session: Session, tokenizer: Tokenize
     return .{ .vector = try out.dupe(f32, result.vector), .input_tokens = result.input_tokens };
 }
 
-fn embedScoped(a: std.mem.Allocator, session: Session, tokenizer: Tokenizer, group: Group, options: Options, lock: ?*std.atomic.Mutex, control: ?Control, cache: ?*FrameCache) !Result {
+/// Indexed readers need packet/picture metadata and one bounded probe payload.
+/// Unknown container inputs retain the full conservative parsing ceiling.
+fn preflightHostBytes(group: Group) !usize {
+    var count: usize = 0;
+    for (group.content) |part| switch (part) {
+        .video => return 512 * 1024 * 1024,
+        .sampled_video => |movie| {
+            // An unbound AVC reader may reconstruct pictures to establish its
+            // logical index (fields/partitions). Only a bound selection proves
+            // that inspection needs metadata rather than decoder references.
+            if (movie.reader != null and movie.selection == null) return 512 * 1024 * 1024;
+            const n = if (movie.reader) |reader| reader.packets.len else if (movie.webm) |webm| if (webm.timeline != null and movie.sampling != .reference) @as(usize, 32) else webm.index.pictures.len else return 512 * 1024 * 1024;
+            count = try std.math.add(usize, count, n);
+        },
+        else => {},
+    };
+    return @min(@as(usize, 512 * 1024 * 1024), try std.math.add(usize, 64 * 1024 * 1024, try std.math.mul(usize, count, 512)));
+}
+
+const ExecutionBounds = struct { sequence: usize, host: usize, workspace: usize };
+/// Preserve the conservative path for uninspected media. Known video/text
+/// shapes cover retained PLE/frame activations, dense attention, projections,
+/// and a fixed runtime/weight-conversion allowance. Allocations enforce host.
+fn executionBounds(known: bool, tokens: usize, preparation: usize, vision: usize, device: usize, legacy: usize) !ExecutionBounds {
+    if (!known) return .{ .sequence = 8192, .host = 512 * 1024 * 1024, .workspace = legacy };
+    const sequence = @min(@as(usize, 8192), @max(@as(usize, 1), tokens));
+    const activations = try std.math.mul(usize, sequence, 192 * 1024);
+    const attention = try std.math.mul(usize, try std.math.mul(usize, sequence, sequence), 48);
+    const language = try std.math.add(usize, 64 * 1024 * 1024, try std.math.add(usize, activations, attention));
+    const host = @min(@as(usize, 512 * 1024 * 1024), try std.math.add(usize, 64 * 1024 * 1024, try std.math.add(usize, language, try std.math.add(usize, preparation, vision))));
+    const work = try std.math.add(usize, 256 * 1024 * 1024, try std.math.add(usize, @max(language, vision), device));
+    return .{ .sequence = sequence, .host = host, .workspace = @min(legacy, work) };
+}
+
+fn embedScoped(bounded: *@import("../runtime/bounded_allocator.zig").BoundedAllocator, session: Session, tokenizer: Tokenizer, group: Group, options: Options, lock: ?*std.atomic.Mutex, control: ?Control, cache: ?*FrameCache) !Result {
+    bounded.limit = 512 * 1024 * 1024;
+    const a = bounded.allocator();
     const cfg = factory.getEmbeddingGemma2Config(session) orelse return error.UnsupportedEmbeddingGemma2Backend;
     try validateGroup(group, options);
     if (options.video_ahead) |ahead| {
@@ -329,13 +365,27 @@ fn embedScoped(a: std.mem.Allocator, session: Session, tokenizer: Tokenizer, gro
     // execution. Temporary metadata is freed before that permit is returned.
     var device_bytes: usize = 0;
     var command_slots: u64 = 0;
+    var shape_known = true;
+    var sequence_bound: usize = 128 + (if (group.title) |title| title.len else 0);
+    var preparation_bound: usize = 0;
+    var vision_bound: usize = 0;
+    for (group.content) |part| switch (part) {
+        .text => |bytes| sequence_bound = std.math.add(usize, sequence_bound, bytes.len) catch return error.ResourceLimitExceeded,
+        .video, .sampled_video => {},
+        else => shape_known = false,
+    };
     if (options.video_ahead) |ahead| {
         device_bytes = if (session.backend() == .metal) try ahead.plan.deviceBytes() else 0;
         command_slots = ahead.plan.commands;
+        sequence_bound = try std.math.add(usize, sequence_bound, ahead.plan.sequence_tokens);
+        preparation_bound = try ahead.plan.hostBytes();
+        vision_bound = ahead.plan.vision_workspace_bytes;
     } else if (has_video) {
-        var preflight = session.admitHostPreprocess(512 * 1024 * 1024) catch |err| return if (options.video_ahead != null and videoSpeculationPressure(err)) error.SpeculativeVideoAdmissionDenied else err;
+        const preflight_bytes = try preflightHostBytes(group);
+        bounded.limit = preflight_bytes;
+        var preflight = session.admitHostPreprocess(preflight_bytes) catch |err| return if (options.video_ahead != null and videoSpeculationPressure(err)) error.SpeculativeVideoAdmissionDenied else err;
         defer preflight.deinit();
-        var host_budget = media_admission.Pool{ .limits = .{ .host_bytes = 512 * 1024 * 1024 } };
+        var host_budget = media_admission.Pool{ .limits = .{ .host_bytes = preflight_bytes } };
         defer std.debug.assert(std.meta.eql(host_budget.snapshot(), media_admission.Resources{}));
         for (group.content) |part| switch (part) {
             inline .video, .sampled_video => |payload| {
@@ -347,19 +397,27 @@ fn embedScoped(a: std.mem.Allocator, session: Session, tokenizer: Tokenizer, gro
                 const plan = try @import("embedding_gemma2_video.zig").inspectConfiguredPlan(a, bytes, packet_reader, effective, .{ .sampling = sampling, .pool = &host_budget, .selection = selection, .webm = if (@TypeOf(payload) == SampledVideo) payload.webm else null, .decoder = options.video_decoder }, session.backend() == .metal);
                 device_bytes = @max(device_bytes, try plan.deviceBytes());
                 command_slots = @max(command_slots, plan.commands);
+                sequence_bound = try std.math.add(usize, sequence_bound, plan.sequence_tokens);
+                preparation_bound = @max(preparation_bound, try plan.hostBytes());
+                vision_bound = @max(vision_bound, plan.vision_workspace_bytes);
             },
             else => {},
         };
     }
-    const workspace = if (session.backend() == .metal)
+    const legacy_workspace = if (session.backend() == .metal)
         try std.math.add(usize, (if (has_video) @as(usize, 1536) else 768) * 1024 * 1024, device_bytes)
     else
         512 * 1024 * 1024;
-    var permit = admitWithVisionCacheReclaim(session, .{ .batch = 1, .sequence = 8192, .input_bytes = input_bytes, .host_preprocess_bytes = 512 * 1024 * 1024, .workspace_bytes = workspace, .output_bytes = 8192 * 768 * @sizeOf(f32) }, effective) catch |err| return if (options.video_ahead != null and videoSpeculationPressure(err)) error.SpeculativeVideoAdmissionDenied else err;
+    const bounds = try executionBounds(shape_known, sequence_bound, preparation_bound, vision_bound, device_bytes, legacy_workspace);
+    // The allocator enforces the same host bound advertised to admission.
+    // A failed speculative call restores the conservative ceiling on retry.
+    if (bounded.live > bounds.host) return error.MemoryBudgetExceeded;
+    bounded.limit = bounds.host;
+    var permit = admitWithVisionCacheReclaim(session, .{ .batch = 1, .sequence = bounds.sequence, .input_bytes = input_bytes, .host_preprocess_bytes = bounds.host, .workspace_bytes = bounds.workspace, .output_bytes = bounds.sequence * 768 * @sizeOf(f32) }, effective) catch |err| return if (options.video_ahead != null and videoSpeculationPressure(err)) error.SpeculativeVideoAdmissionDenied else err;
     defer permit.deinit();
     // Video parts execute sequentially; their transient preparation shares use
     // a maximum, while projected tokens stay in the model workspace.
-    var video_budget = media_admission.Pool{ .limits = .{ .host_bytes = 512 * 1024 * 1024, .device_bytes = if (session.backend() == .metal) device_bytes else 0, .commands = if (session.backend() == .metal) command_slots else 0 } };
+    var video_budget = media_admission.Pool{ .limits = .{ .host_bytes = bounds.host, .device_bytes = if (session.backend() == .metal) device_bytes else 0, .commands = if (session.backend() == .metal) command_slots else 0 } };
     defer std.debug.assert(std.meta.eql(video_budget.snapshot(), media_admission.Resources{}));
     var preparation_guard = if (has_video) try effective.enterUninterruptible(session.interruption()) else @import("../execution_control.zig").UninterruptibleGuard{};
     defer preparation_guard.deinit();
@@ -396,6 +454,7 @@ fn embedScoped(a: std.mem.Allocator, session: Session, tokenizer: Tokenizer, gro
     if (options.video_ahead) |ahead| ahead.release();
     if (options.video_prepared) |hook| try hook.ready(hook.context);
     const count = prepared.ids.len;
+    if (count > bounds.sequence) return error.MemoryBudgetExceeded;
     const mask = prepared.mask;
     if (prepared.embeddings == null and prepared.tensor == null) {
         const vector = try preparedText(cb, a, cfg, prepared.ids, mask, options.dimensions);
@@ -2225,4 +2284,19 @@ test "embeddinggemma2 video lookahead cancellation precedes model admission and 
     var pool = media_admission.Pool{ .limits = .{ .host_bytes = 512 * 1024 * 1024 } };
     try std.testing.expectError(error.Timeout, VideoAhead.start(undefined, .{ .sampling = .reference }, .{ .deadline_ns = 0 }, null, &pool, .{}));
     try std.testing.expectEqual(@as(u64, 0), pool.snapshot().host_bytes);
+}
+
+test "embeddinggemma2 video execution bounds scale with inspected shape and retain unknown media ceiling" {
+    var unbound_reader: @import("antfly_media").mp4.Reader = undefined;
+    const unbound_parts = [_]Part{.{ .sampled_video = .{ .reader = &unbound_reader, .sampling = .reference } }};
+    try std.testing.expectEqual(@as(usize, 512 * 1024 * 1024), try preflightHostBytes(.{ .content = &unbound_parts }));
+    const small = try executionBounds(true, 128, 16 * 1024 * 1024, 128 * 1024 * 1024, 0, 1536 * 1024 * 1024);
+    const large = try executionBounds(true, 4096, 16 * 1024 * 1024, 128 * 1024 * 1024, 0, 1536 * 1024 * 1024);
+    try std.testing.expect(small.host < large.host);
+    try std.testing.expect(small.workspace < large.workspace);
+    try std.testing.expectEqual(@as(usize, 128), small.sequence);
+    const unknown = try executionBounds(false, 1, 0, 0, 0, 1536 * 1024 * 1024);
+    try std.testing.expectEqual(@as(usize, 8192), unknown.sequence);
+    try std.testing.expectEqual(@as(usize, 512 * 1024 * 1024), unknown.host);
+    try std.testing.expectEqual(@as(usize, 1536 * 1024 * 1024), unknown.workspace);
 }

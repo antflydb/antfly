@@ -21,6 +21,8 @@ const avc = @import("avc.zig");
 pub const Mode = enum { from_start, verified_idr };
 pub const Options = struct {
     mode: Mode = .verified_idr,
+    /// Request-owned, immutable-source cache. Never share with mutable readers.
+    seek_cache: ?*SeekCache = null,
     /// Software AVC profiles; the decoder still validates full picture syntax.
     portable_config: bool = false,
     /// Split adjacent IDR runs before exceeding a decoder's dependency bound.
@@ -75,6 +77,23 @@ pub const Plan = struct {
         return null;
     }
 };
+/// Cached nearest verified IDR for immutable packet metadata and payloads.
+/// Payload leases remain plan-owned; this cache retains indexes only.
+pub const SeekCache = struct {
+    allocator: std.mem.Allocator,
+    nearest: []usize,
+    stamp: Stamp,
+    portable: bool,
+    pub fn init(a: std.mem.Allocator, reader: *const media.mp4.Reader, portable: bool) !SeekCache {
+        if (reader.input.identity.len == 0) return error.InvalidVideoReaderSelection;
+        const nearest = try a.alloc(usize, reader.packets.len);
+        @memset(nearest, std.math.maxInt(usize));
+        return .{ .allocator = a, .nearest = nearest, .stamp = Stamp.init(reader), .portable = portable };
+    }
+    pub fn deinit(self: *SeekCache) void {
+        self.allocator.free(self.nearest);
+    }
+};
 const Builder = struct {
     allocator: std.mem.Allocator,
     reader: *media.mp4.Reader,
@@ -87,10 +106,18 @@ const Builder = struct {
     fn start(self: *Builder, selected: usize) !usize {
         if (self.options.mode == .from_start) return 0;
         var index = selected;
+        if (self.options.seek_cache) |cache| {
+            if (cache.nearest[selected] != std.math.maxInt(usize)) return cache.nearest[selected];
+        }
         while (true) {
             if (self.search_steps >= self.options.max_search_steps) return error.ResourceLimitExceeded;
             self.search_steps += 1;
             if (self.search_steps % 256 == 1) try self.reader.input.control.check();
+            if (self.options.seek_cache) |cache| if (cache.nearest[index] != std.math.maxInt(usize)) {
+                const anchor = cache.nearest[index];
+                @memset(cache.nearest[index .. selected + 1], anchor);
+                return anchor;
+            };
             if (self.reader.packets[index].sync) {
                 for (self.anchors.items) |anchor| if (anchor.index == index) return index;
                 var rejected = false;
@@ -107,13 +134,17 @@ const Builder = struct {
                     self.probe_bytes += size;
                     if (try (if (self.options.portable_config) avc.isPortableIdr(lease.bytes, self.reader.track.nal_length_bytes) else avc.isIdr(lease.bytes, self.reader.track.nal_length_bytes))) {
                         try self.anchors.append(self.allocator, .{ .index = index, .payload = lease });
+                        if (self.options.seek_cache) |cache| @memset(cache.nearest[index .. selected + 1], index);
                         return index;
                     }
                     lease.deinit();
                     try self.rejected.append(self.allocator, index);
                 }
             }
-            if (index == 0) return 0; // Baseline path, not a claimed verified seek.
+            if (index == 0) {
+                if (self.options.seek_cache) |cache| @memset(cache.nearest[0 .. selected + 1], 0);
+                return 0;
+            } // Baseline fallback is not a claimed verified seek.
             index -= 1;
         }
     }
@@ -121,6 +152,9 @@ const Builder = struct {
 pub fn create(allocator: std.mem.Allocator, reader: *media.mp4.Reader, selection: []const usize, options: Options) !Plan {
     try reader.input.control.check();
     if (reader.track.codec != .avc) return error.UnsupportedVideoCodec;
+    if (options.seek_cache) |cache| {
+        if (cache.portable != options.portable_config or !std.meta.eql(cache.stamp, Stamp.init(reader))) return error.InvalidVideoReaderSelection;
+    }
     if (options.portable_config) try avc.validatePortableConfig(reader.track.avcc) else try avc.validateConfig(reader.track.avcc);
     if (selection.len == 0 or selection.len > options.max_selections) return error.ResourceLimitExceeded;
     for (selection, 0..) |index, i| {
