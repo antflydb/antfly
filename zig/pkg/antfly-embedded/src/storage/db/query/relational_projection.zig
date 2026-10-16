@@ -22,7 +22,7 @@ const JsonView = @import("json_view.zig").View;
 /// Positive field selections compiled against one immutable layout. Nested
 /// paths reuse document projection semantics, but decode only selected columns.
 pub const Plan = struct {
-    pub const Source = union(enum) { logical: std.json.Value, json: *JsonView };
+    pub const Source = union(enum) { logical: std.json.Value, json: *JsonView, native: *@import("projection_output.zig").NativeCell };
     pub const Sources = std.StringArrayHashMapUnmanaged(Source);
     base: codec.OrdinalProjectionPlan,
     arena: std.heap.ArenaAllocator,
@@ -91,9 +91,9 @@ pub const Plan = struct {
     pub fn projectWithOutputPolicy(self: Plan, scratch_alloc: std.mem.Allocator, output: std.mem.Allocator, row: codec.OrdinalRowView, exact: bool) ![]u8 {
         if (self.base.schema_version != row.table_schema.version) return error.RelationalRowSchemaMismatch;
         if (self.paths.len == 0) {
-            const bytes = try row.projectAlloc(scratch_alloc, self.base);
-            defer scratch_alloc.free(bytes);
-            return output.dupe(u8, bytes);
+            var emitter: codec.OrdinalRowView.ProjectionWriter = .{ .row = row, .scratch = @import("antfly_platform").allocator.reclaimingScratch(scratch_alloc), .plan = self.base };
+            defer emitter.deinit();
+            return @import("serialized_output.zig").alloc(output, exact, &emitter);
         }
         var arena = std.heap.ArenaAllocator.init(scratch_alloc);
         defer arena.deinit();
@@ -101,14 +101,32 @@ pub const Plan = struct {
         var source = Sources.empty;
         for (self.base.ordinals) |ordinal| {
             const cell = (try row.findCell(ordinal)) orelse continue;
-            const value: Source = if (cell.is_json and !cell.is_null) blk: {
-                const view = try scratch.create(JsonView);
-                view.* = .init(scratch, cell.value.bytes_val);
-                break :blk .{ .json = view };
-            } else .{ .logical = try row.materializeCellAlloc(scratch, cell) };
+            const value = try sourceForCell(scratch, &row.table_schema.relational_columns[ordinal], cell, true);
             try source.put(scratch, row.table_schema.relational_columns[ordinal].name, value);
         }
         return self.projectSourcesPolicy(output, scratch, source, exact);
+    }
+
+    /// Cell payload and schema stay pinned until synchronous serialization ends.
+    /// Keep small scalar values inline; large strings/vectors use borrowed cells.
+    /// `canonical_json` requires canonical storage admission, not just syntax
+    /// validation. Callers without that provenance must leave it false.
+    pub fn sourceForCell(alloc: std.mem.Allocator, column: *const schema.RelationalColumn, cell: codec.Cell, canonical_json: bool) !Source {
+        if (cell.is_null) return .{ .logical = .null };
+        if (cell.is_json) {
+            const view = try alloc.create(JsonView);
+            view.* = .init(alloc, cell.value.bytes_val);
+            view.canonical_source = if (canonical_json) cell.value.bytes_val else null;
+            return .{ .json = view };
+        }
+        return switch (column.column_type) {
+            .integer, .number, .boolean, .datetime, .string, .blob, .geoshape => .{ .logical = try codec.borrowedJsonValueFromCellAlloc(alloc, column.*, cell) },
+            else => blk: {
+                const native = try alloc.create(@import("projection_output.zig").NativeCell);
+                native.* = .{ .cell = cell, .column = column, .alloc = alloc };
+                break :blk .{ .native = native };
+            },
+        };
     }
 
     pub fn projectSources(self: Plan, alloc: std.mem.Allocator, scratch: std.mem.Allocator, source: Sources) ![]u8 {
@@ -116,25 +134,10 @@ pub const Plan = struct {
     }
     pub fn projectSourcesPolicy(self: Plan, alloc: std.mem.Allocator, scratch: std.mem.Allocator, source: Sources, exact: bool) ![]u8 {
         const Projection = @import("projection_output.zig").Output;
-        if (self.paths.len == 0) {
-            var output = std.Io.Writer.Allocating.init(scratch);
-            defer output.deinit();
-            output.writer.writeByte('{') catch return error.OutOfMemory;
-            // Sources are inserted in projection ordinal order.
-            for (source.keys(), source.values(), 0..) |name, value, i| {
-                if (i != 0) output.writer.writeByte(',') catch return error.OutOfMemory;
-                std.json.Stringify.value(name, .{}, &output.writer) catch return error.OutOfMemory;
-                output.writer.writeByte(':') catch return error.OutOfMemory;
-                switch (value) {
-                    .logical => |logical| std.json.Stringify.value(logical, .{}, &output.writer) catch return error.OutOfMemory,
-                    // Whole JSON columns are already canonical API values.
-                    // Emit their bytes without constructing a throwaway DOM.
-                    .json => |view| output.writer.writeAll(view.root.raw) catch return error.OutOfMemory,
-                }
-            }
-            output.writer.writeByte('}') catch return error.OutOfMemory;
-            return alloc.dupe(u8, output.written());
-        }
+        if (self.paths.len == 0) return @import("serialized_output.zig").alloc(alloc, exact, SourceWriter{
+            .source = source,
+            .scratch = @import("antfly_platform").allocator.reclaimingScratch(scratch),
+        });
         // Navigation belongs to this response, never to a retained page view.
         // Logical-only projections keep their existing allocator fast path.
         var navigation = std.heap.ArenaAllocator.init(@import("antfly_platform").allocator.reclaimingScratch(scratch));
@@ -161,6 +164,7 @@ pub const Plan = struct {
                     const view = try row_alloc.create(JsonView);
                     view.* = .init(row_alloc, value.json.root.raw);
                     view.parse_numbers = value.json.parse_numbers;
+                    view.canonical_source = value.json.canonical_source;
                     view.root_sources = value.json.root_sources;
                     try view.prepareProjectionWithOptions(selected, .visited, .any_container, .{ .defer_fanout = true, .ranges = &ranges });
                     prepared[i] = view;
@@ -179,11 +183,30 @@ pub const Plan = struct {
                     const view = if (prepared.len != 0) prepared[i] orelse original else original;
                     try Projection.includePlanned(&projection_owner, &result, parts[0], .{ .span = .{ .view = view, .node = &view.root } }, parts[1..], if (selected) |s| s.fields.get(parts[0]) else null);
                 },
+                .native => |native| try Projection.includePlanned(&projection_owner, &result, parts[0], .{ .native = native }, parts[1..], null),
                 .logical => |*logical| try Projection.includePlanned(&projection_owner, &result, parts[0], .{ .logical = logical }, parts[1..], null),
             }
         }
         return (Projection{ .object = result }).serializeWithPolicy(row_alloc, alloc, exact);
     }
+    const SourceWriter = struct {
+        source: Sources,
+        scratch: std.mem.Allocator,
+        pub fn write(self: @This(), writer: *std.Io.Writer) anyerror!void {
+            try writer.writeByte('{');
+            for (self.source.keys(), self.source.values(), 0..) |name, value, i| {
+                if (i != 0) try writer.writeByte(',');
+                try std.json.Stringify.value(name, .{}, writer);
+                try writer.writeByte(':');
+                switch (value) {
+                    .logical => |logical| try std.json.Stringify.value(logical, .{}, writer),
+                    .json => |view| try writer.writeAll(view.root.raw),
+                    .native => |native| try native.write(self.scratch, writer),
+                }
+            }
+            try writer.writeByte('}');
+        }
+    };
 };
 
 test "relational nested projection preserves document semantics with bounded scratch" {
@@ -499,4 +522,181 @@ test "public graph metric borrowed wire later large columns preserve deep native
         try std.testing.expectEqual(@as(usize, 0), budget.live);
         try std.testing.expect(payload.root.children == null and other.root.children == null);
     }
+}
+
+test "public graph metric borrowed wire native whole text and indexed vectors use bounded scratch" {
+    const a = std.testing.allocator;
+    const counters = @import("../../lite/test_allocator.zig");
+    const columns = [_]schema.RelationalColumn{
+        .{ .name = "payload", .path = "payload", .column_type = .json, .is_json = true, .json_kind = .any },
+        .{ .name = "text", .path = "text", .column_type = .string },
+        .{ .name = "embedding", .path = "embedding", .column_type = .dense_vector },
+    };
+    const table: schema.TableSchema = .{ .version = 1, .storage_mode = .relational, .relational_columns = &columns };
+    var layout = try codec.PhysicalLayout.init(a, table);
+    defer layout.deinit();
+    const text = try a.alloc(u8, 1024 * 1024);
+    defer a.free(text);
+    @memset(text, 'a');
+    @memcpy(text[0..12], "\"\\\n\u{1}é中xyz");
+    var raw = std.Io.Writer.Allocating.init(a);
+    defer raw.deinit();
+    try raw.writer.writeAll("{\"keep\":100,\"padding\":");
+    try std.json.Stringify.value(text, .{}, &raw.writer);
+    try raw.writer.writeByte('}');
+    var vector: [1536 * 4]u8 = undefined;
+    for (0..1536) |i| std.mem.writeInt(u32, vector[i * 4 ..][0..4], @bitCast(@as(f32, 0.1)), .little);
+    const cells = [_]codec.Cell{
+        .{ .ordinal = 0, .path = "payload", .is_json = true, .value_type = .bytes_val, .value = .{ .bytes_val = raw.written() } },
+        .{ .ordinal = 1, .path = "text", .value_type = .bytes_val, .value = .{ .bytes_val = text } },
+        .{ .ordinal = 2, .path = "embedding", .is_dense_vector = true, .value_type = .bytes_val, .value = .{ .bytes_val = &vector } },
+    };
+    const encoded = try codec.serializeOrdinal(a, 1, &columns, &cells, @splat(0));
+    defer a.free(encoded);
+    const row = try codec.ordinalRowViewTrusted(encoded, table, &layout);
+    const selections = [_][]const []const u8{ &.{"payload"}, &.{ "payload.keep", "text" }, &.{ "payload.keep", "embedding" }, &.{ "payload.keep", "embedding.0" }, &.{"embedding.0"}, &.{"payload.padding"}, &.{"text"} };
+    var legacy = std.heap.ArenaAllocator.init(a);
+    defer legacy.deinit();
+    var sources: Plan.Sources = .empty;
+    for (&cells, &columns) |cell, column| {
+        if (cell.is_json) {
+            const view = try legacy.allocator().create(JsonView);
+            view.* = .init(legacy.allocator(), cell.value.bytes_val);
+            try sources.put(legacy.allocator(), column.name, .{ .json = view });
+        } else try sources.put(legacy.allocator(), column.name, .{ .logical = try row.materializeCellAlloc(legacy.allocator(), cell) });
+    }
+    for (selections) |fields| {
+        var plan = try Plan.init(a, table, &layout, fields);
+        defer plan.deinit();
+        const expected = if (plan.paths.len == 0) blk: {
+            var whole: Plan.Sources = .empty;
+            defer whole.deinit(a);
+            for (plan.base.ordinals) |ordinal| {
+                const name = columns[ordinal].name;
+                try whole.put(a, name, sources.get(name).?);
+            }
+            break :blk try plan.projectSources(a, legacy.allocator(), whole);
+        } else try plan.projectSources(a, legacy.allocator(), sources);
+        defer a.free(expected);
+        for ([_]bool{ false, true }) |exact| {
+            var no_resize: counters.NoResizeAllocator = .{ .backing = a };
+            var budget: counters.BudgetAllocator = .{ .backing = no_resize.allocator(), .limit = 16 * 1024 };
+            const result = try plan.projectWithOutputPolicy(budget.allocator(), a, row, exact);
+            defer a.free(result);
+            try std.testing.expectEqualStrings(expected, result);
+            if (plan.paths.len == 0) try std.testing.expectEqual(@as(usize, 0), budget.alloc_calls);
+            try std.testing.expectEqual(@as(usize, 0), budget.live);
+        }
+    }
+}
+
+test "public graph metric borrowed wire borrowed native composites preserve ordered logical projections" {
+    const a = std.testing.allocator;
+    const arrays = @import("../../../sql/array_value.zig");
+    const array_storage = @import("../../../sql/array_storage.zig");
+    const columns = [_]schema.RelationalColumn{
+        .{ .name = "point", .path = "point", .column_type = .geopoint },
+        .{ .name = "array", .path = "array", .column_type = .sql_array, .sql_element_type = .int64 },
+        .{ .name = "payload", .path = "payload", .column_type = .json, .is_json = true, .json_kind = .any },
+        .{ .name = "text", .path = "text", .column_type = .string, .allows_null = true },
+        .{ .name = "number", .path = "number", .column_type = .number },
+    };
+    const table: schema.TableSchema = .{ .version = 1, .storage_mode = .relational, .relational_columns = &columns };
+    var layout = try codec.PhysicalLayout.init(a, table);
+    defer layout.deinit();
+    const elements = [_]arrays.Element{ arrays.Element.json(.{ .integer = 9007199254740993 }), .{} };
+    const array = try arrays.Value.init(.int64, &.{.{ .length = 2, .lower = -1 }}, &elements, .{});
+    const array_bytes = try array_storage.encodeAlloc(a, array, .{});
+    defer a.free(array_bytes);
+    const cells = [_]codec.Cell{
+        .{ .ordinal = 0, .path = "point", .value_type = .geo_point, .value = .{ .geo_point = .{ .lat = 0.1, .lon = -0.0 } } },
+        .{ .ordinal = 1, .path = "array", .value_type = .bytes_val, .sql_array_element_type = .int64, .value = .{ .bytes_val = array_bytes } },
+        .{ .ordinal = 2, .path = "payload", .is_json = true, .value_type = .bytes_val, .value = .{ .bytes_val = "{\"n\":100,\"s\":\"é\\n\"}" } },
+        .{ .ordinal = 3, .path = "text", .value_type = .bytes_val, .is_null = true, .value = undefined },
+        .{ .ordinal = 4, .path = "number", .value_type = .f64_val, .value = .{ .f64_val = 1e-20 } },
+    };
+    const encoded = try codec.serializeOrdinal(a, 1, &columns, &cells, @splat(0));
+    defer a.free(encoded);
+    const row = try codec.ordinalRowViewTrusted(encoded, table, &layout);
+    var legacy = std.heap.ArenaAllocator.init(a);
+    defer legacy.deinit();
+    var sources: Plan.Sources = .empty;
+    for (&columns, &cells) |column, cell| try sources.put(legacy.allocator(), column.name, .{ .logical = try row.materializeCellAlloc(legacy.allocator(), cell) });
+    const selections = [_][]const []const u8{
+        &.{ "array", "payload.n", "number", "text" },
+        &.{ "array", "array.values.0", "point", "point.lat", "payload.s" },
+        &.{ "array.values.0", "array.dimensions.0", "point.lon", "payload.n" },
+        &.{ "point", "point.missing.x", "text.n", "payload.n" },
+    };
+    for (selections) |fields| {
+        var plan = try Plan.init(a, table, &layout, fields);
+        defer plan.deinit();
+        const expected = try plan.projectSources(a, legacy.allocator(), sources);
+        defer a.free(expected);
+        const Check = struct {
+            fn run(scratch: std.mem.Allocator, output: std.mem.Allocator, p: Plan, input: codec.OrdinalRowView, want: []const u8) !void {
+                const result = try p.projectWithOutputPolicy(scratch, output, input, true);
+                defer output.free(result);
+                try std.testing.expectEqualStrings(want, result);
+            }
+        };
+        try Check.run(a, a, plan, row, expected);
+        try @import("antfly_platform").allocator.checkAllAllocationFailures(a, Check.run, .{ a, plan, row, expected });
+        try std.testing.checkAllAllocationFailures(a, struct {
+            fn run(output: std.mem.Allocator, p: Plan, input: codec.OrdinalRowView, want: []const u8) !void {
+                try Check.run(std.testing.allocator, output, p, input, want);
+            }
+        }.run, .{ plan, row, expected });
+    }
+    var typed_sources: Plan.Sources = .empty;
+    var materialized: u64 = 0;
+    for (&columns, &cells) |*column, cell| {
+        const source = try Plan.sourceForCell(legacy.allocator(), column, cell, true);
+        if (source == .native) source.native.materialized_count = &materialized;
+        try typed_sources.put(legacy.allocator(), column.name, source);
+    }
+    var overlay = try Plan.init(a, table, &layout, &.{ "array.values.0", "array", "point.lat", "point", "payload.n" });
+    defer overlay.deinit();
+    const expected = try overlay.projectSources(a, legacy.allocator(), sources);
+    defer a.free(expected);
+    for (0..2) |_| {
+        const bytes = try overlay.projectSources(a, legacy.allocator(), typed_sources);
+        defer a.free(bytes);
+        try std.testing.expectEqualStrings(expected, bytes);
+        try std.testing.expectEqual(@as(u64, 2), materialized);
+    }
+}
+
+test "public graph metric borrowed wire wide native writer snapshot releases metadata on every failure" {
+    const a = std.testing.allocator;
+    const names = [_][]const u8{ "a", "b", "c", "d", "e", "f", "g", "h", "i" };
+    var columns: [names.len]schema.RelationalColumn = undefined;
+    var cells: [names.len - 1]codec.Cell = undefined;
+    for (&columns, names) |*column, name| column.* = .{ .name = name, .path = name, .column_type = .integer, .allows_null = true };
+    for (&cells, 0..) |*cell, i| cell.* = .{ .ordinal = @intCast(i), .path = names[i], .value_type = .i64_val, .value = .{ .i64_val = @intCast(i) } };
+    cells[cells.len - 1].is_null = true;
+    const table: schema.TableSchema = .{ .version = 1, .storage_mode = .relational, .relational_columns = &columns };
+    var layout = try codec.PhysicalLayout.init(a, table);
+    defer layout.deinit();
+    const encoded = try codec.serializeOrdinal(a, 1, &columns, &cells, @splat(0));
+    defer a.free(encoded);
+    const row = try codec.ordinalRowViewSelective(encoded, table, &layout);
+    var plan = try Plan.init(a, table, &layout, &names);
+    defer plan.deinit();
+    const Check = struct {
+        fn run(alloc: std.mem.Allocator, p: Plan, input: codec.OrdinalRowView) !void {
+            const expected = "{\"a\":0,\"b\":1,\"c\":2,\"d\":3,\"e\":4,\"f\":5,\"g\":6,\"h\":null}";
+            for ([_]bool{ false, true }) |exact| {
+                const bytes = try p.projectWithOutputPolicy(alloc, alloc, input, exact);
+                defer alloc.free(bytes);
+                try std.testing.expectEqualStrings(expected, bytes);
+            }
+            var output = std.heap.ArenaAllocator.init(alloc);
+            defer output.deinit();
+            const bytes = try p.projectWithOutputPolicy(alloc, output.allocator(), input, false);
+            try std.testing.expectEqualStrings(expected, bytes);
+        }
+    };
+    try Check.run(a, plan, row);
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(a, Check.run, .{ plan, row });
 }

@@ -28,9 +28,21 @@ pub const View = struct {
     root: Node,
     materialized_values: usize = 0,
     parse_numbers: bool = false,
+    /// Canonical native storage provenance, bounded to these immutable pinned
+    /// bytes. Copying view state cannot authorize an unrelated source span.
+    canonical_source: ?[]const u8 = null,
     root_sources: []const RootSource = &.{},
     validated_ranges: ?*const ValidatedRanges.Ref = null,
     pub const ValidatedRanges = @import("validated_ranges.zig").ValidatedRanges;
+    /// `raw` must be a complete subvalue identified by this view's traversal.
+    pub fn canCopyCanonical(self: *const View, raw: []const u8) bool {
+        if (self.parse_numbers) return false;
+        const source = self.canonical_source orelse return false;
+        const base = @intFromPtr(source.ptr);
+        const start = @intFromPtr(raw.ptr);
+        return start >= base and start - base <= source.len and raw.len <= source.len - (start - base);
+    }
+
     pub const RootSource = struct {
         name: []const u8,
         value: Value = .null,

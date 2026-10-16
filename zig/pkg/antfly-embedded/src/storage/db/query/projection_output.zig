@@ -184,10 +184,45 @@ const ArenaAccounting = struct {
     }
 };
 
+/// Borrows an authenticated cell and immutable schema during synchronous row
+/// projection. Only structural access to composite SQL values materializes a
+/// logical container; scalar strings and dense vectors never need a DOM.
+pub const NativeCell = struct {
+    cell: @import("../algebraic/relational_row_codec.zig").Cell,
+    column: *const @import("../../schema.zig").RelationalColumn,
+    alloc: Allocator,
+    cached: ?*const Value = null,
+    materialized_count: ?*u64 = null,
+    fn kind(self: *const @This()) u8 {
+        if (self.cell.is_null) return 0;
+        return switch (self.column.column_type) {
+            .dense_vector => '[',
+            .geopoint, .sql_array => '{',
+            else => 0,
+        };
+    }
+    pub fn write(self: *@This(), scratch: Allocator, writer: *std.Io.Writer) !void {
+        if (self.cached) |value| return std.json.Stringify.value(value.*, .{}, writer);
+        try @import("../algebraic/relational_row_codec.zig").writeCellValue(scratch, writer, self.cell, .logical);
+    }
+
+    fn logical(self: *@This()) !*const Value {
+        if (self.cached == null) {
+            const value = try self.alloc.create(Value);
+            errdefer self.alloc.destroy(value);
+            value.* = try @import("../algebraic/relational_row_codec.zig").borrowedJsonValueFromCellAlloc(self.alloc, self.column.*, self.cell);
+            self.cached = value;
+            if (self.materialized_count) |count| count.* += 1;
+        }
+        return self.cached.?;
+    }
+};
+
 /// Row-owned projection structure. Terminal values borrow immutable sources;
 /// containers become mutable only when an ordered selector needs to change one.
 /// Neither the view nor a loaded source is ever mutated by projection.
 pub const Source = union(enum) {
+    native: *NativeCell,
     span: struct { view: *View, node: *View.Node },
     logical: *const Value,
     embeddings: *const EmbeddingFields,
@@ -197,6 +232,7 @@ pub const Source = union(enum) {
 
     fn kind(self: Source) u8 {
         return switch (self) {
+            .native => |cell| cell.kind(),
             .embeddings, .embedding_stream => '{',
             .vector => '[',
             .component => 0,
@@ -210,6 +246,7 @@ pub const Source = union(enum) {
     }
     fn field(self: Source, alloc: Allocator, name: []const u8) !?Source {
         return switch (self) {
+            .native => |cell| if (cell.kind() == '{') (if ((try cell.logical()).object.getPtr(name)) |value| .{ .logical = value } else null) else null,
             .embedding_stream => |stream| if (try stream.getField(alloc, name)) |v| .{ .vector = v } else null,
             .embeddings => |fields| if (fields.values.get(name)) |v| .{ .vector = v } else null,
             .vector, .component => null,
@@ -219,6 +256,11 @@ pub const Source = union(enum) {
     }
     fn element(self: Source, index: usize) !?Source {
         return switch (self) {
+            .native => |cell| blk: {
+                if (cell.kind() != '[' or index >= cell.cell.value.bytes_val.len / 4) break :blk null;
+                const bytes = cell.cell.value.bytes_val[index * 4 ..][0..4];
+                break :blk .{ .component = @bitCast(std.mem.readInt(u32, bytes, .little)) };
+            },
             .vector => |v| if (index < v.len) .{ .component = v[index] } else null,
             .embeddings, .embedding_stream, .component => null,
             .span => |s| if (try s.view.element(s.node, index)) |node| .{ .span = .{ .view = s.view, .node = node } } else null,
@@ -292,6 +334,10 @@ pub const Output = union(enum) {
 
     fn copyObject(a: Allocator, dst: *Object, source: Source) !void {
         switch (source) {
+            .native => |cell| {
+                const value = try cell.logical();
+                for (value.object.keys(), value.object.values()) |name, *child| try put(a, dst, name, .{ .borrowed = .{ .logical = child } });
+            },
             .embedding_stream => |stream| try copyObject(a, dst, .{ .embeddings = try stream.fields(a) }),
             .embeddings => |fields| for (fields.values.keys(), fields.values.values()) |name, vector| try put(a, dst, name, .{ .borrowed = .{ .vector = vector } }),
             .vector, .component => unreachable,
@@ -304,6 +350,7 @@ pub const Output = union(enum) {
                 const shallow = try a.create(View);
                 shallow.* = .init(a, s.node.raw);
                 shallow.parse_numbers = s.view.parse_numbers;
+                shallow.canonical_source = s.view.canonical_source;
                 const children = try shallow.children(&shallow.root);
                 const names = try a.alloc([]const u8, children.len);
                 var it = shallow.root.object_index.iterator();
@@ -419,44 +466,18 @@ pub const Output = union(enum) {
     pub fn serialize(self: Output, scratch: Allocator, output: Allocator) ![]u8 {
         return self.serializeWithPolicy(scratch, output, false);
     }
-    /// Carry allocation policy through wrappers without unwrapping quota or
-    /// synchronization. Exact/arena owners get a bounded sizing pass followed
-    /// by direct emission into their sole final allocation. Small responses
-    /// remain in the sizing buffer and need no replay.
+    /// Share bounded exact sizing with whole-row and typed-cell serialization.
     pub fn serializeWithPolicy(self: Output, scratch: Allocator, output: Allocator, exact: bool) ![]u8 {
-        const reclaimable = @import("antfly_platform").allocator.reclaimingScratch(output);
-        const arena_output = exact or reclaimable.ptr != output.ptr or reclaimable.vtable != output.vtable;
-        if (arena_output) return self.serializeExact(scratch, output);
-        var writer = std.Io.Writer.Allocating.init(output);
-        defer writer.deinit();
-        self.writeTo(scratch, &writer.writer) catch |err| switch (err) {
-            error.WriteFailed => return error.OutOfMemory,
-            else => return err,
-        };
-        return writer.toOwnedSlice();
-    }
-
-    fn serializeExact(self: Output, scratch: Allocator, output: Allocator) ![]u8 {
-        var buffer: [4096]u8 = undefined;
-        var counter = std.Io.Writer.Discarding.init(&buffer);
         var context = StreamContext.init(scratch);
         defer context.deinit();
-        try self.write(&context, &counter.writer);
-        // No drain means the complete response is still buffered. This keeps
-        // the usual small response to one traversal and one output allocation.
-        if (counter.count == 0) return output.dupe(u8, counter.writer.buffered());
-        const size = std.math.cast(usize, counter.fullCount()) orelse return error.OutOfMemory;
-        const result = try output.alloc(u8, size);
-        errdefer output.free(result);
-        var writer = std.Io.Writer.fixed(result);
-        self.write(&context, &writer) catch |err| switch (err) {
-            error.WriteFailed => return error.OutputSizeChanged,
-            else => return err,
+        const Emission = struct {
+            value: Output,
+            context: *StreamContext,
+            pub fn write(emission: @This(), writer: *std.Io.Writer) anyerror!void {
+                try emission.value.write(emission.context, writer);
+            }
         };
-        // Sources and restartable embedding streams must remain stable during
-        // this synchronous operation. Never expose an unwritten result tail.
-        if (writer.end != result.len) return error.OutputSizeChanged;
-        return result;
+        return @import("serialized_output.zig").alloc(output, exact, Emission{ .value = self, .context = &context });
     }
 
     /// A transport with its own writer can stream the body without allocating
@@ -469,8 +490,9 @@ pub const Output = union(enum) {
     fn write(self: Output, context: *StreamContext, writer: *std.Io.Writer) anyerror!void {
         switch (self) {
             .borrowed => |source| switch (source) {
+                .native => |cell| try cell.write(context.work, writer),
                 .embedding_stream => |stream| try stream.write(writer),
-                .span => |s| try context.writeSpan(writer, s.node.raw, s.view.parse_numbers),
+                .span => |s| if (s.view.canCopyCanonical(s.node.raw)) try writer.writeAll(s.node.raw) else try context.writeSpan(writer, s.node.raw, s.view.parse_numbers),
                 .logical => |v| try std.json.Stringify.value(v.*, .{}, writer),
                 .component => |v| try std.json.Stringify.value(@as(f64, v), .{}, writer),
                 .vector => |v| try writeVector(writer, v),
@@ -559,6 +581,10 @@ pub const Output = union(enum) {
         var count: usize = 0;
         try writer.writeByte('{');
         switch (overlay.base) {
+            .native => |cell| {
+                const value = try cell.logical();
+                for (value.object.keys(), value.object.values()) |name, *child| try writeBaseMember(context, writer, overlay, emitted, &count, name, .{ .logical = child });
+            },
             .vector, .component => unreachable,
             .embedding_stream => |stream| {
                 if (stream.cached_complete) {
@@ -783,7 +809,7 @@ const FanoutRows = struct {
         self.scratch = null;
     }
     fn next(self: *FanoutRows) anyerror!?Output.Object {
-        if (self.source == .vector) return null;
+        if (self.source == .vector or (self.source == .native and self.source.native.kind() == '[')) return null;
         var retire_row = self.scratch != null;
         const slot = self.scratch orelse acquired: {
             const slot = try self.resources.acquire();
@@ -801,6 +827,7 @@ const FanoutRows = struct {
             retire_row = true;
             const a = slot.arena.allocator();
             const item: Source = switch (self.source) {
+                .native => unreachable,
                 .vector => return null,
                 .embeddings, .embedding_stream, .component => unreachable,
                 .logical => |value| blk: {
@@ -862,6 +889,7 @@ const FanoutRows = struct {
                     }
                     slot.view.validated_ranges = span.view.validated_ranges;
                     slot.view.parse_numbers = span.view.parse_numbers;
+                    slot.view.canonical_source = span.view.canonical_source;
                     break :blk .{ .span = .{ .view = &slot.view, .node = &slot.view.root } };
                 },
             };
@@ -1752,4 +1780,29 @@ test "public graph metric borrowed wire exact nested fanout replay survives erro
     };
     try Fixture.run(a, raw.written());
     try @import("antfly_platform").allocator.checkAllAllocationFailures(a, Fixture.run, .{raw.written()});
+}
+
+test "public graph metric borrowed wire canonical span reuse respects source bounds and number mode" {
+    const a = std.testing.allocator;
+    const raw = "{\"n\":900719925474099312345}";
+    var view = View.init(a, raw);
+    view.canonical_source = raw;
+    const value: Output = .{ .borrowed = .{ .span = .{ .view = &view, .node = &view.root } } };
+    var budget: @import("../../lite/test_allocator.zig").BudgetAllocator = .{ .backing = a, .limit = 0 };
+    const exact = try value.serializeWithPolicy(budget.allocator(), a, true);
+    defer a.free(exact);
+    try std.testing.expectEqualStrings(raw, exact);
+    try std.testing.expectEqual(@as(usize, 0), budget.alloc_attempts);
+    view.parse_numbers = true;
+    var parsed = try std.json.parseFromSlice(Value, a, raw, .{});
+    defer parsed.deinit();
+    const expected = try std.json.Stringify.valueAlloc(a, parsed.value, .{});
+    defer a.free(expected);
+    const normalized = try value.serializeWithPolicy(a, a, true);
+    defer a.free(normalized);
+    try std.testing.expectEqualStrings(expected, normalized);
+    view.parse_numbers = false;
+    var foreign: View.Node = .{ .raw = "[0,}" };
+    try std.testing.expect(!view.canCopyCanonical(foreign.raw));
+    try std.testing.expectError(error.SyntaxError, (Output{ .borrowed = .{ .span = .{ .view = &view, .node = &foreign } } }).serializeWithPolicy(a, a, true));
 }

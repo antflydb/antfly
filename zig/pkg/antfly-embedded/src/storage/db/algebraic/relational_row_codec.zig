@@ -1267,22 +1267,58 @@ pub const OrdinalRowView = struct {
         return .{ .parsed = self.parsed, .table_schema = self.table_schema };
     }
 
-    pub fn projectAlloc(self: OrdinalRowView, alloc: Allocator, plan: OrdinalProjectionPlan) ![]u8 {
-        if (self.checksum_groups != null) {
-            if (plan.schema_version != self.table_schema.version) return error.RelationalRowSchemaMismatch;
-            var output = std.ArrayListUnmanaged(u8).empty;
-            errdefer output.deinit(alloc);
-            try output.append(alloc, '{');
-            var comma = false;
-            for (plan.ordinals) |ordinal| {
-                const cell = (try self.findCell(ordinal)) orelse continue;
-                try appendValidatedCellValue(alloc, &output, cell, comma);
-                comma = true;
-            }
-            try output.append(alloc, '}');
-            return output.toOwnedSlice(alloc);
+    /// The addressed cells retain selective checksum verification. The caller
+    /// pins the row throughout emission; no cell payload or complete body copy
+    /// is required beside the final output.
+    pub fn writeProjection(self: OrdinalRowView, scratch: Allocator, writer: *std.Io.Writer, plan: OrdinalProjectionPlan) !void {
+        if (plan.schema_version != self.table_schema.version) return error.RelationalRowSchemaMismatch;
+        try writer.writeByte('{');
+        var comma = false;
+        for (plan.ordinals) |ordinal| {
+            const cell = (try self.findCell(ordinal)) orelse continue;
+            if (comma) try writer.writeByte(',');
+            try writeJsonString(writer, cell.path);
+            try writer.writeByte(':');
+            try writeCellValue(scratch, writer, cell, .physical);
+            comma = true;
         }
-        return try projectParsedOrdinalPlanAlloc(alloc, self.parsed, self.table_schema, plan);
+        try writer.writeByte('}');
+    }
+
+    /// Capture only addressed cell descriptors, authenticating their bytes once
+    /// before a sizing pass. Replay borrows this immutable descriptor snapshot.
+    pub const ProjectionWriter = struct {
+        row: OrdinalRowView,
+        scratch: Allocator,
+        plan: OrdinalProjectionPlan,
+        inline_cells: [8]?Cell = undefined,
+        cells: ?[]?Cell = null,
+        pub fn deinit(self: *@This()) void {
+            if (self.cells) |cells| if (cells.len > self.inline_cells.len) self.scratch.free(cells);
+            self.cells = null;
+        }
+        pub fn write(self: *@This(), writer: *std.Io.Writer) anyerror!void {
+            if (self.plan.schema_version != self.row.table_schema.version) return error.RelationalRowSchemaMismatch;
+            if (self.cells == null) {
+                const cells = if (self.plan.ordinals.len <= self.inline_cells.len) self.inline_cells[0..self.plan.ordinals.len] else try self.scratch.alloc(?Cell, self.plan.ordinals.len);
+                errdefer if (cells.len > self.inline_cells.len) self.scratch.free(cells);
+                for (self.plan.ordinals, cells) |ordinal, *cell| cell.* = try self.row.findCell(ordinal);
+                self.cells = cells;
+            }
+            try writer.writeByte('{');
+            var comma = false;
+            for (self.cells.?) |maybe_cell| if (maybe_cell) |cell| {
+                try writeCellMember(self.scratch, writer, cell, comma);
+                comma = true;
+            };
+            try writer.writeByte('}');
+        }
+    };
+
+    pub fn projectAlloc(self: OrdinalRowView, alloc: Allocator, plan: OrdinalProjectionPlan) ![]u8 {
+        var emitter: ProjectionWriter = .{ .row = self, .scratch = @import("antfly_platform").allocator.reclaimingScratch(alloc), .plan = plan };
+        defer emitter.deinit();
+        return @import("../query/serialized_output.zig").alloc(alloc, false, &emitter);
     }
 
     /// Owned typed projection for native consumers. Absence stays absent;
@@ -2480,53 +2516,78 @@ pub fn appendCellValue(
     return try appendValidatedCellValue(alloc, out, cell, needs_comma);
 }
 
-fn appendValidatedCellValue(
-    alloc: Allocator,
-    out: *std.ArrayListUnmanaged(u8),
-    cell: Cell,
-    needs_comma: bool,
-) !void {
-    if (needs_comma) try out.append(alloc, ',');
-    try appendJsonString(alloc, out, cell.path);
-    try out.append(alloc, ':');
-    if (cell.is_null) {
-        try out.appendSlice(alloc, "null");
-        return;
-    }
+fn appendValidatedCellValue(alloc: Allocator, out: *std.ArrayListUnmanaged(u8), cell: Cell, needs_comma: bool) !void {
+    var writer = std.Io.Writer.Allocating.fromArrayList(alloc, out);
+    defer out.* = writer.toArrayList();
+    writeCellMember(alloc, &writer.writer, cell, needs_comma) catch |err| switch (err) {
+        error.WriteFailed => return error.OutOfMemory,
+        else => return err,
+    };
+}
+
+fn writeCellMember(scratch: Allocator, writer: *std.Io.Writer, cell: Cell, needs_comma: bool) !void {
+    if (needs_comma) try writer.writeByte(',');
+    try writeJsonString(writer, cell.path);
+    try writer.writeByte(':');
+    try writeCellValue(scratch, writer, cell, .physical);
+}
+
+/// Whole-row reconstruction historically formats physical f32/f64 values with
+/// {d}; nested projections format their logical f64 values through JSON. Keep
+/// that compatibility boundary explicit while sharing payload interpretation.
+pub const JsonMode = enum { physical, logical };
+
+pub fn writeCellValue(scratch: Allocator, writer: *std.Io.Writer, cell: Cell, mode: JsonMode) !void {
+    if (cell.is_null) return writer.writeAll("null");
     switch (cell.value_type) {
         .datetime_ns => return error.InvalidRelationalRow,
-        .f64_val => try appendFmt(alloc, out, "{d}", .{cell.value.f64_val}),
-        .u64_val => try appendFmt(alloc, out, "{d}", .{cell.value.u64_val}),
-        .i64_val => try appendFmt(alloc, out, "{d}", .{cell.value.i64_val}),
+        .f64_val => if (mode == .physical) try writer.print("{d}", .{cell.value.f64_val}) else try std.json.Stringify.value(cell.value.f64_val, .{}, writer),
+        .u64_val => try writer.print("{d}", .{cell.value.u64_val}),
+        .i64_val => try writer.print("{d}", .{cell.value.i64_val}),
         .numeric_val => switch (cell.value.numeric_val) {
-            .u64_val => |number| try appendFmt(alloc, out, "{d}", .{number}),
-            .i64_val => |number| try appendFmt(alloc, out, "{d}", .{number}),
-            .f64_val => |number| try appendFmt(alloc, out, "{d}", .{number}),
+            .u64_val => |number| try writer.print("{d}", .{number}),
+            .i64_val => |number| try writer.print("{d}", .{number}),
+            .f64_val => |number| if (mode == .physical) try writer.print("{d}", .{number}) else try std.json.Stringify.value(number, .{}, writer),
         },
-        .bool_val => try out.appendSlice(alloc, if (cell.value.bool_val) "true" else "false"),
-        .geo_point => try appendFmt(alloc, out, "{{\"lat\":{d},\"lon\":{d}}}", .{ cell.value.geo_point.lat, cell.value.geo_point.lon }),
+        .bool_val => try writer.writeAll(if (cell.value.bool_val) "true" else "false"),
+        .geo_point => {
+            try writer.writeAll("{\"lat\":");
+            if (mode == .physical) try writer.print("{d}", .{cell.value.geo_point.lat}) else try std.json.Stringify.value(cell.value.geo_point.lat, .{}, writer);
+            try writer.writeAll(",\"lon\":");
+            if (mode == .physical) try writer.print("{d}", .{cell.value.geo_point.lon}) else try std.json.Stringify.value(cell.value.geo_point.lon, .{}, writer);
+            try writer.writeByte('}');
+        },
         .bytes_val => {
             if (cell.is_numeric) {
-                var value = try @import("../../../sql/numeric_storage.zig").jsonValueAlloc(alloc, cell.value.bytes_val);
-                defer @import("../types.zig").deinitJsonValue(alloc, &value);
-                if (value == .number_string) try out.appendSlice(alloc, value.number_string) else try appendJsonString(alloc, out, value.string);
+                var value = try @import("../../../sql/numeric_storage.zig").jsonValueAlloc(scratch, cell.value.bytes_val);
+                defer @import("../types.zig").deinitJsonValue(scratch, &value);
+                try std.json.Stringify.value(value, .{}, writer);
             } else if (cell.sql_array_element_type) |kind| {
-                var decoded = try @import("../../../sql/array_storage.zig").decode(alloc, kind, cell.value.bytes_val, .{});
+                var decoded = try @import("../../../sql/array_storage.zig").decode(scratch, kind, cell.value.bytes_val, .{});
                 defer decoded.deinit();
-                const envelope = try @import("../../../sql/array_wire.zig").encodeAlloc(alloc, decoded.value, .{});
-                defer alloc.free(envelope);
-                try out.appendSlice(alloc, envelope);
+                try @import("../../../sql/array_wire.zig").encode(decoded.value, writer, .{});
             } else if (cell.is_dense_vector) {
-                try appendDenseVectorJson(alloc, out, cell.value.bytes_val);
+                if (mode == .physical) try validateDenseVectorBytes(cell.value.bytes_val) else if (cell.value.bytes_val.len % 4 != 0) return error.InvalidRelationalRow;
+                try writer.writeByte('[');
+                var offset: usize = 0;
+                while (offset < cell.value.bytes_val.len) : (offset += 4) {
+                    if (offset != 0) try writer.writeByte(',');
+                    const value: f32 = @bitCast(std.mem.readInt(u32, cell.value.bytes_val[offset..][0..4], .little));
+                    if (mode == .physical) try writer.print("{d}", .{value}) else try std.json.Stringify.value(@as(f64, value), .{}, writer);
+                }
+                try writer.writeByte(']');
             } else if (cell.is_json) {
-                // The ordinal parser and appendCellValue validate this before
-                // reaching the hot formatting path.
-                try out.appendSlice(alloc, cell.value.bytes_val);
-            } else {
-                try appendJsonString(alloc, out, cell.value.bytes_val);
-            }
+                // findCell/ingestion establishes canonical JSON; Discarding can
+                // count these immutable bytes without reading their payload.
+                try writer.writeAll(cell.value.bytes_val);
+            } else if (mode == .physical) try writeJsonString(writer, cell.value.bytes_val) else try std.json.Stringify.value(cell.value.bytes_val, .{}, writer);
         },
     }
+}
+
+fn writeJsonString(writer: *std.Io.Writer, value: []const u8) !void {
+    if (!std.unicode.utf8ValidateSlice(value)) return error.InvalidRelationalRow;
+    try std.json.Stringify.value(value, .{}, writer);
 }
 
 /// Lower a validated logical embedding into AROW's canonical binary payload.
@@ -2574,18 +2635,6 @@ fn validateDenseVectorBytes(bytes: []const u8) !void {
         const value: f32 = @bitCast(std.mem.readInt(u32, bytes[offset..][0..4], .little));
         if (!std.math.isFinite(value)) return error.InvalidRelationalRow;
     }
-}
-
-fn appendDenseVectorJson(alloc: Allocator, out: *std.ArrayListUnmanaged(u8), bytes: []const u8) !void {
-    try validateDenseVectorBytes(bytes);
-    try out.append(alloc, '[');
-    var offset: usize = 0;
-    while (offset < bytes.len) : (offset += 4) {
-        if (offset != 0) try out.append(alloc, ',');
-        const value: f32 = @bitCast(std.mem.readInt(u32, bytes[offset..][0..4], .little));
-        try appendFmt(alloc, out, "{d}", .{value});
-    }
-    try out.append(alloc, ']');
 }
 
 pub fn appendJsonString(alloc: Allocator, out: *std.ArrayListUnmanaged(u8), value: []const u8) !void {
@@ -3122,4 +3171,35 @@ test "ordinal rows store dense vectors as canonical binary values" {
         error.InvalidRelationalRow,
         serializeOrdinal(alloc, schema.version, &columns, &invalid_cells, @as([semantic_hash_len]u8, @splat(0x55))),
     );
+}
+
+test "public graph metric borrowed wire native SQL array writer matches logical envelopes across PostgreSQL goldens" {
+    const a = std.testing.allocator;
+    const arrays = @import("../../../sql/array_value.zig");
+    const storage = @import("../../../sql/array_storage.zig");
+    const Fixture = struct { entries: []const struct { element_type: arrays.ElementType, binary: []const u8 } };
+    const fixture = try std.json.parseFromSlice(Fixture, a, @embedFile("../../../sql/fixtures/sql_array_binary_reference.json"), .{ .ignore_unknown_fields = true });
+    defer fixture.deinit();
+    for (fixture.value.entries) |entry| {
+        const binary = try a.alloc(u8, entry.binary.len / 2);
+        defer a.free(binary);
+        _ = try std.fmt.hexToBytes(binary, entry.binary);
+        var original = try @import("../../../sql/array_binary.zig").decode(a, entry.element_type, binary, .{});
+        defer original.deinit();
+        const bytes = try storage.encodeAlloc(a, original.value, .{});
+        defer a.free(bytes);
+        const cell: Cell = .{ .ordinal = 0, .path = "a", .value_type = .bytes_val, .sql_array_element_type = entry.element_type, .value = .{ .bytes_val = bytes } };
+        const column: runtime_schema.RelationalColumn = .{ .name = "a", .path = "a", .column_type = .sql_array, .sql_element_type = entry.element_type };
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        const legacy = try ownedJsonValueFromCellAlloc(arena.allocator(), column, cell);
+        const expected = try std.json.Stringify.valueAlloc(a, legacy, .{});
+        defer a.free(expected);
+        for ([_]JsonMode{ .physical, .logical }) |mode| {
+            var writer = std.Io.Writer.Allocating.init(a);
+            defer writer.deinit();
+            try writeCellValue(a, &writer.writer, cell, mode);
+            try std.testing.expectEqualStrings(expected, writer.written());
+        }
+    }
 }

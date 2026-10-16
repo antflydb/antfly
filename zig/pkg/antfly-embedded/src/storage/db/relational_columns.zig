@@ -2702,6 +2702,26 @@ const Block = struct {
         return logical;
     }
 
+    /// Projection borrows decoded cells while this block pins their payloads.
+    /// Predicate/materialization caches remain independent of row-owned output.
+    fn projectionSource(self: *@This(), ordinal: u32, row: usize, row_alloc: alloc_type) !?ProjectionPlan.Source {
+        const value = try self.column(ordinal);
+        if (!value.present(row)) return null;
+        if (value.bitmaps[null_bytes + row / 8] & (@as(u8, 1) << @intCast(row % 8)) != 0) return .{ .logical = .null };
+        const column_schema = &self.table.relational_columns[ordinal];
+        if (column_schema.is_json) return .{ .json = (try self.jsonView(ordinal, row)).? };
+        const cells_view = try self.initCells(ordinal);
+        if (cells_view[row] != null) {
+            if (self.stats) |stats| stats.cell_cache_hits += 1;
+        } else try self.loadPage(ordinal, value.pages.?.containing(row));
+        const cell = cells_view[row] orelse return error.InvalidColumnSegment;
+        const source = try ProjectionPlan.sourceForCell(row_alloc, column_schema, cell, false);
+        if (source == .native) if (self.stats) |stats| {
+            source.native.materialized_count = &stats.values_materialized;
+        };
+        return source;
+    }
+
     pub fn evaluate(self: *@This(), filter: scan_plan.Filter, candidates: []const bool, out: []bool) !void {
         try self.checkWork();
         @memset(out, false);
@@ -3120,13 +3140,7 @@ pub fn scan(db: anytype, alloc: alloc_type, txn: *store_mod.DocStore.Txn, from: 
                         var object = ProjectionPlan.Sources.empty;
                         for (projection.base.ordinals) |ordinal| {
                             const name = block.table.relational_columns[ordinal].name;
-                            if (block.table.relational_columns[ordinal].is_json) {
-                                if (try block.jsonView(ordinal, i)) |json_view| {
-                                    try object.put(row_alloc, name, .{ .json = json_view });
-                                    continue;
-                                }
-                            }
-                            if (try block.logicalValue(ordinal, i)) |value| try object.put(row_alloc, name, .{ .logical = value });
+                            if (try block.projectionSource(ordinal, i, row_alloc)) |value| try object.put(row_alloc, name, value);
                         }
                         projected = try projection.projectSources(row_alloc, row_alloc, object);
                     } else {
