@@ -3051,6 +3051,16 @@ test "SQL CTE aliases feed hash joins and grouped projection without stringifyin
     try std.testing.expectEqual(@as(usize, 1), backend.statement_closes);
 }
 
+test "SQL recursive type conflicts fail before physical statement admission" {
+    var backend: TestBackend = .{ .row_count = 0 };
+    var compiled = try compiler.compile(std.testing.allocator, "WITH RECURSIVE r(n) AS (SELECT id::integer FROM things UNION ALL SELECT n+2147483648 FROM r WHERE false) SELECT n FROM r", .{});
+    defer compiled.deinit();
+    try std.testing.expectError(error.SqlRecursiveTypeMismatch, execute(std.testing.allocator, backend.coordinated(), &compiled, &.{}, .{}));
+    try std.testing.expectEqual(@as(usize, 0), backend.statement_opens);
+    try std.testing.expectEqual(@as(usize, 0), backend.pages);
+    try std.testing.expectEqual(@as(usize, 0), backend.writes);
+}
+
 test "SQL set and VALUES preserve PostgreSQL integer literal builtin widths" {
     const Case = struct { sql: []const u8, width: @import("array_value.zig").ElementType, rows: usize = 2 };
     for ([_]Case{

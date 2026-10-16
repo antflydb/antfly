@@ -9301,3 +9301,44 @@ The checked-in PostgreSQL oracle passes against owned PostgreSQL 18.6;
 `/private/tmp/antfly-sql-replay-prefix-oracle-test.log` records the final source.
 Ruff, formatting, license, Apache boundary and original-inventory checks pass.
 No throughput speedup or additional original-case closure is claimed.
+
+### Recursive seed-type admission and shared prepared coercion
+
+Recursive binding now selects the term's common builtin/array-element type and
+NUMERIC modifier against the already fixed nonrecursive descriptor. A change
+to that descriptor fails during metadata binding with SQLSTATE 42804 and a hint
+to cast the nonrecursive term to the intended final type. Recursive inference
+constraints retain that diagnostic context; unrelated parameter/value errors
+keep their existing classification.
+
+Legal narrower terms and unknown string literals use the existing owned
+prepared-projection cast pipeline. They are not repaired after rows arrive.
+Prepared projection casts also account for modifier differences, not only the
+coarse kind and builtin identity. Invalid unknown integer input is 22P02 at
+binding; an otherwise correctly typed int4 arithmetic overflow is still 22003
+only when that row is requested. A native physical-table regression verifies
+that a conflicting term fails with no statement capture, page read or mutation,
+even with an empty source and a false recursive predicate.
+
+The synthetic recursive graph fixture now explicitly declares int4 edge
+columns, matching its int4 seed and the PostgreSQL oracle's actual DDL. The old
+storage-default int8 declaration would require an explicitly int8 seed under
+PostgreSQL; accepting that widening was not a valid graph-performance contract.
+The source SQL and original inventory are not rewritten or reclassified.
+
+The checked-in replay oracle also verifies recursive type admission via EXPLAIN,
+legal implicit term casts, invalid input, runtime overflow and both graph join
+orientations. Broader recursive grammar and coercion qualification remain open;
+this checkpoint does not assert complete recursive SQL compatibility.
+
+Validation: `/private/tmp/antfly-sql-recursive-type-full-debug.log` passed the
+full Debug gate (851 core tests, 231 extracted SQL tests, three existing opt-in
+skips, zero failures/leaks). The final recursive-inference diagnostic refinement
+then passed 60 affected NUMERIC, set/VALUES, recursive and LATERAL tests in
+`/private/tmp/antfly-sql-recursive-type-final-debug.log`. The mounted native SQL
+read/mutation, original-join and array-expansion regressions passed three tests
+and 80/80 build steps in `/private/tmp/antfly-sql-recursive-type-public-debug.log`.
+The checked-in oracle passed both tests against owned PostgreSQL 18.6 in
+`/private/tmp/antfly-sql-recursive-type-oracle.log`. Formatting, Ruff, licensing,
+Apache boundary, control-catalog and original-inventory checks pass; original
+case counts remain 505 implemented / 132 rejected / 113 superseded / 836 unresolved.

@@ -352,7 +352,7 @@ const Builder = struct {
     assignment_expected: []const scalar.Type = &.{},
     const OuterScope = struct { id: usize, columns: []const Column, parent: ?*const OuterScope, cte_boundary: usize };
     const RecursiveFrame = struct { id: usize, query: *const ast.Select, columns: []const Column, parent: ?*const RecursiveFrame };
-    const Constraint = struct { expression: *const ast.Scalar, expected: ?ast.ColumnType = null, expected_type: ?scalar.Type = null };
+    const Constraint = struct { expression: *const ast.Scalar, expected: ?ast.ColumnType = null, expected_type: ?scalar.Type = null, type_mismatch: ?anyerror = null };
 
     const Prepared = struct { source: *const Node, lowered: ast.Select, expressions: []const *const ast.Scalar, types: []scalar.Type };
 
@@ -569,6 +569,16 @@ const Builder = struct {
         return subqueries.lowerWithPreparedScope(self.alloc, prepared, prepared_aliases);
     }
 
+    fn inferConstraint(self: *Builder, constraint: Constraint) !bool {
+        return (if (constraint.expected_type) |descriptor|
+            (self.backend.parameter_invocation orelse return error.UnsupportedSqlShape).infer(self.alloc, constraint.expression, self.shape_columns.items, self.parameters, descriptor, .{ .assignment = true })
+        else
+            scalar.inferParameters(self.alloc, constraint.expression, self.shape_columns.items, self.parameters, constraint.expected, .{ .invocation = self.backend.parameter_invocation })) catch |err| {
+            if (constraint.type_mismatch) |mismatch| if (err == error.SqlTypeMismatch or err == error.SqlCannotCoerce) return mismatch;
+            return err;
+        };
+    }
+
     fn inferShape(self: *Builder, statement: ast.Select, expected: []const ast.ColumnType) !void {
         // RETURNING/assignment inference enters directly, before describe's
         // ordinary SELECT normalization. Use the same relational boundary so
@@ -605,10 +615,7 @@ const Builder = struct {
             var changed = false;
             for (self.constraints.items, 0..) |constraint, index| {
                 if (index % 64 == 0) try self.backend.vtable.checkpoint(self.backend.ptr);
-                changed = if (constraint.expected_type) |descriptor|
-                    try (self.backend.parameter_invocation orelse return error.UnsupportedSqlShape).infer(self.alloc, constraint.expression, self.shape_columns.items, self.parameters, descriptor, .{ .assignment = true }) or changed
-                else
-                    try scalar.inferParameters(self.alloc, constraint.expression, self.shape_columns.items, self.parameters, constraint.expected, .{ .invocation = self.backend.parameter_invocation }) or changed;
+                changed = try self.inferConstraint(constraint) or changed;
             }
             if (!changed) return;
         }
@@ -1328,7 +1335,7 @@ const Builder = struct {
             const column_types = try self.scalarColumns(child.columns);
             for (projections, entry.expressions, entry.types) |*projection, expression_, kind| if (kind.kind) |known| {
                 const actual = try scalar.inferOutputWithInvocation(self.alloc, expression_, column_types, self.parameters, self.backend.parameter_invocation);
-                if (actual.kind != known or actual.element_type != kind.element_type)
+                if (actual.kind != known or actual.element_type != kind.element_type or !scalar.NumericModifier.eql(actual.numeric_modifier, kind.numeric_modifier))
                     projection.expression = try self.scalarNode(.{ .cast = .{ .operand = projection.expression orelse try self.scalarNode(.{ .column = projection.field }), .type = known, .element_type = kind.element_type, .numeric_modifier = kind.numeric_modifier } });
             };
             lowered.columns = projections;
@@ -1378,6 +1385,28 @@ const Builder = struct {
         return self.node(columns, source.operation);
     }
 
+    fn prepareRecursiveTerm(self: *Builder, query: *const ast.Select, columns: []const Column, scope: []const ast.Cte, depth: usize) !void {
+        // The nonrecursive term fixes the recursive attribute identities.
+        // Resolve the UNION's common types before binding/evaluating the term,
+        // then reuse ordinary prepared projection casts for implicit inputs.
+        var leaves: std.ArrayList(*const ast.Select) = .empty;
+        try self.collectSet(query, scope, &leaves, depth + 1);
+        const prepared = self.prepared.get(query) orelse return error.InvalidSqlBackendResponse;
+        if (prepared.expressions.len != columns.len) return error.SqlTypeMismatch;
+        const inputs = try self.scalarColumns(prepared.source.columns);
+        for (prepared.expressions, prepared.types, columns) |expression_, *target, column| {
+            const seed: scalar.Type = .{ .kind = column.type, .element_type = scalar.columnElementType(column.type, column.element_type), .numeric_modifier = column.numeric_modifier, .nullable = true };
+            var common = seed;
+            mergeInferredType(&common, try self.setType(expression_, inputs), false) catch |err| switch (err) {
+                error.SqlCannotCoerce, error.SqlTypeMismatch => return error.SqlRecursiveTypeMismatch,
+                else => return err,
+            };
+            if (common.kind != seed.kind or common.element_type != seed.element_type or !scalar.NumericModifier.eql(common.numeric_modifier, seed.numeric_modifier)) return error.SqlRecursiveTypeMismatch;
+            target.* = seed;
+            _ = try scalar.inferParameters(self.alloc, expression_, inputs, self.parameters, seed.kind, .{ .invocation = self.backend.parameter_invocation });
+        }
+    }
+
     fn recursiveCte(self: *Builder, cte: ast.Cte, alias: []const u8, scope: []const ast.Cte, depth: usize) anyerror!*const Node {
         var active = self.recursive_active;
         while (active) |frame| : (active = frame.parent) if (frame.query == cte.query) {
@@ -1401,6 +1430,7 @@ const Builder = struct {
         @memcpy(step_scope[0..scope.len], scope);
         step_scope[scope.len] = cte;
         @memcpy(step_scope[scope.len + 1 ..], cte.query.ctes);
+        if (!self.shape_only) try self.prepareRecursiveTerm(set.right, seed.columns, step_scope, depth + 1);
         const step = try self.derived(set.right, cte.name, cte.columns, step_scope, depth + 1);
         if (seed.columns.len != step.columns.len) return error.SqlTypeMismatch;
         const columns = try self.alloc.dupe(Column, seed.columns);
@@ -1409,7 +1439,7 @@ const Builder = struct {
             if (self.shape_only) {
                 const args = try self.alloc.dupe(*const ast.Scalar, &.{ column.origin.?, other.origin.? });
                 column.origin = try self.scalarNode(.{ .call = .{ .name = "coalesce", .args = args } });
-                try self.constraints.append(self.alloc, .{ .expression = column.origin.? });
+                try self.constraints.append(self.alloc, .{ .expression = column.origin.?, .type_mismatch = error.SqlRecursiveTypeMismatch });
             } else if (!other.untyped_null and column.type != other.type and !(column.type == .number and other.type == .integer)) return error.SqlTypeMismatch;
         }
         const result = try self.node(columns, if (self.shape_only) .singleton else .{ .recursive = .{ .id = id, .seed = seed, .step = step, .all = set.all } });

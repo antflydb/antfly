@@ -22,6 +22,90 @@ from generate_sql_postgres_reference import postgres
 
 
 class ReplayPrefixTest(unittest.TestCase):
+    def test_recursive_type_admission_and_implicit_term_coercion(self):
+        with postgres() as db:
+            for query, oid in [
+                (
+                    "WITH RECURSIVE r(n) AS (SELECT 1::bigint UNION ALL SELECT 2::integer FROM r WHERE n<2) SELECT n FROM r",
+                    20,
+                ),
+                (
+                    "WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT '2' FROM r WHERE n<2) SELECT n FROM r",
+                    23,
+                ),
+            ]:
+                with self.subTest(sql=query), db.transaction(force_rollback=True):
+                    db.execute("SET TRANSACTION READ ONLY")
+                    cursor = db.execute(query)
+                    self.assertEqual([(1,), (2,)], cursor.fetchmany(3))
+                    self.assertEqual(
+                        [("n", oid)],
+                        [(c.name, c.type_code) for c in cursor.description],
+                    )
+            for query, state in [
+                (
+                    "WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT n+2147483648 FROM r WHERE n<2) SELECT n FROM r",
+                    "42804",
+                ),
+                (
+                    "WITH RECURSIVE r(n) AS (SELECT 1::numeric(3,0) UNION ALL SELECT n+1 FROM r WHERE n<2) SELECT n FROM r",
+                    "42804",
+                ),
+                (
+                    "WITH RECURSIVE r(n) AS (SELECT ARRAY[1] UNION ALL SELECT ARRAY[2::bigint] FROM r WHERE n=ARRAY[1]) SELECT n FROM r",
+                    "42804",
+                ),
+                (
+                    "WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT 'bad' FROM r WHERE n<2) SELECT n FROM r",
+                    "22P02",
+                ),
+                (
+                    "WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT '2'::text FROM r WHERE n<2) SELECT n FROM r",
+                    "42804",
+                ),
+                (
+                    "WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT 'text' FROM r) SELECT n FROM r",
+                    "22P02",
+                ),
+            ]:
+                with self.subTest(sql=query):
+                    with (
+                        self.assertRaises(psycopg.Error) as failure,
+                        db.transaction(force_rollback=True),
+                    ):
+                        db.execute("SET TRANSACTION READ ONLY")
+                        # EXPLAIN proves these are planning/admission errors,
+                        # independent of LIMIT, predicate truth or stored rows.
+                        db.execute("EXPLAIN " + query).fetchmany(1)
+                    self.assertEqual(state, failure.exception.sqlstate)
+            cursor = db.execute(
+                "WITH RECURSIVE r(n) AS (SELECT 2147483647 UNION ALL SELECT n+1 FROM r) SELECT n FROM r LIMIT 1"
+            )
+            self.assertEqual([(2147483647,)], cursor.fetchmany(2))
+            self.assertEqual(23, cursor.description[0].type_code)
+            with self.assertRaises(psycopg.errors.NumericValueOutOfRange) as overflow:
+                db.execute(
+                    "WITH RECURSIVE r(n) AS (SELECT 2147483647 UNION ALL SELECT n+1 FROM r) SELECT n FROM r LIMIT 2"
+                ).fetchmany(3)
+            self.assertEqual("22003", overflow.exception.sqlstate)
+            db.execute("CREATE TEMP TABLE edges (src integer, dst integer)")
+            db.execute("INSERT INTO edges SELECT n,n+1 FROM generate_series(1,256) n")
+            for source in [
+                "r JOIN edges e ON r.n=e.src",
+                "edges e JOIN r ON r.n=e.src",
+            ]:
+                with self.subTest(source=source), db.transaction(force_rollback=True):
+                    db.execute("SET TRANSACTION READ ONLY")
+                    cursor = db.execute(
+                        "WITH RECURSIVE r(n) AS (SELECT 1 UNION SELECT e.dst FROM "
+                        + source
+                        + ") SELECT n FROM r ORDER BY n"
+                    )
+                    self.assertEqual(
+                        [(n,) for n in range(1, 258)], cursor.fetchmany(258)
+                    )
+                    self.assertEqual(23, cursor.description[0].type_code)
+
     def test_owned_materialized_and_recursive_prefix_contracts(self):
         with postgres() as db:
             db.execute("CREATE TEMP TABLE things (id bigint)")

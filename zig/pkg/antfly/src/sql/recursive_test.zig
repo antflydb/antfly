@@ -57,7 +57,9 @@ test "SQL recursive physical graph shares one capture and builds static edges on
         checks: usize = 0,
         cursors: [1]catalog.Cursor = undefined,
         fn resolve(_: *anyopaque, _: std.mem.Allocator, name: ast.Name, _: catalog.Action) !catalog.Table {
-            return .{ .id = 1, .physical_name = name.table, .schema_version = 1, .columns = &.{ .{ .name = "src", .path = "src", .type = .integer }, .{ .name = "dst", .path = "dst", .type = .integer } } };
+            // The recursive seed is SQL int4; these declared edge columns
+            // must have that same identity, not the storage-default int8.
+            return .{ .id = 1, .physical_name = name.table, .schema_version = 1, .columns = &.{ .{ .name = "src", .path = "src", .type = .integer, .element_type = .int32 }, .{ .name = "dst", .path = "dst", .type = .integer, .element_type = .int32 } } };
         }
         fn next(ptr: *anyopaque, alloc: std.mem.Allocator, limit: u32) !catalog.Page {
             const self: *@This() = @ptrCast(@alignCast(ptr));
@@ -181,6 +183,66 @@ test "SQL recursive prefix ownership survives paused steps scoped retirement and
     }
 }
 
+test "SQL recursive binding pins seed builtin identities and coerces unknown term literals" {
+    const compiler_a = std.testing.allocator;
+    for ([_]struct { sql: []const u8, error_kind: anyerror }{
+        .{ .sql = "WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT n+2147483648 FROM r WHERE n<2) SELECT n FROM r", .error_kind = error.SqlRecursiveTypeMismatch },
+        .{ .sql = "WITH RECURSIVE r(n) AS (SELECT 1::numeric(3,0) UNION ALL SELECT n+1 FROM r WHERE n<2) SELECT n FROM r", .error_kind = error.SqlRecursiveTypeMismatch },
+        .{ .sql = "WITH RECURSIVE r(n) AS (SELECT ARRAY[1] UNION ALL SELECT ARRAY[2::bigint] FROM r WHERE n=ARRAY[1]) SELECT n FROM r", .error_kind = error.SqlRecursiveTypeMismatch },
+        .{ .sql = "WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT 'bad' FROM r WHERE n<2) SELECT n FROM r", .error_kind = error.SqlInvalidTextRepresentation },
+        .{ .sql = "WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT '2'::text FROM r WHERE n<2) SELECT n FROM r", .error_kind = error.SqlRecursiveTypeMismatch },
+    }) |case| {
+        var fixture: Fixture = .{};
+        var compiled = try compiler.compile(compiler_a, case.sql, .{});
+        defer compiled.deinit();
+        var description = @import("antfly_local_sources").sql_describe.describe(compiler_a, fixture.backend(), &compiled, &.{}) catch |err| {
+            try std.testing.expectEqual(case.error_kind, err);
+            try std.testing.expectEqualStrings(if (err == error.SqlRecursiveTypeMismatch) "42804" else "22P02", @import("antfly_local_sources").sql_errors.describe(err).code);
+            try std.testing.expectEqual(@as(usize, 0), fixture.mutations);
+            continue;
+        };
+        description.deinit();
+        return error.TestExpectedError;
+    }
+    const Check = struct {
+        fn run(a: std.mem.Allocator, compiled: *const compiler.Compiled, width: @import("antfly_local_sources").sql_array_value.ElementType) !void {
+            var fixture: Fixture = .{};
+            var result = try runtime.execute(a, fixture.backend(), compiled, &.{}, .{});
+            defer result.deinit();
+            try std.testing.expectEqual(@as(usize, 2), result.output.rows.len);
+            try std.testing.expectEqual(@as(?@import("antfly_local_sources").sql_array_value.ElementType, width), result.output.columns[0].element_type);
+            try std.testing.expectEqualStrings("1", result.output.rows[0][0].string);
+            try std.testing.expectEqualStrings("2", result.output.rows[1][0].string);
+        }
+    };
+    for ([_]struct { sql: []const u8, width: @import("antfly_local_sources").sql_array_value.ElementType }{
+        .{ .sql = "WITH RECURSIVE r(n) AS (SELECT 1::bigint UNION ALL SELECT 2::integer FROM r WHERE n<2) SELECT n FROM r", .width = .int64 },
+        .{ .sql = "WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT '2' FROM r WHERE n<2) SELECT n FROM r", .width = .int32 },
+    }) |case| {
+        var compiled = try compiler.compile(compiler_a, case.sql, .{});
+        defer compiled.deinit();
+        @import("antfly_platform").allocator.checkAllAllocationFailures(compiler_a, Check.run, .{ &compiled, case.width }) catch |err| {
+            std.debug.print("recursive type case failed: {s}: {t}\n", .{ case.sql, err });
+            return err;
+        };
+    }
+}
+
+test "SQL recursive integer value overflow remains deferred after type admission" {
+    var fixture: Fixture = .{};
+    var first = try compiler.compile(std.testing.allocator, "WITH RECURSIVE r(n) AS (SELECT 2147483647 UNION ALL SELECT n+1 FROM r) SELECT n FROM r LIMIT 1", .{});
+    defer first.deinit();
+    var prefix = try runtime.execute(std.testing.allocator, fixture.backend(), &first, &.{}, .{});
+    defer prefix.deinit();
+    try std.testing.expectEqualStrings("2147483647", prefix.output.rows[0][0].string);
+    var next = try compiler.compile(std.testing.allocator, "WITH RECURSIVE r(n) AS (SELECT 2147483647 UNION ALL SELECT n+1 FROM r) SELECT n FROM r LIMIT 2", .{});
+    defer next.deinit();
+    var description = try @import("antfly_local_sources").sql_describe.describe(std.testing.allocator, fixture.backend(), &next, &.{});
+    defer description.deinit();
+    try std.testing.expectError(error.SqlNumericOutOfRange, runtime.execute(std.testing.allocator, fixture.backend(), &next, &.{}, .{}));
+    try std.testing.expectEqualStrings("22003", @import("antfly_local_sources").sql_errors.describe(error.SqlNumericOutOfRange).code);
+}
+
 test "SQL recursive worklists preserve delta UNION ALL and distinct cycle semantics" {
     const cases = [_]struct { sql: []const u8, expected: []const i64 }{
         .{ .sql = "WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM r WHERE n<5) SELECT n FROM r ORDER BY n", .expected = &.{ 1, 2, 3, 4, 5 } },
@@ -238,7 +300,7 @@ test "SQL recursive admission rejects nonlinear scopes and enforces type work me
     var fixture: Fixture = .{};
     var typed = try compiler.compile(std.testing.allocator, "WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT 'text' FROM r) SELECT n FROM r", .{});
     defer typed.deinit();
-    try std.testing.expectError(error.SqlTypeMismatch, runtime.execute(std.testing.allocator, fixture.backend(), &typed, &.{}, .{}));
+    try std.testing.expectError(error.SqlInvalidTextRepresentation, runtime.execute(std.testing.allocator, fixture.backend(), &typed, &.{}, .{}));
     var endless = try compiler.compile(std.testing.allocator, "WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT n FROM r) SELECT n FROM r", .{});
     defer endless.deinit();
     try std.testing.expectError(error.SqlProgramLimitExceeded, runtime.execute(std.testing.allocator, fixture.backend(), &endless, &.{}, .{ .scan_rows = 16 }));
