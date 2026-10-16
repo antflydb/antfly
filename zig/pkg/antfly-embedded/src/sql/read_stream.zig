@@ -496,6 +496,8 @@ const ParallelScan = struct {
     lane: usize = 0,
     workers: [8]Worker = undefined,
     worker_count: usize = 0,
+    batch_mode: bool = false,
+    serial: bool = false,
     ready: std.Io.Event = .unset,
     const Worker = struct {
         pipeline: *ParallelScan,
@@ -546,23 +548,27 @@ const ParallelScan = struct {
     };
     fn start(source: *Stream) !?*ParallelScan {
         const cursor = source.cursor orelse return null;
-        const split = cursor.split_ordered orelse return null;
+        const batch_mode = cursor.split_ordered_batch != null;
+        const split = cursor.split_ordered_batch orelse cursor.split_ordered orelse return null;
         const io = source.context.backend.execution_io orelse return null;
         if (source.context.limits.retained_bytes < 16 * 1024 * 1024 or source.remaining < 8192) return null;
         if ((cursor.estimated_rows orelse 0) < 8192 and (cursor.estimated_bytes orelse 0) < 2 * 1024 * 1024) return null;
         const a = source.budget.allocator();
         const maximum = if (cursor.ordered_split_bytes == 0) 16 else @min(16, (source.budget.limit -| source.budget.live) / 4 / cursor.ordered_split_bytes);
         if (maximum < 2) return null;
-        const children = (try split(cursor.ptr, a, maximum)) orelse return null;
+        const children = (try split(cursor.ptr, a, maximum)) orelse {
+            if (batch_mode) source.exhausted = true;
+            return null;
+        };
         defer a.free(children);
-        if (children.len < 2) {
+        if (children.len == 0 or (!batch_mode and children.len < 2)) {
             for (children) |child| child.close(child.ptr);
             return null;
         }
         const scheduler = @import("parallel_scheduler.zig").global();
         const workspace_budget = scheduler.workspaceBudget(source.context.limits.retained_bytes / 2);
-        const fanout = scheduler.fanout(children.len, workspace_budget, 4 * 1024 * 1024);
-        if (fanout < 2) {
+        const fanout = @max(1, scheduler.fanout(children.len, workspace_budget, 4 * 1024 * 1024));
+        if (!batch_mode and fanout < 2) {
             for (children) |child| child.close(child.ptr);
             return null;
         }
@@ -570,7 +576,7 @@ const ParallelScan = struct {
         var moved: usize = 0;
         errdefer for (children[moved..]) |child| child.close(child.ptr);
         const self = try a.create(ParallelScan);
-        self.* = .{ .a = a, .io = io, .lanes = &.{} };
+        self.* = .{ .a = a, .io = io, .lanes = &.{}, .batch_mode = batch_mode };
         errdefer self.close();
         const lanes = try a.alloc(Lane, children.len);
         self.storage = lanes;
@@ -613,8 +619,18 @@ const ParallelScan = struct {
         for (self.workers[0..self.worker_count]) |*worker| {
             worker.task = @import("parallel_scheduler.zig").global().submit(io, workspace, Worker.run, .{worker});
             if (worker.task == null) {
-                self.close();
-                return null;
+                if (!batch_mode) {
+                    self.close();
+                    return null;
+                }
+                // The rolling provider already advanced to this file. Keep its
+                // required ranges on the caller when shared admission is full.
+                for (self.workers[0..self.worker_count]) |*started| if (started.task) |*task| {
+                    task.cancel(io) catch {};
+                    started.task = null;
+                };
+                self.serial = true;
+                break;
             }
         }
         self.ready.set(io);
@@ -653,7 +669,15 @@ const ParallelScan = struct {
             const lane = &self.lanes[self.lane];
             if (lane.current == null) {
                 var item: [1]*PendingColumns = undefined;
-                _ = lane.queue.get(self.io, &item, 1) catch |err| switch (err) {
+                if (self.serial) {
+                    if (lane.stream.exhausted) {
+                        self.lane += 1;
+                        continue;
+                    }
+                    const before = lane.stream.visited;
+                    item[0] = try lane.stream.executeColumns(lane.stream.context.limits.executionRows());
+                    item[0].scan_rows = lane.stream.visited - before;
+                } else _ = lane.queue.get(self.io, &item, 1) catch |err| switch (err) {
                     error.Closed => {
                         if (lane.failure) |failure| return failure;
                         self.lane += 1;
@@ -1115,21 +1139,30 @@ pub const Stream = struct {
         self.empty_scan_pages += 1;
         self.pages += 1;
     }
-    fn executeColumns(self: *Stream, max_rows: u32) !*PendingColumns {
-        if (!self.parallel_checked) {
-            self.parallel_checked = true;
-            self.parallel = try ParallelScan.start(self);
-        }
-        if (self.parallel) |pipeline| {
-            const pending = try pipeline.pull(self, max_rows);
-            if (pending.exhausted) {
-                pipeline.close();
-                self.parallel = null;
-                self.exhausted = true;
-                if (self.cursor) |cursor| cursor.close(cursor.ptr);
-                self.cursor = null;
+    fn executeColumns(self: *Stream, max_rows: u32) anyerror!*PendingColumns {
+        while (true) {
+            if (!self.parallel_checked) {
+                self.parallel_checked = true;
+                self.parallel = try ParallelScan.start(self);
             }
-            return pending;
+            if (self.parallel) |pipeline| {
+                const pending = try pipeline.pull(self, max_rows);
+                if (pending.exhausted) {
+                    const next_batch = pipeline.batch_mode and self.remaining != 0;
+                    pipeline.close();
+                    self.parallel = null;
+                    if (next_batch) {
+                        pending.deinit();
+                        self.parallel_checked = false;
+                        continue;
+                    }
+                    self.exhausted = true;
+                    if (self.cursor) |cursor| cursor.close(cursor.ptr);
+                    self.cursor = null;
+                }
+                return pending;
+            }
+            break;
         }
         const pending = try PendingColumns.create(self.projected_alloc orelse self.budget.allocator());
         errdefer pending.deinit();
@@ -1830,6 +1863,71 @@ const OrderedColumns = struct {
         return cursors;
     }
 };
+test "external lake rolling ordered delivery preserves batches errors and saturated admission" {
+    const Rolling = struct {
+        children: [4]Fixture = .{ .{ .count = 5000 }, .{ .offset = 5000, .count = 10000 }, .{ .offset = 10000, .count = 15000 }, .{ .offset = 15000, .count = 20000 } },
+        batch: usize = 0,
+        closed: usize = 0,
+        fn open(raw: *anyopaque, _: std.mem.Allocator, _: catalog.Table, _: catalog.Scan) !?catalog.Cursor {
+            return .{ .ptr = raw, .next = Fixture.next, .next_columns = OrderedColumns.unreachableColumns, .close = close, .split_ordered_batch = split, .estimated_rows = 20000, .estimated_bytes = 20 * 1024 * 1024 };
+        }
+        fn close(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.closed += 1;
+        }
+        fn split(raw: *anyopaque, a: std.mem.Allocator, _: usize) !?[]catalog.Cursor {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.batch == 2) return null;
+            const cursors = try a.alloc(catalog.Cursor, 2);
+            for (self.children[self.batch * 2 ..][0..2], cursors) |*child, *cursor| cursor.* = (try NativeColumns.open(child, a, undefined, .{ .fields = &.{}, .limit = 4096 })).?;
+            self.batch += 1;
+            return cursors;
+        }
+    };
+    const a = std.testing.allocator;
+    for ([_]bool{ false, true }) |saturated| for ([_]bool{ false, true }) |fail_later| {
+        const scheduling = @import("parallel_scheduler.zig").global();
+        const saved = scheduling.max_workers;
+        if (saturated) scheduling.max_workers = 0;
+        defer scheduling.max_workers = saved;
+        var fixture: Rolling = .{};
+        var backend = Fixture.backend(undefined);
+        var vtable = backend.vtable.*;
+        vtable.open_scan = Rolling.open;
+        vtable.checkpoint = struct {
+            fn check(_: *anyopaque) !void {}
+        }.check;
+        backend.ptr = &fixture;
+        backend.vtable = &vtable;
+        backend.execution_io = std.testing.io;
+        var compiled = try compiler.compile(a, if (fail_later) "SELECT 1 / (15000 - n) FROM docs" else "SELECT n + 1 FROM docs", .{});
+        defer compiled.deinit();
+        const stream = (try Stream.open(a, backend, &compiled, &.{}, .{})).?;
+        defer stream.close();
+        var seen: usize = 0;
+        var failed = false;
+        while (true) {
+            var page = stream.next(137) catch |err| {
+                try std.testing.expect(fail_later);
+                try std.testing.expectEqual(error.SqlDivisionByZero, err);
+                failed = true;
+                break;
+            };
+            defer page.deinit();
+            for (page.output.rows) |row| {
+                if (!fail_later) try std.testing.expectEqual(@as(i64, @intCast(seen + 1)), row[0].integer);
+                seen += 1;
+            }
+            if (page.exhausted) break;
+        }
+        try std.testing.expectEqual(fail_later, failed);
+        try std.testing.expectEqual(@as(usize, if (fail_later) 15000 else 20000), seen);
+        try std.testing.expectEqual(@as(usize, 2), fixture.batch);
+        try std.testing.expectEqual(@as(usize, 1), fixture.closed);
+        for (fixture.children) |child| try std.testing.expectEqual(@as(usize, 1), child.closed);
+    };
+}
+
 test "SQL ordered parallel scan evaluates complete pipelines with bounded delivery" {
     const a = std.testing.allocator;
     for ([_][]const u8{ "SELECT n + 1 FROM docs WHERE n % 2 = 0", "SELECT n + 1 FROM docs", "SELECT 1 / (9999 - n) FROM docs" }) |sql| {

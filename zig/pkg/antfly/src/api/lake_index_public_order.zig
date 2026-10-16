@@ -29,7 +29,18 @@ pub const Cursor = struct {
     file_arena: std.heap.ArenaAllocator,
     directory: ?tree.Cursor = null,
     public_files: ?tree.Cursor = null,
+    participants: ?*Participants = null,
+    participant_sorts: usize = 0,
+    participant_spill_files_peak: usize = 0,
+    participant_spill_limit: u64 = 1024 * 1024 * 1024,
     public_digest: [32]u8 = undefined,
+    group_participants: u64 = 0,
+    promotion_probe_limit: u64 = 0,
+    probe_byte_floor: u64 = 0,
+    probe_start: usize = 0,
+    last_probed: ?[32]u8 = null,
+    participant_after: ?[32]u8 = null,
+    promotion_disabled: bool = false,
     requested_rows: usize = 1,
     /// Diagnostic counts exact membership probes, independent of cache warmth.
     public_probes: usize = 0,
@@ -115,6 +126,7 @@ pub const Cursor = struct {
         return result;
     }
     pub fn deinit(self: *Cursor) void {
+        self.clearParticipants();
         if (self.rows) |*rows| rows.deinit();
         if (self.public_files) |*files| files.deinit();
         self.group_arena.deinit();
@@ -129,6 +141,12 @@ pub const Cursor = struct {
     }
     fn loadGroup(self: *Cursor) !bool {
         if (self.exhausted) return false;
+        self.clearParticipants();
+        self.group_participants = 0;
+        self.probe_start = self.public_probes;
+        self.last_probed = null;
+        self.participant_after = null;
+        self.promotion_disabled = false;
         _ = self.group_arena.reset(.retain_capacity);
         self.group_digests = .empty;
         const ca = self.group_arena.allocator();
@@ -144,14 +162,16 @@ pub const Cursor = struct {
             try cached.context.ensureActive();
             try self.reader.pages.cancellation.check();
             var hash = std.crypto.hash.Blake3.init(.{});
-            hash.update("antfly.native-public-tie-files.v1");
+            hash.update("antfly.native-public-tie-files.v2");
             hash.update(&cached.scope);
             hash.update(&self.reader.root.domain);
             hash.update(&self.reader.root.fingerprint);
             const root = self.reader.root.ties orelse return error.InvalidNativeLakeRowIndex;
             // JSON includes the complete immutable tree identity, independent of
             // pointer addresses. Length framing keeps each identity component exact.
-            const identity = try std.json.Stringify.valueAlloc(ca, root, .{});
+            // Cached slots are index-local. Equal tuple trees can have different
+            // file mappings after independent index histories.
+            const identity = try std.json.Stringify.valueAlloc(ca, .{ root, self.reader.root.file_dictionary, self.reader.root.files }, .{});
             for ([_][]const u8{ identity, self.reader.root.source, self.reader.root.snapshot, self.group }) |part| {
                 var length: [8]u8 = undefined;
                 std.mem.writeInt(u64, &length, part.len, .little);
@@ -213,6 +233,36 @@ pub const Cursor = struct {
                 self.group_counts += 1;
                 const total: u64 = if (dictionary.public_names) dictionary.public_count else dictionary.count;
                 const desired_files = @max(1, self.requested_rows / @max(1, first_rows));
+                // A global walk is attractive for dense groups/small pages.
+                // Sparse wide groups sort only their participants under a spill
+                // quota instead of probing unrelated archive files.
+                const global_cost = @min(total, total / @max(1, participating) *| @min(desired_files, participating));
+                const participant_cost = participating *| 4;
+                // Reserve most metadata admission for participant preparation
+                // and returned rows. Count a conservative whole routing path
+                // for both public navigation and exact membership/name seeks.
+                const ties_root = self.reader.root.ties.?;
+                const public_root = dictionary.public.?;
+                const probe_bytes = (@as(u64, ties_root.height) + 1) * @max(ties_root.bytes, tree.target_page_bytes * 2) +
+                    (@as(u64, public_root.height) + 1) * @max(public_root.bytes, tree.target_page_bytes * 2) +
+                    (if (dictionary.public_names) (@as(u64, dictionary.names.?.height) + 1) * @max(dictionary.names.?.bytes, tree.target_page_bytes * 2) else 0);
+                const byte_probes = @max(1, self.reader.remaining_reads / 4 / probe_bytes);
+                self.promotion_probe_limit = @min(participant_cost, byte_probes);
+                self.probe_byte_floor = self.reader.remaining_reads - self.reader.remaining_reads / 4;
+                if (participating > 4096 and (global_cost >= participant_cost or global_cost > byte_probes)) {
+                    if (self.reader.cached) |cached| if (cached.context.io) |io| {
+                        const sorted = self.sortParticipants(following, seed, io) catch |err| switch (err) {
+                            error.OutOfMemory, error.SqlMemoryLimitExceeded, error.SqlProgramLimitExceeded, error.NoSpaceLeft => false,
+                            else => return err,
+                        };
+                        if (sorted) return true;
+                        // Optional spill admission must not reject a query the
+                        // lazy directory path can serve. Its group reseek below
+                        // also discards any partially consumed participant walk.
+                        self.pending = null;
+                        self.promotion_disabled = true;
+                    };
+                }
                 if (participating > 4096 or (participating > 64 and participating *| participating >= total *| desired_files)) {
                     self.directory.?.deinit();
                     self.directory = null;
@@ -226,6 +276,7 @@ pub const Cursor = struct {
                     const boundary = self.boundary != null and std.mem.eql(u8, self.group, self.boundary.?);
                     const lower = if (boundary and !self.reverse_ids) &self.boundary_digest.? else "";
                     const upper = if (boundary and self.reverse_ids) try std.mem.concat(ca, u8, &.{ &self.boundary_digest.?, &.{0} }) else null;
+                    self.group_participants = participating;
                     self.public_files = if (self.reverse_ids)
                         try tree.Cursor.initReverse(self.a, self.reader.dictionaryStore(), dictionary.public, lower, upper)
                     else
@@ -268,6 +319,106 @@ pub const Cursor = struct {
             lease.release();
         };
         self.seekBoundary();
+        return true;
+    }
+    fn shouldPromote(self: *Cursor) bool {
+        return self.public_files != null and !self.promotion_disabled and self.group_participants > 4096 and
+            (self.public_probes - self.probe_start >= self.promotion_probe_limit or self.reader.remaining_reads <= self.probe_byte_floor) and
+            self.reader.cached != null and self.reader.cached.?.context.io != null;
+    }
+    /// Start small pages lazily. If continued traversal spends more probes than
+    /// participant preparation, spill only the unvisited suffix. No completed
+    /// file is revisited and a half-consumed file finishes before switching.
+    fn promoteParticipants(self: *Cursor) !bool {
+        const saved = self.directory;
+        const pending = self.pending;
+        const end = try orderedSuccessor(self.group_arena.allocator(), self.group);
+        self.directory = try tree.Cursor.init(self.a, self.navigation.?.cache.store(), self.reader.root.ties, self.group, end);
+        defer {
+            self.directory.?.deinit();
+            self.directory = saved;
+            self.pending = pending;
+        }
+        self.participant_after = self.last_probed;
+        const first = (try self.directory.?.next()) orelse return error.InvalidNativeLakeRowIndex;
+        const sorted = self.sortParticipants(first, .empty, self.reader.cached.?.context.io.?) catch |err| switch (err) {
+            error.OutOfMemory, error.SqlMemoryLimitExceeded, error.SqlProgramLimitExceeded, error.NoSpaceLeft => false,
+            else => return err,
+        };
+        if (!sorted) {
+            self.promotion_disabled = true;
+            self.participant_after = null;
+            return false;
+        }
+        self.public_files.?.deinit();
+        self.public_files = null;
+        return true;
+    }
+    const Participants = struct {
+        manager: local.sql_spill.Manager,
+        sort: local.sql_spill.Sort = undefined,
+        orders: [1]local.sql_operators.Order,
+        scratch: std.heap.ArenaAllocator,
+    };
+    fn clearParticipants(self: *Cursor) void {
+        if (self.participants) |owner| {
+            owner.sort.deinit();
+            owner.manager.deinit();
+            owner.scratch.deinit();
+            self.a.destroy(owner);
+            self.participants = null;
+        }
+    }
+    fn participantCheck(raw: *anyopaque) !void {
+        const reader: *ordered.Reader = @ptrCast(@alignCast(raw));
+        try reader.pages.cancellation.check();
+        if (reader.cached) |cached| try cached.context.ensureActive();
+    }
+    fn addParticipant(self: *Cursor, slot: u32) !void {
+        const owner = self.participants.?;
+        try participantCheck(self.reader);
+        _ = owner.scratch.reset(.retain_capacity);
+        const scratch = owner.scratch.allocator();
+        const digest = try self.reader.publicDigest(scratch, slot);
+        if (self.boundary) |boundary| if (std.mem.eql(u8, self.group, boundary)) {
+            if (std.mem.order(u8, &digest, &self.boundary_digest.?) == (if (self.reverse_ids) std.math.Order.gt else .lt)) return;
+        };
+        if (self.participant_after) |after| {
+            if (std.mem.order(u8, &digest, &after) != (if (self.reverse_ids) std.math.Order.lt else .gt)) return;
+        }
+        var key: [36]u8 = undefined;
+        key[0..32].* = digest;
+        key[32..36].* = ordered.file_dictionary.slotKey(slot);
+        // Native memcomparable spill runs keep arbitrary digest bytes intact.
+        // Complementing the key supplies descending order without JSON encoding.
+        if (self.reverse_ids) for (&key) |*byte| {
+            byte.* = ~byte.*;
+        };
+        try owner.sort.add(.{ .keys = &.{local.sql_scalar.Datum.fromJson(.{ .string = &key })}, .values = &.{}, .ordinal = slot });
+    }
+    fn sortParticipants(self: *Cursor, following: ?tree.Cursor.Record, seed: std.ArrayList(u32), io: std.Io) !bool {
+        const owner = try self.a.create(Participants);
+        owner.* = .{ .manager = .{ .alloc = self.a, .io = io, .context = self.reader, .checkpoint = participantCheck, .max_bytes = self.participant_spill_limit }, .orders = .{.{}}, .scratch = .init(self.a) };
+        owner.sort = local.sql_spill.Sort.init(self.a, &owner.manager, &owner.orders, 128 * 1024);
+        owner.sort.shared_runs = true;
+        owner.sort.encoded_bytes = true;
+        self.participants = owner;
+        errdefer self.clearParticipants();
+        for (seed.items) |slot| try self.addParticipant(slot);
+        var next_record = following;
+        while (next_record) |record| {
+            if (record.key.len != self.group.len + 4 or !std.mem.eql(u8, record.key[0..self.group.len], self.group)) {
+                self.pending = record;
+                break;
+            }
+            if (record.value.len != 8 or std.mem.readInt(u64, record.value[0..8], .big) == 0) return error.InvalidNativeLakeRowIndex;
+            try self.addParticipant(std.mem.readInt(u32, record.key[record.key.len - 4 ..][0..4], .big));
+            next_record = try self.directory.?.next();
+        }
+        self.participant_sorts += 1;
+        self.participant_spill_files_peak = @max(self.participant_spill_files_peak, owner.manager.admissionStats().peak_files);
+        self.files = &.{};
+        self.file_position = 0;
         return true;
     }
     const GroupFiles = struct { files: []const u32 };
@@ -335,7 +486,7 @@ pub const Cursor = struct {
         var lower: []const u8 = try std.mem.concat(ca, u8, &.{ self.group, &file });
         var upper = try orderedSuccessor(ca, lower);
         if (self.boundary) |boundary| if (std.mem.eql(u8, self.group, boundary)) {
-            const digest = if (self.public_files != null) self.public_digest else self.group_digests.get(slot).?;
+            const digest = if (self.public_files != null or self.participants != null) self.public_digest else self.group_digests.get(slot).?;
             const relation = std.mem.order(u8, &digest, &self.boundary_digest.?);
             if (relation == (if (self.reverse_ids) std.math.Order.gt else .lt)) return false;
             if (relation == .eq) {
@@ -363,9 +514,35 @@ pub const Cursor = struct {
                 rows.deinit();
                 self.rows = null;
             }
+            if (self.participants) |owner| {
+                _ = owner.scratch.reset(.retain_capacity);
+                if (try owner.sort.next(owner.scratch.allocator())) |item| {
+                    const bytes = item.keys[0].value.string;
+                    if (bytes.len != 36) return error.InvalidNativeLakeRowIndex;
+                    var key = bytes[0..36].*;
+                    if (self.reverse_ids) for (&key) |*byte| {
+                        byte.* = ~byte.*;
+                    };
+                    self.public_digest = key[0..32].*;
+                    _ = try self.openFile(std.mem.readInt(u32, key[32..36], .big));
+                    continue;
+                }
+            }
+            if (self.shouldPromote()) {
+                const promoted = self.promoteParticipants() catch |err| switch (err) {
+                    error.OutOfMemory, error.SqlMemoryLimitExceeded, error.SqlProgramLimitExceeded, error.NoSpaceLeft => fallback: {
+                        self.promotion_disabled = true;
+                        self.participant_after = null;
+                        break :fallback false;
+                    },
+                    else => return err,
+                };
+                if (promoted) continue;
+            }
             if (self.public_files) |*files| {
                 var found = false;
-                while (try files.next()) |record| {
+                while (!self.shouldPromote()) {
+                    const record = (try files.next()) orelse break;
                     try self.reader.pages.cancellation.check();
                     if (self.reader.cached) |cached| try cached.context.ensureActive();
                     _ = self.file_arena.reset(.retain_capacity);
@@ -376,6 +553,7 @@ pub const Cursor = struct {
                     var membership = try tree.Cursor.init(self.a, self.navigation.?.cache.store(), self.reader.root.ties, key, null);
                     defer membership.deinit();
                     self.public_probes += 1;
+                    self.last_probed = record.key[0..32].*;
                     const entry = (try membership.next()) orelse continue;
                     if (!std.mem.eql(u8, entry.key, key)) continue;
                     if (entry.value.len != 8 or std.mem.readInt(u64, entry.value[0..8], .big) == 0) return error.InvalidNativeLakeRowIndex;
@@ -385,7 +563,7 @@ pub const Cursor = struct {
                         break;
                     }
                 }
-                if (found) continue;
+                if (found or self.shouldPromote()) continue;
                 files.deinit();
                 self.public_files = null;
             }

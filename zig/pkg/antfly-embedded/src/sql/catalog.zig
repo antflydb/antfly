@@ -435,8 +435,15 @@ pub const Cursor = struct {
     /// reducers. Providers may distribute row groups dynamically; child order
     /// is not source order. Children share the snapshot and close before their parent.
     split_scan: ?*const fn (*anyopaque, std.mem.Allocator, usize) anyerror!?[]Cursor = null,
+    /// Release dynamically claimed work when a reducer completes or stops
+    /// early. This does not close the cursor; its owner still calls close().
+    finish_partition: ?*const fn (*anyopaque) void = null,
     /// Ordered, disjoint ranges whose concatenation preserves source order.
     split_ordered: ?*const fn (*anyopaque, std.mem.Allocator, usize) anyerror!?[]Cursor = null,
+    /// Rolling ordered ranges. Consume and close every child before asking for
+    /// the next bounded batch; null is end of source. Later file/footer errors
+    /// are reported only when the caller reaches that batch.
+    split_ordered_batch: ?*const fn (*anyopaque, std.mem.Allocator, usize) anyerror!?[]Cursor = null,
     /// Provider estimate of retained metadata per ordered child. Planning
     /// limits fan-out before cloning a large immutable inventory.
     ordered_split_bytes: usize = 0,

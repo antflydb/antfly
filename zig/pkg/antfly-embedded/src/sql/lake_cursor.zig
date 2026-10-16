@@ -189,6 +189,7 @@ fn openPinnedMaterialized(alloc: Allocator, table: catalog.Table, request: catal
     // Transfer the arena only after its final allocation. Growing it through
     // the local allocator after copying would leave new buffers unowned.
     owner.* = .{ .alloc = alloc, .arena = arena, .stream = stream, .table = table, .context = context, .conditions = conditions, .after = after, .before = before, .primary_key = primary_key, .mask_arena = .init(alloc) };
+    owner.stream.examined = &owner.examined;
     owner.stream.filter_columns = filter_columns.items;
     if (stream.selection != null or source.scanner.iceberg_delete_plan != null or conditions.len != 0 or after != null or before != null or primary_key != null)
         owner.stream.filter = .{ .ptr = owner, .any_match = Owner.anyMatch };
@@ -201,7 +202,7 @@ fn openPinnedMaterialized(alloc: Allocator, table: catalog.Table, request: catal
         estimated_rows +|= file.row_count;
         estimated_bytes +|= file.byte_len;
     }
-    return .{ .estimated_rows = if (source.inventory.format == .iceberg) estimated_rows else null, .estimated_bytes = estimated_bytes, .ptr = owner, .next = Owner.next, .next_columns = Owner.nextColumns, .count_rows = Owner.countRows, .set_dynamic_filter = Owner.setDynamicFilter, .split_scan = Owner.splitScan, .split_ordered = Owner.splitOrdered, .close = Owner.close };
+    return .{ .estimated_rows = if (source.inventory.format == .iceberg) estimated_rows else null, .estimated_bytes = estimated_bytes, .ptr = owner, .next = Owner.next, .next_columns = Owner.nextColumns, .count_rows = Owner.countRows, .set_dynamic_filter = Owner.setDynamicFilter, .split_scan = Owner.splitScan, .split_ordered = Owner.splitOrdered, .split_ordered_batch = if (stream.iterator != null and stream.selection == null and source.scanner.shared_reader != null) Owner.splitOrderedBatch else null, .close = Owner.close };
 }
 
 fn appendColumn(alloc: Allocator, columns: *std.ArrayList([]const u8), table: catalog.Table, name: []const u8) !void {
@@ -264,6 +265,8 @@ pub fn matches(row: catalog.Row, conditions: []const catalog.Condition) !bool {
 }
 
 const Owner = struct {
+    rolling_queue: ?*RollingQueue = null,
+    examined: std.atomic.Value(u64) = .init(0),
     dynamic: ?*const @import("dynamic_filter.zig").Filter = null,
     started: bool = false,
     alloc: Allocator,
@@ -487,6 +490,41 @@ const Owner = struct {
         _ = self;
         return .{ .rows = output, .owned_arena = arena, .after = page.after };
     }
+    /// Produce one file's ordered row-group ranges at a time. The consumer
+    /// joins/closes this batch before we release its footer and reach the next
+    /// descriptor, preserving source order and deferred errors.
+    fn splitOrderedBatch(raw: *anyopaque, a: Allocator, maximum: usize) !?[]catalog.Cursor {
+        const self: *Owner = @ptrCast(@alignCast(raw));
+        if (self.stream.selection != null or self.stream.iterator == null or self.stream.source.scanner.shared_reader == null or maximum < 2) return null;
+        if (self.dynamic) |filter| if (filter.rows == 0) return null;
+        while (try self.stream.nextEnumerationWork()) {
+            const iterator = self.stream.iterator;
+            self.stream.iterator = null;
+            defer self.stream.iterator = iterator;
+            const count = try self.stream.partitionCount(maximum);
+            if (self.stream.work == null or self.stream.work.?.units.len == 0) continue;
+            const work = self.stream.work.?;
+            std.mem.sort(@import("../serverless/query/lake_stream.zig").ScanWork.Unit, work.units, {}, struct {
+                fn less(_: void, l: @import("../serverless/query/lake_stream.zig").ScanWork.Unit, r: @import("../serverless/query/lake_stream.zig").ScanWork.Unit) bool {
+                    return l.ordinal < r.ordinal;
+                }
+            }.less);
+            const children = try self.splitChildren(a, @max(1, count), false);
+            errdefer {
+                for (children) |child| child.close(child.ptr);
+                a.free(children);
+            }
+            for (children, 0..) |child, index| {
+                if (self.dynamic) |filter| if (!try child.set_dynamic_filter.?(child.ptr, filter)) return error.InvalidSqlBackendResponse;
+                const owner: *Owner = @ptrCast(@alignCast(child.ptr));
+                owner.stream.ordered_next = index * work.units.len / children.len;
+                owner.stream.ordered_end = (index + 1) * work.units.len / children.len;
+            }
+            self.stream.file_index = self.stream.files.len;
+            return children;
+        }
+        return null;
+    }
     fn splitOrdered(raw: *anyopaque, a: Allocator, maximum: usize) !?[]catalog.Cursor {
         const self: *Owner = @ptrCast(@alignCast(raw));
         if (self.started or self.dynamic != null or self.stream.partition_count != 1 or maximum < 2 or self.stream.source.scanner.shared_reader == null) return null;
@@ -523,7 +561,7 @@ const Owner = struct {
         const self: *Owner = @ptrCast(@alignCast(raw));
         if (self.stream.selection != null) return null;
         if (self.started or self.dynamic != null or self.stream.partition_count != 1) return null;
-        if (self.stream.iterator != null and !try self.stream.freezeSmallEnumeration(maximum)) return self.splitEnumerated(a, maximum);
+        if (self.stream.iterator != null and !try self.stream.freezeSmallEnumeration(maximum)) return self.splitRolling(a, maximum);
         const count = try self.stream.partitionCount(maximum);
         if (count < 2) return null;
         return try self.splitChildren(a, count, false);
@@ -572,6 +610,173 @@ const Owner = struct {
         a.free(source.inventory.files);
         a.free(source.pinned_files);
     }
+    fn splitUnorderedBatch(raw: *anyopaque, a: Allocator, maximum: usize) !?[]catalog.Cursor {
+        const self: *Owner = @ptrCast(@alignCast(raw));
+        while (try self.stream.nextEnumerationWindow(4)) {
+            const iterator = self.stream.iterator;
+            self.stream.iterator = null;
+            defer self.stream.iterator = iterator;
+            const count = try self.stream.partitionCount(maximum);
+            if (self.stream.work == null or self.stream.work.?.units.len == 0) continue;
+            // The shared atomic work list is weighted by compressed bytes.
+            // Each lane claims individual row groups, including across files.
+            return try self.splitChildren(a, @max(1, count), false);
+        }
+        return null;
+    }
+    const RollingQueue = struct {
+        parent: *Owner,
+        producer: ?catalog.Cursor = null,
+        context: @import("../serverless/query/lake_read_context.zig").Context,
+        io: ?std.Io,
+        alloc: Allocator,
+        locked: @import("parallel_scheduler.zig").LockedAllocator,
+        maximum: usize,
+        mutex: std.atomic.Mutex = .unlocked,
+        children: []catalog.Cursor = &.{},
+        next: usize = 0,
+        active: usize = 0,
+        users: std.atomic.Value(usize) = .init(0),
+        ended: bool = false,
+        fn lock(self: *@This()) !void {
+            while (!self.mutex.tryLock()) try self.yield();
+        }
+        fn yield(self: *@This()) !void {
+            // Waiting lanes cannot borrow the producer's mutable file view:
+            // advancing a window destroys/replaces that view's reader.
+            try self.context.ensureActive();
+            if (self.io) |io| try io.sleep(.zero, .awake) else std.atomic.spinLoopHint();
+        }
+        fn release(self: *@This(), cursor: catalog.Cursor) void {
+            cursor.close(cursor.ptr);
+            @import("antfly_platform").sync.lockYielding(&self.mutex);
+            self.active -= 1;
+            self.mutex.unlock();
+        }
+        fn claim(self: *@This()) !?catalog.Cursor {
+            while (true) {
+                try self.lock();
+                if (self.next < self.children.len) {
+                    const child = self.children[self.next];
+                    self.next += 1;
+                    self.active += 1;
+                    self.mutex.unlock();
+                    return child;
+                }
+                if (self.active != 0) {
+                    self.mutex.unlock();
+                    try self.yield();
+                    continue;
+                }
+                defer self.mutex.unlock();
+                if (self.ended) return null;
+                self.locked.allocator().free(self.children);
+                self.children = &.{};
+                self.next = 0;
+                const original = self.parent.stream.alloc;
+                self.parent.stream.alloc = self.locked.allocator();
+                defer self.parent.stream.alloc = original;
+                self.children = (try splitUnorderedBatch(self.parent, self.locked.allocator(), self.maximum)) orelse {
+                    self.ended = true;
+                    return null;
+                };
+                // Unordered reducers claim individual row-group ranges, never
+                // a fixed digest/file lane. A hot file can occupy every worker.
+            }
+        }
+        fn deinit(self: *@This()) void {
+            std.debug.assert(self.users.load(.acquire) == 0 and self.active == 0);
+            for (self.children[self.next..]) |child| child.close(child.ptr);
+            self.locked.allocator().free(self.children);
+            if (self.producer) |producer| producer.close(producer.ptr);
+            self.alloc.destroy(self);
+        }
+    };
+    const RollingLane = struct {
+        a: Allocator,
+        queue: *RollingQueue,
+        current: ?catalog.Cursor = null,
+        finished: bool = false,
+        stopped: bool = false,
+        fn release(self: *@This()) void {
+            if (self.current) |cursor| self.queue.release(cursor);
+            self.current = null;
+            self.finished = false;
+        }
+        fn acquire(self: *@This()) !bool {
+            if (self.stopped) return false;
+            if (self.finished) self.release();
+            if (self.current == null) self.current = try self.queue.claim();
+            return self.current != null;
+        }
+        fn next(raw: *anyopaque, a: Allocator, limit: u32) !catalog.Page {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            errdefer self.release();
+            while (try self.acquire()) {
+                const cursor = self.current.?;
+                var page = try cursor.next(cursor.ptr, a, limit);
+                self.finished = page.after == null;
+                if (page.rows.len == 0) {
+                    page.deinit();
+                    continue;
+                }
+                page.after = "rolling";
+                return page;
+            }
+            return .{ .rows = &.{} };
+        }
+        fn nextColumns(raw: *anyopaque, a: Allocator, limit: u32) !catalog.ColumnPage {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            errdefer self.release();
+            while (try self.acquire()) {
+                const cursor = self.current.?;
+                var page = try cursor.next_columns.?(cursor.ptr, a, limit);
+                self.finished = page.after == null;
+                if (page.selection.len == 0) continue;
+                page.after = "rolling";
+                return page;
+            }
+            return .{ .batch = .{ .snapshot = .{ .table_id = self.queue.parent.stream.source.inventory.source_id, .snapshot_id = self.queue.parent.stream.source.inventory.snapshot_id }, .row_refs = &.{}, .columns = &.{} }, .selection = &.{} };
+        }
+        fn finish(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.release();
+            self.stopped = true;
+        }
+        fn close(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.release();
+            _ = self.queue.users.fetchSub(1, .acq_rel);
+            self.a.destroy(self);
+        }
+    };
+    fn splitRolling(self: *Owner, a: Allocator, maximum: usize) !?[]catalog.Cursor {
+        if (self.started or self.dynamic != null or maximum < 2 or self.stream.iterator_started) return null;
+        const count = @min(maximum, 8);
+        const queue = try self.alloc.create(RollingQueue);
+        queue.* = .{ .parent = self, .context = self.stream.context, .io = self.stream.source.scanner.shared_reader.?.context.io, .alloc = self.alloc, .locked = .{ .backing = self.alloc }, .maximum = count };
+        errdefer queue.deinit();
+        // A serial spilling fallback must still see the complete pinned input.
+        // Give the rolling producer an independent iterator and private view.
+        queue.producer = try openPinned(queue.locked.allocator(), self.table, .{ .fields = self.stream.columns, .conditions = self.conditions, .after = self.after, .before = self.before, .primary_key = self.primary_key, .limit = 1024 }, self.context, self.stream.iterator_parent.?);
+        queue.parent = @ptrCast(@alignCast(queue.producer.?.ptr));
+        queue.parent.stream.examined = self.stream.examined;
+        queue.parent.stream.limits = self.stream.limits;
+        const cursors = try a.alloc(catalog.Cursor, count);
+        errdefer a.free(cursors);
+        var opened: usize = 0;
+        errdefer for (cursors[0..opened]) |cursor| cursor.close(cursor.ptr);
+        for (cursors) |*cursor| {
+            const lane = try a.create(RollingLane);
+            lane.* = .{ .a = a, .queue = queue };
+            _ = queue.users.fetchAdd(1, .monotonic);
+            cursor.* = .{ .ptr = lane, .next = RollingLane.next, .next_columns = RollingLane.nextColumns, .finish_partition = RollingLane.finish, .close = RollingLane.close };
+            opened += 1;
+        }
+        self.rolling_queue = queue;
+        self.started = true;
+        return cursors;
+    }
     fn splitEnumerated(self: *Owner, a: Allocator, maximum: usize) !?[]catalog.Cursor {
         if (self.started or self.dynamic != null or self.stream.iterator_started or maximum < 2) return null;
         const parent = self.stream.iterator_parent.?;
@@ -619,6 +824,8 @@ const Owner = struct {
             source.scanner.shared_reader = reader;
             cursor.* = try openPinned(a, self.table, .{ .fields = self.stream.columns, .conditions = self.conditions, .after = self.after, .before = self.before, .primary_key = self.primary_key, .limit = 1024 }, self.context, source);
             const child: *Owner = @ptrCast(@alignCast(cursor.ptr));
+            child.stream.examined = self.stream.examined;
+            child.stream.limits = self.stream.limits;
             child.partition_source = source;
             child.partition_versions_owned = ordered_files;
             child.borrowed_prepared = source.prepared_deletes;
@@ -633,6 +840,7 @@ const Owner = struct {
     fn close(raw: *anyopaque) void {
         const self: *Owner = @ptrCast(@alignCast(raw));
         self.mask_arena.deinit();
+        if (self.rolling_queue) |queue| queue.deinit();
         self.stream.deinit();
         if (self.partition_source) |source| {
             if (source.prepared_deletes != self.borrowed_prepared) {
@@ -1741,6 +1949,7 @@ test "lake SQL paged publication scans retain one file and split independent ord
     const Navigation = struct {
         inventory: @import("../serverless/external_source/types.zig").Inventory,
         order: []const usize,
+        fail_after: ?usize = null,
         const Self = @This();
         const Iterator = struct {
             a: Allocator,
@@ -1751,6 +1960,7 @@ test "lake SQL paged publication scans retain one file and split independent ord
                 const self: *@This() = @ptrCast(@alignCast(raw));
                 try context.ensureActive();
                 if (self.position == self.end) return null;
+                if (self.nav.fail_after) |boundary| if (self.position >= boundary) return error.InvalidExternalSourceInventory;
                 const file = self.nav.inventory.files[self.nav.order[self.position]];
                 var inventory = self.nav.inventory;
                 inventory.files = @constCast(&[_]@import("../serverless/external_source/types.zig").FileEntry{file});
@@ -1933,4 +2143,217 @@ test "lake SQL paged publication scans retain one file and split independent ord
         if (page.after == null) break;
     };
     try std.testing.expectEqual(single_ids.items.len, single_seen);
+    navigation.order = order;
+    lake.source.file_navigation.?.count = 10;
+    // Rolling batches split each independently produced file's row groups;
+    // concatenation remains identical to the serial public-ID stream.
+    {
+        const rolling = try openPinned(a, lake.table, .{ .fields = &.{"amount"}, .limit = 1024 }, .{}, &lake.source);
+        defer rolling.close(rolling.ptr);
+        var rank: usize = 0;
+        var batches: usize = 0;
+        while (try rolling.split_ordered_batch.?(rolling.ptr, a, 3)) |batch| {
+            defer a.free(batch);
+            defer for (batch) |part| part.close(part.ptr);
+            const owner: *Owner = @ptrCast(@alignCast(rolling.ptr));
+            try std.testing.expectEqual(@as(usize, 1), owner.stream.source.inventory.files.len);
+            try std.testing.expectEqual(@as(usize, 1), owner.stream.work.?.plans.len);
+            batches += 1;
+            for (batch) |part| while (true) {
+                const page = try part.next(part.ptr, a, 2);
+                defer page.deinit();
+                for (page.rows) |row| {
+                    try std.testing.expectEqualStrings(ids.items[rank], row.id);
+                    rank += 1;
+                }
+                if (page.after == null) break;
+            };
+        }
+        try std.testing.expectEqual(ids.items.len, rank);
+        try std.testing.expectEqual(@as(usize, 10), batches);
+    }
+    {
+        const rolling = try openPinned(a, lake.table, .{ .fields = &.{"amount"}, .limit = 1024 }, .{}, &lake.source);
+        defer rolling.close(rolling.ptr);
+        const rolling_lanes = (try rolling.split_scan.?(rolling.ptr, a, 3)).?;
+        defer a.free(rolling_lanes);
+        defer for (rolling_lanes) |lane| lane.close(lane.ptr);
+        var found: std.StringHashMapUnmanaged(void) = .empty;
+        defer {
+            var keys = found.keyIterator();
+            while (keys.next()) |key| a.free(key.*);
+            found.deinit(a);
+        }
+        // One consumer may claim every range when peers are busy elsewhere.
+        // No worker is permanently assigned the hot file or a digest range.
+        for (rolling_lanes) |lane| while (true) {
+            const page = try lane.next(lane.ptr, a, 2);
+            defer page.deinit();
+            for (page.rows) |row| {
+                const entry = try found.getOrPut(a, row.id);
+                try std.testing.expect(!entry.found_existing);
+                entry.key_ptr.* = try a.dupe(u8, row.id);
+            }
+            if (page.after == null) break;
+        };
+        try std.testing.expectEqual(ids.items.len, found.count());
+        for (ids.items) |id| try std.testing.expect(found.contains(id));
+        var serial_count: usize = 0;
+        while (true) {
+            const page = try rolling.next(rolling.ptr, a, 4);
+            defer page.deinit();
+            serial_count += page.rows.len;
+            if (page.after == null) break;
+        }
+        try std.testing.expectEqual(ids.items.len, serial_count);
+    }
+    {
+        const retry = try openPinned(a, lake.table, .{ .fields = &.{"amount"}, .limit = 1024 }, .{}, &lake.source);
+        defer retry.close(retry.ptr);
+        const ranges = (try retry.split_scan.?(retry.ptr, a, 3)).?;
+        defer a.free(ranges);
+        defer for (ranges) |range| range.close(range.ptr);
+        const prefix = try ranges[0].next(ranges[0].ptr, a, 1);
+        defer prefix.deinit();
+        try std.testing.expectEqual(@as(usize, 1), prefix.rows.len);
+        ranges[0].finish_partition.?(ranges[0].ptr);
+        // Other consumers must make progress after a reducer stops mid-range.
+        for (ranges[1..]) |range| while (true) {
+            const page = try range.next(range.ptr, a, 4);
+            defer page.deinit();
+            if (page.after == null) break;
+        };
+        var retried: usize = 0;
+        while (true) {
+            const page = try retry.next(retry.ptr, a, 4);
+            defer page.deinit();
+            retried += page.rows.len;
+            if (page.after == null) break;
+        }
+        try std.testing.expectEqual(ids.items.len, retried);
+    }
+    {
+        const Filter = @import("dynamic_filter.zig").Filter;
+        const filter = try Filter.create(a, &.{.{ .name = "amount", .type = .integer }}, 128);
+        defer filter.close();
+        try filter.add(&.{scalar.Datum.json(.{ .integer = 2 })});
+        filter.sealed = true;
+        const filtered = try openPinned(a, lake.table, .{ .fields = &.{"_id"}, .limit = 1024 }, .{}, &lake.source);
+        defer filtered.close(filtered.ptr);
+        try std.testing.expect(try filtered.set_dynamic_filter.?(filtered.ptr, filter));
+        var selected: usize = 0;
+        while (try filtered.split_ordered_batch.?(filtered.ptr, a, 3)) |parts| {
+            defer a.free(parts);
+            defer for (parts) |part| part.close(part.ptr);
+            for (parts) |part| while (true) {
+                const page = try part.next(part.ptr, a, 4);
+                defer page.deinit();
+                for (page.rows) |row| try std.testing.expectEqual(@as(i64, 2), row.value.object.get("amount").?.integer);
+                selected += page.rows.len;
+                if (page.after == null) break;
+            };
+        }
+        try std.testing.expectEqual(@as(usize, 10), selected);
+    }
+    {
+        const bounded = try openPinned(a, lake.table, .{ .fields = &.{"amount"}, .limit = 1024 }, .{}, &lake.source);
+        defer bounded.close(bounded.ptr);
+        const owner: *Owner = @ptrCast(@alignCast(bounded.ptr));
+        owner.stream.limits.max_examined_rows = 5;
+        const ranges = (try bounded.split_scan.?(bounded.ptr, a, 3)).?;
+        defer a.free(ranges);
+        defer for (ranges) |range| range.close(range.ptr);
+        const prefix = try ranges[0].next(ranges[0].ptr, a, 3);
+        defer prefix.deinit();
+        try std.testing.expectEqual(@as(usize, 3), prefix.rows.len);
+        try std.testing.expectError(error.LakeRowsScanBudgetExceeded, ranges[0].next(ranges[0].ptr, a, 3));
+        try std.testing.expectError(error.LakeRowsScanBudgetExceeded, ranges[1].next(ranges[1].ptr, a, 3));
+        try std.testing.expectEqual(@as(u64, 3), owner.examined.load(.monotonic));
+    }
+    {
+        const bounded = try openPinned(a, lake.table, .{ .fields = &.{"amount"}, .limit = 1024 }, .{}, &lake.source);
+        defer bounded.close(bounded.ptr);
+        const owner: *Owner = @ptrCast(@alignCast(bounded.ptr));
+        owner.stream.limits.max_examined_rows = 5;
+        for (0..2) |batch_number| {
+            const parts = (try bounded.split_ordered_batch.?(bounded.ptr, a, 3)).?;
+            defer a.free(parts);
+            defer for (parts) |part| part.close(part.ptr);
+            if (batch_number == 1) {
+                try std.testing.expectError(error.LakeRowsScanBudgetExceeded, parts[0].next(parts[0].ptr, a, 3));
+            } else {
+                const page = try parts[0].next(parts[0].ptr, a, 3);
+                defer page.deinit();
+                try std.testing.expectEqual(@as(usize, 3), page.rows.len);
+            }
+        }
+        try std.testing.expectEqual(@as(u64, 3), owner.examined.load(.monotonic));
+    }
+    {
+        const Drain = struct {
+            const Result = struct { count: usize = 0, sum: i64 = 0 };
+            fn run(cursor: catalog.Cursor, backing: Allocator) anyerror!Result {
+                var result: Result = .{};
+                var arena = std.heap.ArenaAllocator.init(backing);
+                defer arena.deinit();
+                while (true) {
+                    _ = arena.reset(.retain_capacity);
+                    const page = try cursor.next_columns.?(cursor.ptr, arena.allocator(), 2);
+                    for (0..page.selection.len) |index| {
+                        result.count += 1;
+                        result.sum += (try page.cell(arena.allocator(), index, "amount")).value.integer;
+                    }
+                    if (page.after == null) return result;
+                    // Interleave consumers while the producer changes windows.
+                    try std.testing.io.sleep(.fromNanoseconds(1), .awake);
+                }
+            }
+        };
+        const concurrent = try openPinned(a, lake.table, .{ .fields = &.{"amount"}, .limit = 1024 }, .{}, &lake.source);
+        defer concurrent.close(concurrent.ptr);
+        const ranges = (try concurrent.split_scan.?(concurrent.ptr, a, 3)).?;
+        defer a.free(ranges);
+        defer for (ranges) |range| range.close(range.ptr);
+        const scheduling = @import("parallel_scheduler.zig");
+        var tasks: [3]?scheduling.Task(anyerror!Drain.Result) = @splat(null);
+        defer for (&tasks) |*slot| if (slot.*) |pending| {
+            var task = pending;
+            _ = task.cancel(std.testing.io) catch {};
+        };
+        for (ranges, &tasks) |range, *slot| {
+            slot.* = scheduling.global().submitIo(std.testing.io, 1024 * 1024, Drain.run, .{ range, a });
+            try std.testing.expect(slot.* != null);
+        }
+        var total_rows: usize = 0;
+        var total_sum: i64 = 0;
+        for (&tasks) |*slot| {
+            var task = slot.*.?;
+            slot.* = null;
+            const result = try task.await(std.testing.io);
+            total_rows += result.count;
+            total_sum += result.sum;
+        }
+        try std.testing.expectEqual(@as(usize, 30), total_rows);
+        try std.testing.expectEqual(@as(i64, 60), total_sum);
+    }
+    {
+        navigation.fail_after = 1;
+        defer navigation.fail_after = null;
+        const deferred = try openPinned(a, lake.table, .{ .fields = &.{"amount"}, .limit = 1024 }, .{}, &lake.source);
+        defer deferred.close(deferred.ptr);
+        const prefix = (try deferred.split_ordered_batch.?(deferred.ptr, a, 3)).?;
+        {
+            defer a.free(prefix);
+            defer for (prefix) |part| part.close(part.ptr);
+            var seen_prefix: usize = 0;
+            for (prefix) |part| while (true) {
+                const page = try part.next(part.ptr, a, 4);
+                defer page.deinit();
+                seen_prefix += page.rows.len;
+                if (page.after == null) break;
+            };
+            try std.testing.expectEqual(@as(usize, 3), seen_prefix);
+        }
+        try std.testing.expectError(error.InvalidExternalSourceInventory, deferred.split_ordered_batch.?(deferred.ptr, a, 3));
+    }
 }

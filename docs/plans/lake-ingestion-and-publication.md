@@ -1213,9 +1213,9 @@ logical-key ties, public ordering walks that shared directory in digest order an
 can stop before reading every participating file. Continuation seeks start at
 the boundary digest and preserve physical row coordinates, ascending/descending
 IDs, backward pages and transitions between tuples. Small or sparse ties retain
-local ordering and its scoped cache; groups above 4,096 files always use lazy
-intersection to bound preparation memory. Counts choose execution strategy only;
-exact membership and native rows decide results. Sparse large groups may still
+local ordering and its scoped cache; wide dense groups use lazy intersection, while sparse wide groups use
+bounded participant spilling as described below. Counts choose execution strategy only;
+exact membership and native rows decide results. Spill-admission fallback may still
 require many directory probes, so representative archive benchmarks remain
 necessary.
 
@@ -1223,9 +1223,9 @@ Publication scans can freeze at most eight file descriptors into a private
 statement view, with an independent iterator preserving serial fallback after
 setup failure. Unordered scans then use the existing shared row-group work queue;
 single-file ordered scans split row groups into contiguous canonical ranges.
-Ordered multi-file scans keep lazy contiguous file ranges so later descriptor or
-footer errors cannot displace a valid earlier prefix. Larger inventories continue to
-stream digest ranges and retain bounded per-lane file views. Startup warming
+The original multi-file scan path used lazy contiguous file ranges. The rolling
+row-group scheduler below replaces fixed file lanes for large publication scans
+while retaining deferred descriptor/footer errors and bounded file views. Startup warming
 loads compact ordered roots and selected dictionary pages under the existing
 page/time budget, avoiding full dictionary materialization.
 
@@ -1247,3 +1247,69 @@ rebuilt CLI (28.09 seconds). Compiler-derived error metadata, formatting/lint,
 source licenses, whitespace and the Apache boundary (2,065 files) passed.
 Live-provider retention qualification and representative archive latency/RSS
 benchmarks remain deferred; these E2E timings are functional qualification.
+
+
+## Dictionary-bound pagination and rolling row-group scheduling
+
+The public tie cache binds its slot order to the authenticated ordered-file
+mapping as well as the tuple tree, publication source/snapshot and authorization
+scope. Two indexes with equivalent definitions can retain different stable slot
+histories, so the tuple-tree identity alone cannot authorize reuse of cached
+slot numbers. Regression coverage warms one mapping and queries the other in
+both directions with continuation boundaries.
+
+Ordered data-run ancestry and dictionary ancestry are independent. Within a
+checkpoint sequence, the first root establishes the complete slot/name layout;
+subsequent roots authenticate and edit only the reached fingerprint slots.
+Fresh data runs inherit the dictionary independently of their merge forest,
+and checkpoint assembly reuses that dictionary directly. Maintenance reloads
+compact roots instead of materializing/sorting all file names after each file.
+The first incremental merge retains the previous layout's length when newly
+admitted files extend the census. Final assembly streams the row runs normally.
+
+Public ordering chooses between snapshot-directory intersection for dense ties
+and a participant-only external sort for sparse wide ties. Participant sorting
+uses 128 KiB runs and the existing bounded spill manager, resolves only group
+members, and orders digest/slot keys in the requested direction. Continuations
+filter digest bounds before sorting and preserve exact physical row-coordinate
+seeks at an equal boundary. This bounds memory and avoids unrelated archive
+membership probes; it trades up-front participant work for predictable sparse
+group traversal. Small pages keep the lazy prefix when it is cheaper. Continued
+traversal switches to a spilled unvisited suffix once probes exceed participant
+preparation cost or the reserved metadata-read budget, finishing any current
+file before switching. Spill admission
+failure retains lazy traversal. A native fixture exceeds 65,000 files and 4,096 participants,
+forces spilling, and checks full order plus forward/backward continuations.
+
+Large publication scans use a rolling, query-owned row-group scheduler.
+Unordered lanes share a window of at most four footer plans and claim individual
+row groups by compressed size; tiny files overlap and a large file can occupy
+every worker. The next window is planned after current ranges have finished and
+released their borrowed plans. An independent producer preserves the unopened
+parent for serial spilling fallback, and reducers release active claims on early
+exit. Physical row admission belongs to the statement and survives worker
+ranges, rolling windows and fallback. Waiting lanes retain immutable statement
+context and I/O, independently of the producer's changing file view. Ordered
+SQL delivery consumes contiguous row-group ranges as a bounded batch, joins and closes the batch, then advances to the next file.
+Later descriptor/footer errors cannot displace an already delivered prefix.
+Scheduler saturation executes required ordered ranges on the caller rather
+than discarding an already advanced batch. The existing small-inventory path
+continues to support its fixed immutable work plan.
+
+These changes do not claim an archive-scale speedup factor. Representative
+cold/warm latency, publication request counts, RSS and skewed-file throughput
+measurements remain qualification work; real-provider retention qualification
+remains deferred.
+
+
+Validation with origin/main `f9f1582346` included: the Debug CLI built;
+497 lake integration tests (185 shared-engine + 312 server) and 15 focused SQL
+contracts passed without failures or leaks. The final adaptive traversal passed
+four focused cache/tie regressions, including the 65,553-file fixture, small-page
+prefixes, bounded promotion, spill rejection, backward cursors and a following
+tuple. All 50 real Parquet/Iceberg E2Es passed in 621.84 seconds. The new Parquet
+case streams 20,288 rows over pgwire in 137-row delivery batches across cold
+restarts and checks filtered/grouped aggregates; cold Iceberg coverage now also
+includes ten independently written files. Compiler error metadata, lint,
+whitespace, source licenses and the Apache boundary passed. These timings are
+functional qualification rather than archive latency benchmarks.

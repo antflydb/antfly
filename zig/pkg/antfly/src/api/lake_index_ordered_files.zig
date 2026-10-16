@@ -121,6 +121,28 @@ const Batch = struct {
         self.changes = .empty;
     }
 };
+/// A checkpoint within one fixed slot layout edits fingerprints only. Read
+/// and authenticate each reached slot rather than flattening/comparing all files.
+pub fn updateFingerprints(a: A, store: tree.Store, roots: Roots, files: []const []const u8, fingerprints: []const [32]u8, changed: []const u32) !Roots {
+    if (files.len != roots.count or fingerprints.len != roots.count) return error.InvalidNativeLakeRowIndex;
+    var result = roots;
+    var batch: Batch = .{ .arena = .init(a) };
+    defer batch.arena.deinit();
+    var scratch = std.heap.ArenaAllocator.init(a);
+    defer scratch.deinit();
+    for (changed) |slot| {
+        _ = scratch.reset(.retain_capacity);
+        const sa = scratch.allocator();
+        const old = try file(sa, store, roots, slot);
+        if (!std.mem.eql(u8, old.file, files[slot])) return error.InvalidNativeLakeRowIndex;
+        if (!std.mem.eql(u8, &old.fingerprint, &fingerprints[slot]))
+            try batch.add(&slotKey(slot), try std.json.Stringify.valueAlloc(sa, Record{ .file = old.file, .fingerprint = fingerprints[slot] }, .{}));
+        if (batch.changes.items.len >= 64) try batch.flush(store, &result.slots);
+    }
+    try batch.flush(store, &result.slots);
+    try validate(result);
+    return result;
+}
 pub const Previous = struct { roots: Roots, files: []const []const u8, fingerprints: []const [32]u8, same_snapshot: bool };
 pub fn publish(a: A, store: tree.Store, source: []const u8, snapshot: []const u8, files: []const []const u8, fingerprints: []const [32]u8, previous: ?Previous) !Roots {
     return publishWithOptions(a, store, source, snapshot, files, fingerprints, previous, .{});
@@ -287,7 +309,19 @@ test "external lake metadata navigation ordered dictionaries exceed legacy file 
     try std.testing.expect(memory.writes - writes < 10);
     try std.testing.expectEqualDeep(@as([32]u8, @splat(2)), (try file(ca, memory.store(), next, 16999)).fingerprint);
     try std.testing.expectEqualDeep(@as([32]u8, @splat(1)), (try file(ca, memory.store(), first, 16999)).fingerprint);
-    const expanded = try materialize(ca, memory.store(), next);
+    hashes[170] = @splat(3);
+    const selective_reads = memory.reads;
+    const selective_writes = memory.writes;
+    const edited = try updateFingerprints(a, memory.store(), next, names, hashes, &.{170});
+    try std.testing.expect(memory.reads - selective_reads < 10);
+    try std.testing.expect(memory.writes - selective_writes < 10);
+    try std.testing.expectEqualDeep(next.names, edited.names);
+    try std.testing.expectEqualDeep(next.public, edited.public);
+    try std.testing.expectEqualDeep(@as([32]u8, @splat(3)), (try file(ca, memory.store(), edited, 170)).fingerprint);
+    try std.testing.expectEqualDeep(@as([32]u8, @splat(1)), (try file(ca, memory.store(), next, 170)).fingerprint);
+    const unchanged = try updateFingerprints(a, memory.store(), edited, names, hashes, &.{});
+    try std.testing.expectEqualDeep(edited, unchanged);
+    const expanded = try materialize(ca, memory.store(), edited);
     for (names, expanded.files) |expected, actual| try std.testing.expectEqualStrings(expected, actual);
     try std.testing.expectEqualDeep(hashes, expanded.fingerprints);
 }

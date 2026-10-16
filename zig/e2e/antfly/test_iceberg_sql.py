@@ -1597,7 +1597,7 @@ def test_native_iceberg_accepted_text_windows_and_retained_cut_restart(
             held_intents.rename(intents)
 
 
-@pytest.mark.parametrize("file_count", [1, 2])
+@pytest.mark.parametrize("file_count", [1, 2, 10])
 def test_cold_indexed_iceberg_queries_use_publication_file_navigation(
     tmp_path, file_count
 ):

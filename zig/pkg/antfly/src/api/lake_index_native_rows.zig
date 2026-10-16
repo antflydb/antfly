@@ -281,10 +281,10 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
             defer base_sort.deinit();
             base_sort.encoded_bytes = true;
             base_sort.shared_runs = true;
-            const ref = try ordered.publishIncremental(a, ca, store, &base_sort, entry.name, fingerprint(entry.tuple, entry.predicate, entry.cover), source.inventory, entry.cover, cancellation, .{ .run_only = true, .previous = prior, .keep = entry.delta.keep, .files = entry.delta.files, .fingerprints = entry.built_hashes });
+            const ref = try ordered.publishIncremental(a, ca, store, &base_sort, entry.name, fingerprint(entry.tuple, entry.predicate, entry.cover), source.inventory, entry.cover, cancellation, .{ .public_navigation = entry.delta.public_navigation, .run_only = true, .previous = prior, .keep = entry.delta.keep, .files = entry.delta.files, .fingerprints = entry.built_hashes });
             entry.published = ref;
             try input.checkpoint(.{ .name = entry.name, .binding = entry.binding, .artifact = ref });
-            entry.delta.previous = try ordered.loadRoot(entry.root_arena.allocator(), store.*, ref, cancellation, null);
+            entry.delta.previous = try ordered.loadRootLazy(entry.root_arena.allocator(), store.*, ref, cancellation, null);
             entry.initial_build = true;
             @memset(entry.retained, true);
             entry.delta.keep = entry.retained;
@@ -372,10 +372,13 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
                 if (!entry.changed[file_index]) continue;
                 const slot = entry.slots[file_index];
                 entry.built_hashes[slot] = entry.delta.fingerprints[slot];
-                const keep = try a.dupe(bool, entry.delta.keep);
-                defer a.free(keep);
+                // The first merge uses the prior layout's length (new slots
+                // may extend it). Subsequent checkpoints share a fixed census.
+                const first_checkpoint = entry.published == null;
+                const keep = if (first_checkpoint) try a.dupe(bool, entry.delta.keep) else entry.retained;
+                defer if (first_checkpoint) a.free(keep);
                 if (slot < keep.len) keep[slot] = false;
-                var delta: ordered.Delta = .{ .previous = entry.delta.previous, .keep = keep, .files = entry.delta.files, .fingerprints = entry.built_hashes, .public_navigation = entry.delta.public_navigation };
+                var delta: ordered.Delta = .{ .previous = entry.delta.previous, .keep = keep, .files = entry.delta.files, .fingerprints = entry.built_hashes, .public_navigation = entry.delta.public_navigation, .dictionary_slots = if (entry.published != null) &.{slot} else null };
                 if (entry.reverse) |reverse| {
                     delta.built_reverse = try reverse.finish();
                     delta.reverse_built = true;
@@ -396,10 +399,11 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
                 // Only the latest root directory is needed for the next file.
                 // Retaining every prefix here would grow metadata quadratically.
                 _ = entry.root_arena.reset(.free_all);
-                entry.delta.previous = try ordered.loadRoot(entry.root_arena.allocator(), store.*, ref, cancellation, null);
+                entry.delta.previous = try ordered.loadRootLazy(entry.root_arena.allocator(), store.*, ref, cancellation, null);
                 entry.initial_build = entry.delta.previous.?.building;
-                @memset(entry.retained, true);
+                if (first_checkpoint) @memset(entry.retained, true) else entry.retained[slot] = true;
                 entry.delta.keep = entry.retained;
+                entry.delta.dictionary_slots = &.{};
                 entry.sort.deinit();
                 entry.sort = spill.Sort.init(a, &manager, &orders, sort_workspace_bytes / entries.items.len);
                 entry.sort.shared_runs = true;

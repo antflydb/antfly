@@ -5472,3 +5472,142 @@ def test_remote_transform_dependencies_bound_wide_candidate_sources(tmp_path):
         failed = False
     finally:
         server.stop(test_failed=failed)
+
+
+def test_published_parquet_skewed_files_share_row_groups_and_stream_in_order(tmp_path):
+    """A 20,000-row file plus tiny files exercises cold rolling scan workers."""
+    pa = pytest.importorskip("pyarrow")
+    pq = pytest.importorskip("pyarrow.parquet")
+    psycopg = pytest.importorskip("psycopg")
+    root = tmp_path / "lake"
+    objects = root / "buckets" / "antfly" / "objects"
+    objects.mkdir(parents=True)
+    total = 0
+    for part in range(10):
+        count = 20000 if part == 4 else 32
+        path = tmp_path / "part.parquet"
+        pq.write_table(
+            pa.table(
+                {
+                    "amount": pa.array(range(total, total + count), type=pa.int64()),
+                    "body": ["common"] * count,
+                    # Preserve >2 MiB of source bytes so ordinary SQL delivery
+                    # admits its ordered worker path, regardless of compression.
+                    "payload": ["x" * 256] * count,
+                }
+            ),
+            path,
+            compression=None,
+            use_dictionary=False,
+            row_group_size=256,
+        )
+        data = path.read_bytes()
+        (objects / f"part-{part:02}.parquet").write_bytes(
+            b"AFOBJ001"
+            + struct.pack("<QI", len(data), 0)
+            + hashlib.sha256(data).hexdigest().encode()
+            + data
+        )
+        total += count
+    server = StandaloneAntflyServer(
+        resolve_binary_path(os.environ.get("ANTFLY_BIN", str(DEFAULT_ANTFLY_BIN))),
+        "127.0.0.1",
+        0,
+        pgwire=True,
+    )
+    failed = True
+    try:
+
+        def call(method, path, body=None):
+            response = requests.request(
+                method,
+                server.api_url + path,
+                json=body,
+                auth=("admin", AUTH_BOOTSTRAP_PASSWORD),
+                timeout=180,
+            )
+            assert response.ok, response.text + server.debug_logs()
+            return response.json()
+
+        call(
+            "POST",
+            "/tables/skew_scan",
+            {
+                "num_shards": 1,
+                "schema": {
+                    "storage_mode": "relational",
+                    "base_source": {
+                        "kind": "external",
+                        "table_id": "skew-scan",
+                        "format": "parquet",
+                        "object_mutability": "immutable",
+                        "uri": root.as_uri(),
+                    },
+                },
+                "indexes": {"body_text": {"type": "full_text", "field": "body"}},
+            },
+        )
+        deadline = time.monotonic() + 180
+        while True:
+            index = call("GET", "/tables/skew_scan/indexes/body_text")
+            assert index["status"]["readiness"]["state"] != "failed", index
+            if index["status"]["readiness"]["queryable"]:
+                break
+            assert time.monotonic() < deadline, str(index) + server.debug_logs()
+            time.sleep(0.1)
+        expected = list(range(total))
+        divisible = [i for i in expected if i % 3 == 0]
+        first_order = None
+        for _ in range(2):
+            server.restart()
+            with (
+                psycopg.connect(
+                    host="127.0.0.1",
+                    port=server.pgwire_port,
+                    user="admin",
+                    password=AUTH_BOOTSTRAP_PASSWORD,
+                    dbname="default",
+                    sslmode="disable",
+                    autocommit=True,
+                ) as connection,
+                connection.cursor() as cursor,
+            ):
+                # Full delivery uses the streaming transport; the HTTP result
+                # cap remains appropriate for the small aggregates below.
+                order = [
+                    row[0]
+                    for row in cursor.stream(
+                        f"SELECT amount FROM skew_scan LIMIT {total}", size=137
+                    )
+                ]
+            assert sorted(order) == expected
+            if first_order is None:
+                first_order = order
+            else:
+                assert order == first_order
+            assert call(
+                "POST",
+                "/sql",
+                {
+                    "statement": "SELECT SUM(amount), COUNT(*) FROM skew_scan WHERE amount % 3 = 0"
+                },
+            )["rows"] == [[str(sum(divisible)), str(len(divisible))]]
+            assert call(
+                "POST",
+                "/sql",
+                {
+                    "statement": "SELECT amount % 5 AS bucket, SUM(amount), COUNT(*) FROM skew_scan GROUP BY amount % 5 ORDER BY bucket"
+                },
+            )["rows"] == [
+                [
+                    str(bucket),
+                    str(sum(expected[bucket::5])),
+                    str(len(expected[bucket::5])),
+                ]
+                for bucket in range(5)
+            ]
+        failed = False
+    finally:
+        server.stop()
+        if failed and server.log_path.exists():
+            print(server.debug_logs())

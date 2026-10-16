@@ -85,6 +85,8 @@ pub const Stream = struct {
     context: Context,
     limits: Limits,
     stats: Stats = .{},
+    /// Statement-owned admission survives worker ranges and rolling windows.
+    examined: ?*std.atomic.Value(u64) = null,
     files: []usize,
     owns_files: bool = true,
     iterator: ?serving.ServingSource.FileIterator = null,
@@ -657,15 +659,80 @@ pub const Stream = struct {
             job.stats = worker.stats;
         }
     };
-    pub fn deinit(self: *Stream) void {
+    /// All children of the previous file must be closed before advancing.
+    /// Only one footer's work census is retained by the rolling scheduler.
+    pub fn nextEnumerationWork(self: *Stream) !bool {
         self.clearFile();
-        if (self.source.scanner.shared_reader) |reader| reader.drain(true);
+        self.releaseWork();
+        if (self.iterator == null) return false;
+        return self.nextEnumeratedFile();
+    }
+    /// Unordered work keeps a small rolling window so tiny files can overlap
+    /// while a large file still shares all its row groups among workers.
+    pub fn nextEnumerationWindow(self: *Stream, maximum: usize) !bool {
+        self.clearFile();
+        self.releaseWork();
+        const iterator = self.iterator orelse return false;
+        const parent = self.iterator_parent.?;
+        var entries: std.ArrayList(external.FileEntry) = .empty;
+        var moved = false;
+        defer {
+            if (!moved) for (entries.items) |*file| file.deinit(self.alloc);
+            entries.deinit(self.alloc);
+        }
+        self.iterator_started = true;
+        for (0..@min(maximum, 4)) |_| {
+            var file = (try iterator.next(iterator.ptr, self.alloc, self.context)) orelse break;
+            errdefer file.deinit(self.alloc);
+            try entries.append(self.alloc, file);
+        }
+        if (entries.items.len == 0) return false;
+        const pinned = try self.alloc.alloc(bool, entries.items.len);
+        errdefer self.alloc.free(pinned);
+        const order = try self.alloc.alloc(usize, entries.items.len);
+        errdefer self.alloc.free(order);
+        var view = try parent.parallelView(self.alloc);
+        errdefer view.closeParallelView(parent);
+        const files = try entries.toOwnedSlice(self.alloc);
+        moved = true;
+        for (files, pinned, order, 0..) |file, *pin, *index, i| {
+            pin.* = view.immutable_objects and (file.etag.len != 0 or (file.version_id.len != 0 and !std.mem.startsWith(u8, file.version_id, "iceberg:") and !std.mem.startsWith(u8, file.version_id, "object-stat:")));
+            index.* = i;
+        }
+        if (view.delete_lease) |lease| lease.release();
+        view.delete_lease = null;
+        view.prepared_deletes = null;
+        view.inventory.files = files;
+        view.scanner.inventory = view.inventory;
+        view.catalog_files = true;
+        view.catalog_files_owned = true;
+        view.selected_catalog_view = true;
+        view.plan_identity = null;
+        view.version_parent = null;
+        view.pinned_files = pinned;
+        view.pinned_files_owned = true;
+        self.source.closeParallelView(parent);
+        self.source.* = view;
+        if (self.owns_files) self.alloc.free(self.files);
+        self.files = order;
+        self.owns_files = true;
+        self.file_index = 0;
+        return true;
+    }
+    fn releaseWork(self: *Stream) void {
         if (self.owns_work) if (self.work) |work| {
             for (work.plans) |*plan| if (plan.*) |*owned| owned.deinit(self.alloc);
             self.alloc.free(work.plans);
             self.alloc.free(work.units);
             self.alloc.destroy(work);
         };
+        self.work = null;
+        self.owns_work = false;
+    }
+    pub fn deinit(self: *Stream) void {
+        self.clearFile();
+        if (self.source.scanner.shared_reader) |reader| reader.drain(true);
+        self.releaseWork();
         if (self.owns_files) self.alloc.free(self.files);
         self.mapped_columns.deinit(self.alloc);
         if (self.iterator_parent) |parent| {
@@ -712,6 +779,17 @@ pub const Stream = struct {
         self.bloom_next_input = 0;
         self.lookahead_next_input = 0;
     }
+    fn admitRows(self: *Stream, rows: u64) !void {
+        const counter = self.examined orelse {
+            if (rows > self.limits.max_examined_rows -| self.stats.rows_examined) return error.LakeRowsScanBudgetExceeded;
+            return;
+        };
+        var used = counter.load(.monotonic);
+        while (true) {
+            if (rows > self.limits.max_examined_rows -| used) return error.LakeRowsScanBudgetExceeded;
+            if (counter.cmpxchgWeak(used, used + rows, .monotonic, .monotonic)) |current| used = current else return;
+        }
+    }
     /// The returned vectors remain valid until the next pull or close.
     pub fn next(self: *Stream) !?types.ColumnBatch {
         try self.context.ensureActive();
@@ -757,7 +835,7 @@ pub const Stream = struct {
                         self.stats.bloom_groups_pruned += 1;
                         continue;
                     }
-                    if (group.row_count > self.limits.max_examined_rows -| self.stats.rows_examined) return error.LakeRowsScanBudgetExceeded;
+                    try self.admitRows(group.row_count);
                     self.page_cursor = try @import("lake_parquet_cursor.zig").Cursor.init(self.alloc, self.source.scanner.reader(), plan.inventory, input.file_id, input.row_group_ordinal, if (self.identity_only) &.{} else if (self.schema_contract.len != 0) self.file_columns else self.columns, .{
                         .max_rows = self.limits.max_row_group_rows,
                         .max_struct_allocation_bytes = self.limits.max_decoded_bytes,

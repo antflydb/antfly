@@ -28,6 +28,7 @@ const Work = struct {
     visited: *std.atomic.Value(usize),
     pages: *std.atomic.Value(usize),
     fn run(self: Work) anyerror!*operators.Grouped {
+        defer if (self.cursor.finish_partition) |finish| finish(self.cursor.ptr);
         var context = self.context;
         const local = operators.Grouped.create(context.alloc, self.bound.specs, .{ .groups = context.limits.scan_rows, .bytes = context.limits.retained_bytes / (4 * self.parts), .spill = context.spill }) catch return error.ParallelAggregateMemoryExceeded;
         errdefer local.deinit();
