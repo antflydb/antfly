@@ -65,6 +65,12 @@ fn platformDeadlineContext(context: request_operation.RequestContext) !request_o
     return context.platformDeadline();
 }
 
+/// Both terminal operations must check the accepted generation on their
+/// applying lease before calling the native boundary, never after fence lift.
+fn requireAcceptedNativeRootGeneration(actual: u64, expected: u64) !void {
+    if (expected == 0 or actual != expected) return error.PrivateIndexRootRecoveryRequired;
+}
+
 test "native index owner adapter rejects cancellation deadline and foreign group before acquisition" {
     // Deliberately uninitialized: all failures must precede catalog/owner access.
     var source: ProvisionedKernelOwnerSource = undefined;
@@ -94,7 +100,7 @@ test "native index owner adapter rejects cancellation deadline and foreign group
         try std.testing.expectError(expected, source.applyNativeIndexOwnerClaimsAtRoot(std.testing.allocator, 7, "rows", undefined, context));
         try std.testing.expectError(expected, source.consumeNativeIndexSourceAtRoot(std.testing.allocator, 7, "rows", undefined, context));
         try std.testing.expectError(expected, source.stepNativeIndexOwnerInstallationAtRoot(std.testing.allocator, 7, "rows", undefined, 1, context));
-        try std.testing.expectError(expected, source.applyNativeIndexOwnerReleaseAtRoot(std.testing.allocator, 7, "rows", undefined, 1, context));
+        try std.testing.expectError(expected, source.applyNativeIndexOwnerReleaseAtRoot(std.testing.allocator, 7, "rows", undefined, 1, 1, context));
         try std.testing.expectError(expected, source.completeNativeIndexOwnerCancellationAtRoot(std.testing.allocator, 7, "rows", identity, 1, context));
         try std.testing.expectError(expected, source.applyNativeIndexOwnerCancellationReleaseAtRoot(std.testing.allocator, 7, "rows", undefined, 1, 1, context));
         try std.testing.expectError(expected, source.cancelNativeIndexOwnerIntent(std.testing.allocator, 7, "rows", undefined, context));
@@ -3717,13 +3723,15 @@ pub const ProvisionedKernelOwnerSource = struct {
 
     /// One applying lease binds both the terminal effect and its root evidence.
     /// Exact retries use the durable terminal record, not retired job state.
-    pub fn applyNativeIndexOwnerReleaseAtRoot(self: *ProvisionedKernelOwnerSource, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, intent: @FieldType(native_index_control.ReleaseOutcome, "intent"), signing_root_incarnation: u128, context: request_operation.RequestContext) !RootedNativeIndexOwnerRelease {
+    pub fn applyNativeIndexOwnerReleaseAtRoot(self: *ProvisionedKernelOwnerSource, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, intent: @FieldType(native_index_control.ReleaseOutcome, "intent"), expected_root_generation: u64, signing_root_incarnation: u128, context: request_operation.RequestContext) !RootedNativeIndexOwnerRelease {
         try context.ensureActive();
         try intent.validate();
+        if (expected_root_generation == 0) return error.PrivateIndexRootRecoveryRequired;
         const binding = intent.installed.command.validation.command.binding;
         const identity: native_index_control.Identity = .{ .id = binding.id, .plan_digest = binding.plan_digest, .owner_digest = binding.owner_digest, .ordinal = binding.ordinal, .namespace = binding.fence.namespace, .owner_group_id = binding.fence.owner_group_id };
         var lease = try self.acquireNativeIndexOwner(group_id, table_name, identity, context);
         defer lease.deinit();
+        try requireAcceptedNativeRootGeneration(lease.entry.generation, expected_root_generation);
         const encoded = try std.json.Stringify.valueAlloc(alloc, intent, .{});
         defer alloc.free(encoded);
         if (encoded.len > 32 * 1024) return error.TransactionTooLarge;
@@ -3773,7 +3781,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         const identity: native_index_control.Identity = .{ .id = binding.id, .plan_digest = binding.plan_digest, .owner_digest = binding.owner_digest, .ordinal = binding.ordinal, .namespace = binding.fence.namespace, .owner_group_id = binding.fence.owner_group_id };
         var lease = try self.acquireNativeIndexOwner(group_id, table_name, identity, context);
         defer lease.deinit();
-        if (lease.entry.generation != expected_root_generation) return error.PrivateIndexRootRecoveryRequired;
+        try requireAcceptedNativeRootGeneration(lease.entry.generation, expected_root_generation);
         const encoded = try std.json.Stringify.valueAlloc(alloc, intent, .{});
         defer alloc.free(encoded);
         if (encoded.len > 32 * 1024) return error.TransactionTooLarge;

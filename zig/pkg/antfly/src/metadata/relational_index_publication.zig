@@ -710,6 +710,7 @@ pub fn cancellationReleaseDecisionDigest(group: u64, incarnation: local.metadata
 pub const NativeReleaseGrant = struct {
     installed: local.storage_db_relational_index_validation.Installed,
     decision_digest: Digest,
+    installation_proof: RootProof,
 
     pub fn decisionDigest(group: u64, incarnation: local.metadata_incarnation.MetadataClusterIncarnation, head: progress.Head) !Digest {
         try head.validate();
@@ -731,8 +732,12 @@ pub const NativeReleaseGrant = struct {
     pub fn validateFor(self: @This(), group: u64, incarnation: local.metadata_incarnation.MetadataClusterIncarnation, head: progress.Head, owner: progress.OwnerState) !void {
         try (NativeInstallGrant{ .validation = self.installed.command.validation, .decision_digest = self.installed.command.metadata_decision }).validateFor(group, incarnation, head, owner);
         const receipt = try self.installed.command.receipt(self.installed.position);
+        const signed: SignedReceipt = .{ .receipt = receipt, .proof = self.installation_proof };
+        signed.verifySignature() catch return error.InvalidCatalogRecord;
         if (!std.mem.eql(u8, &self.decision_digest, &try decisionDigest(group, incarnation, head)) or
+            !std.mem.eql(u8, &self.installation_proof.identity.metadata_incarnation, &incarnation) or
             !std.meta.eql(receipt.owner, owner.owner) or
+            !std.mem.eql(u8, &try signed.commitment(), &owner.attestations[@backingInt(progress.Action.installed)]) or
             !std.mem.eql(u8, &try receipt.digest(), &owner.receipts[@backingInt(progress.Action.installed)])) return error.InvalidCatalogRecord;
         try self.intent().validate();
     }
@@ -745,6 +750,7 @@ pub fn requireNativeReleaseReceipt(group: u64, incarnation: local.metadata_incar
     const grant: NativeReleaseGrant = .{
         .installed = .{ .command = witness.command, .position = installed.signed.receipt.position.native },
         .decision_digest = try NativeReleaseGrant.decisionDigest(group, incarnation, head),
+        .installation_proof = installed.signed.proof,
     };
     try grant.validateFor(group, incarnation, head, owner);
     if (signed.receipt.position != .native or
@@ -862,6 +868,10 @@ pub const OwnerDecision = struct {
         if (request.operation == .release and self.disposition == .execute and self.owner.owner.authority == .native) {
             const grant = self.native_release orelse return error.InvalidCatalogRecord;
             try grant.validateFor(self.metadata_group_id, self.metadata_incarnation, self.head, self.owner);
+            try self.requireRetainedNativeBinding(grant.installed.command.validation.command.binding);
+            const view = self.native_signing orelse return error.InvalidCatalogRecord;
+            if (!std.meta.eql(grant.installation_proof.identity, view.identity) or grant.installation_proof.reporter_incarnation != view.reporter_incarnation or
+                grant.installation_proof.authority != .native or !std.mem.eql(u8, &grant.installation_proof.authority.native, &view.binding_digest)) return error.InvalidCatalogRecord;
         } else if (self.native_release != null) return error.InvalidCatalogRecord;
         if (request.operation == .cancel_release and self.disposition == .execute and self.owner.owner.authority == .native) {
             const grant = self.native_cancel_release orelse return error.InvalidCatalogRecord;

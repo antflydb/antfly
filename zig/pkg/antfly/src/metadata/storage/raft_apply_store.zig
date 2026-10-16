@@ -5540,6 +5540,7 @@ pub const OwnerAckTestFixture = if (@import("builtin").is_test) struct {
             try std.testing.expectEqualDeep(command, release_intent.installed.command);
             try std.testing.expectEqualDeep(position, release_intent.installed.position);
             const release_grant = release_permission.value.native_release.?;
+            try std.testing.expectEqualDeep(ack.signed.proof, release_grant.installation_proof);
             var changed = release_permission.value;
             changed.native_release = null;
             try std.testing.expectError(error.InvalidCatalogRecord, changed.requireRequest(release_request));
@@ -5552,6 +5553,14 @@ pub const OwnerAckTestFixture = if (@import("builtin").is_test) struct {
             changed = release_permission.value;
             changed.native_release.?.installed.command.metadata_decision[0] ^= 1;
             try std.testing.expectError(error.InvalidCatalogRecord, changed.requireRequest(release_request));
+            changed = release_permission.value;
+            changed.native_release.?.installation_proof.root_generation += 1;
+            const installed_receipt = try release_grant.installed.command.receipt(release_grant.installed.position);
+            changed.native_release.?.installation_proof = try changed.native_release.?.installation_proof.sign(root, try installed_receipt.digest());
+            try std.testing.expectError(error.InvalidCatalogRecord, changed.requireRequest(release_request));
+            try setIndexTestRootGeneration(alloc, &store, group, ack.signed, release_grant.installation_proof.root_generation + 1);
+            try std.testing.expectError(error.IndexOwnerReceiptChanged, store.relationalIndexOwnerDecisionJson(alloc, group, release_request));
+            try setIndexTestRootGeneration(alloc, &store, group, ack.signed, release_grant.installation_proof.root_generation);
             var later = release_permission.value.head;
             later.revision += 1;
             try std.testing.expectEqualDeep(release_grant.decision_digest, try index_publication.NativeReleaseGrant.decisionDigest(group, release_permission.value.metadata_incarnation, later));
@@ -18189,6 +18198,7 @@ pub const RaftApplyStore = struct {
         const grant: index_publication.NativeReleaseGrant = .{
             .installed = .{ .command = witness.command, .position = accepted.signed.receipt.position.native },
             .decision_digest = try index_publication.NativeReleaseGrant.decisionDigest(group_id, incarnation, head),
+            .installation_proof = accepted.signed.proof,
         };
         try grant.validateFor(group_id, incarnation, head, owner);
         _ = try self.currentIndexBuildOwnerTxnImpl(txn, group_id, grant.installed.command.validation.command.binding, null, .installation);
@@ -18598,6 +18608,7 @@ pub const RaftApplyStore = struct {
             decision.native_release = .{
                 .installed = .{ .command = witness.command, .position = accepted.signed.receipt.position.native },
                 .decision_digest = try index_publication.NativeReleaseGrant.decisionDigest(group_id, incarnation, head),
+                .installation_proof = accepted.signed.proof,
             };
         }
         if (owner.owner.authority == .native and request.operation == .cancel_release) {

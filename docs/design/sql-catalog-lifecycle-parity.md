@@ -8412,3 +8412,31 @@ stages, replacement-root adoption and public online-index admission remain
 unfinished. Published release also needs the same pre-effect accepted-generation
 guard. No public activation or original SQL case credit is claimed; the inventory
 remains 483 implemented / 862 unresolved.
+
+### Shared accepted-generation protection for terminal release
+
+Published release now carries its accepted installation root proof, not only
+the logical installed command. The grant checks the root signature and exact
+retained owner attestation, then matches the current signing identity, reporter
+and native binding. A freshly re-signed different generation cannot substitute
+for metadata's accepted proof. Live permission issuance still verifies that the
+accepted physical root is current.
+
+Published and canceled source adapters use the same accepted-generation guard
+on their applying lease before invoking storage. The published receiving path
+passes the accepted generation explicitly and verifies that the returned cut
+belongs to it. No caller flag or post-release signature failure can replace this
+pre-effect check. The check is constant-sized and adds no schema/index audit or
+user-row scan to terminal release.
+
+The frozen-source Debug gate passed 103/103 build steps in
+`/private/tmp/antfly-index-terminal-root-guard-debug.log`: 56 metadata, four ACK,
+one service and three actual leased-adapter tests, with no failures or leaks.
+The metadata fixture rejects re-signed generation substitutions and a changed
+current runtime root; the receiving/scheduler fixture rejects a stale applying
+generation before any release call/effect. Existing lost-reply, pending,
+restart and signed-release checks remain green. Formatting, diff, licensing,
+Apache boundary, control-catalog and inventory integrity checks pass.
+
+Private cancellation transport/scheduling, replacement-root adoption and public
+online-index admission remain unfinished; original SQL accounting is unchanged.

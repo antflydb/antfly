@@ -1333,11 +1333,12 @@ pub fn step(alloc: std.mem.Allocator, source: anytype, metadata: anytype, table_
     }
     if (request.operation == .release) {
         const view = permission.value.native_signing orelse return error.NativeIndexSigningUnavailable;
+        const grant = permission.value.native_release orelse return error.InvalidCatalogRecord;
         const intent = try permission.value.nativeReleaseIntent(hot_request);
-        var rooted = try source.applyNativeIndexOwnerReleaseAtRoot(alloc, request.group_id, table_name, intent, view.identity.root_incarnation, context);
+        var rooted = try source.applyNativeIndexOwnerReleaseAtRoot(alloc, request.group_id, table_name, intent, grant.installation_proof.root_generation, view.identity.root_incarnation, context);
         errdefer rooted.outcome.deinit();
         try rooted.outcome.value.validate();
-        if (rooted.root_generation == 0 or !std.meta.eql(rooted.outcome.value.intent, intent)) return error.InvalidPrivateIndexNativeReceipt;
+        if (rooted.root_generation != grant.installation_proof.root_generation or !std.meta.eql(rooted.outcome.value.intent, intent)) return error.InvalidPrivateIndexNativeReceipt;
         return .{ .releasing = .{ .root_generation = rooted.root_generation, .expected_revision = permission.value.head.revision, .outcome = rooted.outcome, .signing = view } };
     }
     if (request.operation == .source) {
@@ -1448,6 +1449,7 @@ const TestDriver = struct {
     installation_ack_requests: usize = 0,
     installation_acks: usize = 0,
     installation_digest: ?publication.Digest = null,
+    installation_proof: ?publication.RootProof = null,
     validated_outcome: ?native.ValidatedOutcome = null,
     decision_fault: ValidationFault = .none,
     decision_requests: usize = 0,
@@ -1536,6 +1538,7 @@ const TestDriver = struct {
                 self.value.owner.attestations[@backingInt(request.signed.receipt.action)] = try request.signed.commitment();
                 if (installed_ack) {
                     self.installation_digest = request.installation.?.signed.outcome_digest;
+                    self.installation_proof = request.signed.proof;
                     self.installation_acks += 1;
                 } else if (released_ack) {
                     self.release_acks += 1;
@@ -1593,7 +1596,7 @@ const TestDriver = struct {
             value.native_release = null;
         } else if (request.operation == .release) {
             const installed = self.installation_response.?.installed.logical;
-            value.native_release = .{ .installed = .{ .command = installed.command, .position = installed.position }, .decision_digest = try publication.NativeReleaseGrant.decisionDigest(value.metadata_group_id, value.metadata_incarnation, value.head) };
+            value.native_release = .{ .installed = .{ .command = installed.command, .position = installed.position }, .decision_digest = try publication.NativeReleaseGrant.decisionDigest(value.metadata_group_id, value.metadata_incarnation, value.head), .installation_proof = self.installation_proof orelse value.native_release.?.installation_proof };
         } else if (self.installation_acks != 0 and request.operation == .install) {
             value.disposition = .acknowledged;
             value.dispatch = null;
@@ -1701,10 +1704,10 @@ const TestDriver = struct {
         return .{ .root_generation = self.root_generation, .outcome = try parsed(native.InstallationResponse, alloc, value) };
     }
 
-    pub fn applyNativeIndexOwnerReleaseAtRoot(self: *TestDriver, alloc: std.mem.Allocator, _: u64, _: []const u8, intent: @FieldType(native.ReleaseOutcome, "intent"), root_incarnation: u128, context: operation.RequestContext) !struct { root_generation: u64, outcome: std.json.Parsed(native.ReleaseOutcome) } {
+    pub fn applyNativeIndexOwnerReleaseAtRoot(self: *TestDriver, alloc: std.mem.Allocator, _: u64, _: []const u8, intent: @FieldType(native.ReleaseOutcome, "intent"), expected_root_generation: u64, root_incarnation: u128, context: operation.RequestContext) !struct { root_generation: u64, outcome: std.json.Parsed(native.ReleaseOutcome) } {
         try context.ensureActive();
         try intent.validate();
-        if (self.value.native_signing.?.identity.root_incarnation != root_incarnation) return error.PrivateIndexRootRecoveryRequired;
+        if (expected_root_generation == 0 or expected_root_generation != self.root_generation or self.value.native_signing.?.identity.root_incarnation != root_incarnation) return error.PrivateIndexRootRecoveryRequired;
         const duplicate = self.release_outcome != null;
         if (!duplicate) {
             var position = intent.installed.position;
@@ -2805,9 +2808,14 @@ fn testReleaseReceiverAndScheduler(alloc: std.mem.Allocator, permission: publica
     active.owner.attestations[@backingInt(progress.Action.installed)] = try installed_ack.signed.commitment();
     active.native_install = null;
     const logical = installed.installed.logical;
-    active.native_release = .{ .installed = .{ .command = logical.command, .position = logical.position }, .decision_digest = try publication.NativeReleaseGrant.decisionDigest(active.metadata_group_id, active.metadata_incarnation, active.head) };
+    active.native_release = .{ .installed = .{ .command = logical.command, .position = logical.position }, .decision_digest = try publication.NativeReleaseGrant.decisionDigest(active.metadata_group_id, active.metadata_incarnation, active.head), .installation_proof = installed_ack.signed.proof };
     const request: Request = .{ .table_id = active.head.table_id, .group_id = active.owner.owner.group_id, .id = active.head.plan_id, .operation = .release };
     var driver: TestDriver = .{ .value = active, .installation_response = installed, .root_generation = installed_ack.signed.proof.root_generation };
+    driver.root_generation += 1;
+    try std.testing.expectError(error.PrivateIndexRootRecoveryRequired, step(alloc, &driver, &driver, active.dispatch.?.table_name, request, .{}));
+    try std.testing.expectEqual(@as(usize, 0), driver.release_calls);
+    try std.testing.expectEqual(@as(usize, 0), driver.release_effects);
+    driver.root_generation -= 1;
     var result = try step(alloc, &driver, &driver, active.dispatch.?.table_name, request, .{});
     defer result.deinit();
     try std.testing.expect(result == .releasing and result.needsSigning());
