@@ -8905,3 +8905,41 @@ or original-case closure is claimed. Coordinated generation-format activation,
 bounded reporter turnover/upload retirement, production reporting and complete
 SQL index build/rollback/restart qualification remain unfinished. Reporter
 replacement and report deletion are not automatically activated by this lease.
+
+### Pinned native producer restart preparation
+
+The read-only restart observation now crosses the same owned JSON projection
+boundary as other compiled metadata controls. Native standalone preparation
+captures the real durable header, signs with the actual physical-root key and
+observes the exact request through that owner. It requires the held root lease;
+node/store mismatches and unsupported hosted/Raft compositions fail closed.
+No backend handle, signing seed or report inventory crosses the projection.
+
+DataServer pins its first signed startup request for the producer's lifetime.
+Repeated preparation returns that exact body, including the original optional
+reporter preimage, even after its own admission is observed. A stale producer
+cannot sign a successor's preimage by polling again. A fresh producer may capture
+the actual durable predecessor under the retained exclusive lease. Signing-key
+creation is restricted to roots with no known registered or pinned verifier;
+missing known keys are recovery errors, never silent key rotation under a UUID.
+Filesystem work remains outside the metadata mutex; the pinned request owns
+only fixed-size identity/signature fields.
+
+Final Debug qualification passed 89/89 build steps in
+`/private/tmp/antfly-native-reporter-pinned-preparation-debug.log`: nine linked
+native tests, 70 metadata/publication tests and one decoder-barrier test, with
+no failures, skips or leaks. The native fixture exercises stable preparation,
+exact confirmation recovery, fresh-producer preparation with the same physical
+key, stale-producer conflict after a successor commits, missing-key preservation
+and foreign metadata incarnation rejection through the compiled owner. Its
+registration writes seed only an isolated empty test registry using the existing
+primitive; they do not qualify bounded turnover of populated report generations.
+License, inventory and compilation-boundary audits pass.
+
+This completes more of the lease-bound preparation boundary, not automatic
+production registration/reporting. No generation address format or retirement
+writer changed. Production namespace switching and bounded retirement remain
+subject to the prior safety restriction; explicit approval has been requested.
+Cardinality/latency benchmarks, source reporting, real-owner SQL build/rollback/
+restart and the broader SQL pools remain open. Inventory is unchanged at
+483 implemented / 862 unresolved.

@@ -336,6 +336,7 @@ pub const CatalogProjectionRequest = union(enum) {
     // Additive owned JSON projections; no storage handles cross this boundary.
     schema_reader_floor: void,
     standalone_revision_state: void,
+    standalone_native_reporter_observation: @import("../standalone_native_owner.zig").Registration,
     relational_index_status: @import("../relational_index_publication.zig").StatusRequest,
     relational_index_prepare: @import("../relational_index_publication.zig").PrepareRequest,
     relational_index_admission_status: @import("../relational_index_publication.zig").AdmissionRequest,

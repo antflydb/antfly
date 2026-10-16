@@ -2212,6 +2212,34 @@ const LocalStandaloneMetadata = struct {
         };
     }
 
+    const NativeReporterRestartPlan = struct {
+        request: @import("../metadata/standalone_native_owner.zig").Registration,
+        observation: @import("../metadata/standalone_native_owner.zig").RestartObservation,
+    };
+
+    /// Read-only admission preparation, not a steady-state re-registration
+    /// loop. The metadata owner rechecks the captured preimage in one snapshot;
+    /// contention returns a conflict rather than signing a newer reporter cut.
+    fn prepareNativeReporterRestart(self: *LocalStandaloneMetadata) !NativeReporterRestartPlan {
+        try self.requireNativeIndexLease();
+        const cut = blk: {
+            lockAtomic(&self.mutex);
+            defer self.mutex.unlock();
+            if (!self.localFkPublicationSupported()) return error.UnsupportedNativeIndexOwner;
+            const store = self.lifecycle_store orelse return error.UnsupportedNativeIndexOwner;
+            break :blk .{
+                .store = store,
+                .server = self.data_server.?,
+                .binding = self.native_owner_binding orelse return error.StoreRootEnrollmentChanged,
+                .previous = try store.readStore(self.alloc, group_ids.main_metadata_group_id, self.store_id, false),
+            };
+        };
+        defer if (cut.previous) |record| antfly.metadata.table_manager.freeStore(self.alloc, record);
+        const request = try cut.server.prepareNativeReporterRegistration(cut.binding, cut.previous);
+        try self.requireNativeIndexLease();
+        return .{ .request = request, .observation = try cut.store.observeStandaloneNativeReporter(group_ids.main_metadata_group_id, request) };
+    }
+
     const CatalogReader = struct {
         owner: *LocalStandaloneMetadata,
         alloc: std.mem.Allocator,
@@ -12040,6 +12068,77 @@ test "standalone native root ownership excludes independent catalogs until shutd
         break :blk try first.ensureNativeOwnerBindingLocked();
     };
     try std.testing.expect(first.native_owner_lease != null);
+    var cancellation: antfly.common.runtime_lifecycle.CancellationSource = .{};
+    try first.awaitInitialRelationPublication(std.testing.io, cancellation.token());
+    const prepared_revision = try first.lifecycle_store.?.standaloneRevision();
+    const prepared = try first.prepareNativeReporterRestart();
+    try prepared.request.validate();
+    try std.testing.expectEqual(binding.root_incarnation, prepared.request.identity.root_incarnation);
+    try std.testing.expect(prepared.request.expected_reporter_incarnation == null);
+    try std.testing.expect(prepared.request.reporter_incarnation != 0);
+    try std.testing.expect(!prepared.observation.reporter_matches and !prepared.observation.root_enrolled);
+    try std.testing.expect(prepared.observation.header_digest == null);
+    try std.testing.expectEqualDeep(prepared, try first.prepareNativeReporterRestart());
+    try std.testing.expectEqual(prepared_revision, try first.lifecycle_store.?.standaloneRevision());
+    var foreign_binding = binding;
+    foreign_binding.store_id += 1;
+    try std.testing.expectError(error.StoreIdentityMismatch, first_server.prepareNativeReporterRegistration(foreign_binding, null));
+    // Seed only this empty isolated catalog through the existing registration
+    // primitive. No automatic producer or old-report retirement is enabled.
+    try first.lifecycle_store.?.updateStandaloneCatalog(group_ids.main_metadata_group_id, prepared_revision, .{ .native_registration = prepared.request });
+    const confirmed = try first.prepareNativeReporterRestart();
+    try std.testing.expect(confirmed.observation.reporter_matches and !confirmed.observation.root_enrolled);
+    try std.testing.expectEqualDeep(prepared.request, confirmed.request);
+    first_server.deinit();
+    first_server = antfly.data.runtime.DataServer.initFromLocalMetadataSources(a, .{
+        .replica_root_dir = root,
+        .replica_catalog_path = first_catalog,
+        .backend_runtime = runtime.ptr(),
+        .store_registration = .{ .node_id = 1, .store_id = 1, .api_url = "http://localhost", .role = "data" },
+        .api_server_cfg = .{ .deployment_mode = .standalone },
+    }, first.catalogSource(), first.statusSource());
+    const restart_revision = try first.lifecycle_store.?.standaloneRevision();
+    const restart = try first.prepareNativeReporterRestart();
+    try std.testing.expectEqual(prepared.request.reporter_incarnation, restart.request.expected_reporter_incarnation.?);
+    try std.testing.expect(restart.request.reporter_incarnation != prepared.request.reporter_incarnation);
+    try std.testing.expectEqualSlices(u8, &prepared.request.identity.public_key, &restart.request.identity.public_key);
+    try std.testing.expect(!restart.observation.reporter_matches and !restart.observation.root_enrolled);
+    try std.testing.expectEqual(restart_revision, try first.lifecycle_store.?.standaloneRevision());
+    {
+        const retained = (try first.lifecycle_store.?.readStore(a, group_ids.main_metadata_group_id, 1, false)).?;
+        defer antfly.metadata.table_manager.freeStore(a, retained);
+        try std.testing.expectEqual(prepared.request.reporter_incarnation, retained.reporter_incarnation);
+        const signing = @import("antfly_local_sources").storage_db_root_signing_identity;
+        const io = runtime.ptr().apiIo().?;
+        const key_path = try signing.checkpointPathAlloc(a, root);
+        defer a.free(key_path);
+        const paused_key_path = try std.fmt.allocPrint(a, "{s}.paused", .{key_path});
+        defer a.free(paused_key_path);
+        try std.Io.Dir.rename(.cwd(), key_path, .cwd(), paused_key_path, io);
+        var paused = true;
+        defer if (paused) std.Io.Dir.rename(.cwd(), paused_key_path, .cwd(), key_path, io) catch {};
+        try std.testing.expectError(error.FileNotFound, first_server.prepareNativeReporterRegistration(binding, retained));
+        try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(io, key_path, .{}));
+        try std.Io.Dir.rename(.cwd(), paused_key_path, .cwd(), key_path, io);
+        paused = false;
+        const physical_key = try signing.load(a, io, root);
+        // Advance this isolated empty registry to simulate a newer producer.
+        // Polling the stale producer must retain its first signed preimage and
+        // return a conflict, never recapture the successor's reporter to steal it.
+        var successor = restart.request;
+        successor.reporter_incarnation +%= 1;
+        if (successor.reporter_incarnation == 0) successor.reporter_incarnation = 1;
+        successor = try successor.sign(physical_key);
+        try first.lifecycle_store.?.updateStandaloneCatalog(group_ids.main_metadata_group_id, restart_revision, .{ .native_registration = successor });
+        const successor_revision = try first.lifecycle_store.?.standaloneRevision();
+        try std.testing.expectError(error.GenerationPublicationChanged, first.prepareNativeReporterRestart());
+        try std.testing.expectEqualDeep(restart.request, first_server.native_reporter_registration.?);
+        try std.testing.expectEqual(successor_revision, try first.lifecycle_store.?.standaloneRevision());
+        var foreign = restart.request;
+        foreign.identity.metadata_incarnation[0] = if (foreign.identity.metadata_incarnation[0] == '1') '2' else '1';
+        foreign = try foreign.sign(physical_key);
+        try std.testing.expectError(error.StoreRootEnrollmentChanged, first.lifecycle_store.?.observeStandaloneNativeReporter(group_ids.main_metadata_group_id, foreign));
+    }
     var second = try LocalStandaloneMetadata.init(a, 1, 1, "http://localhost", root, second_catalog, runtime.ptr(), null, .local);
     defer second.deinit();
     var second_server = antfly.data.runtime.DataServer.initFromLocalMetadataSources(a, .{

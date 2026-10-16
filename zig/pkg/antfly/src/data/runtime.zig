@@ -5531,6 +5531,9 @@ pub const DataServer = struct {
     store_root_urgent_probe_requested: std.atomic.Value(bool) = .init(false),
     reporter_incarnation_mutex: std.atomic.Mutex = .unlocked,
     reporter_incarnation: u64 = 0,
+    /// The first native startup preimage is immutable for this producer's
+    /// lifetime. Protected by reporter_incarnation_mutex, not rearmed by polls.
+    native_reporter_registration: ?@import("../metadata/standalone_native_owner.zig").Registration = null,
     /// Durable physical store-root identity, protected by
     /// reporter_incarnation_mutex but independent of process incarnation.
     replica_root_incarnation: u128 = 0,
@@ -17986,6 +17989,63 @@ pub const DataServer = struct {
         lockAtomic(&self.reporter_incarnation_mutex);
         defer self.reporter_incarnation_mutex.unlock();
         return retainReplicaRootIncarnation(&self.replica_root_incarnation, loaded.incarnation);
+    }
+
+    /// Prepare once under the caller's exclusive physical-root startup lease.
+    /// This signs a fixed preimage; it neither registers nor enrolls the root.
+    /// Steady-state reporting must not recapture a successor reporter preimage.
+    pub fn prepareNativeReporterRegistration(
+        self: *DataServer,
+        binding: @import("../metadata/standalone_native_owner.zig").Binding,
+        previous: ?antfly.metadata.StoreRecord,
+    ) !@import("../metadata/standalone_native_owner.zig").Registration {
+        if (self.remote_metadata != null or self.data_raft != null or self.api_server_cfg.deployment_mode != .standalone)
+            return error.UnsupportedNativeIndexOwner;
+        try binding.validate();
+        const registration = self.store_registration orelse return error.StoreRegistrationRequired;
+        if (registration.node_id != binding.node_id or registration.store_id != binding.store_id)
+            return error.StoreIdentityMismatch;
+        if (previous) |record| if (record.node_id != binding.node_id or record.store_id != binding.store_id or
+            record.replica_root_incarnation != binding.root_incarnation) return error.StoreRootEnrollmentChanged;
+        const runtime = try self.ensureBackendRuntime();
+        const io = runtime.apiIo() orelse return error.BackendRuntimeUnavailable;
+        const physical = try @import("antfly_local_sources").storage_db_root_identity.load(self.alloc, io, self.write_source.replica_root_dir);
+        if (physical.incarnation != binding.root_incarnation) return error.StoreRootEnrollmentChanged;
+        const signing = @import("antfly_local_sources").storage_db_root_signing_identity;
+        const pinned = blk: {
+            lockAtomic(&self.reporter_incarnation_mutex);
+            defer self.reporter_incarnation_mutex.unlock();
+            break :blk self.native_reporter_registration;
+        };
+        // Once metadata knows a verifier, losing its key is a recovery error,
+        // never permission to generate a replacement under the same UUID.
+        const known_key = pinned != null or (if (previous) |record| !std.mem.allEqual(u8, &record.replica_root_public_key, 0) else false);
+        const root = if (known_key)
+            try signing.load(self.alloc, io, self.write_source.replica_root_dir)
+        else
+            try signing.loadOrCreate(self.alloc, io, self.write_source.replica_root_dir);
+        if (root.root_incarnation != binding.root_incarnation) return error.StoreRootEnrollmentChanged;
+        try validatePreviousStoreRootSigning(previous, root.root_incarnation, root.public_key, true);
+        if (pinned) |request| {
+            if (!request.binding().eql(binding) or !std.mem.eql(u8, &request.identity.public_key, &root.public_key))
+                return error.StoreRootEnrollmentChanged;
+            return request;
+        }
+        const candidate: @import("../metadata/standalone_native_owner.zig").Registration = .{
+            .identity = .{ .metadata_incarnation = binding.metadata_incarnation, .node_id = binding.node_id, .store_id = binding.store_id, .root_incarnation = root.root_incarnation, .public_key = root.public_key },
+            .reporter_incarnation = try self.reporterIncarnation(),
+            .expected_reporter_incarnation = if (previous) |record| record.reporter_incarnation else null,
+            .signature = undefined,
+        };
+        lockAtomic(&self.reporter_incarnation_mutex);
+        defer self.reporter_incarnation_mutex.unlock();
+        if (self.native_reporter_registration) |request| {
+            if (!request.binding().eql(binding) or !std.mem.eql(u8, &request.identity.public_key, &root.public_key))
+                return error.StoreRootEnrollmentChanged;
+            return request;
+        }
+        self.native_reporter_registration = try candidate.sign(root);
+        return self.native_reporter_registration.?;
     }
 
     pub fn registerNodeIfConfigured(self: *DataServer) !void {
