@@ -362,7 +362,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .dependOn(&b.addRunArtifact(sql_index_ddl_tests).step);
     const sql_native_cells_tests = b.addTest(.{
         .root_module = api_http_runtime_test_mod,
-        .filters = &.{ "SQL pgwire native materialized", "SQL stateless fallback" },
+        .filters = &.{ "SQL pgwire native", "SQL stateless fallback" },
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
     b.step("antfly-api-sql-native-cells-test", "Verify native SQL result cells and retained-read requirements")
@@ -596,6 +596,14 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
     b.step("antfly-relational-index-system-test", "Run LSM index lifecycle, standby replay, and work-count benchmarks").dependOn(&addCuratedTestRunArtifact(b, relational_index_system_tests, relational_index_system_tests.filters).step);
+    const native_row_projection_tests = b.addTest(.{
+        .root_module = relational_index_system_mod,
+        .filters = &.{ "ordinal native SQL", "ordinal typed projection" },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("antfly-native-row-projection-test", "Verify native row projection ownership, nulls and allocation bounds")
+        .dependOn(&addFilteredTestRunArtifact(b, native_row_projection_tests).step);
+
     const retained_transfer_tests = b.addTest(.{
         .root_module = relational_index_system_mod,
         .filters = &.{ "relational index system rewrite", "relational index system retained", "relational index system merge tail", "relational index system source pin prepared crash", "storage.source_snapshot." },
@@ -2935,6 +2943,13 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         },
     });
     const lib_storage_test_step = b.step("antfly-storage-test", "Run local and server storage tests");
+    const coordinated_read_set_tests = b.addTest(.{
+        .root_module = antfly_test_mod,
+        .filters = &.{"relational index system coordinated read set"},
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("antfly-coordinated-read-set-test", "Verify merged page ownership and cursor failure lifetimes")
+        .dependOn(&addFilteredTestRunArtifact(b, coordinated_read_set_tests).step);
 
     const hot_standby_tests = b.addTest(.{
         .root_module = antfly_test_mod,

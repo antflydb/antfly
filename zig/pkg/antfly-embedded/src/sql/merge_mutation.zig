@@ -750,8 +750,8 @@ test "MERGE arm domains retain array identity and shared assignment inference" {
                 try std.testing.expect(!values[0].sql_null);
                 const array = values[0].array.?;
                 try std.testing.expectEqual(lower, array.dimensions[0].lower);
-                try std.testing.expectEqual(case.first, array.elements[0].value.integer);
-                try std.testing.expect(array.elements[1].sql_null);
+                try std.testing.expectEqual(case.first, array.flatCell(0).value.integer);
+                try std.testing.expect(array.flatCell(1).sql_null);
             } else {
                 try std.testing.expect(values[0].sql_null);
                 try std.testing.expect(values[0].array == null);
@@ -783,8 +783,8 @@ test "MERGE arm domains retain array identity and shared assignment inference" {
                     try std.testing.expect(stored != .null);
                     const decoded = try @import("array_wire.zig").decodeLeaky(a, .int64, stored, .{});
                     try std.testing.expectEqual(lower, decoded.dimensions[0].lower);
-                    try std.testing.expectEqual(case.first, decoded.elements[0].value.integer);
-                    try std.testing.expect(decoded.elements[1].sql_null);
+                    try std.testing.expectEqual(case.first, decoded.flatCell(0).value.integer);
+                    try std.testing.expect(decoded.flatCell(1).sql_null);
                 } else try std.testing.expect(stored == .null);
             }
         }

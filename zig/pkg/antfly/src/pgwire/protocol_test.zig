@@ -35,6 +35,8 @@ const Mock = struct {
     json_null_results: bool = false,
     array_results: bool = false,
     array_parameters: bool = false,
+    native_parameters: bool = false,
+    native_parameter_checks: usize = 0,
     result_override: ?backend.Result = null,
     result_cells: bool = false,
     ddl_pending: bool = false,
@@ -100,6 +102,7 @@ const Mock = struct {
     }
 
     fn source(self: *Mock) backend.Backend {
+        if (self.native_parameters) return .{ .context = self, .vtable = &.{ .native_parameters = true, .authenticate = authenticate, .describe = describe, .execute = Mock.execute, .load_settings = loadSettings, .validate_namespace = validateNamespace, .evaluate_parameters = evaluateParameters, .fail_transaction = failTransaction, .open_stream = openStream, .disconnect = disconnect } };
         return .{ .context = self, .vtable = &.{ .authenticate = authenticate, .describe = describe, .execute = Mock.execute, .load_settings = loadSettings, .validate_namespace = validateNamespace, .evaluate_parameters = evaluateParameters, .fail_transaction = failTransaction, .open_stream = openStream, .disconnect = disconnect } };
     }
     fn loadSettings(raw: *anyopaque, alloc: std.mem.Allocator, _: backend.Identity, request: backend.Request) !@import("antfly_local_sources").sql_setting_catalog.RawSnapshot {
@@ -303,7 +306,16 @@ const Mock = struct {
             if (self.array_parameters) {
                 try std.testing.expectEqual(@as(usize, 1), request.parameter_descriptors.len);
                 try std.testing.expectEqual(@as(?@import("antfly_local_sources").sql_array_value.ElementType, .int64), request.parameter_descriptors[0].element_type);
-                if (request.parameters[0] != .null) {
+                if (request.parameter_cells) |cells| {
+                    self.native_parameter_checks += 1;
+                    try std.testing.expect(request.parameters[0] == .null);
+                    if (!cells[0].sql_null) {
+                        const array = cells[0].array orelse return error.ExpectedNativeArray;
+                        try std.testing.expectEqual(@as(i32, -1), array.dimensions[0].lower);
+                        try std.testing.expectEqual(@as(i64, 9007199254740993), array.flatCell(0).value.integer);
+                        try std.testing.expect(array.flatCell(1).sql_null);
+                    }
+                } else if (request.parameters[0] != .null) {
                     var decoded = try @import("antfly_local_sources").sql_array_wire.decode(alloc, .int64, request.parameters[0], .{});
                     defer decoded.deinit();
                     try std.testing.expectEqual(@as(i32, -1), decoded.value.dimensions[0].lower);
@@ -448,7 +460,7 @@ fn tags(alloc: std.mem.Allocator, bytes: []const u8) ![]u8 {
 test "pgwire Parse Bind Execute retain inferred and declared array parameter identity" {
     const a = std.testing.allocator;
     const sources = @import("antfly_local_sources");
-    for ([_]u32{ 0, 1016 }) |declared| for ([_]u16{ 0, 1 }) |format| for ([_]bool{ false, true }) |is_null| {
+    for ([_]bool{ false, true }) |native_parameters| for ([_]u32{ 0, 1016 }) |declared| for ([_]u16{ 0, 1 }) |format| for ([_]bool{ false, true }) |is_null| {
         var input: std.Io.Writer.Allocating = .init(a);
         defer input.deinit();
         try startup(&input.writer);
@@ -479,7 +491,7 @@ test "pgwire Parse Bind Execute retain inferred and declared array parameter ide
         try execute(&input.writer, "p", 0);
         try frame(&input.writer, 'S', "");
         try frame(&input.writer, 'X', "");
-        var mock: Mock = .{ .array_parameters = true };
+        var mock: Mock = .{ .array_parameters = true, .native_parameters = native_parameters };
         var output = try run(&mock, input.written(), .{});
         defer output.deinit();
         var messages: protocol.Cursor = .{ .bytes = output.written() };
@@ -497,6 +509,7 @@ test "pgwire Parse Bind Execute retain inferred and declared array parameter ide
         }
         try std.testing.expectEqual(@as(usize, 1), descriptions);
         try std.testing.expectEqual(@as(usize, 1), mock.executions);
+        try std.testing.expectEqual(@as(usize, @intFromBool(native_parameters)), mock.native_parameter_checks);
     };
 }
 

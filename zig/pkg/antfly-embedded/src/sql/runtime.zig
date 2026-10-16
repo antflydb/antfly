@@ -30,6 +30,8 @@ pub const resource_limits = @import("resource_limits.zig");
 pub const Limits = struct {
     /// Internal transports opt into complete Datums; HTTP retains public JSON.
     native_result: bool = false,
+    /// Prepared transport cells; execution takes one owned typed copy.
+    parameter_cells: ?[]const Datum = null,
     error_context: ?*@import("errors.zig").Context = null,
     result_rows: usize = 128,
     mutation_rows: usize = 4096,
@@ -148,7 +150,7 @@ pub fn execute(alloc: std.mem.Allocator, backend: catalog.Backend, compiled: *co
     var result = Result{ .state = state, .output = undefined };
     errdefer result.deinit();
     const arena = state.arena.allocator();
-    statement_backend.parameter_fallback_types = try parameterFallbackTypes(arena, parameters);
+    statement_backend.parameter_fallback_types = try parameterFallbackTypesNative(arena, parameters, limits.parameter_cells);
     result.output = runBound(state.budget.allocator(), arena, statement_backend, compiled, parameters, limits, null) catch |err| {
         if (err == error.OutOfMemory and state.budget.exhausted) return error.SqlWorkingMemoryLimitExceeded;
         return err;
@@ -159,10 +161,23 @@ pub fn execute(alloc: std.mem.Allocator, backend: catalog.Backend, compiled: *co
 /// Execution-only transport hints fill polymorphic holes after SQL constraints
 /// converge. Prepare/Describe without values must not invent these types.
 /// The returned metadata belongs to the statement or cursor's owned arena.
+pub fn parameterFallbackTypesNative(arena: std.mem.Allocator, parameters: []const Json, cells: ?[]const Datum) ![]const ?ast.ColumnType {
+    const native = cells orelse return parameterFallbackTypes(arena, parameters);
+    if (native.len != parameters.len) return error.InvalidSqlParameters;
+    const kinds = try arena.alloc(?ast.ColumnType, native.len);
+    for (native, kinds) |cell, *kind| kind.* = if (cell.sql_null) null else if (cell.array != null) .array else if (cell.numeric != null) .number else parameterFallbackType(cell.value);
+    return kinds;
+}
+
 pub fn parameterFallbackTypes(arena: std.mem.Allocator, parameters: []const Json) ![]const ?ast.ColumnType {
     if (parameters.len > 1024) return error.InvalidSqlParameters;
     const types = try arena.alloc(?ast.ColumnType, parameters.len);
-    for (parameters, types) |value, *kind| kind.* = switch (value) {
+    for (parameters, types) |value, *kind| kind.* = parameterFallbackType(value);
+    return types;
+}
+
+fn parameterFallbackType(value: Json) ?ast.ColumnType {
+    return switch (value) {
         .null => null,
         .bool => .boolean,
         .integer => .integer,
@@ -173,7 +188,6 @@ pub fn parameterFallbackTypes(arena: std.mem.Allocator, parameters: []const Json
         // which the eventual integer coercion must reject rather than round.
         .number_string => |text| if (std.mem.indexOfAny(u8, text, ".eE") == null) .integer else .number,
     };
-    return types;
 }
 
 fn runBound(alloc: std.mem.Allocator, arena: std.mem.Allocator, backend: catalog.Backend, compiled: *const compiler.Compiled, parameters: []const Json, limits: Limits, sink: ?RowSink) !Output {
@@ -198,7 +212,7 @@ fn runBound(alloc: std.mem.Allocator, arena: std.mem.Allocator, backend: catalog
     var statement_backend = backend;
     statement_backend.execution_binding_validator = null;
     statement_backend.parameter_invocation = binding.parameter_invocation;
-    if (binding.parameter_invocation) |invocation| try invocation.prepareJson(alloc, parameters, .{ .bytes = limits.retained_bytes, .wire_bytes = limits.retained_bytes, .error_context = backend.error_context });
+    if (binding.parameter_invocation) |invocation| try invocation.prepareNativeOrJson(alloc, parameters, limits.parameter_cells, .{ .bytes = limits.retained_bytes, .wire_bytes = limits.retained_bytes, .error_context = backend.error_context });
     defer if (binding.parameter_invocation) |invocation| invocation.deinitFrame();
     const prepared_parameters = if (binding.parameter_invocation) |invocation| try invocation.compatibilityValues(arena) else parameters;
     var manager: ?@import("spill.zig").Manager = null;
@@ -2522,9 +2536,9 @@ fn mutationArrayOwnershipScenario(backing: std.mem.Allocator) !void {
     const row = try adapter.row(a, mutation, mutation);
     const array = (try row.cell("a")).array.?;
     try std.testing.expectEqual(@as(i32, 0), array.dimensions[0].lower);
-    try std.testing.expect(array.elements[0].value == .null and !array.elements[0].sql_null);
-    try std.testing.expect(array.elements[1].sql_null);
-    try std.testing.expectEqualStrings("2", array.elements[2].value.object.get("x").?.array.items[1].number_string);
+    try std.testing.expect(array.flatCell(0).value == .null and !array.flatCell(0).sql_null);
+    try std.testing.expect(array.flatCell(1).sql_null);
+    try std.testing.expectEqualStrings("2", array.flatCell(2).value.object.get("x").?.array.items[1].number_string);
     try std.testing.expect(!(try row.cell("j")).sql_null);
     const narrow = try Context.ReturningImages.init(a, table, &.{"n"});
     try std.testing.expect(!narrow.projection.has_typed_cells);
@@ -3807,9 +3821,9 @@ test "SQL shared invocation arrays cross derived set grouped window and recursiv
     try std.testing.expect(!result.output.sql_nulls.?[1][0]);
     var decoded = try @import("array_wire.zig").decode(std.testing.allocator, .int64, result.output.rows[1][0], .{});
     defer decoded.deinit();
-    try std.testing.expectEqual(@as(i64, 9007199254740993), decoded.value.elements[0].value.integer);
+    try std.testing.expectEqual(@as(i64, 9007199254740993), decoded.value.flatCell(0).value.integer);
     try std.testing.expectEqual(@as(i32, -1), decoded.value.dimensions[0].lower);
-    try std.testing.expect(decoded.value.elements[1].sql_null);
+    try std.testing.expect(decoded.value.flatCell(1).sql_null);
     var recursive = try compiler.compile(std.testing.allocator, "WITH RECURSIVE r(n) AS (SELECT cardinality($1::integer[]) UNION ALL SELECT n-1 FROM r WHERE n>1) SELECT n FROM r ORDER BY n", .{});
     defer recursive.deinit();
     var recursion = try execute(std.testing.allocator, fixture.iface(), &recursive, &.{.{ .string = "{1,2,3}" }}, .{});
@@ -3833,9 +3847,9 @@ test "SQL invocation arrays own public envelopes and reject invalid inputs befor
     try std.testing.expectEqualStrings("42", result.output.rows[0][1].string);
     var decoded = try @import("array_wire.zig").decode(a, .int64, result.output.rows[0][0], .{});
     defer decoded.deinit();
-    try std.testing.expectEqual(@as(i64, 9007199254740993), decoded.value.elements[0].value.integer);
+    try std.testing.expectEqual(@as(i64, 9007199254740993), decoded.value.flatCell(0).value.integer);
     try std.testing.expectEqual(@as(i32, -1), decoded.value.dimensions[0].lower);
-    try std.testing.expect(decoded.value.elements[1].sql_null);
+    try std.testing.expect(decoded.value.flatCell(1).sql_null);
     var checked = try compiler.compile(a, "SELECT id FROM things WHERE id=ANY($1::smallint[])", .{});
     defer checked.deinit();
     try std.testing.expectError(error.SqlNumericOutOfRange, execute(a, fixture.iface(), &checked, &.{.{ .string = "{32768}" }}, .{}));
@@ -3874,11 +3888,11 @@ test "SQL typed array navigation promotes defaults without dropping bounds or SQ
             var second = try @import("array_wire.zig").decode(a, .float64, result.output.rows[1][0], .{});
             defer second.deinit();
             try std.testing.expectEqual(@as(i32, 0), first.value.dimensions[0].lower);
-            try std.testing.expectEqual(@as(f64, 3.5), first.value.elements[0].value.float);
-            try std.testing.expect(first.value.elements[1].sql_null);
+            try std.testing.expectEqual(@as(f64, 3.5), first.value.flatCell(0).value.float);
+            try std.testing.expect(first.value.flatCell(1).sql_null);
             try std.testing.expectEqual(@as(i32, -1), second.value.dimensions[0].lower);
-            try std.testing.expectEqual(@as(f64, 1), second.value.elements[0].value.float);
-            try std.testing.expect(second.value.elements[1].sql_null);
+            try std.testing.expectEqual(@as(f64, 1), second.value.flatCell(0).value.float);
+            try std.testing.expect(second.value.flatCell(1).sql_null);
         }
     };
     try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Faults.run, .{});
@@ -5624,9 +5638,9 @@ test "SQL native transport results retain typed arrays numeric and null provenan
         try std.testing.expectEqual(@as(usize, 1), result.output.rowCount());
         try std.testing.expectEqual(@as(usize, 0), result.output.rows.len);
         const cells = result.output.native_rows.?[0];
-        try std.testing.expectEqual(@as(usize, 3), cells[0].array.?.elements.len);
-        try std.testing.expect(cells[0].array.?.elements[1].sql_null);
-        try std.testing.expectEqual(@as(i64, 9007199254740993), cells[0].array.?.elements[2].value.integer);
+        try std.testing.expectEqual(@as(usize, 3), cells[0].array.?.cardinality());
+        try std.testing.expect(cells[0].array.?.flatCell(1).sql_null);
+        try std.testing.expectEqual(@as(i64, 9007199254740993), cells[0].array.?.flatCell(2).value.integer);
         var numeric_context: @import("numeric_value.zig").Context = .{ .alloc = a };
         const text = try @import("numeric_value.zig").format(&numeric_context, cells[1].numeric.?.*);
         defer a.free(text);
@@ -5675,8 +5689,8 @@ test "SQL native transport mutation returning retains complete typed rows before
         try std.testing.expect(result.output.native_rows.?.len > 0);
         try std.testing.expect(result.output.sql_nulls == null);
         for (result.output.native_rows.?) |row| {
-            try std.testing.expectEqual(@as(i64, 9007199254740993), row[0].array.?.elements[0].value.integer);
-            try std.testing.expect(row[0].array.?.elements[1].sql_null);
+            try std.testing.expectEqual(@as(i64, 9007199254740993), row[0].array.?.flatCell(0).value.integer);
+            try std.testing.expect(row[0].array.?.flatCell(1).sql_null);
             try std.testing.expect(row[1].numeric != null and !row[1].sql_null);
             try std.testing.expect(!row[2].sql_null and row[2].value == .null);
             try std.testing.expect(row[3].sql_null);
@@ -5744,4 +5758,38 @@ test "SQL native transport does not retain execution pattern callbacks" {
     const row = try context.resultRow(&.{.{ .value = .{ .string = "retained" }, .sql_null = false, .patterns = &patterns }}, &.{.{ .name = "p", .type = .string }});
     try std.testing.expect(row.native.?[0].patterns == null);
     try std.testing.expectEqualStrings("retained", row.native.?[0].value.string);
+}
+
+test "SQL native transport parameters retain arrays numeric JSON null and source ownership" {
+    const Probe = struct {
+        fn checkpoint(_: *anyopaque) !void {}
+        fn run(a: std.mem.Allocator) !void {
+            var inputs = std.heap.ArenaAllocator.init(a);
+            defer inputs.deinit();
+            const owned = inputs.allocator();
+            const array = try owned.create(@import("array_value.zig").Value);
+            array.* = (try @import("array_text.zig").decodeLeaky(owned, .int64, "[-1:1]={9007199254740993,NULL,-7}", .{})).value;
+            var ctx: @import("numeric_value.zig").Context = .{ .alloc = owned };
+            const number = try @import("numeric_value.zig").parse(&ctx, "9007199254740993.1200");
+            const cells = [_]Datum{ .typedArray(array), .typedNumeric(&number.value), .json(.null), .{} };
+            var marker: u8 = 0;
+            const backend: catalog.Backend = .{ .ptr = &marker, .vtable = &.{ .resolve = undefined, .scan = undefined, .mutate = undefined, .checkpoint = checkpoint } };
+            var compiled = try compiler.compile(a, "SELECT $1::bigint[], $2::numeric, $3::jsonb, $4::numeric", .{});
+            defer compiled.deinit();
+            var result = try execute(a, backend, &compiled, &.{ .null, .null, .null, .null }, .{ .native_result = true, .parameter_cells = &cells });
+            defer result.deinit();
+            _ = inputs.reset(.free_all);
+            const row = result.output.native_rows.?[0];
+            try std.testing.expectEqual(@as(i64, 9007199254740993), row[0].array.?.flatCell(0).value.integer);
+            try std.testing.expectEqual(@as(i32, -1), row[0].array.?.dimensions[0].lower);
+            try std.testing.expect(row[0].array.?.flatCell(1).sql_null);
+            var context: @import("numeric_value.zig").Context = .{ .alloc = a };
+            const text = try @import("numeric_value.zig").format(&context, row[1].numeric.?.*);
+            defer a.free(text);
+            try std.testing.expectEqualStrings("9007199254740993.1200", text);
+            try std.testing.expect(row[2].value == .null and !row[2].sql_null);
+            try std.testing.expect(row[3].sql_null);
+        }
+    };
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Probe.run, .{});
 }

@@ -72,7 +72,7 @@ pub const Prepared = struct {
     pub fn init(backing: A, input: arrays.Value, options: Options) !Prepared {
         var work: arrays.Budget = .{ .remaining = options.values.work, .shared = options.context };
         try work.consume(0);
-        const value = arrays.Value.initWithBudget(input.element_type, input.dimensions, input.elements, options.values, &work) catch |err| return preparationError(options, err);
+        const value = input.validateWithBudget(options.values, &work) catch |err| return preparationError(options, err);
         if (value.dimensions.len != input.dimensions.len) return error.InvalidSqlArrayShape;
         var budget: MemoryBudget = .{ .backing = backing, .limit = options.values.bytes };
         return initAdmitted(backing, budget.allocator(), value, options, &work) catch |err| return preparationError(options, quotaError(&budget, err));
@@ -80,19 +80,21 @@ pub const Prepared = struct {
 
     fn initAdmitted(backing: A, scratch: A, value: arrays.Value, options: Options, work: *arrays.Budget) !Prepared {
         var non_null: usize = 0;
-        for (value.elements) |element| {
+        for (0..value.cardinality()) |array_cell_0| {
+            const element = value.flatCell(array_cell_0);
             try work.consume(1);
             non_null += @intFromBool(!element.sql_null);
         }
-        var size = try layout.encodedSectionSize(value.element_type, value.dimensions.len, value.elements.len, non_null);
+        var size = try layout.encodedSectionSize(value.element_type, value.dimensions.len, value.cardinality(), non_null);
         if (size > options.wire_bytes) return error.SqlProgramLimitExceeded;
-        const jsonb = try scratch.alloc(?[]const u8, if (value.element_type == .jsonb) value.elements.len else 0);
+        const jsonb = try scratch.alloc(?[]const u8, if (value.element_type == .jsonb) value.cardinality() else 0);
         @memset(jsonb, null);
         errdefer {
             for (jsonb) |bytes| if (bytes) |owned| scratch.free(owned);
             scratch.free(jsonb);
         }
-        if (layout.width(value.element_type) == 0) for (value.elements, 0..) |element, i| {
+        if (layout.width(value.element_type) == 0) for (0..value.cardinality(), 0..) |array_cell_0, i| {
+            const element = value.flatCell(array_cell_0);
             if (element.sql_null) continue;
             if (value.element_type == .numeric) {
                 var none = std.heap.FixedBufferAllocator.init(&.{});
@@ -113,7 +115,7 @@ pub const Prepared = struct {
             size = std.math.add(usize, size, payload.len) catch return error.SqlProgramLimitExceeded;
             if (size > options.wire_bytes or size > std.math.maxInt(u32)) return error.SqlProgramLimitExceeded;
         };
-        return .{ .value = value, .allocator = backing, .jsonb = jsonb, .encoded_size = size, .compact = layout.usesCompact(value.element_type, value.elements.len, non_null), .work = work.* };
+        return .{ .value = value, .allocator = backing, .jsonb = jsonb, .encoded_size = size, .compact = layout.usesCompact(value.element_type, value.cardinality(), non_null), .work = work.* };
     }
 
     pub fn deinit(self: *Prepared) void {
@@ -135,21 +137,22 @@ pub const Prepared = struct {
         bytes[0] = layout.version;
         bytes[1] = @intCast(self.value.dimensions.len);
         bytes[2] = @intFromBool(self.compact);
-        std.mem.writeInt(u32, bytes[4..8], @intCast(self.value.elements.len), .little);
-        if (self.value.elements.len == 0) return;
+        std.mem.writeInt(u32, bytes[4..8], @intCast(self.value.cardinality()), .little);
+        if (self.value.cardinality() == 0) return;
         for (self.value.dimensions, 0..) |dimension, i| {
             const at = layout.header_size + i * 8;
             std.mem.writeInt(u32, bytes[at..][0..4], dimension.length, .little);
             std.mem.writeInt(i32, bytes[at + 4 ..][0..4], dimension.lower, .little);
         }
         const bitmap_start = layout.header_size + self.value.dimensions.len * 8;
-        const slots_start = bitmap_start + layout.bitmapSize(self.value.elements.len);
+        const slots_start = bitmap_start + layout.bitmapSize(self.value.cardinality());
         const width = layout.width(self.value.element_type);
-        const values_start = slots_start + if (self.compact) layout.checkpointSize(self.value.elements.len) else @as(usize, 0);
-        const payload_start = try layout.sectionSize(self.value.element_type, self.value.dimensions.len, self.value.elements.len);
+        const values_start = slots_start + if (self.compact) layout.checkpointSize(self.value.cardinality()) else @as(usize, 0);
+        const payload_start = try layout.sectionSize(self.value.element_type, self.value.dimensions.len, self.value.cardinality());
         var payload_at: usize = 0;
         var non_null: usize = 0;
-        for (self.value.elements, 0..) |element, i| {
+        for (0..self.value.cardinality(), 0..) |array_cell_0, i| {
+            const element = self.value.flatCell(array_cell_0);
             try self.work.consume(1);
             if (self.compact and i % 64 == 0) std.mem.writeInt(u32, bytes[slots_start + i / 64 * 4 ..][0..4], @intCast(non_null), .little);
             if (element.sql_null) bytes[bitmap_start + i / 8] |= @as(u8, 1) << @intCast(i % 8);
@@ -197,8 +200,8 @@ pub const Prepared = struct {
                 else => unreachable,
             }
         }
-        if (self.compact) std.mem.writeInt(u32, bytes[slots_start + (self.value.elements.len + 63) / 64 * 4 ..][0..4], @intCast(non_null), .little);
-        if (width == 0) std.mem.writeInt(u32, bytes[slots_start + self.value.elements.len * 4 ..][0..4], @intCast(payload_at), .little);
+        if (self.compact) std.mem.writeInt(u32, bytes[slots_start + (self.value.cardinality() + 63) / 64 * 4 ..][0..4], @intCast(non_null), .little);
+        if (width == 0) std.mem.writeInt(u32, bytes[slots_start + self.value.cardinality() * 4 ..][0..4], @intCast(payload_at), .little);
     }
 };
 
@@ -328,6 +331,22 @@ pub fn decode(backing: A, expected: arrays.ElementType, bytes: []const u8, optio
     return .{ .arena = arena, .budget = budget, .value = decoded.value };
 }
 
+/// Keep canonical primitive/text payloads compact across page ownership.
+/// Variable codecs requiring allocated element objects retain normal decoding.
+pub fn viewLeaky(a: A, expected: arrays.ElementType, bytes: []const u8, options: Options) !arrays.Value {
+    switch (expected) {
+        .uuid, .numeric, .jsonb => return (try decodeLeaky(a, expected, bytes, options)).value,
+        else => {},
+    }
+    var view = try validateCanonical(a, expected, bytes, options);
+    view.bytes = try a.dupe(u8, bytes);
+    const dimensions = try a.alloc(arrays.Dimension, view.rank);
+    for (dimensions, 0..) |*axis, index| axis.* = try view.dimension(index);
+    const owned_view = try a.create(layout.View);
+    owned_view.* = view;
+    return .{ .element_type = expected, .dimensions = dimensions, .stored = owned_view };
+}
+
 /// Owns all decoded payloads in the caller's region; no scratch-allocator
 /// references escape in nested JSON arrays. Callers destroy the region on error.
 pub fn decodeLeaky(backing: A, expected: arrays.ElementType, bytes: []const u8, options: Options) !Decoded {
@@ -451,7 +470,9 @@ test "SQL flat stored arrays roundtrip PostgreSQL binary goldens with canonical 
         defer decoded.deinit();
         var work: arrays.Budget = .{};
         try std.testing.expectEqual(std.math.Order.eq, try original.value.compare(decoded.value, &work));
-        if (entry.element_type == .float32 or entry.element_type == .float64) for (original.value.elements, decoded.value.elements) |left, right| {
+        if (entry.element_type == .float32 or entry.element_type == .float64) for (0..original.value.cardinality(), 0..decoded.value.cardinality()) |array_cell_0, array_cell_1| {
+            const left = original.value.flatCell(array_cell_0);
+            const right = decoded.value.flatCell(array_cell_1);
             if (left.sql_null or std.math.isNan(left.value.float)) continue;
             try std.testing.expectEqual(@as(u64, @bitCast(left.value.float)), @as(u64, @bitCast(right.value.float)));
         };
@@ -486,10 +507,10 @@ test "SQL flat array stacking copies canonical PostgreSQL domains without decode
         try shape.append(original.value.dimensions);
         try shape.append(original.value.dimensions);
         const stacked = try shape.finish(65536);
-        const cells = try a.alloc(arrays.Element, original.value.elements.len * 2);
+        const cells = try a.alloc(arrays.Element, original.value.cardinality() * 2);
         defer a.free(cells);
-        @memcpy(cells[0..original.value.elements.len], original.value.elements);
-        @memcpy(cells[original.value.elements.len..], original.value.elements);
+        @memcpy(cells[0..original.value.cardinality()], original.value.elements);
+        @memcpy(cells[original.value.cardinality()..], original.value.elements);
         const value = try arrays.Value.init(entry.element_type, stacked.axes[0..stacked.rank], cells, .{});
         const expected = try encodeAlloc(a, value, .{});
         defer a.free(expected);
@@ -677,7 +698,7 @@ test "SQL flat array strict JSONB restore rejects equivalent noncanonical bytes 
     var owned = try decode(a, .jsonb, canonical, .{});
     defer owned.deinit();
     // Nested managed arrays retain the owned region, not a stack quota wrapper.
-    const nested = owned.value.elements[0].value.object.getPtr("a").?;
+    const nested = owned.value.flatCell(0).value.object.getPtr("a").?;
     try nested.array.append(.{ .integer = 4 });
     try std.testing.expectEqual(@as(usize, 4), nested.array.items.len);
 }
@@ -740,7 +761,7 @@ test "SQL flat array NUMERIC logical hashes ignore display scale and retain shap
         defer decoded.deinit();
         var work: arrays.Budget = .{};
         try std.testing.expectEqual(std.math.Order.eq, try decoded.value.compare(r, &work));
-        try std.testing.expectEqual(left.value.scale, decoded.value.elements[0].numeric.?.scale);
+        try std.testing.expectEqual(left.value.scale, decoded.value.flatCell(0).numeric.?.scale);
         const again = try encodeAlloc(a, decoded.value, .{});
         defer a.free(again);
         try std.testing.expectEqualSlices(u8, lb, again);
@@ -789,8 +810,8 @@ test "SQL flat array NUMERIC borrowed validation is allocation free and ownershi
     var decoded = try decode(counted.allocator(), .numeric, bytes, .{});
     defer decoded.deinit();
     const decode_ns = std.Io.Clock.now(.awake, std.testing.io).nanoseconds - decode_start;
-    try std.testing.expectEqual(@as(usize, 4096), decoded.value.elements.len);
-    try std.testing.expectEqual(number.value.scale, decoded.value.elements[4095].numeric.?.scale);
+    try std.testing.expectEqual(@as(usize, 4096), decoded.value.cardinality());
+    try std.testing.expectEqual(number.value.scale, decoded.value.flatCell(4095).numeric.?.scale);
     std.debug.print("SQL NUMERIC array owned decode: cells=4096 bytes={} backing_allocations={} elapsed_ns={}\n", .{ bytes.len, counted.alloc_index, decode_ns });
     const Faults = struct {
         fn run(alloc: A, input: arrays.Value) !void {
@@ -987,7 +1008,7 @@ test "SQL flat array strict readers poll directory and UTF8 scans with sticky ca
     try std.testing.expectEqual(@as(usize, 6), copy_cancel.calls);
     var owned = try decode(a, .text, strings, .{});
     defer owned.deinit();
-    try std.testing.expectEqualStrings(&text, owned.value.elements[0].value.string);
+    try std.testing.expectEqualStrings(&text, owned.value.flatCell(0).value.string);
     const corrupt = try a.dupe(u8, strings);
     defer a.free(corrupt);
     const view = try layout.View.open(.text, strings, .{});
@@ -1221,4 +1242,109 @@ test "SQL flat array primitive preparation uses one output allocation and cold s
         try std.testing.expect(total >= 10_000 * count);
         std.debug.print("SQL flat {s} array: cells={} stored_bytes={} pg_wire_bytes={} projected=10000 elapsed_ns={} preparation_allocations=0 output_allocations=1\n", .{ @tagName(kind), count, bytes.len, pg.count, std.Io.Clock.now(.awake, std.testing.io).nanoseconds - started });
     }
+}
+
+test "SQL compact stored array views preserve codecs operations and owned clones" {
+    const a = std.testing.allocator;
+    for ([_]struct { kind: arrays.ElementType, text: []const u8 }{
+        .{ .kind = .int64, .text = "[-1:1]={9007199254740993,NULL,-7}" },
+        .{ .kind = .int32, .text = "{1,2,3}" },
+        .{ .kind = .int16, .text = "{1,NULL,-32768}" },
+        .{ .kind = .float32, .text = "{1.5,NaN,Infinity,NULL}" },
+        .{ .kind = .float64, .text = "{-Infinity,1.5,NaN,NULL}" },
+        .{ .kind = .boolean, .text = "{t,NULL,f}" },
+        .{ .kind = .text, .text = "[-1:1]={\"é\",NULL,\"retained\"}" },
+        .{ .kind = .int64, .text = "[0:1][2:3]={{1,NULL},{3,4}}" },
+        .{ .kind = .int64, .text = "{}" },
+    }) |case| {
+        var source = try @import("array_text.zig").decode(a, case.kind, case.text, .{});
+        defer source.deinit();
+        const encoded = try encodeAlloc(a, source.value, .{});
+        defer a.free(encoded);
+        var region = std.heap.ArenaAllocator.init(a);
+        defer region.deinit();
+        const compact = try viewLeaky(region.allocator(), case.kind, encoded, .{});
+        try std.testing.expect(compact.stored != null and compact.elements.len == 0);
+        const roundtrip = try encodeAlloc(a, compact, .{});
+        defer a.free(roundtrip);
+        try std.testing.expectEqualSlices(u8, encoded, roundtrip);
+        var work: arrays.Budget = .{};
+        try std.testing.expectEqual(std.math.Order.eq, try source.value.compare(compact, &work));
+        try std.testing.expectEqual(try source.value.semanticHash(&work), try compact.semanticHash(&work));
+        for ([_]bool{ false, true }) |binary| {
+            var expected: std.Io.Writer.Allocating = .init(a);
+            defer expected.deinit();
+            var actual: std.Io.Writer.Allocating = .init(a);
+            defer actual.deinit();
+            if (binary) {
+                try @import("array_binary.zig").encode(source.value, &expected.writer, .{});
+                try @import("array_binary.zig").encode(compact, &actual.writer, .{});
+            } else {
+                try @import("array_text.zig").encode(source.value, &expected.writer, .{});
+                try @import("array_text.zig").encode(compact, &actual.writer, .{});
+            }
+            try std.testing.expectEqualStrings(expected.written(), actual.written());
+        }
+        if (compact.dimensions.len == 1) {
+            const needle = compact.flatCell(0);
+            try std.testing.expectEqual(try source.value.position(needle, null, &work), try compact.position(needle, null, &work));
+            const appended = try compact.append(region.allocator(), needle, false, .{}, &work);
+            try std.testing.expectEqual(compact.cardinality() + 1, appended.cardinality());
+            const concat = try compact.concatenate(region.allocator(), compact, .{}, &work);
+            try std.testing.expectEqual(compact.cardinality() * 2, concat.cardinality());
+        }
+        const clone = try @import("operators.zig").cloneDatum(region.allocator(), .typedArray(&compact));
+        @memset(encoded, 0);
+        try std.testing.expectEqual(std.math.Order.eq, try source.value.compare(clone.array.?.*, &work));
+    }
+}
+
+test "SQL compact stored array views avoid expanded element allocation" {
+    const a = std.testing.allocator;
+    const test_alloc = @import("../storage/lite/test_allocator.zig");
+    const elements = try a.alloc(arrays.Element, 32768);
+    defer a.free(elements);
+    @memset(elements, .json(.{ .integer = 42 }));
+    const value = try arrays.Value.init(.int64, &.{.{ .length = 32768 }}, elements, .{});
+    const encoded = try encodeAlloc(a, value, .{});
+    defer a.free(encoded);
+    var peaks: [2]usize = undefined;
+    for ([_]bool{ false, true }, &peaks) |compact, *peak| {
+        var nr: test_alloc.NoResizeAllocator = .{ .backing = a };
+        var budget: test_alloc.BudgetAllocator = .{ .backing = nr.allocator() };
+        {
+            var arena = std.heap.ArenaAllocator.init(budget.allocator());
+            defer arena.deinit();
+            const array = if (compact) try viewLeaky(arena.allocator(), .int64, encoded, .{}) else (try decodeLeaky(arena.allocator(), .int64, encoded, .{})).value;
+            try std.testing.expectEqual(@as(usize, 32768), array.cardinality());
+            try std.testing.expectEqual(@as(i64, 42), array.flatCell(32767).value.integer);
+            peak.* = budget.peak;
+        }
+        try std.testing.expectEqual(@as(usize, 0), budget.live);
+    }
+    try std.testing.expect(peaks[1] < peaks[0] / 4);
+    std.debug.print("SQL compact array: decoded_peak={d} compact_peak={d}\n", .{ peaks[0], peaks[1] });
+}
+
+test "SQL compact stored array views unwind every allocation failure" {
+    const Probe = struct {
+        fn run(a: A) !void {
+            var source = try @import("array_text.zig").decode(a, .text, "[-1:1]={\"é\",NULL,\"retained\"}", .{});
+            defer source.deinit();
+            const bytes = try encodeAlloc(a, source.value, .{});
+            defer a.free(bytes);
+            var region = std.heap.ArenaAllocator.init(a);
+            defer region.deinit();
+            const compact = try viewLeaky(region.allocator(), .text, bytes, .{});
+            var owned = try arrays.Owned.init(a, compact, .{});
+            defer owned.deinit();
+            _ = region.reset(.free_all);
+            @memset(bytes, 0);
+            try std.testing.expect(owned.value.stored != null);
+            try std.testing.expectEqualStrings("retained", owned.value.flatCell(2).value.string);
+            var work: arrays.Budget = .{};
+            try std.testing.expectEqual(std.math.Order.eq, try source.value.compare(owned.value, &work));
+        }
+    };
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Probe.run, .{});
 }

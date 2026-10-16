@@ -504,38 +504,40 @@ const Encoder = struct {
     }
     fn cells(self: *Encoder, values: []const Datum) anyerror!void {
         try self.word(values.len);
-        for (values) |value| {
-            try self.append(&.{@intFromBool(value.sql_null)});
-            if (value.numeric) |number| {
-                if (value.sql_null or value.array != null or value.patterns != null or value.value != .null) return error.SqlTypeMismatch;
-                const numeric = @import("numeric_value.zig");
-                const binary = @import("numeric_binary.zig");
-                var context: numeric.Context = .{ .alloc = self.a, .max_output_bytes = self.limit };
-                const length = try binary.encodedSize(&context, number.*);
-                try self.append(&.{10});
-                try self.word(length);
-                if (length > self.limit -| self.bytes.items.len) return error.SqlProgramLimitExceeded;
-                const start = self.bytes.items.len;
-                try self.bytes.resize(self.a, start + length);
-                var writer: std.Io.Writer = .fixed(self.bytes.items[start..]);
-                try binary.encode(&context, number.*, &writer);
-            } else if (value.array) |array| {
-                if (value.sql_null or value.patterns != null or value.value != .null) return error.SqlTypeMismatch;
-                const validated = try @import("array_value.zig").Value.init(array.element_type, array.dimensions, array.elements, if (self.manager) |manager| manager.array_limits else .{});
-                if (validated.dimensions.len != array.dimensions.len) return error.InvalidSqlArrayShape;
-                try self.append(&.{ 9, @backingInt(array.element_type) });
-                try self.word(array.dimensions.len);
-                for (array.dimensions) |dimension| {
-                    try self.word(dimension.length);
-                    try self.word(@bitCast(@as(i64, dimension.lower)));
-                }
-                try self.cells(array.elements);
-            } else if (value.patterns) |pattern| {
-                const id = try (self.manager orelse return error.InvalidSqlSpill).patternId(pattern);
-                try self.append(&.{8});
-                try self.word(id);
-            } else try self.json(value.value, 0);
-        }
+        for (values) |value| try self.cell(value);
+    }
+    fn cell(self: *Encoder, value: Datum) anyerror!void {
+        try self.append(&.{@intFromBool(value.sql_null)});
+        if (value.numeric) |number| {
+            if (value.sql_null or value.array != null or value.patterns != null or value.value != .null) return error.SqlTypeMismatch;
+            const numeric = @import("numeric_value.zig");
+            const binary = @import("numeric_binary.zig");
+            var context: numeric.Context = .{ .alloc = self.a, .max_output_bytes = self.limit };
+            const length = try binary.encodedSize(&context, number.*);
+            try self.append(&.{10});
+            try self.word(length);
+            if (length > self.limit -| self.bytes.items.len) return error.SqlProgramLimitExceeded;
+            const start = self.bytes.items.len;
+            try self.bytes.resize(self.a, start + length);
+            var writer: std.Io.Writer = .fixed(self.bytes.items[start..]);
+            try binary.encode(&context, number.*, &writer);
+        } else if (value.array) |array| {
+            if (value.sql_null or value.patterns != null or value.value != .null) return error.SqlTypeMismatch;
+            const validated = try array.validate(if (self.manager) |manager| manager.array_limits else .{});
+            if (validated.dimensions.len != array.dimensions.len) return error.InvalidSqlArrayShape;
+            try self.append(&.{ 9, @backingInt(array.element_type) });
+            try self.word(array.dimensions.len);
+            for (array.dimensions) |dimension| {
+                try self.word(dimension.length);
+                try self.word(@bitCast(@as(i64, dimension.lower)));
+            }
+            try self.word(array.cardinality());
+            for (0..array.cardinality()) |index| try self.cell(array.flatCell(index));
+        } else if (value.patterns) |pattern| {
+            const id = try (self.manager orelse return error.InvalidSqlSpill).patternId(pattern);
+            try self.append(&.{8});
+            try self.word(id);
+        } else try self.json(value.value, 0);
     }
     fn json(self: *Encoder, value: std.json.Value, depth: usize) anyerror!void {
         if (depth > 64) return error.SqlProgramLimitExceeded;
@@ -2545,8 +2547,8 @@ test "SQL typed array spill codec preserves complete cells and rejects every tru
             const cells = try decoder.cells();
             try std.testing.expectEqual(std.math.Order.eq, try scalar.compareDatums(Datum.typedArray(&value), cells[0]));
             try std.testing.expectEqual(try scalar.semanticHashDatum(Datum.typedArray(&value)), try scalar.semanticHashDatum(cells[0]));
-            try std.testing.expect(!cells[0].array.?.elements[0].sql_null);
-            try std.testing.expect(cells[0].array.?.elements[1].sql_null);
+            try std.testing.expect(!cells[0].array.?.flatCell(0).sql_null);
+            try std.testing.expect(cells[0].array.?.flatCell(1).sql_null);
             for (0..bytes.items.len) |length| {
                 _ = arena.reset(.free_all);
                 decoder = .{ .manager = &manager, .a = arena.allocator(), .bytes = bytes.items[0..length] };
@@ -2566,7 +2568,7 @@ test "SQL typed array spill codec preserves complete cells and rejects every tru
             bytes.items[10] = kind;
         }
     };
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, Harness.run, .{});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Harness.run, .{});
 }
 
 test "SQL typed array row and column spill preserve dimensions and NULL provenance" {
@@ -2610,7 +2612,7 @@ test "SQL typed array row and column spill preserve dimensions and NULL provenan
     manager.array_limits.elements = 65536;
     const compact_offset = try file.append(.{ .values = &.{Datum.typedArray(&compact)}, .keys = &.{}, .ordinal = 8 }, none);
     const compact_row = try file.read(arena.allocator(), compact_offset);
-    try std.testing.expectEqual(@as(usize, 32), compact_row.row.values[0].array.?.elements.len);
+    try std.testing.expectEqual(@as(usize, 32), compact_row.row.values[0].array.?.cardinality());
 }
 
 test "SQL spill quotas cancellation and corrupt records fail without leaked files" {

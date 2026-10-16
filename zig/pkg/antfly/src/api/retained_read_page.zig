@@ -45,6 +45,31 @@ pub fn encode(alloc: A, sequence: u64, rows: []const View.Row, after: ?[]const u
     };
 }
 
+const LayoutKey = struct { pointer: usize, len: usize };
+const RowPlan = struct {
+    input: *const View.Row,
+    ordinals: ?[]const ?usize,
+    fn present(self: RowPlan, names: []const []const u8, ordinal: usize) !bool {
+        const mapping = self.ordinals orelse return self.input.sqlRow().hasField(names[ordinal]);
+        const source = mapping[ordinal] orelse return false;
+        const cells = self.input.typed_cells.?;
+        if (source >= cells.count()) return error.InvalidRetainedReadPage;
+        return if (cells.presence) |flags| flags[source] else true;
+    }
+    fn value(self: RowPlan, names: []const []const u8, ordinal: usize) !Datum {
+        // _id is transport-owned even if a provider includes a payload slot.
+        if (std.mem.eql(u8, names[ordinal], "_id")) return self.input.cell("_id");
+        const mapping = self.ordinals orelse return self.input.cell(names[ordinal]);
+        const source = mapping[ordinal] orelse return .{};
+        const result = try self.input.typed_cells.?.at(source);
+        if ((!try self.present(names, ordinal) and !result.sql_null) or
+            (result.sql_null and (result.value != .null or result.array != null or result.numeric != null)) or
+            (result.array != null and (result.value != .null or result.numeric != null or result.patterns != null)) or
+            (result.numeric != null and (result.value != .null or result.patterns != null))) return error.InvalidRetainedReadPage;
+        return result;
+    }
+};
+
 fn encodeBounded(alloc: A, output_budget: *sources.sql_memory_budget, sequence: u64, rows: []const View.Row, after: ?[]const u8) ![]u8 {
     if (rows.len > 4096) return error.InvalidRetainedReadPage;
     var out: std.Io.Writer.Allocating = .init(output_budget.allocator());
@@ -54,12 +79,35 @@ fn encodeBounded(alloc: A, output_budget: *sources.sql_memory_budget, sequence: 
     var scratch_budget: sources.sql_memory_budget = .{ .backing = arena.allocator(), .limit = max_bytes * 4 };
     const a = scratch_budget.allocator();
     var names: std.StringArrayHashMapUnmanaged(void) = .empty;
+    var layouts: std.AutoHashMapUnmanaged(LayoutKey, ?[]const ?usize) = .empty;
     for (rows) |row| {
         const input = row.sqlRow();
-        for (try input.fieldNames()) |name| try names.put(a, name, {});
+        const fields = try input.fieldNames();
+        if (input.typed_cells) |cells| {
+            const entry = try layouts.getOrPut(a, .{ .pointer = @intFromPtr(cells.layout.names.ptr), .len = fields.len });
+            if (entry.found_existing) continue;
+            entry.value_ptr.* = null;
+        }
+        for (fields) |name| try names.put(a, name, {});
     }
     // Width is bounded before allocating any per-row shape or value matrix.
     if (names.count() > 65536) return error.RetainedReadPageTooLarge;
+    const plans = try a.alloc(RowPlan, rows.len);
+    for (rows, plans) |*row, *plan| {
+        const input = row.sqlRow();
+        var ordinals: ?[]const ?usize = null;
+        if (input.typed_cells) |cells| {
+            const cached = layouts.getPtr(.{ .pointer = @intFromPtr(cells.layout.names.ptr), .len = cells.layout.names.len }).?;
+            if (cached.* == null) {
+                const mapping = try a.alloc(?usize, names.count());
+                for (names.keys(), mapping) |name, *ordinal| ordinal.* = cells.layout.ordinals.get(name);
+                cached.* = mapping;
+            }
+            ordinals = cached.*;
+        }
+        plan.* = .{ .input = row, .ordinals = ordinals };
+    }
+
     const w = &out.writer;
     try w.writeAll(magic);
     try w.writeInt(u64, sequence, .little);
@@ -67,7 +115,7 @@ fn encodeBounded(alloc: A, output_budget: *sources.sql_memory_budget, sequence: 
     try w.writeInt(u32, @intCast(names.count()), .little);
     for (names.keys()) |name| try blob(w, name);
     if (after) |key| try blob(w, key) else try w.writeInt(u32, std.math.maxInt(u32), .little);
-    for (rows) |row| {
+    for (rows, plans) |row, plan| {
         try blob(w, row.id);
         try w.writeInt(u64, row.version, .little);
         try w.writeInt(u32, row.schema_version, .little);
@@ -77,8 +125,7 @@ fn encodeBounded(alloc: A, output_budget: *sources.sql_memory_budget, sequence: 
             const json = try std.json.Stringify.valueAlloc(a, document, .{});
             try blob(w, json);
         } else try w.writeInt(u32, std.math.maxInt(u32), .little);
-        const input = row.sqlRow();
-        for (names.keys()) |name| try w.writeByte(@intFromBool(try input.hasField(name)));
+        for (0..names.count()) |ordinal| try w.writeByte(@intFromBool(try plan.present(names.keys(), ordinal)));
     }
     // Both axes are tiled, so wide schemas retain the block codec's limits.
     var first: usize = 0;
@@ -92,10 +139,9 @@ fn encodeBounded(alloc: A, output_budget: *sources.sql_memory_budget, sequence: 
             var block_budget: sources.sql_memory_budget = .{ .backing = block_arena.allocator(), .limit = max_bytes * 4 };
             const b = block_budget.allocator();
             const block = try b.alloc(sources.sql_operators.Row, count);
-            for (block, rows[first..][0..count], 0..) |*target, row, index| {
+            for (block, plans[first..][0..count], 0..) |*target, plan, index| {
                 const values = try b.alloc(Datum, width);
-                const input = row.sqlRow();
-                for (names.keys()[column..][0..width], values) |name, *value| value.* = try input.cell(name);
+                for (values, column..) |*value, ordinal| value.* = try plan.value(names.keys(), ordinal);
                 target.* = .{ .values = values, .keys = &.{}, .ordinal = first + index };
             }
             const bytes = try spill.encodeColumnarBlockAlloc(b, block, max_bytes);
@@ -167,28 +213,29 @@ pub fn decode(alloc: A, bytes: []const u8, sequence: u64, schema_version: u32, l
             1 => true,
             else => return error.InvalidRetainedReadPage,
         };
-        row.* = .{ .id = id, .version = version, .schema_version = schema_version, .value = .null, .typed_cells = .{ .layout = layout, .values = try a.alloc(Datum, width), .presence = presence }, .expected_content_digest = digest, .document = document };
+        row.* = .{ .id = id, .version = version, .schema_version = schema_version, .value = .null, .typed_cells = .{ .layout = layout, .presence = presence }, .expected_content_digest = digest, .document = document };
     }
     var first: usize = 0;
     while (first < count) {
         const n = @min(256, count - first);
+        const blocks = try a.alloc(spill.ColumnarBlock, (width + 1023) / 1024);
         var column: usize = 0;
-        while (column < width) {
+        for (blocks) |*block| {
             const k = @min(1024, width - column);
             const encoded = try r.required();
             if (!std.mem.startsWith(u8, encoded, block_magic)) return error.InvalidRetainedReadPage;
-            const block = try spill.decodeColumnarBlockInArena(a, encoded, max_bytes);
+            block.* = try spill.decodeColumnarBlockInArena(a, encoded, max_bytes);
             if (block.count() != n or block.values.len != k or block.keys.len != 0) return error.InvalidRetainedReadPage;
-            for (rows[first..][0..n], 0..) |*row, index| {
+            for (rows[first..][0..n], 0..) |row, index| {
                 if (block.ordinals[index] != first + index) return error.InvalidRetainedReadPage;
-                const cells = row.typed_cells.?;
-                for (@constCast(cells.values)[column..][0..k], column..) |*cell, ordinal| {
-                    cell.* = try block.cell(index, ordinal - column);
-                    if (!cells.presence.?[ordinal] and !cell.sql_null) return error.InvalidRetainedReadPage;
+                for (column..column + k) |ordinal| {
+                    const cell = try block.cell(index, ordinal - column);
+                    if (!row.typed_cells.?.presence.?[ordinal] and !cell.sql_null) return error.InvalidRetainedReadPage;
                 }
             }
             column += k;
         }
+        for (rows[first..][0..n], 0..) |*row, index| row.typed_cells.?.columnar = .{ .blocks = blocks, .row = index };
         first += n;
     }
     if (r.at != bytes.len) return error.InvalidRetainedReadPage;

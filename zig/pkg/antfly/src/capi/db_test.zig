@@ -1999,25 +1999,54 @@ test "capi SQL relational search preserves typed nulls and exact JSON numbers" {
     try database.runUntilIdle();
     var scanned = try sql.compiler.compile(alloc, "SELECT _id,payload,payload IS NULL,payload->>'amount',payload->>'fraction',a,cardinality(a),n FROM rows ORDER BY _id", .{});
     defer scanned.deinit();
-    var baseline = try sql.runtime.execute(alloc, adapter.backend(), &scanned, &.{}, .{});
+    var baseline = try sql.runtime.execute(alloc, adapter.backend(), &scanned, &.{}, .{ .page_rows = 1 });
     defer baseline.deinit();
     var searched = try sql.compiler.compile(alloc, "SELECT _id,payload,payload IS NULL,payload->>'amount',payload->>'fraction',a,cardinality(a),n FROM antfly_search('rows','body:alpha') ORDER BY _id", .{});
     defer searched.deinit();
-    var hits = try sql.runtime.execute(alloc, adapter.backend(), &searched, &.{}, .{});
-    defer hits.deinit();
-    try std.testing.expectEqual(@as(usize, 3), hits.output.rows.len);
-    const expected = try std.json.Stringify.valueAlloc(alloc, .{ .rows = baseline.output.rows, .nulls = baseline.output.sql_nulls }, .{});
-    defer alloc.free(expected);
-    const actual = try std.json.Stringify.valueAlloc(alloc, .{ .rows = hits.output.rows, .nulls = hits.output.sql_nulls }, .{});
-    defer alloc.free(actual);
-    try std.testing.expectEqualStrings(expected, actual);
-    try std.testing.expect(hits.output.rows[0][2].bool);
-    try std.testing.expect(!hits.output.rows[1][2].bool);
-    try std.testing.expect(hits.output.rows[0][5] == .object);
-    try std.testing.expectEqualStrings("2", hits.output.rows[0][6].string);
-    try std.testing.expectEqualStrings("9007199254740993.1200", hits.output.rows[2][7].string);
-    try std.testing.expectEqualStrings("9007199254740993", hits.output.rows[2][3].string);
-    try std.testing.expectEqualStrings("0.123456789012345678901", hits.output.rows[2][4].string);
+    for ([_]u32{ 1, 256 }) |page_rows| {
+        var hits = try sql.runtime.execute(alloc, adapter.backend(), &searched, &.{}, .{ .page_rows = page_rows });
+        defer hits.deinit();
+        try std.testing.expectEqual(@as(usize, 3), hits.output.rows.len);
+        const expected = try std.json.Stringify.valueAlloc(alloc, .{ .rows = baseline.output.rows, .nulls = baseline.output.sql_nulls }, .{});
+        defer alloc.free(expected);
+        const actual = try std.json.Stringify.valueAlloc(alloc, .{ .rows = hits.output.rows, .nulls = hits.output.sql_nulls }, .{});
+        defer alloc.free(actual);
+        try std.testing.expectEqualStrings(expected, actual);
+        try std.testing.expect(hits.output.rows[0][2].bool);
+        try std.testing.expect(!hits.output.rows[1][2].bool);
+        try std.testing.expect(hits.output.rows[0][5] == .object);
+        try std.testing.expectEqualStrings("2", hits.output.rows[0][6].string);
+        try std.testing.expectEqualStrings("9007199254740993.1200", hits.output.rows[2][7].string);
+        try std.testing.expectEqualStrings("9007199254740993", hits.output.rows[2][3].string);
+        try std.testing.expectEqualStrings("0.123456789012345678901", hits.output.rows[2][4].string);
+    }
+    // A delivered ranked page owns its identities, layouts and values after
+    // both the ranked cursor and its primary snapshot have been released.
+    var region = std.heap.ArenaAllocator.init(alloc);
+    defer region.deinit();
+    const a = region.allocator();
+    const backend = adapter.backend();
+    const relation = searched.statement.select.source.?.table;
+    const table = try backend.vtable.resolve(backend.ptr, a, relation.name, .read);
+    const request: @import("antfly_local_sources").sql_catalog.Scan.Search = .{ .expression = relation.search.?.*, .request_text = "body:alpha" };
+    const statement = try backend.vtable.open_statement.?(backend.ptr, alloc, &.{.{ .table = table, .request = .{ .fields = &.{ "a", "n", "payload" }, .search = &request, .limit = 1 } }});
+    var live = true;
+    defer if (live) statement.close(statement.ptr);
+    const cursor = statement.cursors[0];
+    const page = try cursor.next(cursor.ptr, alloc, 1);
+    defer page.deinit();
+    try std.testing.expectEqual(@as(usize, 1), page.rows.len);
+    const expected_id = try a.dupe(u8, page.rows[0].id);
+    const before = try page.rows[0].cell("a");
+    const expected_first: ?i64 = if (before.array) |array| array.flatCell(0).value.integer else null;
+    statement.close(statement.ptr);
+    live = false;
+    try std.testing.expectEqualStrings(expected_id, page.rows[0].id);
+    const after = try page.rows[0].cell("a");
+    if (expected_first) |value| {
+        try std.testing.expect(after.array.?.stored != null);
+        try std.testing.expectEqual(value, after.array.?.flatCell(0).value.integer);
+    } else try std.testing.expect(after.sql_null);
 }
 
 test "capi SQL uses native typed snapshots and atomic mutations" {

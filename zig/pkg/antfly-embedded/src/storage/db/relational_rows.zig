@@ -659,13 +659,36 @@ pub const Reader = struct {
     /// and cached source-layout projection. Ranked queries must retain native
     /// SQL-null provenance rather than round-tripping through public JSON.
     pub fn lookupTypedRow(self: *Reader, alloc: Allocator, document: []const u8) !?Row {
-        if (comptime storage_engine.enabled) return @import("antfly_source_root").antfly_sources.storage_engine.call("relationalReaderLookupTypedRow", .{ self, alloc, document, false });
-        return self.lookupRowFormat(alloc, document, false);
+        if (comptime storage_engine.enabled) return @import("antfly_source_root").antfly_sources.storage_engine.call("relationalReaderLookupTypedRow", .{ self, alloc, document, false, null });
+        return self.lookupRowFormat(alloc, document, false, null);
     }
 
     pub fn lookupSqlRow(self: *Reader, alloc: Allocator, document: []const u8) !?Row {
-        if (comptime storage_engine.enabled) return @import("antfly_source_root").antfly_sources.storage_engine.call("relationalReaderLookupTypedRow", .{ self, alloc, document, true });
-        return self.lookupRowFormat(alloc, document, true);
+        if (comptime storage_engine.enabled) return @import("antfly_source_root").antfly_sources.storage_engine.call("relationalReaderLookupTypedRow", .{ self, alloc, document, true, null });
+        return self.lookupRowFormat(alloc, document, true, null);
+    }
+
+    /// Cache belongs to the caller's page, never to this cursor. Older source
+    /// schemas may have a different field subset/order and get a new layout.
+    pub fn lookupSqlRowWithLayout(self: *Reader, alloc: Allocator, document: []const u8, shared: *?@import("../../sql/catalog.zig").Row.TypedLayout) !?Row {
+        if (comptime storage_engine.enabled) return @import("antfly_source_root").antfly_sources.storage_engine.call("relationalReaderLookupTypedRow", .{ self, alloc, document, true, shared });
+        return self.lookupRowFormat(alloc, document, true, shared);
+    }
+
+    fn cachedSqlLayout(alloc: Allocator, row: codec.OrdinalRowView, projection: codec.OrdinalProjectionPlan, shared: ?*?@import("../../sql/catalog.zig").Row.TypedLayout) !@import("../../sql/catalog.zig").Row.TypedLayout {
+        if (shared) |cache| if (cache.*) |layout| {
+            var same = layout.names.len == projection.ordinals.len;
+            if (same) for (layout.names, projection.ordinals) |name, ordinal| {
+                if (!std.mem.eql(u8, name, row.table_schema.relational_columns[ordinal].name)) {
+                    same = false;
+                    break;
+                }
+            };
+            if (same) return layout;
+        };
+        const layout = try sqlLayout(alloc, row, projection);
+        if (shared) |cache| cache.* = layout;
+        return layout;
     }
 
     fn sqlLayout(alloc: Allocator, row: codec.OrdinalRowView, projection: codec.OrdinalProjectionPlan) !@import("../../sql/catalog.zig").Row.TypedLayout {
@@ -674,7 +697,7 @@ pub const Reader = struct {
         return @import("../../sql/catalog.zig").Row.TypedLayout.init(alloc, names);
     }
 
-    fn lookupRowFormat(self: *Reader, alloc: Allocator, document: []const u8, native_cells: bool) !?Row {
+    fn lookupRowFormat(self: *Reader, alloc: Allocator, document: []const u8, native_cells: bool, shared: ?*?@import("../../sql/catalog.zig").Row.TypedLayout) !?Row {
         if (self.index != null) return error.InvalidRelationalRowsRequest;
         if (self.row_policy_lease) |*lease| try lease.checkAt(@intCast(@divFloor(time.realtimeNs(), std.time.ns_per_s)));
         var scratch = std.heap.ArenaAllocator.init(self.alloc);
@@ -712,7 +735,7 @@ pub const Reader = struct {
             .key = try alloc.dupe(u8, document),
             .json = "",
             .typed = if (projected) |value| value.value else null,
-            .typed_cells = if (cells) |value| .{ .layout = try sqlLayout(alloc, row, self.selected.?), .values = value.values, .presence = value.presence } else null,
+            .typed_cells = if (cells) |value| .{ .layout = try cachedSqlLayout(alloc, row, self.selected.?, shared), .values = value.values, .presence = value.presence } else null,
             .sql_nulls = if (projected) |value| value.sql_nulls else null,
             .version = row.writeTimestampNs(),
             .schema_version = row.table_schema.version,

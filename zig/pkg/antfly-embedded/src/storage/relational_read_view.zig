@@ -51,11 +51,35 @@ pub const View = struct {
         rows: []const Row,
         after: ?[]const u8,
 
+        /// Leases pin immutable payloads through coordinated merges. The
+        /// original page and every output reference release independently.
+        lease: ?*Lease = null,
+        retained_pages: []Page = &.{},
+        const Lease = struct { alloc: std.mem.Allocator, refs: std.atomic.Value(usize), page: Page };
+        pub fn retain(self: *Page, alloc: std.mem.Allocator) !Page {
+            const lease = self.lease orelse blk: {
+                const owner = try alloc.create(Lease);
+                owner.* = .{ .alloc = alloc, .refs = .init(1), .page = self.* };
+                self.lease = owner;
+                break :blk owner;
+            };
+            _ = lease.refs.fetchAdd(1, .monotonic);
+            return self.*;
+        }
         pub fn deinit(self: *Page) void {
-            self.arena.deinit();
+            if (self.lease) |lease| {
+                if (lease.refs.fetchSub(1, .acq_rel) == 1) {
+                    lease.page.deinit();
+                    lease.alloc.destroy(lease);
+                }
+            } else {
+                for (self.retained_pages) |*page| page.deinit();
+                self.arena.deinit();
+            }
             self.* = undefined;
         }
     };
+
     pub const VTable = struct {
         range_proofs: ?*const fn (*anyopaque, std.mem.Allocator) anyerror![]@import("range_protection.zig").Proof = null,
         next: *const fn (*anyopaque, std.mem.Allocator, u32) anyerror!Page,

@@ -18,7 +18,6 @@
 //! mutation fence or reopens an owner between pages.
 const std = @import("std");
 const View = @import("antfly_local_sources").storage_relational_read_view.View;
-const typed_json = @import("antfly_local_sources").storage_typed_json;
 const types = @import("antfly_local_sources").storage_db_types;
 
 pub const Set = struct {
@@ -150,52 +149,31 @@ pub const Set = struct {
         errdefer arena.deinit();
         const owned = arena.allocator();
         var rows: std.ArrayList(View.Row) = .empty;
-        var shared_layout: ?@import("antfly_local_sources").sql_catalog.Row.TypedLayout = null;
+        var retained: std.ArrayList(View.Page) = .empty;
+        errdefer for (retained.items) |*page| page.deinit();
+        var retained_leases: std.AutoHashMapUnmanaged(usize, void) = .empty;
         try self.initialize();
         while (rows.items.len < limit) {
             const index = (try self.selected()) orelse break;
             const source = self.row(index);
-            const id = try owned.dupe(u8, source.id);
-            try rows.append(owned, .{
-                .id = id,
-                .version = source.version,
-                .schema_version = source.schema_version,
-                .value = try typed_json.clone(owned, source.value),
-                .typed_cells = if (source.typed_cells != null) try cloneCells(owned, source, &shared_layout) else null,
-                .expected_content_digest = source.expected_content_digest,
-                .document = if (source.document) |document| try typed_json.clone(owned, document) else null,
-                .sql_nulls = if (source.sql_nulls) |flags| try owned.dupe(bool, flags) else null,
-            });
+            // Pin a source page once per delivery page. Rows, column blocks,
+            // directories and large arrays remain borrowed instead of cloned.
+            const page = &self.owners[index].page.?;
+            const lease_id = if (page.lease) |lease| @intFromPtr(lease) else 0;
+            if (lease_id == 0 or !retained_leases.contains(lease_id)) {
+                try retained.ensureUnusedCapacity(owned, 1);
+                try retained_leases.ensureUnusedCapacity(owned, 1);
+                const held = try page.retain(self.alloc);
+                retained.appendAssumeCapacity(held);
+                retained_leases.putAssumeCapacity(@intFromPtr(held.lease.?), {});
+            }
+            try rows.append(owned, source);
+            const id = source.id;
             try self.advance(index, id);
         }
         const more = (try self.selected()) != null;
         self.failed = false;
-        return .{ .arena = arena, .rows = rows.items, .after = if (more) rows.items[rows.items.len - 1].id else null };
-    }
-
-    fn cloneCells(a: std.mem.Allocator, input: View.Row, shared: *?@import("antfly_local_sources").sql_catalog.Row.TypedLayout) !@import("antfly_local_sources").sql_catalog.Row.TypedCells {
-        const source = input.sqlRow();
-        const names = try source.fieldNames();
-        const cells = input.typed_cells orelse return error.InvalidSqlBackendResponse;
-        var same = false;
-        if (shared.*) |layout| {
-            same = layout.names.len == cells.layout.names.len;
-            if (same) for (layout.names, cells.layout.names) |left, right| {
-                if (!std.mem.eql(u8, left, right)) {
-                    same = false;
-                    break;
-                }
-            };
-        }
-        const layout = if (same) shared.*.? else try cells.layout.clone(a);
-        if (shared.* == null) shared.* = layout;
-        const values = try a.alloc(@import("antfly_local_sources").sql_catalog.Row.Cell, cells.values.len);
-        for (names, values) |name, *out| {
-            const value = try source.cell(name);
-            if (value.patterns != null) return error.InvalidSqlBackendResponse;
-            out.* = try @import("antfly_local_sources").sql_operators.cloneDatum(a, value);
-        }
-        return .{ .layout = layout, .values = values, .presence = if (cells.presence) |flags| try a.dupe(bool, flags) else null };
+        return .{ .arena = arena, .rows = rows.items, .retained_pages = retained.items, .after = if (more) rows.items[rows.items.len - 1].id else null };
     }
 
     fn normalize(ptr: *anyopaque, alloc: std.mem.Allocator, writes: []const types.BatchWrite) ![]types.BatchWrite {
@@ -361,7 +339,9 @@ fn nativeMergeFixture(alloc: std.mem.Allocator) !void {
     try std.testing.expect(left.closed and right.closed);
     for ([_]View.Page{ first, second }) |page| {
         try std.testing.expectEqual(@as(usize, 2), page.rows.len);
-        try std.testing.expect(page.rows[0].typed_cells.?.layout.names.ptr == page.rows[1].typed_cells.?.layout.names.ptr);
+        try std.testing.expect(page.retained_pages.len != 0);
+        // The output pins source payloads; it does not deep-copy array cells.
+        try std.testing.expect(page.rows[0].typed_cells.?.values.ptr == page.retained_pages[0].rows[0].typed_cells.?.values.ptr);
         for (page.rows) |out| {
             const row = out.sqlRow();
             try std.testing.expect(!try row.hasField("missing"));

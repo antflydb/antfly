@@ -40,6 +40,7 @@ pub const Request = struct {
     /// release memory independently instead of nesting under that arena.
     scratch_allocator: ?std.mem.Allocator = null,
     parameters: []const std.json.Value = &.{},
+    parameter_cells: ?[]const @import("antfly_local_sources").sql_scalar.Datum = null,
     parameter_types: []const Type = &.{},
     parameter_descriptors: []const Parameter = &.{},
     database: ?[]const u8 = null,
@@ -186,6 +187,7 @@ pub const Backend = struct {
     vtable: *const VTable,
 
     pub const VTable = struct {
+        native_parameters: bool = false,
         // Called even when a deployment permits anonymous access. The backend
         // alone decides whether credentials authorize a principal; a startup
         // username/database never itself grants access.
@@ -198,6 +200,7 @@ pub const Backend = struct {
         /// Evaluate SQL EXECUTE arguments as scalar expressions without any
         /// catalog/table access. Values are owned by the supplied allocator.
         evaluate_parameters: ?*const fn (*anyopaque, std.mem.Allocator, Identity, Request, []const []const u8) anyerror![]const std.json.Value = null,
+        evaluate_parameter_cells: ?*const fn (*anyopaque, std.mem.Allocator, Identity, Request, []const []const u8) anyerror![]const @import("antfly_local_sources").sql_scalar.Datum = null,
         /// Mark an explicit transaction failed when a SQL cursor fetch or
         /// declaration fails after its statement snapshot was opened.
         fail_transaction: ?*const fn (*anyopaque, Identity, Request) anyerror!void = null,

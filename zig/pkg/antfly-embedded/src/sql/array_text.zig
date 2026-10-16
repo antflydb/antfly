@@ -97,7 +97,7 @@ fn writeAxis(value: arrays.Value, depth: usize, offset: *usize, writer: *std.Io.
     for (0..value.dimensions[depth].length) |index| {
         if (index != 0) try writer.writeByte(',');
         if (depth + 1 == value.dimensions.len) {
-            try writeElement(value.element_type, value.elements[offset.*], writer);
+            try writeElement(value.element_type, value.flatCell(offset.*), writer);
             offset.* += 1;
         } else try writeAxis(value, depth + 1, offset, writer);
     }
@@ -113,7 +113,7 @@ fn writeValue(value: arrays.Value, writer: *std.Io.Writer) !void {
     };
     var offset: usize = 0;
     try writeAxis(value, 0, &offset, writer);
-    std.debug.assert(offset == value.elements.len);
+    std.debug.assert(offset == value.cardinality());
 }
 
 /// Validate shape, payload domains and complete wire/work admission before
@@ -126,7 +126,7 @@ pub fn encode(value: arrays.Value, writer: *std.Io.Writer, options: Options) !vo
 fn encodeInner(value: arrays.Value, writer: *std.Io.Writer, options: Options) !void {
     var work: arrays.Budget = .{ .remaining = options.values.work, .shared = options.context };
     try work.consume(0);
-    const canonical = try arrays.Value.initWithBudget(value.element_type, value.dimensions, value.elements, options.values, &work);
+    const canonical = try value.validateWithBudget(options.values, &work);
     if (canonical.dimensions.len != value.dimensions.len) return error.InvalidSqlArrayShape;
     var size: std.Io.Writer.Discarding = .init(&.{});
     try writeValue(value, &size.writer);

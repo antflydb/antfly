@@ -237,25 +237,37 @@ requires a retained-read provider; a TableReadSource that implements only public
 NDJSON scans must add the native read capability before serving SQL. Public
 HTTP scan support alone cannot provide statement snapshot semantics.
 
-This removes intermediate row JSON, rather than claiming zero allocation.
-`ordinal native SQL projection avoids public array envelope allocations` compares
-both storage boundaries with a 32,768-element bigint array and an arena over a
-non-resizing allocator. The 266,256-byte stored array used 12,190,126 bytes of
-arena backing for the public projection versus 3,932,676 for native cells (68%
-less). `SQL native transport materialized results avoid public envelopes` starts
-with that already-typed array and measures the runtime result boundary: 8,264,998
-bytes of peak backing for public results versus 3,937,372 for native results
-(52% less). These Fast figures exclude fixture storage input and pgwire frame
-buffers. Typed array
-elements, ownership copies, frame bytes, actual JSON/JSONB values, and legacy
-parameter adapters still have allocation and encoding costs.
+Bind parameters and SQL EXECUTE arguments now carry typed Datums into one
+execution-owned frame. Array envelopes and NUMERIC formatting remain at public
+JSON compatibility boundaries. Parameter frames own their payloads before a
+stream can outlive its opening request.
+
+Retained pages keep decoded column blocks behind cell accessors. Coordinated
+merging leases source pages instead of deep-copying their payloads; output pages
+can survive cursor closure. Field mappings are compiled once per source layout.
+
+Primitive and text SQL arrays retain canonical storage bytes, with
+`cardinality()` and `flatCell()` accessors. Cloning preserves the compact form;
+encoders and operators accept both representations. NUMERIC, UUID and JSONB
+arrays retain their existing decoded representation. Lite ranked cursors capture
+ranking and a primary snapshot together, release the writer-excluding lease,
+and hydrate requested pages bounded by row demand and a 256 KiB payload target.
+A single row retains the existing native row-size ceiling.
+
+The native Bind allocation regression uses a 32,768-element bigint array and
+an arena over a non-resizing allocator: public-envelope decoding peaks at
+17,106,262 bytes versus 3,932,232 bytes for native cells (77% lower). The compact
+stored-array regression peaks at 399,446 bytes versus 3,932,392 bytes for expanded
+elements (90% lower). These are isolated ReleaseFast allocation measurements;
+fixture inputs and final pgwire frames are excluded. Page bytes, ownership
+copies, actual JSON/JSONB payloads, and wire output still have costs.
 
 Focused regression gates (from `zig/`, with the repository's Zig version):
 
 ```sh
-zig build antfly-api-sql-native-cells-test -Doptimize=Debug
-zig build antfly-api-table-read-test -Doptimize=Debug
-zig build sql-test -Dtest-filter='SQL native transport' -Doptimize=Debug
-zig build antfly-storage-test -Dtest-filter='relational index system coordinated read set' -Doptimize=Debug
-zig build antfly-relational-index-system-test -Doptimize=fast
+zig build sql-test pgwire-test -Doptimize=ReleaseFast
+zig build sql-test -Dtest-filter='SQL compact stored array' -Dtest-filter='SQL native transport' -Doptimize=Debug
+zig build antfly-api-sql-native-cells-test antfly-api-table-read-test -Doptimize=Debug
+zig build antfly-coordinated-read-set-test antfly-storage-owner-test -Doptimize=Debug
+zig build antfly-native-row-projection-test -Doptimize=Debug
 ```

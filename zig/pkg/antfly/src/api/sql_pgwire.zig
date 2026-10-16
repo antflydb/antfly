@@ -148,7 +148,7 @@ pub const Adapter = struct {
     server: *http.ApiHttpServer,
 
     pub fn backend(self: *Adapter) wire.Backend {
-        return .{ .context = self, .vtable = &.{ .authenticate = authenticate, .describe = describe, .execute = execute, .load_settings = loadSettings, .validate_namespace = validateNamespace, .evaluate_parameters = evaluateParameters, .fail_transaction = failTransaction, .open_stream = openStream, .disconnect = disconnect } };
+        return .{ .context = self, .vtable = &.{ .native_parameters = true, .authenticate = authenticate, .describe = describe, .execute = execute, .load_settings = loadSettings, .validate_namespace = validateNamespace, .evaluate_parameters = evaluateParameters, .evaluate_parameter_cells = evaluateParameterCells, .fail_transaction = failTransaction, .open_stream = openStream, .disconnect = disconnect } };
     }
 
     fn loadSettings(raw: *anyopaque, alloc: std.mem.Allocator, identity: wire.Identity, request: wire.Request) !@import("antfly_local_sources").sql_setting_catalog.RawSnapshot {
@@ -183,10 +183,16 @@ pub const Adapter = struct {
         return evaluateScalarParameters(alloc, request, expressions);
     }
 
-    fn evaluateScalarParameters(alloc: std.mem.Allocator, request: wire.Request, expressions: []const []const u8) ![]const std.json.Value {
+    fn evaluateParameterCells(_: *anyopaque, alloc: std.mem.Allocator, identity: wire.Identity, request: wire.Request, expressions: []const []const u8) ![]const @import("antfly_local_sources").sql_scalar.Datum {
+        const credential: *Credential = @ptrCast(@alignCast(identity.context));
+        try credential.validate();
+        return evaluateScalarCells(alloc, request, expressions);
+    }
+
+    fn evaluateScalarCells(alloc: std.mem.Allocator, request: wire.Request, expressions: []const []const u8) ![]const @import("antfly_local_sources").sql_scalar.Datum {
         if (expressions.len != request.parameter_types.len) return error.InvalidSqlParameters;
         const scalar = @import("antfly_local_sources").sql_scalar;
-        const result = try alloc.alloc(std.json.Value, expressions.len);
+        const result = try alloc.alloc(scalar.Datum, expressions.len);
         if (request.parameter_descriptors.len != 0 and request.parameter_descriptors.len != expressions.len) return error.InvalidSqlParameters;
         for (expressions, request.parameter_types, result, 0..) |expression, kind, *value, index| {
             try request.check();
@@ -203,6 +209,18 @@ pub const Adapter = struct {
             var program = try scalar.bindTypedExpectedWithSettings(alloc, compiled.expression, &.{}, &.{}, descriptor, .{}, null);
             defer program.deinit();
             const evaluated = try program.evaluate(alloc, &.{}, &.{}, .{});
+            var retained = evaluated;
+            retained.patterns = null;
+            value.* = try @import("antfly_local_sources").sql_operators.cloneDatum(alloc, retained);
+        }
+        try request.check();
+        return result;
+    }
+
+    fn evaluateScalarParameters(alloc: std.mem.Allocator, request: wire.Request, expressions: []const []const u8) ![]const std.json.Value {
+        const cells = try evaluateScalarCells(alloc, request, expressions);
+        const result = try alloc.alloc(std.json.Value, cells.len);
+        for (cells, request.parameter_types, result) |evaluated, kind, *value| {
             value.* = if (evaluated.array) |array|
                 try @import("antfly_local_sources").sql_array_wire.toJsonLeaky(alloc, array.*, .{})
             else if (evaluated.numeric) |number| numeric: {
@@ -422,13 +440,13 @@ const OwnedRead = struct {
         self.decision_runtime = try self.native_adapter.decisionRuntime();
         if (self.decision_runtime) |*active| self.native_adapter.decision_provider = active.provider();
         self.guarded = .{ .native = self.native_adapter.backend(), .authority = &self.authority, .revision = &self.native_adapter.revision, .expected_guard = self.authority.request.binding_guard };
-        const parameters = try normalizeParameters(arena, request.parameters, request.parameter_types);
+        const parameters = if (request.parameter_cells != null) request.parameters else try normalizeParameters(arena, request.parameters, request.parameter_types);
         var stream_backend = self.guarded.backend();
         stream_backend.parameter_descriptor_hints = request.parameter_descriptors;
         if (plan.compiled().uses_current_setting) stream_backend.setting_capture = self.native_adapter.settingCapture();
         // Stream.open captures the owner view once; loadSettings validates the
         // prepared epoch on that same snapshot before binding or reading rows.
-        const opened = try Pull.Stream.open(alloc, stream_backend, plan.compiled(), parameters, .{ .result_rows = request.limit, .page_rows = 256 });
+        const opened = try Pull.Stream.open(alloc, stream_backend, plan.compiled(), parameters, .{ .result_rows = request.limit, .page_rows = 256, .parameter_cells = request.parameter_cells });
         if (opened == null) {
             self.identity.?.deinit(server.alloc);
             self.arena.deinit();
@@ -869,10 +887,10 @@ const Job = struct {
             };
             return;
         }
-        const parameters = try normalizeParameters(self.alloc, self.request.parameters, self.request.parameter_types);
+        const parameters = if (self.request.parameter_cells != null) self.request.parameters else try normalizeParameters(self.alloc, self.request.parameters, self.request.parameter_types);
         var execution_backend = guarded.backend();
         execution_backend.parameter_descriptor_hints = self.request.parameter_descriptors;
-        var result = native_adapter.execute(self.request.scratch_allocator orelse self.alloc, compiled, parameters, .{ .result_rows = self.request.limit, .native_result = true }, execution_backend) catch |err| {
+        var result = native_adapter.execute(self.request.scratch_allocator orelse self.alloc, compiled, parameters, .{ .result_rows = self.request.limit, .native_result = true, .parameter_cells = self.request.parameter_cells }, execution_backend) catch |err| {
             if (self.request.diagnostics) |diagnostic| diagnostic.transaction_status = @fromBackingInt(@backingInt(native_adapter.transaction_status));
             if (err == error.SqlMutationOutcomeUnknown or err == error.SqlTransactionOutcomeUnknown or err == error.SessionLeaseLost) if (self.request.diagnostics) |diagnostic|
                 diagnostic.set("40003", "transaction outcome is unknown; do not replay this statement", native_adapter.outcome_transaction_id, false);
@@ -970,7 +988,7 @@ test "SQL pgwire dispatch preserves imported executor authority including unavai
     }
 }
 
-test "SQL pgwire execute arguments use bounded scalar semantics without table access" {
+test "SQL pgwire native execute arguments use bounded scalar semantics without table access" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     var canceled: std.atomic.Value(bool) = .init(false);
@@ -995,6 +1013,11 @@ test "SQL pgwire execute arguments use bounded scalar semantics without table ac
     try std.testing.expectEqual(@as(i32, -1), decoded.value.dimensions[0].lower);
     try std.testing.expectEqual(@as(i64, 9007199254740993), decoded.value.elements[0].value.integer);
     try std.testing.expect(decoded.value.elements[1].sql_null);
+    const native_array = try Adapter.evaluateScalarCells(arena.allocator(), array_request, &.{ "'[-1:1]={9007199254740993,NULL,2}'::bigint[]", "42" });
+    try std.testing.expectEqual(@as(i64, 9007199254740993), native_array[0].array.?.flatCell(0).value.integer);
+    try std.testing.expect(native_array[0].array.?.flatCell(1).sql_null);
+    const native_json = try Adapter.evaluateScalarCells(arena.allocator(), json_request, &.{ "'null'::json", "NULL::json" });
+    try std.testing.expect(!native_json[0].sql_null and native_json[1].sql_null);
     canceled.store(true, .release);
     try std.testing.expectError(error.QueryCanceled, Adapter.evaluateScalarParameters(arena.allocator(), request, &.{ "1", "'x'" }));
 }

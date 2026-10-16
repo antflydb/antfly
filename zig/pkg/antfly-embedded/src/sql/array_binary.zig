@@ -51,12 +51,13 @@ fn elementSize(kind: arrays.ElementType, element: arrays.Element) !usize {
 /// directly; JSONB uses a counting pass for its required length prefix, not a
 /// per-element temporary allocation. Writer failure remains a writer failure.
 pub fn encode(value: arrays.Value, writer: *std.Io.Writer, options: Options) !void {
-    const validated = try arrays.Value.init(value.element_type, value.dimensions, value.elements, options.values);
+    const validated = try value.validate(options.values);
     if (validated.dimensions.len != value.dimensions.len) return error.InvalidSqlArrayShape;
     for (value.dimensions) |dimension| if (dimension.length > std.math.maxInt(i32)) return error.SqlProgramLimitExceeded;
     var size: usize = 12 + value.dimensions.len * 8;
     var has_null = false;
-    for (value.elements) |element| {
+    for (0..value.cardinality()) |array_cell_0| {
+        const element = value.flatCell(array_cell_0);
         has_null = has_null or element.sql_null;
         const length = try elementSize(value.element_type, element);
         if (length > std.math.maxInt(i32)) return error.SqlProgramLimitExceeded;
@@ -71,7 +72,8 @@ pub fn encode(value: arrays.Value, writer: *std.Io.Writer, options: Options) !vo
         try writer.writeInt(i32, @intCast(dimension.length), .big);
         try writer.writeInt(i32, dimension.lower, .big);
     }
-    for (value.elements) |element| {
+    for (0..value.cardinality()) |array_cell_0| {
+        const element = value.flatCell(array_cell_0);
         if (element.sql_null) {
             try writer.writeInt(i32, -1, .big);
             continue;
@@ -318,11 +320,11 @@ test "SQL PostgreSQL array binary boundaries match receive normalization and dia
     const bool_bytes = [_]u8{ 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 16, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1, 2 };
     var boolean = try decode(a, .boolean, &bool_bytes, .{});
     defer boolean.deinit();
-    try std.testing.expect(boolean.value.elements[0].value.bool);
+    try std.testing.expect(boolean.value.flatCell(0).value.bool);
     var integers = [_]u8{ 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 23, 0, 0, 0, 1, 0, 0, 0, 1, 255, 255, 255, 255 };
     var nullable = try decode(a, .int32, &integers, .{});
     defer nullable.deinit();
-    try std.testing.expect(nullable.value.elements[0].sql_null);
+    try std.testing.expect(nullable.value.flatCell(0).sql_null);
     std.mem.writeInt(i32, integers[16..20], std.math.maxInt(i32), .big);
     try std.testing.expectError(error.SqlProgramLimitExceeded, decode(a, .int32, &integers, .{}));
     std.mem.writeInt(i32, integers[16..20], std.math.maxInt(i32) - 1, .big);

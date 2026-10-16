@@ -1448,7 +1448,7 @@ pub const OrdinalRowView = struct {
             value.* = switch (column.column_type) {
                 .sql_array => blk: {
                     const array = try alloc.create(@import("../../../sql/array_value.zig").Value);
-                    array.* = (try @import("../../../sql/array_storage.zig").decodeLeaky(alloc, column.sql_element_type orelse return error.InvalidRelationalRow, cell.value.bytes_val, .{})).value;
+                    array.* = try @import("../../../sql/array_storage.zig").viewLeaky(alloc, column.sql_element_type orelse return error.InvalidRelationalRow, cell.value.bytes_val, .{});
                     break :blk Datum.typedArray(array);
                 },
                 .numeric => blk: {
@@ -3377,9 +3377,9 @@ test "ordinal native SQL projection owns arrays numeric and missing cells across
     defer arena.deinit();
     const projection = try row.projectSqlDatumsAlloc(arena.allocator(), plan);
     @memset(encoded, 0);
-    try std.testing.expectEqual(@as(i64, 9007199254740993), projection.values[0].array.?.elements[0].value.integer);
+    try std.testing.expectEqual(@as(i64, 9007199254740993), projection.values[0].array.?.flatCell(0).value.integer);
     try std.testing.expectEqual(@as(i32, 0), projection.values[0].array.?.dimensions[0].lower);
-    try std.testing.expect(projection.values[0].array.?.elements[1].sql_null);
+    try std.testing.expect(projection.values[0].array.?.flatCell(1).sql_null);
     var context: @import("../../../sql/numeric_value.zig").Context = .{ .alloc = a };
     const text = try @import("../../../sql/numeric_value.zig").format(&context, projection.values[1].numeric.?.*);
     defer a.free(text);
@@ -3419,8 +3419,8 @@ test "ordinal native SQL projection avoids public array envelope allocations" {
             defer arena.deinit();
             if (native) {
                 const projected = try row.projectSqlDatumsAlloc(arena.allocator(), plan);
-                try std.testing.expectEqual(@as(usize, 32768), projected.values[0].array.?.elements.len);
-                try std.testing.expectEqual(@as(i64, 42), projected.values[0].array.?.elements[32767].value.integer);
+                try std.testing.expectEqual(@as(usize, 32768), projected.values[0].array.?.cardinality());
+                try std.testing.expectEqual(@as(i64, 42), projected.values[0].array.?.flatCell(32767).value.integer);
             } else {
                 const projected = try row.projectSqlTypedAlloc(arena.allocator(), plan);
                 try std.testing.expect(projected.value.object.get("a").? == .object);

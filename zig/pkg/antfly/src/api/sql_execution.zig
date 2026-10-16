@@ -850,7 +850,7 @@ pub const Adapter = struct {
                 if (self.require_primary_digest and row.expected_content_digest == null) return error.InvalidSqlBackendResponse;
                 out.* = try self.projection.adaptBorrowed(page.arena.allocator(), layout, row.sqlRow());
             }
-            return .{ .rows = rows, .after = page.after, .owned_arena = page.arena };
+            return .{ .rows = rows, .after = page.after, .storage_page = page };
         }
 
         fn close(ptr: *anyopaque) void {

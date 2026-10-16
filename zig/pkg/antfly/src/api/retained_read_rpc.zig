@@ -183,7 +183,7 @@ pub fn encodeLegacyPage(alloc: std.mem.Allocator, sequence: u64, input: []const 
         out.* = .{ .id = row.id, .version = row.version, .schema_version = row.schema_version, .value = row.value, .expected_content_digest = row.expected_content_digest, .document = row.document, .sql_nulls = row.sql_nulls };
         if (row.typed_cells) |cells| {
             var object: std.json.ObjectMap = .empty;
-            const flags = try a.alloc(bool, cells.values.len);
+            const flags = try a.alloc(bool, cells.count());
             var count: usize = 0;
             const source: @import("antfly_local_sources").sql_catalog.Row = .{ .id = row.id, .version = row.version, .value = .null, .typed_cells = cells };
             for (cells.layout.names) |name| {
@@ -262,9 +262,9 @@ fn consumerTests() type {
                     var context: src.sql_numeric_value.Context = .{ .alloc = a };
                     var number = try src.sql_numeric_value.parse(&context, "9007199254740993.1200");
                     defer number.deinit();
-                    const layout = try src.sql_catalog.Row.TypedLayout.init(owned, &.{ "a", "n", "j", "z", "missing", "f" });
-                    const values = [_]src.sql_catalog.Row.Cell{ .typedArray(&array.value), .typedNumeric(&number.value), .json(.null), .{}, .{}, .json(.{ .float = std.math.nan(f64) }) };
-                    const rows = [_]reads.RelationalReadView.Row{.{ .id = "row", .version = std.math.maxInt(u64), .schema_version = 3, .value = .null, .typed_cells = .{ .layout = layout, .values = &values, .presence = &.{ true, true, true, true, false, true } }, .expected_content_digest = @splat(7) }};
+                    const layout = try src.sql_catalog.Row.TypedLayout.init(owned, &.{ "a", "n", "j", "z", "missing", "f", "_id" });
+                    const values = [_]src.sql_catalog.Row.Cell{ .typedArray(&array.value), .typedNumeric(&number.value), .json(.null), .{}, .{}, .json(.{ .float = std.math.nan(f64) }), .json(.{ .string = "payload-id" }) };
+                    const rows = [_]reads.RelationalReadView.Row{.{ .id = "row", .version = std.math.maxInt(u64), .schema_version = 3, .value = .null, .typed_cells = .{ .layout = layout, .values = &values, .presence = &.{ true, true, true, true, false, true, true } }, .expected_content_digest = @splat(7) }};
                     const bytes = try native_page.encode(a, 4, &rows, "next");
                     defer a.free(bytes);
                     var page = try decodePage(a, bytes, 4, 3, 1);
@@ -282,6 +282,7 @@ fn consumerTests() type {
                     try std.testing.expect((try row.cell("z")).sql_null);
                     try std.testing.expect(!try row.hasField("missing"));
                     try std.testing.expect(std.math.isNan((try row.cell("f")).value.float));
+                    try std.testing.expectEqualStrings("row", (try page.rows[0].typed_cells.?.at(6)).value.string);
                     try std.testing.expectEqualStrings("next", page.after.?);
                     const legacy = try encodeLegacyPage(a, 4, &rows, "next");
                     defer a.free(legacy);
@@ -335,7 +336,9 @@ fn consumerTests() type {
             defer page.deinit();
             try std.testing.expectEqual(@as(usize, 257), page.rows.len);
             try std.testing.expectEqualStrings("r256", page.rows[256].id);
-            const value = page.rows[256].typed_cells.?.values[1024];
+            try std.testing.expect(page.rows[256].typed_cells.?.columnar != null);
+            try std.testing.expectEqual(@as(usize, 0), page.rows[256].typed_cells.?.values.len);
+            const value = try page.rows[256].typed_cells.?.at(1024);
             try std.testing.expectEqual(@as(i64, 1024), value.value.integer);
             try std.testing.expect(!value.sql_null);
             try std.testing.expectEqualStrings("next", page.after.?);

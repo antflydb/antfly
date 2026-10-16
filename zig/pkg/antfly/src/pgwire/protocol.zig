@@ -60,6 +60,7 @@ const Portal = struct {
     arena: std.heap.ArenaAllocator,
     statement: []const u8,
     parameters: []const std.json.Value,
+    parameter_cells: ?[]const @import("antfly_local_sources").sql_scalar.Datum = null,
     types: []const backend.Type,
     formats: []const u16,
     description: backend.Description,
@@ -434,6 +435,10 @@ pub const Session = struct {
     }
 
     fn executeTyped(self: *Session, alloc: std.mem.Allocator, statement: []const u8, parameters: []const std.json.Value, types: []const backend.Type, descriptors: []const backend.Parameter, binding_guard: ?[]const u8, setting_epoch: ?u64) !backend.Result {
+        return self.executeCells(alloc, statement, parameters, types, descriptors, null, binding_guard, setting_epoch);
+    }
+
+    fn executeCells(self: *Session, alloc: std.mem.Allocator, statement: []const u8, parameters: []const std.json.Value, types: []const backend.Type, descriptors: []const backend.Parameter, native_cells: ?[]const @import("antfly_local_sources").sql_scalar.Datum, binding_guard: ?[]const u8, setting_epoch: ?u64) !backend.Result {
         if (try commands.settingCommand(alloc, statement)) |setting| {
             if (parameters.len != 0 or types.len != 0) return error.InvalidParameter;
             return switch (setting) {
@@ -455,6 +460,7 @@ pub const Session = struct {
         defer self.executing.store(false, .release);
         var req = self.request(statement, parameters, types);
         req.parameter_descriptors = descriptors;
+        req.parameter_cells = native_cells;
         req.binding_guard = binding_guard;
         req.setting_epoch = setting_epoch;
         try req.check();
@@ -889,15 +895,21 @@ pub const Session = struct {
                 if (count != statement.parameter_oids.len or (formats.len > 1 and formats.len != count)) return error.InvalidParameter;
                 const parameters = try a.alloc(std.json.Value, count);
                 const types = try a.alloc(backend.Type, count);
+                const native_cells = if (self.source.vtable.native_parameters) try a.alloc(@import("antfly_local_sources").sql_scalar.Datum, count) else null;
                 for (parameters, types, statement.parameter_oids, 0..) |*parameter, *kind, oid, index| {
                     kind.* = try values.fromOid(oid);
                     const len = try cursor.int(i32);
                     if (len == -1) {
                         parameter.* = .null;
+                        if (native_cells) |cells| cells[index] = .{};
                         continue;
                     }
                     if (len < 0) return error.ProtocolViolation;
-                    parameter.* = try values.decode(a, oid, formatAt(formats, index), try cursor.take(@intCast(len)));
+                    const parameter_bytes = try cursor.take(@intCast(len));
+                    if (native_cells) |cells| {
+                        cells[index] = try values.decodeNative(a, oid, formatAt(formats, index), parameter_bytes);
+                        parameter.* = .null;
+                    } else parameter.* = try values.decode(a, oid, formatAt(formats, index), parameter_bytes);
                 }
                 const result_count = try cursor.int(u16);
                 if (result_count > self.limits.columns or (result_count > 1 and result_count != statement.description.columns.len)) return error.UnsupportedResultFormat;
@@ -921,7 +933,7 @@ pub const Session = struct {
                 const namespace = try a.dupe(u8, statement.namespace);
                 const portal = try self.alloc.create(Portal);
                 errdefer if (!transferred) self.alloc.destroy(portal);
-                portal.* = .{ .arena = arena, .statement = text, .parameters = parameters, .types = types, .formats = result_formats, .description = description, .namespace = namespace, .search_path = statement.search_path };
+                portal.* = .{ .arena = arena, .statement = text, .parameters = parameters, .parameter_cells = native_cells, .types = types, .formats = result_formats, .description = description, .namespace = namespace, .search_path = statement.search_path };
                 try self.portals.put(self.alloc, owned_name, portal);
                 transferred = true;
                 try self.message('2', "");
@@ -983,6 +995,7 @@ pub const Session = struct {
                         self.executing.store(true, .release);
                         defer self.executing.store(false, .release);
                         var req = self.request(portal.statement, portal.parameters, portal.types);
+                        req.parameter_cells = portal.parameter_cells;
                         req.parameter_descriptors = portal.description.parameter_descriptors;
                         req.binding_guard = portal.description.binding_guard;
                         req.setting_epoch = portal.description.setting_epoch;
@@ -995,7 +1008,7 @@ pub const Session = struct {
                     return;
                 }
                 if (portal.result == null) {
-                    portal.result = try self.executeTyped(portal.arena.allocator(), portal.statement, portal.parameters, portal.types, portal.description.parameter_descriptors, portal.description.binding_guard, portal.description.setting_epoch);
+                    portal.result = try self.executeCells(portal.arena.allocator(), portal.statement, portal.parameters, portal.types, portal.description.parameter_descriptors, portal.parameter_cells, portal.description.binding_guard, portal.description.setting_epoch);
                     const result = portal.result.?;
                     if (!columnsEqual(portal.description.columns, result.columns)) return error.ResultShapeChanged;
                 }
@@ -1086,17 +1099,22 @@ pub const Session = struct {
                 defer self.request_search_path = previous_search_path;
                 const description = try self.rebindCached(alloc, prepared.statement, prepared.description);
                 if (execute_command.expressions.len != description.parameter_types.len) return error.InvalidParameter;
-                const evaluator = self.source.vtable.evaluate_parameters orelse return error.UnsupportedSqlExecution;
                 self.cancel_requested.store(false, .release);
                 self.executing.store(true, .release);
                 defer self.executing.store(false, .release);
                 var req = self.request(prepared.statement, &.{}, description.parameter_types);
                 req.parameter_descriptors = description.parameter_descriptors;
                 try req.check();
-                const parameters = try evaluator(self.source.context, alloc, self.identity orelse return error.AuthenticationFailed, req, execute_command.expressions);
+                var native_cells: ?[]const @import("antfly_local_sources").sql_scalar.Datum = null;
+                const parameters = if (self.source.vtable.evaluate_parameter_cells) |evaluate| native: {
+                    native_cells = try evaluate(self.source.context, alloc, self.identity orelse return error.AuthenticationFailed, req, execute_command.expressions);
+                    const placeholders = try alloc.alloc(std.json.Value, native_cells.?.len);
+                    @memset(placeholders, .null);
+                    break :native placeholders;
+                } else try (self.source.vtable.evaluate_parameters orelse return error.UnsupportedSqlExecution)(self.source.context, alloc, self.identity orelse return error.AuthenticationFailed, req, execute_command.expressions);
                 if (parameters.len != description.parameter_types.len) return error.InvalidParameter;
-                if (try self.simpleStreamParameters(prepared.statement, parameters, description.parameter_types, description.parameter_descriptors, description.binding_guard, description.setting_epoch)) return true;
-                var result = try self.executeTyped(alloc, prepared.statement, parameters, description.parameter_types, description.parameter_descriptors, description.binding_guard, description.setting_epoch);
+                if (try self.simpleStreamCells(prepared.statement, parameters, description.parameter_types, description.parameter_descriptors, native_cells, description.binding_guard, description.setting_epoch)) return true;
+                var result = try self.executeCells(alloc, prepared.statement, parameters, description.parameter_types, description.parameter_descriptors, native_cells, description.binding_guard, description.setting_epoch);
                 defer result.deinit();
                 if (result.columns.len > 0) try self.rowDescription(result.columns, &.{});
                 if (result.sql_nulls) |flags| if (flags.len != result.rows.len) return error.InvalidResult;
@@ -1473,6 +1491,7 @@ pub const Session = struct {
         self.executing.store(true, .release);
         defer self.executing.store(false, .release);
         var req = self.request(portal.statement, portal.parameters, portal.types);
+        req.parameter_cells = portal.parameter_cells;
         req.parameter_descriptors = portal.description.parameter_descriptors;
         req.binding_guard = portal.description.binding_guard;
         req.setting_epoch = portal.description.setting_epoch;
@@ -1512,6 +1531,10 @@ pub const Session = struct {
     }
 
     fn simpleStreamParameters(self: *Session, statement: []const u8, parameters: []const std.json.Value, types: []const backend.Type, descriptors: []const backend.Parameter, binding_guard: ?[]const u8, setting_epoch: ?u64) !bool {
+        return self.simpleStreamCells(statement, parameters, types, descriptors, null, binding_guard, setting_epoch);
+    }
+
+    fn simpleStreamCells(self: *Session, statement: []const u8, parameters: []const std.json.Value, types: []const backend.Type, descriptors: []const backend.Parameter, native_cells: ?[]const @import("antfly_local_sources").sql_scalar.Datum, binding_guard: ?[]const u8, setting_epoch: ?u64) !bool {
         var settings_arena = std.heap.ArenaAllocator.init(self.alloc);
         defer settings_arena.deinit();
         if (try commands.settingCommand(settings_arena.allocator(), statement) != null) return false;
@@ -1521,6 +1544,7 @@ pub const Session = struct {
         defer self.executing.store(false, .release);
         var req = self.request(statement, parameters, types);
         req.parameter_descriptors = descriptors;
+        req.parameter_cells = native_cells;
         req.binding_guard = binding_guard;
         req.setting_epoch = setting_epoch;
         const stream = (try open(self.source.context, self.alloc, self.identity orelse return error.AuthenticationFailed, req)) orelse return false;
@@ -1528,6 +1552,7 @@ pub const Session = struct {
             .arena = std.heap.ArenaAllocator.init(self.alloc),
             .statement = statement,
             .parameters = parameters,
+            .parameter_cells = native_cells,
             .types = types,
             .formats = &.{},
             .description = .{ .columns = stream.columns, .parameter_types = types, .parameter_descriptors = descriptors, .binding_guard = binding_guard, .setting_epoch = setting_epoch },

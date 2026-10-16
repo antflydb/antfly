@@ -83,7 +83,7 @@ test "SQL prepared parameter frames own typed arrays and bind shared programs on
     try std.testing.expectEqual(@as(i64, -1), (try bound_bounds.evaluate(none.allocator(), &.{}, .{})).value.integer);
     const array = frame.values[0].array.?;
     try std.testing.expectEqual(@as(i32, 2), array.dimensions[1].lower);
-    try std.testing.expect(array.elements[3].sql_null);
+    try std.testing.expect(array.flatCell(3).sql_null);
     var matches: usize = 0;
     var nulls: usize = 0;
     const start = std.Io.Clock.now(.awake, std.testing.io).nanoseconds;
@@ -114,8 +114,8 @@ test "SQL typed parameter inference preserves element identity and guards compat
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
     const result = try (try program.bindParameters(&frame)).evaluate(arena.allocator(), &.{}, .{});
-    try std.testing.expectEqual(@as(i64, 2), result.array.?.elements[0].value.integer);
-    try std.testing.expectEqual(@as(i64, 2), result.array.?.elements[1].value.integer);
+    try std.testing.expectEqual(@as(i64, 2), result.array.?.flatCell(0).value.integer);
+    try std.testing.expectEqual(@as(i64, 2), result.array.?.flatCell(1).value.integer);
     var wrong = try Frame.prepare(a, &.{.{ .kind = .array, .element_type = .text }}, &.{.{ .text = "{1,2}" }}, .{});
     defer wrong.deinit();
     try std.testing.expectError(error.ConflictingSqlParameterTypes, program.bindParameters(&wrong));
@@ -192,9 +192,9 @@ test "SQL JSON parameter ingress owns typed envelopes and shares wire and work a
     input_owner.deinit();
     const value = frame.values[0].array.?;
     try std.testing.expectEqual(@as(i32, 0), value.dimensions[0].lower);
-    try std.testing.expect(!value.elements[0].sql_null and value.elements[0].value == .null);
-    try std.testing.expect(value.elements[1].sql_null);
-    try std.testing.expectEqualStrings("2", value.elements[2].value.object.get("x").?.array.items[1].number_string);
+    try std.testing.expect(!value.flatCell(0).sql_null and value.flatCell(0).value == .null);
+    try std.testing.expect(value.flatCell(1).sql_null);
+    try std.testing.expectEqualStrings("2", value.flatCell(2).value.object.get("x").?.array.items[1].number_string);
     const Faults = struct {
         fn run(backing: A, input: std.json.Value) !void {
             var owner = try Frame.prepareJson(backing, &.{descriptor}, &.{input}, .{});
@@ -290,9 +290,9 @@ test "SQL prepared parameter frames bound admission and unwind every allocation 
             const a: A = .{ .ptr = backing.ptr, .vtable = &vtable };
             var frame = try Frame.prepare(a, &.{ .{ .kind = .array, .element_type = .jsonb }, .{ .kind = .array, .element_type = .text }, .{ .kind = .integer, .element_type = .int64 } }, &.{ .{ .text = "{\"[1,{\\\"a\\\":2}]\",NULL}" }, .{ .text = "{\"é,quoted\",NULL}" }, .{ .text = "9007199254740993" } }, .{});
             defer frame.deinit();
-            const json = frame.values[0].array.?.elements[0].value.array;
+            const json = frame.values[0].array.?.flatCell(0).value.array;
             try std.testing.expectEqual(@intFromPtr(frame.arena), @intFromPtr(json.allocator.ptr));
-            try std.testing.expect(frame.values[0].array.?.elements[1].sql_null);
+            try std.testing.expect(frame.values[0].array.?.flatCell(1).sql_null);
             try std.testing.expectEqual(@as(i64, 9007199254740993), frame.values[2].value.integer);
         }
     };
@@ -338,12 +338,14 @@ test "SQL prepared binary array frames reuse PostgreSQL codecs and stable JSON o
         defer frame.deinit();
         var work: arrays.Budget = .{};
         try std.testing.expectEqual(try expected.value.semanticHash(&work), try frame.values[0].array.?.semanticHash(&work));
-        if (entry.element_type == .jsonb) for (frame.values[0].array.?.elements) |element| {
+        if (entry.element_type == .jsonb) for (0..frame.values[0].array.?.cardinality()) |array_cell_0| {
+            const element = frame.values[0].array.?.flatCell(array_cell_0);
             if (element.value == .array) try std.testing.expectEqual(@intFromPtr(frame.arena), @intFromPtr(element.value.array.allocator.ptr));
         };
         const rank = std.mem.readInt(u32, wire[0..4], .big);
         var at: usize = 12 + 8 * @as(usize, rank);
-        for (expected.value.elements) |element| {
+        for (0..expected.value.cardinality()) |array_cell_0| {
+            const element = expected.value.flatCell(array_cell_0);
             const length = std.mem.readInt(i32, wire[at..][0..4], .big);
             at += 4;
             if (length == -1) continue;
@@ -380,7 +382,7 @@ test "SQL JSON array allocator references survive program and codec owner moves"
     defer program.deinit();
     var constants = program.constant_arrays.valueIterator();
     const cached = constants.next().?.*;
-    const allocator_ptr = cached.elements[0].value.array.allocator.ptr;
+    const allocator_ptr = cached.flatCell(0).value.array.allocator.ptr;
     const pinned_owner = for (program.constant_pool.?.regions.items) |region| {
         if (@intFromPtr(region) == @intFromPtr(allocator_ptr)) break region;
     } else return error.UnpinnedConstantAllocator;
@@ -388,19 +390,19 @@ test "SQL JSON array allocator references survive program and codec owner moves"
     var moved_program = program;
     var moved_constants = moved_program.constant_arrays.valueIterator();
     const moved_cached = moved_constants.next().?.*;
-    const moved_allocator = moved_cached.elements[0].value.array.allocator;
+    const moved_allocator = moved_cached.flatCell(0).value.array.allocator;
     const probe = try moved_allocator.alloc(u8, 256);
     defer moved_allocator.free(probe);
     @memset(probe, 7);
     try std.testing.expectEqual(@as(u8, 7), probe[255]);
-    try std.testing.expectEqual(@as(usize, 2), moved_cached.elements[0].value.array.items.len);
+    try std.testing.expectEqual(@as(usize, 2), moved_cached.flatCell(0).value.array.items.len);
     var owned = try text.decode(a, .jsonb, "{\"[1,2]\"}", .{});
     defer owned.deinit();
-    try std.testing.expectEqual(@intFromPtr(owned.arena), @intFromPtr(owned.value.elements[0].value.array.allocator.ptr));
+    try std.testing.expectEqual(@intFromPtr(owned.arena), @intFromPtr(owned.value.flatCell(0).value.array.allocator.ptr));
     var cloned = try arrays.Owned.init(a, owned.value, .{});
     defer cloned.deinit();
-    try std.testing.expectEqual(@intFromPtr(cloned.arena), @intFromPtr(cloned.value.elements[0].value.array.allocator.ptr));
-    var frame = try Frame.prepare(a, &.{.{ .kind = .json }}, &.{.{ .datum = owned.value.elements[0] }}, .{});
+    try std.testing.expectEqual(@intFromPtr(cloned.arena), @intFromPtr(cloned.value.flatCell(0).value.array.allocator.ptr));
+    var frame = try Frame.prepare(a, &.{.{ .kind = .json }}, &.{.{ .datum = owned.value.flatCell(0) }}, .{});
     defer frame.deinit();
     try std.testing.expectEqual(@intFromPtr(frame.arena), @intFromPtr(frame.values[0].value.array.allocator.ptr));
     try std.testing.expectEqual(@as(?arrays.ElementType, .jsonb), frame.descriptors[0].element_type);
@@ -528,7 +530,7 @@ fn decodeInput(a: A, descriptor: scalar.Type, input: Input, limits: Limits, work
             const array = value.array orelse return error.SqlTypeMismatch;
             if (array.element_type != kind) return error.ConflictingSqlParameterTypes;
             if (value.patterns != null or value.value != .null) return error.SqlTypeMismatch;
-            _ = try arrays.Value.initWithBudget(kind, array.dimensions, array.elements, .{ .bytes = limits.bytes, .elements = limits.elements }, work);
+            _ = try array.validateWithBudget(.{ .bytes = limits.bytes, .elements = limits.elements }, work);
             return operators.cloneDatum(a, value);
         }
         const value = try a.create(arrays.Value);
