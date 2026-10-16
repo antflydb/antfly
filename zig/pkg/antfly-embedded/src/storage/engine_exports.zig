@@ -733,8 +733,8 @@ fn relationalReaderNextTypedPage(self: *@import("db/relational_rows.zig").Reader
     return .{ .value = self.nextTypedPage(alloc, received_io, budget) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
 
-fn relationalReaderLookupTypedRow(self: *@import("db/relational_rows.zig").Reader, alloc: Allocator, document: []const u8) engine.Outcome(?@import("db/relational_rows.zig").Row) {
-    return .{ .value = self.lookupTypedRow(alloc, document) catch |err| return .{ .failure = .init(@errorName(err)) } };
+fn relationalReaderLookupTypedRow(self: *@import("db/relational_rows.zig").Reader, alloc: Allocator, document: []const u8, native_cells: bool) engine.Outcome(?@import("db/relational_rows.zig").Row) {
+    return .{ .value = (if (native_cells) self.lookupSqlRow(alloc, document) else self.lookupTypedRow(alloc, document)) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
 
 fn relationalSessionDeinit(session: *@import("db/relational_read_session.zig").Session) engine.Outcome(void) {

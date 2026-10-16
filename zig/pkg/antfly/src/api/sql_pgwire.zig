@@ -872,7 +872,7 @@ const Job = struct {
         const parameters = try normalizeParameters(self.alloc, self.request.parameters, self.request.parameter_types);
         var execution_backend = guarded.backend();
         execution_backend.parameter_descriptor_hints = self.request.parameter_descriptors;
-        var result = native_adapter.execute(self.request.scratch_allocator orelse self.alloc, compiled, parameters, .{ .result_rows = self.request.limit }, execution_backend) catch |err| {
+        var result = native_adapter.execute(self.request.scratch_allocator orelse self.alloc, compiled, parameters, .{ .result_rows = self.request.limit, .native_result = true }, execution_backend) catch |err| {
             if (self.request.diagnostics) |diagnostic| diagnostic.transaction_status = @fromBackingInt(@backingInt(native_adapter.transaction_status));
             if (err == error.SqlMutationOutcomeUnknown or err == error.SqlTransactionOutcomeUnknown or err == error.SessionLeaseLost) if (self.request.diagnostics) |diagnostic|
                 diagnostic.set("40003", "transaction outcome is unknown; do not replay this statement", native_adapter.outcome_transaction_id, false);
@@ -902,12 +902,15 @@ const Job = struct {
         };
         const columns = try self.alloc.alloc(wire.Column, result.output.columns.len);
         for (columns, result.output.columns) |*out, column| out.* = .{ .name = column.name, .type = try wireType(column.type), .element_type = column.element_type, .numeric_modifier = column.numeric_modifier };
+        const native_owner = if (result.output.native_rows != null) try result.state.arena.allocator().create(NativeResultCells) else null;
+        if (native_owner) |owner| owner.* = .{ .result = result };
         self.result = .{
             .columns = columns,
+            .cells = if (native_owner) |owner| .{ .context = owner, .count = result.output.rowCount(), .width = columns.len, .read = NativeResultCells.read } else null,
             .rows = result.output.rows,
             .sql_nulls = result.output.sql_nulls,
             .rows_affected = result.output.rows_affected,
-            .command_tag = try commandTag(self.alloc, result.output.command_tag, result.output.rows.len, result.output.rows_affected),
+            .command_tag = try commandTag(self.alloc, result.output.command_tag, result.output.rowCount(), result.output.rows_affected),
             .mutation_outcome = if (result.output.mutation_outcome) |outcome| switch (outcome) {
                 inline else => |kind| @field(wire.MutationOutcome, @tagName(kind)),
             } else null,
@@ -1037,6 +1040,53 @@ test "SQL pgwire MERGE completion reports committed affected rows" {
     defer std.testing.allocator.free(tag);
     try std.testing.expectEqualStrings("MERGE 3", tag);
 }
+
+test "SQL pgwire native materialized cells match public text and binary encodings" {
+    const Probe = struct {
+        fn checkpoint(_: *anyopaque) !void {}
+        fn run(a: std.mem.Allocator) !void {
+            var marker: u8 = 0;
+            const backend: catalog.Backend = .{ .ptr = &marker, .vtable = &.{ .resolve = undefined, .scan = undefined, .mutate = undefined, .checkpoint = checkpoint } };
+            var compiled = try compiler.compile(a, "SELECT ARRAY[9007199254740993::bigint,NULL::bigint,-7::bigint] AS a, '9007199254740993.1200'::numeric AS n, 'null'::jsonb AS j, NULL::numeric AS z", .{});
+            defer compiled.deinit();
+            var result = try native.execute(a, backend, &compiled, &.{}, .{ .native_result = true });
+            defer result.deinit();
+            var baseline = try native.execute(a, backend, &compiled, &.{}, .{});
+            defer baseline.deinit();
+            var owner: NativeResultCells = .{ .result = result };
+            var columns: [4]wire.Column = undefined;
+            for (&columns, result.output.columns) |*out, column| out.* = .{ .name = column.name, .type = try wireType(column.type), .element_type = column.element_type };
+            const published: wire.Result = .{ .columns = &columns, .cells = .{ .context = &owner, .count = result.output.rowCount(), .width = columns.len, .read = NativeResultCells.read }, .command_tag = "SELECT 1" };
+            const view = try published.view(0, 1);
+            for ([_]u16{ 0, 1 }) |format| for (columns, 0..) |column, index| {
+                const cell = try view.cell(a, 0, index);
+                const expected_null = baseline.output.sql_nulls.?[0][index];
+                try std.testing.expectEqual(expected_null, cell.sql_null);
+                if (cell.sql_null) continue;
+                var bytes: std.Io.Writer.Allocating = .init(a);
+                defer bytes.deinit();
+                var expected: std.Io.Writer.Allocating = .init(a);
+                defer expected.deinit();
+                wire_values.encodeCellInto(a, &bytes.writer, column, format, cell, 1 << 20) catch |err| return if (err == error.WriteFailed) error.OutOfMemory else err;
+                wire_values.encodeColumnInto(a, &expected.writer, column, format, baseline.output.rows[0][index], 1 << 20) catch |err| return if (err == error.WriteFailed) error.OutOfMemory else err;
+                try std.testing.expectEqualSlices(u8, expected.written(), bytes.written());
+            };
+            try std.testing.expectError(error.InvalidResult, published.cell(a, 1, 0));
+        }
+    };
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Probe.run, .{});
+}
+
+const NativeResultCells = struct {
+    result: native.Result,
+    fn read(raw: *anyopaque, alloc: std.mem.Allocator, row: usize, column: usize) !wire.Cell {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        const rows = self.result.output.native_rows orelse return error.InvalidSqlBackendResponse;
+        if (row >= rows.len or column >= self.result.output.columns.len or rows[row].len != self.result.output.columns.len) return error.InvalidSqlBackendResponse;
+        const datum = rows[row][column];
+        return .{ .value = if (!datum.sql_null and self.result.output.columns[column].type == .datetime) try datetimeResult(alloc, datum.value) else datum.value, .sql_null = datum.sql_null, .array = datum.array, .numeric = datum.numeric };
+    }
+};
 
 fn releaseResult(raw: *anyopaque) void {
     var result = native.Result{ .state = @ptrCast(@alignCast(raw)), .output = undefined };

@@ -2815,11 +2815,11 @@ pub const BoundTableReadSource = struct {
     fn nextRelationalPage(ptr: *anyopaque, alloc: std.mem.Allocator, limit: u32) !@import("antfly_local_sources").api_table_read_source.RelationalReadView.Page {
         const View = @import("antfly_local_sources").api_table_read_source.RelationalReadView;
         const session: *db_mod.DB.RelationalReadSession = @ptrCast(@alignCast(ptr));
-        var page = try session.nextTypedPage(alloc, null, .{ .rows = limit, .output_bytes = 16 * 1024 * 1024 });
+        var page = try session.nextTypedPage(alloc, null, .{ .rows = limit, .output_bytes = 16 * 1024 * 1024, .native_cells = true });
         errdefer page.deinit();
         const owned = page.arena.allocator();
         const rows = try owned.alloc(View.Row, page.rows.len);
-        for (page.rows, rows) |row, *output| output.* = .{ .id = row.key, .version = row.version, .schema_version = session.reader.active.version(), .value = row.typed orelse return error.InvalidSqlBackendResponse, .sql_nulls = row.sql_nulls, .expected_content_digest = row.expected_content_digest };
+        for (page.rows, rows) |row, *output| output.* = .{ .id = row.key, .version = row.version, .schema_version = session.reader.active.version(), .value = row.typed orelse .null, .typed_cells = row.typed_cells, .sql_nulls = row.sql_nulls, .expected_content_digest = row.expected_content_digest };
         // Reader.after is an opaque physical continuation. It advances even
         // when a bounded page contains only filtered or expired records.
         const after = if (page.more) try owned.dupe(u8, session.reader.after.items) else null;
@@ -27653,13 +27653,13 @@ fn implementationTests() type {
                 var retained_page = try retained.next(alloc, 1);
                 defer retained_page.deinit();
                 try std.testing.expectEqual(@as(usize, 1), retained_page.rows.len);
-                try std.testing.expectEqualStrings("second", retained_page.rows[0].value.object.get("name").?.string);
+                try std.testing.expectEqualStrings("second", (try retained_page.rows[0].cell("name")).value.string);
                 try std.testing.expectEqual(@as(u64, 9007199254740994), retained_page.rows[0].version);
             }
             var page = try view.next(alloc, 1);
             defer page.deinit();
             try std.testing.expectEqual(@as(usize, 1), page.rows.len);
-            try std.testing.expectEqualStrings("second", page.rows[0].value.object.get("name").?.string);
+            try std.testing.expectEqualStrings("second", (try page.rows[0].cell("name")).value.string);
             try std.testing.expectEqual(@as(u64, 9007199254740994), page.rows[0].version);
             var exhausted = try view.next(alloc, 1);
             defer exhausted.deinit();
@@ -27717,7 +27717,7 @@ fn implementationTests() type {
                 defer page.deinit();
                 try std.testing.expectEqual(@as(usize, 1), page.rows.len);
                 try std.testing.expectEqualStrings("a", page.rows[0].id);
-                try std.testing.expectEqualStrings("before", page.rows[0].value.object.get("name").?.string);
+                try std.testing.expectEqualStrings("before", (try page.rows[0].cell("name")).value.string);
             }
             const secondary = table_read_source.RelationalStatementScan{ .table = "rows", .opts = .{
                 .relational_query = .{ .fields = &.{"name"}, .index = "by_name", .schema_version = 1 },

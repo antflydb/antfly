@@ -202,7 +202,7 @@ pub const Projection = struct {
     /// nested JSONB/string cloning occurs. Legacy scalar-only pages stay cheap.
     pub fn adaptBorrowed(self: Projection, alloc: std.mem.Allocator, layout: ?catalog.Row.TypedLayout, row: catalog.Row) !catalog.Row {
         if (!self.has_typed_cells) return row;
-        const directory = layout orelse return error.InvalidSqlBackendResponse;
+        const directory = layout orelse if (row.typed_cells) |cells| cells.layout else return error.InvalidSqlBackendResponse;
         if (directory.names.len != self.columns.len) return error.InvalidSqlBackendResponse;
         const cells = try alloc.alloc(catalog.Row.Cell, self.columns.len);
         const presence = try alloc.alloc(bool, self.columns.len);

@@ -23,6 +23,33 @@ const ast = dependencies.sql_ast;
 pub const compiler = dependencies.sql_compiler;
 pub const runtime = dependencies.sql_runtime;
 
+/// Highlight JSON is a SQL JSONB value. Build it directly in the cursor's
+/// region, owning strings before the captured search result is released.
+pub fn highlightsValueLeaky(a: std.mem.Allocator, items: anytype) !?std.json.Value {
+    if (items.len == 0) return null;
+    var fields: std.json.ObjectMap = .empty;
+    for (items) |item| {
+        var fragments = std.json.Array.init(a);
+        for (item.fragments) |fragment| {
+            var object: std.json.ObjectMap = .empty;
+            try object.put(a, "text", .{ .string = try a.dupe(u8, fragment.text) });
+            try object.put(a, "offset", .{ .integer = fragment.offset });
+            if (fragment.item) |index| try object.put(a, "item", .{ .integer = index });
+            var spans = std.json.Array.init(a);
+            for (fragment.spans) |span| {
+                var object_span: std.json.ObjectMap = .empty;
+                try object_span.put(a, "start", .{ .integer = span.start });
+                try object_span.put(a, "end", .{ .integer = span.end });
+                try spans.append(.{ .object = object_span });
+            }
+            try object.put(a, "spans", .{ .array = spans });
+            try fragments.append(.{ .object = object });
+        }
+        try fields.put(a, try a.dupe(u8, item.field), .{ .array = fragments });
+    }
+    return .{ .object = fields };
+}
+
 pub fn Adapter(comptime native: type) type {
     return struct {
         const Self = @This();
@@ -593,7 +620,16 @@ pub fn Adapter(comptime native: type) type {
             var view = self.db.core.acquireSchemaView() orelse return error.PreparedGenerationChanged;
             defer view.release();
             if (view.version() != table.schema_version) return error.PreparedGenerationChanged;
-            var captured = try lease.search(alloc, search);
+            var ranked = search;
+            // Ordinary ranked SQL hydrates selected cells from this same
+            // snapshot below. Avoid preparing an unused public document body.
+            // Graph/highlight/evaluation/hierarchy stages may need that body.
+            if (table.storage_mode == .relational and search.graph_queries.len == 0 and
+                search.highlight == null and !search.hasHitEvaluation() and search.return_mode == .parent and
+                !search.hierarchy_include_source and !search.hierarchy_include_unit and
+                !search.hierarchy_grouped_matches and search.aggregations_json.len == 0)
+                ranked.include_stored = false;
+            var captured = try lease.search(alloc, ranked);
             defer captured.result.deinit();
             const cursor = try alloc.create(SearchCursor);
             errdefer alloc.destroy(cursor);
@@ -610,27 +646,38 @@ pub fn Adapter(comptime native: type) type {
             else
                 null;
             defer if (typed_reader) |*reader| reader.deinit();
+            var output_names: std.StringArrayHashMapUnmanaged(void) = .empty;
+            for (request.fields) |field| if (!std.mem.eql(u8, field, "_id")) {
+                try output_names.put(a, try a.dupe(u8, field), {});
+            };
+            const output_layout = try catalog.Row.TypedLayout.init(a, output_names.keys());
             for (captured.result.hits, rows) |hit, *out| {
-                const typed = if (typed_reader) |*reader| (try reader.lookupTypedRow(a, hit.id)) orelse return error.SqlStatementReadUnavailable else null;
-                var document = if (typed) |row| row.typed orelse return error.InvalidSqlBackendResponse else if (hit.source_value) |value| try types.cloneJsonValue(a, value) else if (hit.stored_data) |data| try std.json.parseFromSliceLeaky(std.json.Value, a, data, .{ .parse_numbers = false }) else return error.InvalidSqlBackendResponse;
-                if (document != .object) return error.InvalidSqlBackendResponse;
-                try document.object.put(a, "score", if (hit.score) |score| .{ .float = score } else .null);
-                if (try native.public_api.query.highlightsJsonValue(a, hit.highlights)) |highlights| {
-                    const encoded = try std.json.Stringify.valueAlloc(a, highlights, .{});
-                    try document.object.put(a, "_highlights", try std.json.parseFromSliceLeaky(std.json.Value, a, encoded, .{ .parse_numbers = false }));
-                } else _ = document.object.swapRemove("_highlights");
-                if (typed) |row| {
-                    // Native typed cells are already projected and owned. Add
-                    // only search metadata, keeping their SQL-null bitmap.
-                    var projected: std.json.ObjectMap = .empty;
-                    const nulls = try a.alloc(bool, request.fields.len);
-                    for (request.fields) |field| {
-                        if (std.mem.eql(u8, field, "_id")) continue;
-                        try projected.put(a, field, document.object.get(field) orelse .null);
-                        nulls[projected.count() - 1] = if (std.mem.eql(u8, field, "score")) hit.score == null else if (std.mem.eql(u8, field, "_highlights")) !document.object.contains("_highlights") else if (document.object.getIndex(field)) |index| row.sql_nulls.?[index] else true;
+                if (typed_reader) |*reader| {
+                    const row = (try reader.lookupSqlRow(a, hit.id)) orelse return error.SqlStatementReadUnavailable;
+                    const source: catalog.Row = .{ .id = row.key, .version = row.version, .value = .null, .typed_cells = row.typed_cells, .expected_content_digest = row.expected_content_digest };
+                    const values = try a.alloc(catalog.Row.Cell, output_layout.names.len);
+                    const presence = try a.alloc(bool, values.len);
+                    for (output_layout.names, values, presence) |field, *cell, *present| {
+                        if (std.mem.eql(u8, field, "score")) {
+                            cell.* = if (hit.score) |score| catalog.Row.Cell.json(.{ .float = score }) else .{};
+                            present.* = true;
+                        } else if (std.mem.eql(u8, field, "_highlights")) {
+                            const highlights = try highlightsValueLeaky(a, hit.highlights);
+                            cell.* = if (highlights) |value| catalog.Row.Cell.json(value) else .{};
+                            present.* = highlights != null;
+                        } else {
+                            cell.* = try source.cell(field);
+                            present.* = try source.hasField(field);
+                        }
                     }
-                    out.* = .{ .id = row.key, .version = row.version, .value = .{ .object = projected }, .sql_nulls = nulls[0..projected.count()] };
-                } else out.* = try dependencies.sql_document_row.projectValue(a, table, hit.id, 0, document, request.fields);
+                    out.* = .{ .id = row.key, .version = row.version, .value = .null, .typed_cells = .{ .layout = output_layout, .values = values, .presence = presence }, .expected_content_digest = row.expected_content_digest };
+                } else {
+                    var document = if (hit.source_value) |value| try types.cloneJsonValue(a, value) else if (hit.stored_data) |data| try std.json.parseFromSliceLeaky(std.json.Value, a, data, .{ .parse_numbers = false }) else return error.InvalidSqlBackendResponse;
+                    if (document != .object) return error.InvalidSqlBackendResponse;
+                    try document.object.put(a, "score", if (hit.score) |score| .{ .float = score } else .null);
+                    if (try highlightsValueLeaky(a, hit.highlights)) |value| try document.object.put(a, "_highlights", value) else _ = document.object.swapRemove("_highlights");
+                    out.* = try dependencies.sql_document_row.projectValue(a, table, hit.id, 0, document, request.fields);
+                }
             }
             cursor.* = .{ .alloc = alloc, .arena = arena, .rows = rows };
             return .{ .ptr = cursor, .next = SearchCursor.next, .close = SearchCursor.close };
@@ -663,10 +710,10 @@ pub fn Adapter(comptime native: type) type {
                         };
                     }
                 }
-                out.* = .{ .name = try alloc.dupe(u8, column.name), .path = try alloc.dupe(u8, column.path), .nullable = !column.required or column.allows_null, .generated = generated, .defaulted = catalog.hasColumnDefault(parsed, column.name), .element_type = column.sql_element_type, .type = dependencies.sql_document_row.relationalType(parsed, column.name, switch (column.column_type) {
+                out.* = .{ .name = try alloc.dupe(u8, column.name), .path = try alloc.dupe(u8, column.path), .nullable = !column.required or column.allows_null, .generated = generated, .defaulted = catalog.hasColumnDefault(parsed, column.name), .element_type = column.sql_element_type, .numeric_modifier = column.numeric_modifier, .type = dependencies.sql_document_row.relationalType(parsed, column.name, switch (column.column_type) {
                     .string => .string,
                     .integer => .integer,
-                    .number => .number,
+                    .number, .numeric => .number,
                     .boolean => .boolean,
                     .datetime => .datetime,
                     .json => .json,
@@ -683,12 +730,12 @@ pub fn Adapter(comptime native: type) type {
             projection: dependencies.sql_document_row.Projection,
             fn next(ptr: *anyopaque, alloc: std.mem.Allocator, limit: u32) !catalog.Page {
                 const self: *Cursor = @ptrCast(@alignCast(ptr));
-                var page = try self.session.nextTypedPage(alloc, null, .{ .rows = limit, .output_bytes = 16 * 1024 * 1024 });
+                var page = try self.session.nextTypedPage(alloc, null, .{ .rows = limit, .output_bytes = 16 * 1024 * 1024, .native_cells = true });
                 errdefer page.deinit();
                 const owned = page.arena.allocator();
                 const rows = try owned.alloc(catalog.Row, page.rows.len);
                 const layout = try self.projection.pageLayout(owned);
-                for (page.rows, rows) |row, *out| out.* = try self.projection.adaptBorrowed(owned, layout, .{ .id = row.key, .version = row.version, .value = row.typed orelse return error.InvalidSqlBackendResponse, .sql_nulls = row.sql_nulls, .expected_content_digest = row.expected_content_digest });
+                for (page.rows, rows) |row, *out| out.* = try self.projection.adaptBorrowed(owned, layout, .{ .id = row.key, .version = row.version, .value = row.typed orelse .null, .typed_cells = row.typed_cells, .sql_nulls = row.sql_nulls, .expected_content_digest = row.expected_content_digest });
                 const after = if (page.more) try owned.dupe(u8, self.session.reader.after.items) else null;
                 return .{ .rows = rows, .after = after, .owned_arena = page.arena };
             }

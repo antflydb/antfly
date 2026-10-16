@@ -28,11 +28,23 @@ pub const View = struct {
         version: u64,
         schema_version: u32,
         value: std.json.Value,
+        /// Complete native SQL cells, owned by the page arena.
+        typed_cells: ?@import("../sql/catalog.zig").Row.TypedCells = null,
         expected_content_digest: ?[32]u8 = null,
         document: ?std.json.Value = null,
         /// SQL NULL flags aligned with value.object insertion order. A JSON
         /// payload containing null has a false flag.
         sql_nulls: ?[]const bool = null,
+
+        /// Borrowed SQL view; payload lifetime is exactly the owning page.
+        /// Native and legacy providers share the same cell/null accessor.
+        pub fn sqlRow(self: Row) @import("../sql/catalog.zig").Row {
+            return .{ .id = self.id, .version = self.version, .value = self.value, .typed_cells = self.typed_cells, .sql_nulls = self.sql_nulls, .expected_content_digest = self.expected_content_digest, .document = self.document };
+        }
+
+        pub fn cell(self: Row, name: []const u8) !@import("../sql/catalog.zig").Row.Cell {
+            return self.sqlRow().cell(name);
+        }
     };
     pub const Page = struct {
         arena: std.heap.ArenaAllocator,

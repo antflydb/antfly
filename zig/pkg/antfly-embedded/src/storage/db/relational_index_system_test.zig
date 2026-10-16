@@ -3077,6 +3077,13 @@ test "relational index system query lease typed point hydration retains nulls nu
     try std.testing.expectEqualSlices(bool, &.{ false, true }, retained.sql_nulls.?);
     try std.testing.expect(retained.typed.?.object.get("payload").? == .null);
     try std.testing.expect(try reader.lookupTypedRow(a, "missing") == null);
+    const native = (try reader.lookupSqlRow(a, "a")).?;
+    try std.testing.expect(native.typed == null and native.sql_nulls == null);
+    const native_row: @import("../../sql/catalog.zig").Row = .{ .id = native.key, .version = native.version, .value = .null, .typed_cells = native.typed_cells };
+    try std.testing.expect(!(try native_row.cell("payload")).sql_null);
+    try std.testing.expect((try native_row.cell("payload")).value == .null);
+    try std.testing.expect((try native_row.cell("optional")).sql_null);
+    try std.testing.expect(try reader.lookupSqlRow(a, "missing") == null);
     var current = try db.beginRelationalRows(alloc, .{ .fields = &.{ "payload", "optional" } });
     defer current.deinit();
     const updated = (try current.lookupTypedRow(a, "a")).?;

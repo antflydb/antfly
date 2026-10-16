@@ -224,7 +224,9 @@ pub const Row = struct {
     /// Internal relation rows retain complete, owned Datums and share a single
     /// page-local name directory, without constructing per-row JSON objects.
     /// Legacy backend rows continue to use JSON and the null/pattern channels.
-    typed_cells: ?struct { layout: TypedLayout, values: []const Cell, presence: ?[]const bool = null } = null,
+    typed_cells: ?TypedCells = null,
+
+    pub const TypedCells = struct { layout: TypedLayout, values: []const Cell, presence: ?[]const bool = null };
 
     pub const Cell = @import("scalar.zig").Datum;
     pub const TypedLayout = struct {

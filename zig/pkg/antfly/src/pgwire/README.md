@@ -217,3 +217,45 @@ through a real connection. Go, Node.js, and Rust (at least 1.94 for SQLx 0.9) to
 Both base and full E2E CI gates require the driver conformance job, which reuses
 the corresponding candidate binary. Use
 `--url` to target an existing node or `--drivers` to select individual clients.
+
+Relational SQL reads carry page-owned native cells from storage through the SQL
+batch and pgwire cell accessor. Embedded SQL scans and ranked point hydration
+use the same native cells; ordinary ranked retrieval omits the unused public
+document body. Arrays decode directly into typed elements, and
+NUMERIC retains canonical decimal groups; neither requires a public JSON
+envelope. Materialized SELECT and mutation RETURNING results use the same typed
+sink as blocking SQL operators. The result owner keeps cells alive until the
+protocol releases the result. HTTP SQL continues to request public JSON results.
+
+Private retained-read paging negotiates `application/vnd.antfly.sql-page.v1`
+through Accept. New peers exchange bounded native column blocks, preserving
+array bounds, exact NUMERIC, missing fields, SQL NULL, JSON null, schema epochs,
+sequence numbers, and primary digests. Control messages and authentication are
+unchanged. An older owner can ignore Accept and return its existing JSON page;
+an older coordinator receives that legacy page shape from a new owner. SQL
+requires a retained-read provider; a TableReadSource that implements only public
+NDJSON scans must add the native read capability before serving SQL. Public
+HTTP scan support alone cannot provide statement snapshot semantics.
+
+This removes intermediate row JSON, rather than claiming zero allocation.
+`ordinal native SQL projection avoids public array envelope allocations` compares
+both storage boundaries with a 32,768-element bigint array and an arena over a
+non-resizing allocator. The 266,256-byte stored array used 12,190,126 bytes of
+arena backing for the public projection versus 3,932,676 for native cells (68%
+less). `SQL native transport materialized results avoid public envelopes` starts
+with that already-typed array and measures the runtime result boundary: 8,264,998
+bytes of peak backing for public results versus 3,937,372 for native results
+(52% less). These Fast figures exclude fixture storage input and pgwire frame
+buffers. Typed array
+elements, ownership copies, frame bytes, actual JSON/JSONB values, and legacy
+parameter adapters still have allocation and encoding costs.
+
+Focused regression gates (from `zig/`, with the repository's Zig version):
+
+```sh
+zig build antfly-api-sql-native-cells-test -Doptimize=Debug
+zig build antfly-api-table-read-test -Doptimize=Debug
+zig build sql-test -Dtest-filter='SQL native transport' -Doptimize=Debug
+zig build antfly-storage-test -Dtest-filter='relational index system coordinated read set' -Doptimize=Debug
+zig build antfly-relational-index-system-test -Doptimize=fast
+```

@@ -1422,6 +1422,50 @@ pub const OrdinalRowView = struct {
         return (try self.projectSqlTypedAlloc(alloc, plan)).value;
     }
 
+    pub const DatumProjection = struct {
+        values: []const @import("../../../sql/scalar.zig").Datum,
+        presence: []const bool,
+    };
+
+    /// Cursor-independent SQL cells. Decode physical arrays and exact NUMERIC
+    /// directly, without public JSON envelopes or decimal formatting. All
+    /// payloads belong to the caller's page arena before the cursor advances.
+    pub fn projectSqlDatumsAlloc(self: OrdinalRowView, alloc: Allocator, plan: OrdinalProjectionPlan) !DatumProjection {
+        if (plan.schema_version != self.table_schema.version) return error.RelationalRowSchemaMismatch;
+        const Datum = @import("../../../sql/scalar.zig").Datum;
+        const values = try alloc.alloc(Datum, plan.ordinals.len);
+        const presence = try alloc.alloc(bool, plan.ordinals.len);
+        for (plan.ordinals, values, presence) |ordinal, *value, *present| {
+            const cell = (try self.findCell(ordinal)) orelse {
+                value.* = .{};
+                present.* = false;
+                continue;
+            };
+            present.* = true;
+            value.* = .{};
+            if (cell.is_null) continue;
+            const column = self.table_schema.relational_columns[ordinal];
+            value.* = switch (column.column_type) {
+                .sql_array => blk: {
+                    const array = try alloc.create(@import("../../../sql/array_value.zig").Value);
+                    array.* = (try @import("../../../sql/array_storage.zig").decodeLeaky(alloc, column.sql_element_type orelse return error.InvalidRelationalRow, cell.value.bytes_val, .{})).value;
+                    break :blk Datum.typedArray(array);
+                },
+                .numeric => blk: {
+                    const numeric = @import("../../../sql/numeric_value.zig");
+                    var context: numeric.Context = .{ .alloc = alloc };
+                    var decoded = try @import("../../../sql/numeric_binary.zig").decodeCanonical(&context, cell.value.bytes_val);
+                    errdefer decoded.deinit();
+                    const number = try alloc.create(numeric.Value);
+                    number.* = decoded.value;
+                    break :blk Datum.typedNumeric(number);
+                },
+                else => Datum.json(try self.materializeCellAlloc(alloc, cell)),
+            };
+        }
+        return .{ .values = values, .presence = presence };
+    }
+
     pub const TypedProjection = struct {
         value: std.json.Value,
         /// Aligned with object insertion order, not schema ordinals. Missing
@@ -3296,4 +3340,97 @@ test "public graph metric borrowed wire native SQL array writer matches logical 
             try std.testing.expectEqualStrings(expected, writer.written());
         }
     }
+}
+
+test "ordinal native SQL projection owns arrays numeric and missing cells across cursor advance" {
+    const a = std.testing.allocator;
+    const columns = [_]runtime_schema.RelationalColumn{
+        .{ .name = "a", .path = "a", .column_type = .sql_array, .sql_element_type = .int64 },
+        .{ .name = "n", .path = "n", .column_type = .numeric, .sql_element_type = .numeric },
+        .{ .name = "s", .path = "s", .column_type = .string },
+        .{ .name = "j", .path = "j", .column_type = .json, .is_json = true },
+        .{ .name = "missing", .path = "missing", .column_type = .integer, .allows_null = true },
+        .{ .name = "null", .path = "null", .column_type = .string, .allows_null = true },
+    };
+    const schema: runtime_schema.TableSchema = .{ .version = 2, .storage_mode = .relational, .relational_columns = &columns };
+    var layout = try PhysicalLayout.init(a, schema);
+    defer layout.deinit();
+    var array = try @import("../../../sql/array_text.zig").decode(a, .int64, "[0:2]={9007199254740993,NULL,-7}", .{});
+    defer array.deinit();
+    const payload = try @import("../../../sql/array_storage.zig").encodeAlloc(a, array.value, .{});
+    defer a.free(payload);
+    const number = try @import("../../../sql/numeric_storage.zig").encodeJsonAlloc(a, .{ .string = "9007199254740993.1200" });
+    defer a.free(number);
+    const cells = [_]Cell{
+        .{ .ordinal = 0, .path = "a", .value_type = .bytes_val, .sql_array_element_type = .int64, .value = .{ .bytes_val = payload } },
+        .{ .ordinal = 1, .path = "n", .value_type = .bytes_val, .is_numeric = true, .value = .{ .bytes_val = number } },
+        .{ .ordinal = 2, .path = "s", .value_type = .bytes_val, .value = .{ .bytes_val = "retained" } },
+        .{ .ordinal = 3, .path = "j", .value_type = .bytes_val, .is_json = true, .value = .{ .bytes_val = "null" } },
+        .{ .ordinal = 5, .path = "null", .value_type = .bytes_val, .is_null = true, .value = .{ .bytes_val = "" } },
+    };
+    const encoded = try serializeOrdinal(a, schema.version, &columns, &cells, @splat(0));
+    defer a.free(encoded);
+    const row = try ordinalRowViewTrusted(encoded, schema, &layout);
+    var plan = try OrdinalProjectionPlan.init(a, schema, &layout, &.{ "a", "n", "s", "j", "missing", "null" });
+    defer plan.deinit();
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const projection = try row.projectSqlDatumsAlloc(arena.allocator(), plan);
+    @memset(encoded, 0);
+    try std.testing.expectEqual(@as(i64, 9007199254740993), projection.values[0].array.?.elements[0].value.integer);
+    try std.testing.expectEqual(@as(i32, 0), projection.values[0].array.?.dimensions[0].lower);
+    try std.testing.expect(projection.values[0].array.?.elements[1].sql_null);
+    var context: @import("../../../sql/numeric_value.zig").Context = .{ .alloc = a };
+    const text = try @import("../../../sql/numeric_value.zig").format(&context, projection.values[1].numeric.?.*);
+    defer a.free(text);
+    try std.testing.expectEqualStrings("9007199254740993.1200", text);
+    try std.testing.expectEqualStrings("retained", projection.values[2].value.string);
+    try std.testing.expect(projection.values[3].value == .null and !projection.values[3].sql_null);
+    try std.testing.expect(!projection.presence[4] and projection.values[4].sql_null);
+    try std.testing.expect(projection.presence[5] and projection.values[5].sql_null);
+}
+
+test "ordinal native SQL projection avoids public array envelope allocations" {
+    const a = std.testing.allocator;
+    const arrays = @import("../../../sql/array_value.zig");
+    const storage = @import("../../../sql/array_storage.zig");
+    const test_alloc = @import("../../lite/test_allocator.zig");
+    const elements = try a.alloc(arrays.Element, 32768);
+    defer a.free(elements);
+    @memset(elements, arrays.Element.json(.{ .integer = 42 }));
+    const array = try arrays.Value.init(.int64, &.{.{ .length = 32768, .lower = 1 }}, elements, .{});
+    const payload = try storage.encodeAlloc(a, array, .{});
+    defer a.free(payload);
+    const columns = [_]runtime_schema.RelationalColumn{.{ .name = "a", .path = "a", .column_type = .sql_array, .sql_element_type = .int64 }};
+    const schema: runtime_schema.TableSchema = .{ .version = 1, .storage_mode = .relational, .relational_columns = &columns };
+    var layout = try PhysicalLayout.init(a, schema);
+    defer layout.deinit();
+    const encoded = try serializeOrdinal(a, 1, &columns, &.{.{ .ordinal = 0, .path = "a", .value_type = .bytes_val, .sql_array_element_type = .int64, .value = .{ .bytes_val = payload } }}, @splat(0));
+    defer a.free(encoded);
+    const row = try ordinalRowViewTrusted(encoded, schema, &layout);
+    var plan = try OrdinalProjectionPlan.init(a, schema, &layout, &.{"a"});
+    defer plan.deinit();
+    var peaks: [2]usize = undefined;
+    for ([_]bool{ false, true }, &peaks) |native, *peak| {
+        var no_resize: test_alloc.NoResizeAllocator = .{ .backing = a };
+        var budget: test_alloc.BudgetAllocator = .{ .backing = no_resize.allocator() };
+        {
+            var arena = std.heap.ArenaAllocator.init(budget.allocator());
+            defer arena.deinit();
+            if (native) {
+                const projected = try row.projectSqlDatumsAlloc(arena.allocator(), plan);
+                try std.testing.expectEqual(@as(usize, 32768), projected.values[0].array.?.elements.len);
+                try std.testing.expectEqual(@as(i64, 42), projected.values[0].array.?.elements[32767].value.integer);
+            } else {
+                const projected = try row.projectSqlTypedAlloc(arena.allocator(), plan);
+                try std.testing.expect(projected.value.object.get("a").? == .object);
+            }
+            peak.* = budget.peak;
+        }
+        try std.testing.expectEqual(@as(usize, 0), budget.live);
+    }
+    // A generous allocation bound guards against reintroducing envelopes,
+    // independent of allocator size classes and exact arena growth policy.
+    try std.testing.expect(peaks[1] < peaks[0] / 2);
+    std.debug.print("SQL array boundary: stored={d} public_peak={d} native_peak={d}\n", .{ payload.len, peaks[0], peaks[1] });
 }
