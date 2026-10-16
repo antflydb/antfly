@@ -127,6 +127,7 @@ pub const mp3 = mp3_impl;
 pub const mp4 = mp4_impl;
 pub const caf = caf_impl;
 pub const aac = aac_impl;
+pub const aacplus = @import("aacplus/mod.zig");
 pub const streaming = @import("streaming.zig");
 pub const alac = alac_impl;
 pub const aiff = aiff_impl;
@@ -672,6 +673,7 @@ fn decodeInterleavedOpus(allocator: std.mem.Allocator, audio_bytes: []const u8) 
 }
 
 fn decodeInterleavedOpusPureZig(allocator: std.mem.Allocator, audio_bytes: []const u8) !AudioInterleaved {
+    if (try decodeOggChain(allocator, audio_bytes)) |decoded| return decoded;
     const decoded = try opus.decodeInterleavedOggAlloc(allocator, audio_bytes);
     return .{
         .samples = decoded.samples,
@@ -681,7 +683,15 @@ fn decodeInterleavedOpusPureZig(allocator: std.mem.Allocator, audio_bytes: []con
     };
 }
 
+fn decodeOggChain(a: std.mem.Allocator, bytes: []const u8) !?AudioInterleaved {
+    var streams = try ogg.parsePacketStreamsAlloc(a, bytes);
+    defer streams.deinit();
+    if (streams.streams.len <= 1) return null;
+    const decoded = try @import("ogg_chains.zig").decode(a, bytes);
+    return .{ .samples = decoded.samples, .sample_rate = decoded.sample_rate, .channels = decoded.channels, .allocator = a };
+}
 fn decodeInterleavedOggPureZig(allocator: std.mem.Allocator, audio_bytes: []const u8) !AudioInterleaved {
+    if (try decodeOggChain(allocator, audio_bytes)) |decoded| return decoded;
     const codec = try ogg.sniffCodec(allocator, audio_bytes);
     switch (codec) {
         .flac => {
@@ -1266,7 +1276,7 @@ const AacToolCorpusCase = struct {
     expected_channels: u8,
 };
 
-const checked_in_additional_codec_cases: [58]CodecCase = conformance.buildCheckedInCodecCases(EncodedFormat, .{
+const checked_in_additional_codec_cases: [63]CodecCase = conformance.buildCheckedInCodecCases(EncodedFormat, .{
     .tone_aac_bytes = tone_aac_bytes,
     .tone_aac_44k_mono_bytes = tone_aac_44k_mono_bytes,
     .transient_aac_44k_pns_bytes = transient_aac_44k_pns_bytes,
@@ -2138,7 +2148,7 @@ test "checked-in codec corpus decodes and stays close to its reference" {
             interleaved.sample_rate,
             interleaved.channels,
         );
-        try conformance.assertStereoCoherenceIfExpected(case.expected_channels, interleaved.samples);
+        if (case.expect_coherent_stereo) try conformance.assertStereoCoherenceIfExpected(case.expected_channels, interleaved.samples);
 
         var mono = try decode(std.testing.allocator, case.bytes, .{});
         defer mono.deinit();
@@ -3091,7 +3101,7 @@ test "non-mp3 corpus lane summary json export stays coherent" {
 
     try conformance.appendLaneSummariesJson(&buf, std.testing.allocator, &non_mp3_lane_summaries);
     try std.testing.expectEqualStrings(
-        "[{\"lane\":\"passing\",\"case_count\":58},{\"lane\":\"decode_but_not_claimed\",\"case_count\":0},{\"lane\":\"unsupported\",\"case_count\":1}]",
+        "[{\"lane\":\"passing\",\"case_count\":63},{\"lane\":\"decode_but_not_claimed\",\"case_count\":0},{\"lane\":\"unsupported\",\"case_count\":1}]",
         buf.items,
     );
 }
@@ -3194,7 +3204,7 @@ test "streaming audio codec blocks preserve full decode sample clocks trim gain 
             try self.samples.appendSlice(std.testing.allocator, pcm);
         }
     };
-    inline for (.{ "../tone.mp3", "tone-stereo.flac", "tone-stereo-24bit.flac", "tone-mono-44k.aac", "transient-stereo-44k-short.aac", "tone-stereo.mp4", "tone-stereo-alac.m4a", "tone-stereo-opus.ogg", "tone-stereo.oga", "tone-stereo-flac.ogg", "tone-stereo.caf", "tone-stereo-alac-24bit.caf", "tone-stereo.aiff", "probe-silk-mono-16k-fec-60ms.ogg" }) |name| {
+    inline for (.{ "../tone.mp3", "tone-stereo.flac", "tone-stereo-24bit.flac", "tone-mono-44k.aac", "transient-stereo-44k-short.aac", "tone-stereo.mp4", "tone-stereo-alac.m4a", "tone-stereo-opus.ogg", "tone-stereo.oga", "tone-stereo-flac.ogg", "tone-stereo.caf", "tone-stereo-alac-24bit.caf", "tone-stereo.aiff", "owned-he-aac-44100-stereo.m4a", "owned-he-aac-v2-44100-stereo.m4a", "owned-he-aac-48000-mixed.m4a", "owned-he-aac-v2-48000-mixed.m4a", "owned-he-aac-48000-mono.m4a", "probe-silk-mono-16k-fec-60ms.ogg" }) |name| {
         const bytes = @embedFile("../testdata/codec-corpus/" ++ name);
         var expected = try decode(std.testing.allocator, bytes, .{});
         defer expected.deinit();
@@ -3261,5 +3271,205 @@ test "streaming audio PCM containers fit fixed scratch and propagate cancellatio
         capture.stop = true;
         fixed.reset();
         try std.testing.expectError(error.Cancelled, streaming.visit(fixed.allocator(), bytes, .{}, .{ .context = &capture, .write = Capture.write }));
+    }
+}
+
+test "streaming audio real HE-AAC and PS blocks preserve reference PCM and clocks" {
+    const a = std.testing.allocator;
+    const Compare = struct {
+        expected: []const u8,
+        rate: u32,
+        channels: u8,
+        skip: usize,
+        offset: usize = 0,
+        signal: f64 = 0,
+        squared_error: f64 = 0,
+        fn write(raw: *anyopaque, pcm: []const f32, rate: u32, channels: u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try std.testing.expectEqual(self.rate, rate);
+            try std.testing.expectEqual(self.channels, channels);
+            try std.testing.expect(pcm.len <= 4096);
+            const drop = @min(self.skip, pcm.len);
+            self.skip -= drop;
+            for (pcm[drop..]) |value| {
+                if (self.offset == self.expected.len / 2) break;
+                const want: f64 = @floatFromInt(std.mem.readInt(i16, self.expected[self.offset * 2 ..][0..2], .little));
+                const delta = @as(f64, value) - want;
+                self.signal += want * want;
+                self.squared_error += delta * delta;
+                self.offset += 1;
+            }
+        }
+    };
+    inline for (.{ "he-aac-44100-stereo", "he-aac-v2-44100-stereo", "he-aac-48000-mixed", "he-aac-v2-48000-mixed", "he-aac-48000-mono" }) |name| {
+        const encoded = @embedFile("../testdata/codec-corpus/owned-" ++ name ++ ".m4a");
+        const reference = @embedFile("../testdata/codec-corpus/reference/owned-" ++ name ++ "-reference.s16le");
+        var demuxed = try mp4.demux(a, encoded);
+        defer demuxed.deinit();
+        var compare = Compare{ .expected = reference, .rate = demuxed.sample_rate, .channels = @intCast(demuxed.channels), .skip = @intCast(demuxed.trim_start_frames * demuxed.channels) };
+        var scratch: [512 * 1024]u8 = undefined;
+        var bounded = std.heap.FixedBufferAllocator.init(&scratch);
+        try aacplus.visit(bounded.allocator(), demuxed.decoder_config, demuxed.access_units, 0, .{ .context = &compare, .write = Compare.write });
+        try std.testing.expectEqual(@as(usize, 0), compare.skip);
+        try std.testing.expectEqual(reference.len / 2, compare.offset);
+        // Independent FFmpeg PCM16 oracle, including container priming. A 50 dB
+        // floor allows bounded fixed-point rounding without accepting missing
+        // SBR bands, synthetic enhancement or dropped PS channel reconstruction.
+        const snr = 10 * @log10(compare.signal / @max(compare.squared_error, 1));
+        try std.testing.expect(snr >= 50);
+    }
+}
+
+test "streaming audio enhanced AAC allocation and cancellation preserve ownership" {
+    const a = std.testing.allocator;
+    const encoded = @embedFile("../testdata/codec-corpus/owned-he-aac-v2-48000-mixed.m4a");
+    var demuxed = try mp4.demux(a, encoded);
+    defer demuxed.deinit();
+    const Capture = struct {
+        calls: usize = 0,
+        stop: bool = false,
+        fn write(raw: *anyopaque, pcm: []const f32, rate: u32, channels: u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try std.testing.expectEqual(@as(u32, 48000), rate);
+            try std.testing.expectEqual(@as(u8, 2), channels);
+            try std.testing.expectEqual(@as(usize, 4096), pcm.len);
+            self.calls += 1;
+            if (self.stop) return error.Cancelled;
+        }
+        fn allocation(a2: std.mem.Allocator, config: []const u8, units: []const []const u8) !void {
+            var capture = @This(){};
+            try aacplus.visit(a2, config, units[0..4], 0, .{ .context = &capture, .write = write });
+            try std.testing.expectEqual(@as(usize, 4), capture.calls);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(a, Capture.allocation, .{ demuxed.decoder_config, demuxed.access_units });
+    const decoder = try aacplus.Decoder.create(a, demuxed.decoder_config, 0);
+    defer decoder.deinit();
+    var capture = Capture{ .stop = true };
+    const sink = @import("pcm_sink.zig").Sink{ .context = &capture, .write = Capture.write };
+    try std.testing.expectError(error.Cancelled, decoder.decode(demuxed.access_units[0], sink));
+    try std.testing.expectEqual(@as(usize, 1), capture.calls);
+    capture.stop = false;
+    // A consumer error retires the state; retry must use a fresh session.
+    try std.testing.expectError(error.UnsupportedAudioFormat, decoder.decode(demuxed.access_units[1], sink));
+    const Cancel = struct {
+        fn check(_: ?*const anyopaque) !void {
+            return error.Cancelled;
+        }
+    };
+    const scope = @import("work_control.zig").Scope.enter(.{ .check_fn = Cancel.check });
+    defer scope.deinit();
+    try std.testing.expectError(error.Cancelled, aacplus.Decoder.create(a, demuxed.decoder_config, 0));
+}
+
+test "streaming audio enhanced AAC truncated and mutated units remain bounded" {
+    const a = std.testing.allocator;
+    const Capture = struct {
+        fn write(_: *anyopaque, samples: []const f32, rate: u32, channels: u8) !void {
+            try std.testing.expect(rate > 0 and rate <= 192000);
+            try std.testing.expect(channels == 1 or channels == 2);
+            try std.testing.expect(samples.len <= 4096);
+            for (samples) |sample| try std.testing.expect(std.math.isFinite(sample));
+        }
+    };
+    var context: u8 = 0;
+    const sink = @import("pcm_sink.zig").Sink{ .context = &context, .write = Capture.write };
+    inline for (.{ "he-aac-48000-mixed", "he-aac-v2-48000-mixed", "he-aac-48000-mono" }) |name| {
+        var demuxed = try mp4.demux(a, @embedFile("../testdata/codec-corpus/owned-" ++ name ++ ".m4a"));
+        defer demuxed.deinit();
+        const source = demuxed.access_units[10];
+        for (0..32) |trial| {
+            const decoder = try aacplus.Decoder.create(a, demuxed.decoder_config, 0);
+            defer decoder.deinit();
+            for (demuxed.access_units[0..10]) |unit| try decoder.decode(unit, sink);
+            const altered = try a.dupe(u8, source);
+            defer a.free(altered);
+            const index = trial * altered.len / 32;
+            altered[index] ^= @as(u8, 1) << @intCast(trial % 8);
+            decoder.decode(altered, sink) catch |err| {
+                try std.testing.expectEqual(error.UnsupportedAudioFormat, err);
+                try std.testing.expect(!decoder.valid);
+            };
+        }
+        for (0..16) |trial| {
+            const decoder = try aacplus.Decoder.create(a, demuxed.decoder_config, 0);
+            defer decoder.deinit();
+            decoder.decode(source[0 .. trial * source.len / 16], sink) catch |err| {
+                try std.testing.expectEqual(error.UnsupportedAudioFormat, err);
+            };
+        }
+    }
+}
+
+test "streaming audio Ogg chains reset codecs and preserve independent segment clocks" {
+    const a = std.testing.allocator;
+    inline for (.{
+        .{ "tone-mono-48k.opus", "tone-stereo-opus.ogg" },
+        .{ "tone-stereo-flac.ogg", "tone-stereo-flac.ogg" },
+        .{ "tone-stereo.ogg", "tone-stereo-opus.ogg" },
+        .{ "tone-stereo-flac.ogg", "tone-mono-48k.opus" },
+    }) |pair| {
+        const first = @embedFile("../testdata/codec-corpus/" ++ pair[0]);
+        const second = @embedFile("../testdata/codec-corpus/" ++ pair[1]);
+        const bytes = try a.alloc(u8, first.len + second.len);
+        defer a.free(bytes);
+        @memcpy(bytes[0..first.len], first);
+        @memcpy(bytes[first.len..], second);
+        // Give the second logical stream its own serial and valid page CRCs.
+        var cursor: usize = first.len;
+        while (cursor < bytes.len) {
+            const segments = bytes[cursor + 26];
+            var size: usize = 27 + @as(usize, segments);
+            for (bytes[cursor + 27 ..][0..segments]) |lace| size += lace;
+            const page = bytes[cursor..][0..size];
+            std.mem.writeInt(u32, page[14..18], 0x43484149, .little);
+            @memset(page[22..26], 0);
+            var crc: u32 = 0;
+            for (page) |value| {
+                crc ^= @as(u32, value) << 24;
+                for (0..8) |_| crc = (crc << 1) ^ (if (crc & 0x80000000 != 0) @as(u32, 0x04c11db7) else 0);
+            }
+            std.mem.writeInt(u32, page[22..26], crc, .little);
+            cursor += size;
+        }
+        var left = try decode(a, first, .{});
+        defer left.deinit();
+        var right = try decode(a, second, .{});
+        defer right.deinit();
+        const rate = @max(left.sample_rate, right.sample_rate);
+        const x = try copyOrResample(a, left.samples, left.sample_rate, rate);
+        defer a.free(x);
+        const y = try copyOrResample(a, right.samples, right.sample_rate, rate);
+        defer a.free(y);
+        const expected = try a.alloc(f32, x.len + y.len);
+        defer a.free(expected);
+        @memcpy(expected[0..x.len], x);
+        @memcpy(expected[x.len..], y);
+        const Compare = struct {
+            expected: []const f32,
+            rate: u32,
+            offset: usize = 0,
+            stop: bool = false,
+            fn write(raw: *anyopaque, pcm: []const f32, sample_rate: u32, channels: u8) !void {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                if (self.stop) return error.Cancelled;
+                try std.testing.expectEqual(self.rate, sample_rate);
+                try std.testing.expectEqual(@as(u8, 1), channels);
+                try std.testing.expect(self.offset + pcm.len <= self.expected.len);
+                for (pcm, self.expected[self.offset..][0..pcm.len]) |actual, want| try std.testing.expectApproxEqAbs(want, actual, 1e-6);
+                self.offset += pcm.len;
+            }
+        };
+        var compare = Compare{ .expected = expected, .rate = rate };
+        try std.testing.expect(try streaming.supported(a, bytes));
+        try streaming.visit(a, bytes, .{}, .{ .context = &compare, .write = Compare.write });
+        try std.testing.expectEqual(expected.len, compare.offset);
+        var batch = try decode(a, bytes, .{});
+        defer batch.deinit();
+        try std.testing.expectEqual(rate, batch.sample_rate);
+        try std.testing.expectEqual(expected.len, batch.samples.len);
+        for (batch.samples, expected) |actual, want| try std.testing.expectApproxEqAbs(want, actual, 1e-6);
+        compare.stop = true;
+        try std.testing.expectError(error.Cancelled, streaming.visit(a, bytes, .{}, .{ .context = &compare, .write = Compare.write }));
     }
 }

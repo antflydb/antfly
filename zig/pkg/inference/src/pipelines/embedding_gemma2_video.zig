@@ -42,7 +42,48 @@ pub const Encoded = struct {
 /// The FPS policy matches HF; timestamp selection remains a separate video API.
 pub const Sampling = union(enum) { reference, timestamps: video.sampling.TimestampPolicy, source_timestamps: video.sampling.TimestampPolicy };
 /// Decoder controls apply equally to CPU and Metal model execution.
-pub const WebmInput = struct { reader: *const media.webm.Reader, index: *const video.webm_pictures.Index, continuation: ?*video.webm_pictures.Continuation = null };
+pub const WebmInput = struct {
+    reader: *const media.webm.Reader,
+    index: *const video.webm_pictures.Index,
+    continuation: ?*video.webm_pictures.Continuation = null,
+    apple_continuation: ?*WebmDecoderContinuation = null,
+};
+pub const WebmDecoderContinuation = struct {
+    allocator: std.mem.Allocator,
+    reader: *const media.webm.Reader,
+    apple: ?*video.apple_webm.Continuation = null,
+    session: ?@import("../backends/session.zig").Session = null,
+    permit: ?@import("../backends/session.zig").RunPermit = null,
+    pub fn deinit(self: *@This()) void {
+        if (self.apple) |owner| owner.deinit();
+        self.apple = null;
+        if (self.permit) |*permit| permit.deinit();
+        self.permit = null;
+    }
+    fn decode(self: *@This(), reader: *media.webm.Reader, indexed: video.webm_pictures.Index, selected: []const usize, capture: *Capture) !?video.apple_webm.Receipt {
+        if (@import("builtin").os.tag != .macos) return null;
+        const session = self.session orelse return null;
+        if (self.apple == null) {
+            if (indexed.pictures.len == 0) return error.EmptyVideo;
+            const shape = indexed.pictures[0];
+            // Check platform eligibility before reserving persistent resources.
+            _ = try video.apple_webm.validate(reader, indexed);
+            const bytes = try video.apple.surfaceAdmissionBytesForDepth(shape.width, shape.height, 32, shape.bit_depth);
+            self.permit = try session.admitHostPreprocess(std.math.cast(usize, bytes) orelse return error.ResourceLimitExceeded);
+            errdefer {
+                self.permit.?.deinit();
+                self.permit = null;
+            }
+            // CoreVideo backing belongs to the request's host working-memory
+            // budget, including when Metal borrows it without a pixel copy.
+            self.apple = try video.apple_webm.Continuation.create(self.allocator, self.reader, .{ .decode = .{ .require_hardware = false, .max_decode_packets = 8192 } });
+        }
+        return self.apple.?.decodeTo(reader, indexed, selected, .{ .context = capture, .accept = Capture.publishAppleWebm }) catch |err| {
+            self.deinit();
+            return err;
+        };
+    }
+};
 pub const Configuration = struct {
     webm: ?WebmInput = null,
     sampling: Sampling = .reference,
@@ -842,7 +883,7 @@ pub const Prefetch = struct {
         if (missing == 0) return;
         capture.decode_slots = miss_slots[0..missing];
         if (webm) {
-            try decodeWebm(a, &webm_reader, webm_index.?, misses[0..missing], &capture, if (self.webm_input) |input| input.continuation else null);
+            try decodeWebm(a, &webm_reader, webm_index.?, misses[0..missing], &capture, self.webm_input);
         } else try decodeSelection(a, &reader, misses[0..missing], configurations, &capture);
     }
 
@@ -1063,7 +1104,7 @@ fn encodeInput(a: std.mem.Allocator, cb: *const ComputeBackend, bytes: []const u
     }
     capture.decode_slots = miss_slots[0..missing];
     const decoded = if (missing == 0) {} else if (webm)
-        decodeWebm(a, &webm_reader, webm_index.?, misses[0..missing], &capture, if (webm_input) |input| input.continuation else null)
+        decodeWebm(a, &webm_reader, webm_index.?, misses[0..missing], &capture, webm_input)
     else
         decodeSelection(a, &reader, misses[0..missing], configurations, &capture);
     const decode_error: ?anyerror = if (decoded) |_| null else |err| err;
@@ -1135,11 +1176,17 @@ fn decodeAppleH264(a: std.mem.Allocator, reader: *media.mp4.Reader, selected: []
     capture.decoder.record(if (batch.hardware) .apple_hardware else .apple_software);
     return true;
 }
-fn decodeWebm(a: std.mem.Allocator, reader: *media.webm.Reader, indexed: video.webm_pictures.Index, selected: []const usize, capture: *Capture, continuation: ?*video.webm_pictures.Continuation) !void {
+fn decodeAppleWebm(a: std.mem.Allocator, reader: *media.webm.Reader, indexed: video.webm_pictures.Index, selected: []const usize, capture: *Capture, input: ?WebmInput) !video.apple_webm.Receipt {
+    if (input) |bound| if (bound.apple_continuation) |owner| {
+        if (try owner.decode(reader, indexed, selected, capture)) |value| return value;
+    };
+    return video.apple_webm.decodeTo(a, reader, indexed, selected, .{ .decode = .{ .require_hardware = false, .max_decode_packets = 8192 }, .pool = capture.pool, .device_surfaces = capture.metal != null }, .{ .context = capture, .accept = Capture.publishAppleWebm });
+}
+fn decodeWebm(a: std.mem.Allocator, reader: *media.webm.Reader, indexed: video.webm_pictures.Index, selected: []const usize, capture: *Capture, input: ?WebmInput) !void {
     const estimate = if (indexed.pictures.len != 0) try video.apple.surfaceAdmissionBytesForDepth(indexed.pictures[0].width, indexed.pictures[0].height, selected.len, indexed.pictures[0].bit_depth) else 0;
     if (capture.decoder.policy == .automatic and estimate > 512 * 1024 * 1024) capture.decoder.fallback();
     if (capture.decoder.policy != .portable and (capture.decoder.policy == .apple or estimate <= 512 * 1024 * 1024)) {
-        const receipt: ?video.apple_webm.Receipt = video.apple_webm.decodeTo(a, reader, indexed, selected, .{ .decode = .{ .require_hardware = false, .max_decode_packets = 8192 }, .pool = capture.pool, .device_surfaces = capture.metal != null }, .{ .context = capture, .accept = Capture.publishAppleWebm }) catch |err| blk: {
+        const receipt: ?video.apple_webm.Receipt = decodeAppleWebm(a, reader, indexed, selected, capture, input) catch |err| blk: {
             try appleUnavailable(capture, err);
             break :blk @as(?video.apple_webm.Receipt, null);
         };
@@ -1150,7 +1197,7 @@ fn decodeWebm(a: std.mem.Allocator, reader: *media.webm.Reader, indexed: video.w
     }
     capture.decoder.record(.portable);
     const options = webmDecodeOptions(reader.input.control, capture.pool);
-    if (continuation) |owner| {
+    if (if (input) |bound| bound.continuation else null) |owner| {
         // Model preparation borrows a reader copy with per-window cancellation.
         // Retained codec state stays bound to the request's immutable reader.
         if (owner.reader.packets.ptr != reader.packets.ptr or !std.mem.eql(u8, owner.reader.input.identity, reader.input.identity)) return error.InvalidVideoIndex;
@@ -2730,4 +2777,66 @@ test "embeddinggemma2 video retained WebM preparation matches independent window
         }
         try std.testing.expect(owner.reused_windows > 0);
     }
+}
+
+test "embeddinggemma2 video retained Apple WebM preparation drains temporary window owners" {
+    try qualifyRetainedAppleWebm(null);
+}
+fn qualifyRetainedAppleWebm(device: ?*anyopaque) !void {
+    if (@import("builtin").os.tag != .macos) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    inline for (.{ .{ "vp9", @embedFile("../testdata/video/vp9.webm") }, .{ "av1", @embedFile("../testdata/video/av1.webm") } }) |fixture| {
+        const name = fixture[0];
+        var pool = media.admission.Pool{ .limits = .{ .host_bytes = 512 * 1024 * 1024 } };
+        var source = media.source.Source{ .allocator = a, .storage = .{ .borrowed = fixture[1] }, .identity = name, .admission_pool = &pool };
+        var reader = try media.webm.Reader.init(a, &source, .{});
+        defer reader.deinit();
+        var indexed = try video.webm_pictures.index(a, &reader, webmDecodeOptions(.{}, &pool));
+        defer indexed.deinit();
+        const baseline = pool.snapshot();
+        var marker: u8 = 0;
+        var admission = @import("../runtime/tier/memory.zig").AdmissionController{};
+        const session = @import("../backends/session.zig").Session{ .ptr = &marker, .vtable = &.{ .run = undefined, .inputInfo = undefined, .outputInfo = undefined, .backend = undefined, .close = undefined }, .run_admission = .{ .controller = &admission, .backend_class = .cpu, .limits = .{ .host_limit_bytes = 512 * 1024 * 1024 }, .static_workspace_bytes = 0, .check_live_memory = false } };
+        var owner = WebmDecoderContinuation{ .allocator = a, .reader = &reader, .session = session };
+        defer owner.deinit();
+        for (indexed.pictures[0..@min(indexed.pictures.len, 4)]) |picture| {
+            var temporary = media.admission.Pool{ .limits = .{ .host_bytes = 512 * 1024 * 1024, .device_bytes = 256 * 1024 * 1024, .commands = 4 } };
+            defer std.debug.assert(std.meta.eql(temporary.snapshot(), media.admission.Resources{}));
+            const sampling = Sampling{ .source_timestamps = .{ .start_ns = picture.pts, .end_ns = picture.pts + 1, .max_frames = 1, .overflow = .truncate } };
+            const independent = try Prefetch.startConfigured(a, std.testing.io, device, &.{}, null, .{}, .{ .pool = &temporary, .sampling = sampling, .decoder = .{ .policy = .apple }, .webm = .{ .reader = &reader, .index = &indexed } });
+            const expected = preparedReaderHash(a, independent) catch |err| {
+                independent.deinit();
+                if (err == error.VideoDecoderUnavailable) return error.SkipZigTest;
+                return err;
+            };
+            independent.deinit();
+            const retained = try Prefetch.startConfigured(a, std.testing.io, device, &.{}, null, .{}, .{ .pool = &temporary, .sampling = sampling, .decoder = .{ .policy = .apple }, .webm = .{ .reader = &reader, .index = &indexed, .apple_continuation = &owner } });
+            defer retained.deinit();
+            try std.testing.expectEqual(expected, try preparedReaderHash(a, retained));
+        }
+        try std.testing.expect(owner.apple.?.reused_windows > 0);
+        try std.testing.expect(owner.apple.?.active == null);
+        try std.testing.expect(admission.snapshot().host_scratch_bytes > 0);
+        owner.deinit();
+        try std.testing.expectEqual(@as(usize, 0), admission.snapshot().host_scratch_bytes);
+        try std.testing.expectEqual(baseline, pool.snapshot());
+    }
+}
+
+test "embeddinggemma2 Metal video retained Apple WebM preparation preserves request admission" {
+    if (!build_options.enable_metal) return error.SkipZigTest;
+    const metal = @import("../ops/metal_compute.zig");
+    const hosted = @import("../ops/gpu_hosted_store.zig");
+    const a = std.testing.allocator;
+    var store = hosted.WeightStore{ .allocator = a, .prefix = "", .lazy_weights = .empty };
+    defer {
+        metal.deinitPrefetchQueue(&store);
+        store.lazy_weights.deinit(a);
+    }
+    metal.initPrefetchQueue(&store, a);
+    var compute = try MetalCompute.init(a, &store, null);
+    defer compute.deinit();
+    const cb = compute.computeBackend();
+    if (!cb.decoderRuntimeReady()) return error.SkipZigTest;
+    try qualifyRetainedAppleWebm(try MetalCompute.videoDevice(&cb));
 }

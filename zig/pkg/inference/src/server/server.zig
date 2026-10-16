@@ -11772,6 +11772,9 @@ pub const Node = struct {
                                     if (movie.selection) |selection| if (selection.continuation) |continuation| {
                                         continuation.session = adapter.model.?.session;
                                     };
+                                    if (movie.webm) |webm| if (webm.apple_continuation) |continuation| {
+                                        continuation.session = adapter.model.?.session;
+                                    };
                                     break :configured .{ .sampled_video = .{ .bytes = if (movie.reader != null) &.{} else movie.bytes, .reader = movie.reader, .sampling = if (movie.source_timestamps) .{ .source_timestamps = movie.policy } else .{ .timestamps = movie.policy }, .selection = movie.selection, .webm = movie.webm } };
                                 },
                                 .pcm => unreachable,

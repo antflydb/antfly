@@ -73,11 +73,31 @@ errors are 6.7102e-7 and 2.5996e-7. These qualify the five-video corpus, not
 arbitrary streams or end-user relevance. Fresh reports stay in ignored
 `.benchmark-results/apple-video/`.
 
-The current decoder suite executes on offline Linux ARM64: 254 passes, 38
+The earlier full decoder suite executed on offline Linux ARM64: 254 passes, 38
 platform skips and no failures. The pinned 15.5 SDK compile check passes. Native macOS 15/26 compatibility and
 optional self-hosted GPU jobs are defined in the
 [Apple workflow](../../.github/workflows/zig-apple-video.yml); those OS runs
 remain pending and are not established by the local macOS 27 result.
+
+## Incremental codec ownership
+
+Forward model windows retain portable VP8/VP9/AV1 references, portable AVC
+separate-plane/configuration-epoch state, and eligible Apple VP9/AV1 native
+sessions. Backward selections retain verified independent replay. Native owners
+fence callbacks before temporary window state expires and release request/shared
+admission on failure or destruction. The focused Apple WebM suite passes all 15
+tests on hardware VP9/AV1, including consumer failure/retry and backward replay;
+the CPU/Metal model suite passes all 75 tests without skips.
+
+The complete audio suite passes 512 tests. Real HE-AAC/PS reconstruction and
+bounded visitors replace the synthetic enhancement approximation; five owned
+44.1/48 kHz mono/stereo fixtures compare complete trimmed PCM with independent
+FFmpeg references at a 50 dB SNR floor. Chained Ogg Vorbis/Opus/FLAC, including
+mixed codecs/rates/channels, normalize incrementally. AIFF/AU/PCM-G.711 CAF and
+unknown-total WebM FLAC also avoid whole-source PCM retention. Actual offline
+Linux ARM64 passes 14 audio, 17 model-aware chunking, four planning, seven sampling
+and 57 portable video-model tests; 14 Apple/Metal tests skip as expected. Profile
+limits remain explicit in [AUDIO.md](../../zig/lib/audio/AUDIO.md).
 
 ## Reproduce
 

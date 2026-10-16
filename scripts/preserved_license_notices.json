@@ -631,5 +631,11 @@
     "required": [
       "Maintained Antfly Zig port"
     ]
+  },
+  "zig/lib/audio/src/aacplus/core.zig": {
+    "file": "LICENSES/third-party/PacketVideo-AAC-notice.txt",
+    "required": [
+      "Maintained Antfly Zig port; see PORTING.md and SOURCE_NOTICES.md."
+    ]
   }
 }

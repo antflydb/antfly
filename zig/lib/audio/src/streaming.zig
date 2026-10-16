@@ -48,24 +48,12 @@ const Mono = struct {
         return .{ .context = self, .write = write };
     }
 };
-pub fn supported(a: std.mem.Allocator, bytes: []const u8) !bool {
+pub fn supported(_: std.mem.Allocator, bytes: []const u8) !bool {
     const format = audio.detectFormat(bytes) orelse return false;
     return switch (format) {
         .mp3, .flac, .aac, .webm, .aiff, .au, .caf => true,
-        .ogg, .opus => blk: {
-            if (bytes.len < 4 or !std.mem.eql(u8, bytes[0..4], "OggS")) break :blk false;
-            const codec = try audio.ogg.sniffCodec(a, bytes);
-            var streams = try audio.ogg.parsePacketStreamsAlloc(a, bytes);
-            defer streams.deinit();
-            break :blk codec == .vorbis or streams.streams.len == 1;
-        },
-        .mp4 => blk: {
-            var demuxed = try audio.mp4.demux(a, bytes);
-            defer demuxed.deinit();
-            if (demuxed.codec == .alac) break :blk true;
-            const cfg = try audio.aac.parseAudioSpecificConfig(demuxed.decoder_config);
-            break :blk !cfg.sbr_present and !cfg.ps_present and cfg.object_type != 5 and cfg.object_type != 29;
-        },
+        .ogg, .opus => true,
+        .mp4 => true,
         else => false,
     };
 }
@@ -108,21 +96,7 @@ pub fn visit(a: std.mem.Allocator, bytes: []const u8, control: @import("work_con
             }
             if (mono.skip != 0 or (mono.remaining != null and mono.remaining.? != 0)) return error.UnsupportedAudioFormat;
         },
-        .ogg, .opus => {
-            switch (try audio.ogg.sniffCodec(a, bytes)) {
-                .opus => {
-                    var demuxed = try audio.opus.demuxOggAlloc(a, bytes);
-                    defer demuxed.deinit();
-                    try audio.opus.visitPackets(a, demuxed.packets, demuxed.packet_tocs, demuxed.header.channels, demuxed.header.output_gain_q8, demuxed.header.pre_skip, demuxed.playable_frames, mono.consumer());
-                },
-                .vorbis => try audio.vorbis.visitOgg(a, bytes, mono.consumer()),
-                .flac => {
-                    const encoded = try audio.ogg.reconstructFlacStreamAlloc(a, bytes);
-                    defer a.free(encoded);
-                    try audio.flac.visitInterleaved(a, encoded, mono.consumer());
-                },
-            }
-        },
+        .ogg, .opus => try @import("ogg_chains.zig").visit(a, bytes, mono.consumer()),
         else => return error.UnsupportedStreamingAudioProfile,
     }
 }

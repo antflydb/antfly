@@ -525,7 +525,9 @@ pub const Runner = struct {
         if (end <= origin) return error.UnknownVideoDuration;
         var continuation = video.webm_pictures.Continuation{ .allocator = self.allocator, .reader = reader };
         defer continuation.deinit();
-        try self.videoWindows(&.{}, null, end - origin, origin, 1_000_000_000, null, .{ .reader = reader, .index = &indexed, .continuation = &continuation });
+        var apple_continuation = @import("embedding_gemma2_video.zig").WebmDecoderContinuation{ .allocator = self.allocator, .reader = reader };
+        defer apple_continuation.deinit();
+        try self.videoWindows(&.{}, null, end - origin, origin, 1_000_000_000, null, .{ .reader = reader, .index = &indexed, .continuation = &continuation, .apple_continuation = &apple_continuation });
     }
     fn videoWindows(self: *Runner, bytes: []const u8, reader: ?*const media.mp4.Reader, duration: i128, origin: i64, timescale: u32, owner: ?*@import("media_chunking_video.zig").Owner, webm: ?@import("embedding_gemma2_video.zig").WebmInput) !void {
         const end = std.math.cast(i64, duration) orelse return error.TimestampOverflow;
@@ -842,25 +844,31 @@ test "model aware media WebM retains one verified index across range-backed mode
 
 test "model aware media streaming audio retains only forward windows and overlap" {
     const a = std.testing.allocator;
-    const bytes = std.Io.Dir.cwd().readFileAlloc(std.testing.io, "zig/lib/audio/testdata/tone.mp3", a, .limited(1024 * 1024)) catch try std.Io.Dir.cwd().readFileAlloc(std.testing.io, "../../lib/audio/testdata/tone.mp3", a, .limited(1024 * 1024));
-    defer a.free(bytes);
-    var bounded = @import("../runtime/bounded_allocator.zig").BoundedAllocator{ .backing = a, .limit = 8 * 1024 * 1024 };
-    const stream = (try @import("media_chunking_audio.zig").Stream.start(bounded.allocator(), bytes, .{ .io = std.testing.io })) orelse return error.TestUnexpectedResult;
-    var live = true;
-    defer if (live) stream.deinit();
-    var decoded = try audio.decode(a, bytes, .{});
-    defer decoded.deinit();
-    const provider = stream.provider();
-    var first: usize = 0;
-    while (first < provider.samples) {
-        const last = @min(provider.samples, first + 4000);
-        const window = try provider.read(provider.context, a, first, last);
-        try std.testing.expectEqualSlices(f32, decoded.samples[first..last], window.pcm.samples);
-        if (last == provider.samples) break;
-        first = last - 400;
+    for ([_][]const u8{ "tone.mp3", "codec-corpus/owned-he-aac-v2-48000-mixed.m4a", "codec-corpus/owned-he-aac-48000-mono.m4a" }) |name| {
+        const root_path = try std.fmt.allocPrint(a, "zig/lib/audio/testdata/{s}", .{name});
+        defer a.free(root_path);
+        const package_path = try std.fmt.allocPrint(a, "../../lib/audio/testdata/{s}", .{name});
+        defer a.free(package_path);
+        const bytes = std.Io.Dir.cwd().readFileAlloc(std.testing.io, root_path, a, .limited(1024 * 1024)) catch try std.Io.Dir.cwd().readFileAlloc(std.testing.io, package_path, a, .limited(1024 * 1024));
+        defer a.free(bytes);
+        var bounded = @import("../runtime/bounded_allocator.zig").BoundedAllocator{ .backing = a, .limit = 8 * 1024 * 1024 };
+        const stream = (try @import("media_chunking_audio.zig").Stream.start(bounded.allocator(), bytes, .{ .io = std.testing.io })) orelse return error.TestUnexpectedResult;
+        var live = true;
+        defer if (live) stream.deinit();
+        var decoded = try audio.decode(a, bytes, .{});
+        defer decoded.deinit();
+        const provider = stream.provider();
+        var first: usize = 0;
+        while (first < provider.samples) {
+            const last = @min(provider.samples, first + 4000);
+            const window = try provider.read(provider.context, a, first, last);
+            try std.testing.expectEqualSlices(f32, decoded.samples[first..last], window.pcm.samples);
+            if (last == provider.samples) break;
+            first = last - 400;
+        }
+        try stream.finish();
+        stream.deinit();
+        live = false;
+        try std.testing.expectEqual(@as(usize, 0), bounded.live);
     }
-    try stream.finish();
-    stream.deinit();
-    live = false;
-    try std.testing.expectEqual(@as(usize, 0), bounded.live);
 }

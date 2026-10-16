@@ -829,18 +829,23 @@ pub fn demuxOggAlloc(allocator: std.mem.Allocator, ogg_bytes: []const u8) !Demux
     var packet_sequence = try ogg.parsePacketsAlloc(allocator, ogg_bytes);
     defer packet_sequence.deinit();
 
-    if (packet_sequence.packets.len < 3) return error.UnsupportedAudioFormat;
-    const header = try parseHead(packet_sequence.packets[0].bytes);
-    if (packet_sequence.packets[1].bytes.len < 8 or !std.mem.eql(u8, packet_sequence.packets[1].bytes[0..8], "OpusTags")) {
+    return demuxOggPacketsAlloc(allocator, packet_sequence.packets);
+}
+
+pub fn demuxOggPacketsAlloc(allocator: std.mem.Allocator, ogg_packets: []const ogg.Packet) !Demuxed {
+    if (ogg_packets.len < 3) return error.UnsupportedAudioFormat;
+    const header = try parseHead(ogg_packets[0].bytes);
+    if (ogg_packets[1].bytes.len < 8 or !std.mem.eql(u8, ogg_packets[1].bytes[0..8], "OpusTags")) {
         return error.UnsupportedAudioFormat;
     }
 
-    const audio_packets = packet_sequence.packets[2..];
+    const audio_packets = ogg_packets[2..];
     if (audio_packets.len == 0) return error.UnsupportedAudioFormat;
 
     const packets = try allocator.alloc([]u8, audio_packets.len);
+    var initialized: usize = 0;
     errdefer {
-        for (packets[0..audio_packets.len]) |packet| allocator.free(packet);
+        for (packets[0..initialized]) |packet| allocator.free(packet);
         allocator.free(packets);
     }
     const packet_tocs = try allocator.alloc(Toc, audio_packets.len);
@@ -852,6 +857,8 @@ pub fn demuxOggAlloc(allocator: std.mem.Allocator, ogg_bytes: []const u8) !Demux
     var last_granule: ?u64 = null;
     for (audio_packets, 0..) |packet, i| {
         packets[i] = try allocator.dupe(u8, packet.bytes);
+        initialized += 1;
+        if (packet.bytes.len == 0) return error.UnsupportedAudioFormat;
         packet_tocs[i] = try parseToc(packet.bytes[0]);
         packet_sample_counts[i] = try packetSamples(packet.bytes, 48_000);
         total_decoded_frames += packet_sample_counts[i];

@@ -136,6 +136,17 @@ Persistent AVC validation retains admitted decoder/configuration state and
 independent checkpoints. Failed delivery retains output for retry; commit follows
 successful delivery. Discontinuities drain epochs and report gaps explicitly.
 
+Apple VP9/AV1 WebM also exposes a request-owned
+[continuation](src/backends/apple_webm.zig). Forward windows submit only newly
+required packets; backward windows use independent verified replay. A stable
+native callback owner borrows each window's capture until a drain fence completes,
+then clears that pointer. Consumer/decode failure destroys native references and
+releases admission before retry. One caller may use an owner at a time; concurrent
+calls fail explicitly, and callers must join before destroying it. Native
+reference estimates belong to the request-lived pool, separate from selected
+surfaces and temporary preparation buffers. Model integration also reserves shared
+session preprocessing capacity for the retained CoreVideo backing.
+
 ## CPU and Metal preparation
 
 [preparation](src/preparation.zig) converts declared native-depth/chroma surfaces
@@ -185,7 +196,7 @@ updates within compatible configuration epochs; geometry/representation epochs
 construct fresh decoder owners. Portable VP8/VP9/AV1 WebM windows retain reference
 and entropy state across forward selections. Backward selections and outputs
 already consumed within a multi-output packet use verified independent replay.
-Apple WebM selections continue to use the native replay path. Dependency bytes remain bounded
+Eligible Apple VP9/AV1 WebM windows also retain native reference state. Dependency bytes remain bounded
 per window even when reconstruction reuses references. Native decoder callbacks
 drain before window release; retained Apple surfaces keep their admission until
 decoder destruction. Request-local projected reuse and bounded preparation overlap

@@ -895,3 +895,15 @@ DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
 THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
 (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+
+## PacketVideo AAC enhancement algorithm
+
+The maintained Zig source in `zig/lib/audio/src/aacplus/core.zig` derives from
+PacketVideo's AAC decoder in Android `frameworks/av`, commit
+`437ced8a14944bf5450df50c5e7e7a6dfe20ea40`.
+Copyright (C) 1998-2009 PacketVideo. Apache-2.0.
+Copyright (c) 2005-2008, The Android Open Source Project.
+See [source notices](zig/lib/audio/src/aacplus/SOURCE_NOTICES.md) and
+[port details](zig/lib/audio/src/aacplus/PORTING.md). No C/C++ codec build or
+runtime codec library is used.

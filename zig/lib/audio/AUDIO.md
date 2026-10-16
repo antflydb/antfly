@@ -37,7 +37,7 @@ All public interleaved decode output is normalized to finite `[-1, 1]` PCM.
 | AIFF/AIFC | Pure Zig for common PCM/float/G.711 | Covers checked-in AIFF PCM16 plus synthetic AIFC `NONE`/`twos`/`sowt`, `in24`/`in32`, `raw `, `fl32`/`fl64`, `ulaw`, and `alaw`; unsupported variants now fail closed. |
 | CAF | Pure Zig for `lpcm`/G.711 and checked-in stereo ALAC | CAF packet-table priming/remainder trimming is applied at the shared decode boundary, including ALAC `data` chunks that run to end-of-file and the checked-in 16-bit and 24-bit stereo ALAC fixtures; unsupported variants now fail closed. |
 | MP3 | Pure Zig | Pure-Zig coverage includes checked-in mono, free-format stereo downmix, and mode-switching stereo vectors, plus every MPEG-2 and MPEG-2.5 low sampling frequency (24/22.05/16/12/11.025/8 kHz) including their short blocks. Silent frames decode to silence and a final frame the stream cuts short decodes from the bit reservoir, so a clip keeps its length and its timeline; only a leading Xing/Info/VBRI frame is read as metadata instead of audio. Unsupported MP3 shapes still fail closed, and a sample rate without band tables is rejected when the frame header is read rather than reaching the tables. Short blocks share the long blocks' IMDCT normalization, so every checked-in MPEG-1, MPEG-2 and MPEG-2.5 vector now decodes sample-exact against the reference decoder. External fetched MP3 vector coverage is now being widened through the misc e2e lane. |
-| AAC/ADTS | Pure Zig for a narrow AAC Main/AAC-LC lane | Supports checked-in long/short-window mono/stereo AAC-LC shapes, real mono PNS/TNS-gain fixtures, real stereo low-bitrate CPE/TNS fixtures, narrow MP4/M4A `frame_length_960` AAC-LC access-unit shapes, a narrow MP4/M4A AAC-LC core shape with SBR sync-extension signaling, payload-structure-aware sync-extension SBR/PS postprocess when a real `FIL` enhancement payload is present, narrow explicit HE-AAC/PS object-type long-window synthetic shapes via synthesized 2x highband enhancement, explicit PCE/layout validation, non-predictive AAC Main mono/stereo synthetic shapes, synthetic AAC Main long-window predictor-data coverage, and synthetic PS mono-core stereo output plus stereo intensity/TNS/gain CPE coverage. Unsupported AAC tools and broader enhancement-profile syntax now fail closed. |
+| AAC/ADTS | Pure Zig | AAC Main/LC core lanes and maintained HE-AAC/SBR/PS reconstruction; bounded qualification and profile limits below. |
 | MP4/M4A/QuickTime audio | Pure Zig demux plus codec-specific pure-Zig decode for the owned AAC/ALAC lane | Demuxes checked-in AAC and ALAC access units/config, including the checked-in 16-bit and 24-bit stereo ALAC fixtures. Handles `stsz`/`stz2` sample sizes, direct or `wave`-wrapped codec config, QuickTime `qt  ` brand/`.mov`/`.qt` aliases, later supported audio tracks after earlier unsupported ones, and contiguous-media-edit plus leading/trailing-empty-edit `elst` timing for priming/remainder trimming; unsupported codec/container shapes fail closed. |
 | FLAC | Pure Zig | Covers the checked-in native `.flac` 16-bit and 24-bit fixtures through the shared `lib/audio` boundary, plus the external `flac-test-files` sweep including the 32-bit `uncommon/05 - 32bps audio.flac` vector and the raw-frame-start/prefix-noise cases via raw-frame fallback. Only the intentionally malformed `faulty/` negatives and the intentionally unrepresentable mid-stream-format-change `uncommon/01-04` vectors remain expected unsupported. |
 | Ogg/FLAC | Pure Zig for the narrow checked-in mapping | Reassembles Ogg pages/packets for the checked-in FLAC-in-Ogg mapping and feeds the result into the native FLAC decoder; unsupported Ogg/FLAC shapes now fail closed. |
@@ -55,7 +55,7 @@ All public interleaved decode output is normalized to finite `[-1, 1]` PCM.
 | AIFF/AIFC | Common pure-Zig coverage | Decide how far to go beyond PCM/float/G.711 before falling back. |
 | CAF | `lpcm`/G.711 pure Zig, checked-in 16-bit/24-bit stereo ALAC pure Zig | Broaden ALAC compressed-frame coverage beyond the checked-in stereo fixtures. |
 | MP4/M4A demux | Pure-Zig demux for checked-in AAC/ALAC, including 16 kHz stereo, 44.1 kHz mono, and 44.1 kHz short-window AAC fixtures, `stsz`/`stz2` sample tables, stable single-description `stsc` chunk maps even when the selected description is not entry 1, version-0/1/2 audio sample entries, direct or `wave`-wrapped config atoms, order-insensitive audio `mdia` handler/minf parsing, order-insensitive `moov` `mvhd`/`trak` scanning, skipping earlier unsupported audio tracks when a later one is supported, contiguous-media-edit trim metadata | Widen ISO BMFF/QuickTime layouts beyond discontiguous edit-list timing and broader multi-track/container shapes. |
-| AAC Main/AAC-LC | Narrow pure-Zig decode lane | Broaden conformance before claiming general AAC. Narrow MP4/M4A `frame_length_960` access-unit decode is now covered, sync-extension SBR now has a narrow payload-aware enhancement lane, and explicit HE-AAC/PS object-type configs now have a narrow synthesized highband/stereo-widening lane, but remaining hard cases still include wider real stereo CPE/tool combinations beyond the checked-in PNS/TNS/gain/short-window fixtures plus general enhancement-payload SBR/PS reconstruction beyond the current synthetic/object-type boundary. The AAC-LC lane now matches ffmpeg sample for sample on the checked-in ADTS/M4A/MP4 corpus and on ffmpeg and Apple encodes at 16, 44.1 and 48 kHz (short windows, TNS, PNS, M/S, intensity, edit-list and iTunSMPB priming). Known gaps: synthetic SBR/PS enhancement tests do not establish real HE-AAC conformance. General enhancement-payload reconstruction remains unqualified. `test-audio-codecs` runs the complete shared suite, including internal AAC tests, without the curated per-test repetitions. |
+| AAC Main/AAC-LC and HE-AAC/PS | Bounded pure-Zig qualification | Core fixtures cover ADTS/MP4 tools, 960-sample MP4 cores, edit-list and iTunSMPB priming. Five owned HE-AAC/PS fixtures compare complete trimmed PCM with independent FFmpeg output at a 50 dB SNR floor. See the AAC notes for profile limits. |
 | MP3 | Narrow pure-Zig decode lane | Broaden Huffman/requantization/oracle coverage before calling it general. Unsupported MP3 shapes now fail closed. |
 | FLAC | Narrow pure-Zig decode lane | Add malformed/real-world corpus coverage and more stream-shape coverage before calling it general. |
 | Ogg container | Narrow pure-Zig owned codec mappings | Pure-Zig Ogg dispatch now owns the checked-in Vorbis, Opus, and FLAC-in-Ogg lanes and fails closed on unsupported codec/container shapes. Broaden packet/page coverage only if we intend to own more Ogg shapes. |
@@ -64,82 +64,30 @@ All public interleaved decode output is normalized to finite `[-1, 1]` PCM.
 
 ## AAC Notes
 
-The pure-Zig AAC path is capability-shaped rather than file-name-shaped. It
-stays in Zig when the stream uses supported AAC Main/AAC-LC syntax and fails
-closed when a required tool or container shape is not implemented.
+AAC Main/LC retains the existing long/short-window, mono/stereo, PNS, TNS,
+M/S/intensity, prediction, PCE and narrow MP4 960-sample core lanes. Unsupported
+object types and required tools fail explicitly. An SBR sync declaration without
+an enhancement payload preserves the compatible LC core without inventing bands.
 
-Implemented AAC pieces include:
+HE-AAC and HE-AAC v2 use the maintained Apache-2.0
+[AAC enhancement core](src/aacplus/PORTING.md), with complex QMF synthesis and
+parametric stereo. Runtime builds compile Zig source without a codec library.
+The current contract is 1024-sample cores, 1x/2x output, one SBR element (stereo
+CPE or mono SCE, including PS), one or two output channels, sample rates up to
+192 kHz and access units up to 64 KiB. Separate-SCE-pair SBR, enhancement over
+960-sample cores and arbitrary MPEG-4 Audio profiles are outside this contract.
+Implicit ADTS SBR/PS discovers the actual output clock/channel layout. MP4 uses
+its declared output layout and applies container priming/remainder trimming.
 
-- `AudioSpecificConfig` and ADTS header parsing.
-- Narrow AAC Main profile support, including synthetic long-window
-  predictor-data coverage, where the bitstream shape otherwise matches the
-  covered AAC-LC lane.
-- Narrow MP4/M4A AAC-LC `frame_length_960` access-unit support for the
-  supported mono/stereo long-window lane. ADTS remains on the 1024-sample
-  framing path.
-- Narrow MP4/M4A AAC-LC core compatibility when the `AudioSpecificConfig`
-  carries an SBR sync extension but the packetized LC core remains directly
-  decodable at the container sample rate.
-- Narrow payload-structure-aware sync-extension SBR/PS support when access
-  units carry a real trailing `FIL` enhancement payload marker; the current
-  enhancement step now derives small synthetic envelope/noise/stereo hints from
-  the carried payload bytes instead of treating all enhancement payloads the
-  same, now also derives narrow tail-byte detail/phase hints rather than using
-  those later payload bytes only as hash noise, applies that structure per
-  access unit across multi-frame decode, and when one access unit carries
-  multiple same-kind enhancement payloads the later payload now drives the
-  narrow postprocess instead of being merged into a synthetic max/xor blend, can
-  preserve older unrefreshed hint fields when a later same-kind payload is
-  shorter than the earlier one instead of wiping them to zero, now also does
-  the same for shorter real refresh payloads in later access units, can
-  carry the last seen sync-extension enhancement profile across later access
-  units that omit a fresh `FIL` marker, now also keeps the last plain-SBR
-  shaping profile across later PS-only refresh access units instead of letting
-  PS-marked bytes clobber it, can also carry the last seen
-  PS-marked stereoization profile across later access units that only refresh
-  the SBR-marked payload, tolerates leading non-SBR `FIL` metadata before the
-  first channel element, scans independent stereo `SCE+SCE` access units for
-  trailing enhancement payloads too, and only enables the narrow
-  sync-extension PS mono-core stereo lane when the carried `FIL` payload is
-  actually PS-marked rather than merely SBR-marked; pre-PS access units in a
-  later-PS sequence now decode as dual-mono until the first PS-marked payload
-  appears, and stale carried SBR/PS shaping now decays across repeated later
-  access units that only refresh part of the enhancement state or omit it
-  entirely.
-- Narrow explicit HE-AAC/PS object-type support for synthetic long-window
-  mono/stereo access-unit shapes via synthesized 2x highband enhancement to the
-  extension sample rate, including explicit PS mono-core stereo output and the
-  same carried enhancement-profile decay across later no-fill access units once
-  a real trailing payload has appeared; in multi-access-unit explicit-object
-  sequences, pre-payload access units stay on the conservative pre-enhancement
-  lane until the first real trailing payload activates the narrow HE/PS
-  postprocess, and explicit PS stereoization now stays off for SBR-only
-  payloads until a real PS-marked payload appears.
-- Long-window and checked-in short-window IMDCT/windowing/overlap-add.
-- Mono `SCE` and stereo `CPE` PCM sequence reconstruction for supported
-  checked-in AAC-LC shapes, including real mono PNS/TNS-gain fixtures and real
-  low-bitrate stereo `CPE`/TNS ADTS fixtures.
-- Synthetic stereo `CPE` coverage that combines gain-control, intensity, and
-  TNS payloads with trailing SBR `FIL` enhancement payload markers.
-- Pulse application, deterministic mono PNS injection, TNS coefficient
-  mapping/filtering, structured gain-control payload parsing, MS stereo, and
-  intensity-stereo reconstruction for the covered lanes.
-- Explicit PCE mono/stereo layout inference and element-tag validation for ADTS
-  and MP4/M4A access units.
-- Leading PCE/DSE/FIL metadata skipping, metadata-only access-unit skipping,
-  repeated-PCE consistency checks, mixed-sample-rate ADTS rejection, ID3v2/ID3v1
-  metadata around ADTS frames, and CRC-protected ADTS frame handling.
-- Real low-bitrate MP4/M4A SBR config detection so the pure-Zig path accepts
-  only the checked core-compatible shape and still rejects broader
-  enhancement-profile syntax rather than mis-decoding it.
-
-Still intentionally not claimed:
-
-- General AAC decode.
-- General HE-AAC/SBR/PS enhancement-payload reconstruction beyond the current
-  core-compatible SBR-signaled shape and narrow synthesized enhancement path.
-- Arbitrary object types outside the current AAC Main/AAC-LC lane.
-- Broad stereo CPE/tool combinations beyond the current checked-in corpus.
+Five owned fixtures cover 44.1/48 kHz HE-AAC/PS, mono, distinct stereo channels,
+high-frequency tones, chirps, noise, silence and transients. Independent FFmpeg
+PCM16 references check the complete trimmed output with a 50 dB SNR floor.
+Visitors emit at most 4096 interleaved samples per block using bounded codec
+state. Batch/visitor comparisons check the shared PCM contract. Allocation-failure,
+consumer cancellation and deterministic truncation/mutation tests exercise cleanup;
+a failed decode or consumer retires its decoder state. Broader real-world and
+malformed-input qualification remains necessary before claiming general conformance.
+The former synthetic high-band/stereo approximation has been removed.
 
 ## MP3 Notes
 
@@ -287,16 +235,16 @@ check it between coded units; the scope restores the prior caller control on
 success or failure. The callback must outlive the decode and must not suspend.
 The model-aware runner also checks cancellation between model windows and source
 reads. WAV inputs can decode exact sample ranges without retaining full PCM;
-MP3, FLAC, core AAC, ALAC and Opus/Vorbis visitors retain codec prediction/overlap
+MP3, FLAC, AAC (including SBR/PS), ALAC and Opus/Vorbis visitors retain codec prediction/overlap
 state while emitting bounded PCM blocks. A two-block queue overlaps decoding with
 model work, retaining only the current PCM window plus overlap. MP4/CAF priming
 and remainder trimming, Opus gain/pre-skip, channel clipping before downmixing and
-supported WebM timeline gaps preserve the ordinary decode contract. Unsupported
-incremental profiles use the existing bounded full-decode fallback (including
-enhanced AAC). AIFF/AIFC, AU and PCM/G.711 CAF deliver at most 1024 frames per
-block, including cancellation checks. Chained Vorbis streams reset codec state
-per logical stream and normalize to the batch path's maximum sample rate/channel
-count using a previous frame and one output block. WebM FLAC without declared
+supported WebM timeline gaps preserve the ordinary decode contract. Unsupported incremental profiles and single-threaded execution use the existing
+bounded full-decode fallback. AIFF/AIFC, AU and PCM/G.711 CAF deliver at most 1024 frames per
+block, including cancellation checks. Chained Ogg Vorbis, Opus and FLAC (including mixed-codec chains) reset codec
+state per logical stream and normalize to the maximum sample rate/channel count
+using a previous frame and one output block. Opus pre-skip/gain and each logical
+stream's final granule remain local to that stream. WebM FLAC without declared
 sample totals uses a PCM-free counting pass before streaming execution.
 Compressed input and packet metadata are still contiguous bounded owners.
 Metadata without a trustworthy duration uses a bounded PCM-free validation pass;

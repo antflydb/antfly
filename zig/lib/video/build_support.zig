@@ -56,7 +56,10 @@ pub fn addTests(b: *std.Build, root: std.Build.LazyPath, target: std.Build.Resol
     if (target.result.os.tag == .macos) module.addCSourceFile(.{ .file = root.path(b, "src/backends/apple_video_test.m"), .flags = &.{"-fobjc-arc"} });
     const filter = b.option([]const u8, "video-test-filter", "Run video tests matching this substring");
     const tests = b.addTest(.{ .use_llvm = b.option(bool, "video-test-llvm", "Use LLVM for video tests"), .root_module = module, .filters = if (filter) |value| &.{value} else &.{} });
-    b.step("test-video", "Run video selection, decode, surface and preparation tests").dependOn(&b.addRunArtifact(tests).step);
+    const run_tests = b.addRunArtifact(tests);
+    // Platform decoder/device availability can change independently of code.
+    run_tests.has_side_effects = true;
+    b.step("test-video", "Run video selection, decode, surface and preparation tests").dependOn(&run_tests.step);
     b.step("check-video", "Compile video tests without executing them").dependOn(&tests.step);
     b.step("install-video-tests", "Install portable qualification tests for execution on another host").dependOn(&b.addInstallArtifact(tests, .{ .dest_sub_path = "video-tests" }).step);
     const fuzz_module = b.createModule(.{ .root_source_file = root.path(b, "video_fuzz_root.zig"), .target = target, .optimize = optimize });
