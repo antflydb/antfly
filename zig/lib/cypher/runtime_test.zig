@@ -1333,3 +1333,97 @@ test "lazy overlay scans preserve opaque native tokens and staged bags" {
     try std.testing.expectEqual(@as(usize, 3), total);
     try std.testing.expect(ids.contains("a") and ids.contains("B") and ids.contains("d"));
 }
+
+test "streamed UNWIND retains null scalar bag scope and optional semantics" {
+    try check("MATCH (n:Document) UNWIND [1,1,null] AS x RETURN count(*),count(x),sum(n.rank)", "[[9,6,18]]");
+    try check("MATCH (n:Document) UNWIND null AS x RETURN count(*)", "[[0]]");
+    try check("MATCH (n:Document) UNWIND 7 AS x WITH n.rank AS rank,x WHERE rank>1 UNWIND [x,x+1] AS y RETURN count(*),sum(y)", "[[4,30]]");
+    try check("MATCH (n:Document) UNWIND [n.rank,n.rank] AS x WITH DISTINCT x RETURN collect(x)", "[[[1,2,3]]]");
+    try check("OPTIONAL MATCH (n:Document {id:'absent'}) UNWIND [] AS x RETURN count(*)", "[[0]]");
+    try check("MATCH (n:Document) UNWIND [n.rank,0] AS x RETURN x ORDER BY x DESC SKIP 1 LIMIT 2", "[[2],[1]]");
+    try check("MATCH (n:Document) UNWIND [n.rank,n.rank+10] AS x RETURN x LIMIT 1", "[[1]]");
+}
+
+test "multi-pattern pull cursor preserves full MATCH state across tiny pages" {
+    const Paged = struct {
+        fn expand(ptr: *anyopaque, a: std.mem.Allocator, mapping: catalog.Relationship, identity: v.Identity, direction: c.ast.Direction, after: ?[]const u8, demand: usize) !b.Page(*const v.Relationship) {
+            const all = try Fixture.expand(ptr, a, mapping, identity, direction, null, demand);
+            const start = if (after) |text| try std.fmt.parseUnsigned(usize, text, 10) else 0;
+            const end = @min(all.items.len, start + demand);
+            return .{ .items = all.items[start..end], .next = if (end < all.items.len) try std.fmt.allocPrint(a, "{d}", .{end}) else null };
+        }
+    };
+    const queries = [_][]const u8{
+        "MATCH (a:Document),(b:Document) RETURN a.id,b.id",
+        "MATCH (a:Document),(b:Document) WHERE a.rank=b.rank RETURN a.id,b.id",
+        "MATCH (a:Document {rank:b.rank}),(b:Document) RETURN a.id,b.id",
+        "MATCH (a:Document)-[:CITES]->(b),(b)-[:CITES]->(c) RETURN a.id,b.id,c.id",
+        "MATCH (a:Document)-[r:CITES]->(b),(a)-[r]->(b) RETURN a.id",
+        "MATCH p=(a:Document)-[:CITES*0..2]->(b),(b:Document) RETURN length(p),a.id,b.id",
+    };
+    for (queries) |text| {
+        var diagnostic: c.Diagnostic = .{};
+        var compiled = try c.compile(std.testing.allocator, text, .{}, &diagnostic);
+        defer compiled.deinit();
+        var fixture: Fixture = .{};
+        var expected = try runtime.execute(std.testing.allocator, fixture.backend(), graph, &compiled, &.{}, .{});
+        defer expected.deinit();
+        const base = fixture.backend();
+        var table = base.vtable.*;
+        table.expand = Paged.expand;
+        const cursor = (try runtime.NodeCursor.open(std.testing.allocator, .{ .ptr = base.ptr, .vtable = &table }, graph, compiled.query, &.{}, .{})).?;
+        defer cursor.close();
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        var position: usize = 0;
+        while (!cursor.done) {
+            const rows = try cursor.next(arena.allocator(), 1);
+            for (rows) |row| {
+                try std.testing.expect(position < expected.rows.len);
+                for (row, expected.rows[position]) |entry, value| try std.testing.expect(v.Value.eql(entry.value, value));
+                position += 1;
+            }
+            _ = arena.reset(.free_all);
+        }
+        try std.testing.expectEqual(expected.rows.len, position);
+    }
+}
+
+test "ALL path count agrees with exact route enumeration for bounds and uniqueness" {
+    const patterns = [_][]const u8{
+        "(a:Document)-[:CITES*0..3]->(b:Document)",
+        "(a:Document)-[:CITES]->(b:Document)-[:CITES]->(c:Document)",
+        "(a:Document)-[r:CITES]->(b:Document)-[r:CITES]->(c:Document)",
+        "(a:Document)-[:CITES*1..2]->(b:Document {rank:3})",
+        "(a:Document)-[:CITES*0..1]->(b:Document)-[:CITES*0..2]->(c:Document)",
+    };
+    for ([_][]const u8{ "", "REPEATABLE ELEMENTS ", "DIFFERENT RELATIONSHIPS " }) |mode| {
+        for (patterns) |pattern| {
+            const text = try std.fmt.allocPrint(std.testing.allocator, "MATCH {s}{s} RETURN count(*)", .{ mode, pattern });
+            defer std.testing.allocator.free(text);
+            const exact_text = try std.fmt.allocPrint(std.testing.allocator, "MATCH {s}{s} UNWIND [1] AS x RETURN count(*)", .{ mode, pattern });
+            defer std.testing.allocator.free(exact_text);
+            var diagnostic: c.Diagnostic = .{};
+            var compiled = try c.compile(std.testing.allocator, text, .{}, &diagnostic);
+            defer compiled.deinit();
+            var exact_compiled = try c.compile(std.testing.allocator, exact_text, .{}, &diagnostic);
+            defer exact_compiled.deinit();
+            var fixture: Fixture = .{};
+            var result = try runtime.execute(std.testing.allocator, fixture.backend(), graph, &compiled, &.{}, .{});
+            defer result.deinit();
+            var exact = try runtime.execute(std.testing.allocator, fixture.backend(), graph, &exact_compiled, &.{}, .{});
+            defer exact.deinit();
+            try std.testing.expectEqual(exact.rows[0][0].integer, result.rows[0][0].integer);
+        }
+    }
+}
+
+test "pull planning preserves correlated interior anchors" {
+    var diagnostic: c.Diagnostic = .{};
+    var compiled = try c.compile(std.testing.allocator, "MATCH (m:Document),(a:Document)-[:CITES]->(m)-[:CITES]->(z:Document) RETURN a.id,z.id", .{}, &diagnostic);
+    defer compiled.deinit();
+    var fixture: Fixture = .{};
+    // Retain the general producer's bound-interior seek rather than replacing
+    // it with an exhaustive endpoint scan in the pull cursor.
+    try std.testing.expect((try runtime.NodeCursor.open(std.testing.allocator, fixture.backend(), graph, compiled.query, &.{}, .{})) == null);
+}

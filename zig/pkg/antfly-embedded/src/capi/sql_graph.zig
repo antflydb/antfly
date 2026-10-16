@@ -61,6 +61,13 @@ const Cursor = struct {
         try self.read.validate();
         return page;
     }
+    fn countRows(ptr: *anyopaque) !?u64 {
+        const self: *Cursor = @ptrCast(@alignCast(ptr));
+        try self.read.validate();
+        const count = if (self.child.count_rows) |count_rows| try count_rows(self.child.ptr) else null;
+        try self.read.validate();
+        return count;
+    }
     fn close(ptr: *anyopaque) void {
         const self: *Cursor = @ptrCast(@alignCast(ptr));
         self.child.close(self.child.ptr);
@@ -144,5 +151,5 @@ pub fn open(adapter: anytype, a: A, binding: catalog.graph_relation.Binding, req
         parameter.* = .{ .name = name, .value = try cypher.value.Value.fromJson(temporary.allocator(), adapter.graph_parameters[index - 1]) };
     }
     self.child = try catalog.graph_relation.Cursor.open(a, binding, provider, parameters, request, .{});
-    return .{ .ptr = self, .next = Cursor.next, .close = Cursor.close, .estimated_rows = self.child.estimated_rows };
+    return .{ .ptr = self, .next = Cursor.next, .close = Cursor.close, .count_rows = Cursor.countRows, .estimated_rows = self.child.estimated_rows };
 }

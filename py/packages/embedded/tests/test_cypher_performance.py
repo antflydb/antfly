@@ -448,6 +448,15 @@ def test_dag_count_reports_overflow_only_for_qualifying_endpoints(graph_db):
     with pytest.raises(af.GraphError) as overflow:
         db.cypher_json("g", request)
     assert overflow.value.graph_code == "CypherNumericOverflow"
+    request["query"] = (
+        "MATCH (s:D) WHERE antfly.documentKey(s)=$s MATCH (z:D) WHERE antfly.documentKey(z)=$z MATCH p=(s)-[:R*1..64]->(z) RETURN count(*)"
+    )
+    request["parameters"]["z"] = keys[1]
+    assert db.cypher_json("g", request)["rows"] == [[{"type": "integer", "value": "0"}]]
+    request["parameters"]["z"] = keys[2]
+    with pytest.raises(af.GraphError) as overflow:
+        db.cypher_json("g", request)
+    assert overflow.value.graph_code == "CypherNumericOverflow"
 
 
 def test_selective_right_endpoint_drives_traversal(graph_db):
@@ -926,3 +935,140 @@ def test_sql_graph_boolean_filters_keep_three_valued_semantics_and_barriers(grap
     )
     grouped = f"(SELECT g.score%2 AS bucket,count(*) AS total FROM {relation} GROUP BY g.score%2) x"
     assert db.sql(f"SELECT x.total FROM {grouped} WHERE x.bucket=0")["rows"] == [["2"]]
+
+
+def test_native_or_and_required_label_predicates_seek_the_index(graph_db):
+    db = graph_db
+    populate(db, 3000)
+    db.sql("CREATE INDEX docs_score ON docs(score)")
+    for predicate in (
+        "n.score=2998 OR n.score=2999",
+        "n.score=2998 OR n.score IN [2999,null]",
+        "2998=n.score OR n.score=2999",
+    ):
+        result = db.cypher_json(
+            "g",
+            {
+                "query": f"MATCH (n:D) WHERE {predicate} RETURN n.score ORDER BY n.score",
+                "limits": {"scanned_anchors": 2},
+            },
+        )
+        assert [row[0]["value"] for row in result["rows"]] == ["2998", "2999"]
+        assert result["stats"]["scanned_anchors"] == 2
+    # A non-membership arm must decline the whole OR hint.
+    mixed = db.cypher_json(
+        "g", {"query": "MATCH (n:D) WHERE n.score=2999 OR n.id='n0' RETURN n.score ORDER BY n.score"}
+    )
+    assert [row[0]["value"] for row in mixed["rows"]] == ["0", "2999"]
+    db.graph_catalog_json(
+        {
+            "action": "put",
+            "name": "rare",
+            "definition": {
+                "labels": [
+                    {"name": "Rare", "table": "docs", "where": {"score": 2999}},
+                    {"name": "Common", "table": "docs", "where": {"score": 0}},
+                ],
+                "relationships": [],
+            },
+        }
+    )
+    rare = db.cypher_json("rare", {"query": "MATCH (n:Rare) RETURN count(*)", "limits": {"scanned_anchors": 1}})
+    assert rare["rows"] == [[{"type": "integer", "value": "1"}]]
+    assert rare["stats"]["scanned_anchors"] == 1
+    union = db.cypher_json("rare", {"query": "MATCH (n) RETURN n.score ORDER BY n.score"})
+    assert [row[0]["value"] for row in union["rows"]] == ["0", "2999"]
+    assert db.cypher_json("rare", {"query": "MATCH (n:Rare:Common) RETURN count(*)"})["rows"] == [
+        [{"type": "integer", "value": "0"}]
+    ]
+
+
+def test_unwind_fuses_with_reducers_and_carries_limit_demand(graph_db):
+    db = graph_db
+    populate(db, 3000)
+    result = db.cypher_json(
+        "g", {"query": "MATCH (n:D) UNWIND [1] AS x RETURN count(*)", "limits": {"memory_bytes": 2 << 20}}
+    )
+    assert result["rows"] == [[{"type": "integer", "value": "3000"}]]
+    limited = db.cypher_json(
+        "g",
+        {"query": "MATCH (n:D) UNWIND [1,2] AS x RETURN n.score,x LIMIT 1", "limits": {"scanned_anchors": 1}},
+    )
+    assert limited["rows"] == [[{"type": "integer", "value": "0"}, {"type": "integer", "value": "1"}]]
+    assert limited["stats"]["scanned_anchors"] == 1
+
+
+def test_sql_comma_patterns_suspend_the_whole_join_at_limit(graph_db):
+    db = graph_db
+    populate(db, 3000)
+    relation = "GRAPH_TABLE(g MATCH (a IS D),(b IS D) COLUMNS(a.score AS first,b.score AS second)) q"
+    assert db.sql(f"SELECT q.first,q.second FROM {relation} LIMIT 1")["rows"] == [["0", "0"]]
+    # The residual needs several pulls, so demand must never become an inner LIMIT.
+    assert db.sql(f"SELECT q.first,q.second FROM {relation} WHERE q.second+0=7 LIMIT 1")["rows"] == [["0", "7"]]
+    db.sql("CREATE INDEX docs_score ON docs(score)")
+    joined = "GRAPH_TABLE(g MATCH (a IS D),(b IS D) WHERE a.score=b.score COLUMNS(a.score AS score)) q"
+    assert db.sql(f"SELECT q.score FROM {joined} LIMIT 1")["rows"] == [["0"]]
+
+
+def test_all_paths_count_uses_dag_states_for_native_and_sql(graph_db):
+    from math import comb
+
+    db = graph_db
+    size = 18
+    patterns = [f"(n{i}:D {{id:'n{i}',score:{i}}})" for i in range(size)]
+    patterns += [f"(n{i})-[:R]->(n{j})" for i in range(size) for j in range(i + 1, size)]
+    db.cypher_json("g", {"query": "CREATE " + ",".join(patterns)})
+    expected = comb(size, 7)
+    fixed = "(a:D)" + "".join(f"-[:R]->(m{i}:D)" for i in range(5)) + "-[:R]->(b:D)"
+    for pattern in (fixed, "(a:D)-[:R*6..6]->(b:D)"):
+        result = db.cypher_json(
+            "g",
+            {
+                "query": f"MATCH {pattern} RETURN count(*)",
+                "limits": {"explored_edges": 1000, "intermediate_states": 20000, "memory_bytes": 4 << 20},
+            },
+        )
+        assert result["rows"] == [[{"type": "integer", "value": str(expected)}]]
+        assert result["stats"]["explored_edges"] <= 1000
+    rejected = db.cypher_json(
+        "g",
+        {
+            "query": "MATCH (a:D {id:'n0'})-[:R]->(m:D {score:999999})-[:R]->(b:D) RETURN count(*)",
+            "limits": {"explored_edges": size - 1},
+        },
+    )
+    assert rejected["rows"] == [[{"type": "integer", "value": "0"}]]
+    assert rejected["stats"]["explored_edges"] == size - 1
+    sql_pattern = "(a IS D)" + "".join(f"-[r{i} IS R]->(m{i} IS D)" for i in range(5)) + "-[r5 IS R]->(b IS D)"
+    # Exercise the public SQL exact-count hook, including both cursor adapters.
+    # Enumerating 31,824 rows took over 20 seconds before count delegation.
+    import time
+
+    start = time.monotonic()
+    assert db.sql(f"SELECT count(*) FROM GRAPH_TABLE(g MATCH {sql_pattern} COLUMNS(b.score AS score)) q")["rows"] == [
+        [str(expected)]
+    ]
+    assert time.monotonic() - start < 5
+
+
+def test_all_path_product_states_preserve_endpoint_constraints_and_bags(graph_db):
+    db = graph_db
+    patterns = [f"(n{i}:D {{id:'n{i}',score:{i}}})" for i in range(6)]
+    patterns += [f"(n{i})-[:R]->(n{j})" for i in range(6) for j in range(i + 1, 6)]
+    # Parallel edges must contribute separate ways through every product state.
+    patterns += ["(n0)-[:R]->(n1)"]
+    db.cypher_json("g", {"query": "CREATE " + ",".join(patterns)})
+    for pattern in (
+        "(a:D)-[:R*0..3]->(b:D)",
+        "(a:D)-[:R*0..1]->(b:D)-[:R*0..2]->(c:D)",
+        "(a:D)-[:R]->(b:D {score:2})-[:R*1..3]->(c:D)",
+        "(a:D)-[r:R]->(b:D)-[r:R]->(c:D)",
+        "(a:D)-[:R*1..3]->(a:D)",
+        "(a:D)-[:R]-(b:D)-[:R]->(c:D)",
+    ):
+        optimized = db.cypher_json("g", {"query": f"MATCH {pattern} RETURN count(*)"})
+        enumerated = db.cypher_json("g", {"query": f"MATCH {pattern} UNWIND [1] AS x RETURN count(*)"})
+        assert optimized["rows"] == enumerated["rows"], pattern
+    relation = "GRAPH_TABLE(g MATCH (a IS D)-[r IS R]->(b IS D) COLUMNS(b.score AS score)) q"
+    assert db.sql(f"SELECT count(*) FROM {relation} WHERE q.score+0=5")["rows"] == [["5"]]
+    assert db.sql(f"SELECT count(*) FROM (SELECT q.score FROM {relation} LIMIT 3) limited")["rows"] == [["3"]]

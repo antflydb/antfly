@@ -1219,8 +1219,10 @@ entries and min/max values have independent lifetimes. Supported grouped reducti
 retain one accumulator per key. DISTINCT retains typed unique keys, including
 null and numeric equivalence, rather than every source row. Unordered DISTINCT
 propagates `SKIP + LIMIT` demand after deduplication; row-local `WITH DISTINCT`
-stages share their key set across producer pages. Collect and correlated pattern
-expressions retain the general operator.
+stages share their key set across producer pages. Collect retains its result payload; correlated pattern expressions retain the
+general operator. Row-local WITH and UNWIND form a streaming pipeline into
+reducers and LIMIT. UNWIND preserves scalar, list, null and duplicate semantics,
+reclaiming each expanded row after its downstream consumer finishes.
 
 Independent all-path patterns feed their bindings directly into the next pattern
 without materializing Cartesian products. Ready equality constraints use native
@@ -1230,7 +1232,11 @@ certifies a complete, authorized, unfiltered scan. Its reclaimable cache is capp
 at the smaller of 8 MiB and one eighth of the statement memory limit; exceeding
 that cache quota releases it and resumes ordinary scans. Other predicates,
 relationship uniqueness, null equality and duplicate matches remain residual
-Cypher checks.
+Cypher checks. Same-property equality OR trees normalize to indexed membership
+only when every arm provides safe candidate evidence; the complete Boolean
+expression remains residual. Explicitly required catalog labels contribute their
+equality predicates to anchor planning. Unlabeled scans preserve the union of
+label memberships instead of conjoining unrelated label predicates.
 
 SQL `GRAPH_TABLE` prunes unused row-local COLUMNS expressions and pushes compatible
 scalar property conditions into MATCH, preserving SQL residual comparisons.
@@ -1238,11 +1244,13 @@ Aggregation, DISTINCT, ordering, optional matching and selected paths retain
 their required semantic barriers. Observable SQL `_id` values keep source
 ordinals, so those scans retain SQL predicates outside MATCH. Tagged graph
 continuations replay the same optimized relation with bounded page retention;
-legacy ordinal tokens keep their original unfiltered-source interpretation. Ordinary single-node
-relations expose a pull cursor: each SQL demand reads another bounded graph page
+legacy ordinal tokens keep their original unfiltered-source interpretation. Ordinary
+all-path relations, including comma-separated patterns, expose a pull cursor: each SQL demand reads another bounded graph page
 under the same cut and cumulative work/memory ceilings. SQL LIMIT can stop the
 source without retaining previous pages. Advisory SQL row goals influence page
-size without truncating the relation. Each production binding owns its authority
+size without truncating the relation. Suspended pattern joins retain their current
+route, shared bindings, deferred constraints and relationship uniqueness across
+fetches. Terminal node scans amortize reads with bounded anchor pages. Each production binding owns its authority
 channel, RPC client and staged view for the cursor lifetime.
 
 Path planning compares every vertex before opening an anchor scan. Existing
@@ -1288,6 +1296,20 @@ are sought directly during replay, which consumes logical execution work without
 charging physical reads again. Their route
 enumeration remains combinatorial when uniqueness requires it; neither vertex
 compression nor early deduplication may discard valid qualifying trails.
+
+Eligible ALL-path count(*) reductions discover authorized adjacency from sparse
+(pattern edge, hop, identity) states. Rejected intermediate node predicates leave
+the branches behind those nodes unopened. Finite bounds and a DAG proof permit prefix
+compression under trail and node uniqueness; repeatable walks admit bounded
+product states directly. Pattern labels, directions, relationship types,
+constant properties and parallel-edge multiplicities remain exact. Edge patterns
+sharing a mapping/direction domain reuse one capture; heterogeneous domains, rebound
+route aliases, repeated node aliases, path-sensitive constraints and unproven cyclic
+trails retain exact enumeration, reusing captured adjacency where applicable.
+Intermediate counts saturate above the result range, so only qualifying endpoint
+counts can report overflow. SQL GRAPH_TABLE exposes this through the exact-count
+cursor hook under the same owner cut, with SQL residuals and ordinal selection
+retaining ordinary pulls.
 
 `antfly.search` no longer scans the table to enumerate allowed IDs. Unrestricted
 table labels without row policies use native indexed search directly. Restricted

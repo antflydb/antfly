@@ -329,6 +329,66 @@ def test_authenticated_cypher_property_plans_and_sql_overlays(monkeypatch):
             },
         )
         assert len(pulled["rows"]) == 1, pulled
+        counted = call(
+            f"/graphs/{hops}/query",
+            {
+                "query": "MATCH (a:H)-[:R*6..6]->(b:H) RETURN count(*)",
+                "limits": {"explored_edges": 1000, "intermediate_states": 20000},
+            },
+        )
+        assert counted["rows"] == [[{"type": "integer", "value": "31824"}]], counted
+        start = time.monotonic()
+        counted_sql = call(
+            "/sql",
+            {
+                "statement": f"SELECT count(*) FROM GRAPH_TABLE({hops} MATCH {path} COLUMNS(b.score AS score)) q"
+            },
+        )
+        assert counted_sql["rows"] == [["31824"]], counted_sql
+        assert time.monotonic() - start < 10
+        comma = call(
+            "/sql",
+            {
+                "statement": f"SELECT q.first,q.second FROM GRAPH_TABLE({graph} MATCH (a IS D),(b IS D) COLUMNS(a.score AS first,b.score AS second)) q LIMIT 1"
+            },
+        )
+        assert len(comma["rows"]) == 1, comma
+        expanded = call(
+            f"/graphs/{graph}/query",
+            {
+                "query": "MATCH (n:D) UNWIND [1,2] AS x RETURN n.score,x LIMIT 1",
+                "limits": {"scanned_anchors": 1},
+            },
+        )
+        assert len(expanded["rows"]) == 1, expanded
+        sought = call(
+            f"/graphs/{graph}/query",
+            {
+                "query": "MATCH (n:D) WHERE n.score=1998 OR n.score=1999 RETURN n.score ORDER BY n.score",
+                "limits": {"scanned_anchors": 2},
+            },
+            wait_for_index=True,
+        )
+        assert sought["rows"] == [
+            [{"type": "integer", "value": "1998"}],
+            [{"type": "integer", "value": "1999"}],
+        ], sought
+        call(
+            f"/graphs/{graph}_rare",
+            {
+                "labels": [{"name": "Rare", "table": table, "where": {"score": 1999}}],
+                "relationships": [],
+            },
+        )
+        rare = call(
+            f"/graphs/{graph}_rare/query",
+            {
+                "query": "MATCH (n:Rare) RETURN count(*)",
+                "limits": {"scanned_anchors": 1},
+            },
+            wait_for_index=True,
+        )
+        assert rare["rows"] == [[{"type": "integer", "value": "1"}]], rare
         script = (
             Path(__file__).resolve().parents[2]
             / "scripts"

@@ -343,7 +343,16 @@ pub const Cursor = struct {
         copied.primary_key = if (request.primary_key) |key| try owned.dupe(u8, key) else null;
         if ((empty and resume_position != 0) or (result != null and resume_position > result.?.rows.len)) return error.InvalidSqlBackendResponse;
         self.* = .{ .a = a, .arena = arena, .result = result, .stream = stream, .request = copied, .position = if (stream != null) 0 else resume_position, .resume_position = resume_position, .optimized = optimized, .empty = empty };
-        return .{ .ptr = self, .next = next, .close = close, .estimated_rows = if (empty) 0 else if (result) |value| value.rows.len else null };
+        return .{ .ptr = self, .next = next, .close = close, .count_rows = countRows, .estimated_rows = if (empty) 0 else if (result) |value| value.rows.len else null };
+    }
+    fn countRows(ptr: *anyopaque) anyerror!?u64 {
+        const self: *Cursor = @ptrCast(@alignCast(ptr));
+        if (self.empty) return 0;
+        // Storage hints are supersets of SQL truth. Leave any SQL residual to
+        // its consumer rather than counting hinted candidates as exact rows.
+        if (self.position != 0 or self.resume_position != 0 or self.request.primary_key != null or self.request.conditions.len != 0) return null;
+        if (self.stream) |stream| return stream.countRows();
+        return if (self.result) |result| result.rows.len else null;
     }
     fn next(ptr: *anyopaque, a: A, limit: u32) !catalog.Page {
         const self: *Cursor = @ptrCast(@alignCast(ptr));

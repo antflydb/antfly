@@ -1640,6 +1640,16 @@ pub const Adapter = struct {
             try self.validate(a);
             return page;
         }
+        fn countRows(ptr: *anyopaque) !?u64 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            const count_rows = self.child.count_rows orelse return null;
+            var arena = std.heap.ArenaAllocator.init(self.a);
+            defer arena.deinit();
+            try self.validate(arena.allocator());
+            const count = try count_rows(self.child.ptr);
+            try self.validate(arena.allocator());
+            return count;
+        }
         fn close(ptr: *anyopaque) void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.child.close(self.child.ptr);
@@ -1806,7 +1816,7 @@ pub const Adapter = struct {
             errdefer child.close(child.ptr);
             const wrapper = try a.create(GraphStatementCursor);
             wrapper.* = .{ .a = a, .adapter = self, .table = request.table, .child = child, .owner = owner };
-            out.* = .{ .ptr = wrapper, .next = GraphStatementCursor.next, .close = GraphStatementCursor.close };
+            out.* = .{ .ptr = wrapper, .next = GraphStatementCursor.next, .close = GraphStatementCursor.close, .count_rows = if (child.count_rows != null) GraphStatementCursor.countRows else null };
             owner.opened += 1;
         }
         // All allocations through the local arena must finish before its

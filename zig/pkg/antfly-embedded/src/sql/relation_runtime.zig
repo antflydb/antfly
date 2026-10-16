@@ -2181,11 +2181,21 @@ fn Engine(comptime Context: type) type {
                 self.ordinal += batch.len();
                 return .{ .native = .{ .values = values, .names = names }, .selection = selection, .after = if (batch.len() != 0) try std.fmt.allocPrint(a, "{d}", .{self.ordinal}) else null };
             }
+            fn countRows(ptr: *anyopaque) !?u64 {
+                const self: *Adapter = @ptrCast(@alignCast(ptr));
+                // Only an untouched physical scan is transparent to exact
+                // cardinality. Filters, joins, derived projections and other
+                // operators must retain their own row/error semantics.
+                if (self.ordinal != 0 or self.pending_failure != null or self.iterator.pages != 0 or self.iterator.apply_mode or self.iterator.recursive_id != null or self.iterator.node.operation != .scan) return null;
+                const scan_node = self.iterator.node.operation.scan;
+                const cursor = self.engine.cursors[scan_node.index];
+                return if (cursor.count_rows) |count_rows| try count_rows(cursor.ptr) else null;
+            }
             fn open(ptr: *anyopaque, _: Allocator, _: catalog.Table, _: catalog.Scan) !?catalog.Cursor {
                 const self: *Adapter = @ptrCast(@alignCast(ptr));
                 if (self.opened) return error.InvalidSqlBackendResponse;
                 self.opened = true;
-                return .{ .ptr = self, .next = next, .next_columns = if (hasPatterns(self.iterator.node, 0)) null else nextColumns, .close = close };
+                return .{ .ptr = self, .next = next, .next_columns = if (hasPatterns(self.iterator.node, 0)) null else nextColumns, .count_rows = countRows, .close = close };
             }
             fn close(_: *anyopaque) void {}
             fn next(ptr: *anyopaque, alloc: Allocator, limit: u32) !catalog.Page {
@@ -2272,6 +2282,10 @@ fn Source(comptime Context: type) type {
             const self: *Self = @ptrCast(@alignCast(raw));
             return Engine(Context).Adapter.nextColumns(&self.adapter, alloc, limit);
         }
+        fn countRows(raw: *anyopaque) !?u64 {
+            const self: *Self = @ptrCast(@alignCast(raw));
+            return Engine(Context).Adapter.countRows(&self.adapter);
+        }
         fn closeCursor(raw: *anyopaque) void {
             const self: *Self = @ptrCast(@alignCast(raw));
             self.close();
@@ -2281,7 +2295,7 @@ fn Source(comptime Context: type) type {
 
 pub fn openCursor(context: anytype) !catalog.Cursor {
     const owner = try Source(@TypeOf(context)).create(context);
-    return .{ .ptr = owner, .next = @TypeOf(owner.*).next, .next_columns = if (Engine(@TypeOf(context)).Adapter.hasPatterns(owner.iterator.?.node, 0)) null else @TypeOf(owner.*).nextColumns, .close = @TypeOf(owner.*).closeCursor };
+    return .{ .ptr = owner, .next = @TypeOf(owner.*).next, .next_columns = if (Engine(@TypeOf(context)).Adapter.hasPatterns(owner.iterator.?.node, 0)) null else @TypeOf(owner.*).nextColumns, .count_rows = @TypeOf(owner.*).countRows, .close = @TypeOf(owner.*).closeCursor };
 }
 
 pub fn execute(context: anytype) anyerror!@import("runtime.zig").Output {
