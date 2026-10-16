@@ -141,6 +141,13 @@ pub const Plan = struct {
         defer navigation.deinit();
         var ranges = JsonView.ValidatedRanges.init(scratch);
         defer ranges.deinit();
+        // Choose one response-wide capacity before any column publishes proof.
+        // The largest selected source may contain no cacheable ranges itself.
+        if (self.selectors) |selectors| for (source.keys(), source.values()) |name, value| {
+            if (value == .json) if (selectors.fields.get(name)) |selected| {
+                if (selected.fields.count() != 0) ranges.reserveFor(value.json.root.raw.len);
+            };
+        };
         var row_alloc = scratch;
         var prepared: []?*JsonView = &.{};
         if (self.selectors) |selectors| for (source.keys(), source.values(), 0..) |name, value, i| {
@@ -437,4 +444,59 @@ test "public graph metric borrowed wire native scoped fanout preserves ignored d
     var stronger = try Plan.init(a, table, &layout, &.{ "payload.items.x.y", "payload.items.x.ignored.d" });
     defer stronger.deinit();
     try std.testing.expectError(error.DuplicateField, stronger.projectSources(a, owner.allocator(), source));
+}
+
+test "public graph metric borrowed wire later large columns preserve deep native validation reuse" {
+    const a = std.testing.allocator;
+    const counters = @import("../../lite/test_allocator.zig");
+    const columns = [_]schema.RelationalColumn{
+        .{ .name = "payload", .path = "payload", .column_type = .json, .is_json = true, .json_kind = .any },
+        .{ .name = "other", .path = "other", .column_type = .json, .is_json = true, .json_kind = .any },
+    };
+    const table: schema.TableSchema = .{ .version = 1, .storage_mode = .relational, .relational_columns = &columns };
+    var layout = try codec.PhysicalLayout.init(a, table);
+    defer layout.deinit();
+    var raw = std.Io.Writer.Allocating.init(a);
+    defer raw.deinit();
+    var field = std.Io.Writer.Allocating.init(a);
+    defer field.deinit();
+    try raw.writer.writeAll("{\"items\":[");
+    try field.writer.writeAll("payload.items");
+    for (0..32) |_| {
+        try raw.writer.writeAll("{\"x\":[");
+        try field.writer.writeAll(".x");
+    }
+    for (0..1000) |i| {
+        if (i != 0) try raw.writer.writeByte(',');
+        try raw.writer.writeAll("{\"absent\":0}");
+    }
+    for (0..32) |_| try raw.writer.writeAll("]}");
+    try raw.writer.writeAll("]}");
+    try field.writer.writeAll(".m");
+    var large = std.Io.Writer.Allocating.init(a);
+    defer large.deinit();
+    try large.writer.writeAll("{\"padding\":\"");
+    try large.writer.splatByteAll('a', 262144);
+    try large.writer.writeAll("\"}");
+    var payload = JsonView.init(a, raw.written());
+    var other = JsonView.init(a, large.written());
+    var plan = try Plan.init(a, table, &layout, &.{ field.written(), "other.missing" });
+    defer plan.deinit();
+    for ([_]bool{ false, true }) |large_first| {
+        var sources: Plan.Sources = .empty;
+        defer sources.deinit(a);
+        if (large_first) try sources.put(a, "other", .{ .json = &other });
+        try sources.put(a, "payload", .{ .json = &payload });
+        if (!large_first) try sources.put(a, "other", .{ .json = &other });
+        var no_resize: counters.NoResizeAllocator = .{ .backing = a };
+        var budget: counters.BudgetAllocator = .{ .backing = no_resize.allocator() };
+        const bytes = try plan.projectSources(a, budget.allocator(), sources);
+        defer a.free(bytes);
+        try std.testing.expectEqualStrings("{\"payload\":{},\"other\":{}}", bytes);
+        // Clearing the first column's cache causes over 420 allocations here.
+        // Leave headroom for hash collisions while catching repeated traversal.
+        try std.testing.expect(budget.alloc_calls < 400);
+        try std.testing.expectEqual(@as(usize, 0), budget.live);
+        try std.testing.expect(payload.root.children == null and other.root.children == null);
+    }
 }

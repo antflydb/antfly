@@ -114,14 +114,11 @@ pub const ValidatedRanges = struct {
         self.primary = null;
     }
     /// One response shares at most 16 KiB, even across multiple JSON columns.
-    /// Grow the hint only when needed; existing proofs survive cache eviction.
+    /// Call for every selected source before preparation. Once allocated, keep
+    /// the table stable: later hints must not discard earlier sources' work.
     pub fn reserveFor(self: *@This(), input_len: usize) void {
         const capacity = std.math.ceilPowerOfTwoAssert(usize, @max(64, @min(1024, input_len / 128)));
-        if (capacity > self.capacity) {
-            self.alloc.free(self.entries);
-            self.entries = &.{};
-            self.alloc.free(self.scope_ids);
-            self.scope_ids = &.{};
+        if (capacity > self.capacity and self.entries.len == 0 and self.scope_ids.len == 0) {
             self.capacity = capacity;
         }
     }
@@ -264,10 +261,9 @@ test "public graph metric borrowed wire range refill preserves source and duplic
     try std.testing.expect(!try narrow.skip(&foreign, true));
     narrow.refill(raw);
     try std.testing.expectEqual(allocations, counted.allocations);
-    // Growth evicts cache entries without changing either published proof.
+    // A later size hint preserves earlier entries and published proofs.
     cache.reserveFor(128 * 1024);
-    try std.testing.expect(!try all.skip(&foreign, true));
-    try cache.remember(raw);
+    try std.testing.expectEqual(allocations, counted.allocations);
     try std.testing.expect(!try visited.skip(&foreign, true));
     try std.testing.expect(try all.skip(&foreign, true));
 }
@@ -313,6 +309,9 @@ test "public graph metric borrowed wire visited array proofs are source and sele
         try cache.rememberSelected(raw, selected);
     }
     const checked = cache.validated(raw, false).?;
+    const capacity = cache.capacity;
+    cache.reserveFor(128 * 1024);
+    try std.testing.expectEqual(capacity, cache.capacity);
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
     const wanted = try @import("json_projection_plan.zig").compile(arena.allocator(), &.{.{ .parts = &.{"y"} }});
@@ -334,4 +333,35 @@ test "public graph metric borrowed wire visited array proofs are source and sele
     try std.testing.expect(!try checked.skipSelected(&foreign, wanted));
     try checked.refillSelected(raw, wanted);
     try std.testing.expect(try checked.skipSelected(&foreign, wanted));
+}
+
+test "public graph metric borrowed wire partial scoped allocation keeps capacity stable across retry" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const selected = try @import("json_projection_plan.zig").compile(arena.allocator(), &.{.{ .parts = &.{"x"} }});
+    const raw = try a.alloc(u8, 512);
+    defer a.free(raw);
+    @memset(raw, ' ');
+    raw[0] = '[';
+    raw[raw.len - 1] = ']';
+    var failing = std.testing.FailingAllocator.init(a, .{});
+    var cache = ValidatedRanges.init(failing.allocator());
+    defer cache.deinit();
+    _ = try cache.scopes.intern(cache.alloc, selected);
+    // Scope IDs succeed; the next allocation for range entries fails.
+    failing.fail_index = failing.alloc_index + 1;
+    try std.testing.expectError(error.OutOfMemory, cache.rememberSelected(raw, selected));
+    try std.testing.expect(cache.scope_ids.len != 0 and cache.entries.len == 0);
+    const capacity = cache.capacity;
+    cache.reserveFor(128 * 1024);
+    try std.testing.expectEqual(capacity, cache.capacity);
+    failing.fail_index = std.math.maxInt(usize);
+    try cache.rememberSelected(raw, selected);
+    const checked = cache.validated(raw, false).?;
+    var scanner = std.json.Scanner.initCompleteInput(a, raw);
+    defer scanner.deinit();
+    _ = try scanner.peekNextTokenType();
+    try std.testing.expect(try checked.skipSelected(&scanner, selected));
+    try std.testing.expectEqual(.end_of_document, try scanner.next());
 }

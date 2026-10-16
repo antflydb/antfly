@@ -419,20 +419,44 @@ pub const Output = union(enum) {
     pub fn serialize(self: Output, scratch: Allocator, output: Allocator) ![]u8 {
         return self.serializeWithPolicy(scratch, output, false);
     }
-    /// Carry allocation policy through wrappers without unwrapping their
-    /// synchronization or quota accounting. Only growing writers need scratch.
+    /// Carry allocation policy through wrappers without unwrapping quota or
+    /// synchronization. Exact/arena owners get a bounded sizing pass followed
+    /// by direct emission into their sole final allocation. Small responses
+    /// remain in the sizing buffer and need no replay.
     pub fn serializeWithPolicy(self: Output, scratch: Allocator, output: Allocator, exact: bool) ![]u8 {
         const reclaimable = @import("antfly_platform").allocator.reclaimingScratch(output);
-        // An arena cannot reclaim superseded growing buffers. Preserve one
-        // exact allocation there; ordinary owners can take the writer buffer.
         const arena_output = exact or reclaimable.ptr != output.ptr or reclaimable.vtable != output.vtable;
-        var writer = std.Io.Writer.Allocating.init(if (arena_output) @import("antfly_platform").allocator.reclaimingScratch(scratch) else output);
+        if (arena_output) return self.serializeExact(scratch, output);
+        var writer = std.Io.Writer.Allocating.init(output);
         defer writer.deinit();
         self.writeTo(scratch, &writer.writer) catch |err| switch (err) {
             error.WriteFailed => return error.OutOfMemory,
             else => return err,
         };
-        return if (arena_output) output.dupe(u8, writer.written()) else writer.toOwnedSlice();
+        return writer.toOwnedSlice();
+    }
+
+    fn serializeExact(self: Output, scratch: Allocator, output: Allocator) ![]u8 {
+        var buffer: [4096]u8 = undefined;
+        var counter = std.Io.Writer.Discarding.init(&buffer);
+        var context = StreamContext.init(scratch);
+        defer context.deinit();
+        try self.write(&context, &counter.writer);
+        // No drain means the complete response is still buffered. This keeps
+        // the usual small response to one traversal and one output allocation.
+        if (counter.count == 0) return output.dupe(u8, counter.writer.buffered());
+        const size = std.math.cast(usize, counter.fullCount()) orelse return error.OutOfMemory;
+        const result = try output.alloc(u8, size);
+        errdefer output.free(result);
+        var writer = std.Io.Writer.fixed(result);
+        self.write(&context, &writer) catch |err| switch (err) {
+            error.WriteFailed => return error.OutputSizeChanged,
+            else => return err,
+        };
+        // Sources and restartable embedding streams must remain stable during
+        // this synchronous operation. Never expose an unwritten result tail.
+        if (writer.end != result.len) return error.OutputSizeChanged;
+        return result;
     }
 
     /// A transport with its own writer can stream the body without allocating
@@ -1607,4 +1631,125 @@ test "public graph metric borrowed wire escaped scalar emission uses fixed scrat
         defer output.deinit();
         if (context.writeSpan(&output.writer, input, true)) |_| return error.ExpectedSyntaxFailure else |_| {}
     }
+}
+
+test "public graph metric borrowed wire exact escaped output stays within bounded scratch for arena owners" {
+    const a = std.testing.allocator;
+    const query = @import("../document_query.zig");
+    const counters = @import("../../lite/test_allocator.zig");
+    var raw = std.Io.Writer.Allocating.init(a);
+    defer raw.deinit();
+    try raw.writer.writeAll("{\"payload\":{\"text\":\"");
+    for (0..262144) |_| try raw.writer.writeAll("\\u0061");
+    try raw.writer.writeAll("\"}}");
+    var plan = (try query.SpanProjectionPlan.init(a, .{ .fields = &.{"payload.text"}, .include_all_fields = false })).?;
+    defer plan.deinit();
+    for ([_]bool{ false, true }) |exact| {
+        var budget: counters.BudgetAllocator = .{ .backing = a, .limit = 32 * 1024 };
+        var output_budget: counters.BudgetAllocator = .{ .backing = a };
+        {
+            var arena = std.heap.ArenaAllocator.init(output_budget.allocator());
+            defer arena.deinit();
+            const result = try query.lookupJsonWithSourcesPolicy(budget.allocator(), arena.allocator(), raw.written(), &plan, &.{}, exact);
+            const prefix = "{\"payload\":{\"text\":\"";
+            try std.testing.expectEqualStrings(prefix, result.json[0..prefix.len]);
+            try std.testing.expectEqual(262144 + "{\"payload\":{\"text\":\"\"}}".len, result.json.len);
+            for (result.json[prefix.len..][0..262144]) |byte| try std.testing.expectEqual(@as(u8, 'a'), byte);
+            try std.testing.expectEqualStrings("\"}}", result.json[result.json.len - 3 ..]);
+            try std.testing.expectEqual(@as(usize, 1), output_budget.alloc_calls);
+        }
+        try std.testing.expectEqual(@as(usize, 0), budget.live);
+        try std.testing.expectEqual(@as(usize, 0), output_budget.live);
+    }
+}
+
+test "public graph metric borrowed wire exact stream replay bounds allocation and rejects changed lengths" {
+    const Stream = @import("embedding_fields.zig").EmbeddingStream;
+    const Fixture = struct {
+        resets: usize = 0,
+        emitted: bool = false,
+        delta: i8 = 0,
+        fail_replay: bool = false,
+        length: usize = 4096,
+        vector: [4096]f32 = @splat(0),
+        fn reset(ctx: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.resets += 1;
+            self.emitted = false;
+            if (self.fail_replay and self.resets == 2) return error.ReplayFailed;
+        }
+        fn next(ctx: *anyopaque) !?Stream.Field {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            if (self.emitted) return null;
+            self.emitted = true;
+            const len: usize = if (self.resets == 2 and self.delta < 0) self.length - 2 else if (self.resets == 1 and self.delta > 0) self.length - 2 else self.length;
+            return .{ .name = "v", .vector = self.vector[0..len] };
+        }
+        fn close(_: *anyopaque) void {}
+        fn run(alloc: Allocator, delta: i8, fail_replay: bool) !void {
+            var fixture: @This() = .{ .delta = delta, .fail_replay = fail_replay };
+            var stream: Stream = .{ .ctx = &fixture, .next_fn = next, .reset_fn = reset, .close_fn = close };
+            defer stream.deinit();
+            const value: Output = .{ .borrowed = .{ .embedding_stream = &stream } };
+            var scratch: @import("../../lite/test_allocator.zig").BudgetAllocator = .{ .backing = std.testing.allocator, .limit = 0 };
+            if (delta != 0) {
+                try std.testing.expectError(error.OutputSizeChanged, value.serializeWithPolicy(scratch.allocator(), alloc, true));
+            } else if (fail_replay) {
+                try std.testing.expectError(error.ReplayFailed, value.serializeWithPolicy(scratch.allocator(), alloc, true));
+            } else {
+                const bytes = try value.serializeWithPolicy(scratch.allocator(), alloc, true);
+                defer alloc.free(bytes);
+                try std.testing.expectEqualStrings("{\"v\":[0", bytes[0..7]);
+                try std.testing.expectEqual(@as(usize, 8199), bytes.len);
+            }
+            try std.testing.expectEqual(@as(usize, 2), fixture.resets);
+            try std.testing.expectEqual(@as(usize, 0), scratch.alloc_attempts);
+        }
+    };
+    const a = std.testing.allocator;
+    for ([_]i8{ -1, 0, 1 }) |delta| try Fixture.run(a, delta, false);
+    try Fixture.run(a, 0, true);
+    try std.testing.checkAllAllocationFailures(a, Fixture.run, .{ @as(i8, 0), false });
+    var small: Fixture = .{ .length = 1 };
+    var stream: Stream = .{ .ctx = &small, .next_fn = Fixture.next, .reset_fn = Fixture.reset, .close_fn = Fixture.close };
+    defer stream.deinit();
+    const bytes = try (Output{ .borrowed = .{ .embedding_stream = &stream } }).serializeWithPolicy(a, a, true);
+    defer a.free(bytes);
+    try std.testing.expectEqualStrings("{\"v\":[0]}", bytes);
+    try std.testing.expectEqual(@as(usize, 1), small.resets);
+}
+
+test "public graph metric borrowed wire exact nested fanout replay survives errors and repeated serialization" {
+    const a = std.testing.allocator;
+    var raw = std.Io.Writer.Allocating.init(a);
+    defer raw.deinit();
+    try raw.writer.writeByte('[');
+    for (0..4) |i| {
+        if (i != 0) try raw.writer.writeByte(',');
+        try raw.writer.writeAll("{\"x\":[{\"m\":\"");
+        try raw.writer.splatByteAll('a', 2048);
+        try raw.writer.writeAll("\"}]}");
+    }
+    try raw.writer.writeByte(']');
+    const Fixture = struct {
+        fn run(alloc: Allocator, input: []const u8) !void {
+            var arena = std.heap.ArenaAllocator.init(alloc);
+            defer arena.deinit();
+            var view = View.init(arena.allocator(), input);
+            var owner = Owner.init(arena.allocator());
+            defer owner.deinit();
+            var root: Output.Object = .empty;
+            try Output.include(&owner, &root, "items", .{ .span = .{ .view = &view, .node = &view.root } }, &.{ "x", "m" });
+            const value: Output = .{ .object = root };
+            for (0..2) |_| {
+                const bytes = try value.serializeWithPolicy(alloc, alloc, true);
+                defer alloc.free(bytes);
+                try std.testing.expectEqualStrings("{\"items\":", bytes[0..9]);
+                try std.testing.expectEqualStrings(input, bytes[9 .. bytes.len - 1]);
+                try std.testing.expectEqual(@as(u8, '}'), bytes[bytes.len - 1]);
+            }
+        }
+    };
+    try Fixture.run(a, raw.written());
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(a, Fixture.run, .{raw.written()});
 }
