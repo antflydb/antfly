@@ -55,7 +55,8 @@ const View = struct {
         try writer.endArray();
         try writer.objectField("values");
         try writer.beginArray();
-        for (self.value.elements) |element| {
+        for (0..self.value.cardinality()) |array_cell_0| {
+            const element = self.value.flatCell(array_cell_0);
             if (element.sql_null) {
                 try writer.write(null);
             } else switch (self.value.element_type) {
@@ -74,7 +75,7 @@ const View = struct {
         try writer.endArray();
         try writer.objectField("sql_nulls");
         try writer.beginArray();
-        for (self.value.elements) |element| try writer.write(element.sql_null);
+        for (0..self.value.cardinality()) |index| try writer.write(self.value.flatCell(index).sql_null);
         try writer.endArray();
         try writer.endObject();
     }
@@ -84,7 +85,7 @@ const View = struct {
 /// share one view, avoiding per-element JSON serialization/parse allocations.
 fn encodedSize(value: arrays.Value, options: Options) !usize {
     var work: arrays.Budget = .{ .remaining = options.values.work, .shared = options.context };
-    const canonical = try arrays.Value.initWithBudget(value.element_type, value.dimensions, value.elements, options.values, &work);
+    const canonical = try value.validateWithBudget(options.values, &work);
     if (canonical.dimensions.len != value.dimensions.len) return error.InvalidSqlArrayShape;
     var size: std.Io.Writer.Discarding = .init(&.{});
     try std.json.Stringify.value(View{ .value = value }, .{}, &size.writer);
@@ -122,9 +123,10 @@ pub fn toJsonLeaky(a: A, value: arrays.Value, options: Options) !Json {
         try object.put(a, "lower_bound", .{ .integer = dimension.lower });
         axis.* = .{ .object = object };
     }
-    const values = try a.alloc(Json, value.elements.len);
-    const nulls = try a.alloc(Json, value.elements.len);
-    for (value.elements, values, nulls) |cell, *out, *flag| {
+    const values = try a.alloc(Json, value.cardinality());
+    const nulls = try a.alloc(Json, value.cardinality());
+    for (0..value.cardinality(), values, nulls) |array_cell_0, *out, *flag| {
+        const cell = value.flatCell(array_cell_0);
         flag.* = .{ .bool = cell.sql_null };
         out.* = if (cell.sql_null) .null else switch (value.element_type) {
             .numeric => numeric: {
@@ -453,8 +455,8 @@ test "SQL NUMERIC array assignment shares its full work budget and unwinds alloc
             var parent: @import("numeric_value.zig").Context = .{ .alloc = alloc };
             var value = try decodeBorrowedWithModifier(alloc, .numeric, input, .{ .precision = 4, .scale = 2 }, .{ .context = &parent });
             defer value.deinit();
-            try std.testing.expectEqual(@as(usize, 3), value.value.elements.len);
-            try std.testing.expect(value.value.elements[1].sql_null);
+            try std.testing.expectEqual(@as(usize, 3), value.value.cardinality());
+            try std.testing.expect(value.value.flatCell(1).sql_null);
         }
     };
     try std.testing.checkAllAllocationFailures(a, Run.run, .{parsed.value});
@@ -477,8 +479,8 @@ test "SQL borrowed array envelopes preserve pinned payloads and unwind both flat
             var view = try decodeBorrowed(a, .jsonb, input, .{});
             defer view.deinit();
             const values = input.object.get("values").?.array.items;
-            try std.testing.expect(view.value.elements[2].value.object.keys().ptr == values[2].object.keys().ptr);
-            try std.testing.expect(!view.value.elements[0].sql_null and view.value.elements[1].sql_null);
+            try std.testing.expect(view.value.flatCell(2).value.object.keys().ptr == values[2].object.keys().ptr);
+            try std.testing.expect(!view.value.flatCell(0).sql_null and view.value.flatCell(1).sql_null);
         }
     };
     const a = std.testing.allocator;
@@ -590,10 +592,10 @@ test "SQL array envelope owns JSONB payloads and unwinds all allocation failures
             defer decoded.deinit();
             parsed.deinit();
             try std.testing.expectEqual(@as(i32, 0), decoded.value.dimensions[0].lower);
-            try std.testing.expectEqualStrings("2", decoded.value.elements[0].value.object.get("nested").?.array.items[1].number_string);
-            try std.testing.expect(!decoded.value.elements[1].sql_null);
-            try std.testing.expect(decoded.value.elements[1].value == .null);
-            try std.testing.expect(decoded.value.elements[2].sql_null);
+            try std.testing.expectEqualStrings("2", decoded.value.flatCell(0).value.object.get("nested").?.array.items[1].number_string);
+            try std.testing.expect(!decoded.value.flatCell(1).sql_null);
+            try std.testing.expect(decoded.value.flatCell(1).value == .null);
+            try std.testing.expect(decoded.value.flatCell(2).sql_null);
             var arena = std.heap.ArenaAllocator.init(a);
             defer arena.deinit();
             const materialized = blk: {

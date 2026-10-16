@@ -127,7 +127,7 @@ pub const Store = struct {
                         break :decoded &view.?.value;
                     };
                     if ((value.array != null and value.value != .null) or array.element_type != definition.element_type) return error.InvalidResult;
-                    _ = try sources.sql_array_value.Value.init(array.element_type, array.dimensions, array.elements, .{});
+                    _ = try array.validate(.{});
                     values[row] = (try sources.sql_operators.cloneDatum(a, .{ .array = array, .sql_null = false })).array.?;
                 },
                 .numeric => |values| {

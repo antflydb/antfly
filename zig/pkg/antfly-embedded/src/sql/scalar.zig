@@ -1105,10 +1105,10 @@ test "SQL multidimensional constructors flatten typed cells and bound dynamic wo
             const array = result.array.?;
             try std.testing.expectEqual(arrays.ElementType.int64, array.element_type);
             try std.testing.expectEqual(@as(usize, 2), array.dimensions.len);
-            try std.testing.expectEqual(@as(usize, 4), array.elements.len);
-            try std.testing.expectEqual(@as(i64, 9007199254740993), array.elements[0].value.integer);
-            try std.testing.expectEqual(@as(i64, -9223372036854775807), array.elements[2].value.integer);
-            try std.testing.expect(array.elements[3].sql_null);
+            try std.testing.expectEqual(@as(usize, 4), array.cardinality());
+            try std.testing.expectEqual(@as(i64, 9007199254740993), array.flatCell(0).value.integer);
+            try std.testing.expectEqual(@as(i64, -9223372036854775807), array.flatCell(2).value.integer);
+            try std.testing.expect(array.flatCell(3).sql_null);
         }
     };
     try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Faults.run, .{});
@@ -1158,9 +1158,9 @@ test "SQL multidimensional column constructors preserve bounds and admit heap sc
             var arena = std.heap.ArenaAllocator.init(a);
             defer arena.deinit();
             const result = (try program.evaluate(arena.allocator(), &.{Datum.typedArray(&input)}, &.{}, .{})).array.?;
-            try std.testing.expectEqual(@as(usize, 17), result.elements.len);
+            try std.testing.expectEqual(@as(usize, 17), result.cardinality());
             try std.testing.expectEqual(@as(i32, -1), result.dimensions[1].lower);
-            try std.testing.expectEqualStrings("é", result.elements[16].value.string);
+            try std.testing.expectEqualStrings("é", result.flatCell(16).value.string);
         }
     };
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Faults.run, .{});
@@ -1222,8 +1222,8 @@ test "SQL constant preparation owns adopted regions and unwinds every allocation
             var program = try bind(alloc, compiled.expression, &.{.{ .name = "flag", .type = .boolean }}, &.{}, .{});
             defer program.deinit();
             const good = try program.evaluate(std.testing.failing_allocator, &.{Datum.json(.{ .bool = false })}, &.{}, .{});
-            try std.testing.expectEqual(@as(i64, 1), good.array.?.elements[0].value.integer);
-            try std.testing.expect(good.array.?.elements[2].sql_null);
+            try std.testing.expectEqual(@as(i64, 1), good.array.?.flatCell(0).value.integer);
+            try std.testing.expect(good.array.?.flatCell(2).sql_null);
             try std.testing.expect(program.constant_pool.?.memory.footprint() <= 8 * 1024 * 1024);
         }
     };
@@ -1257,7 +1257,7 @@ test "SQL constant cache admission is bounded and does not change execution dema
     var region = std.heap.ArenaAllocator.init(a);
     defer region.deinit();
     const result = try program.evaluate(region.allocator(), &.{}, &.{}, .{});
-    try std.testing.expectEqual(@as(usize, 3), result.array.?.elements.len);
+    try std.testing.expectEqual(@as(usize, 3), result.array.?.cardinality());
     try std.testing.expectError(error.SqlProgramLimitExceeded, program.evaluate(region.allocator(), &.{}, &.{}, .{ .steps = 0 }));
     var input = try @import("compiler.zig").compileScalar(a, "'{1,2,NULL}'::integer[]", .{});
     defer input.deinit();
@@ -1266,7 +1266,7 @@ test "SQL constant cache admission is bounded and does not change execution dema
     defer mandatory.deinit();
     try std.testing.expect(mandatory.constant_inputs.count() != 0);
     const borrowed = try mandatory.evaluate(std.testing.failing_allocator, &.{}, &.{}, .{});
-    try std.testing.expectEqual(@as(usize, 3), borrowed.array.?.elements.len);
+    try std.testing.expectEqual(@as(usize, 3), borrowed.array.?.cardinality());
     try std.testing.expectError(error.SqlProgramLimitExceeded, mandatory.evaluate(std.testing.failing_allocator, &.{}, &.{}, .{ .output_bytes = 0 }));
 }
 
@@ -1354,7 +1354,7 @@ test "SQL array binding retains element identity NULL provenance and bounded all
     try std.testing.expectError(error.SqlProgramLimitExceeded, program.evaluate(arena.allocator(), &.{}, &.{}, .{ .output_bytes = 1 }));
     const value = try program.evaluate(arena.allocator(), &.{}, &.{}, .{});
     try std.testing.expect(!value.sql_null);
-    try std.testing.expect(value.array.?.elements[1].sql_null);
+    try std.testing.expect(value.array.?.flatCell(1).sql_null);
     const narrow = try arrays.Value.init(.int32, &.{.{ .length = 1 }}, &.{arrays.Element.json(.{ .integer = 1 })}, .{});
     var work: arrays.Budget = .{};
     try std.testing.expectEqual(@as(?bool, false), try narrow.quantified(arrays.Element.json(.{ .integer = 9223372036854775807 }), .eq, .any, &work));
@@ -1464,10 +1464,10 @@ test "SQL array cast execution preserves bounds and releases allocations on ever
             const result = (try program.evaluate(arena.allocator(), &.{Datum.typedArray(&source)}, &.{}, .{})).array.?;
             try std.testing.expectEqualDeep(source.dimensions, result.dimensions);
             try std.testing.expectEqual(arrays.ElementType.int32, result.element_type);
-            try std.testing.expectEqual(@as(i64, 3), result.elements[0].value.integer);
-            try std.testing.expect(result.elements[1].sql_null);
-            try std.testing.expect(result.elements[2].sql_null);
-            try std.testing.expectEqual(@as(i64, -3), result.elements[3].value.integer);
+            try std.testing.expectEqual(@as(i64, 3), result.flatCell(0).value.integer);
+            try std.testing.expect(result.flatCell(1).sql_null);
+            try std.testing.expect(result.flatCell(2).sql_null);
+            try std.testing.expectEqual(@as(i64, -3), result.flatCell(3).value.integer);
         }
     };
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Faults.run, .{});
@@ -1529,7 +1529,8 @@ fn arrayScalarType(kind: arrays.ElementType) ast.ColumnType {
 
 fn mixedNumberQuantified(value: arrays.Value, probe: arrays.Element, op: arrays.Comparison, every: bool, work: *arrays.Budget) !?bool {
     var unknown = false;
-    for (value.elements) |element| {
+    for (0..value.cardinality()) |array_cell_0| {
+        const element = value.flatCell(array_cell_0);
         try work.consume(1);
         if (probe.sql_null or element.sql_null) {
             unknown = true;
@@ -1677,9 +1678,9 @@ test "SQL PostgreSQL array construction unwinds every allocation failure" {
             var arena = std.heap.ArenaAllocator.init(a);
             defer arena.deinit();
             const result = try program.evaluate(arena.allocator(), &.{}, &.{}, .{});
-            try std.testing.expectEqual(@as(usize, 5), result.array.?.elements.len);
-            try std.testing.expectEqualStrings("a", result.array.?.elements[0].value.string);
-            try std.testing.expect(result.array.?.elements[2].sql_null);
+            try std.testing.expectEqual(@as(usize, 5), result.array.?.cardinality());
+            try std.testing.expectEqualStrings("a", result.array.?.flatCell(0).value.string);
+            try std.testing.expect(result.array.?.flatCell(2).sql_null);
             try std.testing.expectError(error.SqlProgramLimitExceeded, program.evaluate(arena.allocator(), &.{}, &.{}, .{ .output_bytes = 1 }));
         }
     };
@@ -1702,8 +1703,8 @@ test "SQL PostgreSQL array construction preserves prepared widths and borrows id
     defer arena.deinit();
     const result = try (try program.bindParameters(&frame)).evaluate(arena.allocator(), &.{}, .{});
     try std.testing.expectEqual(@as(i32, 0), result.array.?.dimensions[0].lower);
-    try std.testing.expect(result.array.?.elements[1].sql_null);
-    try std.testing.expectEqual(@as(i64, 9007199254740993), result.array.?.elements[2].value.integer);
+    try std.testing.expect(result.array.?.flatCell(1).sql_null);
+    try std.testing.expectEqual(@as(i64, 9007199254740993), result.array.?.flatCell(2).value.integer);
 
     var identity_sql = try @import("compiler.zig").compileScalar(a, "$1::int4[] || NULL", .{});
     defer identity_sql.deinit();
@@ -1824,8 +1825,8 @@ test "SQL PostgreSQL array search prepared frames keep input widths and bounded 
     const prepared = try program.bindParameters(&frame);
     const result = try prepared.evaluate(arena.allocator(), &.{}, .{});
     try std.testing.expectEqual(@as(i32, 0), result.array.?.dimensions[0].lower);
-    try std.testing.expectEqual(@as(i64, 9007199254740993), result.array.?.elements[0].value.integer);
-    try std.testing.expect(result.array.?.elements[1].sql_null);
+    try std.testing.expectEqual(@as(i64, 9007199254740993), result.array.?.flatCell(0).value.integer);
+    try std.testing.expect(result.array.?.flatCell(1).sql_null);
     try std.testing.expectError(error.SqlProgramLimitExceeded, prepared.evaluate(arena.allocator(), &.{}, .{ .output_bytes = 1 }));
     try std.testing.expectError(error.SqlProgramLimitExceeded, prepared.evaluate(arena.allocator(), &.{}, .{ .steps = 1 }));
 
@@ -2892,8 +2893,8 @@ test "SQL array assignment casts match the PostgreSQL builtin matrix without rel
     try std.testing.expectError(error.SqlNumericOutOfRange, assignArray(arena.allocator(), Datum.typedArray(&input.value), .int16, .{}));
     const text = try assignArray(arena.allocator(), Datum.typedArray(&input.value), .text, .{});
     try std.testing.expectEqual(@as(i32, -3), text.array.?.dimensions[0].lower);
-    try std.testing.expectEqualStrings("32768", text.array.?.elements[0].value.string);
-    try std.testing.expect(text.array.?.elements[1].sql_null);
+    try std.testing.expectEqualStrings("32768", text.array.?.flatCell(0).value.string);
+    try std.testing.expect(text.array.?.flatCell(1).sql_null);
     try std.testing.expectError(error.SqlAssignmentTypeMismatch, assignArray(arena.allocator(), text, .int64, .{}));
     try std.testing.expectError(error.SqlProgramLimitExceeded, assignArray(arena.allocator(), Datum.typedArray(&input.value), .text, .{ .steps = 0 }));
 }
@@ -3124,11 +3125,11 @@ const Evaluator = struct {
             .column => |ordinal| if (ordinal < self.cells.len) self.cells[ordinal] else return error.InvalidSqlBackendResponse,
             .cast => |cast| blk: {
                 if (cast.type == .array) if (self.program.constant_arrays.get(index)) |prepared| {
-                    try self.charge(@sizeOf(arrays.Value) + prepared.elements.len * @sizeOf(arrays.Element) + prepared.dimensions.len * @sizeOf(arrays.Dimension));
+                    try self.charge(@sizeOf(arrays.Value) + prepared.cardinality() * @sizeOf(arrays.Element) + prepared.dimensions.len * @sizeOf(arrays.Dimension));
                     break :blk Datum.typedArray(prepared);
                 };
                 if (self.program.constant_inputs.get(index)) |input| {
-                    if (input.array) |array| try self.charge(@sizeOf(arrays.Value) + array.elements.len * @sizeOf(arrays.Element) + array.dimensions.len * @sizeOf(arrays.Dimension));
+                    if (input.array) |array| try self.charge(@sizeOf(arrays.Value) + array.cardinality() * @sizeOf(arrays.Element) + array.dimensions.len * @sizeOf(arrays.Dimension));
                     break :blk if (!self.input_validation and cast.numeric_modifier != null) try self.constrainNumeric(input, cast.numeric_modifier.?) else input;
                 }
                 const datum = try self.runDatum(cast.operand, depth + 1);
@@ -3287,8 +3288,8 @@ const Evaluator = struct {
                         if (call.function == .array_cat) {
                             if (left.sql_null) break :blk right;
                             if (right.sql_null) break :blk left;
-                            if (left.array.?.elements.len == 0) break :blk right;
-                            if (right.array.?.elements.len == 0) break :blk left;
+                            if (left.array.?.cardinality() == 0) break :blk right;
+                            if (right.array.?.cardinality() == 0) break :blk left;
                         }
                         var work = self.workBudget();
                         const limits: arrays.Limits = .{ .bytes = self.limits.output_bytes -| self.bytes };
@@ -3296,7 +3297,7 @@ const Evaluator = struct {
                         const input = if (prepend) right else left;
                         const empty: arrays.Value = .{ .element_type = instruction.type.element_type.?, .dimensions = &.{}, .elements = &.{} };
                         const output = if (call.function == .array_cat) try left.array.?.concatenate(self.alloc, right.array.?.*, limits, &work) else try (input.array orelse &empty).append(self.alloc, if (prepend) left else right, prepend, limits, &work);
-                        try self.charge(@sizeOf(arrays.Value) + output.dimensions.len * @sizeOf(arrays.Dimension) + output.elements.len * @sizeOf(arrays.Element));
+                        try self.charge(@sizeOf(arrays.Value) + output.dimensions.len * @sizeOf(arrays.Dimension) + output.cardinality() * @sizeOf(arrays.Element));
                         const owned = try self.alloc.create(arrays.Value);
                         owned.* = output;
                         break :blk Datum.typedArray(owned);
@@ -3312,7 +3313,7 @@ const Evaluator = struct {
                         var work = self.workBudget();
                         if (call.function == .array_position) {
                             if (array.dimensions.len > 1) return error.UnsupportedSqlShape;
-                            if (array.elements.len == 0) break :blk .{};
+                            if (array.cardinality() == 0) break :blk .{};
                             if (call.args.len == 3 and third.sql_null) return error.SqlNullValueNotAllowed;
                             const start = if (call.args.len == 3) std.math.cast(i32, third.value.integer) orelse return error.SqlNumericOutOfRange else null;
                             const answer = if (call.args.len == 2 and self.program.constant_memberships.contains(call.args[0])) try self.program.constant_memberships.get(call.args[0]).?.firstPosition(needle, &work) else try array.position(needle, start, &work);
@@ -3320,7 +3321,7 @@ const Evaluator = struct {
                         }
                         const limits: arrays.Limits = .{ .bytes = self.limits.output_bytes -| self.bytes };
                         const output = if (call.function == .array_positions) try array.positions(self.alloc, needle, limits, &work) else try array.transform(self.alloc, needle, if (call.function == .array_remove) null else third, limits, &work);
-                        try self.charge(@sizeOf(arrays.Value) + output.dimensions.len * @sizeOf(arrays.Dimension) + output.elements.len * @sizeOf(arrays.Element));
+                        try self.charge(@sizeOf(arrays.Value) + output.dimensions.len * @sizeOf(arrays.Dimension) + output.cardinality() * @sizeOf(arrays.Element));
                         const owned = try self.alloc.create(arrays.Value);
                         owned.* = output;
                         break :blk Datum.typedArray(owned);
@@ -3375,7 +3376,7 @@ const Evaluator = struct {
                             const other = right.array orelse return error.SqlTypeMismatch;
                             if (self.program.constant_memberships.get(call.args[0])) |prepared| break :contains if (call.function == .@"$overlaps") try prepared.overlaps(other.*, &work) else try prepared.contains(other.*, &work);
                             if (call.function == .@"$overlaps") if (self.program.constant_memberships.get(call.args[1])) |prepared| break :contains try prepared.overlaps(array.*, &work);
-                            const swapped = call.function == .@"$overlaps" and other.elements.len < array.elements.len;
+                            const swapped = call.function == .@"$overlaps" and other.cardinality() < array.cardinality();
                             var membership = try arrays.Membership.initWithBudget(self.alloc, if (swapped) other.* else array.*, .{ .bytes = self.limits.output_bytes -| self.bytes }, &work);
                             defer membership.deinit();
                             try self.charge(membership.budget.live + @sizeOf(arrays.Membership));
@@ -3386,7 +3387,7 @@ const Evaluator = struct {
                     .@"$array" => {
                         const kind = instruction.type.element_type orelse return error.InvalidSqlProgram;
                         if (self.program.constant_arrays.get(index)) |prepared| {
-                            try self.charge(@sizeOf(arrays.Value) + prepared.elements.len * @sizeOf(arrays.Element) + prepared.dimensions.len * @sizeOf(arrays.Dimension));
+                            try self.charge(@sizeOf(arrays.Value) + prepared.cardinality() * @sizeOf(arrays.Element) + prepared.dimensions.len * @sizeOf(arrays.Dimension));
                             break :blk Datum.typedArray(prepared);
                         }
                         for (call.args) |arg| if (self.program.instructions[arg].type.kind == .array) {
@@ -3836,7 +3837,8 @@ const Evaluator = struct {
         const cells = try self.alloc.alloc(arrays.Element, count);
         var at: usize = 0;
         for (children) |child| if (child.array) |array| {
-            for (array.elements) |element| {
+            for (0..array.cardinality()) |array_cell_0| {
+                const element = array.flatCell(array_cell_0);
                 try self.workOwner().charge(1);
                 cells[at] = if (element.sql_null) .{} else try self.castDatumBuiltin(element, array.element_type, kind);
                 at += 1;
@@ -3856,9 +3858,10 @@ const Evaluator = struct {
         const source = datum.array orelse return error.UnsupportedSqlShape;
         if (source.element_type == target) return datum;
         if (!builtin_cast.allowed(source.element_type, target)) return error.SqlCannotCoerce;
-        try self.charge(@sizeOf(arrays.Value) + source.elements.len * @sizeOf(arrays.Element));
-        const cells = try self.alloc.alloc(arrays.Element, source.elements.len);
-        for (source.elements, cells) |element, *cell| {
+        try self.charge(@sizeOf(arrays.Value) + source.cardinality() * @sizeOf(arrays.Element));
+        const cells = try self.alloc.alloc(arrays.Element, source.cardinality());
+        for (0..source.cardinality(), cells) |array_cell_0, *cell| {
+            const element = source.flatCell(array_cell_0);
             try self.workOwner().charge(1);
             cell.* = if (element.sql_null or (source.element_type == .jsonb and element.value == .null and target != .text and target != .jsonb)) .{} else try self.castDatumBuiltin(element, source.element_type, target);
         }
@@ -3873,9 +3876,10 @@ const Evaluator = struct {
         if (datum.sql_null) return datum;
         if (datum.array) |source| {
             if (source.element_type != .numeric) return error.InvalidSqlProgram;
-            try self.charge(@sizeOf(arrays.Value) + source.elements.len * @sizeOf(arrays.Element));
-            const cells = try self.alloc.alloc(arrays.Element, source.elements.len);
-            for (source.elements, cells) |element, *cell| {
+            try self.charge(@sizeOf(arrays.Value) + source.cardinality() * @sizeOf(arrays.Element));
+            const cells = try self.alloc.alloc(arrays.Element, source.cardinality());
+            for (0..source.cardinality(), cells) |array_cell_0, *cell| {
+                const element = source.flatCell(array_cell_0);
                 try self.workOwner().charge(1);
                 cell.* = try self.constrainNumeric(element, modifier);
             }
@@ -3998,7 +4002,8 @@ const Evaluator = struct {
         const floating = builtin_cast.floating(array.element_type) or probe.value == .float;
         const needle = if (!probe.sql_null and floating) try self.castDatumBuiltin(probe, null, .float64) else probe;
         var unknown = false;
-        for (array.elements) |element| {
+        for (0..array.cardinality()) |array_cell_0| {
+            const element = array.flatCell(array_cell_0);
             try self.workOwner().charge(1);
             if (needle.sql_null or element.sql_null) {
                 unknown = true;
@@ -4189,10 +4194,11 @@ const Evaluator = struct {
                 if (set_datum.sql_null) return .null;
                 const array = set_datum.array orelse return error.InvalidSqlProgram;
                 if (array.element_type != .text) return error.SqlUndefinedOperator;
-                if (array.elements.len == 0) return .{ .bool = all.bool };
+                if (array.cardinality() == 0) return .{ .bool = all.bool };
                 if (operand == .null) return .null;
                 var unknown = false;
-                for (array.elements) |pattern| {
+                for (0..array.cardinality()) |array_cell_0| {
+                    const pattern = array.flatCell(array_cell_0);
                     try self.workOwner().charge(1);
                     if (pattern.sql_null) {
                         unknown = true;
