@@ -2407,6 +2407,8 @@ pub const LiteResolvedOpenOptions = struct {
     /// Internal: the connection boundary owns the cross-process path lease.
     externally_locked: bool = false,
     artifact_reader_fence: bool = false,
+    /// Borrowed only during open, under the connection's publication fence.
+    allocator_verification_owner: ?*lite_backend.native.NativeFile = null,
 };
 
 pub fn optionFieldType(comptime Options: type, comptime field_name: []const u8) type {
@@ -2648,6 +2650,10 @@ pub fn openLiteHandleAllocWithSharedInference(
             .io = borrowed_io,
         });
     errdefer backend.deinit();
+    if (resolved.allocator_verification_owner) |verified| {
+        if (!resolved.externally_locked) return error.InvalidArgument;
+        try backend.native_docstore.?.file.inheritAllocatorVerification(verified);
+    }
     if (resolved.externally_locked) {
         backend.native_docstore.?.file.externally_locked = true;
         backend.native_docstore.?.maintenance_start_suppressed = true;
