@@ -198,7 +198,7 @@ test "relational nested projection preserves document semantics with bounded scr
             defer failing.free(result);
         }
     };
-    try std.testing.checkAllAllocationFailures(alloc, Check.run, .{ table, &layout, row });
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(alloc, Check.run, .{ table, &layout, row });
 }
 
 test "public graph metric borrowed wire native JSON sparse selectors reuse immutable plans" {
