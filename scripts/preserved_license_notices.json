@@ -32,6 +32,9 @@
   "zig/lib/tokenizer/src/testdata/UNICODE-LICENSE.txt": {
     "file": "LICENSES/third-party/Unicode-V3.txt"
   },
+  "zig/lib/regex/src/unicode_data.zig": {
+    "file": "LICENSES/third-party/Unicode-V3.txt"
+  },
   "zig/lib/tokenizer/src/unicode_classes.zig": {
     "file": "LICENSES/third-party/Unicode-V3.txt"
   },
@@ -61,5 +64,170 @@
   },
   "zig/lib/platform/src/io_uring_compat.zig": {
     "file": "LICENSES/third-party/Zig-SHA256-MIT.txt"
+  },
+  "zig/lib/encoding/src/tables.zig": {
+    "file": "LICENSES/third-party/WHATWG-Encoding-BSD-3-Clause.txt"
+  },
+  "zig/lib/compress/src/bzip2_random.zig": {
+    "file": "LICENSES/third-party/Bzip2-1.0.6.txt"
+  },
+  "zig/lib/compress/src/brotli/decode.zig": {
+    "file": "LICENSES/third-party/Brotli-Zig-MIT.txt"
+  },
+  "zig/lib/compress/src/zstd_native.zig": {
+    "file": "LICENSES/third-party/Zig-Stdlib-MIT.txt",
+    "required": [
+      "SPDX-License-Identifier: Apache-2.0 AND MIT"
+    ]
+  },
+  "zig/lib/syntax/src/vendor/yuku/parser/ast.zig": {
+    "file": "LICENSES/third-party/Yuku-MIT.txt"
+  },
+  "zig/lib/syntax/src/vendor/yuku/parser/codegen/output.zig": {
+    "file": "LICENSES/third-party/Yuku-MIT.txt"
+  },
+  "zig/lib/syntax/src/vendor/yuku/parser/codegen/printer.zig": {
+    "file": "LICENSES/third-party/Yuku-MIT.txt"
+  },
+  "zig/lib/syntax/src/vendor/yuku/parser/codegen/sourcemap.zig": {
+    "file": "LICENSES/third-party/Yuku-MIT.txt"
+  },
+  "zig/lib/syntax/src/vendor/yuku/parser/codegen/utils.zig": {
+    "file": "LICENSES/third-party/Yuku-MIT.txt"
+  },
+  "zig/lib/syntax/src/vendor/yuku/parser/comments.zig": {
+    "file": "LICENSES/third-party/Yuku-MIT.txt"
+  },
+  "zig/lib/syntax/src/vendor/yuku/parser/dialect.zig": {
+    "file": "LICENSES/third-party/Yuku-MIT.txt"
+  },
+  "zig/lib/syntax/src/vendor/yuku/parser/ecmascript.zig": {
+    "file": "LICENSES/third-party/Yuku-MIT.txt"
+  },
+  "zig/lib/syntax/src/vendor/yuku/parser/grammar.zig": {
+    "file": "LICENSES/third-party/Yuku-MIT.txt"
+  },
+  "zig/lib/syntax/src/vendor/yuku/parser/lexer.zig": {
+    "file": "LICENSES/third-party/Yuku-MIT.txt"
+  },
+  "zig/lib/syntax/src/vendor/yuku/parser/parser.zig": {
+    "file": "LICENSES/third-party/Yuku-MIT.txt"
+  },
+  "zig/lib/syntax/src/vendor/yuku/parser/strings.zig": {
+    "file": "LICENSES/third-party/Yuku-MIT.txt"
+  },
+  "zig/lib/syntax/src/vendor/yuku/parser/syntax/array.zig": {
+    "file": "LICENSES/third-party/Yuku-MIT.txt"
+  },
+  "zig/lib/syntax/src/vendor/yuku/parser/syntax/class.zig": {
+    "file": "LICENSES/third-party/Yuku-MIT.txt"
+  },
+  "zig/lib/syntax/src/vendor/yuku/parser/syntax/decorators.zig": {
+    "file": "LICENSES/third-party/Yuku-MIT.txt"
+  },
+  "zig/lib/syntax/src/vendor/yuku/parser/syntax/expressions.zig": {
+    "file": "LICENSES/third-party/Yuku-MIT.txt"
+  },
+  "zig/lib/syntax/src/vendor/yuku/parser/syntax/for_loop.zig": {
+    "file": "LICENSES/third-party/Yuku-MIT.txt"
+  },
+  "zig/lib/syntax/src/vendor/yuku/parser/syntax/functions.zig": {
+    "file": "LICENSES/third-party/Yuku-MIT.txt"
+  },
+  "zig/lib/syntax/src/vendor/yuku/parser/syntax/jsx/root.zig": {
+    "file": "LICENSES/third-party/Yuku-MIT.txt"
+  },
+  "zig/lib/syntax/src/vendor/yuku/parser/syntax/literals.zig": {
+    "file": "LICENSES/third-party/Yuku-MIT.txt"
+  },
+  "zig/lib/syntax/src/vendor/yuku/parser/syntax/modules.zig": {
+    "file": "LICENSES/third-party/Yuku-MIT.txt"
+  },
+  "zig/lib/syntax/src/vendor/yuku/parser/syntax/object.zig": {
+    "file": "LICENSES/third-party/Yuku-MIT.txt"
+  },
+  "zig/lib/syntax/src/vendor/yuku/parser/syntax/parenthesized.zig": {
+    "file": "LICENSES/third-party/Yuku-MIT.txt"
+  },
+  "zig/lib/syntax/src/vendor/yuku/parser/syntax/patterns.zig": {
+    "file": "LICENSES/third-party/Yuku-MIT.txt"
+  },
+  "zig/lib/syntax/src/vendor/yuku/parser/syntax/statements.zig": {
+    "file": "LICENSES/third-party/Yuku-MIT.txt"
+  },
+  "zig/lib/syntax/src/vendor/yuku/parser/syntax/ts/arrows.zig": {
+    "file": "LICENSES/third-party/Yuku-MIT.txt"
+  },
+  "zig/lib/syntax/src/vendor/yuku/parser/syntax/ts/expressions.zig": {
+    "file": "LICENSES/third-party/Yuku-MIT.txt"
+  },
+  "zig/lib/syntax/src/vendor/yuku/parser/syntax/ts/statements.zig": {
+    "file": "LICENSES/third-party/Yuku-MIT.txt"
+  },
+  "zig/lib/syntax/src/vendor/yuku/parser/syntax/ts/types/core.zig": {
+    "file": "LICENSES/third-party/Yuku-MIT.txt"
+  },
+  "zig/lib/syntax/src/vendor/yuku/parser/syntax/ts/types/generics.zig": {
+    "file": "LICENSES/third-party/Yuku-MIT.txt"
+  },
+  "zig/lib/syntax/src/vendor/yuku/parser/syntax/ts/types/literal.zig": {
+    "file": "LICENSES/third-party/Yuku-MIT.txt"
+  },
+  "zig/lib/syntax/src/vendor/yuku/parser/syntax/ts/types/object.zig": {
+    "file": "LICENSES/third-party/Yuku-MIT.txt"
+  },
+  "zig/lib/syntax/src/vendor/yuku/parser/syntax/ts/types/predicate.zig": {
+    "file": "LICENSES/third-party/Yuku-MIT.txt"
+  },
+  "zig/lib/syntax/src/vendor/yuku/parser/syntax/ts/types.zig": {
+    "file": "LICENSES/third-party/Yuku-MIT.txt"
+  },
+  "zig/lib/syntax/src/vendor/yuku/parser/syntax/variables.zig": {
+    "file": "LICENSES/third-party/Yuku-MIT.txt"
+  },
+  "zig/lib/syntax/src/vendor/yuku/parser/token.zig": {
+    "file": "LICENSES/third-party/Yuku-MIT.txt"
+  },
+  "zig/lib/syntax/src/vendor/yuku/util/root.zig": {
+    "file": "LICENSES/third-party/Yuku-MIT.txt"
+  },
+  "zig/lib/syntax/src/vendor/yuku/util/simd.zig": {
+    "file": "LICENSES/third-party/Yuku-MIT.txt"
+  },
+  "zig/lib/syntax/src/vendor/yuku/util/unicode_id.zig": {
+    "file": "LICENSES/third-party/Yuku-MIT.txt",
+    "required": [
+      "UNICODE LICENSE V3"
+    ]
+  },
+  "zig/lib/syntax/src/vendor/yuku/util/utf.zig": {
+    "file": "LICENSES/third-party/Yuku-MIT.txt"
+  },
+  "zig/lib/syntax/src/vendor/yuku/util/xhtml_entities.zig": {
+    "file": "LICENSES/third-party/Yuku-MIT.txt"
+  },
+  "zig/lib/compress/src/bcj.zig": {
+    "file": "LICENSES/third-party/XZ-Embedded-0BSD.txt",
+    "required": [
+      "SPDX-License-Identifier: 0BSD"
+    ]
+  },
+  "zig/lib/syntax/src/grammars/go.zig": {
+    "file": "LICENSES/third-party/Tree-Sitter-Go-MIT.txt"
+  },
+  "zig/lib/syntax/src/grammars/python.zig": {
+    "file": "LICENSES/third-party/Tree-Sitter-Python-MIT.txt"
+  },
+  "zig/lib/syntax/src/grammars/rust.zig": {
+    "file": "LICENSES/third-party/Tree-Sitter-Rust-MIT.txt"
+  },
+  "zig/lib/syntax/src/scanners.zig": {
+    "file": "LICENSES/third-party/Tree-Sitter-Python-MIT.txt",
+    "required": [
+      "Copyright (c) 2017 Maxim Sokolov"
+    ]
+  },
+  "zig/lib/regex/src/script_runs_data.zig": {
+    "file": "LICENSES/third-party/Unicode-V3.txt"
   }
 }

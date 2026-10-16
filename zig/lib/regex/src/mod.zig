@@ -19,6 +19,8 @@ const fst = @import("antfly_fst");
 
 const Allocator = std.mem.Allocator;
 
+pub const search = @import("search.zig");
+pub const Budget = @import("bounded.zig").Budget;
 pub const RegexAutomaton = automaton.RegexAutomaton;
 /// Capture-capable Unicode execution, independent of byte/FST automata.
 pub const captures = @import("antfly_capture_regex");
@@ -93,10 +95,16 @@ pub const PreparedPattern = struct {
     }
 
     pub fn matches(self: *const PreparedPattern, alloc: Allocator, text: []const u8) Error!bool {
-        const buffers = try alloc.alloc(u32, self.states.len * 3);
-        defer alloc.free(buffers);
-        const seen = try alloc.alloc(bool, self.states.len);
-        defer alloc.free(seen);
+        // Discovery checks short compiled globs for every directory entry. Keep
+        // their bounded VM workspaces on the stack instead of allocating twice
+        // per rule/path. Large patterns retain the same bounded heap fallback.
+        var stack_buffers: [256 * 3]u32 = undefined;
+        var stack_seen: [256]bool = undefined;
+        const use_stack = self.states.len <= stack_seen.len;
+        const buffers = if (use_stack) stack_buffers[0 .. self.states.len * 3] else try alloc.alloc(u32, self.states.len * 3);
+        defer if (!use_stack) alloc.free(buffers);
+        const seen = if (use_stack) stack_seen[0..self.states.len] else try alloc.alloc(bool, self.states.len);
+        defer if (!use_stack) alloc.free(seen);
         @memset(seen, false);
         var current = buffers[0..self.states.len];
         var next = buffers[self.states.len .. self.states.len * 2];

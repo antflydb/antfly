@@ -1,0 +1,80 @@
+{
+  "version": 1,
+  "target": {
+    "ripgrep": "15.2.0",
+    "pcre2": "10.45",
+    "implementation": "native Zig; no libpcre2"
+  },
+  "areas": [
+    {
+      "area": "Regex, Unicode and output combinations",
+      "status": "tested subset",
+      "evidence": [
+        "tests/local_fixtures.json",
+        "tests/pcre2_dialect_fixtures.json"
+      ],
+      "limits": "Golden fixtures establish the enumerated cases; complete upstream dialect/JIT parity is not claimed."
+    },
+    {
+      "area": "Discovery, binary input, encoding, JSON/statistics",
+      "status": "tested subset",
+      "evidence": [
+        "tests/test_cli.py"
+      ],
+      "limits": "Includes Git ignore/config, late NUL, transcoding and platform-specific contracts; exhaustive gitwildmatch/platform parity is not claimed."
+    },
+    {
+      "area": "Python, Go and Rust source understanding",
+      "status": "pinned grammar coverage",
+      "evidence": [
+        "../../lib/syntax/README.md"
+      ],
+      "limits": "328 upstream valid named trees; no macro expansion or semantic type resolution."
+    },
+    {
+      "area": "Decision relevance and source evidence",
+      "status": "fixture pipeline + opt-in provider evaluation",
+      "evidence": [
+        "tests/relevance.json",
+        "bench/evaluate.py"
+      ],
+      "limits": "Fixture precision/recall/nDCG test plumbing and independent-line discovery, not model quality."
+    },
+    {
+      "area": "Decision budgets, cache, retries and cancellation",
+      "status": "fixture tested",
+      "evidence": [
+        "tests/test_cli.py"
+      ],
+      "limits": "Provider checks use HTTP/native fixtures. POSIX interrupt cancellation is cooperative; Windows signal behavior is not runtime-verified."
+    },
+    {
+      "area": "Antfly indexed tables",
+      "status": "fixture tested exact scan",
+      "evidence": [
+        "schema/document-v1.json",
+        "schema/tables-v1.json",
+        "tests/test_cli.py"
+      ],
+      "limits": "Snapshot-bound ID cursors are required. Exact scans are bounded by request/document/source/output budgets. No connector ingestion or direct remote-file downloads."
+    },
+    {
+      "area": "Unified local/indexed results",
+      "status": "shared matcher, decision and renderer",
+      "evidence": [
+        "src/root.zig",
+        "src/document.zig",
+        "tests/test_cli.py"
+      ],
+      "limits": "JSON events expose schema version, provenance, source revision, index time, snapshot and observation time. Local sources are live; indexed sources represent stored revisions."
+    },
+    {
+      "area": "Performance",
+      "status": "reproducible measurements",
+      "evidence": [
+        "bench/compare.py"
+      ],
+      "limits": "Tracks startup, first stdout byte, elapsed/CPU, RSS and throughput on generated large files and 1000-file repositories. Host, binary hashes and per-run results are recorded; no general ripgrep performance parity claim."
+    }
+  ]
+}

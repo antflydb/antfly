@@ -98,6 +98,22 @@ class AssetLicenseTests(unittest.TestCase):
                     )
                 )
 
+    def test_format_dictionary_license_exception_is_exact(self):
+        name = "zig/lib/compress/src/brotli/brotli_dictionary.bin"
+        record = dict(assets.ASSETS[name])
+        self.assertEqual(record["license"], "MIT")
+        with patch.object(assets, "ASSETS", {name: record}):
+            self.assertEqual(assets.check_asset_records(), [])
+            record["license"] = "BSD-3-Clause"
+            self.assertTrue(
+                any("reviewed MIT license" in e for e in assets.check_asset_records())
+            )
+            record["license"] = "MIT"
+            record["license_text"] = "missing-license.txt"
+            self.assertTrue(
+                any("license file" in e for e in assets.check_asset_records())
+            )
+
     def test_unicode_generator_preserves_the_complete_notice(self):
         source = assets.ROOT / "zig/lib/tokenizer/tools/generate_unicode_classes.py"
         spec = importlib.util.spec_from_file_location(
