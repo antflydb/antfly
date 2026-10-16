@@ -177,7 +177,13 @@ Compatible native database connections retain one local inference service across
 foreground and maintenance snapshots. Refreshing a checkpoint does not reload
 models or reset admission accounting; the service drains and closes after its
 last retained database snapshot is released. Standalone `antfly_inference`
-handles continue to own independent runtimes.
+handles continue to own independent runtimes. Explicit database `models_dir`
+values are copied during open and remain valid after the caller releases its
+options buffer. Allocator-only checkpoint changes retain the current database
+runtime, and idle maintenance writer admission does not schedule new replay. Native
+connection refresh defers derived replay to the maintenance driver, so opening
+a foreground handle does not publish competing index bytes during a detached
+build.
 
 `antfly_db_status_json` includes `inference.memory_admission` for a local runtime.
 It records the last denied admission's pressure category, requested/admitted
@@ -435,11 +441,13 @@ one table per turn, including one relational index page, and releases the writer
 turns, retaining pending work for subsequent turns.
 
 Detached maintenance primary transactions and index publications join the fair
-writer queue. They adopt the latest primary checkpoint when the namespace,
-catalog, and physical index inputs remain unchanged, so unrelated foreground
-commits do not force a retry. Inference and segment construction run outside
-the writer gate; changed index inputs or file replacement still cancel stale
-publication. Reclamation continues to yield on contention.
+writer queue. They adopt the latest primary checkpoint when the namespace
+and catalog remain unchanged, so unrelated foreground commits do not force a
+retry. Immutable index publication additionally checks its physical inputs;
+changed index inputs cancel that work while primary transactions can still
+persist completed replay progress against the latest checkpoint. Inference
+and segment construction run outside the writer gate; file replacement
+cancels stale publication. Reclamation continues to yield on contention.
 
 Replay-producing maintenance delivers its prepared effects to the current
 coordinator under that writer lease. It validates captured documents and
@@ -595,6 +603,9 @@ and temporary remote failures retry up to four times. Unclassified
 `Unexpected`, `InputOutput`, `ReadFailed` and `WriteFailed` errors fail immediately
 rather than assuming storage corruption is transient. A failure after a newer
 checkpoint uses that checkpoint for both retry accounting and recovery.
+A detached snapshot invalidated by concurrent publication yields and retries
+from its durable checkpoint. This does not fail the job or consume its
+transient-failure budget.
 
 Replacement ownership uses an IO mutex. Blocking cancellation and deletion park
 on it; backoff sleeps occur after releasing it. Regular activation catch-up has

@@ -5995,6 +5995,7 @@ test "capi SQL idle native maintenance avoids runtime construction and resumes w
     try std.testing.expectEqual(capi.ErrorCode.ok, antfly_open_options_init(&options));
     options.storage_kind = capi.storage_kind_lite;
     options.profile = capi.profile_native;
+    options.flags |= capi.open_flag_generated_enrichment_replay;
     var handle: ?*anyopaque = null;
     try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_create_with_options(path, &options, &handle));
     defer antfly_db_close(handle);
@@ -6006,12 +6007,37 @@ test "capi SQL idle native maintenance avoids runtime construction and resumes w
     owner.stopping.store(true, .release);
     owner.wake.set(shared.handleLockIo());
     owner.worker.?.join();
-    owner.worker = null;
+    // Keep notification behavior enabled while driving this joined worker
+    // deterministically. Clear it before close, which must not join twice.
+    defer owner.worker = null;
     owner.stopping.store(false, .release);
+    {
+        const guard = public.enterHandle(handle, .exclusive).?;
+        defer guard.leave();
+        try guard.handle.db.addIndex(.{ .name = "idle_graph", .kind = .graph, .config_json =
+            \\{"source":{"artifact":"extraction","path":"$.relations[*]","format":"extraction_relation","mention_edge_type":"about"},"artifact":{"name":"extraction","kind":"asset","source":{"type":"field","value":"payload"},"content_type":"application/json"},"edge_types":[{"name":"about"}]}
+        });
+        _ = try guard.handle.db.upsertResolverWithResultOptions(.{
+            .name = "concepts",
+            .table = "default",
+            .source_artifact = "extraction",
+            .resolution_artifact = "resolution",
+            .key_template = "entity/{{ uslug _entity.text }}",
+            .promote = false,
+            .inline_managed = true,
+        }, .{ .drain_backfill = false });
+        const document = try std.json.Stringify.valueAlloc(a, .{ .payload = "{\"entities\":[{\"id\":\"a\",\"text\":\"Antfly\",\"label\":\"technology\",\"confidence\":0.9}],\"relations\":[]}" }, .{});
+        defer a.free(document);
+        try guard.handle.db.batch(.{ .writes = &.{.{ .key = "seed", .value = document }}, .sync_level = .write });
+        owner.maintenance_pending = true;
+    }
     // Finish any initial reclamation. Later idle polls must reuse the physical
     // store and must neither open a DB runtime nor refresh the foreground DB.
     for (0..64) |_| if (!try owner.maintenanceTurnForTest()) break;
+    owner.wake.reset();
     const opens = owner.test_runtime_snapshot_opens;
+    const settled_replay_sequence = owner.current.?.db.core.nextDerivedSequence();
+    const settled_sequence = owner.maintenance_snapshot.?.owned_lite_backend.?.native_docstore.?.file.activeCheckpoint().commit_sequence;
     for (0..8) |_| {
         const current = owner.current.?;
         const snapshot = owner.maintenance_snapshot.?;
@@ -6028,7 +6054,10 @@ test "capi SQL idle native maintenance avoids runtime construction and resumes w
         }
         try std.testing.expect(!owner.maintenance_snapshot.?.db_live);
     }
+    try std.testing.expect(!owner.wake.isSet());
+    try std.testing.expectEqual(settled_replay_sequence, owner.current.?.db.core.nextDerivedSequence());
     try std.testing.expectEqual(opens, owner.test_runtime_snapshot_opens);
+    try std.testing.expectEqual(settled_sequence, owner.maintenance_snapshot.?.owned_lite_backend.?.native_docstore.?.file.activeCheckpoint().commit_sequence);
     // Enrichment/index work still upgrades the storage-only snapshot and is
     // replayed through the ordinary independent native maintenance runtime.
     {
@@ -6068,6 +6097,11 @@ test "capi lite inference service survives foreground and maintenance snapshots"
     options.storage_kind = capi.storage_kind_lite;
     options.profile = capi.profile_native;
     options.flags |= capi.open_flag_local_runtime_configured;
+    const models_path = try std.fs.path.join(a, &.{ directory.path(), "models" });
+    defer a.free(models_path);
+    const caller_models_path = try a.dupe(u8, models_path);
+    defer a.free(caller_models_path);
+    options.models_dir = capi.Slice.fromSlice(caller_models_path);
     var handle: ?*anyopaque = null;
     try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_create_with_options(path, &options, &handle));
     defer antfly_db_close(handle);
@@ -6076,6 +6110,21 @@ test "capi lite inference service survives foreground and maintenance snapshots"
         defer guard.leave();
         break :blk guard.connection.?.owner;
     };
+    // The public options buffer belongs to the caller and may disappear as
+    // soon as open returns. Refresh and compatible opens must use owned bytes.
+    @memset(caller_models_path, 0xDD);
+    try std.testing.expectEqualStrings(models_path, owner.options.inference.models_dir.?);
+    const second_models_path = try a.dupe(u8, models_path);
+    defer a.free(second_models_path);
+    options.models_dir = capi.Slice.fromSlice(second_models_path);
+    var second: ?*anyopaque = null;
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_open_with_options(path, &options, &second));
+    {
+        defer antfly_db_close(second);
+        const guard = public.enterHandle(second, .exclusive).?;
+        defer guard.leave();
+        try std.testing.expectEqual(owner, guard.connection.?.owner);
+    }
     owner.stopping.store(true, .release);
     owner.wake.set(shared.handleLockIo());
     owner.worker.?.join();

@@ -440,6 +440,7 @@ pub const Owner = struct {
     path: []const u8,
     options: api.LiteResolvedOpenOptions,
     owned_ttl_owner_id: ?[]u8 = null,
+    owned_models_dir: ?[]u8 = null,
     gate: *PathGate,
     connections: std.ArrayList(*Connection) = .empty,
     worker: ?std.Thread = null,
@@ -448,6 +449,7 @@ pub const Owner = struct {
     next_ttl_ns: i96 = 0,
     wake: std.Io.Event = .unset,
     current: ?*h.Handle = null,
+    persistent_metadata: ?struct { root_page: u64, sequence: u64, digest: [32]u8 } = null,
     retired: std.ArrayList(*h.Handle) = .empty,
     maintenance_snapshot: ?*h.Handle = null,
     maintenance_table_cursor: usize = 0,
@@ -469,6 +471,40 @@ pub const Owner = struct {
     embedding_memo_budget: cache_budget.CacheBudget = .init(embedding_memo_bytes),
     test_after_capture: if (h.builtin.is_test) ?struct { ptr: *anyopaque, notify: *const fn (*anyopaque, *h.Handle) void } else void = if (h.builtin.is_test) null else {},
 
+    fn persistentMetadataDigest(file: *native.NativeFile) ![32]u8 {
+        var cursor = try file.metadataCatalogCursor(file.activeCheckpoint(), "");
+        defer cursor.deinit();
+        var hash = std.crypto.hash.Blake3.init(.{});
+        while (try cursor.next()) |entry| {
+            defer file.allocator.free(entry.key);
+            if (std.mem.startsWith(u8, entry.key, native.NativeFile.artifact_lease_key_prefix)) continue;
+            var encoded: [16]u8 = undefined;
+            std.mem.writeInt(u64, encoded[0..8], entry.key.len, .little);
+            std.mem.writeInt(u64, encoded[8..16], entry.page_id, .little);
+            hash.update(&encoded);
+            hash.update(entry.key);
+        }
+        var digest: [32]u8 = undefined;
+        hash.final(&digest);
+        return digest;
+    }
+
+    fn rememberPersistentMetadata(self: *Owner, file: *native.NativeFile) !void {
+        const checkpoint = file.activeCheckpoint();
+        if (self.persistent_metadata) |cached| if (cached.root_page == checkpoint.catalog_root_page and cached.sequence == checkpoint.commit_sequence) return;
+        self.persistent_metadata = .{ .root_page = checkpoint.catalog_root_page, .sequence = checkpoint.commit_sequence, .digest = try persistentMetadataDigest(file) };
+    }
+
+    fn persistentMetadataUnchanged(self: *Owner, before: *native.NativeFile, after: *native.NativeFile) !bool {
+        if (before.activeCheckpoint().catalog_root_page == after.activeCheckpoint().catalog_root_page) return true;
+        // Cache the old proof while its checkpoint is live. Reclamation may
+        // have recycled old metadata pages by the time refresh observes a
+        // newer tip, so never traverse the previous catalog here.
+        const cached = self.persistent_metadata orelse return false;
+        if (cached.root_page != before.activeCheckpoint().catalog_root_page or cached.sequence != before.activeCheckpoint().commit_sequence) return false;
+        return std.mem.eql(u8, &cached.digest, &(try persistentMetadataDigest(after)));
+    }
+
     /// Caller holds the path lease, so the checkpoint and catalog cannot race
     /// a different process's publication. Cursor continuation deliberately
     /// uses its pinned generation without reopening the connection.
@@ -479,17 +515,49 @@ pub const Owner = struct {
             defer probe.close();
             const file = &current.owned_lite_backend.?.native_docstore.?.file;
             const same_inode = (try probe.file.stat(probe.runtime())).inode == (try file.file.stat(file.runtime())).inode;
-            if (current.maintenance_references == 0 and same_inode and std.meta.eql(probe.header, file.header)) return current;
             if (self.maintenance_snapshot) |snapshot| {
                 const captured = &snapshot.owned_lite_backend.?.native_docstore.?.file;
                 if (std.meta.eql(probe.header, captured.header) and
                     (try probe.file.stat(probe.runtime())).inode == (try captured.file.stat(captured.runtime())).inode) known_maintenance = snapshot;
+            }
+            if (current.maintenance_references == 0 and same_inode) {
+                if (std.meta.eql(probe.header, file.header)) {
+                    try self.rememberPersistentMetadata(file);
+                    return current;
+                }
+                var before = file.activeCheckpoint();
+                var after = probe.activeCheckpoint();
+                // Allocator service and orphaned artifact leases move the
+                // physical checkpoint without changing logical database roots.
+                // Reopening the DB here creates
+                // fresh artifact-reader leases, feeding new retirement work
+                // back into the next maintenance turn.
+                before.commit_sequence = 0;
+                after.commit_sequence = 0;
+                before.free_map_root_page = 0;
+                after.free_map_root_page = 0;
+                before.page_count = 0;
+                after.page_count = 0;
+                before.catalog_root_page = 0;
+                after.catalog_root_page = 0;
+                // Only adopt our own fenced maintenance result. Arbitrary
+                // external checkpoints require a new DB even if recycled
+                // physical page IDs happen to match the old roots.
+                if (known_maintenance != null and std.meta.eql(before, after) and file.header.packed_records == probe.header.packed_records and
+                    file.header.page_size == probe.header.page_size and file.header.indexed_reclamation == probe.header.indexed_reclamation and
+                    try self.persistentMetadataUnchanged(file, &probe))
+                {
+                    try current.owned_lite_backend.?.native_docstore.?.refreshIndexPublicationCheckpoint(probe.header);
+                    try self.rememberPersistentMetadata(file);
+                    return current;
+                }
             }
         }
         var options = self.options;
         options.externally_locked = true;
         const replacement = try api.openLiteHandleAllocWithSharedInference(alloc, self.path, options, false, h.handleLockIo(), null, self.current);
         errdefer h.closeHandle(replacement);
+        const replacement_metadata = try persistentMetadataDigest(&replacement.owned_lite_backend.?.native_docstore.?.file);
         if (self.current) |previous| {
             if (known_maintenance) |snapshot| {
                 replacement.sql_commit_recovery_needed = previous.sql_commit_recovery_needed or snapshot.sql_commit_recovery_needed;
@@ -515,6 +583,7 @@ pub const Owner = struct {
             }
         }
         self.current = replacement;
+        self.persistent_metadata = .{ .root_page = replacement.owned_lite_backend.?.native_docstore.?.file.activeCheckpoint().catalog_root_page, .sequence = replacement.owned_lite_backend.?.native_docstore.?.file.activeCheckpoint().commit_sequence, .digest = replacement_metadata };
         for (self.connections.items) |connection| {
             connection.current = replacement;
             var sessions = connection.sql_sessions.valueIterator();
@@ -594,7 +663,12 @@ pub const Owner = struct {
         if (self.stopping.load(.acquire)) return error.Canceled;
         self.publication_stats.attempts +|= 1;
         errdefer self.publication_stats.refused +|= 1;
-        if (scope != .reclamation) if (root.maintenance_publication) |p| if (p.index_inputs_changed) return error.EnrichmentWaitCanceled;
+        // A resolver publication can change index inputs before its replay
+        // watermark is saved. Fence subsequent immutable index work, while
+        // allowing primary transactions to read the rebased checkpoint and
+        // persist that completed progress. Otherwise replay repeats its own
+        // output forever without advancing its durable watermark.
+        if (scope == .index) if (root.maintenance_publication) |p| if (p.index_inputs_changed) return error.EnrichmentWaitCanceled;
         if (self.current) |current| if (needsOutcomeReconciliation(current)) return error.EnrichmentWaitCanceled;
         var lease = native.lockWriterPathWithIo(alloc, h.handleLockIo(), self.path) catch |err| switch (err) {
             error.FileBusy, error.WouldBlock => return error.EnrichmentWaitCanceled,
@@ -619,7 +693,10 @@ pub const Owner = struct {
             defer latest.close();
             if ((try latest.file.stat(latest.runtime())).inode != (try file.file.stat(file.runtime())).inode) return error.EnrichmentWaitCanceled;
             if (file.activeCheckpoint().index_catalog_root_page != latest.activeCheckpoint().index_catalog_root_page) {
-                if (!try file.indexCatalogPrefixUnchanged(&latest, publication.index_prefix)) return error.EnrichmentWaitCanceled;
+                if (!try file.indexCatalogPrefixUnchanged(&latest, publication.index_prefix)) {
+                    publication.index_inputs_changed = true;
+                    if (scope == .index) return error.EnrichmentWaitCanceled;
+                }
             }
             try root.owned_lite_backend.?.native_docstore.?.refreshIndexPublicationCheckpoint(latest.header);
             self.publication_stats.rebased +|= 1;
@@ -638,7 +715,9 @@ pub const Owner = struct {
         if (root.maintenance_writer_references != 0) return;
         var lease = root.maintenance_writer_lease.?;
         root.maintenance_writer_lease = null;
-        self.notifyMutation();
+        // Admission alone is not a mutation. Reclamation probes also take
+        // this lease; waking replay here makes each idle turn schedule itself.
+        // Generated and replay publications notify at their commit boundary.
         lease.close();
         self.gate.mutex.unlock(h.handleLockIo());
     }
@@ -836,6 +915,10 @@ pub const Owner = struct {
         // replay pass. Reader leases/index housekeeping also move that tip;
         // treating them as enrichment debt makes idle runtime opens perpetual.
         // The next capture checks the durable journal for foreground work.
+        // A primary rebase may have fenced immutable index work without
+        // making the replay driver itself fail. Retry on a fresh snapshot
+        // even when its cached replay target looked complete this turn.
+        pending = pending or publication.index_inputs_changed;
         self.maintenance_round_pending = self.maintenance_round_pending or pending;
         if (self.maintenance_table_cursor == 0) {
             // Mutations arriving during the detached turn still wake the owner;
@@ -885,6 +968,7 @@ pub const Owner = struct {
         self.retired.deinit(alloc);
         self.connections.deinit(alloc);
         if (self.owned_ttl_owner_id) |id| alloc.free(id);
+        if (self.owned_models_dir) |directory| alloc.free(directory);
         alloc.destroy(self);
     }
 };
@@ -900,6 +984,12 @@ fn compatible(a: api.LiteResolvedOpenOptions, b: api.LiteResolvedOpenOptions) bo
         if (!std.mem.eql(u8, ttl.owner_id, other.owner_id)) return false;
         ttl.owner_id = "";
         right.ttl_cleanup.?.owner_id = "";
+    }
+    if (left.inference.models_dir) |directory| {
+        const other = right.inference.models_dir orelse return false;
+        if (!std.mem.eql(u8, directory, other)) return false;
+        left.inference.models_dir = null;
+        right.inference.models_dir = null;
     }
     return std.meta.eql(left, right);
 }
@@ -1060,6 +1150,12 @@ pub fn open(path: []const u8, options: api.LiteResolvedOpenOptions, create: bool
         resolved_options.ttl_cleanup.?.owner_id = ttl_owner_id.?;
     }
     defer if (ttl_owner_id) |id| alloc.free(id);
+    var models_dir: ?[]u8 = null;
+    if (options.inference.models_dir) |directory| {
+        models_dir = try alloc.dupe(u8, directory);
+        resolved_options.inference.models_dir = models_dir.?;
+    }
+    defer if (models_dir) |directory| alloc.free(directory);
     var initial: ?*h.Handle = null;
     errdefer if (initial) |root| {
         root.lease_snapshot = true;
@@ -1093,7 +1189,7 @@ pub fn open(path: []const u8, options: api.LiteResolvedOpenOptions, create: bool
     const owner = existing orelse try alloc.create(Owner);
     errdefer if (existing == null) alloc.destroy(owner);
     if (existing == null) {
-        owner.* = .{ .path = gate.path, .gate = gate, .options = resolved_options, .current = initial, .owned_ttl_owner_id = ttl_owner_id };
+        owner.* = .{ .path = gate.path, .gate = gate, .options = resolved_options, .current = initial, .owned_ttl_owner_id = ttl_owner_id, .owned_models_dir = models_dir };
     }
     try owner.connections.ensureUnusedCapacity(alloc, 1);
     errdefer if (existing == null) owner.connections.deinit(alloc);
@@ -1132,6 +1228,9 @@ pub fn open(path: []const u8, options: api.LiteResolvedOpenOptions, create: bool
         h.closeHandle(root);
     };
     initial = null;
-    if (existing == null) ttl_owner_id = null;
+    if (existing == null) {
+        ttl_owner_id = null;
+        models_dir = null;
+    }
     return wrapper;
 }

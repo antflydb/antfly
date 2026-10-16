@@ -28370,8 +28370,10 @@ pub const DB = struct {
             }
             if (saved.retry_after_ns > retry_now) continue;
             return self.advanceGraphReplacementOnce(deadline, saved) catch |err| {
-                if (err == error.Canceled or err == error.Cancelled) {
-                    // Interrupting this owner is not cancelling the durable
+                if (err == error.Canceled or err == error.Cancelled or err == error.EnrichmentWaitCanceled) {
+                    // A stale detached snapshot yields without failing the job
+                    // or consuming its retry budget. Interrupting this owner
+                    // is also not cancelling the durable
                     // job. Discard volatile work and preserve its checkpoint.
                     self.clearGraphReplacementManager();
                     return err;
@@ -137646,6 +137648,23 @@ test "capi resolver replacement retry budget resets only after durable progress"
         try std.testing.expectEqual(DB.replacement_total_retry_limit - 1, jobs.value[0].total_retry_count);
         try std.testing.expect(jobs.value[0].last_error == null);
     }
+    const Yield = struct {
+        fn call(_: *DB) anyerror!void {
+            return error.EnrichmentWaitCanceled;
+        }
+    };
+    DB.test_graph_replacement_before_build = Yield.call;
+    defer DB.test_graph_replacement_before_build = null;
+    for (0..8) |_| {
+        try std.testing.expectError(error.EnrichmentWaitCanceled, db.advanceGraphReplacement());
+        const yielded = try db.graphReplacementStatusAlloc(a);
+        defer yielded.deinit();
+        try std.testing.expect(yielded.value[0].phase != .failed);
+        try std.testing.expectEqual(@as(u32, 0), yielded.value[0].retry_count);
+        try std.testing.expectEqual(DB.replacement_total_retry_limit - 1, yielded.value[0].total_retry_count);
+        try std.testing.expect(yielded.value[0].last_error == null);
+    }
+    DB.test_graph_replacement_before_build = null;
     const Failure = struct {
         fn call(_: *DB) anyerror!void {
             return error.NoSpaceLeft;
