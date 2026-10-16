@@ -1077,3 +1077,259 @@ test "streaming distinct aggregates preserve nulls numeric equality groups and m
     try check("UNWIND [1,1.0,2,null,[1],[1.0],{x:1},{x:1.0}] AS x MATCH (n:Document) RETURN count(DISTINCT x)", "[[4]]");
     try check("MATCH (n:Document) WITH n.rank%2 AS x RETURN min(DISTINCT toString(x)),max(DISTINCT toString(x))", "[[\"0\",\"1\"]]");
 }
+
+test "pull traversal preserves bags constraints path directions and page ownership" {
+    const Paged = struct {
+        fn expand(ptr: *anyopaque, a: std.mem.Allocator, mapping: catalog.Relationship, identity: v.Identity, direction: c.ast.Direction, after: ?[]const u8, demand: usize) !b.Page(*const v.Relationship) {
+            const all = try Fixture.expand(ptr, a, mapping, identity, direction, null, 128);
+            const start = if (after) |text| try std.fmt.parseUnsigned(usize, text, 10) else 0;
+            const end = @min(all.items.len, start + demand);
+            return .{ .items = all.items[start..end], .next = if (end < all.items.len) try std.fmt.allocPrint(a, "{d}", .{end}) else null };
+        }
+    };
+    const queries = [_][]const u8{
+        "MATCH p=(a:Document)-[r:CITES]->(b:Document) RETURN a.id,b.id,r.weight,nodes(p)",
+        "MATCH p=(a:Document)-[r:CITES*0..3]->(b:Document) RETURN a.id,b.id,r,p",
+        "MATCH REPEATABLE ELEMENTS p=(a:Document)-[r:CITES*0..3]->(b:Document) RETURN a.id,b.id,r,p",
+        "MATCH p=(a:Document)-[r:CITES*1..2]-(b:Document) RETURN a.id,b.id,r,p",
+        "MATCH (a:Document {rank:b.rank-1})-[r:CITES {weight:b.rank-1}]->(b:Document) RETURN a.id,b.id",
+        "MATCH p=(a:Document)-[r:CITES*1..2]->(b:Document) WHERE antfly.documentKey(b)='c' RETURN a.id,b.id,r,p",
+        "MATCH (a:Document)-[r:CITES]->(b:Document)-[s:CITES]->(c:Document) RETURN a.id,b.id,c.id,r,s",
+    };
+    for (queries) |query| for ([_]usize{ 1, 3, 128 }) |page_size| {
+        var fixture: Fixture = .{};
+        const backend = fixture.backend();
+        var table = backend.vtable.*;
+        table.expand = Paged.expand;
+        const paged: b.Backend = .{ .ptr = backend.ptr, .vtable = &table };
+        var diagnostic: c.Diagnostic = .{};
+        var compiled = try c.compile(std.testing.allocator, query, .{}, &diagnostic);
+        defer compiled.deinit();
+        var expected = try runtime.execute(std.testing.allocator, paged, graph, &compiled, &.{}, .{});
+        defer expected.deinit();
+        const cursor = (try runtime.NodeCursor.open(std.testing.allocator, paged, graph, compiled.query, &.{}, .{ .memory_bytes = 2 << 20 })).?;
+        defer cursor.close();
+        var retained = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer retained.deinit();
+        const a = retained.allocator();
+        var page_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer page_arena.deinit();
+        var actual_json: std.ArrayList([]const u8) = .empty;
+        while (true) {
+            const rows = try cursor.next(page_arena.allocator(), page_size);
+            if (rows.len == 0) break;
+            try std.testing.expect(rows.len <= page_size);
+            for (rows) |row| {
+                const values = try a.alloc(v.Value, row.len);
+                for (row, values) |entry, *value| value.* = entry.value;
+                try actual_json.append(a, try std.json.Stringify.valueAlloc(a, values, .{}));
+            }
+            _ = page_arena.reset(.free_all);
+        }
+        const expected_json = try a.alloc([]const u8, expected.rows.len);
+        for (expected.rows, expected_json) |row, *json| json.* = try std.json.Stringify.valueAlloc(a, row, .{});
+        const Order = struct {
+            fn less(_: void, left: []const u8, right: []const u8) bool {
+                return std.mem.order(u8, left, right) == .lt;
+            }
+        };
+        std.mem.sort([]const u8, expected_json, {}, Order.less);
+        std.mem.sort([]const u8, actual_json.items, {}, Order.less);
+        try std.testing.expectEqual(expected_json.len, actual_json.items.len);
+        for (expected_json, actual_json.items) |left, right| try std.testing.expectEqualStrings(left, right);
+    };
+}
+
+test "optional streaming joins preserve null extension before downstream filters and reducers" {
+    try check("OPTIONAL MATCH (a:Document),(b:Document) WHERE a.rank=b.rank RETURN count(*)", "[[3]]");
+    try check("MATCH (a:Document) OPTIONAL MATCH (b:Document) WHERE a.rank=b.rank RETURN count(b)", "[[3]]");
+    try check("MATCH (a:Document) OPTIONAL MATCH (b:Person) WHERE a.id=b.id WITH b WHERE b IS NULL RETURN count(*)", "[[2]]");
+    try check("OPTIONAL MATCH (a:Document),(b:Person) WHERE a.rank<0 RETURN count(*),count(a),collect(a)", "[[1,0,[]]]");
+    try check("OPTIONAL MATCH (a:Document),(b:Person) WHERE a.rank<0 WITH a WHERE a IS NOT NULL RETURN count(*)", "[[0]]");
+    try check("MATCH (a:Document) MATCH (b:Document) WHERE a.rank=b.rank RETURN count(*)", "[[3]]");
+}
+
+test "pull traversal charges cumulative edge budgets and closes suspended frames" {
+    const Paged = struct {
+        fn expand(ptr: *anyopaque, a: std.mem.Allocator, mapping: catalog.Relationship, identity: v.Identity, direction: c.ast.Direction, after: ?[]const u8, demand: usize) !b.Page(*const v.Relationship) {
+            const all = try Fixture.expand(ptr, a, mapping, identity, direction, null, 128);
+            const start = if (after) |text| try std.fmt.parseUnsigned(usize, text, 10) else 0;
+            const end = @min(all.items.len, start + demand);
+            return .{ .items = all.items[start..end], .next = if (end < all.items.len) try std.fmt.allocPrint(a, "{d}", .{end}) else null };
+        }
+    };
+    for ([_]bool{ false, true }) |exhaust| {
+        var fixture: Fixture = .{};
+        const backend = fixture.backend();
+        var table = backend.vtable.*;
+        table.expand = Paged.expand;
+        var diagnostic: c.Diagnostic = .{};
+        var compiled = try c.compile(std.testing.allocator, "MATCH (a:Document)-[:CITES]->(b:Document) RETURN b.id", .{}, &diagnostic);
+        defer compiled.deinit();
+        const cursor = (try runtime.NodeCursor.open(std.testing.allocator, .{ .ptr = backend.ptr, .vtable = &table }, graph, compiled.query, &.{}, .{ .explored_edges = 1 })).?;
+        defer cursor.close();
+        var page = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer page.deinit();
+        try std.testing.expectEqual(@as(usize, 1), (try cursor.next(page.allocator(), 1)).len);
+        _ = page.reset(.free_all);
+        if (exhaust) try std.testing.expectError(error.CypherEdgeBudgetExceeded, cursor.next(page.allocator(), 1));
+    }
+}
+
+test "pull traversal drains more than one SQL sized page" {
+    const Wide = struct {
+        fn expand(ptr: *anyopaque, a: std.mem.Allocator, mapping: catalog.Relationship, identity: v.Identity, direction: c.ast.Direction, after: ?[]const u8, demand: usize) !b.Page(*const v.Relationship) {
+            const all = try Fixture.expand(ptr, a, mapping, identity, direction, null, 128);
+            if (all.items.len == 0) return .{ .items = &.{} };
+            const start = if (after) |text| try std.fmt.parseUnsigned(usize, text, 10) else 0;
+            const end = @min(@as(usize, 153), start + demand);
+            const items = try a.alloc(*const v.Relationship, end - start);
+            @memset(items, all.items[0]);
+            return .{ .items = items, .next = if (end < 153) try std.fmt.allocPrint(a, "{d}", .{end}) else null };
+        }
+    };
+    var fixture: Fixture = .{};
+    const backend = fixture.backend();
+    var table = backend.vtable.*;
+    table.expand = Wide.expand;
+    var diagnostic: c.Diagnostic = .{};
+    var compiled = try c.compile(std.testing.allocator, "MATCH (a:Document)-[:CITES]->(b:Document) RETURN b.id", .{}, &diagnostic);
+    defer compiled.deinit();
+    const cursor = (try runtime.NodeCursor.open(std.testing.allocator, .{ .ptr = backend.ptr, .vtable = &table }, graph, compiled.query, &.{}, .{})).?;
+    defer cursor.close();
+    var page = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer page.deinit();
+    var total: usize = 0;
+    while (!cursor.done) {
+        const rows = try cursor.next(page.allocator(), 128);
+        total += rows.len;
+        _ = page.reset(.free_all);
+    }
+    try std.testing.expectEqual(@as(usize, 306), total);
+}
+
+test "pull cursor owns a stable backend binding across suspended routes" {
+    const Bound = struct {
+        fixture: Fixture = .{},
+        a: ?std.mem.Allocator = null,
+        binds: usize = 0,
+        fn bind(ptr: *anyopaque, a: std.mem.Allocator, _: catalog.Graph) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.a = a;
+            self.binds += 1;
+        }
+        fn checkpoint(_: *anyopaque) !void {}
+        fn scan(ptr: *anyopaque, a: std.mem.Allocator, name: []const u8, after: ?[]const u8, demand: usize) !b.Page(*const v.Node) {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return Fixture.scan(&self.fixture, a, name, after, demand);
+        }
+        fn get(ptr: *anyopaque, a: std.mem.Allocator, identity: v.Identity) !?*const v.Node {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            const node = (try Fixture.get(&self.fixture, a, identity)) orelse return null;
+            // Overlays retain imported nodes using the allocator passed at bind.
+            return (try (v.Value{ .node = node }).clone(self.a.?)).node;
+        }
+        fn expand(ptr: *anyopaque, a: std.mem.Allocator, mapping: catalog.Relationship, identity: v.Identity, direction: c.ast.Direction, after: ?[]const u8, demand: usize) !b.Page(*const v.Relationship) {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            const all = try Fixture.expand(&self.fixture, a, mapping, identity, direction, null, demand);
+            const start = if (after) |text| try std.fmt.parseUnsigned(usize, text, 10) else 0;
+            const end = @min(all.items.len, start + demand);
+            return .{ .items = all.items[start..end], .next = if (end < all.items.len) try std.fmt.allocPrint(a, "{d}", .{end}) else null };
+        }
+    };
+    var provider: Bound = .{};
+    const backend: b.Backend = .{ .ptr = &provider, .vtable = &.{ .bind = Bound.bind, .checkpoint = Bound.checkpoint, .scan = Bound.scan, .get = Bound.get, .expand = Bound.expand } };
+    var diagnostic: c.Diagnostic = .{};
+    var compiled = try c.compile(std.testing.allocator, "MATCH (a:Document)-[:CITES]->(b:Document) RETURN b.id", .{}, &diagnostic);
+    defer compiled.deinit();
+    const cursor = (try runtime.NodeCursor.open(std.testing.allocator, backend, graph, compiled.query, &.{}, .{})).?;
+    defer cursor.close();
+    var page = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer page.deinit();
+    var total: usize = 0;
+    while (!cursor.done) {
+        total += (try cursor.next(page.allocator(), 1)).len;
+        _ = page.reset(.free_all);
+    }
+    try std.testing.expectEqual(@as(usize, 4), total);
+    try std.testing.expectEqual(@as(usize, 1), provider.binds);
+}
+
+test "pull cursor releases binding allocations when backend initialization fails" {
+    const Failing = struct {
+        fn bind(_: *anyopaque, a: std.mem.Allocator, _: catalog.Graph) !void {
+            _ = try a.alloc(u8, 1 << 20);
+            return error.CypherCancelled;
+        }
+        fn startup(_: *anyopaque) b.StartupWork {
+            return .{ .scanned_anchors = 2, .explored_edges = 1, .intermediate_states = 3 };
+        }
+    };
+    var fixture: Fixture = .{};
+    var backend = fixture.backend();
+    var table = backend.vtable.*;
+    table.bind = Failing.bind;
+    backend.vtable = &table;
+    var diagnostic: c.Diagnostic = .{};
+    var compiled = try c.compile(std.testing.allocator, "MATCH (a:Document)-[:CITES]->(b:Document) RETURN b.id", .{}, &diagnostic);
+    defer compiled.deinit();
+    try std.testing.expectError(error.CypherCancelled, runtime.NodeCursor.open(std.testing.allocator, backend, graph, compiled.query, &.{}, .{}));
+    table.bind = Fixture.bind;
+    table.startup_work = Failing.startup;
+    try std.testing.expectError(error.CypherAnchorBudgetExceeded, runtime.NodeCursor.open(std.testing.allocator, backend, graph, compiled.query, &.{}, .{ .scanned_anchors = 1 }));
+    try std.testing.expectError(error.CypherEdgeBudgetExceeded, runtime.NodeCursor.open(std.testing.allocator, backend, graph, compiled.query, &.{}, .{ .explored_edges = 0 }));
+}
+
+test "lazy overlay scans preserve opaque native tokens and staged bags" {
+    const Opaque = struct {
+        fn scan(_: *anyopaque, a: std.mem.Allocator, _: []const u8, after: ?[]const u8, demand: usize) !b.Page(*const v.Node) {
+            const Token = struct { offset: usize };
+            const start = if (after) |text| (try std.json.parseFromSliceLeaky(Token, a, text, .{})).offset else 0;
+            const end = @min(@as(usize, 3), start + demand);
+            const items = try a.alloc(*const v.Node, end - start);
+            for (items, start..) |*item, index| item.* = &Fixture.nodes[index];
+            return .{ .items = items, .next = if (end < 3) try std.json.Stringify.valueAlloc(a, Token{ .offset = end }, .{}) else null };
+        }
+        fn identity(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: bool) !v.Identity {
+            return error.CypherMutationsUnavailable;
+        }
+        fn commit(_: *anyopaque, _: std.mem.Allocator, _: []const b.Mutation) !void {
+            return error.CypherMutationsUnavailable;
+        }
+    };
+    var fixture: Fixture = .{};
+    var base = fixture.backend();
+    var table = base.vtable.*;
+    table.scan = Opaque.scan;
+    base.vtable = &table;
+    var overlay: @import("transaction.zig").Overlay = .{ .lazy = true, .base = base, .host = .{ .ptr = &fixture, .new_identity = Opaque.identity, .commit = Opaque.commit } };
+    const backend = overlay.backend();
+    var retained = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer retained.deinit();
+    const a = retained.allocator();
+    try backend.vtable.bind(backend.ptr, a, graph);
+    try backend.vtable.begin.?(backend.ptr);
+    const changed: v.Node = .{ .identity = Fixture.nodes[1].identity, .labels = &.{"Document"}, .properties = &.{.{ .name = "id", .value = .{ .string = "B" } }} };
+    const added: v.Node = .{ .identity = .{ .table = "docs", .key = "d" }, .labels = &.{"Document"}, .properties = &.{.{ .name = "id", .value = .{ .string = "d" } }} };
+    try overlay.stageReadDocument(a, changed.identity, &changed);
+    try overlay.stageReadDocument(a, added.identity, &added);
+    try overlay.stageReadDocument(a, Fixture.nodes[2].identity, null);
+    var diagnostic: c.Diagnostic = .{};
+    var compiled = try c.compile(std.testing.allocator, "MATCH (n:Document) RETURN n.id", .{}, &diagnostic);
+    defer compiled.deinit();
+    const cursor = (try runtime.NodeCursor.open(std.testing.allocator, backend, graph, compiled.query, &.{}, .{})).?;
+    defer cursor.close();
+    var page = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer page.deinit();
+    var ids: std.StringHashMapUnmanaged(void) = .empty;
+    var total: usize = 0;
+    while (!cursor.done) {
+        for (try cursor.next(page.allocator(), 1)) |row| {
+            total += 1;
+            try ids.put(a, try a.dupe(u8, row[0].value.string), {});
+        }
+        _ = page.reset(.free_all);
+    }
+    try std.testing.expectEqual(@as(usize, 3), total);
+    try std.testing.expect(ids.contains("a") and ids.contains("B") and ids.contains("d"));
+}

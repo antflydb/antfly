@@ -20,7 +20,7 @@
 /// mutation captures. Never write parameter values into the immutable plan.
 pub fn bindSearchScans(a: Allocator, input_scans: []const catalog.StatementScan, parameters: []const std.json.Value) ![]const catalog.StatementScan {
     const needs_binding = for (input_scans) |scan| {
-        if (scan.request.search != null or scan.request.graph_conditions.len != 0) break true;
+        if (scan.request.search != null or scan.request.graph_conditions.len != 0 or scan.request.graph_predicates.len != 0) break true;
     } else false;
     return if (needs_binding) bound: {
         const bound_scans = try a.dupe(catalog.StatementScan, input_scans);
@@ -47,6 +47,19 @@ pub fn bindSearchScans(a: Allocator, input_scans: []const catalog.StatementScan,
                 scan.request.conditions = try conditions.toOwnedSlice(a);
                 scan.request.graph_conditions = &.{};
             }
+            if (scan.request.graph_predicates.len != 0) {
+                var filters: std.ArrayList(catalog.Scan.GraphFilter) = .empty;
+                try filters.appendSlice(a, scan.request.graph_filters);
+                for (scan.request.graph_predicates) |predicate| {
+                    const filter = bindGraphPredicate(a, predicate, parameters) catch |err| {
+                        if (err == error.SqlProgramLimitExceeded or std.mem.startsWith(u8, @import("errors.zig").describe(err).code, "22")) continue;
+                        return err;
+                    };
+                    try filters.append(a, filter);
+                }
+                scan.request.graph_filters = try filters.toOwnedSlice(a);
+                scan.request.graph_predicates = &.{};
+            }
             if (scan.request.search) |original| {
                 const search = try a.create(catalog.Scan.Search);
                 search.* = original.*;
@@ -65,6 +78,20 @@ pub fn bindSearchScans(a: Allocator, input_scans: []const catalog.StatementScan,
         }
         break :bound bound_scans;
     } else input_scans;
+}
+
+fn bindGraphPredicate(a: Allocator, predicate: catalog.Scan.GraphPredicate, parameters: []const std.json.Value) anyerror!catalog.Scan.GraphFilter {
+    return switch (predicate) {
+        .comparison => |condition| blk: {
+            const value = try condition.operand.evaluateInstruction(a, condition.operand.root, parameters);
+            break :blk .{ .comparison = .{ .column = condition.column, .op = condition.op, .value = value.value, .operand = value } };
+        },
+        .all, .any => |children| blk: {
+            const filters = try a.alloc(catalog.Scan.GraphFilter, children.len);
+            for (children, filters) |child, *filter| filter.* = try bindGraphPredicate(a, child, parameters);
+            break :blk if (predicate == .all) .{ .all = filters } else .{ .any = filters };
+        },
+    };
 }
 
 // Deduplication is deliberately representation preserving: cross-domain SQL

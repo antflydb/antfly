@@ -168,6 +168,8 @@ pub const Condition = struct {
 };
 pub const Scan = struct {
     pub const GraphCondition = struct { column: []const u8, op: @FieldType(Condition, "op"), operand: @import("scalar.zig").Program };
+    pub const GraphPredicate = union(enum) { comparison: GraphCondition, all: []const GraphPredicate, any: []const GraphPredicate };
+    pub const GraphFilter = union(enum) { comparison: Condition, all: []const GraphFilter, any: []const GraphFilter };
     pub const Order = struct { column: []const u8, descending: bool = false, nulls_first: bool = false };
     pub const IndexEquality = struct {
         name: []const u8,
@@ -188,6 +190,10 @@ pub const Scan = struct {
     /// Immutable row-local predicates selected by relational binding. Operands
     /// bind at execution, so prepared invocations never mutate the scan plan.
     graph_conditions: []const GraphCondition = &.{},
+    /// Boolean optimization hints bind once per invocation. SQL retains the
+    /// complete residual predicate; unsupported arms decline an entire hint.
+    graph_predicates: []const GraphPredicate = &.{},
+    graph_filters: []const GraphFilter = &.{},
     graph_source_ordinals: bool = false,
     /// A request, never proof. Providers explicitly attest the entire order.
     order: []const Order = &.{},

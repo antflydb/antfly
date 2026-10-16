@@ -118,6 +118,26 @@ Pushdown quotas leave remaining predicates in SQL residual evaluation;
 they do not reject otherwise valid statements. A NULL operand in an ordinary SQL
 comparison proves the graph scan empty before its producer is opened.
 
+SQL row-local traversal cursors retain an explicit depth-first stack and bounded
+adjacency pages across pulls. They preserve relationship uniqueness, repeatable
+walks, variable-length edge bindings, forward property constraints, and written
+path direction when an endpoint seek reverses execution. Quotas accumulate across
+pulls, and closing a suspended cursor releases its pages and route state. Selective
+interior anchors and stateful selectors retain the general producer's plan.
+Each cursor binds its backend into a stable arena once, preserving transaction
+overlays across pulls while authority checkpoints and cumulative quotas remain active.
+Overlay scans preserve opaque native continuation tokens and emit dirty postimages
+in a separate phase, including inserts, replacements and tombstones.
+Equality lookup planning includes the first pattern of a correlated MATCH and
+optional producers, whose null extension happens before downstream filtering.
+COLLECT stores argument values per group; DISTINCT collection shares typed
+argument equality and NULL exclusion with the other streaming reducers.
+SQL graph pushdown carries typed Boolean trees and lowers same-column equality
+alternatives to indexed membership. Unsupported OR arms decline the whole hint;
+SQL remains responsible for residual truth and errors. Direct column lineage
+survives transparent derived projections and renaming, with aggregation, windows,
+materialization, OFFSET and LIMIT kept as semantic boundaries.
+
 Native Cypher CREATE defaults, generated-column SET through aliases, and REMOVE
 SQL NULL postimages are qualified against durable SQL rows. Cypher entity properties
 omit SQL NULL and document JSON null fields; `keys(n)` and `properties(n)` do

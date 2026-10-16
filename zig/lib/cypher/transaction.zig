@@ -343,65 +343,7 @@ pub const Overlay = struct {
         self.staged_order_valid = true;
     }
     fn lazyScan(self: *Overlay, a: A, table: []const u8, after: ?[]const u8, limit: usize) !b.Page(*const v.Node) {
-        if (limit == 0) return error.CypherInvalidBackendPage;
-        const page = try self.base.vtable.scan(self.base.ptr, a, table, after, limit);
-        var found: std.ArrayList(*const v.Node) = .empty;
-        var present: v.IdentitySet = .empty;
-        for (page.items) |value| {
-            try present.put(a, value.identity, {});
-            if (self.findNode(value.identity)) |node| {
-                if (!node.deleted and node.value.labels.len != 0) try found.append(a, node.value);
-            } else {
-                // Scanning is not a write/read-set admission. Untouched rows
-                // remain page-owned; mutation/get imports a private copy only
-                // when the statement actually needs to retain that identity.
-                if (self.retain_scan_preimages) {
-                    try self.capacity();
-                    const retained = self.alloc.?;
-                    // The runtime's write scan uses its statement allocator.
-                    // Borrow immutable properties there; clone transient pages.
-                    const copy = if (a.ptr == retained.ptr and a.vtable == retained.vtable)
-                        try self.retainNode(retained, value)
-                    else
-                        @constCast((try (v.Value{ .node = value }).clone(retained)).node);
-                    try self.appendNode(retained, .{ .value = copy });
-                    try found.append(a, copy);
-                } else try found.append(a, value);
-            }
-        }
-        try self.prepareStagedOrder();
-        const order = self.staged_order.items;
-        var lo: usize = 0;
-        var hi = order.len;
-        while (lo < hi) {
-            const middle = lo + (hi - lo) / 2;
-            const identity = self.nodes.items[order[middle]].value.identity;
-            const tables = std.mem.order(u8, identity.table, table);
-            if (tables == .lt or (tables == .eq and if (after) |key| std.mem.order(u8, identity.key, key) != .gt else false)) lo = middle + 1 else hi = middle;
-        }
-        var staged: usize = 0;
-        var examined = page.examined orelse page.items.len;
-        for (order[lo..]) |index| {
-            const node = self.nodes.items[index];
-            if (!std.mem.eql(u8, node.value.identity.table, table)) break;
-            if (page.next) |key| if (std.mem.order(u8, node.value.identity.key, key) == .gt) break;
-            if (present.contains(node.value.identity)) continue;
-            try self.charge(1);
-            examined += 1;
-            if (node.deleted or node.value.labels.len == 0) continue;
-            try found.append(a, node.value);
-            staged += 1;
-            // Later staged keys cannot enter this page's retained prefix.
-            if (staged > limit) break;
-        }
-        std.mem.sort(*const v.Node, found.items, {}, struct {
-            fn less(_: void, left: *const v.Node, right: *const v.Node) bool {
-                return std.mem.lessThan(u8, left.identity.key, right.identity.key);
-            }
-        }.less);
-        const overflow = found.items.len > limit;
-        const items = found.items[0..@min(limit, found.items.len)];
-        return .{ .items = items, .next = if (overflow) items[items.len - 1].identity.key else page.next, .examined = examined };
+        return self.lazyNodes(a, table, &.{}, after, limit);
     }
     const LazyCursor = struct { staged: bool = false, native: ?[]const u8 = null, offset: usize = 0 };
     fn lazyExpand(self: *Overlay, a: A, mapping: c.Relationship, identity: v.Identity, direction: ast.Direction, after: ?[]const u8, limit: usize) anyerror!b.Page(*const v.Relationship) {
@@ -463,11 +405,19 @@ pub const Overlay = struct {
         const filtered = self.base.vtable.scan_where orelse return scan(ptr, a, table, after, limit);
         if (!self.active) return filtered(self.base.ptr, a, table, filters, after, limit);
         if (!self.lazy or filters.len == 0) return scan(ptr, a, table, after, limit);
+        return self.lazyNodes(a, table, filters, after, limit);
+    }
+    // Native continuation tokens are opaque. Dirty postimages are emitted in
+    // a separate phase, so they cannot manufacture a key-based native token.
+    fn lazyNodes(self: *Overlay, a: A, table: []const u8, filters: []const b.PropertyFilter, after: ?[]const u8, limit: usize) !b.Page(*const v.Node) {
         if (limit == 0) return error.CypherInvalidBackendPage;
         const cursor = if (after) |encoded| try std.json.parseFromSliceLeaky(LazyCursor, a, encoded, .{}) else LazyCursor{};
         var found: std.ArrayList(*const v.Node) = .empty;
         if (!cursor.staged) {
-            const page = try filtered(self.base.ptr, a, table, filters, cursor.native, limit);
+            const page = if (filters.len != 0 and self.base.vtable.scan_where != null)
+                try self.base.vtable.scan_where.?(self.base.ptr, a, table, filters, cursor.native, limit)
+            else
+                try self.base.vtable.scan(self.base.ptr, a, table, cursor.native, limit);
             for (page.items) |value| {
                 if (self.findNode(value.identity)) |node| {
                     // Emit every dirty postimage exactly once in the staged

@@ -150,6 +150,21 @@ def test_authenticated_cypher_property_plans_and_sql_overlays(monkeypatch):
             joined_unwind
         )
         assert joined_unwind["stats"]["scanned_anchors"] <= 400, joined_unwind
+        for match in (
+            "MATCH (a:D) WHERE a.score<150 MATCH (b:D) WHERE a.score=b.score",
+            "OPTIONAL MATCH (a:D),(b:D) WHERE a.score<150 AND a.score=b.score",
+        ):
+            bounded_join = call(
+                f"/graphs/{graph}/query",
+                {
+                    "query": match + " RETURN count(b)",
+                    "limits": {"scanned_anchors": 400, "memory_bytes": 8 << 20},
+                },
+                wait_for_index=True,
+            )
+            assert bounded_join["rows"] == [[{"type": "integer", "value": "150"}]], (
+                bounded_join
+            )
         for predicate, anchors, values in (
             ("n.score>=1999", 1, ["1999"]),
             ("n.score IN [1999,1,1999,null]", 2, ["1", "1999"]),
@@ -197,6 +212,17 @@ def test_authenticated_cypher_property_plans_and_sql_overlays(monkeypatch):
             "2",
             "1",
         ], distinct_aggregate
+        collected = call(
+            f"/graphs/{graph}/query",
+            {
+                "query": "MATCH (n:D) WITH DISTINCT n.score%2 AS bucket RETURN collect(bucket)",
+                "limits": {"memory_bytes": 8 << 20},
+            },
+        )
+        assert {value["value"] for value in collected["rows"][0][0]["value"]} == {
+            "0",
+            "1",
+        }, collected
         # Column requirements must survive the coordinator/owner RPC boundary.
         wide = table + "_wide"
         call("/sql", {"statement": f"CREATE TABLE {wide} (score BIGINT,payload TEXT)"})
@@ -250,6 +276,59 @@ def test_authenticated_cypher_property_plans_and_sql_overlays(monkeypatch):
             sql = call("/sql", {"statement": statement})
             assert sql["rows"] == expected, sql
 
+        for source, predicate in (
+            (relation, "g.score IN (398,399,399,NULL)"),
+            (relation, "g.score=398 OR g.score=399"),
+            (f"(SELECT g.score,g.unused FROM {relation}) g", "g.score IN (398,399)"),
+        ):
+            filtered = call(
+                "/sql",
+                {
+                    "statement": f"SELECT g.score,g.unused FROM {source} WHERE {predicate} ORDER BY g.score"
+                },
+            )
+            assert filtered["rows"] == [["398", "x" * 8192], ["399", "x" * 8192]], (
+                filtered
+            )
+
+        hops = table + "_hops"
+        call("/sql", {"statement": f"CREATE TABLE {hops} (id TEXT,score BIGINT)"})
+        call(
+            f"/tables/{hops}/indexes/links",
+            {"type": "graph", "edge_types": [{"name": "link"}]},
+        )
+        call(
+            f"/graphs/{hops}",
+            {
+                "labels": [{"name": "H", "table": hops}],
+                "relationships": [
+                    {
+                        "name": "R",
+                        "index": "links",
+                        "source_label": "H",
+                        "target_label": "H",
+                        "stored_type": "link",
+                    }
+                ],
+            },
+        )
+        patterns = [f"(n{i}:H {{id:'n{i}',score:{i}}})" for i in range(18)]
+        patterns += [
+            f"(n{i})-[:R]->(n{j})" for i in range(18) for j in range(i + 1, 18)
+        ]
+        call(f"/graphs/{hops}/query", {"query": "CREATE " + ",".join(patterns)})
+        path = (
+            "(a IS H)"
+            + "".join(f"-[r{i} IS R]->(m{i} IS H)" for i in range(5))
+            + "-[r5 IS R]->(b IS H)"
+        )
+        pulled = call(
+            "/sql",
+            {
+                "statement": f"SELECT q.score FROM GRAPH_TABLE({hops} MATCH {path} COLUMNS(b.score AS score)) q LIMIT 1"
+            },
+        )
+        assert len(pulled["rows"]) == 1, pulled
         script = (
             Path(__file__).resolve().parents[2]
             / "scripts"

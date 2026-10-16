@@ -658,6 +658,20 @@ def test_pattern_equality_joins_use_indexes_or_bounded_hash_lookups(graph_db):
             )
             assert materialized["rows"] == [[{"type": "integer", "value": "153"}]]
             assert materialized["stats"]["scanned_anchors"] <= 500
+        for match in (
+            "MATCH (a:D) MATCH (b:D)",
+            "OPTIONAL MATCH (a:D),(b:D)",
+            "MATCH (a:D) OPTIONAL MATCH (b:D)",
+        ):
+            joined = db.cypher_json(
+                "g",
+                {
+                    "query": match + " WHERE a.score=b.score RETURN count(b)",
+                    "limits": {"scanned_anchors": 500, "memory_bytes": 4 << 20},
+                },
+            )
+            assert joined["rows"] == [[{"type": "integer", "value": "153"}]]
+            assert joined["stats"]["scanned_anchors"] <= 500
         projected = db.cypher_json(
             "g",
             {
@@ -719,6 +733,18 @@ def test_sql_graph_table_prunes_columns_pushes_filters_and_pulls_rows(graph_db):
     assert db.sql(f"SELECT g.score FROM {relation} LIMIT 1")["rows"] == [["0"]]
     assert db.sql(f"SELECT count(*) FROM {relation}")["rows"] == [["1000"]]
     assert db.sql(f"SELECT g.unused FROM {relation} WHERE g.score=999")["rows"] == [[payload]]
+    for predicate in ("g.score IN (999)", "g.score IN (998,999,999,NULL)", "g.score=998 OR g.score=999"):
+        expected = [["999", payload]] if predicate == "g.score IN (999)" else [["998", payload], ["999", payload]]
+        assert db.sql(f"SELECT g.score,g.unused FROM {relation} WHERE {predicate} ORDER BY g.score")["rows"] == expected
+    for source, field in (
+        (f"(SELECT g.score,g.unused FROM {relation}) x", "score"),
+        (
+            f"(SELECT y.s AS renamed,y.p AS unused FROM (SELECT g.score AS s,g.unused AS p FROM {relation}) y) x",
+            "renamed",
+        ),
+    ):
+        assert db.sql(f"SELECT x.unused FROM {source} WHERE x.{field}=999")["rows"] == [[payload]]
+        assert db.sql(f"SELECT x.unused FROM {source} WHERE x.{field} IN (999,NULL)")["rows"] == [[payload]]
     for value in (999, 2):
         assert db.sql(f"SELECT g.score,g.unused FROM {relation} WHERE g.score=$1", [value])["rows"] == [
             [str(value), payload]
@@ -808,3 +834,95 @@ def test_sql_graph_pushdown_preserves_null_extension_and_query_barriers(graph_db
     assert db.sql(
         f"SELECT count(*) FROM (SELECT g.score FROM {graph} LIMIT 1) q CROSS JOIN (SELECT 1 AS x) v WHERE q.score=2"
     )["rows"] == [["0"]]
+
+
+def test_collect_retains_values_instead_of_source_rows(graph_db):
+    db = graph_db
+    populate(db, 2000)
+    db.sql("INSERT INTO docs (_id,score) VALUES ('null',NULL)")
+    for distinct, size in (("", 2000), ("DISTINCT ", 2)):
+        result = db.cypher_json(
+            "g",
+            {"query": f"MATCH (n:D) RETURN collect({distinct}n.score%2)", "limits": {"memory_bytes": 2 << 20}},
+        )
+        values = result["rows"][0][0]["value"]
+        assert len(values) == size
+        assert {value["value"] for value in values} == {"0", "1"}
+        assert result["stats"]["scanned_anchors"] == 2001
+        assert result["stats"]["memory_bytes"] < 2 << 20
+    result = db.cypher_json(
+        "g",
+        {
+            "query": "MATCH (n:D) WITH DISTINCT n.score%2 AS bucket RETURN collect(bucket)",
+            "limits": {"memory_bytes": 2 << 20},
+        },
+    )
+    assert {value["value"] for value in result["rows"][0][0]["value"]} == {"0", "1"}
+
+
+def test_sql_path_cursor_pulls_traversals_and_respects_residual_limit(graph_db):
+    db = graph_db
+    count = 18
+    patterns = [f"(n{i}:D {{id:'n{i}',score:{i}}})" for i in range(count)]
+    patterns += [f"(n{i})-[:R]->(n{j})" for i in range(count) for j in range(i + 1, count)]
+    db.cypher_json("g", {"query": "CREATE " + ",".join(patterns)})
+    # There are 31,824 six-hop routes. A LIMIT 1 consumer must not retain them.
+    pattern = "(a IS D)" + "".join(f"-[r{i} IS R]->(m{i} IS D)" for i in range(5)) + "-[r5 IS R]->(b IS D)"
+    query = f"SELECT q.score FROM GRAPH_TABLE(g MATCH {pattern} COLUMNS(b.score AS score)) q LIMIT 1"
+    # A bounded first pull should not depend on how many routes remain.
+    import time
+
+    start = time.monotonic()
+    assert len(db.sql(query)["rows"]) == 1
+    assert time.monotonic() - start < 5
+    onehop = "GRAPH_TABLE(g MATCH (a IS D)-[r IS R]->(b IS D) COLUMNS(a.score AS source,b.score AS target,r AS edge)) q"
+    rows = []
+    with closing(db.sql_cursor(f"SELECT q.source,q.target FROM {onehop}")) as cursor:
+        while True:
+            page = cursor.fetch(17)
+            rows.extend(page["result"]["rows"])
+            if not page["result"]["rows"]:
+                break
+    assert len(rows) == 153
+    assert {(int(source), int(target)) for source, target in rows} == {
+        (i, j) for i in range(count) for j in range(i + 1, count)
+    }
+    # Residual predicates need additional pulls; row_goal cannot truncate input.
+    assert db.sql(f"SELECT q.source,q.target FROM {onehop} WHERE q.target+0=17 AND q.source+0=16 LIMIT 1")["rows"] == [
+        ["16", "17"]
+    ]
+    assert db.sql(f"SELECT count(*) FROM {onehop}")["rows"] == [["153"]]
+
+
+def test_sql_graph_boolean_filters_keep_three_valued_semantics_and_barriers(graph_db):
+    db = graph_db
+    populate(db, 3)
+    db.sql("INSERT INTO docs (_id,score) VALUES ('null',NULL)")
+    relation = "GRAPH_TABLE(g MATCH (n IS D) COLUMNS(n.score AS score)) g"
+    for predicate, expected in (
+        ("g.score IN (1,1,NULL)", [["1"]]),
+        ("g.score NOT IN (0,NULL)", []),
+        ("g.score=0 OR CAST(g.score AS TEXT)='1'", [["0"], ["1"]]),
+        ("g.score=0 OR g.score IS NULL", [["0"], [None]]),
+        ("(g.score=0 OR g.score=1) AND g.score>0", [["1"]]),
+    ):
+        assert (
+            db.sql(f"SELECT g.score FROM {relation} WHERE {predicate} ORDER BY g.score NULLS LAST")["rows"] == expected
+        )
+    # Compare bound literal coercion against the same relation with pushdown blocked.
+    predicate = "g.score=0 OR g.score=1.5"
+    baseline = f"(SELECT g.score FROM {relation} OFFSET 0) g"
+    assert (
+        db.sql(f"SELECT g.score FROM {relation} WHERE {predicate} ORDER BY g.score")["rows"]
+        == db.sql(f"SELECT g.score FROM {baseline} WHERE {predicate} ORDER BY g.score")["rows"]
+    )
+    for value, expected in ((None, []), (1, [["1"]]), (2, [["2"]])):
+        assert db.sql(f"SELECT g.score FROM {relation} WHERE g.score IN ($1,NULL)", [value])["rows"] == expected
+    assert (
+        db.sql(f"SELECT x.score FROM (SELECT g.score FROM {relation} ORDER BY g.score LIMIT 1) x WHERE x.score=2")[
+            "rows"
+        ]
+        == []
+    )
+    grouped = f"(SELECT g.score%2 AS bucket,count(*) AS total FROM {relation} GROUP BY g.score%2) x"
+    assert db.sql(f"SELECT x.total FROM {grouped} WHERE x.bucket=0")["rows"] == [["2"]]

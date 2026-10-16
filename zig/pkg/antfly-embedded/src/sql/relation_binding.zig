@@ -1800,32 +1800,40 @@ fn constantScanOperand(program: scalar.Program, index: u32, depth: usize) bool {
         else => false,
     };
 }
-fn graphScanConditions(alloc: Allocator, root: *const Node, source: *const Node, program: scalar.Program, index: u32, output: *std.ArrayList(catalog.Scan.GraphCondition), depth: usize) anyerror!void {
+fn graphScanConditions(alloc: Allocator, root: *const Node, source: *const Node, program: scalar.Program, index: u32, output: *std.ArrayList(catalog.Scan.GraphCondition), predicates: *std.ArrayList(catalog.Scan.GraphPredicate), depth: usize) anyerror!void {
     // Optimization quotas must never become statement validity limits. Any
     // omitted conjunct remains in the authoritative SQL residual predicate.
-    if (depth >= 128 or output.items.len >= 256) return;
+    if (depth >= 128 or output.items.len + predicates.items.len >= 256) return;
     if (index >= program.instructions.len) return error.InvalidSqlProgram;
     const instruction = program.instructions[index];
+    if (instruction.operation == .in_list or (instruction.operation == .binary and instruction.operation.binary.op == .@"or")) {
+        var remaining: usize = 256;
+        if (try graphBoolean(alloc, root, source, program, index, &remaining)) |predicate| try predicates.append(alloc, predicate);
+        return;
+    }
     if (instruction.operation != .binary) return;
     const binary = instruction.operation.binary;
     if (binary.op == .@"and") {
-        try graphScanConditions(alloc, root, source, program, binary.left, output, depth + 1);
-        return graphScanConditions(alloc, root, source, program, binary.right, output, depth + 1);
+        try graphScanConditions(alloc, root, source, program, binary.left, output, predicates, depth + 1);
+        return graphScanConditions(alloc, root, source, program, binary.right, output, predicates, depth + 1);
     }
-    var op: @FieldType(catalog.Condition, "op") = switch (binary.op) {
+    if (try graphScalarCondition(root, source, program, binary.op, binary.left, binary.right)) |condition| try output.append(alloc, condition);
+}
+fn graphScalarCondition(root: *const Node, source: *const Node, program: scalar.Program, binary_op: ast.Scalar.Binary, left: u32, right: u32) !?catalog.Scan.GraphCondition {
+    var op: @FieldType(catalog.Condition, "op") = switch (binary_op) {
         .eq => .eq,
         .neq => .neq,
         .lt => .lt,
         .lte => .lte,
         .gt => .gt,
         .gte => .gte,
-        else => return,
+        else => return null,
     };
-    var column_index = binary.left;
-    var value_index = binary.right;
+    var column_index = left;
+    var value_index = right;
     if (program.instructions[column_index].operation != .column) {
-        column_index = binary.right;
-        value_index = binary.left;
+        column_index = right;
+        value_index = left;
         op = switch (op) {
             .lt => .gt,
             .lte => .gte,
@@ -1834,25 +1842,57 @@ fn graphScanConditions(alloc: Allocator, root: *const Node, source: *const Node,
             else => op,
         };
     }
-    if (program.instructions[column_index].operation != .column or !constantScanOperand(program, value_index, 0)) return;
+    if (program.instructions[column_index].operation != .column or !constantScanOperand(program, value_index, 0)) return null;
     const scan = source.operation.scan;
     const ordinal = program.instructions[column_index].operation.column;
     if (ordinal >= root.columns.len) return error.InvalidSqlProgram;
     const local = for (source.columns, 0..) |column, local| {
         if (std.mem.eql(u8, root.columns[ordinal].internal, column.internal)) break local;
-    } else return;
+    } else return null;
     const column = source.columns[local];
-    if (column.element_type == .numeric or (column.type != .integer and column.type != .number and column.type != .string and column.type != .boolean)) return;
+    if (column.element_type == .numeric or (column.type != .integer and column.type != .number and column.type != .string and column.type != .boolean)) return null;
     const name = scan.source_columns[local];
-    if (std.mem.eql(u8, name, "_id")) return;
+    if (std.mem.eql(u8, name, "_id")) return null;
     var operand = program;
     operand.root = value_index;
-    try output.append(alloc, .{ .column = name, .op = op, .operand = operand });
+    return .{ .column = name, .op = op, .operand = operand };
+}
+// OR/IN are atomic optimization candidates: dropping an unsupported arm
+// would remove valid rows. The SQL program remains the authoritative residual.
+fn graphBoolean(alloc: Allocator, root: *const Node, source: *const Node, program: scalar.Program, index: u32, remaining: *usize) anyerror!?catalog.Scan.GraphPredicate {
+    if (remaining.* == 0) return null;
+    remaining.* -= 1;
+    const operation = program.instructions[index].operation;
+    if (operation == .binary and (operation.binary.op == .@"and" or operation.binary.op == .@"or")) {
+        const left = (try graphBoolean(alloc, root, source, program, operation.binary.left, remaining)) orelse return null;
+        const right = (try graphBoolean(alloc, root, source, program, operation.binary.right, remaining)) orelse return null;
+        const children = try alloc.dupe(catalog.Scan.GraphPredicate, &.{ left, right });
+        return if (operation.binary.op == .@"and") .{ .all = children } else .{ .any = children };
+    }
+    if (operation == .in_list) {
+        const list = operation.in_list;
+        if (list.values.len > remaining.*) return null;
+        const children = try alloc.alloc(catalog.Scan.GraphPredicate, list.values.len);
+        // Lower membership into typed comparisons without inventing SQL/Cypher
+        // coercions. NULL arms retain UNKNOWN, including for NOT IN.
+        remaining.* -= list.values.len;
+        for (list.values, children) |value, *child| {
+            child.* = .{ .comparison = (try graphScalarCondition(root, source, program, if (list.negated) .neq else .eq, list.operand, value)) orelse return null };
+        }
+        return if (list.negated) .{ .all = children } else .{ .any = children };
+    }
+    if (operation != .binary) return null;
+    const binary = operation.binary;
+    return .{ .comparison = (try graphScalarCondition(root, source, program, binary.op, binary.left, binary.right)) orelse return null };
 }
 /// Route row-local conjuncts by bound column identity. Only joins with
-/// preserved filtering semantics are transparent; derived queries, Apply,
-/// materialization and set operators retain their own evaluation boundaries.
+/// preserved filtering semantics and direct derived column forwarding are
+/// transparent. Apply, materialization and set operators retain their boundaries.
 pub fn attachGraphConditions(alloc: Allocator, root: *const Node, program: scalar.Program, scans: []catalog.StatementScan) !void {
+    const has_graph = for (scans) |scan| {
+        if (scan.table.graph != null and !scan.request.graph_source_ordinals) break true;
+    } else false;
+    if (!has_graph) return;
     try attachGraphConditionsAt(alloc, root, root, program, scans);
 }
 fn attachGraphConditionsAt(alloc: Allocator, root: *const Node, node: *const Node, program: scalar.Program, scans: []catalog.StatementScan) anyerror!void {
@@ -1862,12 +1902,36 @@ fn attachGraphConditionsAt(alloc: Allocator, root: *const Node, node: *const Nod
             if (source.table.graph == null or source.request.graph_source_ordinals) return;
             var conditions: std.ArrayList(catalog.Scan.GraphCondition) = .empty;
             try conditions.appendSlice(alloc, source.request.graph_conditions);
-            try graphScanConditions(alloc, root, node, program, program.root, &conditions, 0);
+            var predicates: std.ArrayList(catalog.Scan.GraphPredicate) = .empty;
+            try predicates.appendSlice(alloc, source.request.graph_predicates);
+            try graphScanConditions(alloc, root, node, program, program.root, &conditions, &predicates, 0);
             source.request.graph_conditions = try conditions.toOwnedSlice(alloc);
+            source.request.graph_predicates = try predicates.toOwnedSlice(alloc);
         },
         .join => |join| {
             if (join.kind == .inner or join.kind == .cross or join.kind == .left) try attachGraphConditionsAt(alloc, root, join.left, program, scans);
             if (join.kind == .inner or join.kind == .cross or join.kind == .right) try attachGraphConditionsAt(alloc, root, join.right, program, scans);
+        },
+        .query => |query| {
+            if (query.binding.aggregate != null or query.binding.window != null or query.statement.count_all or query.statement.limit != null or query.statement.offset != null or query.statement.scalar_cardinality_limit or query.statement.group_by.len != 0 or query.statement.having != null) return;
+            const columns = try alloc.dupe(Column, root.columns);
+            if (!query.preserve_scope) for (node.columns, 0..) |output, index| {
+                if (index >= query.statement.columns.len) return;
+                const projection = query.statement.columns[index];
+                const name = if (projection.expression == null) projection.field else direct: {
+                    if (index >= query.binding.scalars.projections.len) return;
+                    const expression = query.binding.scalars.projections[index] orelse return;
+                    const instruction = expression.instructions[expression.root].operation;
+                    if (instruction != .column) return;
+                    break :direct query.source.columns[instruction.column].internal;
+                };
+                for (columns) |*column| if (std.mem.eql(u8, column.internal, output.internal)) {
+                    column.internal = name;
+                };
+            };
+            var mapped = root.*;
+            mapped.columns = columns;
+            try attachGraphConditionsAt(alloc, &mapped, query.source, program, scans);
         },
         else => {},
     }
@@ -1901,6 +1965,7 @@ fn projectScans(builder: *Builder, node: *const Node, needed: *std.StringHashMap
             for (node.columns, scan.source_columns) |column, name| {
                 if (needed.contains(column.internal) and std.mem.eql(u8, name, "_id")) {
                     request.request.graph_conditions = &.{};
+                    request.request.graph_predicates = &.{};
                     request.request.graph_source_ordinals = true;
                 }
             }

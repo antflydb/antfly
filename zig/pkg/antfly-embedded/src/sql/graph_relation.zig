@@ -149,6 +149,106 @@ fn json(a: A, value: cypher.value.Value) anyerror!std.json.Value {
 // A scan predicate is SQL-typed. Push only comparisons whose direct scalar
 // projection has the same Cypher domain, retaining SQL residual checks below.
 // Aggregation, DISTINCT, ordering and path selection remain semantic barriers.
+fn graphComparison(a: A, binding: Binding, original: cypher.ast.Projection, condition: catalog.Condition, allow_null: bool) !?*cypher.ast.Expr {
+    const item = for (original.items) |candidate| {
+        if (std.mem.eql(u8, candidate.alias.?, condition.column)) break candidate;
+    } else return null;
+    if (item.expression.value != .property) return null;
+    const kind = expressionType(binding, item.expression);
+    if (kind != .integer and kind != .number and kind != .string and kind != .boolean) return null;
+    const datum = condition.datum();
+    if (datum.numeric != null or datum.array != null or datum.patterns != null) return null;
+    const predicate = try a.create(cypher.ast.Expr);
+    const span = item.expression.span;
+    if (condition.op == .is_null or condition.op == .is_not_null) {
+        predicate.* = .{ .span = span, .depth = item.expression.depth + 1, .value = .{ .unary = .{ .op = if (condition.op == .is_null) .is_null else .is_not_null, .operand = item.expression } } };
+    } else {
+        if (datum.sql_null and !allow_null) return null;
+        const literal: cypher.ast.Value = if (datum.sql_null) .null else switch (datum.value) {
+            .integer => |value| if (kind == .integer or kind == .number) .{ .integer = value } else return null,
+            .number_string => |value| if (kind == .integer or kind == .number) .{ .integer = std.fmt.parseInt(i64, value, 10) catch return null } else return null,
+            .float => |value| if (kind == .number and std.math.isFinite(value)) .{ .number = value } else return null,
+            .string => |value| if (kind == .string) .{ .string = try a.dupe(u8, value) } else return null,
+            .bool => |value| if (kind == .boolean and (condition.op == .eq or condition.op == .neq)) .{ .boolean = value } else return null,
+            else => return null,
+        };
+        const operand = try a.create(cypher.ast.Expr);
+        operand.* = .{ .span = span, .value = .{ .literal = literal } };
+        predicate.* = .{ .span = span, .depth = item.expression.depth + 1, .value = .{ .binary = .{ .left = item.expression, .right = operand, .op = switch (condition.op) {
+            .eq => .eq,
+            .neq => .neq,
+            .lt => .lt,
+            .lte => .lte,
+            .gt => .gt,
+            .gte => .gte,
+            else => unreachable,
+        } } } };
+    }
+    return predicate;
+}
+fn combinePredicate(a: A, left: *const cypher.ast.Expr, right: *const cypher.ast.Expr, op: cypher.ast.Binary) !?*cypher.ast.Expr {
+    const depth = 1 + @max(left.depth, right.depth);
+    if (depth > 64) return null;
+    const combined = try a.create(cypher.ast.Expr);
+    combined.* = .{ .span = left.span, .depth = depth, .value = .{ .binary = .{ .op = op, .left = left, .right = right } } };
+    return combined;
+}
+fn membershipTerms(a: A, binding: Binding, original: cypher.ast.Projection, filter: catalog.Scan.GraphFilter, property: *?*const cypher.ast.Expr, values: *std.ArrayList(*const cypher.ast.Expr)) anyerror!bool {
+    switch (filter) {
+        .any => |children| {
+            for (children) |child| if (!try membershipTerms(a, binding, original, child, property, values)) return false;
+            return true;
+        },
+        .comparison => |condition| {
+            if (condition.op != .eq) return false;
+            const expression = (try graphComparison(a, binding, original, condition, true)) orelse return false;
+            const binary = expression.value.binary;
+            if (property.*) |previous| {
+                if (previous != binary.left) return false;
+            } else property.* = binary.left;
+            try values.append(a, binary.right);
+            return true;
+        },
+        else => return false,
+    }
+}
+fn graphFilter(a: A, binding: Binding, original: cypher.ast.Projection, filter: catalog.Scan.GraphFilter) anyerror!?*cypher.ast.Expr {
+    if (filter == .any) {
+        var property: ?*const cypher.ast.Expr = null;
+        var values: std.ArrayList(*const cypher.ast.Expr) = .empty;
+        if (try membershipTerms(a, binding, original, filter, &property, &values) and property != null) {
+            const list = try a.create(cypher.ast.Expr);
+            list.* = .{ .span = property.?.span, .value = .{ .list = try values.toOwnedSlice(a) } };
+            const membership = try a.create(cypher.ast.Expr);
+            membership.* = .{ .span = property.?.span, .depth = property.?.depth + 1, .value = .{ .binary = .{ .op = .in, .left = property.?, .right = list } } };
+            return membership;
+        }
+    }
+    return switch (filter) {
+        .comparison => |condition| graphComparison(a, binding, original, condition, true),
+        .all, .any => |children| blk: {
+            if (children.len == 0) {
+                const literal = try a.create(cypher.ast.Expr);
+                literal.* = .{ .span = .{}, .value = .{ .literal = .{ .boolean = filter == .all } } };
+                break :blk literal;
+            }
+            var expression = (try graphFilter(a, binding, original, children[0])) orelse break :blk null;
+            for (children[1..]) |child| {
+                const right = (try graphFilter(a, binding, original, child)) orelse break :blk null;
+                expression = (try combinePredicate(a, expression, right, if (filter == .all) .@"and" else .@"or")) orelse break :blk null;
+            }
+            break :blk expression;
+        },
+    };
+}
+fn filterNeeds(filter: catalog.Scan.GraphFilter, column: []const u8) bool {
+    return switch (filter) {
+        .comparison => |condition| std.mem.eql(u8, condition.column, column),
+        .all, .any => |children| for (children) |child| {
+            if (filterNeeds(child, column)) break true;
+        } else false,
+    };
+}
 fn scanQuery(a: A, binding: Binding, request: catalog.Scan) !cypher.ast.Query {
     var query = binding.definition.query;
     if (query.clauses.len != 2 or query.clauses[0].operation != .match or query.clauses[1].operation != .project) return query;
@@ -164,49 +264,16 @@ fn scanQuery(a: A, binding: Binding, request: catalog.Scan) !cypher.ast.Query {
     for (operation.paths) |path| if (path.selector != .all) {
         push = false;
     };
-    if (push) for (request.conditions) |condition| {
-        const item = for (original.items) |candidate| {
-            if (std.mem.eql(u8, candidate.alias.?, condition.column)) break candidate;
-        } else continue;
-        if (item.expression.value != .property) continue;
-        const kind = expressionType(binding, item.expression);
-        if (kind != .integer and kind != .number and kind != .string and kind != .boolean) continue;
-        const datum = condition.datum();
-        if (datum.numeric != null or datum.array != null or datum.patterns != null) continue;
-        const predicate = try a.create(cypher.ast.Expr);
-        const span = item.expression.span;
-        if (condition.op == .is_null or condition.op == .is_not_null) {
-            predicate.* = .{ .span = span, .depth = item.expression.depth + 1, .value = .{ .unary = .{ .op = if (condition.op == .is_null) .is_null else .is_not_null, .operand = item.expression } } };
-        } else {
-            if (datum.sql_null) continue;
-            const literal: cypher.ast.Value = switch (datum.value) {
-                .integer => |value| if (kind == .integer or kind == .number) .{ .integer = value } else continue,
-                .number_string => |value| if (kind == .integer or kind == .number) .{ .integer = std.fmt.parseInt(i64, value, 10) catch continue } else continue,
-                .float => |value| if (kind == .number and std.math.isFinite(value)) .{ .number = value } else continue,
-                .string => |value| if (kind == .string) .{ .string = try a.dupe(u8, value) } else continue,
-                .bool => |value| if (kind == .boolean and (condition.op == .eq or condition.op == .neq)) .{ .boolean = value } else continue,
-                else => continue,
-            };
-            const operand = try a.create(cypher.ast.Expr);
-            operand.* = .{ .span = span, .value = .{ .literal = literal } };
-            predicate.* = .{ .span = span, .depth = item.expression.depth + 1, .value = .{ .binary = .{ .left = item.expression, .right = operand, .op = switch (condition.op) {
-                .eq => .eq,
-                .neq => .neq,
-                .lt => .lt,
-                .lte => .lte,
-                .gt => .gt,
-                .gte => .gte,
-                else => unreachable,
-            } } } };
+    if (push) {
+        for (request.conditions) |condition| {
+            const predicate = (try graphComparison(a, binding, original, condition, false)) orelse continue;
+            operation.predicate = if (operation.predicate) |previous| (try combinePredicate(a, previous, predicate, .@"and")) orelse continue else predicate;
         }
-        if (operation.predicate) |previous| {
-            const depth = 1 + @max(previous.depth, predicate.depth);
-            if (depth > 64) continue;
-            const combined = try a.create(cypher.ast.Expr);
-            combined.* = .{ .span = span, .depth = depth, .value = .{ .binary = .{ .op = .@"and", .left = previous, .right = predicate } } };
-            operation.predicate = combined;
-        } else operation.predicate = predicate;
-    };
+        for (request.graph_filters) |filter| {
+            const predicate = (try graphFilter(a, binding, original, filter)) orelse continue;
+            operation.predicate = if (operation.predicate) |previous| (try combinePredicate(a, previous, predicate, .@"and")) orelse continue else predicate;
+        }
+    }
     var items: std.ArrayList(cypher.ast.Item) = .empty;
     for (original.items) |item| {
         const name = item.alias.?;
@@ -215,6 +282,9 @@ fn scanQuery(a: A, binding: Binding, request: catalog.Scan) !cypher.ast.Query {
             needed = true;
         };
         for (request.conditions) |condition| if (std.mem.eql(u8, name, condition.column)) {
+            needed = true;
+        };
+        for (request.graph_filters) |filter| if (filterNeeds(filter, name)) {
             needed = true;
         };
         if (needed) try items.append(a, item);
@@ -268,6 +338,7 @@ pub const Cursor = struct {
         var copied = request;
         copied.fields = fields;
         copied.conditions = conditions;
+        copied.graph_filters = &.{};
         copied.after = null;
         copied.primary_key = if (request.primary_key) |key| try owned.dupe(u8, key) else null;
         if ((empty and resume_position != 0) or (result != null and resume_position > result.?.rows.len)) return error.InvalidSqlBackendResponse;

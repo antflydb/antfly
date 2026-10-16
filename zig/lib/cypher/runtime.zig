@@ -90,10 +90,10 @@ pub fn execute(backing: A, backend: backend_mod.Backend, graph: catalog.Graph, c
     return executeBudget(budget, backend, graph, compiled, parameters, limits) catch |err| return if (budget.exhausted) error.CypherMemoryBudgetExceeded else err;
 }
 
-/// Pull execution for row-local node scans. Stateful reductions, path
+/// Pull execution for row-local node scans and all-path traversals. Stateful reductions, path
 /// selection and nested patterns use the general statement operators. Every
-/// pull shares one quota/work meter and immutable read cut; page arenas are
-/// released before returning caller-owned rows.
+/// pull shares one quota/work meter and immutable read cut. Suspended routes
+/// pin their adjacency pages; returned rows belong to the caller.
 pub const NodeCursor = struct {
     backing: A,
     budget: *Budget,
@@ -106,14 +106,16 @@ pub const NodeCursor = struct {
     after: std.ArrayList(u8) = .empty,
     continuation: bool = false,
     done: bool = false,
+    frames: std.ArrayList(*PathFrame) = .empty,
     pub fn open(backing: A, backend: backend_mod.Backend, graph: catalog.Graph, query: ast.Query, parameters: []const v.Entry, limits: Limits) !?*NodeCursor {
         if (query.explain or query.unions.len != 0 or query.clauses.len != 2 or query.clauses[0].operation != .match or query.clauses[1].operation != .project) return null;
         const operation = query.clauses[0].operation.match;
         const projection = query.clauses[1].operation.project.value;
-        if (operation.optional or operation.paths.len != 1 or operation.paths[0].edges.len != 0 or projection.distinct or projection.wildcard or projection.order.len != 0 or projection.skip != null or projection.limit != null) return null;
+        if (operation.optional or operation.paths.len != 1 or operation.paths[0].selector != .all or projection.distinct or projection.wildcard or projection.order.len != 0 or projection.skip != null or projection.limit != null) return null;
         if (operation.predicate) |predicate| if (@import("expressions.zig").containsPattern(predicate)) return null;
         if (projection.predicate) |predicate| if (@import("expressions.zig").containsPattern(predicate)) return null;
-        for (operation.paths[0].nodes[0].properties) |entry| if (@import("expressions.zig").containsPattern(entry.value)) return null;
+        for (operation.paths[0].nodes) |node| for (node.properties) |entry| if (@import("expressions.zig").containsPattern(entry.value)) return null;
+        for (operation.paths[0].edges) |edge| for (edge.properties) |entry| if (@import("expressions.zig").containsPattern(entry.value)) return null;
         for (projection.items) |item| if (aggregates(item.expression) or @import("expressions.zig").containsPattern(item.expression)) return null;
         try graph.validate();
         try @import("binder.zig").validate(backing, graph, query);
@@ -124,26 +126,84 @@ pub const NodeCursor = struct {
         errdefer allocator.destroy(budget);
         budget.* = .{ .backing = allocator, .limit = limits.memory_bytes };
         var arena = std.heap.ArenaAllocator.init(budget.allocator());
-        errdefer arena.deinit();
+        var arena_moved = false;
+        errdefer if (arena_moved) self.arena.deinit() else arena.deinit();
         const a = arena.allocator();
         const owned_query = try std.json.parseFromSliceLeaky(ast.Query, a, try std.json.Stringify.valueAlloc(a, query, .{}), .{});
         const owned_parameters = try a.alloc(v.Entry, parameters.len);
         for (parameters, owned_parameters) |parameter, *out| out.* = .{ .name = try a.dupe(u8, parameter.name), .value = try parameter.value.clone(a) };
         const engine = try a.create(Engine);
         engine.* = .{ .a = a, .scratch_allocator = budget.allocator(), .backend = backend, .graph = graph, .source = owned_query.source, .parameters = owned_parameters, .limits = limits, .read_only = true, .cache_reads = true, .regex = .{ .a = a, .scratch = std.heap.ArenaAllocator.init(budget.allocator()) } };
+        var aliases: std.ArrayList([]const u8) = .empty;
+        for (owned_query.clauses[0].operation.match.paths[0].nodes) |node| if (node.alias) |alias| try aliases.append(a, alias);
+        for (owned_query.clauses[0].operation.match.paths[0].edges) |edge| if (edge.alias) |alias| try aliases.append(a, alias);
+        if (owned_query.clauses[0].operation.match.paths[0].alias) |alias| try aliases.append(a, alias);
+        engine.match_aliases = try aliases.toOwnedSlice(a);
         engine.values = .{ .a = a, .ptr = engine, .charge = Engine.chargeWork };
         engine.strings = .{ .a = a, .ptr = engine, .charge = Engine.chargeWork };
         errdefer engine.regex.deinit();
         const columns = try a.alloc([]const u8, projection.items.len);
         for (owned_query.clauses[1].operation.project.value.items, columns) |item, *out| out.* = item.alias orelse try engine.expressionName(item.expression);
         const fields = try @import("read_fields.zig").required(a, owned_query, graph);
-        try backend.vtable.bind(backend.ptr, a, graph);
         self.* = .{ .backing = allocator, .budget = budget, .arena = arena, .engine = engine, .query = owned_query, .fields = fields, .columns = columns };
+        arena_moved = true;
         engine.a = self.arena.allocator();
         engine.values.a = engine.a;
         engine.strings.a = engine.a;
         engine.regex.a = engine.a;
+        // Binding can retain an allocator and staged graph state. Its arena
+        // must have a stable address for the whole cursor, and rebinding must
+        // not invalidate routes suspended between pulls.
+        try backend.vtable.bind(backend.ptr, self.arena.allocator(), graph);
+        if (operation.paths[0].edges.len != 0 and !try self.planAnchor()) {
+            self.close();
+            return null;
+        }
+        if (backend.vtable.startup_work) |work| {
+            const initial = work(backend.ptr);
+            if (initial.scanned_anchors > limits.scanned_anchors) return error.CypherAnchorBudgetExceeded;
+            if (initial.explored_edges > limits.explored_edges) return error.CypherEdgeBudgetExceeded;
+            try Engine.chargeWork(engine, initial.intermediate_states);
+            engine.startup_accounted = initial;
+            engine.stats.scanned_anchors = initial.scanned_anchors;
+            engine.stats.explored_edges = initial.explored_edges;
+        }
         return self;
+    }
+    fn planAnchor(self: *NodeCursor) !bool {
+        const e = self.engine;
+        const operation = self.query.clauses[0].operation.match;
+        const original = operation.paths[0];
+        var anchor: usize = 0;
+        var score = try e.anchorScore(original.nodes[0], operation.predicate, &.{});
+        for (original.nodes[1..], 1..) |node, index| {
+            const candidate = try e.anchorScore(node, operation.predicate, &.{});
+            if (candidate > score) {
+                anchor = index;
+                score = candidate;
+            }
+        }
+        // The general producer retains its interior-anchor plan. Do not replace
+        // a selective interior seek with an exhaustive endpoint scan.
+        if (anchor != 0 and anchor + 1 != original.nodes.len) return false;
+        if (anchor == 0) return true;
+        const nodes = try e.a.dupe(ast.Node, original.nodes);
+        const edges = try e.a.dupe(ast.Edge, original.edges);
+        std.mem.reverse(ast.Node, nodes);
+        std.mem.reverse(ast.Edge, edges);
+        for (edges) |*edge| edge.direction = switch (edge.direction) {
+            .out => .in,
+            .in => .out,
+            .both => .both,
+        };
+        var path = original;
+        path.nodes = nodes;
+        path.edges = edges;
+        path.execution_reversed = true;
+        const clauses = try e.a.dupe(ast.Clause, self.query.clauses);
+        clauses[0].operation.match.paths = try e.a.dupe(ast.Path, &.{path});
+        self.query.clauses = clauses;
+        return true;
     }
     pub fn next(self: *NodeCursor, a: A, demand: usize) ![]const Row {
         return self.pull(a, demand) catch |err| return if (self.budget.exhausted) error.CypherMemoryBudgetExceeded else err;
@@ -153,9 +213,7 @@ pub const NodeCursor = struct {
         if (self.done) return &.{};
         const e = self.engine;
         const backend = e.backend;
-        var binding_arena = std.heap.ArenaAllocator.init(self.budget.allocator());
-        defer binding_arena.deinit();
-        try backend.vtable.bind(backend.ptr, binding_arena.allocator(), e.graph);
+        try backend.vtable.checkpoint(backend.ptr);
         if (backend.vtable.set_work) |configure| configure(backend.ptr, .{ .ptr = e, .charge = Engine.chargeWork, .value = Engine.chargeValue, .remaining = Engine.remainingWork });
         defer if (backend.vtable.set_work) |configure| configure(backend.ptr, null);
         if (backend.vtable.set_read_fields) |configure| configure(backend.ptr, self.fields);
@@ -164,7 +222,11 @@ pub const NodeCursor = struct {
         const path = operation.paths[0];
         const node = path.nodes[0];
         var output: std.ArrayList(Row) = .empty;
-        while (self.label < e.graph.labels.len and output.items.len < demand) {
+        while ((self.label < e.graph.labels.len or self.frames.items.len != 0) and output.items.len < demand) {
+            if (self.frames.items.len != 0) {
+                try self.pullPaths(a, demand, &output);
+                continue;
+            }
             const label = e.graph.labels[self.label];
             if (!e.firstTableLabel(self.label, node)) {
                 self.label += 1;
@@ -182,8 +244,8 @@ pub const NodeCursor = struct {
                 const found = try e.getNode(.{ .table = label.table, .key = key.string });
                 break :blk .{ .items = if (found) |value| try e.a.dupe(*const v.Node, &.{value}) else &.{}, .examined = 1 };
             } else blk: {
-                const page = try e.scanNodes(label.table, node, operation.predicate, &.{}, if (self.continuation) self.after.items else null, @min(128, demand - output.items.len));
-                if (page.items.len > @min(128, demand - output.items.len)) return error.CypherInvalidBackendPage;
+                const page = try e.scanNodes(label.table, node, operation.predicate, &.{}, if (self.continuation) self.after.items else null, if (path.edges.len != 0) 1 else @min(128, demand - output.items.len));
+                if (page.items.len > (if (path.edges.len != 0) @as(usize, 1) else @min(128, demand - output.items.len))) return error.CypherInvalidBackendPage;
                 if (self.continuation) if (page.next) |cursor| if (std.mem.eql(u8, self.after.items, cursor)) return error.CypherInvalidBackendCursor;
                 self.after.clearRetainingCapacity();
                 self.continuation = page.next != null;
@@ -197,6 +259,11 @@ pub const NodeCursor = struct {
             for (page.items) |value| {
                 try e.state();
                 if (!try e.nodeMatches(value, node)) continue;
+                if (path.edges.len != 0) {
+                    try self.startAnchor(value);
+                    try self.pullPaths(a, demand, &output);
+                    continue;
+                }
                 var row = (try e.bind(&.{}, node.alias, .{ .node = value })) orelse continue;
                 if (path.alias) |alias| row = (try e.bind(row, alias, .{ .path = .{ .nodes = try e.a.dupe(*const v.Node, &.{value}), .relationships = &.{} } })) orelse continue;
                 const constrained = (try e.constrain(.{ .row = row }, .{ .node = value }, node.properties)) orelse continue;
@@ -208,12 +275,217 @@ pub const NodeCursor = struct {
                 }
             }
         }
-        self.done = self.label == e.graph.labels.len;
+        self.done = self.label == e.graph.labels.len and self.frames.items.len == 0;
         return output.toOwnedSlice(a);
+    }
+    // A frame pins its parent's route and current adjacency page. Only the top
+    // frame advances; pages are reclaimed once all children have been consumed.
+    // Suspension retains the current route and pages, with no replay on the next pull.
+    const PathFrame = struct {
+        arena: std.heap.ArenaAllocator,
+        page_arena: std.heap.ArenaAllocator,
+        state: Engine.MatchState,
+        nodes: []const *const v.Node,
+        relationships: []const *const v.Relationship,
+        edge_values: []const v.Value = &.{},
+        edge_index: usize = 0,
+        hops: u32 = 0,
+        endpoint_tried: bool = false,
+        mapping: usize = 0,
+        items: []const *const v.Relationship = &.{},
+        position: usize = 0,
+        loaded: bool = false,
+        last_page: bool = false,
+        after: std.ArrayList(u8) = .empty,
+    };
+    fn newFrame(self: *NodeCursor) !*PathFrame {
+        const a = self.budget.allocator();
+        const frame = try a.create(PathFrame);
+        frame.* = .{ .arena = std.heap.ArenaAllocator.init(a), .page_arena = std.heap.ArenaAllocator.init(a), .state = .{ .row = &.{} }, .nodes = &.{}, .relationships = &.{} };
+        return frame;
+    }
+    fn freeFrame(self: *NodeCursor, frame: *PathFrame) void {
+        frame.after.deinit(self.budget.allocator());
+        frame.page_arena.deinit();
+        frame.arena.deinit();
+        self.budget.allocator().destroy(frame);
+    }
+    fn popFrame(self: *NodeCursor) void {
+        self.freeFrame(self.frames.pop().?);
+    }
+    fn startAnchor(self: *NodeCursor, raw: *const v.Node) !void {
+        const frame = try self.newFrame();
+        var retained = false;
+        defer if (!retained) self.freeFrame(frame);
+        const e = self.engine;
+        const scope = Engine.EvalScope.enter(e, frame.arena.allocator());
+        defer scope.leave(e);
+        const value = try (v.Value{ .node = raw }).clone(e.a);
+        const path = self.query.clauses[0].operation.match.paths[0];
+        const row = (try e.bind(&.{}, path.nodes[0].alias, value)).?;
+        frame.state = (try e.constrain(.{ .row = row }, value, path.nodes[0].properties)) orelse return;
+        frame.nodes = try e.a.dupe(*const v.Node, &.{value.node});
+        try self.frames.append(self.budget.allocator(), frame);
+        retained = true;
+    }
+    fn pullPaths(self: *NodeCursor, a: A, demand: usize, output: *std.ArrayList(Row)) !void {
+        const e = self.engine;
+        const operation = self.query.clauses[0].operation.match;
+        const path = operation.paths[0];
+        while (self.frames.items.len != 0 and output.items.len < demand) {
+            try e.checkpoint();
+            const frame = self.frames.items[self.frames.items.len - 1];
+            var scratch = std.heap.ArenaAllocator.init(self.budget.allocator());
+            defer scratch.deinit();
+            const scope = Engine.EvalScope.enter(e, scratch.allocator());
+            defer scope.leave(e);
+            if (frame.edge_index == path.edges.len) {
+                try e.state();
+                var route: v.Path = .{ .nodes = frame.nodes, .relationships = frame.relationships };
+                if (path.execution_reversed and path.alias != null) {
+                    const nodes = try e.a.dupe(*const v.Node, route.nodes);
+                    const relationships = try e.a.dupe(*const v.Relationship, route.relationships);
+                    std.mem.reverse(*const v.Node, nodes);
+                    std.mem.reverse(*const v.Relationship, relationships);
+                    route = .{ .nodes = nodes, .relationships = relationships };
+                }
+                if (try e.bind(frame.state.row, path.alias, .{ .path = route })) |row| {
+                    if (try e.constraintsMatch(frame.state.constraints, row, false)) {
+                        const accepted = if (operation.predicate) |predicate| (try (try e.eval(predicate, row, null)).truth()) == true else true;
+                        if (accepted) for (try e.projectUnordered(&.{row}, self.query.clauses[1].operation.project.value, false)) |projected| {
+                            try e.values.output(.{ .map = projected });
+                            try output.append(a, (try (v.Value{ .map = projected }).clone(a)).map);
+                        };
+                    }
+                }
+                self.popFrame();
+                continue;
+            }
+            const edge = path.edges[frame.edge_index];
+            const current = frame.nodes[frame.nodes.len - 1];
+            if (!frame.endpoint_tried) {
+                frame.endpoint_tried = true;
+                if (frame.hops >= edge.min_hops and try e.nodeMatches(current, path.nodes[frame.edge_index + 1])) {
+                    const child = try self.newFrame();
+                    var retained = false;
+                    defer if (!retained) self.freeFrame(child);
+                    const child_scope = Engine.EvalScope.enter(e, child.arena.allocator());
+                    defer child_scope.leave(e);
+                    if (try e.bind(frame.state.row, path.nodes[frame.edge_index + 1].alias, .{ .node = current })) |node_row| {
+                        const edge_value = try e.routeEdgeValue(path, edge, frame.edge_values, frame.relationships);
+                        if (try e.bind(node_row, edge.alias, edge_value)) |edge_row| {
+                            if (try e.constrain(.{ .row = edge_row, .used = frame.state.used, .constraints = frame.state.constraints }, .{ .node = current }, path.nodes[frame.edge_index + 1].properties)) |candidate| {
+                                child.state = candidate;
+                                child.nodes = frame.nodes;
+                                child.relationships = frame.relationships;
+                                child.edge_index = frame.edge_index + 1;
+                                try e.state();
+                                try self.frames.append(self.budget.allocator(), child);
+                                retained = true;
+                                continue;
+                            }
+                        }
+                    }
+                }
+            }
+            if (edge.max_hops) |maximum| if (frame.hops >= maximum) {
+                self.popFrame();
+                continue;
+            };
+            if (frame.mapping == e.graph.relationships.len) {
+                self.popFrame();
+                continue;
+            }
+            const mapping = e.graph.relationships[frame.mapping];
+            const selected = if (edge.types.len == 0) true else for (edge.types) |name| {
+                if (std.mem.eql(u8, mapping.name, name)) break true;
+            } else false;
+            const outgoing = selected and edge.direction != .in and try e.graph.admits(current, mapping.source_label, &e.values);
+            const incoming = selected and edge.direction != .out and try e.graph.admits(current, mapping.target_label, &e.values);
+            if ((!outgoing and !incoming) or (frame.loaded and frame.position == frame.items.len and frame.last_page)) {
+                frame.mapping += 1;
+                frame.loaded = false;
+                frame.after.clearRetainingCapacity();
+                continue;
+            }
+            if (!frame.loaded or frame.position == frame.items.len) {
+                _ = frame.page_arena.reset(.retain_capacity);
+                const page_scope = Engine.EvalScope.enter(e, frame.page_arena.allocator());
+                defer page_scope.leave(e);
+                const requested = @min(128, demand - output.items.len);
+                const page = try e.expandEdges(frame.mapping, mapping, current.identity, edge.direction, if (frame.loaded) frame.after.items else null, requested);
+                if (page.items.len > requested) return error.CypherInvalidBackendPage;
+                if (frame.loaded) if (page.next) |continuation| if (std.mem.eql(u8, frame.after.items, continuation)) return error.CypherInvalidBackendCursor;
+                frame.after.clearRetainingCapacity();
+                if (page.next) |continuation| try frame.after.appendSlice(self.budget.allocator(), continuation);
+                frame.items = page.items;
+                frame.position = 0;
+                frame.last_page = page.next == null;
+                frame.loaded = true;
+                continue;
+            }
+            const relationship = frame.items[frame.position];
+            frame.position += 1;
+            var reused = false;
+            if (operation.mode != .repeatable) for (frame.state.used) |previous| {
+                try e.state();
+                if (v.Value.eql(.{ .relationship = previous }, .{ .relationship = relationship })) {
+                    reused = true;
+                    break;
+                }
+            };
+            if (reused) continue;
+            if (!std.mem.eql(u8, relationship.index, mapping.index) or !std.mem.eql(u8, relationship.type, mapping.name)) return error.CypherInvalidBackendRelationship;
+            const traversing_out = outgoing and relationship.source.eql(current.identity);
+            const target = if (traversing_out) relationship.target else if (incoming and relationship.target.eql(current.identity)) relationship.source else continue;
+            const child = try self.newFrame();
+            var retained = false;
+            defer if (!retained) self.freeFrame(child);
+            const child_scope = Engine.EvalScope.enter(e, child.arena.allocator());
+            defer child_scope.leave(e);
+            const reached = (try e.getNode(target)) orelse continue;
+            if (!try e.graph.admits(reached, if (traversing_out) mapping.target_label else mapping.source_label, &e.values)) continue;
+            if (operation.mode == .node_simple) {
+                var visited = false;
+                for (frame.nodes) |node| {
+                    try e.state();
+                    if (node.identity.eql(reached.identity)) {
+                        visited = true;
+                        break;
+                    }
+                }
+                if (visited) continue;
+            }
+            const candidate = (try e.constrain(frame.state, .{ .relationship = relationship }, edge.properties)) orelse continue;
+            if (frame.relationships.len >= e.limits.path_depth) return error.CypherPathBudgetExceeded;
+            const nodes = try e.a.alloc(*const v.Node, frame.nodes.len + 1);
+            @memcpy(nodes[0..frame.nodes.len], frame.nodes);
+            nodes[frame.nodes.len] = reached;
+            const relationships = try e.a.alloc(*const v.Relationship, frame.relationships.len + 1);
+            @memcpy(relationships[0..frame.relationships.len], frame.relationships);
+            relationships[frame.relationships.len] = relationship;
+            const used = try e.a.alloc(*const v.Relationship, frame.state.used.len + 1);
+            @memcpy(used[0..frame.state.used.len], frame.state.used);
+            used[frame.state.used.len] = relationship;
+            const values = try e.a.alloc(v.Value, frame.edge_values.len + 1);
+            @memcpy(values[0..frame.edge_values.len], frame.edge_values);
+            values[frame.edge_values.len] = .{ .relationship = relationship };
+            child.state = .{ .row = frame.state.row, .used = used, .constraints = candidate.constraints };
+            child.nodes = nodes;
+            child.relationships = relationships;
+            child.edge_values = values;
+            child.edge_index = frame.edge_index;
+            child.hops = frame.hops + 1;
+            try e.state();
+            try self.frames.append(self.budget.allocator(), child);
+            retained = true;
+        }
     }
     pub fn close(self: *NodeCursor) void {
         const allocator = self.backing;
         const budget = self.budget;
+        while (self.frames.items.len != 0) self.popFrame();
+        self.frames.deinit(budget.allocator());
         self.after.deinit(budget.allocator());
         self.engine.regex.deinit();
         self.arena.deinit();
@@ -416,6 +688,7 @@ const Engine = struct {
         sum: v.Value = .{ .integer = 0 },
         mean: f64 = 0,
         best: v.Value = .null,
+        collected: std.ArrayList(v.Value) = .empty,
         fn add(self: *StreamingAggregate, engine: *Engine, row: Row) !void {
             const value = if (self.function.star) v.Value{ .integer = 1 } else try engine.eval(self.function.args[0], row, null);
             if (value == .null) return;
@@ -437,6 +710,12 @@ const Engine = struct {
             }
             self.count += 1;
             if (std.ascii.eqlIgnoreCase(self.function.name, "count")) return;
+            if (std.ascii.eqlIgnoreCase(self.function.name, "collect")) {
+                const retained = self.arena.allocator();
+                const owned = if (self.function.distinct) self.distinct_values.items[self.distinct_values.items.len - 1] else try value.clone(retained);
+                try self.collected.append(retained, owned);
+                return;
+            }
             if (std.ascii.eqlIgnoreCase(self.function.name, "sum")) {
                 if (value != .integer and value != .number) return error.CypherTypeMismatch;
                 self.sum = try engine.binary(.add, self.sum, value);
@@ -461,6 +740,7 @@ const Engine = struct {
         fn result(self: StreamingAggregate) v.Value {
             if (std.ascii.eqlIgnoreCase(self.function.name, "count")) return .{ .integer = @intCast(self.count) };
             if (std.ascii.eqlIgnoreCase(self.function.name, "sum")) return self.sum;
+            if (std.ascii.eqlIgnoreCase(self.function.name, "collect")) return .{ .list = self.collected.items };
             if (self.count == 0) return .null;
             if (std.ascii.eqlIgnoreCase(self.function.name, "avg")) return .{ .number = self.mean };
             return self.best;
@@ -469,7 +749,6 @@ const Engine = struct {
     fn collectStreamingAggregates(self: *Engine, expression: *const ast.Expr, calls: *std.ArrayList(*const ast.Expr)) !bool {
         if (expression.value == .call and aggregateName(expression.value.call.name)) {
             const call_value = expression.value.call;
-            if (std.ascii.eqlIgnoreCase(call_value.name, "collect")) return false;
             for (call_value.args) |arg| if (aggregates(arg)) return false;
             if (call_value.args.len != (if (call_value.star) @as(usize, 0) else 1)) return error.CypherFunctionArity;
             for (calls.items) |prior| if (prior == expression) return true;
@@ -570,8 +849,10 @@ const Engine = struct {
         matched: *usize,
         distinct: []DistinctRows,
         distinct_goal: ?usize = null,
+        accepted: usize = 0,
         fn add(fold: *@This(), engine: *Engine, initial: Row) anyerror!void {
             var row = initial;
+            fold.accepted += 1;
             fold.stage_counts[0] += 1;
             for (fold.middle, 0..) |clause, index| {
                 const projected = try engine.projectUnordered(&.{row}, clause.operation.project.value, false);
@@ -618,7 +899,7 @@ const Engine = struct {
     };
     fn streamMatchProjection(self: *Engine, input: []const Row, operation: ast.Match, projection: ast.Projection, middle: []const ast.Clause, match_span: ast.Span, projection_span: ast.Span) anyerror!?[]const Row {
         if (!self.cache_reads) return null;
-        if (operation.optional or operation.paths.len == 0) return null;
+        if (operation.paths.len == 0) return null;
         if (operation.paths.len > 1) for (operation.paths) |candidate| if (candidate.selector != .all) return null;
         const path = operation.paths[0];
         if (operation.predicate) |predicate| if (@import("expressions.zig").containsPattern(predicate)) return null;
@@ -662,7 +943,7 @@ const Engine = struct {
                 for (path.edges[0].properties) |entry| if (self.constant(entry.value, row) == null) return null;
             }
         }
-        const count_shortest = selected_path and grouped and middle.len == 0 and operation.predicate == null and blk: {
+        const count_shortest = !operation.optional and selected_path and grouped and middle.len == 0 and operation.predicate == null and blk: {
             for (projection.items) |item| if (!aggregates(item.expression)) break :blk false;
             for (calls.items) |expression| if (expression.value.call.distinct or !expression.value.call.star or !std.ascii.eqlIgnoreCase(expression.value.call.name, "count")) break :blk false;
             break :blk true;
@@ -748,12 +1029,23 @@ const Engine = struct {
             const scope = EvalScope.enter(self, scratch.allocator());
             defer scope.leave(self);
             var ignored: std.ArrayList(MatchState) = .empty;
+            const accepted_before = fold.accepted;
             var count_paths: u64 = 0;
             self.shortest_count = if (count_shortest) &count_paths else null;
             self.joinPath(.{ .row = row }, operation, 0, &ignored) catch |err| switch (err) {
                 error.CypherStreamComplete => break :produce,
                 else => return err,
             };
+            if (operation.optional and fold.accepted == accepted_before) {
+                var extended = row;
+                for (self.match_aliases) |alias| if (lookup(extended, alias) == null) {
+                    extended = (try self.bind(extended, alias, .null)).?;
+                };
+                fold.add(self, extended) catch |err| switch (err) {
+                    error.CypherStreamComplete => break :produce,
+                    else => return err,
+                };
+            }
             if (count_shortest) {
                 matched +|= std.math.cast(usize, count_paths) orelse std.math.maxInt(usize);
                 stage_counts[0] = matched;
@@ -1155,7 +1447,7 @@ const Engine = struct {
         // Reuse the route producer with a row collector when downstream
         // operators require materialization. Join planning and early predicate
         // evaluation must not depend on projection/aggregate fusion.
-        if (!operation.optional and operation.paths.len > 1) {
+        if (operation.paths.len > 0) {
             const previous_columns = self.columns;
             const stage_count = self.stages.items.len;
             defer self.columns = previous_columns;
@@ -1291,7 +1583,7 @@ const Engine = struct {
         self.lookup = null;
         defer self.lookup = previous_lookup;
         const path = operation.paths[index];
-        if (index > 0 and index < self.lookups.len and path.nodes.len == 1 and path.nodes[0].labels.len == 1) {
+        if (index < self.lookups.len and input.row.len != 0 and path.nodes.len == 1 and path.nodes[0].labels.len == 1) {
             const node = path.nodes[0];
             if (node.alias) |alias| {
                 var filters: std.ArrayList(backend_mod.PropertyFilter) = .empty;
