@@ -8868,3 +8868,40 @@ generation format, bounded reporter turnover/upload retirement, actual source
 reporting and end-to-end SQL build/rollback/restart gates remain unfinished. The
 previous safety restriction on production retirement is unchanged. No original
 case disposition changes: 483 implemented / 862 unresolved.
+
+### Native physical-root process ownership
+
+Native standalone now retains an exclusive `std.Io` file lease on the replica
+root before admitting its physical native binding. This closes the gap in the
+catalog-path operator lock: independent catalog directories pointing at the same
+replica root previously had independent catalog locks. The root lease lives
+until DataServer and metadata work have shut down. Its stable inode is never
+truncated or unlinked by production code. Opening uses nonblocking exclusive
+locking and rejects a symlinked sentinel; subsequent checks detect a missing or
+replaced sentinel. Durable root UUID and signing checks remain separate.
+
+Index coordinator authority requires the held lease. A configured native
+receiver's shared owner-decision read also requires and checks it before any
+storage effect. That filesystem validation runs outside the metadata mutex.
+Metadata-only observations do not invent a physical receiver or acquire a lease.
+Hot-standby/unsupported native execution remains guarded.
+
+Final Debug qualification passed 79/79 build steps in
+`/private/tmp/antfly-native-root-lease-ci-debug.log`: nine linked native tests
+and four standalone relation/DDL tests, without failures, skips or leaks. The
+linked suite includes the new independent-catalog ownership test, both lease
+unit tests, and all existing initial/ordinary FK, external MATCH PARTIAL,
+cancellation and native TRUNCATE/graph restart fixtures. The new receiver test
+rejects before job lookup when ownership is absent; failed contention preserves
+the second catalog's revision/binding, and complete shutdown permits the next
+owner to acquire the same physical UUID. Existing CI storage/integration gates
+select these tests through the same linked native artifact.
+
+An earlier sandbox run passed ownership and ordinary native cases but rejected
+two HTTP fixtures at loopback bind with EPERM; the final gate uses socket access,
+with no implementation or expectation changes to bypass that restriction.
+License, inventory and compilation-boundary checks pass. No latency benchmark
+or original-case closure is claimed. Coordinated generation-format activation,
+bounded reporter turnover/upload retirement, production reporting and complete
+SQL index build/rollback/restart qualification remain unfinished. Reporter
+replacement and report deletion are not automatically activated by this lease.

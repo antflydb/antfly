@@ -5037,6 +5037,8 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const standalone_initial_fk_tests = b.addTest(.{
         .root_module = standalone_initial_fk_test_mod,
         .filters = &.{
+            "standalone native root ownership excludes independent catalogs until shutdown",
+            "standalone physical root lease",
             "standalone initial self FK private owners publish two ranges after restart",
             "standalone initial external MATCH PARTIAL FK publishes native parent receipts after restart",
             "standalone initial external MATCH PARTIAL FK cancellation retires private child after restart",

@@ -21,6 +21,7 @@ const system_catalog = @import("antfly_local_sources").system_catalog_domain;
 const hot_standby_wal = @import("../storage/wal_runtime.zig");
 const inference_provider = @import("inference_provider.zig");
 const lease_executor = @import("lease_executor.zig");
+const native_root_lease = @import("root_lease.zig");
 const builtin = @import("builtin");
 const platform_sync = @import("antfly_platform").sync;
 const platform_clock = @import("antfly_platform").clock;
@@ -763,6 +764,7 @@ const LocalStandaloneMetadata = struct {
     initial_fk_primed: std.AutoHashMapUnmanaged(u64, TrackedInitialOwner) = .empty,
     metadata_incarnation: ?@import("antfly_local_sources").metadata_incarnation.MetadataClusterIncarnation = null,
     native_owner_binding: ?@import("../metadata/standalone_native_owner.zig").Binding = null,
+    native_owner_lease: ?native_root_lease.Lease = null,
     coordinated_lifecycle_allowed: bool = true,
     hot_standby_gate: ?antfly.db.ReplicationWriteGate = null,
     hot_standby_mirror: ?antfly.db.ReplicationAsyncEffectMirror = null,
@@ -1033,6 +1035,7 @@ const LocalStandaloneMetadata = struct {
         if (self.system_catalog_state) |*state| state.deinit();
         self.vector_migration_commands.deinit(self.alloc);
         if (self.operator_lock) |file| file.close(self.backend_runtime.filesystemIo().?);
+        if (self.native_owner_lease) |*lease| lease.deinit(self.backend_runtime.filesystemIo().?);
         self.extension_catalog.deinit();
         self.manager.deinit();
         self.alloc.free(self.catalog_path);
@@ -2177,6 +2180,10 @@ const LocalStandaloneMetadata = struct {
     /// root cannot acquire the predecessor's hidden-owner authority.
     fn ensureNativeOwnerBindingLocked(self: *LocalStandaloneMetadata) !@import("../metadata/standalone_native_owner.zig").Binding {
         if (!self.localFkPublicationSupported()) return error.UnsupportedOperation;
+        const io = self.backend_runtime.filesystemIo() orelse return error.MissingBackendRuntimeIo;
+        if (self.native_owner_lease == null)
+            self.native_owner_lease = try native_root_lease.Lease.acquire(io, self.replica_root_dir);
+        try self.native_owner_lease.?.check(io);
         const binding = try self.physicalNativeOwnerBinding();
         if (self.native_owner_binding == null) {
             const store = self.lifecycle_store orelse return error.UnsupportedOperation;
@@ -2186,6 +2193,23 @@ const LocalStandaloneMetadata = struct {
             self.epoch = self.durable_revision;
         }
         return binding;
+    }
+
+    fn requireNativeIndexLease(self: *LocalStandaloneMetadata) !void {
+        const lease = blk: {
+            lockAtomic(&self.mutex);
+            defer self.mutex.unlock();
+            // Metadata-only readers have no physical receiver to authorize.
+            if (self.data_server == null) return;
+            if (!self.localFkPublicationSupported()) return error.UnsupportedNativeIndexOwner;
+            break :blk self.native_owner_lease orelse return error.UnsupportedNativeIndexOwner;
+        };
+        // The lease outlives DataServer and all of its requests. Filesystem
+        // validation must not run under the metadata apply/capture mutex.
+        lease.check(self.backend_runtime.filesystemIo() orelse return error.MissingBackendRuntimeIo) catch |err| switch (err) {
+            error.StandaloneRootLeaseChanged => return error.StoreRootEnrollmentChanged,
+            else => return err,
+        };
     }
 
     const CatalogReader = struct {
@@ -2579,6 +2603,7 @@ const LocalStandaloneMetadata = struct {
         const self: *LocalStandaloneMetadata = @ptrCast(@alignCast(ptr));
         try context.ensureActive();
         if (call.isRelationalIndexOwnerCall() and !context.index_publication_authority) return error.Forbidden;
+        if (call == .relational_index_owner_decision) try self.requireNativeIndexLease();
         if (call == .relational_index_begin) return self.beginRelationalIndexPublication(alloc, context, call.relational_index_begin);
         if ((call == .relational_index_status or call == .relational_index_prepare) and !context.setting_admin) return error.Forbidden;
         if ((call == .store_root_enroll or call == .store_root_enrollment_status) and !context.setting_admin) return error.Forbidden;
@@ -3791,6 +3816,7 @@ const LocalStandaloneMetadata = struct {
             lockAtomic(&metadata.mutex);
             defer metadata.mutex.unlock();
             if (!metadata.standaloneRelationPublicationSupported() or !metadata.localFkPublicationSupported()) return null;
+            if (metadata.native_owner_lease == null) return null;
             const binding = metadata.native_owner_binding orelse return null;
             const incarnation = metadata.metadata_incarnation orelse return error.InvalidMetadataIncarnation;
             if (!std.mem.eql(u8, &binding.metadata_incarnation, &incarnation)) return error.StoreRootEnrollmentChanged;
@@ -11981,6 +12007,73 @@ test "standalone shared restore worker imports a mixed dependency cohort without
     var metadata = try LocalStandaloneMetadata.init(alloc, 1, 1, "http://localhost", root, path, runtime.ptr(), null, .local);
     defer metadata.deinit();
     try @import("../api/restore_worker_fixture.zig").runWithPersistence(antfly.public_api.http_server.RestoreWorkerTestDriver, false, metadata.statusSource(), metadata.restorePersistence());
+}
+
+test "standalone native root ownership excludes independent catalogs until shutdown" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/physical-owner", .{tmp.sub_path});
+    defer a.free(root);
+    const first_catalog = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/first/catalog.json", .{tmp.sub_path});
+    defer a.free(first_catalog);
+    const second_catalog = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/second/catalog.json", .{tmp.sub_path});
+    defer a.free(second_catalog);
+    var runtime = try antfly.db.background_runtime.BackendRuntimeHandle.init(a, .{});
+    defer runtime.deinit();
+    var first = try LocalStandaloneMetadata.init(a, 1, 1, "http://localhost", root, first_catalog, runtime.ptr(), null, .local);
+    var first_open = true;
+    defer if (first_open) first.deinit();
+    var first_server = antfly.data.runtime.DataServer.initFromLocalMetadataSources(a, .{
+        .replica_root_dir = root,
+        .replica_catalog_path = first_catalog,
+        .backend_runtime = runtime.ptr(),
+        .store_registration = .{ .node_id = 1, .store_id = 1, .api_url = "http://localhost", .role = "data" },
+        .api_server_cfg = .{ .deployment_mode = .standalone },
+    }, first.catalogSource(), first.statusSource());
+    defer if (first_open) first_server.deinit();
+    first.data_server = &first_server;
+    try std.testing.expect(first.localFkPublicationSupported());
+    const binding = blk: {
+        var lock = try first.lockMutation();
+        defer lock.deinit();
+        break :blk try first.ensureNativeOwnerBindingLocked();
+    };
+    try std.testing.expect(first.native_owner_lease != null);
+    var second = try LocalStandaloneMetadata.init(a, 1, 1, "http://localhost", root, second_catalog, runtime.ptr(), null, .local);
+    defer second.deinit();
+    var second_server = antfly.data.runtime.DataServer.initFromLocalMetadataSources(a, .{
+        .replica_root_dir = root,
+        .replica_catalog_path = second_catalog,
+        .backend_runtime = runtime.ptr(),
+        .store_registration = .{ .node_id = 1, .store_id = 1, .api_url = "http://localhost", .role = "data" },
+        .api_server_cfg = .{ .deployment_mode = .standalone },
+    }, second.catalogSource(), second.statusSource());
+    defer second_server.deinit();
+    second.data_server = &second_server;
+    {
+        var lock = try second.lockMutation();
+        defer lock.deinit();
+        const revision = try second.lifecycle_store.?.standaloneRevision();
+        try std.testing.expectError(error.StandaloneRootInUse, second.ensureNativeOwnerBindingLocked());
+        try std.testing.expect(second.native_owner_lease == null and second.native_owner_binding == null);
+        try std.testing.expectEqual(revision, try second.lifecycle_store.?.standaloneRevision());
+    }
+    // Both native mutation and private-claim ports obtain permission through
+    // this metadata read. A configured receiver without the physical lease
+    // must fail before inspecting any job or reaching a storage effect.
+    try std.testing.expectError(error.UnsupportedNativeIndexOwner, second.statusSource().systemCatalog(a, .{ .index_publication_authority = true }, .{ .relational_index_owner_decision = .{ .table_id = 101, .group_id = 301, .id = @splat(1), .operation = .fence } }));
+    first_server.deinit();
+    first.deinit();
+    first_open = false;
+    {
+        var lock = try second.lockMutation();
+        defer lock.deinit();
+        const next = try second.ensureNativeOwnerBindingLocked();
+        try std.testing.expectEqual(binding.root_incarnation, next.root_incarnation);
+        try std.testing.expect(!std.mem.eql(u8, &binding.metadata_incarnation, &next.metadata_incarnation));
+        try std.testing.expect(second.native_owner_lease != null);
+    }
 }
 
 test "standalone initial self FK private owners publish two ranges after restart" {
