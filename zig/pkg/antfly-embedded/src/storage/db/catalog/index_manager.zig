@@ -9450,6 +9450,24 @@ pub const IndexManager = struct {
         _ = entry.validateServingCertificate(checkpoint);
     }
 
+    /// Carry only an already-certified empty publication across a durable
+    /// source-only native watermark. Call under the existing apply/catalog
+    /// publication fence. Ordinary native ingestion still omits count sidecars;
+    /// reads never mint certificates or inspect the live mutable cardinality.
+    pub fn preserveCertifiedEmptyDenseCheckpoint(
+        self: *IndexManager,
+        alloc: Allocator,
+        store: anytype,
+        checkpoint_path: ?[]const u8,
+        index_name: []const u8,
+    ) !void {
+        const entry = self.denseIndex(index_name) orelse return error.IndexNotFound;
+        const checkpoint = self.denseProjectionCheckpointMetadata(index_name) orelse return error.InvalidDerivedApplyState;
+        const certified = entry.certifiedEmptyNativeCheckpoint(checkpoint) orelse return;
+        try apply_state.saveProjectionCheckpointWithSidecar(alloc, self.checkpointIo(), store, checkpoint_path, index_name, certified);
+        _ = entry.validateServingCertificate(certified);
+    }
+
     pub fn denseProjectionCheckpointMetadata(
         self: *const IndexManager,
         index_name: []const u8,
