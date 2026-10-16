@@ -772,3 +772,76 @@ test "shortest paths preserve rebound route aliases and bound-target frontier li
     try std.testing.expectEqual(@as(usize, 2), result.rows.len);
     try std.testing.expectEqual(@as(usize, 2), result.stats.explored_edges);
 }
+
+test "streaming aggregation composes WITH keys and aggregate expressions" {
+    try check("MATCH (n:Document) WITH count(*) AS c RETURN c+1", "[[4]]");
+    try check("MATCH (n:Document) WITH n.rank%2 AS k,count(*) AS c RETURN sum(c)", "[[3]]");
+    try check("MATCH (n:Document) WITH n WITH n.rank AS r WHERE r>1 RETURN count(*)+1,sum(r)*2", "[[3,10]]");
+    try check("MATCH (n:Document) RETURN n.rank%2 AS bucket,count(*)+10 AS total ORDER BY bucket", "[[0,11],[1,12]]");
+    try check("MATCH (n:Document) RETURN {total:count(*),avg:avg(n.rank)}", "[[{\"total\":3,\"avg\":2}]]");
+    try check("MATCH (n:Document) WHERE n.rank<0 WITH n RETURN count(*)+1", "[[1]]");
+    try check("MATCH (n:Document) WITH n WHERE n.rank<0 RETURN count(*)", "[[0]]");
+    try check("MATCH (n:Document) WITH n.rank AS r RETURN r%2 AS b,sum(r) AS s ORDER BY s DESC LIMIT 1", "[[1,4]]");
+    try check("MATCH (n:Document) RETURN n.rank%2 AS b,sum(n.rank) AS s ORDER BY sum(n.rank) DESC", "[[1,4],[0,2]]");
+}
+
+test "nested owner RPC scans keep grouped pipeline memory independent of input size" {
+    const Large = struct {
+        count: usize,
+        fn bind(_: *anyopaque, _: std.mem.Allocator, _: catalog.Graph) !void {}
+        fn checkpoint(_: *anyopaque) !void {}
+        fn get(_: *anyopaque, _: std.mem.Allocator, _: v.Identity) !?*const v.Node {
+            return null;
+        }
+        fn expand(_: *anyopaque, _: std.mem.Allocator, _: catalog.Relationship, _: v.Identity, _: c.ast.Direction, _: ?[]const u8, _: usize) !b.Page(*const v.Relationship) {
+            return .{ .items = &.{} };
+        }
+        fn scan(ptr: *anyopaque, a: std.mem.Allocator, _: []const u8, after: ?[]const u8, limit: usize) !b.Page(*const v.Node) {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            const start = if (after) |key| try std.fmt.parseInt(usize, key, 10) else 0;
+            const end = start + @min(limit, self.count - start);
+            const nodes = try a.alloc(*const v.Node, end - start);
+            for (nodes, start..) |*out, index| {
+                const key = try std.fmt.allocPrint(a, "n{d}", .{index});
+                const node = try a.create(v.Node);
+                const properties = try a.dupe(v.Entry, &.{ .{ .name = "id", .value = .{ .string = key } }, .{ .name = "score", .value = .{ .integer = @intCast(index) } } });
+                node.* = .{ .identity = .{ .table = "docs", .key = key }, .labels = &.{"Document"}, .properties = properties };
+                out.* = node;
+            }
+            return .{ .items = nodes, .next = if (end < self.count) try std.fmt.allocPrint(a, "{d}", .{end}) else null };
+        }
+        fn backend(self: *@This()) b.Backend {
+            return .{ .ptr = self, .vtable = &.{ .bind = bind, .checkpoint = checkpoint, .scan = scan, .get = get, .expand = expand } };
+        }
+    };
+    const definition: catalog.Graph = .{ .name = "g", .incarnation = 1, .revision = 1, .labels = &.{.{ .name = "Document", .table = "docs" }}, .relationships = &.{} };
+    const Link = struct {
+        child: b.Backend,
+        fn call(ptr: *anyopaque, a: std.mem.Allocator, body: []const u8) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return (@import("rpc.zig").Owner{ .backend = self.child, .graph = definition, .table = "docs" }).execute(a, body);
+        }
+    };
+    var diagnostic: c.Diagnostic = .{};
+    var compiled = try c.compile(std.testing.allocator, "MATCH (n:Document) WITH n.score AS s RETURN s%2 AS bucket,count(*) AS total ORDER BY bucket", .{}, &diagnostic);
+    defer compiled.deinit();
+    var previous: usize = 0;
+    var previous_physical: usize = 0;
+    for ([_]usize{ 2000, 10000 }) |count| {
+        var fixture: Large = .{ .count = count };
+        var first_link: Link = .{ .child = fixture.backend() };
+        var first_client: @import("rpc.zig").Client = .{ .incarnation = 1, .revision = 1, .channel = .{ .ptr = &first_link, .call = Link.call } };
+        var second_link: Link = .{ .child = first_client.backend() };
+        var second_client: @import("rpc.zig").Client = .{ .incarnation = 1, .revision = 1, .channel = .{ .ptr = &second_link, .call = Link.call } };
+        var physical: @import("budget.zig") = .{ .backing = std.testing.allocator, .limit = 128 << 20 };
+        var request_arena = std.heap.ArenaAllocator.init(physical.allocator());
+        defer request_arena.deinit();
+        var result = try runtime.execute(request_arena.allocator(), second_client.backend(), definition, &compiled, &.{}, .{ .memory_bytes = 8 << 20 });
+        defer result.deinit();
+        try std.testing.expectEqual(@as(i64, @intCast(count / 2)), result.rows[0][1].integer);
+        if (previous != 0) try std.testing.expect(result.stats.memory_bytes <= previous + (1 << 20));
+        previous = result.stats.memory_bytes;
+        if (previous_physical != 0) try std.testing.expect(physical.peak <= previous_physical + (1 << 20));
+        previous_physical = physical.peak;
+    }
+}

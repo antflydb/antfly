@@ -3583,6 +3583,10 @@ pub const DB = struct {
     /// caller must obtain it under a statement capture fence after read-index
     /// admission. It deliberately cannot be serialized across owners.
     pub const RelationalStatementSnapshot = struct {
+        /// Optional immutable index authority captured with the primary cut.
+        /// Legacy delayed SQL readers deliberately retain only the primary path.
+        index_catalog_captured: bool = false,
+        indexes: ?relational_index_catalog.WriteSnapshot = null,
         row_policy_lease: ?row_policy_gate_mod.Gate.Lease = null,
         row_policy_phase: table_catalog_mod.RowPolicyPhase = .disabled,
         row_policy_generation: u64 = 0,
@@ -3592,6 +3596,7 @@ pub const DB = struct {
 
         pub fn deinit(self: *@This()) void {
             if (comptime storage_engine.enabled) return storage_engine.call("relationalSnapshotDeinit", .{self}) catch @panic("incompatible storage owner");
+            if (self.indexes) |*indexes| indexes.deinit();
             self.read.abort();
             if (self.row_policy_lease) |*lease| lease.release();
             self.* = undefined;
@@ -3647,16 +3652,16 @@ pub const DB = struct {
     }
 
     fn beginRelationalRowsAtSnapshot(self: *DB, alloc: Allocator, request: RelationalRows.Request, statement: ?*RelationalStatementSnapshot) !RelationalRows.Reader {
-        // A delayed scan may use only the primary path. READY index state and
-        // auto-index plans can change after the original visibility cut.
-        if (statement != null and (request.index != null or request.auto_index)) return error.SqlStatementSnapshotRequired;
+        // Delayed index reads require the catalog pin captured with their
+        // primary snapshot. Never substitute a later live index generation.
+        if (statement) |cut| if (!cut.index_catalog_captured and (request.index != null or request.auto_index)) return error.SqlStatementSnapshotRequired;
         try self.lockApplySharedForPortableRuntime();
         var locked = true;
         defer if (locked) self.core.unlockApplyShared();
         var view = self.core.acquireSchemaView() orelse return error.RelationalTableRequired;
         defer view.release();
         if (statement) |cut| if (view.version() != cut.schema_version) return error.PreparedGenerationChanged;
-        var indexes = self.core.relational_indexes.acquire();
+        var indexes = if (statement) |cut| if (cut.indexes) |pinned| relational_index_catalog.WriteSnapshot{ .head = pinned.head, .plan = pinned.plan.clone() } else null else self.core.relational_indexes.acquire();
         defer if (indexes) |*pinned| pinned.deinit();
         const read_snapshot = if (statement) |cut| try cut.read.forkRead() else try self.core.store.beginReadTxn();
         const authenticated = self.core.store.valuesAreAuthenticated();
@@ -40181,7 +40186,7 @@ pub const DB = struct {
             .index = parsed.value.index,
             .auto_index = parsed.value.auto_index,
             .include_primary_digest = opts.include_content_hashes,
-            .include_cursor = parsed.value.index != null,
+            .include_cursor = parsed.value.index != null or parsed.value.auto_index,
             .after = parsed.value.after,
             .lower = lower,
             .upper = upper,

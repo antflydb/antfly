@@ -27,6 +27,7 @@ const A = std.mem.Allocator;
 pub const Snapshot = struct {
     a: A,
     primary: docstore.DocStore.Txn,
+    indexes: ?@import("relational_index_catalog.zig").WriteSnapshot = null,
     schema_version: u32,
     now: u64,
     graphs: []Graph,
@@ -38,16 +39,24 @@ pub const Snapshot = struct {
             self.a.free(entry.name);
         }
         self.a.free(self.graphs);
+        if (self.indexes) |*indexes| indexes.deinit();
         self.primary.abort();
         self.* = undefined;
     }
 };
 pub fn capture(db: anytype, a: A, fence: anytype, definition: cypher.catalog.Graph, table: []const u8) !Snapshot {
     if (fence.source != db) return error.CypherSnapshotRequired;
+    db.core.lockApplyShared();
+    var locked = true;
+    defer if (locked) db.core.unlockApplyShared();
     var schema = db.core.acquireSchemaView();
     defer if (schema) |*view| view.release();
     var primary = try db.core.store.beginReadTxn();
     errdefer primary.abort();
+    var indexes = db.core.relational_indexes.acquire();
+    errdefer if (indexes) |*pinned| pinned.deinit();
+    db.core.unlockApplyShared();
+    locked = false;
     var graphs: std.ArrayList(Snapshot.Graph) = .empty;
     errdefer {
         for (graphs.items) |*entry| {
@@ -74,7 +83,7 @@ pub fn capture(db: anytype, a: A, fence: anytype, definition: cypher.catalog.Gra
         errdefer a.free(name);
         try graphs.append(a, .{ .name = name, .identity = identity, .context = context });
     }
-    return .{ .a = a, .primary = primary, .schema_version = if (schema) |view| view.version() else 0, .now = @import("antfly_platform").time.realtimeNs(), .graphs = try graphs.toOwnedSlice(a) };
+    return .{ .a = a, .primary = primary, .indexes = indexes, .schema_version = if (schema) |view| view.version() else 0, .now = @import("antfly_platform").time.realtimeNs(), .graphs = try graphs.toOwnedSlice(a) };
 }
 pub fn scan(db: anytype, a: A, cut: *Snapshot, from: []const u8, to: []const u8, input: types.ScanOptions) !types.ScanResult {
     var schema = db.core.acquireSchemaView();
@@ -89,7 +98,12 @@ pub fn scan(db: anytype, a: A, cut: *Snapshot, from: []const u8, to: []const u8,
     var collector: collectors.Scan = .{ .alloc = a, .include_documents = true };
     defer collector.deinit();
     if (schema != null and schema.?.storageMode() == .relational) {
-        var statement: @TypeOf(db.*).RelationalStatementSnapshot = .{ .read = try cut.primary.forkRead(), .schema_version = cut.schema_version, .row_policy_lease = try db.acquireCypherReadAuthority(temporary, "", "default") };
+        var statement: @TypeOf(db.*).RelationalStatementSnapshot = retained: {
+            var read = try cut.primary.forkRead();
+            errdefer read.abort();
+            const lease = try db.acquireCypherReadAuthority(temporary, "", "default");
+            break :retained .{ .read = read, .schema_version = cut.schema_version, .row_policy_lease = lease };
+        };
         defer statement.deinit();
         const session = try db.openRelationalReadSessionAtSnapshot(temporary, from, to, opts, &statement);
         defer session.deinit();
@@ -157,6 +171,21 @@ pub fn Database(comptime DB: type) type {
         }
         pub fn scan(self: *@This(), a: A, from: []const u8, to: []const u8, opts: types.ScanOptions) !types.ScanResult {
             return self.source.scanCypherPinnedSnapshot(a, &self.cut, from, to, opts);
+        }
+        pub fn cypherDocumentScanOptions(self: *@This(), a: A, opts: types.ScanOptions) !types.ScanOptions {
+            return self.source.cypherDocumentScanOptions(a, opts);
+        }
+        pub fn openRelationalReadSession(self: *@This(), a: A, from: []const u8, to: []const u8, opts: types.ScanOptions) !*DB.RelationalReadSession {
+            var statement: DB.RelationalStatementSnapshot = cut: {
+                var read = try self.cut.primary.forkRead();
+                errdefer read.abort();
+                const lease = try self.source.acquireCypherReadAuthority(a, opts.row_policy_principal_proof, opts.row_policy_database);
+                break :cut .{ .index_catalog_captured = true, .indexes = if (self.cut.indexes) |indexes| .{ .head = indexes.head, .plan = indexes.plan.clone() } else null, .read = read, .schema_version = self.cut.schema_version, .row_policy_lease = lease };
+            };
+            defer statement.deinit();
+            const session = try self.source.openRelationalReadSessionAtSnapshot(a, from, to, opts, &statement);
+            session.reader.now_ns = self.cut.now;
+            return session;
         }
         pub fn getDocument(self: *@This(), a: A, key: []const u8, _: types.LookupOptions) !?types.LookupResult {
             var page = try self.scan(a, key, key, .{ .inclusive_from = true, .include_documents = true, .limit = 1 });

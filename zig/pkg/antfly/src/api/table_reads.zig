@@ -4115,7 +4115,16 @@ pub const ProvisionedTableReadSource = struct {
         if (input.tables.len == 0 or input.tables.len > 64) return error.CypherOwnerBudgetExceeded;
         const factory = @import("graph_statement_source.zig");
         var plans: std.ArrayList(factory.Plan) = .empty;
-        defer plans.deinit(alloc);
+        defer {
+            for (plans.items) |plan| {
+                for (plan.ranges) |range| {
+                    alloc.free(range.start);
+                    if (range.end) |end| alloc.free(end);
+                }
+                alloc.free(plan.ranges);
+            }
+            plans.deinit(alloc);
+        }
         var routes: std.ArrayList(table_router.GroupRoute) = .empty;
         defer {
             for (routes.items) |*route| route.deinit(alloc);
@@ -4134,6 +4143,9 @@ pub const ProvisionedTableReadSource = struct {
             try certifyDelayedOwnerCut(owned.group_ids.len);
             try tableReadsValidateDocIdentityReadyForMultiGroup(alloc, self.catalog, table.name, owned.group_ids.len);
             owned.releaseActivity();
+            var routing = (try table_catalog.observedTableRoutingSnapshot(alloc, self.catalog, table.name, input.deadline_ns)) orelse return error.CatalogGenerationChanged;
+            defer routing.deinit(alloc);
+            if (routing.table_id != owned.table_id or routing.topology_epoch != owned.topology_epoch or !routing.coversKeyspace()) return error.TopologyChanged;
             for (owned.group_ids, 0..) |group, i| {
                 if (plans.items.len >= 1024) return error.CypherOwnerBudgetExceeded;
                 var route: table_router.GroupRoute = if (self.distributed_router) |router|
@@ -4142,7 +4154,25 @@ pub const ProvisionedTableReadSource = struct {
                     table_router.GroupRoute.local;
                 errdefer route.deinit(alloc);
                 const fence = owned.fenceAt(i, input.deadline_ns, input.cancellation);
-                try plans.append(alloc, .{ .table = table, .fence = fence, .route = switch (route) {
+                try plans.ensureUnusedCapacity(alloc, 1);
+                try routes.ensureUnusedCapacity(alloc, 1);
+                var ranges: std.ArrayList(@import("cypher").distributed.KeyRange) = .empty;
+                errdefer {
+                    for (ranges.items) |range| {
+                        alloc.free(range.start);
+                        if (range.end) |end| alloc.free(end);
+                    }
+                    ranges.deinit(alloc);
+                }
+                for (routing.ranges) |range| if (range.group_id == group) {
+                    const start = try alloc.dupe(u8, range.start_key);
+                    errdefer alloc.free(start);
+                    const end = if (range.end_key) |end| try alloc.dupe(u8, end) else null;
+                    errdefer if (end) |value| alloc.free(value);
+                    try ranges.append(alloc, .{ .start = start, .end = end });
+                };
+                if (ranges.items.len == 0) return error.TopologyChanged;
+                try plans.append(alloc, .{ .table = table, .fence = fence, .ranges = try ranges.toOwnedSlice(alloc), .route = switch (route) {
                     .local => .{ .local = self.groupLocalSourceWithFence(fence) },
                     .remote => |remote| .{ .remote = .{ .executor = self.distributedInternalExecutor(), .base_uri = remote.base_uri } },
                 } });

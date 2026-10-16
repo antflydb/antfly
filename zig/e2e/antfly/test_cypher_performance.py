@@ -1,0 +1,174 @@
+# Copyright 2026 Antfly, Inc.
+# SPDX-License-Identifier: Elastic-2.0
+#
+# Licensed under the Elastic License 2.0 (ELv2); you may not use this file
+# except in compliance with the Elastic License 2.0. You may obtain a copy of
+# the Elastic License 2.0 at
+#
+#     https://www.antfly.io/licensing/ELv2-license
+#
+# Unless required by applicable law or agreed to in writing, software distributed
+# under the Elastic License 2.0 is distributed on an "AS IS" BASIS, WITHOUT
+# WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+# Elastic License 2.0 for the specific language governing permissions and
+# limitations.
+
+"""Native graph access-path and staged SQL regression campaigns."""
+
+import os
+import json
+import conftest
+import subprocess
+import sys
+import time
+import uuid
+from pathlib import Path
+
+import pytest
+import requests
+
+from conftest import (
+    AUTH_BOOTSTRAP_PASSWORD,
+    DEFAULT_ANTFLY_BIN,
+    StandaloneAntflyServer,
+    find_free_port,
+)
+
+
+def test_authenticated_cypher_property_plans_and_sql_overlays(monkeypatch):
+    monkeypatch.setenv(
+        "ANTFLY_TRUSTED_PRINCIPAL_SECRET", "cypher-performance-principal-secret-v1"
+    )
+    monkeypatch.setenv("ANTFLY_TRUSTED_PRINCIPAL_ISSUER", "cypher-performance")
+    write_config = conftest._write_remote_content_e2e_config
+
+    def with_graph_work_budget(*args, **kwargs):
+        path = write_config(*args, **kwargs)
+        config = json.loads(path.read_text())
+        config["graph_execution"] = {"max_intermediate_states": 1000000}
+        path.write_text(json.dumps(config))
+        return path
+
+    monkeypatch.setattr(
+        conftest, "_write_remote_content_e2e_config", with_graph_work_budget
+    )
+    binary = os.environ.get("ANTFLY_BIN", str(DEFAULT_ANTFLY_BIN))
+    if not Path(binary).exists():
+        pytest.skip("native Antfly binary is unavailable")
+    server = StandaloneAntflyServer(binary, "127.0.0.1", find_free_port(), pgwire=True)
+    session = requests.Session()
+    session.auth = ("admin", AUTH_BOOTSTRAP_PASSWORD)
+    table = "cypher_access_" + uuid.uuid4().hex
+    graph = table + "_g"
+    try:
+
+        def call(path, body, *, wait_for_index=False):
+            deadline = time.monotonic() + 60
+            while True:
+                response = session.post(
+                    server.api_url.rstrip("/") + path, json=body, timeout=45
+                )
+                if not (
+                    wait_for_index
+                    and response.status_code == 429
+                    and response.json().get("code") == "CypherAnchorBudgetExceeded"
+                    and time.monotonic() < deadline
+                ):
+                    break
+                # SQL index publication precedes asynchronous owner backfill.
+                # Retry only this read until its strict budget proves READY use.
+                time.sleep(0.1)
+            assert response.status_code in (200, 201, 202), (
+                response.status_code,
+                response.text,
+                server.log_path.read_text()[-6000:],
+            )
+            return response.json()
+
+        call("/sql", {"statement": f"CREATE TABLE {table} (id TEXT, score BIGINT)"})
+        call("/sql", {"statement": f"CREATE INDEX {table}_id ON {table}(id)"})
+        call(
+            f"/tables/{table}/batch",
+            {
+                "inserts": {f"n{i}": {"id": f"n{i}", "score": i} for i in range(2000)},
+                "sync_level": "full_index",
+            },
+        )
+        call(
+            f"/graphs/{graph}",
+            {"labels": [{"name": "D", "table": table}], "relationships": []},
+        )
+        result = call(
+            f"/graphs/{graph}/query",
+            {
+                "query": "MATCH (n:D {id:'n1999'}) RETURN n.score",
+                "limits": {"scanned_anchors": 4},
+            },
+            wait_for_index=True,
+        )
+        assert result["rows"] == [[{"type": "integer", "value": "1999"}]], result
+        result = call(
+            f"/graphs/{graph}/query",
+            {
+                "query": "MATCH (n:D) WITH n.score AS s RETURN s%2 AS bucket,count(*) AS total ORDER BY bucket",
+                "limits": {"memory_bytes": 8 << 20},
+            },
+        )
+        assert [[cell["value"] for cell in row] for row in result["rows"]] == [
+            ["0", "1000"],
+            ["1", "1000"],
+        ], result
+        first_memory = result["stats"]["memory_bytes"]
+        call(
+            f"/tables/{table}/batch",
+            {
+                "inserts": {
+                    f"n{i}": {"id": f"n{i}", "score": i} for i in range(2000, 10000)
+                },
+                "sync_level": "full_index",
+            },
+        )
+        result = call(
+            f"/graphs/{graph}/query",
+            {
+                "query": "MATCH (n:D) WITH n.score AS s RETURN s%2 AS bucket,count(*) AS total ORDER BY bucket",
+                "limits": {"memory_bytes": 8 << 20},
+            },
+        )
+        assert [[cell["value"] for cell in row] for row in result["rows"]] == [
+            ["0", "5000"],
+            ["1", "5000"],
+        ], result
+        assert result["stats"]["memory_bytes"] <= first_memory + (1 << 20), result
+        script = (
+            Path(__file__).resolve().parents[2]
+            / "scripts"
+            / "verify_cypher_sql_transaction.py"
+        )
+        for policy in (False, True):
+            command = [
+                sys.executable,
+                str(script),
+                "--url",
+                server.url,
+                "--pgport",
+                str(server.pgwire_port),
+            ]
+            if policy:
+                command.append("--policy")
+            result = subprocess.run(
+                command,
+                capture_output=True,
+                text=True,
+                timeout=220,
+                env={
+                    **os.environ,
+                    "ANTFLY_CYPHER_TEST_AUTH": f"admin:{AUTH_BOOTSTRAP_PASSWORD}",
+                },
+            )
+            assert result.returncode == 0, (
+                result.stdout + result.stderr + server.log_path.read_text()[-6000:]
+            )
+    finally:
+        session.close()
+        server.stop()

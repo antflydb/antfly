@@ -34,6 +34,7 @@ pub fn reclaimingAllocator(input: std.mem.Allocator) std.mem.Allocator {
 pub fn Page(comptime T: type) type {
     return struct { items: []const T, next: ?[]const u8 = null, examined: ?usize = null };
 }
+pub const PropertyFilter = struct { property: []const u8, value: v.Value };
 pub const Seed = struct { node: *const v.Node, score: f64 };
 pub const SearchInput = struct { parameters: v.Value, prepared_json: []const u8 = "", max_examined: usize = 1_000_000 };
 pub const SearchPage = struct { seeds: []const Seed, examined: usize = 0, approximate: bool = false };
@@ -117,6 +118,9 @@ pub const Backend = struct {
         bind: *const fn (*anyopaque, std.mem.Allocator, catalog.Graph) anyerror!void,
         checkpoint: *const fn (*anyopaque) anyerror!void,
         scan: *const fn (*anyopaque, std.mem.Allocator, []const u8, ?[]const u8, usize) anyerror!Page(*const v.Node),
+        /// Equality constraints are candidate restrictions; the runtime always
+        /// rechecks Cypher semantics after authorization and projection.
+        scan_where: ?*const fn (*anyopaque, std.mem.Allocator, []const u8, []const PropertyFilter, ?[]const u8, usize) anyerror!Page(*const v.Node) = null,
         /// Authorized document lookup also serves nonvertex producers. The runtime
         /// applies graph membership before admitting traversal endpoints.
         get: *const fn (*anyopaque, std.mem.Allocator, v.Identity) anyerror!?*const v.Node,

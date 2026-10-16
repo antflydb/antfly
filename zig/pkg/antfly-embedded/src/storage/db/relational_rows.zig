@@ -112,6 +112,9 @@ pub const Page = struct {
     rows: []const Row,
     more: bool,
     records_examined: usize,
+    /// Index continuation after the last examined record, including rejected
+    /// candidates. Unlike row cursors this also advances empty result pages.
+    next_cursor: ?[]const u8 = null,
     output_bytes: usize,
     /// Work counters distinguish covering scans from primary-row fallbacks.
     primary_lookups: usize = 0,
@@ -280,7 +283,7 @@ pub const Reader = struct {
         // predicates remain residual checks against the selected snapshot.
         var planner_candidates: usize = 0;
         var planner_records: usize = 0;
-        if (selected_index == null and request.auto_index and request.primary_lower == null and request.primary_upper == null) {
+        if (request.auto_index and request.primary_lower == null and request.primary_upper == null) {
             if (indexes) |pinned| {
                 if (pinned.plan.schemaView().epoch != active_view.epoch) return error.PreparedGenerationChanged;
                 const raw_head = try read.get(catalog.head_key);
@@ -306,6 +309,9 @@ pub const Reader = struct {
                     }
                 }
                 for (pinned.plan.boundIndexes()) |candidate| {
+                    // A resumed automatic scan keeps its exact index identity
+                    // while reapplying predicate bounds to the remaining range.
+                    if (request.index) |name| if (!std.mem.eql(u8, candidate.name, name)) continue;
                     if (candidate.tuple.keys.len == 0) continue;
                     var equality_count: usize = 0;
                     var candidate_values: [32]Value = @splat(.null);
@@ -397,8 +403,13 @@ pub const Reader = struct {
                     }
                     if (best_candidate) |candidate| {
                         const bounds = try candidate.bounds(owned, request.conditions, conditions);
-                        lower = bounds.lower;
-                        upper = bounds.upper;
+                        if (request.index != null) {
+                            if (std.mem.order(u8, bounds.lower, lower) == .gt) lower = bounds.lower;
+                            if (std.mem.order(u8, bounds.upper, upper) == .lt) upper = bounds.upper;
+                        } else {
+                            lower = bounds.lower;
+                            upper = bounds.upper;
+                        }
                     }
                 }
             }
@@ -419,6 +430,9 @@ pub const Reader = struct {
                 };
             } else index_only = false;
         }
+        if (selected_index) |index| if (request.include_cursor) {
+            cursor_identity = row_cursor_codec.identity(active_view.version(), index.name, index.tuple.fingerprint);
+        };
         return .{
             .alloc = alloc,
             .arena = arena,
@@ -436,7 +450,7 @@ pub const Reader = struct {
             .now_ns = now_ns,
             .authenticated = authenticated,
             .include_primary_digest = request.include_primary_digest,
-            .include_cursor = request.include_cursor,
+            .include_cursor = request.include_cursor and selected_index != null,
             .cursor_identity = cursor_identity,
             .row_filter = request.row_filter,
             .index_only = index_only,
@@ -857,6 +871,10 @@ pub const Reader = struct {
                 exhausted = false;
                 break;
             }
+        }
+        if (!exhausted and self.include_cursor and self.index != null) {
+            const prefix = try records.forwardPrefix(self.index.?.id());
+            result.next_cursor = try row_cursor_codec.encode(page, self.cursor_identity.?, continuation.items[prefix.len..]);
         }
         try self.after.ensureTotalCapacity(self.alloc, continuation.items.len);
         @memcpy(self.after.items.ptr[0..continuation.items.len], continuation.items);

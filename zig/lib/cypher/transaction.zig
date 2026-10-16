@@ -61,7 +61,7 @@ pub const Overlay = struct {
     const Reference = struct { position: usize, version: usize };
     const Node = struct { value: *v.Node, deleted: bool = false, created: bool = false, dirty: bool = false, projection_cached: bool = false, projected: ?*const v.Node = null };
     const Relationship = struct { value: *v.Relationship, deleted: bool = false, created: bool = false, dirty: bool = false, version: usize = 0, from_base: bool = false };
-    const plain_vtable: b.Backend.VTable = .{ .bind = bind, .checkpoint = checkpoint, .scan = scan, .get = get, .get_relationship = getRelationship, .expand = expand, .search = search, .set_work = setWork, .begin = begin, .startup_work = startupWork, .mutate = mutate, .commit = commit, .rollback = rollback, .new_identity = newIdentity };
+    const plain_vtable: b.Backend.VTable = .{ .bind = bind, .checkpoint = checkpoint, .scan = scan, .scan_where = scanWhere, .get = get, .get_relationship = getRelationship, .expand = expand, .search = search, .set_work = setWork, .begin = begin, .startup_work = startupWork, .mutate = mutate, .commit = commit, .rollback = rollback, .new_identity = newIdentity };
     const projecting_vtable: b.Backend.VTable = projected: {
         var value = plain_vtable;
         value.project_node = projectNode;
@@ -420,7 +420,10 @@ pub const Overlay = struct {
                     try self.appendRelationship(retained_a, .{ .value = copy, .from_base = true });
                     break :blk self.findRelationship(.{ .identity = value.identity, .index = value.index }).?;
                 };
-                if (!item.deleted and try self.producerVisible(a, item.value)) try found.append(a, item.value);
+                // Staged replacements are emitted only in the staged phase.
+                // This also lets hosts install exact tombstones without first
+                // enumerating the native adjacency that they mask.
+                if (!item.dirty and !item.created and !item.deleted and try self.producerVisible(a, item.value)) try found.append(a, item.value);
             }
             return .{ .items = try found.toOwnedSlice(a), .next = try std.json.Stringify.valueAlloc(a, LazyCursor{ .staged = page.next == null, .native = page.next }, .{}), .examined = page.examined orelse page.items.len };
         }
@@ -430,7 +433,7 @@ pub const Overlay = struct {
         for (references[cursor.offset..end]) |reference| {
             try self.charge(1);
             const item = self.currentReference(reference) orelse continue;
-            if (item.from_base or item.deleted or !std.mem.eql(u8, item.value.type, mapping.name) or !std.mem.eql(u8, item.value.index, mapping.index)) continue;
+            if ((item.from_base and !item.dirty and !item.created) or item.deleted or !std.mem.eql(u8, item.value.type, mapping.name) or !std.mem.eql(u8, item.value.index, mapping.index)) continue;
             if (!((direction != .in and item.value.source.eql(identity)) or (direction != .out and item.value.target.eql(identity)))) continue;
             if (try self.producerVisible(a, item.value)) try found.append(a, item.value);
         }
@@ -449,6 +452,54 @@ pub const Overlay = struct {
                 if (after == null) break;
             }
         }
+    }
+    fn scanWhere(ptr: *anyopaque, a: A, table: []const u8, filters: []const b.PropertyFilter, after: ?[]const u8, limit: usize) anyerror!b.Page(*const v.Node) {
+        const self = cast(ptr);
+        try checkpoint(ptr);
+        const filtered = self.base.vtable.scan_where orelse return scan(ptr, a, table, after, limit);
+        if (!self.active) return filtered(self.base.ptr, a, table, filters, after, limit);
+        if (!self.lazy or filters.len == 0) return scan(ptr, a, table, after, limit);
+        if (limit == 0) return error.CypherInvalidBackendPage;
+        const cursor = if (after) |encoded| try std.json.parseFromSliceLeaky(LazyCursor, a, encoded, .{}) else LazyCursor{};
+        var found: std.ArrayList(*const v.Node) = .empty;
+        if (!cursor.staged) {
+            const page = try filtered(self.base.ptr, a, table, filters, cursor.native, limit);
+            for (page.items) |value| {
+                if (self.findNode(value.identity)) |node| {
+                    // Emit every dirty postimage exactly once in the staged
+                    // phase, even if its indexed value moved into/out of range.
+                    if (!node.dirty and !node.deleted and node.value.labels.len != 0) try found.append(a, node.value);
+                } else if (self.retain_scan_preimages) {
+                    try self.capacity();
+                    const retained = self.alloc.?;
+                    const copy = if (a.ptr == retained.ptr and a.vtable == retained.vtable) try self.retainNode(retained, value) else @constCast((try (v.Value{ .node = value }).clone(retained)).node);
+                    try self.appendNode(retained, .{ .value = copy });
+                    try found.append(a, copy);
+                } else try found.append(a, value);
+            }
+            return .{ .items = try found.toOwnedSlice(a), .examined = page.examined orelse page.items.len, .next = try std.json.Stringify.valueAlloc(a, LazyCursor{ .staged = page.next == null, .native = page.next }, .{}) };
+        }
+        try self.prepareStagedOrder();
+        const order = self.staged_order.items;
+        if (cursor.offset > order.len) return error.CypherInvalidBackendCursor;
+        var position = cursor.offset;
+        if (position == 0) {
+            var hi = order.len;
+            while (position < hi) {
+                const middle = position + (hi - position) / 2;
+                if (std.mem.order(u8, self.nodes.items[order[middle]].value.identity.table, table) == .lt) position = middle + 1 else hi = middle;
+            }
+        }
+        var examined: usize = 0;
+        while (position < order.len and examined < limit) : (position += 1) {
+            const node = self.nodes.items[order[position]];
+            if (!std.mem.eql(u8, node.value.identity.table, table)) break;
+            try self.charge(1);
+            examined += 1;
+            if (!node.deleted and node.value.labels.len != 0) try found.append(a, node.value);
+        }
+        const more = position < order.len and std.mem.eql(u8, self.nodes.items[order[position]].value.identity.table, table);
+        return .{ .items = try found.toOwnedSlice(a), .examined = examined, .next = if (more) try std.json.Stringify.valueAlloc(a, LazyCursor{ .staged = true, .offset = position }, .{}) else null };
     }
     fn scan(ptr: *anyopaque, a: A, table: []const u8, after: ?[]const u8, limit: usize) !b.Page(*const v.Node) {
         const self = cast(ptr);

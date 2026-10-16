@@ -30,6 +30,7 @@ pub const View = struct {
     inner: cypher.transaction.Overlay = undefined,
     changed: bool = false,
     staged_rows: cypher.value.IdentitySet = .empty,
+    old_fields_loaded: cypher.value.IdentitySet = .empty,
     projected_fields: std.HashMapUnmanaged(FieldKey, void, FieldKey.Context, std.hash_map.default_max_load_percentage) = .empty,
     const FieldKey = struct {
         source: cypher.value.Identity,
@@ -45,7 +46,7 @@ pub const View = struct {
         };
     };
     pub fn backend(self: *View) cypher.backend.Backend {
-        return .{ .ptr = self, .vtable = &.{ .bind = bind, .checkpoint = checkpoint, .scan = scan, .get = get, .expand = expand, .search = search, .startup_work = startupWork, .set_work = setWork } };
+        return .{ .ptr = self, .vtable = &.{ .bind = bind, .checkpoint = checkpoint, .scan = scan, .scan_where = scanWhere, .get = get, .expand = expand, .search = search, .startup_work = startupWork, .set_work = setWork } };
     }
     fn cast(ptr: *anyopaque) *View {
         return @ptrCast(@alignCast(ptr));
@@ -71,17 +72,11 @@ pub const View = struct {
         self.client.work = .{ .ptr = self, .charge = captureCharge, .value = captureValue, .remaining = captureRemaining };
         defer self.client.work = previous_work;
         self.staged_rows = .empty;
+        self.old_fields_loaded = .empty;
         self.projected_fields = .empty;
-        // Discover old contributions only on sources whose SQL postimages or
-        // physical edge deltas can replace them. This preserves field/artifact
-        // ownership without capturing unrelated vertices and adjacency.
-        var loaded: cypher.value.IdentitySet = .empty;
-        for (self.rows) |row| try self.loadSource(a, graph, row.identity, &loaded);
-        for (self.effects) |effects| {
-            for (effects.deletes) |edge| try self.loadSource(a, graph, .{ .table = effects.table, .key = edge.source }, &loaded);
-            for (effects.writes) |edge| try self.loadSource(a, graph, .{ .table = effects.table, .key = edge.source }, &loaded);
-        }
-        for (self.inner.relationships.items) |relationship| try self.indexField(a, relationship.value);
+        self.changed = false;
+        // Relationship masks and staged postimages are sufficient to reconcile
+        // native pages on demand; node-only queries never open adjacency.
         for (self.rows) |row| {
             const member = for (graph.labels) |label| {
                 if (std.mem.eql(u8, label.table, row.identity.table)) break true;
@@ -124,19 +119,26 @@ pub const View = struct {
         }
         for (self.effects) |effects| {
             for (effects.deletes) |edge| for (graph.relationships) |mapping| {
-                if (!matches(graph, effects.table, mapping, edge) or self.projectedFieldEffect(effects.table, mapping, edge)) continue;
+                if (!matches(graph, effects.table, mapping, edge) or try self.projectedFieldEffect(a, graph, effects.table, mapping, edge)) continue;
                 self.changed = true;
                 const tuple = try std.json.Stringify.valueAlloc(a, .{ edge.source, edge.target, edge.edge_type, edge.edge_id, producer(edge) }, .{});
                 for ([_][]const u8{ edge.edge_id, tuple }) |key| {
                     if (key.len == 0) continue;
                     try self.inner.charge(1);
-                    const position = self.inner.relationship_positions.get(.{ .identity = .{ .table = effects.table, .key = key }, .index = mapping.index }) orelse continue;
+                    const position = self.inner.relationship_positions.get(.{ .identity = .{ .table = effects.table, .key = key }, .index = mapping.index }) orelse blk: {
+                        try self.capacity();
+                        const relationship = try a.create(cypher.value.Relationship);
+                        relationship.* = .{ .identity = .{ .table = effects.table, .key = key }, .index = mapping.index, .type = mapping.name, .source = .{ .table = effects.table, .key = edge.source }, .target = .{ .table = graph.label(mapping.target_label).?.table, .key = edge.target } };
+                        const index = self.inner.relationships.items.len;
+                        try self.inner.appendRelationship(a, .{ .value = relationship, .deleted = true, .dirty = true });
+                        break :blk index;
+                    };
                     const relationship = &self.inner.relationships.items[position];
                     if (std.mem.eql(u8, relationship.value.type, mapping.name) and std.mem.eql(u8, relationship.value.source.key, edge.source) and std.mem.eql(u8, relationship.value.target.key, edge.target)) relationship.deleted = true;
                 }
             };
             for (effects.writes) |edge| for (graph.relationships) |mapping| {
-                if (!matches(graph, effects.table, mapping, edge) or self.projectedFieldEffect(effects.table, mapping, edge)) continue;
+                if (!matches(graph, effects.table, mapping, edge) or try self.projectedFieldEffect(a, graph, effects.table, mapping, edge)) continue;
                 self.changed = true;
                 try checkpoint(ptr);
                 const source = cypher.value.Identity{ .table = effects.table, .key = edge.source };
@@ -167,33 +169,16 @@ pub const View = struct {
                     relationship.value.* = .{ .identity = .{ .table = effects.table, .key = key }, .index = mapping.index, .type = mapping.name, .source = source, .target = target, .native = .{ .weight = edge.weight, .created_at = edge.created_at, .updated_at = edge.updated_at }, .properties = try cypher.value.entityProperties(a, properties.items), .ownership = if (producer(edge).len == 0) .explicit else .document, .producer = if (producer(edge).len == 0) null else .{ .table = effects.table, .key = producer(edge) } };
                     if (field_derived) relationship.value.ownership = .field;
                     relationship.deleted = false;
+                    relationship.dirty = true;
                     try self.inner.indexRelationship(a, position);
                 } else {
                     try self.capacity();
                     const relationship = try a.create(cypher.value.Relationship);
                     relationship.* = .{ .identity = .{ .table = effects.table, .key = key }, .index = mapping.index, .type = mapping.name, .source = source, .target = target, .native = .{ .weight = edge.weight, .created_at = edge.created_at, .updated_at = edge.updated_at }, .properties = try cypher.value.entityProperties(a, properties.items), .ownership = if (producer(edge).len == 0) .explicit else .document, .producer = if (producer(edge).len == 0) null else .{ .table = effects.table, .key = producer(edge) } };
-                    try self.inner.appendRelationship(a, .{ .value = relationship });
+                    try self.inner.appendRelationship(a, .{ .value = relationship, .dirty = true });
                 }
                 self.inner.captured.explored_edges +|= 1;
             };
-        }
-    }
-    fn loadSource(self: *View, a: A, graph: cypher.catalog.Graph, identity: cypher.value.Identity, loaded: *cypher.value.IdentitySet) !void {
-        if ((try loaded.getOrPut(a, identity)).found_existing) return;
-        const inner = self.inner.backend();
-        for (graph.relationships) |mapping| {
-            if (!std.mem.eql(u8, graph.label(mapping.source_label).?.table, identity.table)) continue;
-            var after: ?[]const u8 = null;
-            while (true) {
-                var scratch = std.heap.ArenaAllocator.init(cypher.backend.reclaimingAllocator(a));
-                defer scratch.deinit();
-                const page = try inner.vtable.expand(inner.ptr, scratch.allocator(), mapping, identity, .out, after, 128);
-                const examined = page.examined orelse page.items.len;
-                if (examined > self.limits.explored_edges -| self.inner.captured.explored_edges) return error.CypherEdgeBudgetExceeded;
-                self.inner.captured.explored_edges += examined;
-                after = if (page.next) |next| try a.dupe(u8, next) else null;
-                if (after == null) break;
-            }
         }
     }
     fn matches(graph: cypher.catalog.Graph, table: []const u8, mapping: cypher.catalog.Relationship, edge: anytype) bool {
@@ -202,9 +187,20 @@ pub const View = struct {
     // Deterministic fields have already been rebuilt from the complete staged
     // document. Replaying their physical tuple deltas would also erase a
     // published artifact assertion sharing that tuple and producer.
-    fn projectedFieldEffect(self: *View, table: []const u8, mapping: cypher.catalog.Relationship, edge: anytype) bool {
+    fn projectedFieldEffect(self: *View, a: A, graph: cypher.catalog.Graph, table: []const u8, mapping: cypher.catalog.Relationship, edge: anytype) !bool {
         if (edge.edge_id.len != 0 or edge.owner_document.len != 0 or (edge.owner.len != 0 and !std.mem.eql(u8, edge.owner, edge.source))) return false;
         const source = cypher.value.Identity{ .table = table, .key = edge.source };
+        if (self.staged_rows.contains(source) and !self.old_fields_loaded.contains(source)) {
+            try self.old_fields_loaded.put(a, source, {});
+            const base = self.client.backend();
+            self.inner.captured.scanned_anchors +|= 1;
+            if (self.inner.captured.scanned_anchors > self.limits.scanned_anchors) return error.CypherAnchorBudgetExceeded;
+            if (try base.vtable.get(base.ptr, a, source)) |node| {
+                const relationships = try base.vtable.document_relationships.?(base.ptr, a, node);
+                for (relationships) |relationship| try self.indexField(a, relationship);
+            }
+        }
+        _ = graph;
         return self.staged_rows.contains(source) and self.projected_fields.contains(.{ .source = source, .index = mapping.index, .kind = mapping.name });
     }
     fn indexField(self: *View, a: A, relationship: *const cypher.value.Relationship) !void {
@@ -240,6 +236,10 @@ pub const View = struct {
     fn scan(ptr: *anyopaque, a: A, table: []const u8, after: ?[]const u8, limit: usize) !cypher.backend.Page(*const cypher.value.Node) {
         const backend_inner = cast(ptr).inner.backend();
         return backend_inner.vtable.scan(backend_inner.ptr, a, table, after, limit);
+    }
+    fn scanWhere(ptr: *anyopaque, a: A, table: []const u8, filters: []const cypher.backend.PropertyFilter, after: ?[]const u8, limit: usize) !cypher.backend.Page(*const cypher.value.Node) {
+        const backend_inner = cast(ptr).inner.backend();
+        return backend_inner.vtable.scan_where.?(backend_inner.ptr, a, table, filters, after, limit);
     }
     fn get(ptr: *anyopaque, a: A, identity: cypher.value.Identity) !?*const cypher.value.Node {
         const backend_inner = cast(ptr).inner.backend();

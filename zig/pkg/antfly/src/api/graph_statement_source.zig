@@ -26,6 +26,7 @@ const http = local.common_http_http_common;
 pub const Plan = struct {
     table: port.GraphTable,
     fence: metadata.CatalogRouteFence,
+    ranges: []const cypher.distributed.KeyRange = &.{},
     route: union(enum) {
         local: reads.TableReadSource,
         remote: struct { executor: http.RequestExecutor, base_uri: []const u8 },
@@ -60,6 +61,9 @@ pub const Statement = struct {
         for (plans, copied) |plan, *out| {
             out.* = plan;
             out.table = try std.json.parseFromSliceLeaky(port.GraphTable, owned, try std.json.Stringify.valueAlloc(owned, plan.table, .{}), .{ .allocate = .alloc_always });
+            const ranges = try owned.alloc(cypher.distributed.KeyRange, plan.ranges.len);
+            for (plan.ranges, ranges) |range, *copy| copy.* = .{ .start = try owned.dupe(u8, range.start), .end = if (range.end) |end| try owned.dupe(u8, end) else null };
+            out.ranges = ranges;
             out.fence.route = try std.json.parseFromSliceLeaky(@TypeOf(plan.fence.route), owned, try std.json.Stringify.valueAlloc(owned, plan.fence.route, .{}), .{ .allocate = .alloc_always });
             out.fence.admission_deadline_ns = input.deadline_ns;
             out.fence.admission_deadline_io = null;
@@ -77,7 +81,7 @@ pub const Statement = struct {
         owned_input.tables = &.{};
         self.* = .{ .a = a, .arena = arena, .input = owned_input, .graph = try local.system_catalog_domain.graphForExecution(owned, record), .graphs = graphs, .versions = versions, .plans = copied, .set = undefined };
         const targets = try owned.alloc(cypher.distributed.Target, plans.len);
-        for (plans, targets) |plan, *target| target.* = .{ .table = plan.table.name, .table_id = plan.table.table_id, .group_id = plan.fence.route.group_id };
+        for (copied, targets) |plan, *target| target.* = .{ .table = plan.table.name, .table_id = plan.table.table_id, .group_id = plan.fence.route.group_id, .ranges = plan.ranges };
         self.set = try cypher.distributed.ReadSet.acquire(a, .{ .ptr = self, .checkpoint = checkpoint, .admit = admit, .capture = capture }, targets);
         errdefer self.set.deinit();
         const backend = self.set.backend();
@@ -180,7 +184,7 @@ pub const Statement = struct {
     fn invoke(ptr: *anyopaque, a: std.mem.Allocator, body: []const u8) ![]u8 {
         const self = cast(ptr);
         try checkpoint(ptr);
-        var arena = std.heap.ArenaAllocator.init(a);
+        var arena = std.heap.ArenaAllocator.init(cypher.backend.reclaimingAllocator(a));
         defer arena.deinit();
         const header = try std.json.parseFromSliceLeaky(struct { graph_incarnation: u64, graph_revision: u64, operation: []const u8 }, arena.allocator(), body, .{ .ignore_unknown_fields = true });
         const graph = for (self.graphs) |entry| {

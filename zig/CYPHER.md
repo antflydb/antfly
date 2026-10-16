@@ -16,13 +16,54 @@ system catalog and exposed through generated HTTP catalog routes and SDK types.
 The existing JSON pattern engine now follows Cypher relationship uniqueness in
 each MATCH scope and accepts explicit zero-hop bounds.
 
+Execution uses bounded native pages rather than capturing the graph. Equality
+constraints on mapped relational properties are candidate restrictions for the
+native READY-index planner; authorization, graph membership, and full Cypher
+predicates remain residual checks. Index continuations retain their schema and
+index identity and reapply the original predicate bounds. Without a usable
+index, execution keeps a budgeted primary scan.
+
+Retained results and temporary pages share one quota, backed by a reclaiming
+allocator even when the host supplies a request arena. Releasing a page frees
+its physical buffers instead of merely decrementing a counter while the host
+retains the allocation. RPC bodies and decoded reply metadata use temporary
+arenas; only returned entities and continuation bytes survive each call.
+
+Single-vertex MATCH pipelines stream through ordinary WITH projections into
+bounded top-k or hash aggregation. Grouped count/sum/avg/min/max retain one
+accumulator set per group, and aggregate expressions are evaluated after the
+fold. Intermediate reductions can feed subsequent clauses. DISTINCT, collect,
+and general traversal/join pipelines still use the budgeted materializing path.
+
+Shortest-path frontiers share equal-distance predecessors in a DAG. Each
+vertex/branch expands once; qualifying paths are reconstructed lazily with all
+ties preserved. Undirected positive relationship-simple cycles retain separate
+first-edge branches. The number of returned shortest paths can still be
+exponential and remains subject to the normal output/work/memory limits.
+
+Distributed point and endpoint-batch reads use the immutable key ranges captured
+with the owner cohort. Keys are partitioned by owning shard; temporary routing
+and reply-decode buffers are reclaimed after retaining positive results.
+Incoming adjacency still follows source-owner routing. SQL overlays reconcile
+staged postimages and exact relationship tombstones when pages are read, so a
+node-only GRAPH_TABLE query does not enumerate a staged source's adjacency.
+
+The public regression corpus checks one-anchor indexed property reads, indexed
+read-your-writes after a key moves, composite-index and empty-page continuations,
+2 MiB local grouped/compound aggregate pipelines, and shared shortest-path
+expansion with every result tie preserved. Authenticated HTTP tests compare
+2,000 and 10,000 inputs under the same 8 MiB execution budget, including RPC
+page/decode overhead. SQL overlay tests reject any adjacency callback for a
+node-only staged query and qualify explicit/derived edges, rollback and row
+policies through HTTP and pgwire.
+
 | Surface | Implemented behavior | Qualification and compatibility bounds |
 | --- | --- | --- |
 | Grammar/compiler | Generated conflict-free grammar; spans; Unicode strings and identifiers; owned AST; named and positional parameters; compile budgets | Full selected-version conformance suite, temporal/spatial types, additional Java regex constructs, legacy integer id() |
 | Read execution | MATCH/OPTIONAL MATCH, directional and variable-length paths, zero-hop paths, relationship uniqueness, UNWIND, list and pattern comprehensions/slices, chained comparisons, all/any/none/single, reduce, map projections, correlated read EXISTS, WITH/RETURN, grouping, DISTINCT, ORDER BY/SKIP/LIMIT, UNION, correlated CALL | General pipeline streaming/spill, schema type binding, comprehensive expression compatibility |
 | Values | Qualified node and relationship identities, paths, lists/maps, three-valued equality and partial comparisons, numeric comparison, Cypher ORDER BY type ordering, tagged JSON | Decimal-string signed integers, typed parameter maps and collision-free envelopes implemented; SQL graph datum encoding implemented; pgwire JSONB entities, prepared parameters, NULLs, and ordinary-table joins qualified |
 | Write execution | CREATE/MERGE/SET/REMOVE/DELETE/DETACH DELETE hooks and statement overlays; native graph effects survive transaction prepare/reopen/commit/abort; source range and guard regressions qualified | Production authenticated distributed provider, principal-bound durable receipts, duplicate request-ID rejection, and concurrent MERGE qualified through the 66-check real three-metadata/three-data-node campaign, including owner-node receipt restart recovery. Receipts are replicated in metadata Raft; reads on every metadata node, availability while the original owner is killed, global request-ID rejection after leader failover, and opaque read/snapshot recovery are qualified. Recovery after owner loss while a committed write waits for embedding-index visibility is qualified without replaying the statement. The principal-bound `/transactions/{id}/status` receipt remains readable after table permission revocation and across owner loss, failover, restart, and table removal; it contains no staged rows or execution plans. |
-| Search | Typed antfly.search procedure, lossless private owner RPC, bounded top-K merge, score propagation through traversal, and explicit approximation metadata for owner-local scoring | Production preparation, owner-cut ranking with authorized candidate whitelists, work budgets and approximation metadata implemented; full-text HTTP and semantic/hybrid provider transport on one and two owners qualified. Full-text search is also qualified on real replicated owner nodes. Protected full-text tables are qualified, including score invariance after hidden documents are added. Protected semantic/hybrid search and post-commit indexing of a Cypher-created row are qualified on one and two shards. |
+| Search | Typed antfly.search procedure, lossless private owner RPC, bounded top-K merge, score propagation through traversal, and explicit approximation metadata for owner-local scoring | Production preparation, owner-cut ranking with native authorized-candidate predicates, work budgets and approximation metadata implemented; full-text HTTP and semantic/hybrid provider transport on one and two owners qualified. Full-text search is also qualified on real replicated owner nodes. Protected full-text tables are qualified, including score invariance after hidden documents are added. Protected semantic/hybrid search and post-commit indexing of a Cypher-created row are qualified on one and two shards. |
 | Graph catalog | Durable create/read/list/drop/rename; conditional definition updates; immutable table/index incarnation bindings; scoped table targets; mapping validation; graph resource permissions; generated SDKs | Six native HTTP revision checks qualify stable graph incarnation, monotonic revisions, stale/concurrent update rejection, prepared SQL invalidation, and authorization of newly mapped tables. Owner readiness checks are available in the catalog UI. These revision checks also pass through the real three-metadata/three-data-node campaign, including receipt availability across failover and restart. |
 | Native execution | DB.queryCypher over caller-retained immutable table cuts and authority callbacks; physical adjacency paging; node/relationship projection, revocation checkpoints | Signed owner-side row authority, borrowed cohort fences, immutable owner cuts and private authenticated distributed paging implemented; protected-table and real three-metadata/three-data-node integration qualified; public C/Lite catalog, text-query, write, and receipt bindings implemented and qualified; public Zig and WASM catalog/query/write/status interfaces use the portable single-source host and pass native and WASM smoke qualification |
 | JSON graph matching | Relationship-simple trails; parallel identities; node revisits; zero hops; conjunctive uniqueness; independent OPTIONAL scope | All deployment/cross-table paths and compatibility fixtures |

@@ -31,6 +31,7 @@ pub const Request = struct {
     identities: []const v.Identity = &.{},
     relationship: []const u8 = "",
     direction: ast.Direction = .out,
+    filters: []const struct { property: []const u8, value: std.json.Value } = &.{},
     after: ?[]const u8 = null,
     limit: usize = 128,
     search: ?std.json.Value = null,
@@ -53,7 +54,7 @@ pub const Client = struct {
     allowed_versions: []const Version = &.{},
     work: ?b.Work = null,
     pub fn backend(self: *Client) b.Backend {
-        return .{ .ptr = self, .vtable = &.{ .bind = bind, .checkpoint = checkpoint, .scan = scan, .get = get, .get_many = getMany, .expand = expand, .search = search, .normalize_node = normalizeNode, .project_postimage = projectPostimage, .document_relationships = documentRelationships, .set_work = setWork } };
+        return .{ .ptr = self, .vtable = &.{ .bind = bind, .checkpoint = checkpoint, .scan = scan, .scan_where = scanWhere, .get = get, .get_many = getMany, .expand = expand, .search = search, .normalize_node = normalizeNode, .project_postimage = projectPostimage, .document_relationships = documentRelationships, .set_work = setWork } };
     }
     fn setWork(ptr: *anyopaque, work: ?b.Work) void {
         cast(ptr).work = work;
@@ -125,19 +126,29 @@ pub const Client = struct {
         return (try self.projectDocument(a, node.identity, document, &.{}, true)).relationships;
     }
     fn scan(ptr: *anyopaque, a: A, table: []const u8, after: ?[]const u8, limit: usize) !b.Page(*const v.Node) {
+        return scanWhere(ptr, a, table, &.{}, after, limit);
+    }
+    fn scanWhere(ptr: *anyopaque, a: A, table: []const u8, filters: []const b.PropertyFilter, after: ?[]const u8, limit: usize) !b.Page(*const v.Node) {
         const self = cast(ptr);
-        const reply = try self.invoke(a, .{ .operation = .scan, .graph_incarnation = self.incarnation, .graph_revision = self.revision, .table = table, .after = after, .limit = limit });
+        var scratch = std.heap.ArenaAllocator.init(b.reclaimingAllocator(a));
+        defer scratch.deinit();
+        const temporary = scratch.allocator();
+        const encoded_filters = try std.json.parseFromSliceLeaky(@FieldType(Request, "filters"), temporary, try std.json.Stringify.valueAlloc(temporary, filters, .{}), .{ .parse_numbers = false });
+        const reply = try self.invoke(temporary, .{ .filters = encoded_filters, .operation = .scan, .graph_incarnation = self.incarnation, .graph_revision = self.revision, .table = table, .after = after, .limit = limit });
         const nodes = try a.alloc(*const v.Node, reply.values.len);
         for (reply.values, nodes) |input, *out| {
             const value = try wire.transport(a, input);
             if (value != .node or !std.mem.eql(u8, value.node.identity.table, table)) return error.CypherInvalidBackendPage;
             out.* = value.node;
         }
-        return .{ .items = nodes, .next = reply.next, .examined = reply.examined };
+        return .{ .items = nodes, .next = if (reply.next) |next| try a.dupe(u8, next) else null, .examined = reply.examined };
     }
     fn get(ptr: *anyopaque, a: A, identity: v.Identity) !?*const v.Node {
         const self = cast(ptr);
-        const reply = try self.invoke(a, .{ .operation = .get, .graph_incarnation = self.incarnation, .graph_revision = self.revision, .identity = identity });
+        var scratch = std.heap.ArenaAllocator.init(b.reclaimingAllocator(a));
+        defer scratch.deinit();
+        const temporary = scratch.allocator();
+        const reply = try self.invoke(temporary, .{ .operation = .get, .graph_incarnation = self.incarnation, .graph_revision = self.revision, .identity = identity });
         if (reply.values.len == 0) return null;
         if (reply.values.len != 1) return error.CypherInvalidBackendPage;
         const value = try wire.transport(a, reply.values[0]);
@@ -147,7 +158,10 @@ pub const Client = struct {
     fn getMany(ptr: *anyopaque, a: A, identities: []const v.Identity) ![]const ?*const v.Node {
         if (identities.len > 128) return error.CypherOwnerBudgetExceeded;
         const self = cast(ptr);
-        const reply = try self.invoke(a, .{ .operation = .get_many, .graph_incarnation = self.incarnation, .graph_revision = self.revision, .identities = identities });
+        var scratch = std.heap.ArenaAllocator.init(b.reclaimingAllocator(a));
+        defer scratch.deinit();
+        const temporary = scratch.allocator();
+        const reply = try self.invoke(temporary, .{ .operation = .get_many, .graph_incarnation = self.incarnation, .graph_revision = self.revision, .identities = identities });
         if (reply.values.len != identities.len) return error.CypherInvalidBackendPage;
         const nodes = try a.alloc(?*const v.Node, identities.len);
         for (reply.values, identities, nodes) |input, identity, *out| {
@@ -163,10 +177,13 @@ pub const Client = struct {
     }
     fn search(ptr: *anyopaque, a: A, table: []const u8, input: b.SearchInput) !b.SearchPage {
         const self = cast(ptr);
+        var scratch = std.heap.ArenaAllocator.init(b.reclaimingAllocator(a));
+        defer scratch.deinit();
+        const temporary = scratch.allocator();
         const request = input.parameters;
         if (request != .map) return error.CypherTypeMismatch;
-        const encoded = try std.json.parseFromSliceLeaky(std.json.Value, a, try std.json.Stringify.valueAlloc(a, wire.Value{ .value = request }, .{}), .{});
-        const reply = try self.invoke(a, .{ .operation = .search, .graph_incarnation = self.incarnation, .graph_revision = self.revision, .table = table, .search = encoded, .prepared_search_json = input.prepared_json, .max_examined = input.max_examined });
+        const encoded = try std.json.parseFromSliceLeaky(std.json.Value, temporary, try std.json.Stringify.valueAlloc(temporary, wire.Value{ .value = request }, .{}), .{});
+        const reply = try self.invoke(temporary, .{ .operation = .search, .graph_incarnation = self.incarnation, .graph_revision = self.revision, .table = table, .search = encoded, .prepared_search_json = input.prepared_json, .max_examined = input.max_examined });
         if (reply.values.len != reply.scores.len or reply.values.len > 1024) return error.CypherInvalidBackendPage;
         const seeds = try a.alloc(b.Seed, reply.values.len);
         for (reply.values, reply.scores, seeds) |encoded_value, score, *out| {
@@ -178,14 +195,17 @@ pub const Client = struct {
     }
     fn expand(ptr: *anyopaque, a: A, mapping: catalog.Relationship, identity: v.Identity, direction: ast.Direction, after: ?[]const u8, limit: usize) !b.Page(*const v.Relationship) {
         const self = cast(ptr);
-        const reply = try self.invoke(a, .{ .operation = .expand, .graph_incarnation = self.incarnation, .graph_revision = self.revision, .identity = identity, .relationship = mapping.name, .direction = direction, .after = after, .limit = limit });
+        var scratch = std.heap.ArenaAllocator.init(b.reclaimingAllocator(a));
+        defer scratch.deinit();
+        const temporary = scratch.allocator();
+        const reply = try self.invoke(temporary, .{ .operation = .expand, .graph_incarnation = self.incarnation, .graph_revision = self.revision, .identity = identity, .relationship = mapping.name, .direction = direction, .after = after, .limit = limit });
         const relationships = try a.alloc(*const v.Relationship, reply.values.len);
         for (reply.values, relationships) |input, *out| {
             const value = try wire.transport(a, input);
             if (value != .relationship or !std.mem.eql(u8, value.relationship.type, mapping.name) or !std.mem.eql(u8, value.relationship.index, mapping.index)) return error.CypherInvalidBackendPage;
             out.* = value.relationship;
         }
-        return .{ .items = relationships, .next = reply.next, .examined = reply.examined };
+        return .{ .items = relationships, .next = if (reply.next) |next| try a.dupe(u8, next) else null, .examined = reply.examined };
     }
 };
 pub const Owner = struct {
@@ -199,7 +219,7 @@ pub const Owner = struct {
     }
     pub fn execute(self: Owner, a: A, body: []const u8) ![]u8 {
         if (body.len > 1 << 20) return error.CypherRequestTooLarge;
-        var arena = std.heap.ArenaAllocator.init(a);
+        var arena = std.heap.ArenaAllocator.init(b.reclaimingAllocator(a));
         defer arena.deinit();
         const scratch = arena.allocator();
         const request = try std.json.parseFromSliceLeaky(Request, scratch, body, .{});
@@ -229,7 +249,9 @@ pub const Owner = struct {
             },
             .scan => {
                 if (!self.permitsTable(request.table)) return error.Forbidden;
-                const page = try self.backend.vtable.scan(self.backend.ptr, scratch, request.table, request.after, request.limit);
+                const filters = try scratch.alloc(b.PropertyFilter, request.filters.len);
+                for (request.filters, filters) |input, *filter| filter.* = .{ .property = input.property, .value = try v.Value.fromJson(scratch, input.value) };
+                const page = if (self.backend.vtable.scan_where) |filtered| try filtered(self.backend.ptr, scratch, request.table, filters, request.after, request.limit) else try self.backend.vtable.scan(self.backend.ptr, scratch, request.table, request.after, request.limit);
                 for (page.items) |node| try values.append(scratch, .{ .value = .{ .node = node } });
                 next = page.next;
                 examined = page.examined;

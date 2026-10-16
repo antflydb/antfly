@@ -157,3 +157,122 @@ def test_lazy_overlay_discovers_incident_edges_before_delete(graph_db):
     assert failure.value.graph_code == "CypherNodeHasRelationships"
     db.cypher_json("g", {"query": "MATCH (n:D {id:'a'}) DETACH DELETE n"})
     assert db.cypher_json("g", {"query": "MATCH ()-[r:R]->() RETURN r"})["rows"] == []
+
+
+def test_projection_chains_and_grouped_reducers_remain_bounded(graph_db):
+    db = graph_db
+    populate(db, 2000)
+    limits = {"memory_bytes": 2 << 20}
+    for query, expected in [
+        ("MATCH (n:D) WITH n RETURN count(*)", [["2000"]]),
+        ("MATCH (n:D) RETURN count(*)+1", [["2001"]]),
+        ("MATCH (n:D) WITH count(*) AS total RETURN total+1", [["2001"]]),
+        ("MATCH (n:D) WITH n.score AS s WHERE s>=1000 RETURN sum(s)", [["1499500"]]),
+        ("MATCH (n:D) RETURN n.score%2 AS bucket,count(*) AS total ORDER BY bucket", [["0", "1000"], ["1", "1000"]]),
+    ]:
+        result = db.cypher_json("g", {"query": query, "limits": limits})
+        assert [[cell["value"] for cell in row] for row in result["rows"]] == expected
+        assert result["stats"]["memory_bytes"] < 2 << 20
+
+
+def test_property_seeks_use_indexes_and_preserve_paging(graph_db):
+    db = graph_db
+    populate(db, 2000)
+    db.sql("CREATE INDEX docs_id ON docs(id)")
+    for condition in ("{id:'n1999'}", ""):
+        suffix = "" if condition else " WHERE n.id='n1999'"
+        result = db.cypher_json(
+            "g", {"query": f"MATCH (n:D {condition}){suffix} RETURN count(*)", "limits": {"scanned_anchors": 4}}
+        )
+        assert result["rows"] == [[{"type": "integer", "value": "1"}]]
+        assert result["stats"]["scanned_anchors"] <= 4
+    result = db.cypher_json(
+        "g",
+        {
+            "query": "MATCH (n:D {id:'n1999'}) SET n.id='renamed' WITH n MATCH (m:D {id:'renamed'}) RETURN m.score",
+            "limits": {"scanned_anchors": 4},
+        },
+    )
+    assert result["rows"] == [[{"type": "integer", "value": "1999"}]]
+    db.sql("UPDATE docs SET id='same' WHERE score<400")
+    # The id index supplies many candidates rejected by the score residual.
+    # Empty physical pages must still advance their index continuation.
+    result = db.cypher_json(
+        "g",
+        {
+            "query": "MATCH (n:D {id:'same',score:399}) RETURN n.score",
+            "limits": {"scanned_anchors": 400},
+        },
+    )
+    assert result["rows"] == [[{"type": "integer", "value": "399"}]]
+    assert result["stats"]["scanned_anchors"] == 400
+    # A composite index orders candidates by its suffix, rather than document
+    # key. Continuations must retain that native order across multiple pages.
+    db.sql("DROP INDEX docs_id ON docs")
+    db.sql("CREATE INDEX docs_id_score ON docs(id,score)")
+    db.sql("UPDATE docs SET id='same' WHERE score<400")
+    result = db.cypher_json(
+        "g", {"query": "MATCH (n:D {id:'same'}) RETURN count(*),sum(n.score)", "limits": {"scanned_anchors": 450}}
+    )
+    assert [cell["value"] for cell in result["rows"][0]] == ["400", "79800"]
+    # Pushdown remains only a candidate restriction; missing properties and
+    # mixed-type comparisons retain Cypher semantics.
+    assert db.cypher_json("g", {"query": "MATCH (n:D {missing:'x'}) RETURN count(*)"})["rows"] == [
+        [{"type": "integer", "value": "0"}]
+    ]
+
+
+def test_all_shortest_paths_share_expansion_of_tied_prefixes(graph_db):
+    db = graph_db
+    layers = 8
+    patterns = ["(a:D)", "(z:D)"] + [f"(n{i}_{j}:D)" for i in range(layers) for j in range(2)]
+    patterns += [f"(a)-[:R]->(n0_{j})" for j in range(2)]
+    patterns += [f"(n{i}_{j})-[:R]->(n{i + 1}_{k})" for i in range(layers - 1) for j in range(2) for k in range(2)]
+    result = db.cypher_json(
+        "g",
+        {
+            "query": "CREATE "
+            + ",".join(patterns)
+            + " RETURN antfly.documentKey(a),antfly.documentKey(z),antfly.documentKey(n7_0)"
+        },
+    )
+    first, isolated, reachable = [cell["value"] for cell in result["rows"][0]]
+    edges = 2 + 4 * (layers - 1)
+    for target, count in ((isolated, 0), (reachable, 1 << (layers - 1))):
+        result = db.cypher_json(
+            "g",
+            {
+                "query": "MATCH (a:D) WHERE antfly.documentKey(a)=$first MATCH (z:D) WHERE antfly.documentKey(z)=$last MATCH p=allShortestPaths((a)-[:R*1..16]->(z)) RETURN count(*)",
+                "parameters": {"first": first, "last": target},
+                "limits": {"explored_edges": edges},
+            },
+        )
+        assert result["rows"] == [[{"type": "integer", "value": str(count)}]]
+        assert result["stats"]["explored_edges"] == edges
+
+
+def test_index_candidates_preserve_cypher_numeric_and_type_semantics(graph_db):
+    db = graph_db
+    db.sql("CREATE TABLE amounts (amount NUMERIC)")
+    db.sql("CREATE INDEX amount_index ON amounts(amount)")
+    with db.open_table("amounts") as table:
+        table.batch_json('{"inserts":{"one":{"amount":100000000000000000000.1}}}')
+    db.graph_catalog_json(
+        {
+            "action": "put",
+            "name": "amounts",
+            "definition": {"labels": [{"name": "A", "table": "amounts"}], "relationships": []},
+        }
+    )
+    # NUMERIC's JSON projection rounds to a Cypher float. An exact-decimal
+    # index restriction would exclude the row that the residual comparison admits.
+    result = db.cypher_json("amounts", {"query": "MATCH (n:A) WHERE n.amount=1e20 RETURN count(*)"})
+    assert result["rows"] == [[{"type": "integer", "value": "1"}]]
+    populate(db, 300)
+    db.sql("CREATE INDEX docs_score ON docs(score)")
+    assert db.cypher_json("g", {"query": "MATCH (n:D {score:'nan'}) RETURN count(*)"})["rows"] == [
+        [{"type": "integer", "value": "0"}]
+    ]
+    assert db.cypher_json("g", {"query": "MATCH (n:D {score:2.0}) RETURN n.id"})["rows"] == [
+        [{"type": "string", "value": "n2"}]
+    ]

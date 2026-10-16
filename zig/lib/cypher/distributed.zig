@@ -22,7 +22,24 @@ const v = @import("value.zig");
 const catalog = @import("catalog.zig");
 const ast = @import("ast.zig");
 const A = std.mem.Allocator;
-pub const Target = struct { table: []const u8, table_id: u64, group_id: u64 };
+pub const KeyRange = struct { start: []const u8 = "", end: ?[]const u8 = null };
+pub const Target = struct {
+    table: []const u8,
+    table_id: u64,
+    group_id: u64,
+    /// Empty only for legacy/custom sources with no routing projection.
+    ranges: []const KeyRange = &.{},
+    fn owns(self: Target, identity: v.Identity) bool {
+        if (!std.mem.eql(u8, self.table, identity.table)) return false;
+        if (self.ranges.len == 0) return true;
+        for (self.ranges) |range| {
+            if (std.mem.order(u8, identity.key, range.start) == .lt) continue;
+            if (range.end) |end| if (end.len != 0 and std.mem.order(u8, identity.key, end) != .lt) continue;
+            return true;
+        }
+        return false;
+    }
+};
 pub const Snapshot = struct { backend: b.Backend, ptr: *anyopaque, validate: *const fn (*anyopaque) anyerror!void, close: *const fn (*anyopaque) void };
 pub const Fence = struct { ptr: *anyopaque, validate: *const fn (*anyopaque) anyerror!void, fork: *const fn (*anyopaque, A) anyerror!Snapshot, release: *const fn (*anyopaque) void };
 pub const Source = struct {
@@ -81,23 +98,46 @@ pub const ReadSet = struct {
         const owned = try a.alloc(Target, targets.len);
         errdefer a.free(owned);
         var copied: usize = 0;
-        errdefer for (owned[0..copied]) |target| a.free(target.table);
+        errdefer for (owned[0..copied]) |target| freeTarget(a, target);
         for (targets, owned) |target, *out| {
             out.* = target;
             out.table = try a.dupe(u8, target.table);
+            errdefer a.free(out.table);
+            const ranges = try a.alloc(KeyRange, target.ranges.len);
+            errdefer a.free(ranges);
+            var initialized: usize = 0;
+            errdefer for (ranges[0..initialized]) |range| {
+                a.free(range.start);
+                if (range.end) |end| a.free(end);
+            };
+            for (target.ranges, ranges) |range, *copy| {
+                const start = try a.dupe(u8, range.start);
+                errdefer a.free(start);
+                copy.* = .{ .start = start, .end = if (range.end) |end| try a.dupe(u8, end) else null };
+                initialized += 1;
+            }
+            out.ranges = ranges;
             copied += 1;
         }
         return .{ .a = a, .source = source, .targets = owned, .snapshots = snapshots };
     }
+    fn freeTarget(a: A, target: Target) void {
+        a.free(target.table);
+        for (target.ranges) |range| {
+            a.free(range.start);
+            if (range.end) |end| a.free(end);
+        }
+        a.free(target.ranges);
+    }
     pub fn deinit(self: *ReadSet) void {
         for (self.snapshots) |snapshot| snapshot.close(snapshot.ptr);
-        for (self.targets) |target| self.a.free(target.table);
+        for (self.targets) |target| freeTarget(self.a, target);
         self.a.free(self.targets);
         self.a.free(self.snapshots);
         self.* = undefined;
     }
     pub fn backend(self: *ReadSet) b.Backend {
-        return .{ .ptr = self, .vtable = &.{ .bind = bind, .checkpoint = checkpoint, .scan = scan, .get = get, .get_many = getMany, .expand = expand, .search = search, .set_work = setWork } };
+        return .{ .ptr = self, .vtable = &.{ .bind = bind, .checkpoint = checkpoint, .scan = scan, .scan_where = scanWhere, .get = get, .get_many = getMany, .expand = expand, .search = search, .set_work = setWork } };
     }
     fn setWork(ptr: *anyopaque, work: ?b.Work) void {
         for (cast(ptr).snapshots) |snapshot| if (snapshot.backend.vtable.set_work) |configure| configure(snapshot.backend.ptr, work);
@@ -140,11 +180,14 @@ pub const ReadSet = struct {
         return null;
     }
     fn scan(ptr: *anyopaque, a: A, table: []const u8, encoded: ?[]const u8, limit: usize) !b.Page(*const v.Node) {
+        return scanWhere(ptr, a, table, &.{}, encoded, limit);
+    }
+    fn scanWhere(ptr: *anyopaque, a: A, table: []const u8, filters: []const b.PropertyFilter, encoded: ?[]const u8, limit: usize) !b.Page(*const v.Node) {
         const self = cast(ptr);
         try checkpoint(ptr);
         const position = try self.cursor(a, table, encoded);
         const owner = self.snapshots[position.owner].backend;
-        const page = try owner.vtable.scan(owner.ptr, a, table, position.after, limit);
+        const page = if (owner.vtable.scan_where) |filtered| try filtered(owner.ptr, a, table, filters, position.after, limit) else try owner.vtable.scan(owner.ptr, a, table, position.after, limit);
         try checkpoint(ptr);
         return .{ .items = page.items, .examined = page.examined, .next = try self.next(a, table, position, page.next) };
     }
@@ -153,7 +196,7 @@ pub const ReadSet = struct {
         try checkpoint(ptr);
         var result: ?*const v.Node = null;
         for (self.targets, self.snapshots) |target, snapshot| {
-            if (!std.mem.eql(u8, target.table, identity.table)) continue;
+            if (!target.owns(identity)) continue;
             if (try snapshot.backend.vtable.get(snapshot.backend.ptr, a, identity)) |node| {
                 if (result != null) return error.CypherOverlappingOwners;
                 result = node;
@@ -169,23 +212,26 @@ pub const ReadSet = struct {
         const result = try a.alloc(?*const v.Node, identities.len);
         @memset(result, null);
         for (self.targets, self.snapshots) |target, snapshot| {
+            var scratch = std.heap.ArenaAllocator.init(b.reclaimingAllocator(a));
+            defer scratch.deinit();
+            const temporary = scratch.allocator();
             var selected: std.ArrayList(v.Identity) = .empty;
             var positions: std.ArrayList(usize) = .empty;
-            for (identities, 0..) |identity, index| if (std.mem.eql(u8, target.table, identity.table)) {
-                try selected.append(a, identity);
-                try positions.append(a, index);
+            for (identities, 0..) |identity, index| if (target.owns(identity)) {
+                try selected.append(temporary, identity);
+                try positions.append(temporary, index);
             };
             if (selected.items.len == 0) continue;
             const owner = snapshot.backend;
-            const nodes = if (owner.vtable.get_many) |batch| try batch(owner.ptr, a, selected.items) else blk: {
-                const fetched = try a.alloc(?*const v.Node, selected.items.len);
-                for (selected.items, fetched) |identity, *node| node.* = try owner.vtable.get(owner.ptr, a, identity);
+            const nodes = if (owner.vtable.get_many) |batch| try batch(owner.ptr, temporary, selected.items) else blk: {
+                const fetched = try temporary.alloc(?*const v.Node, selected.items.len);
+                for (selected.items, fetched) |identity, *node| node.* = try owner.vtable.get(owner.ptr, temporary, identity);
                 break :blk fetched;
             };
             if (nodes.len != positions.items.len) return error.CypherInvalidBackendPage;
             for (nodes, positions.items) |node, index| if (node) |value| {
                 if (result[index] != null) return error.CypherOverlappingOwners;
-                result[index] = value;
+                result[index] = (try (v.Value{ .node = value }).clone(a)).node;
             };
         }
         try checkpoint(ptr);
@@ -268,6 +314,7 @@ test "distributed graph captures the whole cohort and pages immutable owners" {
             fixture: *Self,
             index: usize,
             node: v.Node,
+            gets: usize = 0,
             fn checkpoint(ptr: *anyopaque) !void {
                 const self: *@This() = @ptrCast(@alignCast(ptr));
                 if (self.fixture.revoked) return error.Forbidden;
@@ -301,6 +348,7 @@ test "distributed graph captures the whole cohort and pages immutable owners" {
             }
             fn get(ptr: *anyopaque, _: A, identity: v.Identity) !?*const v.Node {
                 const self: *@This() = @ptrCast(@alignCast(ptr));
+                self.gets += 1;
                 return if (self.node.identity.eql(identity)) &self.node else null;
             }
             fn search(ptr: *anyopaque, a: A, _: []const u8, _: b.SearchInput) !b.SearchPage {
@@ -337,10 +385,19 @@ test "distributed graph captures the whole cohort and pages immutable owners" {
         .{ .fixture = &fixture, .index = 0, .node = .{ .identity = .{ .table = "docs", .key = "a" }, .labels = &.{"Document"} } },
         .{ .fixture = &fixture, .index = 1, .node = .{ .identity = .{ .table = "docs", .key = "b" }, .labels = &.{"Document"} } },
     };
-    var set = try ReadSet.acquire(std.testing.allocator, .{ .ptr = &fixture, .checkpoint = Fixture.checkpoint, .admit = Fixture.admit, .capture = Fixture.capture }, &.{ .{ .table = "docs", .table_id = 7, .group_id = 1 }, .{ .table = "docs", .table_id = 7, .group_id = 2 } });
+    var set = try ReadSet.acquire(std.testing.allocator, .{ .ptr = &fixture, .checkpoint = Fixture.checkpoint, .admit = Fixture.admit, .capture = Fixture.capture }, &.{ .{ .table = "docs", .table_id = 7, .group_id = 1, .ranges = &.{.{ .end = "b" }} }, .{ .table = "docs", .table_id = 7, .group_id = 2, .ranges = &.{.{ .start = "b" }} } });
     defer set.deinit();
     try std.testing.expectEqual(@as(usize, 0), fixture.held);
     try std.testing.expectEqual(@as(usize, 2), fixture.forks);
+    var scratch = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer scratch.deinit();
+    const provider = set.backend();
+    _ = try provider.vtable.get(provider.ptr, scratch.allocator(), .{ .table = "docs", .key = "a" });
+    const batch = try provider.vtable.get_many.?(provider.ptr, scratch.allocator(), &.{ .{ .table = "docs", .key = "a" }, .{ .table = "docs", .key = "b" } });
+    try std.testing.expect(batch[0].?.identity.eql(fixture.owners[0].node.identity));
+    try std.testing.expect(batch[1].?.identity.eql(fixture.owners[1].node.identity));
+    try std.testing.expectEqual(@as(usize, 2), fixture.owners[0].gets);
+    try std.testing.expectEqual(@as(usize, 1), fixture.owners[1].gets);
     const root = @import("root.zig");
     var diagnostic: root.compiler.Diagnostic = .{};
     var compiled = try root.compiler.compile(std.testing.allocator, "MATCH (n:Document) RETURN antfly.documentKey(n) AS key ORDER BY key", .{}, &diagnostic);
