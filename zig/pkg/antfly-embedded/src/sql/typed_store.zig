@@ -448,6 +448,32 @@ pub const Store = struct {
     /// dictionary bytes. Capacity growth is still enforced by the allocator.
     /// Representation identity for expression reuse, including a distinct NULL
     /// lane. No semantic comparison or coercion is implied by dictionary IDs.
+    pub fn physicalColumn(self: *const Store, a: A, column: usize, begin: usize, count: usize) !?@import("execution_batch.zig").PhysicalColumn {
+        if (self.failed or column >= self.columns.len or begin > self.len or count > self.len - begin) return error.InvalidSqlBackendResponse;
+        const stored = self.columns[column];
+        if (stored.patterns.items.len != 0 or stored.arrays.items.len != 0 or stored.numerics.items.len != 0) return null;
+        const types = @import("../storage/rowsource/types.zig");
+        const values: types.ColumnValues = switch (stored.values) {
+            .integers => |v| if (v.encoded) .{ .dictionary_i64 = .{ .values = v.values.items, .indices = v.indices.items[begin..][0..count] } } else .{ .i64 = v.flat.items[begin..][0..count] },
+            .numbers => |v| if (v.encoded) .{ .dictionary_f64 = .{ .values = v.values.items, .indices = v.indices.items[begin..][0..count] } } else .{ .f64 = v.flat.items[begin..][0..count] },
+            .booleans => |v| .{ .bool = v.items[begin..][0..count] },
+            .strings => |v| if (v.flat) |flat| .{ .bytes = flat.items[begin..][0..count] } else .{ .dictionary_bytes = .{ .values = v.values.items, .indices = v.indices.items[begin..][0..count] } },
+            else => return null,
+        };
+        const nulls = try a.alloc(u8, count);
+        const selection = try a.alloc(usize, count);
+        for (nulls, selection, 0..) |*flag, *row_index, i| {
+            flag.* = @intFromBool(stored.isNull(begin + i));
+            row_index.* = i;
+        }
+        return .{ .vector = .{ .name = "", .values = values, .nulls = .{ .bytes = nulls } }, .selection = selection, .kind = switch (values) {
+            .i64, .dictionary_i64 => .integer,
+            .f64, .dictionary_f64 => .number,
+            .bool => .boolean,
+            .bytes, .dictionary_bytes => .string,
+            else => unreachable,
+        }, .element = if (stored.values == .numbers) .float64 else null };
+    }
     pub fn dictionaryId(self: *const Store, row_index: usize, column: usize) !?u64 {
         if (row_index >= self.len or column >= self.columns.len) return error.InvalidSqlBackendResponse;
         const stored = self.columns[column];

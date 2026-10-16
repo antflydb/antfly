@@ -5179,3 +5179,55 @@ Parquet/Iceberg E2Es passed against the final Debug CLI in 626.48 seconds with
 production disk safeguards enabled. Generated error parity, Zig formatting,
 whitespace, licenses, and the Apache boundary (2,066 source files) passed. The
 private error-name table includes main's new promotion-writer fencing error.
+
+
+### Bounded global state, typed expression delivery, and adjacent page envelopes
+
+Global aggregation admits one group independently of input batch length. Fixed
+primitive reducers update that state in windows of at most 256 lanes; variable
+MIN/MAX admission reserves the largest possible winner. Physical descriptors are
+normalized once per batch and reused for admission, semantic key hashes, exact
+typed key lookup, and aggregate updates. The small-budget path avoids per-row
+hash probes without bypassing exact NUMERIC, DISTINCT, pattern, spill, or error
+semantics.
+
+Computed primitive expressions deliver owned typed payloads and separate null
+states through the existing batch reader contract. Their instruction DAG retains
+shared subexpressions and uses shared CPU scheduling for sufficiently large
+cohorts; joined output copies primitive lanes without a Datum delivery matrix.
+INT16/INT32 validation applies only to selected lanes. REAL inputs and each REAL
+instruction retain scalar rounding, overflow, and underflow behavior. Borrowed
+retained columns expose native payload/dictionary views; portable spill blocks
+decode numeric wire lanes once into bounded typed buffers, preserving borrowed
+text and dictionary entries. Complex values retain their exact fallback.
+
+Aggregate FILTER expressions form lazy cohorts. Only surviving physical lanes
+evaluate aggregate inputs, then a SQL-NULL mask maps typed results back into the
+parent batch. Keys resolve once, unrelated unfiltered inputs stay native, and
+filtered-out division/coercion errors remain unevaluated. Ordered and DISTINCT
+consumers receive the same logical rows and null semantics as before. Compact
+computed dictionary entries retain their existing encoded dictionary path.
+
+Failed regex/fuzzy executions are removed from the query-owned pool on lease
+return, including failures caused by the parent budget rather than the child.
+Their tables are reclaimed before a private retry starts; the first attempt's
+reader and iterator also close before retry. Later traversals can build and reuse
+a healthy bounded execution when headroom becomes available. Actual allocation
+failures still propagate, and cache pressure does not change matches/statistics.
+
+Parquet prefetch merges only adjacent explicitly planned cold ranges, with zero
+gap and a 2 MiB envelope target. At most four columns plan the current page plus
+one adjacent indexed page each. Filtered/pruning consumers defer future payloads,
+pruned current pages are not prefetched, and decoded hits skip encoded fetches.
+Each exact page cache entry pins a slice of the shared immutable response; its
+cache key retains source version and credential scope. Admission conservatively
+charges the full envelope per alias so partial admission/eviction cannot hide
+retained bytes. No cache lock covers provider I/O. Member flights let required
+reads wait for an in-flight envelope, cancellation/close joins every owner, and
+shared admission can fall back to smaller individual page jobs. Dictionary and
+unindexed header discovery retain their bounded path. The real Parquet restart
+fixture now also checks mixed computed FILTER cohorts and wide global counts.
+
+These are bounded execution improvements, not an archive-scale latency claim.
+Representative latency/RSS benchmarking and live cloud retention qualification
+remain deferred.

@@ -1194,12 +1194,67 @@ pub const Grouped = struct {
         const a = scratch.allocator();
         const row_keys = try a.alloc(Datum, keys.len);
         const row_inputs = try a.alloc(Datum, inputs.len);
-        var needed: usize = 4096 +| count *| (512 +| self.specs.len *| @sizeOf(Aggregate) *| 2);
-        for (keys) |column| for (0..count) |index| {
-            needed +|= (try datumBytes(try column.cell(a, index, 0))) *| 4;
+        const Physical = @import("execution_batch.zig").PhysicalColumn;
+        const physical_keys = try a.alloc(?Physical, keys.len);
+        const physical_inputs = try a.alloc(?Physical, inputs.len);
+        for (keys, physical_keys) |column, *view| {
+            view.* = try column.physicalColumn(a, 0);
+            if (view.*) |native| try native.validate();
+        }
+        for (inputs, physical_inputs) |column, *view| {
+            view.* = try column.physicalColumn(a, 0);
+            if (view.*) |native| try native.validate();
+        }
+
+        // A global reducer retains one group, independently of batch length.
+        // Admit its state once and use bounded scratch windows. Variable-width
+        // MIN/MAX reserve the largest possible winner rather than every row.
+        var global = keys.len == 0 and self.external == null;
+        for (self.specs) |spec| if (spec.distinct or spec.kind == .pattern_set or spec.input_element == .numeric) {
+            global = false;
         };
-        for (self.specs, inputs) |spec, column| if (spec.kind == .min or spec.kind == .max) {
-            for (0..count) |index| needed +|= (try datumBytes(try column.cell(a, index, 0))) *| 4;
+        if (global) {
+            for (inputs, row_inputs) |column, *cell| cell.* = try column.cell(a, 0, 0);
+            var growth: usize = 0;
+            for (self.specs, inputs, physical_inputs) |spec, column, native| if (spec.kind == .min or spec.kind == .max) {
+                var maximum: usize = 0;
+                for (0..count) |index| maximum = @max(maximum, if (native) |view| try view.bytes(index) else try datumBytes(try column.cell(a, index, 0)));
+                growth +|= maximum *| 4;
+            };
+            if (try self.canRetainAdditional(&.{}, row_inputs, growth)) {
+                self.key_count = 0;
+                errdefer self.failed = true;
+                try self.ensureGlobalGroup();
+                var chunk = std.heap.ArenaAllocator.init(self.backing);
+                defer chunk.deinit();
+                var begin: usize = 0;
+                const ids: [256]usize = @splat(0);
+                var selected: [256]usize = undefined;
+                while (begin < count) {
+                    _ = chunk.reset(.retain_capacity);
+                    const length = @min(ids.len, count - begin);
+                    for (selected[0..length], 0..) |*row, offset| row.* = begin + offset;
+                    for (self.state_columns, inputs, physical_inputs) |*column, *values, native| {
+                        if (native) |physical| {
+                            var view = physical;
+                            view.selection = physical.selection[begin..][0..length];
+                            if (try column.updatePhysical(self.budget.allocator(), ids[0..length], view)) continue;
+                        }
+                        const view = try values.select(chunk.allocator(), selected[0..length]);
+                        try column.updateEncoded(self.budget.allocator(), ids[0..length], view);
+                    }
+                    begin += length;
+                }
+                self.rows_seen = std.math.add(u64, self.rows_seen, count) catch return error.SqlNumericOutOfRange;
+                return;
+            }
+        }
+        var needed: usize = 4096 +| count *| (512 +| self.specs.len *| @sizeOf(Aggregate) *| 2);
+        for (keys, physical_keys) |column, native| for (0..count) |index| {
+            needed +|= (if (native) |view| try view.bytes(index) else try datumBytes(try column.cell(a, index, 0))) *| 4;
+        };
+        for (self.specs, inputs, physical_inputs) |spec, column, native| if (spec.kind == .min or spec.kind == .max) {
+            for (0..count) |index| needed +|= (if (native) |view| try view.bytes(index) else try datumBytes(try column.cell(a, index, 0))) *| 4;
         };
         var fast = self.external == null and needed <= self.budget.limit -| self.budget.live and self.budget.live <= self.budget.limit / 2;
         for (self.specs) |spec| if (spec.distinct or spec.kind == .pattern_set or spec.input_element == .numeric) {
@@ -1207,7 +1262,7 @@ pub const Grouped = struct {
         };
         if (!fast) {
             for (0..count) |index| {
-                for (keys, row_keys) |column, *cell| cell.* = try column.cell(a, index, 0);
+                for (keys, physical_keys, row_keys) |column, native, *cell| cell.* = if (native) |view| try view.cell(index) else try column.cell(a, index, 0);
                 for (inputs, row_inputs) |column, *cell| cell.* = try column.cell(a, index, 0);
                 if (identity) |ids| self.source_ordinal = ids.ordinals[index];
                 try self.add(row_keys, row_inputs);
@@ -1220,18 +1275,24 @@ pub const Grouped = struct {
         if (keys.len == 0) {
             try self.ensureGlobalGroup();
             @memset(ids, 0);
-            for (self.state_columns, inputs) |*column, values| try column.updateEncoded(self.budget.allocator(), ids, values);
+            for (self.state_columns, inputs, physical_inputs) |*column, values, native| {
+                if (native) |physical| if (try column.updatePhysical(self.budget.allocator(), ids, physical)) continue;
+                try column.updateEncoded(self.budget.allocator(), ids, values);
+            }
             self.rows_seen = std.math.add(u64, self.rows_seen, count) catch return error.SqlNumericOutOfRange;
             return;
         }
-        const hashes = if (identity) |ids_| ids_.hashes else try @import("batch_hash.zig").encodedColumns(a, keys, count, true);
+        const hashes = if (identity) |ids_| ids_.hashes else try @import("batch_hash.zig").encodedColumnsWithPhysical(a, keys, physical_keys, count, true);
         for (ids, 0..) |*id, index| {
-            for (keys, row_keys) |column, *cell| cell.* = try column.cell(a, index, 0);
+            for (keys, physical_keys, row_keys) |column, native, *cell| cell.* = if (native) |view| try view.cell(index) else try column.cell(a, index, 0);
             if (identity) |identity_| self.source_ordinal = identity_.ordinals[index];
             id.* = try self.resolveGroupHashed(row_keys, hashes[index].?);
             self.rows_seen = std.math.add(u64, self.rows_seen, 1) catch return error.SqlNumericOutOfRange;
         }
-        for (self.state_columns, inputs) |*column, values| try column.updateEncoded(self.budget.allocator(), ids, values);
+        for (self.state_columns, inputs, physical_inputs) |*column, values, native| {
+            if (native) |physical| if (try column.updatePhysical(self.budget.allocator(), ids, physical)) continue;
+            try column.updateEncoded(self.budget.allocator(), ids, values);
+        }
     }
 
     /// Global COUNT, integer SUM and boolean reductions do not need a hash
@@ -2881,4 +2942,18 @@ test "SQL global encoded aggregates consume physical vectors without hash probes
     try std.testing.expectEqual(@as(i64, 5), result.aggregates[0].value.integer);
     try std.testing.expectEqual(@as(i64, 3), result.aggregates[1].value.integer);
     try std.testing.expectEqual(@as(i64, -2), result.aggregates[2].value.integer);
+}
+
+test "SQL global encoded wide batches admit one group under a small budget" {
+    const a = std.testing.allocator;
+    const specs: [12]AggregateSpec = @splat(.{ .kind = .count });
+    const values = [_]Datum{Datum.json(.{ .integer = 1 })};
+    const indices: [1024]u32 = @splat(0);
+    const batch: @import("execution_batch.zig").Batch = .{ .dictionary = .{ .values = &values, .indices = &indices } };
+    const inputs: [12]@import("execution_batch.zig").Batch = @splat(batch);
+    var grouped = try Grouped.create(a, &specs, .{ .bytes = 64 * 1024 });
+    defer grouped.deinit();
+    try grouped.addEncodedColumns(&.{}, &inputs, indices.len);
+    try std.testing.expectEqual(@as(usize, 0), grouped.hash_probes);
+    for (grouped.state_columns) |column| try std.testing.expectEqual(@as(u64, indices.len), column.values.counts.items[0]);
 }

@@ -455,12 +455,12 @@ pub const Cursor = struct {
         };
     }
     fn planPrefetchPages(self: *Cursor, reader: *@import("lake_serving_cache.zig").Reader) !void {
-        var reads: [4]ranges.RangeRead = undefined;
+        var reads: [8]ranges.RangeRead = undefined;
         var count: usize = 0;
         var planned: usize = 0;
         for (self.columns) |*column| {
             if (self.filter != null and !column.required) continue;
-            if (planned == reads.len) break;
+            if (planned == 4) break;
             if (column.consumed != column.count) continue;
             const end = std.math.add(u64, column.chunk.file_offset, column.chunk.compressed_len) catch return error.InvalidParquetPage;
             if (column.offset >= end) continue;
@@ -472,8 +472,25 @@ pub const Cursor = struct {
             const limit = self.limits.max_input_bytes / @max(@as(usize, 1), self.columns.len);
             if (self.indexedPage(column)) |entry| {
                 if (entry.len > limit or entry.len > end - column.offset) continue;
+                if (column.required and self.prune_page != null and !self.prune_page.?(self.prune_ptr.?, column.chunk, entry)) continue;
                 reads[count] = .{ .object = try ranges.objectRefForExternalFileUri(self.file), .range = .{ .offset = column.offset, .len = entry.len }, .purpose = .parquet_column_chunk };
                 count += 1;
+                // One adjacent page of lookahead per projected column. Filter
+                // consumers defer future payload until its row window survives.
+                if (self.filter == null and self.prune_page == null and count < reads.len) {
+                    var following_column = column.*;
+                    following_column.offset += entry.len;
+                    if (self.indexedPage(&following_column)) |following| {
+                        if (following.len <= limit and following.len <= end - following_column.offset) {
+                            if (try self.cachedIndexedPage(&following_column)) |lease| {
+                                lease.release();
+                            } else {
+                                reads[count] = .{ .object = reads[count - 1].object, .range = .{ .offset = following_column.offset, .len = following.len }, .purpose = .parquet_column_chunk };
+                                count += 1;
+                            }
+                        }
+                    }
+                }
             } else {
                 const probe: ranges.RangeRead = .{ .object = try ranges.objectRefForExternalFileUri(self.file), .range = .{ .offset = column.offset, .len = @min(end - column.offset, 512) }, .purpose = .parquet_column_chunk };
                 try reader.prefetchPage(probe, end, limit);

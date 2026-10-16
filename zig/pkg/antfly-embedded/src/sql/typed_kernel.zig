@@ -74,8 +74,106 @@ const Vector = struct {
         }
     }
 };
+/// Owned delivery vectors keep computed primitive results typed across
+/// operator boundaries. JSON NULL retains a distinct state and declines the
+/// SQL-null-only physical trait, while scalar readers still see exact cells.
+pub const Encoded = struct {
+    vector: Vector,
+    nulls: []u8,
+    selection: []usize,
+    type: scalar.Type,
+    json_null: bool = false,
+    fn allocate(a: A, kind_: Kind, count: usize, type_: scalar.Type) !*Encoded {
+        const self = try a.create(Encoded);
+        errdefer a.destroy(self);
+        const payload = try a.alloc(u64, count * (if (kind_ == .string) @as(usize, 2) else 1));
+        errdefer a.free(payload);
+        @memset(payload, 0);
+        const states = try a.alloc(State, count);
+        errdefer a.free(states);
+        const nulls = try a.alloc(u8, count);
+        errdefer a.free(nulls);
+        const selection = try a.alloc(usize, count);
+        for (selection, 0..) |*row, index| row.* = index;
+        self.* = .{ .vector = .{ .kind = kind_, .payload = payload, .states = states }, .nulls = nulls, .selection = selection, .type = type_ };
+        return self;
+    }
+    fn copy(self: *Encoded, source: Vector, begin: usize) void {
+        for (source.states, 0..) |state, offset| {
+            const row = begin + offset;
+            self.vector.states[row] = state;
+            self.nulls[row] = @intFromBool(state == .sql_null);
+            self.json_null = self.json_null or state == .json_null;
+            if (state != .value) continue;
+            switch (source.kind) {
+                .integer => self.vector.integers()[row] = source.integers()[offset],
+                .number => self.vector.numbers()[row] = source.numbers()[offset],
+                .boolean => self.vector.booleans()[row] = source.booleans()[offset],
+                .string => self.vector.strings()[row] = source.strings()[offset],
+                .none => unreachable,
+            }
+        }
+    }
+    fn create(a: A, source: Vector, type_: scalar.Type) !*Encoded {
+        const self = try allocate(a, source.kind, source.states.len, type_);
+        self.copy(source, 0);
+        return self;
+    }
+    pub fn concat(a: A, parts: []const *const Encoded) !*Encoded {
+        if (parts.len == 0) return error.InvalidSqlBackendResponse;
+        var count: usize = 0;
+        for (parts) |part| {
+            if (part.vector.kind != parts[0].vector.kind or !std.meta.eql(part.type, parts[0].type)) return error.InvalidSqlBackendResponse;
+            count = try std.math.add(usize, count, part.vector.states.len);
+        }
+        const self = try allocate(a, parts[0].vector.kind, count, parts[0].type);
+        var begin: usize = 0;
+        for (parts) |part| {
+            self.copy(part.vector, begin);
+            begin += part.vector.states.len;
+        }
+        return self;
+    }
+    fn read(raw: *anyopaque, _: A, row: usize, column: usize) !Datum {
+        const self: *Encoded = @ptrCast(@alignCast(raw));
+        if (column != 0 or row >= self.vector.states.len) return error.InvalidSqlBackendResponse;
+        return self.vector.get(row);
+    }
+    fn physical(raw: *anyopaque, _: A, column: usize) !?@import("execution_batch.zig").PhysicalColumn {
+        const self: *Encoded = @ptrCast(@alignCast(raw));
+        if (column != 0) return error.InvalidSqlBackendResponse;
+        if (self.json_null or self.type.kind == null or self.vector.kind == .none) return null;
+        return .{ .vector = .{ .name = "", .nulls = .{ .bytes = self.nulls }, .values = switch (self.vector.kind) {
+            .integer => .{ .i64 = self.vector.integers() },
+            .number => .{ .f64 = self.vector.numbers() },
+            .boolean => .{ .bool = self.vector.booleans() },
+            .string => .{ .bytes = self.vector.strings() },
+            .none => unreachable,
+        } }, .selection = self.selection, .kind = self.type.kind.?, .element = self.type.element_type };
+    }
+    pub fn destroy(raw: *anyopaque, a: A) void {
+        const self: *Encoded = @ptrCast(@alignCast(raw));
+        a.free(self.vector.payload);
+        a.free(self.vector.states);
+        a.free(self.nulls);
+        a.free(self.selection);
+        a.destroy(self);
+    }
+    pub fn batch(self: *Encoded) @import("execution_batch.zig").Batch {
+        return .{ .reader = .{ .ptr = self, .read = read, .read_physical = physical, .free_owned = destroy, .count = self.vector.states.len, .width = 1 } };
+    }
+};
+fn Delivery(comptime encoded: bool) type {
+    return if (encoded) ?*Encoded else []const Datum;
+}
+pub fn evaluateEncoded(a: A, programs: []const *const scalar.Program, input: anytype, parameters: []const std.json.Value) !?[]const ?*Encoded {
+    return evaluateImpl(true, a, programs, input, parameters) catch |err| switch (err) {
+        error.UnsupportedTypedKernel => null,
+        else => return err,
+    };
+}
 fn kind(type_: scalar.Type) ?Kind {
-    if (type_.element_type == .float32 or type_.element_type == .numeric) return null; // Exact scalar fallback preserves float4 rounding and decimal limbs.
+    if (type_.element_type == .numeric) return null; // Decimal limbs retain exact scalar evaluation.
     return if (type_.kind) |k| switch (k) {
         .integer => .integer,
         .number => .number,
@@ -144,13 +242,13 @@ fn children(instruction: scalar.Instruction, storage: *[2]u32) []const u32 {
     };
 }
 pub fn evaluate(a: A, programs: []const *const scalar.Program, input: anytype, parameters: []const std.json.Value) !?[]const []const Datum {
-    return evaluateImpl(a, programs, input, parameters) catch |err| switch (err) {
+    return evaluateImpl(false, a, programs, input, parameters) catch |err| switch (err) {
         error.UnsupportedTypedKernel => null,
         else => return err,
     };
 }
 
-test "SQL typed kernels preserve int4 overflow and decline float4 execution" {
+test "SQL typed kernels preserve int4 overflow and float4 node rounding" {
     const Input = struct {
         count: usize = 2,
         pub fn cell(_: @This(), _: A, _: usize, _: u32) !Datum {
@@ -177,10 +275,10 @@ test "SQL typed kernels preserve int4 overflow and decline float4 execution" {
     defer compiled.deinit();
     var program = try scalar.bind(std.testing.allocator, compiled.expression, &.{.{ .name = "x", .type = .number, .element_type = .float32 }}, &.{}, .{});
     defer program.deinit();
-    try std.testing.expect(!supported(&program));
+    try std.testing.expect(supported(&program));
 }
 
-fn evaluateImpl(a: A, programs: []const *const scalar.Program, input: anytype, parameters: []const std.json.Value) !?[]const []const Datum {
+fn evaluateImpl(comptime encoded: bool, a: A, programs: []const *const scalar.Program, input: anytype, parameters: []const std.json.Value) !?[]const Delivery(encoded) {
     if (input.count > 4096 or programs.len > 256) return null;
     var instructions: [512]scalar.Instruction = undefined;
     var len: usize = 0;
@@ -238,13 +336,19 @@ fn evaluateImpl(a: A, programs: []const *const scalar.Program, input: anytype, p
         if (pending[i] == 0) live -= 1;
     }
     if (peak *| input.count > 32768) return null;
-    const outputs = try a.alloc([]const Datum, programs.len);
-    @memset(outputs, &.{});
+    const outputs = try a.alloc(Delivery(encoded), programs.len);
+    @memset(outputs, if (encoded) null else &.{});
     errdefer {
-        for (outputs) |values| a.free(values);
+        for (outputs) |values| {
+            if (encoded) {
+                if (values) |owned| Encoded.destroy(owned, a);
+            } else a.free(values);
+        }
         a.free(outputs);
     }
-    for (outputs) |*output| output.* = try a.alloc(Datum, input.count);
+    if (!encoded) for (outputs) |*output| {
+        output.* = try a.alloc(Datum, input.count);
+    };
     const words: usize = for (instructions[0..len]) |instruction| {
         if (kind(instruction.type) == .string) break 2;
     } else 1;
@@ -294,10 +398,20 @@ fn evaluateImpl(a: A, programs: []const *const scalar.Program, input: anytype, p
                 if (state == .value) _ = try @import("builtin_cast.zig").checkedInteger(value, element);
             };
         };
+        if (target.kind == .number and instruction.type.element_type == .float32) {
+            for (target.numbers(), target.states) |*value, state| if (state == .value) {
+                value.* = try @import("builtin_cast.zig").floatValue(f32, .{ .float = value.* });
+            };
+        }
         // Materialize roots when ready, so delivery vectors do not pin live
         // kernel slots while later expressions reuse the shared DAG.
-        for (roots[0..programs.len], outputs) |root, output| if (root == i) {
-            for (@constCast(output), 0..) |*value, row| {
+        for (roots[0..programs.len], outputs) |root, *output| if (root == i) {
+            if (encoded) {
+                // Validate using the same scalar boundary; no Datum delivery
+                // array is allocated or retained for primitive consumers.
+                for (0..input.count) |row| try scalar.validateResult(target.get(row), .{});
+                output.* = try Encoded.create(a, target, instruction.type);
+            } else for (@constCast(output.*), 0..) |*value, row| {
                 value.* = target.get(row);
                 try scalar.validateResult(value.*, .{});
             }
@@ -394,5 +508,32 @@ fn binary(out: Vector, op: ast.Scalar.Binary, left: Vector, right: Vector) !void
         // Nulls, mixed numeric kinds and exceptional lanes share scalar rules.
         try out.set(row, try @import("vector_eval.zig").binary(op, left.get(row), right.get(row)));
         row += 1;
+    }
+}
+
+test "SQL typed kernels round REAL inputs and intermediate nodes with scalar errors" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const ca = arena.allocator();
+    var compiled = try @import("compiler.zig").compileScalar(a, "(x + x) - x", .{});
+    defer compiled.deinit();
+    var program = try scalar.bind(a, compiled.expression, &.{.{ .name = "x", .type = .number, .element_type = .float32 }}, &.{}, .{});
+    defer program.deinit();
+    const Input = struct {
+        count: usize = 4,
+        value: f64,
+        pub fn cell(self: @This(), _: A, _: usize, _: u32) !Datum {
+            return Datum.json(.{ .float = self.value });
+        }
+    };
+    for ([_]f64{ 16777217, -16777217, 0, -0.0 }) |value| {
+        const result = (try evaluateEncoded(ca, &.{&program}, Input{ .value = value }, &.{})).?;
+        const expected = try program.evaluate(ca, &.{try @import("describe.zig").coerceDatum(ca, Datum.json(.{ .float = value }), .number, .float32)}, &.{}, .{});
+        const batch = result[0].?.batch();
+        for (0..batch.len()) |row| try std.testing.expectEqualDeep(expected, try batch.cell(ca, row, 0));
+    }
+    for ([_]f64{ 1e-50, std.math.floatMax(f32) }) |value| {
+        try std.testing.expectError(error.SqlNumericOutOfRange, evaluateEncoded(ca, &.{&program}, Input{ .value = value }, &.{}));
     }
 }

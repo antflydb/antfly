@@ -197,6 +197,19 @@ pub fn evaluateColumnsEncodedMany(a: std.mem.Allocator, programs: []const *const
             @constCast(vectors)[offset] = null;
         };
     }
+    group.clearRetainingCapacity();
+    group_positions.clearRetainingCapacity();
+    for (programs, 0..) |program, index| if (outputs[index] == null and @import("typed_kernel.zig").supported(program)) {
+        try group.append(a, program);
+        try group_positions.append(a, index);
+    };
+    if (try evaluateEncodedScheduled(a, group.items, page, columns, parameters, io)) |encoded| {
+        defer a.free(encoded);
+        // No fallible operations between ownership transfer and publication.
+        for (encoded, group_positions.items) |vector, index| if (vector) |owned| {
+            outputs[index] = owned.batch();
+        };
+    }
     for (programs, 0..) |program, index| if (outputs[index] == null) {
         try fallback.append(a, program);
         try positions.append(a, index);
@@ -215,6 +228,58 @@ pub fn evaluateColumnsEncodedMany(a: std.mem.Allocator, programs: []const *const
     return outputs;
 }
 
+fn evaluateEncodedPart(a: std.mem.Allocator, programs: []const *const scalar.Program, page: @import("catalog.zig").ColumnPage, columns: []const scalar.Column, parameters: []const std.json.Value) anyerror!?[]const ?*@import("typed_kernel.zig").Encoded {
+    return @import("typed_kernel.zig").evaluateEncoded(a, programs, ColumnInput{ .page = page, .columns = columns, .count = page.selection.len }, parameters);
+}
+fn evaluateEncodedScheduled(a: std.mem.Allocator, programs: []const *const scalar.Program, page: @import("catalog.zig").ColumnPage, columns: []const scalar.Column, parameters: []const std.json.Value, io: ?std.Io) !?[]const ?*@import("typed_kernel.zig").Encoded {
+    const kernel = @import("typed_kernel.zig");
+    var work: usize = 0;
+    for (programs) |program| work +|= program.instructions.len;
+    const lanes = scheduledLanes(page.selection.len, work);
+    if (io == null or lanes == 1) return evaluateEncodedPart(a, programs, page, columns, parameters);
+    const scheduling = @import("parallel_scheduler.zig");
+    var locked: scheduling.LockedAllocator = .{ .backing = a };
+    const alloc = locked.allocator();
+    var tasks: [4]?scheduling.Task(anyerror!?[]const ?*kernel.Encoded) = @splat(null);
+    var outputs: [4]?[]const ?*kernel.Encoded = @splat(null);
+    defer for (outputs) |output| if (output) |vectors| {
+        for (vectors) |vector| if (vector) |owned| kernel.Encoded.destroy(owned, alloc);
+        alloc.free(vectors);
+    };
+    var failure: ?anyerror = null;
+    for (0..lanes) |lane| {
+        var part = page;
+        part.selection = page.selection[lane * page.selection.len / lanes .. (lane + 1) * page.selection.len / lanes];
+        tasks[lane] = scheduling.global().submit(io.?, (work +| columns.len +| 1) *| part.selection.len *| @sizeOf(Datum), evaluateEncodedPart, .{ alloc, programs, part, columns, parameters });
+        if (tasks[lane] == null) outputs[lane] = evaluateEncodedPart(alloc, programs, part, columns, parameters) catch |err| blk: {
+            failure = failure orelse err;
+            break :blk null;
+        };
+    }
+    // Join every owner before freeing either successful or failed lanes.
+    for (tasks[0..lanes], 0..) |*task, lane| if (task.*) |*active| {
+        outputs[lane] = active.await(io.?) catch |err| blk: {
+            failure = failure orelse err;
+            break :blk null;
+        };
+        task.* = null;
+    };
+    if (failure) |err| return err;
+    for (outputs[0..lanes]) |output| if (output == null) return null;
+    const joined = try a.alloc(?*kernel.Encoded, programs.len);
+    @memset(joined, null);
+    errdefer {
+        for (joined) |vector| if (vector) |owned| kernel.Encoded.destroy(owned, a);
+        a.free(joined);
+    }
+    for (joined, 0..) |*output, column| {
+        var parts: [4]*const kernel.Encoded = undefined;
+        for (outputs[0..lanes], parts[0..lanes]) |lane, *part| part.* = lane.?[column] orelse return error.InvalidSqlBackendResponse;
+        output.* = try kernel.Encoded.concat(a, parts[0..lanes]);
+    }
+    return joined;
+}
+
 pub fn freeEncodedMany(a: std.mem.Allocator, outputs: []const ?@import("execution_batch.zig").Batch) void {
     for (outputs) |optional| if (optional) |batch| switch (batch) {
         .dictionary => |encoded| {
@@ -226,6 +291,7 @@ pub fn freeEncodedMany(a: std.mem.Allocator, outputs: []const ?@import("executio
             a.free(vectors.values);
         },
         .columns => |physical| a.free(physical.definitions),
+        .reader => |reader| if (reader.free_owned) |free| free(reader.ptr, a),
         else => unreachable,
     };
     a.free(outputs);
@@ -1098,4 +1164,67 @@ fn physicalExpressionScenario(a: std.mem.Allocator) !void {
 test "SQL physical identity expressions reach aggregate kernels without vector expansion" {
     try physicalExpressionScenario(std.testing.allocator);
     try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, physicalExpressionScenario, .{});
+}
+
+fn computedPhysicalScenario(a: std.mem.Allocator) !void {
+    const definitions = [_]scalar.Column{.{ .name = "n", .type = .integer, .element_type = .int32 }};
+    const refs: [3]@import("../storage/rowsource/types.zig").RowRef = @splat(.{ .relational_key = "r" });
+    const page: @import("catalog.zig").ColumnPage = .{ .batch = .{
+        .snapshot = .{ .table_id = "t", .snapshot_id = "s" },
+        .row_refs = &refs,
+        .columns = &.{.{ .name = "n", .values = .{ .i64 = &.{ 2, 3, std.math.maxInt(i64) } }, .nulls = .{ .bytes = &.{ 0, 0, 1 } } }},
+    }, .selection = &.{ 0, 2, 1 } };
+    var compiled = try @import("compiler.zig").compileScalar(a, "n + 1", .{});
+    defer compiled.deinit();
+    var program = try scalar.bind(a, compiled.expression, &definitions, &.{}, .{});
+    defer program.deinit();
+    const outputs = try evaluateColumnsEncodedMany(a, &.{&program}, page, &definitions, &.{}, null);
+    defer freeEncodedMany(a, outputs);
+    try std.testing.expect(outputs[0].? == .reader);
+    var scratch = std.heap.ArenaAllocator.init(a);
+    defer scratch.deinit();
+    const physical = (try outputs[0].?.physicalColumn(scratch.allocator(), 0)).?;
+    try physical.validate();
+    try std.testing.expectEqual(@as(i64, 3), physical.vector.values.i64[0]);
+    try std.testing.expect(physical.vector.nulls.isNull(1));
+    const masked = try outputs[0].?.mask(scratch.allocator(), &.{ 1, 3, 4 }, 6);
+    const native = (try masked.physicalColumn(scratch.allocator(), 0)).?;
+    try native.validate();
+    for (0..6) |index| try std.testing.expectEqual(index != 1 and index != 4, (try masked.cell(a, index, 0)).sql_null);
+    var state = @import("aggregate_state.zig").Column.init(.{ .kind = .sum, .input_type = .integer });
+    defer state.clear(a);
+    try state.append(a);
+    try state.updateEncoded(a, &.{ 0, 0, 0, 0, 0, 0 }, masked);
+    try std.testing.expectEqual(@as(i64, 7), (try state.finish(0)).value.integer);
+}
+test "SQL physical computed outputs and FILTER masks retain native lanes under allocation faults" {
+    try computedPhysicalScenario(std.testing.allocator);
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, computedPhysicalScenario, .{});
+}
+
+test "SQL physical computed vectors share parallel scheduling and typed delivery" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const ca = arena.allocator();
+    const definitions = [_]scalar.Column{.{ .name = "n", .type = .integer }};
+    const refs = try ca.alloc(@import("../storage/rowsource/types.zig").RowRef, 4096);
+    @memset(refs, .{ .relational_key = "r" });
+    const integers = try ca.alloc(i64, refs.len);
+    const selection = try ca.alloc(usize, refs.len);
+    for (integers, selection, 0..) |*value, *index, i| {
+        value.* = @intCast(i);
+        index.* = i;
+    }
+    const page: @import("catalog.zig").ColumnPage = .{ .batch = .{ .snapshot = .{ .table_id = "t", .snapshot_id = "s" }, .row_refs = refs, .columns = &.{.{ .name = "n", .values = .{ .i64 = integers } }} }, .selection = selection };
+    var compiled = try @import("compiler.zig").compileScalar(a, "n + n + n", .{});
+    defer compiled.deinit();
+    var program = try scalar.bind(a, compiled.expression, &definitions, &.{}, .{});
+    defer program.deinit();
+    const outputs = try evaluateColumnsEncodedMany(a, &.{&program}, page, &definitions, &.{}, std.testing.io);
+    defer freeEncodedMany(a, outputs);
+    const physical = (try outputs[0].?.physicalColumn(ca, 0)).?;
+    try physical.validate();
+    try std.testing.expectEqual(refs.len, physical.selection.len);
+    for (integers, physical.vector.values.i64) |input, output| try std.testing.expectEqual(input * 3, output);
 }

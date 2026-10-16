@@ -167,6 +167,23 @@ pub const PatternPrograms = struct {
             @import("antfly_platform").sync.lockYielding(&self.owner.mutex);
             defer self.owner.mutex.unlock();
             self.execution.busy = false;
+            // A parent allocator can refuse growth without exhausting the
+            // child budget. Failed DFA tables are never reusable, regardless
+            // of which admission owner rejected their allocation.
+            const failed = switch (self.execution.program) {
+                inline else => |program| program.allocation_failed,
+            };
+            if (failed or self.execution.budget.isExhausted()) {
+                for (self.owner.entries) |entry| if (entry) |held| {
+                    for (&held.executions) |*slot| if (slot.* == self.execution) {
+                        slot.* = null;
+                        self.execution.deinit();
+                        self.owner.budget.allocator().destroy(self.execution);
+                        return;
+                    };
+                };
+                unreachable;
+            }
         }
     };
     /// Mutable DFA tables are exclusive to one traversal, but survive between
@@ -933,13 +950,31 @@ pub const FuzzyFilter = struct {
         return fuzzyPrefixMatches(self.term, term, self.prefix_len);
     }
 
-    fn executeInternal(
+    fn executeInternal(self: FuzzyFilter, alloc: Allocator, seg: *const index_mod.SegmentEntry, comptime collect_stats: bool, stats: ?*ExecutionStats) FilterError!roaring.RoaringBitmap {
+        const original_stats = if (stats) |value| value.* else null;
+        return self.executeAttempt(alloc, seg, collect_stats, stats) catch |err| switch (err) {
+            error.PatternProgramBudgetExceeded => blk: {
+                // The failed attempt has released its reader, iterator and
+                // execution lease before the private traversal starts.
+                var fallback = self;
+                fallback.control.pattern_programs = null;
+                if (stats) |value| value.* = original_stats.?;
+                break :blk fallback.executeAttempt(alloc, seg, collect_stats, stats) catch |failure| switch (failure) {
+                    error.PatternProgramBudgetExceeded => unreachable,
+                    else => return failure,
+                };
+            },
+            else => return err,
+        };
+    }
+
+    fn executeAttempt(
         self: FuzzyFilter,
         alloc: Allocator,
         seg: *const index_mod.SegmentEntry,
         comptime collect_stats: bool,
         stats: ?*ExecutionStats,
-    ) FilterError!roaring.RoaringBitmap {
+    ) (FilterError || error{PatternProgramBudgetExceeded})!roaring.RoaringBitmap {
         var inv_reader = (try seg.reader.invertedIndexScoped(alloc, self.field)) orelse
             return roaring.RoaringBitmap.init(alloc);
         defer inv_reader.deinit();
@@ -959,16 +994,10 @@ pub const FuzzyFilter = struct {
 
         var result = roaring.RoaringBitmap.init(alloc);
         errdefer result.deinit();
-        const original_stats = if (stats) |value| value.* else null;
         try collectAutomatonTerms(alloc, &term_iter, &result, self, acceptTerm, collect_stats, stats);
         if (lev.allocation_failed) {
             if (execution) |lease| if (lease.execution.budget.isExhausted() or lease.owner.budget.isExhausted()) {
-                result.deinit();
-                result = roaring.RoaringBitmap.init(alloc);
-                var fallback = self;
-                fallback.control.pattern_programs = null;
-                if (stats) |value| value.* = original_stats.?;
-                return fallback.executeInternal(alloc, seg, collect_stats, stats);
+                return error.PatternProgramBudgetExceeded;
             };
             return error.OutOfMemory;
         }
@@ -1025,13 +1054,31 @@ pub const RegexpFilter = struct {
         return true;
     }
 
-    fn executeInternal(
+    fn executeInternal(self: RegexpFilter, alloc: Allocator, seg: *const index_mod.SegmentEntry, comptime collect_stats: bool, stats: ?*ExecutionStats) FilterError!roaring.RoaringBitmap {
+        const original_stats = if (stats) |value| value.* else null;
+        return self.executeAttempt(alloc, seg, collect_stats, stats) catch |err| switch (err) {
+            error.PatternProgramBudgetExceeded => blk: {
+                // The failed attempt has released its reader, iterator and
+                // execution lease before the private traversal starts.
+                var fallback = self;
+                fallback.control.pattern_programs = null;
+                if (stats) |value| value.* = original_stats.?;
+                break :blk fallback.executeAttempt(alloc, seg, collect_stats, stats) catch |failure| switch (failure) {
+                    error.PatternProgramBudgetExceeded => unreachable,
+                    else => return failure,
+                };
+            },
+            else => return err,
+        };
+    }
+
+    fn executeAttempt(
         self: RegexpFilter,
         alloc: Allocator,
         seg: *const index_mod.SegmentEntry,
         comptime collect_stats: bool,
         stats: ?*ExecutionStats,
-    ) FilterError!roaring.RoaringBitmap {
+    ) (FilterError || error{PatternProgramBudgetExceeded})!roaring.RoaringBitmap {
         var inv_reader = (try seg.reader.invertedIndexScoped(alloc, self.field)) orelse
             return roaring.RoaringBitmap.init(alloc);
         defer inv_reader.deinit();
@@ -1056,16 +1103,10 @@ pub const RegexpFilter = struct {
 
         var result = roaring.RoaringBitmap.init(alloc);
         errdefer result.deinit();
-        const original_stats = if (stats) |value| value.* else null;
         try collectAutomatonTerms(alloc, &term_iter, &result, self, acceptTerm, collect_stats, stats);
         if (regex.allocation_failed) {
             if (execution) |lease| if (lease.execution.budget.isExhausted() or lease.owner.budget.isExhausted()) {
-                result.deinit();
-                result = roaring.RoaringBitmap.init(alloc);
-                var fallback = self;
-                fallback.control.pattern_programs = null;
-                if (stats) |value| value.* = original_stats.?;
-                return fallback.executeInternal(alloc, seg, collect_stats, stats);
+                return error.PatternProgramBudgetExceeded;
             };
             return error.OutOfMemory;
         }
@@ -4310,7 +4351,27 @@ test "external lake metadata navigation compiled programs share immutable plans 
         lease.execution.budget.limit = 0;
         lease.release();
         try Worker.run(a, leaves[if (fuzzy) 2 else 0].withControl(.{ .pattern_programs = &bounded }), &writer.snapshot().segments[0]);
-        try testing.expect(lease.execution.budget.isExhausted());
+        try testing.expect(plan.executions[0] == null);
+    }
+    for ([_]bool{ false, true }) |fuzzy| {
+        var pressure = PatternPrograms.init(a, 1024 * 1024);
+        defer pressure.deinit();
+        const plan = (try pressure.getDistance(if (fuzzy) .fuzzy else .regexp, if (fuzzy) "alpina" else "alp.*", if (fuzzy) 1 else 0, .{})).?;
+        const lease = (try pressure.checkout(plan, .{})).?;
+        const initial_live = pressure.budget.live;
+        pressure.budget.limit = initial_live;
+        lease.release();
+        try Worker.run(a, leaves[if (fuzzy) 2 else 0].withControl(.{ .pattern_programs = &pressure }), &writer.snapshot().segments[0]);
+        try testing.expect(pressure.budget.isExhausted());
+        try testing.expect(plan.executions[0] == null);
+        try testing.expect(pressure.budget.live < initial_live);
+        // Restoring headroom builds a healthy execution, then reuses it.
+        pressure.budget.limit = 1024 * 1024;
+        try Worker.run(a, leaves[if (fuzzy) 2 else 0].withControl(.{ .pattern_programs = &pressure }), &writer.snapshot().segments[0]);
+        const builds = pressure.execution_builds;
+        try Worker.run(a, leaves[if (fuzzy) 2 else 0].withControl(.{ .pattern_programs = &pressure }), &writer.snapshot().segments[1]);
+        try testing.expectEqual(builds, pressure.execution_builds);
+        try testing.expect(pressure.execution_hits > 0);
     }
     // Optional cache admission never makes a valid pattern disappear.
     var tiny = PatternPrograms.init(a, 0);

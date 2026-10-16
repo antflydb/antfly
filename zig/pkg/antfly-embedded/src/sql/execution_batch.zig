@@ -37,6 +37,76 @@ pub const PhysicalColumn = struct {
         view.selection = rows;
         return view;
     }
+    /// Normalize only selected lanes; excluded payloads remain lazy. Narrow
+    /// integers are checked without copying, and REAL values round once into
+    /// a compact native vector using the scalar width/underflow contract.
+    pub fn coerce(self: @This(), a: A, kind_: @import("ast.zig").ColumnType, element_: ?@import("array_value.zig").ElementType) !?@This() {
+        if (self.kind != kind_) return null;
+        const compatible = switch (kind_) {
+            .integer => element_ == null or element_ == .int16 or element_ == .int32 or element_ == .int64,
+            .number => element_ == null or element_ == .float32 or element_ == .float64,
+            .boolean => element_ == null or element_ == .boolean,
+            .string => element_ == null or element_ == .text,
+            else => false,
+        };
+        if (!compatible) return null;
+        var view = self;
+        view.element = element_;
+        try view.validate();
+        if (element_ == .float32) {
+            const values = try a.alloc(f64, self.selection.len);
+            errdefer a.free(values);
+            const nulls = try a.alloc(u8, values.len);
+            errdefer a.free(nulls);
+            const selection = try a.alloc(usize, values.len);
+            errdefer a.free(selection);
+            for (self.selection, values, nulls, selection, 0..) |row, *value, *flag, *index, i| {
+                flag.* = @intFromBool(self.vector.nulls.isNull(row));
+                index.* = i;
+                const number = if (flag.* != 0) 0 else switch (self.vector.values) {
+                    .f64 => |v| v[row],
+                    .dictionary_f64 => |v| v.at(row),
+                    else => return error.InvalidSqlBackendResponse,
+                };
+                value.* = try @import("builtin_cast.zig").floatValue(f32, .{ .float = number });
+            }
+            view.vector = .{ .name = self.vector.name, .values = .{ .f64 = values }, .nulls = .{ .bytes = nulls } };
+            view.selection = selection;
+        }
+        return view;
+    }
+    pub fn cell(self: @This(), index: usize) !scalar.Datum {
+        if (index >= self.selection.len) return error.InvalidSqlBackendResponse;
+        const row = self.selection[index];
+        if (self.vector.nulls.isNull(row)) return .{};
+        return scalar.Datum.json(switch (self.vector.values) {
+            .i64 => |v| .{ .integer = v[row] },
+            .dictionary_i64 => |v| .{ .integer = v.at(row) },
+            .f64 => |v| .{ .float = v[row] },
+            .dictionary_f64 => |v| .{ .float = v.at(row) },
+            .bool => |v| .{ .bool = v[row] },
+            .bytes => |v| .{ .string = v[row] },
+            .dictionary_bytes => |v| .{ .string = v.at(row) },
+            else => return error.InvalidSqlBackendResponse,
+        });
+    }
+    pub fn bytes(self: @This(), index: usize) !usize {
+        const row_index = self.selection[index];
+        if (self.vector.nulls.isNull(row_index)) return @sizeOf(scalar.Datum);
+        return @sizeOf(scalar.Datum) + switch (self.vector.values) {
+            .bytes => |v| v[row_index].len,
+            .dictionary_bytes => |v| v.at(row_index).len,
+            else => @as(usize, 0),
+        };
+    }
+    pub fn dictionaryIdentity(self: @This(), index: usize) ?u64 {
+        const row_index = self.selection[index];
+        if (self.vector.nulls.isNull(row_index)) return 0;
+        return switch (self.vector.values) {
+            inline .dictionary_i64, .dictionary_f64, .dictionary_bytes => |v| @as(u64, v.indices[row_index]) + 1,
+            else => null,
+        };
+    }
     pub fn validate(self: @This()) !void {
         const compatible = switch (self.vector.values) {
             .i64, .dictionary_i64 => self.kind == .integer,
@@ -52,6 +122,14 @@ pub const PhysicalColumn = struct {
             switch (self.vector.values) {
                 inline .dictionary_i64, .dictionary_f64, .dictionary_bytes => |values| if (values.indices[row] >= values.values.len) return error.InvalidSqlBackendResponse,
                 else => {},
+            }
+            if (self.kind == .integer and (self.element == .int16 or self.element == .int32)) {
+                const integer = switch (self.vector.values) {
+                    .i64 => |values| values[row],
+                    .dictionary_i64 => |values| values.at(row),
+                    else => unreachable,
+                };
+                _ = try @import("builtin_cast.zig").checkedInteger(integer, self.element.?);
             }
             if (self.kind == .number and self.element == null) {
                 const number = switch (self.vector.values) {
@@ -70,7 +148,7 @@ pub const Batch = union(enum) {
     /// Stable retained columns; ownership belongs to the enclosing lease.
     retained: struct { store: *const @import("typed_store.zig").Store, begin: usize = 0, count: usize },
     /// Operator-specific column access without constructing a row matrix.
-    reader: struct { ptr: *anyopaque, read: *const fn (*anyopaque, A, usize, usize) anyerror!scalar.Datum, read_physical: ?*const fn (*anyopaque, A, usize) anyerror!?PhysicalColumn = null, read_dictionary: ?*const fn (*anyopaque, A, usize) anyerror!?Batch = null, read_identity: ?*const fn (*anyopaque, usize, usize) anyerror!?u64 = null, count: usize, width: usize },
+    reader: struct { ptr: *anyopaque, read: *const fn (*anyopaque, A, usize, usize) anyerror!scalar.Datum, free_owned: ?*const fn (*anyopaque, A) void = null, read_physical: ?*const fn (*anyopaque, A, usize) anyerror!?PhysicalColumn = null, read_dictionary: ?*const fn (*anyopaque, A, usize) anyerror!?Batch = null, read_identity: ?*const fn (*anyopaque, usize, usize) anyerror!?u64 = null, count: usize, width: usize },
     columns: struct { page: @import("catalog.zig").ColumnPage, definitions: []const scalar.Column },
     rows: []const []const scalar.Datum,
     vectors: struct { values: []const []const scalar.Datum, count: usize },
@@ -127,6 +205,54 @@ pub const Batch = union(enum) {
         view.* = .{ .source = self, .column = column, .physical = physical };
         return .{ .reader = .{ .ptr = view, .read = View.read, .read_physical = View.physicalView, .read_dictionary = View.dictionary, .read_identity = View.identity, .count = self.len(), .width = 1 } };
     }
+    /// Scatter a lazily evaluated FILTER cohort back into its parent batch.
+    /// Missing lanes are SQL NULL and never touch excluded source payloads.
+    pub fn mask(self: *const Batch, a: A, positions: []const usize, count: usize) !Batch {
+        if (positions.len != self.len() or self.width() != 1) return error.InvalidSqlBackendResponse;
+        const View = struct {
+            source: *const Batch,
+            indices: []usize,
+            fn read(raw: *anyopaque, alloc: A, row_index: usize, _: usize) !scalar.Datum {
+                const view: *@This() = @ptrCast(@alignCast(raw));
+                const index = view.indices[row_index];
+                return if (index == std.math.maxInt(usize)) .{} else view.source.cell(alloc, index, 0);
+            }
+            fn physical(raw: *anyopaque, alloc: A, _: usize) !?PhysicalColumn {
+                const view: *@This() = @ptrCast(@alignCast(raw));
+                const source = (try view.source.physicalColumn(alloc, 0)) orelse return null;
+                try source.validate();
+                const rows = try alloc.alloc(usize, view.indices.len);
+                const nulls = try alloc.alloc(u8, rows.len);
+                for (rows, nulls, view.indices, 0..) |*row_index, *flag, index, i| {
+                    row_index.* = i;
+                    flag.* = @intFromBool(index == std.math.maxInt(usize) or source.vector.nulls.isNull(source.selection[index]));
+                }
+                const values: @import("../storage/rowsource/types.zig").ColumnValues = switch (source.vector.values) {
+                    inline .i64, .f64, .bool, .bytes => |v, tag| blk: {
+                        const result = try alloc.alloc(@typeInfo(@TypeOf(v)).pointer.child, rows.len);
+                        for (result, nulls, view.indices) |*value, flag, index| value.* = if (flag != 0) std.mem.zeroes(@TypeOf(value.*)) else v[source.selection[index]];
+                        break :blk @unionInit(@import("../storage/rowsource/types.zig").ColumnValues, @tagName(tag), result);
+                    },
+                    inline .dictionary_i64, .dictionary_f64, .dictionary_bytes => |v, tag| blk: {
+                        const indices = try alloc.alloc(u32, rows.len);
+                        for (indices, nulls, view.indices) |*id, flag, index| id.* = if (flag != 0) 0 else v.indices[source.selection[index]];
+                        break :blk @unionInit(@import("../storage/rowsource/types.zig").ColumnValues, @tagName(tag), .{ .values = v.values, .indices = indices });
+                    },
+                    else => return null,
+                };
+                return .{ .vector = .{ .name = "", .values = values, .nulls = .{ .bytes = nulls } }, .selection = rows, .kind = source.kind, .element = source.element };
+            }
+        };
+        const indices = try a.alloc(usize, count);
+        @memset(indices, std.math.maxInt(usize));
+        for (positions, 0..) |position, index| {
+            if (position >= count or indices[position] != std.math.maxInt(usize)) return error.InvalidSqlBackendResponse;
+            indices[position] = index;
+        }
+        const view = try a.create(View);
+        view.* = .{ .source = self, .indices = indices };
+        return .{ .reader = .{ .ptr = view, .read = View.read, .read_physical = View.physical, .count = count, .width = 1 } };
+    }
     pub fn physicalColumn(self: Batch, a: A, column: usize) anyerror!?PhysicalColumn {
         if (column >= self.width()) return error.InvalidSqlBackendResponse;
         // Empty derived producers may retain schema names without physical
@@ -134,33 +260,32 @@ pub const Batch = union(enum) {
         if (self.len() == 0) return null;
         return switch (self) {
             .reader => |v| if (v.read_physical) |read| try read(v.ptr, a, column) else null,
+            .retained => |v| try v.store.physicalColumn(a, column, v.begin, v.count),
             .mapped => |v| blk: {
                 if (v.ordinals[column] == std.math.maxInt(usize) or column >= v.types.len) break :blk null;
                 const source = (try v.source.physicalColumn(a, v.ordinals[column])) orelse break :blk null;
-                if (v.types[column].kind != source.kind or v.types[column].element_type != source.element) break :blk null;
-                break :blk try source.select(a, v.selection);
+                break :blk try (try source.select(a, v.selection)).coerce(a, v.types[column].kind orelse return null, v.types[column].element_type);
             },
             .columns => |v| blk: {
                 const definition = v.definitions[column];
                 if (v.page.native) |native| {
                     for (native.names, 0..) |name, ordinal| if (std.mem.eql(u8, name, definition.name)) {
                         const source = (try native.values.physicalColumn(a, ordinal)) orelse break :blk null;
-                        if (definition.type != source.kind or definition.element_type != source.element) break :blk null;
-                        break :blk try source.select(a, v.page.selection);
+                        break :blk try (try source.select(a, v.page.selection)).coerce(a, definition.type, definition.element_type);
                     };
                     break :blk null;
                 }
                 if (std.mem.eql(u8, definition.name, "_id")) break :blk null;
                 const vector = v.page.batch.findColumn(definition.name) orelse break :blk null;
                 const compatible = switch (vector.values) {
-                    .i64, .dictionary_i64 => definition.type == .integer and (definition.element_type == null or definition.element_type == .int64),
-                    .f64, .dictionary_f64 => definition.type == .number and (definition.element_type == null or definition.element_type == .float64),
+                    .i64, .dictionary_i64 => definition.type == .integer and (definition.element_type == null or definition.element_type == .int16 or definition.element_type == .int32 or definition.element_type == .int64),
+                    .f64, .dictionary_f64 => definition.type == .number and (definition.element_type == null or definition.element_type == .float32 or definition.element_type == .float64),
                     .bool => definition.type == .boolean and (definition.element_type == null or definition.element_type == .boolean),
                     .bytes, .dictionary_bytes => definition.type == .string and (definition.element_type == null or definition.element_type == .text),
                     else => false,
                 };
                 if (!compatible) break :blk null;
-                break :blk PhysicalColumn{ .vector = vector, .selection = v.page.selection, .kind = definition.type, .element = definition.element_type };
+                break :blk try (PhysicalColumn{ .vector = vector, .selection = v.page.selection, .kind = definition.type, .element = definition.element_type }).coerce(a, definition.type, definition.element_type);
             },
             else => null,
         };
@@ -372,4 +497,62 @@ test "SQL physical views decline empty derived producers with retained schema na
     } } };
     var none = std.heap.FixedBufferAllocator.init(&.{});
     try std.testing.expect((try batch.physicalColumn(none.allocator(), 0)) == null);
+}
+
+test "SQL physical retained and spilled batches expose native columns and exact NULL lanes" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const ca = arena.allocator();
+    var store = @import("typed_store.zig").Store.init(a);
+    defer store.deinit();
+    _ = try store.append(&.{ scalar.Datum.json(.{ .integer = 7 }), scalar.Datum.json(.{ .string = "seven" }) });
+    _ = try store.append(&.{ .{}, .{} });
+    _ = try store.append(&.{ scalar.Datum.json(.{ .integer = -2 }), scalar.Datum.json(.{ .string = "two" }) });
+    const retained: Batch = .{ .retained = .{ .store = &store, .begin = 1, .count = 2 } };
+    for (0..2) |column| {
+        const physical = (try retained.physicalColumn(ca, column)).?;
+        try physical.validate();
+        for (0..2) |index| try std.testing.expectEqualDeep(try retained.cell(ca, index, column), try physical.cell(index));
+    }
+    const spill = @import("spill.zig");
+    const rows = [_]@import("operators.zig").Row{
+        .{ .values = &.{ scalar.Datum.json(.{ .integer = 7 }), scalar.Datum.json(.{ .string = "seven" }) }, .keys = &.{scalar.Datum.json(.{ .integer = 3 })}, .ordinal = 0 },
+        .{ .values = &.{ .{}, .{} }, .keys = &.{.{}}, .ordinal = 1 },
+        .{ .values = &.{ scalar.Datum.json(.{ .integer = -2 }), scalar.Datum.json(.{ .string = "two" }) }, .keys = &.{scalar.Datum.json(.{ .integer = -1 })}, .ordinal = 2 },
+    };
+    const bytes = try spill.encodeColumnarBlockAlloc(a, &rows, 4096);
+    defer a.free(bytes);
+    var block: spill.Sequential.OwnedBlock = .{ .a = a, .arena = std.heap.ArenaAllocator.init(a), .encoded = try spill.decodeColumnarBlockInArena(ca, bytes, 4096) };
+    defer block.arena.deinit();
+    for ([_]bool{ false, true }) |keys| {
+        const batch = try block.batch(ca, keys);
+        for (0..batch.width()) |column| {
+            const physical = (try batch.physicalColumn(ca, column)).?;
+            try physical.validate();
+            for (0..batch.len()) |index| try std.testing.expectEqualDeep(try batch.cell(ca, index, column), try physical.cell(index));
+        }
+    }
+}
+
+test "SQL physical narrow widths preserve selected coercion and REAL rounding" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const ca = arena.allocator();
+    const integers: PhysicalColumn = .{ .kind = .integer, .vector = .{ .name = "n", .values = .{ .i64 = &.{ 32767, 32768, std.math.maxInt(i64) } } }, .selection = &.{0} };
+    const narrow = (try integers.coerce(ca, .integer, .int16)).?;
+    try narrow.validate();
+    var overflow = integers;
+    overflow.selection = &.{1};
+    try std.testing.expectError(error.SqlNumericOutOfRange, overflow.coerce(ca, .integer, .int16));
+    const numbers: PhysicalColumn = .{ .kind = .number, .element = .float64, .vector = .{ .name = "r", .values = .{ .f64 = &.{ 16777217, 1e-50, -0.0, std.math.inf(f64), std.math.nan(f64) } } }, .selection = &.{ 0, 2, 3, 4 } };
+    const real = (try numbers.coerce(ca, .number, .float32)).?;
+    try std.testing.expectEqual(@as(f64, 16777216), (try real.cell(0)).value.float);
+    try std.testing.expect(std.math.signbit((try real.cell(1)).value.float));
+    try std.testing.expect(std.math.isInf((try real.cell(2)).value.float));
+    try std.testing.expect(std.math.isNan((try real.cell(3)).value.float));
+    var underflow = numbers;
+    underflow.selection = &.{1};
+    try std.testing.expectError(error.SqlNumericOutOfRange, underflow.coerce(ca, .number, .float32));
 }

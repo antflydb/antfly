@@ -1374,6 +1374,42 @@ pub const Sequential = struct {
                     const encoded = view.block.encoded orelse return null;
                     return encoded.dictionaryIdentity(row_index, column, view.keys);
                 }
+                fn physical(raw: *anyopaque, alloc: Allocator, column: usize) anyerror!?@import("execution_batch.zig").PhysicalColumn {
+                    const view: *@This() = @ptrCast(@alignCast(raw));
+                    const encoded = view.block.encoded orelse return null;
+                    const columns = if (view.keys) encoded.keys else encoded.values;
+                    if (column >= columns.len) return error.InvalidSqlSpill;
+                    const stored = columns[column];
+                    for (0..encoded.count()) |row_index| {
+                        const flag = (stored.flags[row_index / 4] >> @as(u3, @intCast(row_index % 4 * 2))) & 3;
+                        if (flag > 1) return null;
+                    }
+                    const wire_tag = switch (stored.values) {
+                        .fixed => |v| v.kind,
+                        .dictionary => |v| v.kind,
+                        .texts => |v| if (v.decimal) return null else @as(u8, 5),
+                        else => return null,
+                    };
+                    const kind_: @import("../storage/rowsource/types.zig").ColumnKind = switch (wire_tag) {
+                        1 => .bool,
+                        2 => .i64,
+                        3 => .f64,
+                        5 => .bytes,
+                        else => return null,
+                    };
+                    var block = view.block.*;
+                    if (view.keys) block.encoded = .{ .values = encoded.keys, .keys = &.{}, .ordinals = encoded.ordinals };
+                    const vector = try block.columnVector(alloc, column, kind_);
+                    const selection = try alloc.alloc(usize, encoded.count());
+                    for (selection, 0..) |*row_index, index| row_index.* = index;
+                    return .{ .vector = vector, .selection = selection, .kind = switch (kind_) {
+                        .bool => .boolean,
+                        .i64 => .integer,
+                        .f64 => .number,
+                        .bytes => .string,
+                        else => unreachable,
+                    }, .element = if (kind_ == .f64) .float64 else null };
+                }
                 fn dictionary(raw: *anyopaque, alloc: Allocator, column: usize) anyerror!?@import("execution_batch.zig").Batch {
                     const view: *@This() = @ptrCast(@alignCast(raw));
                     const encoded = view.block.encoded orelse return null;
@@ -1382,7 +1418,7 @@ pub const Sequential = struct {
             };
             const view = try a.create(View);
             view.* = .{ .block = self, .keys = keys };
-            return .{ .reader = .{ .ptr = view, .read = View.cell, .read_identity = View.identity, .read_dictionary = View.dictionary, .count = self.count(), .width = if (keys) self.keyWidth() else self.width() } };
+            return .{ .reader = .{ .ptr = view, .read = View.cell, .read_physical = View.physical, .read_identity = View.identity, .read_dictionary = View.dictionary, .count = self.count(), .width = if (keys) self.keyWidth() else self.width() } };
         }
         /// Export a typed column directly from validated spill buffers. Strings
         /// and string dictionaries borrow the block; numeric wire values are

@@ -5593,6 +5593,34 @@ def test_published_parquet_skewed_files_share_row_groups_and_stream_in_order(tmp
                     "statement": "SELECT SUM(amount), COUNT(*) FROM skew_scan WHERE amount % 3 = 0"
                 },
             )["rows"] == [[str(sum(divisible)), str(len(divisible))]]
+            # Mixed FILTER cohorts retain native computed vectors and evaluate
+            # invalid expressions only for lanes that survive their filter.
+            filtered = call(
+                "POST",
+                "/sql",
+                {
+                    "statement": "SELECT amount % 5 AS bucket, SUM(amount + 1) FILTER (WHERE amount % 3 = 0), COUNT(*) FILTER (WHERE amount % 3 = 0), SUM(1 / 0) FILTER (WHERE FALSE), SUM(amount) FROM skew_scan GROUP BY amount % 5 ORDER BY bucket"
+                },
+            )
+            assert filtered["rows"] == [
+                [
+                    str(bucket),
+                    str(sum(i + 1 for i in divisible if i % 5 == bucket)),
+                    str(sum(1 for i in divisible if i % 5 == bucket)),
+                    None,
+                    str(sum(expected[bucket::5])),
+                ]
+                for bucket in range(5)
+            ], filtered
+            assert call(
+                "POST",
+                "/sql",
+                {
+                    "statement": "SELECT "
+                    + ", ".join(["COUNT(*)"] * 12)
+                    + " FROM skew_scan"
+                },
+            )["rows"] == [[str(total)] * 12]
             assert call(
                 "POST",
                 "/sql",

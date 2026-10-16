@@ -23,6 +23,7 @@ const operators = @import("operators.zig");
 const scalar = @import("scalar.zig");
 const Datum = scalar.Datum;
 const Json = std.json.Value;
+const count_one = [_]Datum{Datum.json(.{ .integer = 1 })};
 
 fn addRow(context: anytype, bound: *const binding.Bound, grouped: anytype, alloc: std.mem.Allocator, row: catalog.Row) !void {
     const cells = try bound.input.cells(alloc, row);
@@ -115,62 +116,25 @@ pub fn addColumns(context: anytype, bound: *const binding.Bound, grouped: anytyp
     }
     var accepted = page;
     accepted.selection = selection.items;
-    // Unfiltered cohorts preserve physical expression vectors all the way
-    // into typed state, including global aggregates without hash probes.
-    // Filtered cohorts below retain lazy evaluation.
-    if (for (bound.filters) |filter| {
-        if (filter != null) break false;
-    } else true) {
-        const Batch = @import("execution_batch.zig").Batch;
-        var cohort: std.ArrayList(*const scalar.Program) = .empty;
-        for (bound.input.projections[0..bound.group_count]) |*optional| try cohort.append(a, &optional.*.?);
-        for (bound.inputs) |input| if (input) |slot| {
-            try cohort.append(a, &bound.input.projections[slot].?);
-        };
-        const outputs = try @import("vector_eval.zig").evaluateColumnsEncodedMany(a, cohort.items, accepted, bound.input.columns, context.parameters, context.backend.execution_io);
-        const key_batches = try a.alloc(Batch, bound.group_count);
-        const input_batches = try a.alloc(Batch, bound.inputs.len);
-        for (key_batches, cohort.items[0..key_batches.len], outputs[0..key_batches.len]) |*batch, program, output| {
-            batch.* = output orelse .{ .vectors = .{ .values = try a.dupe([]const Datum, &.{try columnValues(context, bound, a, accepted, program)}), .count = accepted.selection.len } };
-        }
-        var position = key_batches.len;
-        for (bound.inputs, input_batches) |input, *batch| {
-            if (input != null) {
-                batch.* = outputs[position] orelse .{ .vectors = .{ .values = try a.dupe([]const Datum, &.{try columnValues(context, bound, a, accepted, cohort.items[position])}), .count = accepted.selection.len } };
-                position += 1;
-            } else {
-                const indices = try a.alloc(u32, accepted.selection.len);
-                @memset(indices, 0);
-                batch.* = .{ .dictionary = .{ .values = &.{Datum.json(.{ .integer = 1 })}, .indices = indices } };
-            }
-        }
-        return grouped.addEncodedColumns(key_batches, input_batches, accepted.selection.len);
-    }
-    const keys = try a.alloc([]const Datum, bound.group_count);
-    const inputs = try a.alloc([]Datum, bound.inputs.len);
-    for (inputs) |*input| {
-        input.* = try a.alloc(Datum, selection.items.len);
-        @memset(input.*, .{});
-    }
-    // Keys and unfiltered inputs share one DAG and column normalization.
-    // Filtered inputs form separate cohorts below, preserving lazy errors.
+    const Batch = @import("execution_batch.zig").Batch;
+    const vector = @import("vector_eval.zig");
+    const key_batches = try a.alloc(Batch, bound.group_count);
+    const input_batches = try a.alloc(Batch, bound.inputs.len);
     var programs: std.ArrayList(*const scalar.Program) = .empty;
+    var slots: std.ArrayList(usize) = .empty;
     for (bound.input.projections[0..bound.group_count]) |*optional| try programs.append(a, &optional.*.?);
-    for (bound.inputs, bound.filters) |input, filter| if (filter == null) if (input) |slot| {
-        try programs.append(a, &bound.input.projections[slot].?);
+    for (bound.inputs, bound.filters, 0..) |input, filter, index| if (filter == null) {
+        if (input) |slot| {
+            try programs.append(a, &bound.input.projections[slot].?);
+            try slots.append(a, index);
+        } else input_batches[index] = try constantBatch(a, accepted.selection.len);
     };
-    const vectors = try @import("vector_eval.zig").evaluateColumnsManyScheduled(a, programs.items, accepted, bound.input.columns, context.parameters, context.backend.execution_io);
-    for (programs.items, vectors) |program, *vector| if (vector.* == null) {
-        @constCast(vector).* = try columnValues(context, bound, a, accepted, program);
-    };
-    for (keys, vectors[0..keys.len]) |*key, vector| key.* = vector.?;
-    var unfiltered: usize = keys.len;
-    for (bound.inputs, bound.filters, 0..) |input, filter, k| if (filter == null) {
-        if (input != null) {
-            @memcpy(inputs[k], vectors[unfiltered].?);
-            unfiltered += 1;
-        } else @memset(inputs[k], Datum.json(.{ .integer = 1 }));
-    };
+    const outputs = try vector.evaluateColumnsEncodedMany(a, programs.items, accepted, bound.input.columns, context.parameters, context.backend.execution_io);
+    for (key_batches, outputs[0..key_batches.len], programs.items[0..key_batches.len]) |*batch, output, program| batch.* = output orelse try scalarBatch(context, bound, a, accepted, program);
+    for (slots.items, outputs[key_batches.len..], programs.items[key_batches.len..]) |slot, output, program| input_batches[slot] = output orelse try scalarBatch(context, bound, a, accepted, program);
+    // Each FILTER cohort evaluates inputs only for accepted physical lanes.
+    // Native vectors remain typed through the SQL-NULL mask; unrelated
+    // unfiltered aggregates keep their original physical capabilities.
     const completed = try a.alloc(bool, bound.inputs.len);
     @memset(completed, false);
     for (bound.filters, 0..) |filter, k| {
@@ -188,32 +152,38 @@ pub fn addColumns(context: anytype, bound: *const binding.Bound, grouped: anytyp
         }
         var selected = accepted;
         selected.selection = filtered.items;
-        var cohort: std.ArrayList(*const scalar.Program) = .empty;
-        var slots: std.ArrayList(usize) = .empty;
+        programs.clearRetainingCapacity();
+        slots.clearRetainingCapacity();
         for (bound.inputs, bound.filters, 0..) |input, candidate, index| {
             if (candidate == null or completed[index]) continue;
             if (candidate.? != filter.? and !@import("typed_kernel.zig").sameProgram(filter_program, &bound.input.projections[candidate.?].?)) continue;
             completed[index] = true;
             if (input) |slot| {
-                try cohort.append(a, &bound.input.projections[slot].?);
+                try programs.append(a, &bound.input.projections[slot].?);
                 try slots.append(a, index);
-            } else for (positions.items) |position| inputs[index][position] = Datum.json(.{ .integer = 1 });
+            } else {
+                const source = try a.create(Batch);
+                source.* = try constantBatch(a, selected.selection.len);
+                input_batches[index] = try source.mask(a, positions.items, accepted.selection.len);
+            }
         }
-        const outputs = try @import("vector_eval.zig").evaluateColumnsManyScheduled(a, cohort.items, selected, bound.input.columns, context.parameters, context.backend.execution_io);
-        for (cohort.items, outputs, slots.items) |program, optional, slot| {
-            const values = optional orelse try columnValues(context, bound, a, selected, program);
-            for (positions.items, values) |index, value| inputs[slot][index] = value;
+        const encoded = try vector.evaluateColumnsEncodedMany(a, programs.items, selected, bound.input.columns, context.parameters, context.backend.execution_io);
+        for (programs.items, encoded, slots.items) |program, output, slot| {
+            const source = try a.create(Batch);
+            source.* = output orelse try scalarBatch(context, bound, a, selected, program);
+            input_batches[slot] = try source.mask(a, positions.items, accepted.selection.len);
         }
     }
-    if (bound.group_count == 0) {
-        const columns = try a.alloc([]const Datum, inputs.len);
-        for (inputs, columns) |input, *column| column.* = input;
-        try grouped.addGlobalColumns(columns, accepted.selection.len);
-    } else {
-        const columns = try a.alloc([]const Datum, inputs.len);
-        for (inputs, columns) |input, *column| column.* = input;
-        try grouped.addColumns(keys, columns, accepted.selection.len);
-    }
+    return grouped.addEncodedColumns(key_batches, input_batches, accepted.selection.len);
+}
+
+fn constantBatch(a: std.mem.Allocator, count: usize) !@import("execution_batch.zig").Batch {
+    const indices = try a.alloc(u32, count);
+    @memset(indices, 0);
+    return .{ .dictionary = .{ .values = &count_one, .indices = indices } };
+}
+fn scalarBatch(context: anytype, bound: *const binding.Bound, a: std.mem.Allocator, page: catalog.ColumnPage, program: *const scalar.Program) !@import("execution_batch.zig").Batch {
+    return .{ .vectors = .{ .values = try a.dupe([]const Datum, &.{try columnValues(context, bound, a, page, program)}), .count = page.selection.len } };
 }
 
 fn addGroupedDecisionPages(context: anytype, bound: *const binding.Bound, grouped: *@import("ordered_grouped.zig").Collector, top: *operators.TopK, projection: @import("decision_eval.zig").SortedProjection) !void {

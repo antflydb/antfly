@@ -317,7 +317,7 @@ pub const Column = struct {
     }
     /// Dispatch once per state/vector pair. Nulls and selections stay physical;
     /// dictionary IDs are gathered directly without creating Datum arrays.
-    fn updatePhysical(self: *Column, a: A, ids: []const usize, physical: @import("execution_batch.zig").PhysicalColumn) !bool {
+    pub fn updatePhysical(self: *Column, a: A, ids: []const usize, physical: @import("execution_batch.zig").PhysicalColumn) !bool {
         if (physical.selection.len != ids.len) return error.InvalidSqlBackendResponse;
         const compatible = switch (self.values) {
             .counts => true,
