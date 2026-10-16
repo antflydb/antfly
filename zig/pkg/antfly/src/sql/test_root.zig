@@ -49,6 +49,7 @@ test {
     _ = @import("antfly_local_sources").sql_read_stream;
     _ = @import("antfly_local_sources").sql_operators;
     _ = @import("antfly_local_sources").sql_aggregate_partial;
+    _ = @import("antfly_local_sources").sql_aggregate_state;
     _ = @import("antfly_local_sources").sql_aggregate_materialization;
     _ = @import("antfly_local_sources").sql_vector_eval;
     _ = @import("antfly_local_sources").sql_parallel_scheduler;

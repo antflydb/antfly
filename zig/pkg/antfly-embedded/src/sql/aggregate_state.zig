@@ -297,25 +297,34 @@ pub const Column = struct {
     /// Merge compact partial vectors directly after resolving destination IDs.
     /// Typed states need no Aggregate snapshots, cloned reducers or OwnedRows.
     pub fn mergeBatch(self: *Column, a: A, ids: []const usize, source: *const Column, begin: usize) !void {
+        return self.mergeSelectedBatch(a, ids, source, begin, null);
+    }
+    /// Selection vectors keep partial states typed across hash-owner exchanges.
+    pub fn mergeSelectedBatch(self: *Column, a: A, ids: []const usize, source: *const Column, begin: usize, indices: ?[]const usize) !void {
+        if (indices) |selected| if (selected.len != ids.len) return error.InvalidSqlBackendResponse;
         if (!std.meta.eql(self.spec, source.spec)) return error.InvalidSqlBackendResponse;
         if (std.meta.activeTag(self.values) != std.meta.activeTag(source.values)) {
             if (self.values != .dynamic) try self.promote(a);
             var arena = std.heap.ArenaAllocator.init(a);
             defer arena.deinit();
-            for (ids, begin..) |id, index| {
+            for (ids, 0..) |id, offset| {
+                const index = if (indices) |selected| selected[offset] else begin + offset;
                 _ = arena.reset(.retain_capacity);
                 try @import("aggregate_partial.zig").merge(&self.values.dynamic.items[id], try source.snapshot(arena.allocator(), index));
             }
             return;
         }
         switch (self.values) {
-            .counts => |*target| for (ids, begin..) |id, index| {
+            .counts => |*target| for (ids, 0..) |id, offset| {
+                const index = if (indices) |selected| selected[offset] else begin + offset;
                 target.items[id] = try mergedCount(target.items[id], source.values.counts.items[index]);
             },
-            .exact => |*target| for (ids, begin..) |id, index| {
+            .exact => |*target| for (ids, 0..) |id, offset| {
+                const index = if (indices) |selected| selected[offset] else begin + offset;
                 try target.items[id].merge(source.values.exact.items[index].state);
             },
-            .integers => |*target| for (ids, begin..) |id, index| {
+            .integers => |*target| for (ids, 0..) |id, offset| {
+                const index = if (indices) |selected| selected[offset] else begin + offset;
                 const from = source.values.integers.items[index];
                 const to = &target.items[id];
                 const count = try mergedCount(to.count, from.count);
@@ -326,14 +335,16 @@ pub const Column = struct {
                 }
                 to.count = count;
             },
-            .booleans => |*target| for (ids, begin..) |id, index| {
+            .booleans => |*target| for (ids, 0..) |id, offset| {
+                const index = if (indices) |selected| selected[offset] else begin + offset;
                 const from = source.values.booleans.items[index];
                 const to = &target.items[id];
                 const count = try mergedCount(to.count, from.count);
                 if (from.count != 0) to.value = if (to.count == 0) from.value else if (self.spec.kind == .bool_and or self.spec.kind == .min) to.value and from.value else to.value or from.value;
                 to.count = count;
             },
-            .bytes => |*target| for (ids, begin..) |id, index| {
+            .bytes => |*target| for (ids, 0..) |id, offset| {
+                const index = if (indices) |selected| selected[offset] else begin + offset;
                 const from = source.values.bytes.items[index];
                 const to = &target.items[id];
                 const count = try mergedCount(to.count, from.count);
@@ -344,13 +355,15 @@ pub const Column = struct {
                 }
                 to.count = count;
             },
-            .dynamic => |*target| for (ids, begin..) |id, index| {
+            .dynamic => |*target| for (ids, 0..) |id, offset| {
+                const index = if (indices) |selected| selected[offset] else begin + offset;
                 try @import("aggregate_partial.zig").merge(&target.items[id], source.values.dynamic.items[index]);
             },
             .numbers => {
                 var arena = std.heap.ArenaAllocator.init(a);
                 defer arena.deinit();
-                for (ids, begin..) |id, index| {
+                for (ids, 0..) |id, offset| {
+                    const index = if (indices) |selected| selected[offset] else begin + offset;
                     _ = arena.reset(.retain_capacity);
                     try self.mergeExact(a, id, try source.snapshot(arena.allocator(), index));
                 }
@@ -514,4 +527,26 @@ test "SQL typed partial merge batches allocate no primitive snapshots and own st
     try std.testing.expect(!operators.exactMergeable(.{ .kind = .min, .input_type = .number }));
     try std.testing.expect(operators.exactMergeable(.{ .kind = .min, .input_type = .integer, .input_element = .int32 }));
     try std.testing.expect(operators.exactMergeable(.{ .kind = .max, .input_type = .string, .input_element = .text }));
+}
+
+test "SQL typed partial merge batches select exact NUMERIC lanes" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    var work: @import("array_value.zig").Budget = .{};
+    const scalar = @import("scalar.zig");
+    const low = try scalar.numericTextLeaky(arena.allocator(), "1.1", &work);
+    const high = try scalar.numericTextLeaky(arena.allocator(), "2.2", &work);
+    const expected = try scalar.numericTextLeaky(arena.allocator(), "5.5", &work);
+    var source = Column.init(.{ .kind = .sum, .input_type = .number, .input_element = .numeric });
+    defer source.clear(a);
+    var target = Column.init(source.spec);
+    defer target.clear(a);
+    try source.append(a);
+    try source.append(a);
+    try source.update(a, 0, low);
+    try source.update(a, 1, high);
+    try target.append(a);
+    try target.mergeSelectedBatch(a, &.{ 0, 0, 0 }, &source, 0, &.{ 1, 0, 1 });
+    try std.testing.expectEqual(std.math.Order.eq, try scalar.compareDatums(expected, try target.finish(0)));
 }

@@ -1621,6 +1621,8 @@ test "lake SQL shared row group tasks and exact parallel reducers match serial g
         "SELECT SUM(amount::NUMERIC), AVG(amount::NUMERIC), COUNT(*) FROM events",
         "SELECT amount % 7 AS bucket, MIN(amount), MAX(amount), MIN(amount::TEXT), MAX(amount::TEXT), MIN(amount > 100), MAX(amount > 100), COUNT(*) FROM events GROUP BY amount % 7 ORDER BY bucket",
         "SELECT amount % 7 AS bucket, COUNT(*) AS n FROM events GROUP BY amount % 7 LIMIT 3",
+        "SELECT amount, SUM(amount), COUNT(*), MIN(amount::TEXT), MAX(amount > 100) FROM events GROUP BY amount ORDER BY amount LIMIT 100",
+        "SELECT amount, SUM(amount), COUNT(*) FROM events GROUP BY amount LIMIT 100",
     }) |sql| {
         var compiled = try compiler.compile(a, sql, .{});
         defer compiled.deinit();

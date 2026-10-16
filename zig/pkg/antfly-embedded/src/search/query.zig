@@ -138,6 +138,76 @@ pub const Filter = union(enum) {
     }
 };
 
+/// Query-owned immutable programs. Only compilation runs under the lock;
+/// dictionary I/O and private DFA execution never hold it. Full/oversized
+/// caches decline reuse and preserve the ordinary per-consumer execution path.
+pub const PatternPrograms = struct {
+    const Kind = enum { regexp, wildcard };
+    const Entry = struct {
+        key: [32]u8,
+        pattern: []u8,
+        program: union(Kind) { regexp: regex_mod.RegexAutomaton, wildcard: wildcard_mod.SearchPlan },
+    };
+    budget: @import("../sql/memory_budget.zig"),
+    entries: [16]?*Entry = @splat(null),
+    mutex: std.atomic.Mutex = .unlocked,
+    builds: usize = 0,
+    hits: usize = 0,
+    pub fn init(a: Allocator, bytes: usize) @This() {
+        return .{ .budget = .{ .backing = a, .limit = bytes } };
+    }
+    pub fn deinit(self: *@This()) void {
+        const a = self.budget.allocator();
+        for (self.entries) |entry| if (entry) |held| {
+            switch (held.program) {
+                .regexp => |*program| program.deinit(),
+                .wildcard => |*program| program.deinit(a),
+            }
+            a.free(held.pattern);
+            a.destroy(held);
+        };
+        std.debug.assert(self.budget.live == 0);
+    }
+    fn get(self: *@This(), kind: Kind, pattern: []const u8, control: ExecutionControl) !?*const Entry {
+        try control.check();
+        var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+        hasher.update(@tagName(kind));
+        hasher.update(pattern);
+        var key: [32]u8 = undefined;
+        hasher.final(&key);
+        @import("antfly_platform").sync.lockYielding(&self.mutex);
+        defer self.mutex.unlock();
+        for (self.entries) |entry| if (entry) |held| if (std.mem.eql(u8, &held.key, &key)) {
+            self.hits += 1;
+            return held;
+        };
+        const slot = for (&self.entries) |*entry| {
+            if (entry.* == null) break entry;
+        } else return null;
+        self.budget.exhausted = false;
+        const built = self.build(kind, pattern, key) catch |err| {
+            if (err == error.OutOfMemory and self.budget.exhausted) return null;
+            return err;
+        };
+        slot.* = built;
+        self.builds += 1;
+        try control.check();
+        return built;
+    }
+    fn build(self: *@This(), kind: Kind, pattern: []const u8, key: [32]u8) !*Entry {
+        const a = self.budget.allocator();
+        const entry = try a.create(Entry);
+        errdefer a.destroy(entry);
+        const owned = try a.dupe(u8, pattern);
+        errdefer a.free(owned);
+        entry.* = .{ .key = key, .pattern = owned, .program = switch (kind) {
+            .regexp => .{ .regexp = try regex_mod.compile(a, owned) },
+            .wildcard => .{ .wildcard = try wildcard_mod.searchPlanAlloc(a, owned) },
+        } };
+        return entry;
+    }
+};
+
 /// Bounded query-owned pattern leaves for one immutable corpus/pack. Keys own
 /// only digests; encoded segments and request syntax are never retained. Each
 /// mutable caller receives a private bitmap. Scorers can instead pin immutable
@@ -890,8 +960,14 @@ pub const RegexpFilter = struct {
 
         // Compile regex → automaton; the dictionary walk prunes whole blocks
         // whose shared prefix cannot reach an accepting state.
-        var regex = regex_mod.compile(alloc, self.pattern) catch
-            return roaring.RoaringBitmap.init(alloc);
+        const cached = if (self.control.pattern_programs) |programs| programs.get(.regexp, self.pattern, self.control) catch |err| switch (err) {
+            error.InvalidRegex => return roaring.RoaringBitmap.init(alloc),
+            else => return err,
+        } else null;
+        var regex = if (cached) |entry| entry.program.regexp.fork(alloc) else regex_mod.compile(alloc, self.pattern) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => return roaring.RoaringBitmap.init(alloc),
+        };
         defer regex.deinit();
 
         var term_iter = try inv_reader.fstSearchIterator(regex.automaton());
@@ -900,6 +976,7 @@ pub const RegexpFilter = struct {
         var result = roaring.RoaringBitmap.init(alloc);
         errdefer result.deinit();
         try collectAutomatonTerms(alloc, &term_iter, &result, self, acceptTerm, collect_stats, stats);
+        if (regex.allocation_failed) return error.OutOfMemory;
         return result;
     }
 };
@@ -1823,8 +1900,9 @@ pub const WildcardFilter = struct {
         // lookup; otherwise seek to the literal prefix and stop as soon as
         // the sorted dictionary leaves it. Only a leading operator still has
         // to walk the whole dictionary.
-        var plan = try wildcard_mod.searchPlanAlloc(alloc, self.pattern);
-        defer plan.deinit(alloc);
+        const cached = if (self.control.pattern_programs) |programs| try programs.get(.wildcard, self.pattern, self.control) else null;
+        var plan = if (cached) |entry| entry.program.wildcard else try wildcard_mod.searchPlanAlloc(alloc, self.pattern);
+        defer if (cached == null) plan.deinit(alloc);
         const literal_prefix = plan.literal_prefix;
 
         if (plan.exact) {
@@ -4068,4 +4146,57 @@ test "external lake metadata navigation pattern leaves reuse immutable membershi
         }
     };
     try testing.checkAllAllocationFailures(a, Failure.run, .{ segment, leaves[0] });
+}
+
+test "external lake metadata navigation compiled programs share immutable plans across segments" {
+    const a = std.testing.allocator;
+    const data = try buildTestSegmentWithTerms(a, &.{
+        .{ .terms = &.{.{ .term = "alpine", .freq = 1, .norm = 1 }} },
+        .{ .terms = &.{.{ .term = "beta", .freq = 1, .norm = 1 }} },
+    });
+    defer a.free(data);
+    var writer = try index_mod.IndexWriter.init(a);
+    defer writer.deinit();
+    for (0..4) |_| try writer.addSegment(data);
+    var programs = PatternPrograms.init(a, 1024 * 1024);
+    defer programs.deinit();
+    const leaves = [_]Filter{
+        .{ .regexp = .{ .field = "body", .pattern = "alp.*" } },
+        .{ .wildcard = .{ .field = "body", .pattern = "al\\p*" } },
+    };
+    const Worker = struct {
+        fn run(alloc: Allocator, leaf: Filter, segment: *const index_mod.SegmentEntry) anyerror!void {
+            var matches = try leaf.execute(alloc, segment);
+            defer matches.deinit();
+            try testing.expect(matches.contains(0));
+            try testing.expect(!matches.contains(1));
+        }
+    };
+    for (leaves) |leaf| {
+        const controlled = leaf.withControl(.{ .pattern_programs = &programs });
+        var futures: [4]std.Io.Future(anyerror!void) = undefined;
+        for (&futures, 0..) |*future, index| future.* = std.Io.async(std.testing.io, Worker.run, .{ a, controlled, &writer.snapshot().segments[index] });
+        var failure: ?anyerror = null;
+        for (&futures) |*future| future.await(std.testing.io) catch |err| {
+            failure = failure orelse err;
+        };
+        if (failure) |err| return err;
+        try testing.expectError(error.Timeout, leaf.withControl(.{ .pattern_programs = &programs, .deadline_ns = 0 }).execute(a, &writer.snapshot().segments[0]));
+    }
+    try testing.expectEqual(@as(usize, 2), programs.builds);
+    try testing.expectEqual(@as(usize, 6), programs.hits);
+    // Optional cache admission never makes a valid pattern disappear.
+    var tiny = PatternPrograms.init(a, 0);
+    defer tiny.deinit();
+    try Worker.run(a, leaves[0].withControl(.{ .pattern_programs = &tiny }), &writer.snapshot().segments[0]);
+    const Failure = struct {
+        fn run(alloc: Allocator, segment: *const index_mod.SegmentEntry) !void {
+            var cache = PatternPrograms.init(alloc, 1024 * 1024);
+            defer cache.deinit();
+            var matches = try (Filter{ .regexp = .{ .field = "body", .pattern = "alp.*", .control = .{ .pattern_programs = &cache } } }).execute(alloc, segment);
+            defer matches.deinit();
+            try testing.expect(matches.contains(0));
+        }
+    };
+    try testing.checkAllAllocationFailures(a, Failure.run, .{&writer.snapshot().segments[0]});
 }

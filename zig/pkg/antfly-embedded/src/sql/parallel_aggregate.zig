@@ -30,6 +30,102 @@ const Result = struct {
         self.backing.destroy(self);
     }
 };
+/// Stable allocator/owners survive until the final typed batches are consumed.
+const Reduction = struct {
+    backing: std.mem.Allocator,
+    allocator: scheduling.LockedAllocator,
+    results: [4]?*Result = @splat(null),
+    groups: [4]*operators.Grouped = undefined,
+    fn release(raw: *anyopaque) void {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        for (self.results) |result| if (result) |owned| owned.deinit();
+        self.backing.destroy(self);
+    }
+};
+const ReduceWork = struct {
+    context: runtime.Context,
+    owner: *Reduction,
+    sources: []const ?*Result,
+    selections: []const [][]usize,
+    lane: usize,
+    workspace: usize,
+    ready: *std.Io.Event,
+    fn run(self: @This()) anyerror!*Result {
+        try self.ready.wait(self.context.backend.execution_io.?);
+        const a = self.owner.allocator.allocator();
+        const result = try a.create(Result);
+        result.* = .{ .backing = a, .budget = .{ .backing = a, .limit = self.workspace } };
+        errdefer result.deinit();
+        result.grouped = try operators.Grouped.create(result.budget.allocator(), self.sources[0].?.grouped.?.specs, .{ .groups = self.context.limits.scan_rows, .bytes = self.workspace / 2, .spill = self.context.spill });
+        var ordinal: u64 = 0;
+        for (self.sources, self.selections) |source, selections| {
+            try self.context.checkpoint();
+            try result.grouped.?.mergeExactSelected(source.?.grouped.?, ordinal, selections[self.lane]);
+            ordinal = try std.math.add(u64, ordinal, source.?.grouped.?.rows_seen);
+        }
+        return result;
+    }
+};
+fn reduce(context: runtime.Context, grouped: *operators.Grouped, locals: []const ?*Result, workspace: usize) !bool {
+    var partials: usize = 0;
+    for (locals) |local| {
+        const source = local.?.grouped.?;
+        // Spilled partial streams already use bounded partition reduction.
+        // Retain the existing serial bridge for those streams and tiny groups.
+        if (source.external != null) return false;
+        partials +|= source.groupCount();
+    }
+    if (partials < 4096 or grouped.key_count == 0) return false;
+    const owner = try context.alloc.create(Reduction);
+    owner.* = .{ .backing = context.alloc, .allocator = .{ .backing = if (context.spill) |manager| manager.allocator() else context.alloc } };
+    var adopted = false;
+    defer if (!adopted) Reduction.release(owner);
+    var arena = std.heap.ArenaAllocator.init(owner.allocator.allocator());
+    defer arena.deinit();
+    const selections = try arena.allocator().alloc([][]usize, locals.len);
+    for (locals, selections) |source, *selection| selection.* = try source.?.grouped.?.partitionGroups(arena.allocator(), locals.len);
+    const io = context.backend.execution_io.?;
+    var tasks: [4]?scheduling.Task(anyerror!*Result) = @splat(null);
+    defer for (&tasks, 0..) |*task, lane| if (task.*) |*pending| {
+        owner.results[lane] = pending.cancel(io) catch null;
+        task.* = null;
+    };
+    var ready: std.Io.Event = .unset;
+    var work: [4]ReduceWork = undefined;
+    for (0..locals.len) |lane| {
+        work[lane] = .{ .context = context, .owner = owner, .sources = locals, .selections = selections, .lane = lane, .workspace = workspace, .ready = &ready };
+        if (lane != 0) tasks[lane] = scheduling.global().submit(io, workspace, ReduceWork.run, .{work[lane]});
+    }
+    ready.set(io);
+    var failure: ?anyerror = null;
+    for (work[0..locals.len], 0..) |item, lane| if (tasks[lane] == null) {
+        owner.results[lane] = item.run() catch |err| blk: {
+            failure = failure orelse err;
+            break :blk null;
+        };
+    };
+    for (tasks[0..locals.len], 0..) |*task, lane| if (task.*) |*pending| {
+        owner.results[lane] = pending.await(io) catch |err| blk: {
+            failure = failure orelse err;
+            break :blk null;
+        };
+        task.* = null;
+    };
+    if (failure) |err| return switch (err) {
+        // Decline before changing the destination; all local partials remain
+        // readable for its established serial/spilling reduction.
+        error.OutOfMemory, error.SqlProgramLimitExceeded => false,
+        else => err,
+    };
+    var rows: u64 = 0;
+    for (locals, 0..) |source, lane| {
+        rows = try std.math.add(u64, rows, source.?.grouped.?.rows_seen);
+        owner.groups[lane] = owner.results[lane].?.grouped.?;
+    }
+    try grouped.adoptReducers(.{ .ptr = owner, .groups = owner.groups[0..locals.len], .release = Reduction.release }, rows);
+    adopted = true;
+    return true;
+}
 const Work = struct {
     context: runtime.Context,
     bound: *const binding.Bound,
@@ -144,6 +240,13 @@ pub fn execute(context: runtime.Context, bound: *const binding.Bound, grouped: *
         // shard, reclaim all worker memory before the serial spilling fallback.
         if (err == error.ParallelAggregateMemoryExceeded) return false;
         return err;
+    }
+    if (bound.group_count != 0) {
+        const reduced = reduce(context, grouped, locals[0..cursors.len], workspace) catch |err| switch (err) {
+            error.OutOfMemory, error.SqlProgramLimitExceeded => false,
+            else => return err,
+        };
+        if (reduced) return true;
     }
     var ordinal: u64 = 0;
     for (locals[0..cursors.len]) |local| {

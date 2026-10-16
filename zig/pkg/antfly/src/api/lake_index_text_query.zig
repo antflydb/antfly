@@ -239,7 +239,10 @@ fn executePinned(a: A, server: *server_api.ApiHttpServer, current_table: local.c
         owner.private_digests = metadata.?.private_digests;
     }
     const publication_finished = @import("antfly_platform").time.monotonicNs();
+    var pattern_programs = local.search_query.PatternPrograms.init(@import("antfly_platform").allocator.processAllocator(std.heap.page_allocator), 2 * 1024 * 1024);
+    defer pattern_programs.deinit();
     var effective = req;
+    effective.text_pattern_programs = &pattern_programs;
     effective.cancellation = .{ .ptr = &owner, .is_cancelled_fn = Execution.canceled };
     const has_vectors = build_recent or effective.dense != null or effective.sparse != null or effective.dense_queries.len != 0 or effective.sparse_queries.len != 0;
     const has_text = for (owner.declarations) |declaration| {

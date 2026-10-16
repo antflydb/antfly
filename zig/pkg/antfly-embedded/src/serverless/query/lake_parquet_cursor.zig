@@ -115,32 +115,43 @@ pub const Cursor = struct {
         const offset = column.chunk.offset_index_offset orelse return;
         const len = column.chunk.offset_index_length.?;
         const budget = self.limits.max_input_bytes / @max(@as(usize, 1), self.columns.len);
-        if (len > budget or (column.chunk.column_index_length orelse 0) > budget - len) return error.ParquetPageTooLarge;
+        // Navigation is optional. A large directory must not prevent a
+        // streaming scan whose individual data pages fit the reader budget.
+        if (len > budget) return;
+        const bounds = self.filter != null and column.required and self.prune_page != null and
+            (column.chunk.column_index_length orelse 0) <= budget - len;
         if (self.shared_reader) |shared| {
-            const interpretation = try std.json.Stringify.valueAlloc(self.a, .{ .version = "page-directory-v1", .chunk = column.chunk, .rows = self.group.row_count, .allocation_limit = self.limits.max_struct_allocation_bytes / @max(@as(usize, 1), self.columns.len) }, .{});
+            const interpretation = try std.json.Stringify.valueAlloc(self.a, .{ .version = "page-directory-v2", .bounds = bounds, .chunk = column.chunk, .rows = self.group.row_count, .allocation_limit = self.limits.max_struct_allocation_bytes / @max(@as(usize, 1), self.columns.len) }, .{});
             defer self.a.free(interpretation);
             const key = try shared.objectKey(self.a, .{ .object = try ranges.objectRefForExternalFileUri(self.file), .range = .{ .offset = offset, .len = len }, .purpose = .parquet_page_index }, interpretation);
             var loader = struct {
                 cursor: *Cursor,
                 column: *Column,
+                bounds: bool,
                 fn load(raw: *anyopaque, item: *@import("lake_decoded_cache.zig").Item) !void {
                     const value: *@This() = @ptrCast(@alignCast(raw));
-                    const decoded = try value.cursor.readIndex(value.column, item.arena.allocator());
+                    const decoded = try value.cursor.readIndex(value.column, item.arena.allocator(), value.bounds);
                     item.payload = .{ .page_directory = decoded };
                 }
-            }{ .cursor = self, .column = column };
+            }{ .cursor = self, .column = column, .bounds = bounds };
             const limit = @min(shared.cache.decoded.max_loading_bytes, self.limits.max_struct_allocation_bytes);
-            const lease = try shared.cache.decoded.acquire(key, limit, shared.context, .{ .ptr = &loader, .load = @TypeOf(loader).load });
+            const lease = shared.cache.decoded.acquire(key, limit, shared.context, .{ .ptr = &loader, .load = @TypeOf(loader).load }) catch |err| switch (err) {
+                error.DecodedArtifactTooLarge, error.SqlMemoryLimitExceeded => return,
+                else => return err,
+            };
             column.directory_lease = lease;
             column.directory = lease.item.payload.page_directory;
-        } else column.directory = try self.readIndex(column, self.a);
+        } else column.directory = self.readIndex(column, self.a, bounds) catch |err| switch (err) {
+            error.DecodedArtifactTooLarge => return,
+            else => return err,
+        };
     }
-    fn readIndex(self: *Cursor, column: *Column, a: A) !@import("lake_parquet_metadata.zig").PageDirectory {
+    fn readIndex(self: *Cursor, column: *Column, a: A, include_bounds: bool) !@import("lake_parquet_metadata.zig").PageDirectory {
         const offset = column.chunk.offset_index_offset.?;
         const len = column.chunk.offset_index_length.?;
         const offsets = try self.reader.readPlannedLease(a, .{ .object = try ranges.objectRefForExternalFileUri(self.file), .range = .{ .offset = offset, .len = len }, .purpose = .parquet_page_index });
         defer offsets.release();
-        const bounds = if (column.chunk.column_index_offset) |start| try self.reader.readPlannedLease(a, .{ .object = try ranges.objectRefForExternalFileUri(self.file), .range = .{ .offset = start, .len = column.chunk.column_index_length.? }, .purpose = .parquet_page_index }) else null;
+        const bounds = if (if (include_bounds) column.chunk.column_index_offset else null) |start| try self.reader.readPlannedLease(a, .{ .object = try ranges.objectRefForExternalFileUri(self.file), .range = .{ .offset = start, .len = column.chunk.column_index_length.? }, .purpose = .parquet_page_index }) else null;
         defer if (bounds) |bytes| bytes.release();
         return try @import("lake_parquet_metadata.zig").parsePageDirectory(a, offsets.bytes, if (bounds) |v| v.bytes else null, column.chunk, self.group.row_count, self.limits.max_struct_allocation_bytes / @max(@as(usize, 1), self.columns.len));
     }
@@ -153,7 +164,7 @@ pub const Cursor = struct {
         column.count = 0;
         column.consumed = 0;
         column.pruned = false;
-        if (self.filter != null) try self.loadIndex(column);
+        try self.loadIndex(column);
         const end = std.math.add(u64, column.chunk.file_offset, column.chunk.compressed_len) catch return error.InvalidParquetPage;
         while (column.offset < end) {
             if (column.directory) |directory| {
@@ -326,9 +337,31 @@ pub const Cursor = struct {
         return probe.parsed;
     }
     const HeaderRead = struct { parsed: page.ParsedHeader, lease: ranges.RangeLease };
+    fn indexedPage(self: *const Cursor, column: *const Column) ?@import("lake_parquet_metadata.zig").IndexedPage {
+        _ = self;
+        const directory = column.directory orelse return null;
+        var index = column.directory_index;
+        while (index < directory.pages.len and directory.pages[index].offset < column.offset) index += 1;
+        return if (index < directory.pages.len and directory.pages[index].offset == column.offset) directory.pages[index] else null;
+    }
     fn headerRead(self: *Cursor, column: *const Column) !HeaderRead {
         const end = std.math.add(u64, column.chunk.file_offset, column.chunk.compressed_len) catch return error.InvalidParquetPage;
         if (column.offset >= end) return error.InvalidParquetPage;
+        if (self.indexedPage(column)) |entry| {
+            // OffsetIndex compressed_page_size includes the header. Validate
+            // admission before the GET and validate the encoded header against
+            // the directory before trusting either lengths or row ordinals.
+            if (entry.len > end - column.offset) return error.InvalidParquetMetadata;
+            if (entry.len > self.limits.max_input_bytes / @max(@as(usize, 1), self.columns.len)) return error.ParquetPageTooLarge;
+            const lease = try self.read(column.offset, entry.len);
+            errdefer lease.release();
+            const parsed = try page.parsePageHeader(lease.bytes);
+            try parsed.header.validateResourceLimits();
+            if (parsed.header.page_type != .data_page and parsed.header.page_type != .data_page_v2) return error.InvalidParquetMetadata;
+            const len = std.math.add(usize, parsed.header_len, parsed.header.compressed_page_size) catch return error.ParquetPageTooLarge;
+            if (len != entry.len or parsed.header.value_count != entry.rows) return error.InvalidParquetMetadata;
+            return .{ .parsed = parsed, .lease = lease };
+        }
         var probe_size: usize = @intCast(@min(end - column.offset, 512));
         while (true) {
             const probe_lease = try self.read(column.offset, probe_size);
@@ -377,16 +410,25 @@ pub const Cursor = struct {
     fn planPrefetchPages(self: *Cursor, reader: *@import("lake_serving_cache.zig").Reader) !void {
         var reads: [4]ranges.RangeRead = undefined;
         var count: usize = 0;
+        var planned: usize = 0;
         for (self.columns) |*column| {
             if (self.filter != null and !column.required) continue;
-            if (count == reads.len) break;
+            if (planned == reads.len) break;
             if (column.consumed != column.count) continue;
             const end = std.math.add(u64, column.chunk.file_offset, column.chunk.compressed_len) catch return error.InvalidParquetPage;
             if (column.offset >= end) continue;
-            reads[count] = .{ .object = try ranges.objectRefForExternalFileUri(self.file), .range = .{ .offset = column.offset, .len = @min(end - column.offset, 512) }, .purpose = .parquet_column_chunk };
-            try reader.prefetchPage(reads[count], end, self.limits.max_input_bytes / @max(@as(usize, 1), self.columns.len));
-            count += 1;
+            planned += 1;
+            const limit = self.limits.max_input_bytes / @max(@as(usize, 1), self.columns.len);
+            if (self.indexedPage(column)) |entry| {
+                if (entry.len > limit or entry.len > end - column.offset) continue;
+                reads[count] = .{ .object = try ranges.objectRefForExternalFileUri(self.file), .range = .{ .offset = column.offset, .len = entry.len }, .purpose = .parquet_column_chunk };
+                count += 1;
+            } else {
+                const probe: ranges.RangeRead = .{ .object = try ranges.objectRefForExternalFileUri(self.file), .range = .{ .offset = column.offset, .len = @min(end - column.offset, 512) }, .purpose = .parquet_column_chunk };
+                try reader.prefetchPage(probe, end, limit);
+            }
         }
+        try reader.prefetch(reads[0..count]);
     }
     const DecodeStats = struct { pages: usize, dictionaries: usize };
     const DecodeAllocator = @import("../../sql/parallel_scheduler.zig").LockedAllocator;
@@ -403,9 +445,9 @@ pub const Cursor = struct {
     fn advanceColumns(self: *Cursor, required_only: bool) !void {
         // Index arenas outlive this call. Their backing allocator must be the
         // cursor allocator, never the temporary worker locking adapter.
-        if (self.filter != null) for (self.columns) |*column| {
+        for (self.columns) |*column| {
             if (!required_only or column.required) try self.loadIndex(column);
-        };
+        }
         const io = if (self.shared_reader) |reader| reader.context.io else null;
         if (io == null or self.columns.len < 2) {
             for (self.columns) |*column| {

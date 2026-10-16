@@ -26,6 +26,11 @@ const A = std.mem.Allocator;
 pub const Options = struct { dry_run: bool = true, max_marked: usize = 262144, max_read_bytes: u64 = 512 * 1024 * 1024, max_deleted: usize = 4096 };
 pub const Result = struct { marked: usize = 0, eligible: usize = 0, deleted: usize = 0, complete: bool = false };
 pub const Collector = struct {
+    // Artifact membership and dependency expansion have independent lifetimes.
+    // Keep expansion bits beside the owned reference, within max_marked.
+    const Marked = struct { artifact_id: []const u8, checksum: []const u8, byte_len: u64, expanded: u8 = 0 };
+    const Expansion = enum(u3) { directory, maintenance, manifest, seekable_manifest, text_root, artifact };
+
     a: A,
     table: u64,
     authority: lease_api.Authority,
@@ -37,7 +42,7 @@ pub const Collector = struct {
     expires_ms: u64 = 0,
     authority_deadline: u64 = 0,
     remaining_reads: u64 = 0,
-    marked: std.StringHashMapUnmanaged(artifacts.ChunkRef) = .empty,
+    marked: std.StringHashMapUnmanaged(Marked) = .empty,
     result: Result = .{},
     upload_cutoff: u64 = 0,
     upload_floor: u64 = 0,
@@ -201,6 +206,21 @@ pub const Collector = struct {
         try self.marked.put(self.a, owned, .{ .artifact_id = owned, .checksum = owned[7..71], .byte_len = ref.byte_len });
         return true;
     }
+    fn expand(self: *Collector, ref: artifacts.ChunkRef, mode: Expansion, reason: []const u8) !bool {
+        if (self.progress) |progress| return progress.expand(ref, reason);
+        _ = try self.mark(ref);
+        const entry = self.marked.getPtr(ref.artifact_id).?;
+        const mask = @as(u8, 1) << @backingInt(mode);
+        if (entry.expanded & mask != 0) return false;
+        // Set before recursion to bound cycles. Any failed expansion aborts
+        // the complete audit/mark phase; incomplete marks are never swept.
+        entry.expanded |= mask | switch (mode) {
+            .manifest => @as(u8, 1) << @backingInt(Expansion.maintenance),
+            .seekable_manifest => (@as(u8, 1) << @backingInt(Expansion.maintenance)) | (@as(u8, 1) << @backingInt(Expansion.manifest)),
+            else => @as(u8, 0),
+        };
+        return true;
+    }
     /// Collection must understand the preceding immutable root format after an
     /// upgrade, while serving and rebuild selection continue to require current metadata.
     fn retainedNativeRoot(self: *Collector, a: A, comptime native: type, ref: local.serverless_manifest_artifact_ref.ArtifactRef) !native.Root {
@@ -257,7 +277,7 @@ pub const Collector = struct {
         try @import("../serverless/graph_segment/page_tree.zig").walkPage(a, pages.store(), root, &visitor);
     }
     pub fn markTextDirectory(self: *Collector, a: A, ref: artifacts.ChunkRef) !void {
-        const fresh = if (self.progress) |progress| try progress.expand(ref, "native-text-directory-v1") else try self.mark(ref);
+        const fresh = try self.expand(ref, .directory, "native-text-directory-v1");
         if (!fresh) return;
         try stores.chargeReadBudget(&self.remaining_reads, ref.byte_len);
         const directory = try @import("lake_index_seekable_text.zig").loadDirectory(a, .{ .store = self.store, .cache = null, .context = .{}, .cancellation = self.cancellation() }, ref);
@@ -269,7 +289,7 @@ pub const Collector = struct {
         return self.markTextManifestMode(a, ref, seekable, false);
     }
     pub fn markTextManifestMode(self: *Collector, a: A, ref: artifacts.ChunkRef, seekable: bool, maintenance_only: bool) !void {
-        const fresh = if (self.progress) |progress| try progress.expand(ref, if (maintenance_only) "text-maintenance" else "text-manifest") else try self.mark(ref);
+        const fresh = try self.expand(ref, if (maintenance_only) .maintenance else if (seekable) .seekable_manifest else .manifest, if (maintenance_only) "text-maintenance" else if (seekable) "text-manifest-seekable" else "text-manifest");
         if (!fresh) return;
         // Charge before I/O, independently from the serving metadata budget.
         try stores.chargeReadBudget(&self.remaining_reads, ref.byte_len);
@@ -298,7 +318,7 @@ pub const Collector = struct {
         }
     }
     pub fn markTextRootAuto(self: *Collector, a: A, ref: artifacts.ChunkRef) anyerror!void {
-        const fresh = if (self.progress) |progress| try progress.expand(ref, "text_segment") else try self.mark(ref);
+        const fresh = try self.expand(ref, .text_root, "text_segment");
         if (!fresh) return;
         try stores.chargeReadBudget(&self.remaining_reads, ref.byte_len);
         const decoded = try @import("lake_index_native_text.zig").loadRootDirectoryAuto(a, self.store, ref, self.cancellation(), null);
@@ -369,7 +389,7 @@ pub const Collector = struct {
     }
     pub fn markArtifact(self: *Collector, a: A, ref: local.serverless_manifest_artifact_ref.ArtifactRef) !void {
         const root_chunk: artifacts.ChunkRef = .{ .artifact_id = ref.artifact_id, .checksum = ref.checksum, .byte_len = ref.byte_len };
-        const fresh = if (self.progress) |progress| try progress.expand(root_chunk, @tagName(ref.kind)) else try self.mark(root_chunk);
+        const fresh = try self.expand(root_chunk, .artifact, @tagName(ref.kind));
         if (!fresh) return;
         switch (ref.kind) {
             .algebraic_segment => {

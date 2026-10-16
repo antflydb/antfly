@@ -5499,6 +5499,7 @@ def test_published_parquet_skewed_files_share_row_groups_and_stream_in_order(tmp
             path,
             compression=None,
             use_dictionary=False,
+            write_page_index=True,
             row_group_size=256,
         )
         data = path.read_bytes()
@@ -5607,6 +5608,23 @@ def test_published_parquet_skewed_files_share_row_groups_and_stream_in_order(tmp
                     str(max(expected[bucket::5])),
                 ]
                 for bucket in range(5)
+            ]
+            # Thousands of partial groups use hash-owned final reduction. The
+            # final typed batches must preserve exact totals across cold starts.
+            assert call(
+                "POST",
+                "/sql",
+                {
+                    "statement": "SELECT amount % 2048 AS bucket, SUM(amount), COUNT(*) "
+                    "FROM skew_scan GROUP BY amount % 2048 ORDER BY bucket LIMIT 16"
+                },
+            )["rows"] == [
+                [
+                    str(bucket),
+                    str(sum(expected[bucket::2048])),
+                    str(len(expected[bucket::2048])),
+                ]
+                for bucket in range(16)
             ]
             # The sealed join filter must reach the probe scan even though
             # only aggregate output is projected; duplicates retain join weight.

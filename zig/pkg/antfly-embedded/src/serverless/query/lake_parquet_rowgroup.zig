@@ -10340,3 +10340,146 @@ test "lake persistent cache keeps restart reads and retries writer admission aft
     defer a.free(next);
     try std.testing.expectEqualStrings("next", next);
 }
+
+test "external lake OffsetIndex reads large pages once and validates lengths and ordinals" {
+    const a = std.testing.allocator;
+    const storage = @import("../../storage/object_storage.zig");
+    for ([_]bool{ false, true }) |dictionary| for (0..4) |fault| {
+        var bytes: std.ArrayList(u8) = .empty;
+        defer bytes.deinit(a);
+        if (dictionary) try appendPlainI64DictionaryPage(&bytes, a, &.{ 10, 20 });
+        var starts: [2]usize = undefined;
+        var lengths: [2]usize = undefined;
+        for (&starts, &lengths) |*start, *len| {
+            start.* = bytes.items.len;
+            if (dictionary) try appendDictionaryI64DataPage(&bytes, a, 128, 1, &.{ 0x80, 0x02, 1 }) else try appendPlainI64DataPage(&bytes, a, &@as([128]i64, @splat(20)));
+            len.* = bytes.items.len - start.*;
+        }
+        const data_end = bytes.items.len;
+        var field: i16 = 0;
+        try appendField(&bytes, a, &field, 1, .list);
+        try appendListHeader(&bytes, a, .struct_, 2);
+        for (starts, lengths, 0..) |start, len, index| {
+            var id: i16 = 0;
+            try appendField(&bytes, a, &id, 1, .i64);
+            try appendI64(&bytes, a, @intCast(start));
+            try appendField(&bytes, a, &id, 2, .i32);
+            try appendI32(&bytes, a, @intCast(len - @intFromBool(fault == 1 and index == 0)));
+            try appendField(&bytes, a, &id, 3, .i64);
+            try appendI64(&bytes, a, @intCast(index * 128 + @intFromBool(fault == 2 and index == 1)));
+            try appendStop(&bytes, a);
+        }
+        if (fault == 3) {
+            // A valid optional extension makes the index larger than the
+            // admitted data-page read. Fall back without fetching this index.
+            try appendField(&bytes, a, &field, 4, .binary);
+            try appendBinary(&bytes, a, &@as([4096]u8, @splat(0)));
+        }
+        try appendStop(&bytes, a);
+        var memory = storage.MemoryObjectStorage.init(a);
+        defer memory.deinit();
+        var client = memory.client();
+        try client.makeBucket("bucket");
+        var put = try client.putObject("bucket", "data", bytes.items, .{});
+        defer put.deinit(a);
+        const Provider = struct {
+            base: storage.ObjectStorage,
+            vtable: storage.ObjectStorage.VTable,
+            calls: usize = 0,
+            fn get(raw: *anyopaque, alloc: Allocator, bucket: []const u8, key: []const u8, options: storage.GetOptions) !storage.GetResult {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                self.calls += 1;
+                var base = self.base;
+                base.allocator = alloc;
+                return base.getObject(bucket, key, options);
+            }
+        };
+        var provider: Provider = .{ .base = client, .vtable = client.vtable.* };
+        provider.vtable.get_object = Provider.get;
+        var reader = @import("lake_object_reader.zig").ObjectStorageRangeReader.init(.{ .allocator = a, .ptr = &provider, .vtable = &provider.vtable });
+        var chunks = [_]external_source.ColumnChunk{.{ .column_id = @constCast("n"), .file_offset = 0, .compressed_len = data_end, .uncompressed_len = data_end, .physical_type = @constCast("int64"), .encoding = @constCast(if (dictionary) "rle_dictionary" else "plain"), .offset_index_offset = data_end, .offset_index_length = @intCast(bytes.items.len - data_end) }};
+        var groups = [_]external_source.RowGroup{.{ .ordinal = 0, .row_count = 256, .file_offset = 0, .total_byte_len = data_end, .column_chunks = &chunks }};
+        var files = [_]external_source.FileEntry{.{ .file_id = @constCast("data"), .object_uri = @constCast("s3://bucket/data"), .etag = put.etag.?, .byte_len = bytes.items.len, .row_count = 256, .row_groups = &groups }};
+        const inventory: external_source.Inventory = .{ .format = .parquet, .source_id = @constCast("events"), .source_uri = @constCast("s3://bucket"), .snapshot_id = @constCast("v1"), .schema_fingerprint = @constCast("v1"), .files = &files };
+        var cursor = try @import("lake_parquet_cursor.zig").Cursor.init(a, reader.parquetReader(), inventory, "data", 0, &.{"n"}, .{ .max_input_bytes = 2048 });
+        defer cursor.deinit();
+        if (fault == 1 or fault == 2) {
+            try std.testing.expectError(error.InvalidParquetMetadata, cursor.next());
+            continue;
+        }
+        var rows: usize = 0;
+        while (try cursor.next()) |batch| {
+            for (0..batch.rowCount()) |index| try std.testing.expectEqual(@as(i64, 20), try batch.columns[0].integerAt(index));
+            rows += batch.rowCount();
+        }
+        try std.testing.expectEqual(@as(usize, 256), rows);
+        try std.testing.expectEqual(if (fault == 3) @as(usize, if (dictionary) 3 else 4) else @as(usize, 3) + @intFromBool(dictionary), provider.calls);
+        try std.testing.expectEqual(@as(usize, 2), cursor.pages_decoded);
+    };
+}
+
+test "external lake page prefetch bounds mixed header discovery to four columns" {
+    const a = std.testing.allocator;
+    var bytes: std.ArrayList(u8) = .empty;
+    defer bytes.deinit(a);
+    const names = [_][]const u8{ "a", "b", "c", "d", "e" };
+    var chunks: [5]external_source.ColumnChunk = undefined;
+    var next_offsets: [5]u64 = undefined;
+    for (&chunks, &next_offsets, names) |*chunk, *next, name| {
+        const start = bytes.items.len;
+        try appendPlainI64DataPage(&bytes, a, &.{1});
+        next.* = bytes.items.len;
+        try appendPlainI64DataPage(&bytes, a, &@as([32]i64, @splat(2)));
+        chunk.* = .{ .column_id = @constCast(name), .file_offset = start, .compressed_len = bytes.items.len - start, .uncompressed_len = bytes.items.len - start, .physical_type = @constCast("int64"), .encoding = @constCast("plain") };
+    }
+    const storage = @import("../../storage/object_storage.zig");
+    var memory = storage.MemoryObjectStorage.init(a);
+    defer memory.deinit();
+    var client = memory.client();
+    try client.makeBucket("bucket");
+    var put = try client.putObject("bucket", "data", bytes.items, .{});
+    defer put.deinit(a);
+    const Provider = struct {
+        base: storage.ObjectStorage,
+        vtable: storage.ObjectStorage.VTable,
+        offsets: [5]u64,
+        ready: std.Io.Event = .unset,
+        fn get(raw: *anyopaque, alloc: Allocator, bucket: []const u8, key: []const u8, options: storage.GetOptions) !storage.GetResult {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (options.range) |range| for (self.offsets) |offset| {
+                if (range.offset == offset) try self.ready.wait(std.testing.io);
+            };
+            var base = self.base;
+            base.allocator = alloc;
+            return base.getObject(bucket, key, options);
+        }
+    };
+    var provider: Provider = .{ .base = client, .vtable = client.vtable.*, .offsets = next_offsets };
+    provider.vtable.get_object = Provider.get;
+    var groups = [_]external_source.RowGroup{.{ .ordinal = 0, .row_count = 33, .file_offset = 0, .total_byte_len = bytes.items.len, .column_chunks = &chunks }};
+    var files = [_]external_source.FileEntry{.{ .file_id = @constCast("data"), .object_uri = @constCast("s3://bucket/data"), .etag = put.etag.?, .byte_len = bytes.items.len, .row_count = 33, .row_groups = &groups }};
+    const inventory: external_source.Inventory = .{ .format = .parquet, .source_id = @constCast("events"), .source_uri = @constCast("s3://bucket"), .snapshot_id = @constCast("v1"), .schema_fingerprint = @constCast("v1"), .files = &files };
+    const shared = @import("lake_serving_cache.zig");
+    var cache = shared.Cache.init(a);
+    defer cache.deinit();
+    var reader: shared.Reader = .{ .cache = &cache, .base = @import("lake_object_reader.zig").ObjectStorageRangeReader.init(.{ .allocator = a, .ptr = &provider, .vtable = &provider.vtable }), .scope = @splat(0), .context = .{ .io = std.testing.io } };
+    var cursor = try @import("lake_parquet_cursor.zig").Cursor.init(a, reader.reader(), inventory, "data", 0, &names, .{});
+    defer {
+        provider.ready.set(std.testing.io);
+        reader.drain(true);
+        cursor.deinit();
+    }
+    cursor.shared_reader = &reader;
+    try std.testing.expectEqual(@as(usize, 1), (try cursor.next()).?.rowCount());
+    var pending: usize = 0;
+    for (reader.pending) |job| if (job != null) {
+        pending += 1;
+    };
+    try std.testing.expectEqual(@as(usize, 4), pending);
+    provider.ready.set(std.testing.io);
+    reader.drain(false);
+    const batch = (try cursor.next()).?;
+    try std.testing.expectEqual(@as(usize, 32), batch.rowCount());
+    for (batch.columns) |column| for (0..batch.rowCount()) |row| try std.testing.expectEqual(@as(i64, 2), try column.integerAt(row));
+    try std.testing.expect((try cursor.next()) == null);
+}

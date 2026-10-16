@@ -628,3 +628,48 @@ test "external lake global frontier retained compacted roots detect v10 and v11 
         try std.testing.expect(collector.marked.contains(upload.artifact_id));
     }
 }
+
+test "external lake global frontier GC upgrades maintenance and already marked manifests" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const ca = arena.allocator();
+    var directory = try local.common_test_directory.TestDirectory.init("native-gc-mode-upgrade");
+    defer directory.cleanup();
+    var fs = try @import("../serverless/artifacts/fs_store.zig").FsStore.init(a, directory.path());
+    defer fs.deinit();
+    var store = fs.artifactStore();
+    const identity: [32]u8 = @splat(4);
+    const namespace: [32]u8 = @splat(8);
+    const domain = @import("lake_index_publication.zig").uploadDomainWithNamespace(4, identity, namespace);
+    store.upload_scope = try stores.UploadScope.forPublication(domain, 1, std.testing.io);
+    var child = try store.put("reader-held posting segment");
+    defer child.deinit(a);
+    const text = @import("lake_index_native_text.zig");
+    const group: text.FileGroup = .{ .file = .{ .id = "part", .digest = @splat(7) }, .segments = &.{.{ .artifact_id = child.artifact_id, .checksum = child.checksum, .byte_len = child.byte_len }} };
+    var manifest = try store.put(try std.json.Stringify.valueAlloc(ca, group, .{}));
+    defer manifest.deinit(a);
+    const ref: @import("lake_index_aggregate_artifact.zig").ChunkRef = .{ .artifact_id = manifest.artifact_id, .checksum = manifest.checksum, .byte_len = manifest.byte_len };
+    // A compacted publication needs only canonical maintenance edges. An older
+    // reader-held publication needs the complete serving graph of the same ID.
+    for ([_]bool{ false, true }) |maintenance_first| {
+        var collector: @import("lake_index_gc.zig").Collector = .{ .a = a, .table = 4, .authority = undefined, .store = store, .identity = identity, .context = .{}, .token = @splat(1), .namespace = namespace, .audit_only = true, .remaining_reads = 1024 * 1024 };
+        defer {
+            var keys = collector.marked.keyIterator();
+            while (keys.next()) |key| a.free(key.*);
+            collector.marked.deinit(a);
+        }
+        _ = try collector.mark(ref);
+        if (maintenance_first) {
+            try collector.markTextManifestMode(ca, ref, false, true);
+            try std.testing.expect(!collector.marked.contains(child.artifact_id));
+        }
+        try collector.markTextManifestMode(ca, ref, false, false);
+        try collector.markTextManifestMode(ca, ref, false, true);
+        try std.testing.expect(collector.marked.contains(child.artifact_id));
+        const remaining = collector.remaining_reads;
+        try collector.markTextManifestMode(ca, ref, false, false);
+        try std.testing.expectEqual(remaining, collector.remaining_reads);
+        try std.testing.expectEqual(@as(u32, 2), collector.marked.count());
+    }
+}

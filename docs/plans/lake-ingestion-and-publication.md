@@ -1382,3 +1382,69 @@ retaining one descriptor per sort.
 Floating/dynamic extrema retain source-order execution until representative ties
 have a defined parallel contract. Ordered producers reserve shared I/O workspace
 using the same scheduling policy as aggregates, retaining bounded caller fallback.
+
+
+## GC expansion upgrades and final serving refinements
+
+Artifact marking and dependency traversal are separate. Ordinary GC planning and
+cloud publication audits retain a bounded expansion bitset beside each marked
+reference. A maintenance-only canonical manifest can later be expanded for an
+older reader-held serving publication, including seekable directory children.
+Full expansion subsumes maintenance expansion; visiting a raw reference cannot
+suppress its later traversal. Resumable collection keeps its durable expansion
+keys, including a separate seekable-manifest key. Failed or incomplete traversals
+never authorize a sweep.
+
+Parquet cursors load the embedded OffsetIndex for projected chunks even without a
+filter. Unfiltered scans omit the ColumnIndex bounds read. For indexed data pages,
+required reads and rolling prefetch use the exact header-inclusive compressed
+range. The encoded header must agree with the index length, page type, and row
+count before decoding. Range and input admission precede the read. Dictionary
+preludes and chunks without an OffsetIndex retain bounded header discovery.
+Optional indexes that exceed navigation admission use the ordinary bounded
+header path; malformed admitted indexes still fail validation.
+This removes a header-probe GET for cold indexed pages larger than the probe;
+small pages already fit the existing probe. The page directory remains versioned,
+leased, and bounded by each consumer's allocation policy.
+
+Exact parallel aggregation partitions in-memory partial groups by their existing
+semantic key hash once there are at least 4,096 partial groups. Each admitted
+reducer exclusively owns its destination hash table and merges typed state through
+selection vectors. A stable owner retains reducer budgets until result shaping
+consumes their batches. Final batches go directly to the existing result collector,
+without a serial hash-table rebuild. Source ordinals preserve implicit ordering;
+global group limits apply across all reducers. Every task joins before scratch or
+source release. Low-cardinality, spilled-source, and declined-admission cases use
+the existing bounded serial/spilling bridge. Reducers themselves may spill when
+an owner is skewed. Floating or order-sensitive aggregate states retain their
+established eligibility restrictions.
+
+Posting scorers share query-owned immutable regex programs and wildcard navigation
+plans across segments and remote routing windows. Regex execution forks private
+DFA state; provider I/O never holds the compilation-cache mutex. The cache admits
+at most 16 programs within 2 MiB, owns syntax bytes, and declines oversized/full
+entries to normal per-consumer compilation. Deadlines and cancellation remain
+authoritative. Compilation and DFA allocation failures propagate instead of
+turning a valid regex into an empty result; DFA columns publish states only after
+all allocations succeed. Fuzzy matching still constructs its inexpensive term
+wrapper with independent execution state.
+
+Regressions exercise both manifest traversal orders, already-marked references,
+one provider GET per indexed data page, dictionary preludes, inconsistent index
+lengths/ordinals, concurrent program reuse, allocation-failure cleanup, hash-owned
+state lifetime, overlapping groups, winning text extrema, ordinals, and the global
+group limit. The real Parquet cold-restart fixture now writes embedded page indexes
+and checks a 2,048-group aggregate alongside ordered result delivery. Provider
+retention qualification and representative archive latency/RSS measurements remain
+deferred; request-count regression evidence is not an archive-scale speedup claim.
+
+
+Qualification (2026-10-16): all 501 full native lake tests (187 shared-engine and
+314 server), 24 focused SQL regressions, and 31 runtime ABI tests passed without
+native failures or leaks. Final reducer sealing and four-column lookahead were
+rechecked with four focused native tests and six typed SQL owner tests. All 50
+real Parquet/Iceberg E2Es passed together in 639.93 seconds, with production disk
+safeguards enabled. The final Debug CLI, source/license boundaries, generated
+error parity, formatting, and lint checks passed. Latest fetched `origin/main`
+`9dd098d773` is included. The final CLI also passed the indexed Parquet
+cold-restart/grouping flow again (12.08 seconds) after the last guards.

@@ -547,8 +547,12 @@ fn effectiveK(request: SearchRequest, snap: *const index_mod.IndexSnapshot) u32 
 pub fn execute(
     alloc: Allocator,
     snap: *const index_mod.IndexSnapshot,
-    request: SearchRequest,
+    unprepared: SearchRequest,
 ) !SearchResult {
+    var programs = query_mod.PatternPrograms.init(alloc, 2 * 1024 * 1024);
+    defer programs.deinit();
+    var request = unprepared;
+    if (request.control.pattern_programs == null) request.control.pattern_programs = &programs;
     // Pure patterns have constant scores and a dedicated bounded bitmap
     // collector. Cursor/preparation metadata must not route them through the
     // general Boolean arena; mixed Boolean trees still use streaming lowering.
@@ -610,7 +614,11 @@ pub fn countMatchesPrepared(alloc: Allocator, snap: *const index_mod.IndexSnapsh
 pub fn countMatchesWithControl(alloc: Allocator, snap: *const index_mod.IndexSnapshot, query: SearchQuery, control: query_mod.ExecutionControl) !u32 {
     return countMatchesPreparedWithControl(alloc, snap, query, null, control);
 }
-pub fn countMatchesPreparedWithControl(alloc: Allocator, snap: *const index_mod.IndexSnapshot, query: SearchQuery, prepared: ?*const TextNavigationPlan, control: query_mod.ExecutionControl) !u32 {
+pub fn countMatchesPreparedWithControl(alloc: Allocator, snap: *const index_mod.IndexSnapshot, query: SearchQuery, prepared: ?*const TextNavigationPlan, unprepared: query_mod.ExecutionControl) !u32 {
+    var programs = query_mod.PatternPrograms.init(alloc, 2 * 1024 * 1024);
+    defer programs.deinit();
+    var control = unprepared;
+    if (control.pattern_programs == null) control.pattern_programs = &programs;
     try control.check();
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
@@ -630,8 +638,12 @@ pub fn executeCountCandidatesWithControl(
     alloc: Allocator,
     snap: *const index_mod.IndexSnapshot,
     query: SearchQuery,
-    control: query_mod.ExecutionControl,
+    unprepared: query_mod.ExecutionControl,
 ) !SearchResult {
+    var programs = query_mod.PatternPrograms.init(alloc, 2 * 1024 * 1024);
+    defer programs.deinit();
+    var control = unprepared;
+    if (control.pattern_programs == null) control.pattern_programs = &programs;
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
 
