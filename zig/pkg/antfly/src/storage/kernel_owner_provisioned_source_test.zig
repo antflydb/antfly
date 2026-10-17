@@ -94,6 +94,7 @@ test "native index owner adapter inspects cold native ownership and rejects fore
         defer rooted.deinit();
         try std.testing.expect(rooted.outcome.value == null);
         try std.testing.expectEqual(table_reads.backend_current_root_generation, rooted.root_generation);
+        try std.testing.expectError(error.OnlineSourceScopeChanged, owners.raftIndexOwnerObservationAtRoot(alloc, 7501, "items", identity, .{}));
         var foreign = identity;
         foreign.namespace.range_id += 1;
         try std.testing.expectError(error.IdentityNamespaceMismatch, owners.nativeIndexOwnerState(alloc, 7501, "items", foreign, .{}));
@@ -102,6 +103,30 @@ test "native index owner adapter inspects cold native ownership and rejects fore
         defer after_rejection.deinit();
         try std.testing.expect(after_rejection.value == null);
     }
+    // A separate durable Raft domain exercises the real leased preparation
+    // bridge. These supplied catalog/header inputs are not metadata authority.
+    const raft_root = try std.fmt.allocPrint(alloc, "{s}/raft-owner", .{root});
+    defer alloc.free(raft_root);
+    var raft_owners = kernel_owner_source.ProvisionedKernelOwnerSource.init(alloc, raft_root, catalog.source(), read_gate.alreadyReadSafeBarrier());
+    defer raft_owners.deinit();
+    const empty = try raft_owners.raftIndexOwnerObservationAtRoot(alloc, 7501, "items", identity, .{});
+    try std.testing.expect(empty.observation.binding == null and empty.observation.applied == null);
+    try std.testing.expectEqual(table_reads.backend_current_root_generation, empty.root_generation);
+    const before_json = (try Catalog.snapshot(&catalog)).tables[0].schema_json;
+    const after_json =
+        \\{"version":2,"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"integer"}},"additionalProperties":false}}},"relational_indexes":[{"name":"id_idx","keys":[{"column":"id"}]}],"unique_constraints":[{"name":"id_idx","origin":"index","columns":["id"]}]}
+    ;
+    var schema = try local.schema_mod.parseValidatedTableSchema(alloc, before_json);
+    defer schema.deinit(alloc);
+    var prior = try local.schema_relational_declarations.compileCatalog(alloc, schema, 101, null);
+    defer prior.deinit();
+    var candidate = try local.storage_db_relational_index_candidate.Candidate.prepare(alloc, 101, before_json, after_json, prior.value, "id_idx");
+    defer candidate.deinit();
+    const header: local.storage_db_relational_index_raft_contract.Admission = .{ .id = identity.id, .plan_digest = identity.plan_digest, .owner_digest = identity.owner_digest, .ordinal = identity.ordinal, .fence = .{ .role = .index_build, .transition_id = 9, .attempt = 1, .owner_group_id = 7501, .peer_group_id = 7501, .namespace = identity.namespace, .catalog_digest = local.storage_db_relational_index_inputs.digest(prior.value) }, .candidate_digest = local.storage_db_relational_index_inputs.digest(candidate.next.value), .reservation_digest = local.storage_db_relational_index_inputs.digest(candidate.reservation.value) };
+    const prepared = try raft_owners.raftIndexOwnerPreparationAtRoot(alloc, 7501, "items", header, candidate.inputs.bytes, .{});
+    try prepared.preparation.validate(header, local.storage_db_relational_index_inputs.digest(candidate.inputs.bytes));
+    try std.testing.expectEqual(empty.root_generation, prepared.root_generation);
+    try std.testing.expectEqualDeep(empty, try raft_owners.raftIndexOwnerObservationAtRoot(alloc, 7501, "items", identity, .{}));
 }
 
 test "native index owner adapter executes fresh permission stages and recovers reserved LSM receipts after restart" {
@@ -122,6 +147,7 @@ test "native index owner adapter executes fresh permission stages and recovers r
     const Catalog = struct {
         tables: [1]metadata_table_manager.TableRecord,
         ranges: [1]metadata_table_manager.RangeRecord,
+        metadata_incarnation: [32]u8,
         fn pointSnapshot(ptr: *anyopaque, table: []const u8, deadline_ns: ?u64) !metadata_api.CatalogRoutingSnapshot {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             try std.testing.expectEqualStrings(self.tables[0].name, table);
@@ -133,7 +159,7 @@ test "native index owner adapter executes fresh permission stages and recovers r
         fn snapshot(ptr: *anyopaque) !metadata_api.AdminSnapshot {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             return .{
-                .status = .{ .metadata_group_id = 13, .metadata_incarnation = @splat('1'), .metrics = .{} },
+                .status = .{ .metadata_group_id = 13, .metadata_incarnation = self.metadata_incarnation, .metrics = .{} },
                 .tables = &self.tables,
                 .ranges = &self.ranges,
                 .stores = &.{},
@@ -337,7 +363,7 @@ test "native index owner adapter executes fresh permission stages and recovers r
             return parsed(execution.ClaimResponse, a, result.response());
         }
     };
-    var catalog: Catalog = .{ .tables = .{plan.before}, .ranges = .{plan.owners[0].range} };
+    var catalog: Catalog = .{ .tables = .{plan.before}, .ranges = .{plan.owners[0].range}, .metadata_incarnation = std.fmt.bytesToHex(plan.table_guard.incarnation, .lower) };
     const group = plan.owners[0].range.group_id;
     const RootGeneration = struct {
         fn read(ptr: *anyopaque, _: u64) u64 {
@@ -378,7 +404,7 @@ test "native index owner adapter executes fresh permission stages and recovers r
         prepared = try plan.prepare(alloc);
         metadata = .{ .value = .{
             .metadata_group_id = 13,
-            .metadata_incarnation = @splat('1'),
+            .metadata_incarnation = catalog.metadata_incarnation,
             .head = prepared.?.head,
             .owner = prepared.?.owners[0],
             .disposition = .execute,

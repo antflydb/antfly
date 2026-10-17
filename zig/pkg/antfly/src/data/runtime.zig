@@ -37499,6 +37499,126 @@ fn consumerTests() type {
             try std.testing.expectEqual(@as(usize, RaftTableApplyStateMachine.max_apply_outcome_waiters), sm.apply_outcomes.count());
         }
 
+        test "data raft rejected prepare snapshot preserves the native mutation gap" {
+            const alloc = std.testing.allocator;
+            const group_id: u64 = 77;
+            var tmp = std.testing.tmpDir(.{});
+            defer tmp.cleanup();
+            const replica_root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/rejected-prepare-snapshot", .{tmp.sub_path});
+            defer alloc.free(replica_root);
+            const Catalog = struct {
+                fn snapshot(_: *anyopaque) !antfly.metadata_api.AdminSnapshot {
+                    return .{
+                        .status = .{ .metadata_group_id = 1, .metadata_epoch = 1, .metrics = .{} },
+                        .tables = @constCast(&[_]antfly.metadata.table_manager.TableRecord{.{ .table_id = 7, .name = "docs", .placement_role = "data", .schema_json = "{\"version\":1,\"storage_mode\":\"relational\",\"default_type\":\"row\",\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"keyword\"}},\"additionalProperties\":false}}}}" }}),
+                        .ranges = @constCast(&[_]antfly.metadata.table_manager.RangeRecord{.{ .group_id = group_id, .table_id = 7, .range_id = group_id, .start_key = "", .end_key = null }}),
+                        .stores = &.{},
+                        .placement_intents = &.{},
+                        .split_transitions = &.{},
+                        .merge_transitions = &.{},
+                    };
+                }
+                fn free(_: *anyopaque, _: *antfly.metadata_api.AdminSnapshot) void {}
+                fn source() antfly.public_api.table_catalog.CatalogSource {
+                    return .{ .ptr = undefined, .vtable = &.{
+                        .admin_snapshot = snapshot,
+                        .free_admin_snapshot = free,
+                        .routing_snapshot = antfly.public_api.table_catalog.TestAdminRoutingAdapter(snapshot, free).routingSnapshot,
+                        .linearizable_routing_snapshot = antfly.public_api.table_catalog.TestAdminRoutingAdapter(snapshot, free).linearizableSnapshot,
+                        .free_routing_snapshot = antfly.public_api.table_catalog.TestAdminRoutingAdapter(snapshot, free).freeRoutingSnapshot,
+                    } };
+                }
+            };
+            var apply_sm = try RaftTableApplyStateMachine.init(alloc, replica_root, Catalog.source(), null);
+            var linked_owner = antfly.public_api.table_writes.LinkedTestOwner.init(&apply_sm.write_source) catch |err| {
+                apply_sm.deinit();
+                return err;
+            };
+            defer linked_owner.deinitOwner();
+            defer apply_sm.deinit();
+            apply_sm.attachKernelOwnerSource(linked_owner.owner);
+            var descriptor = try linked_owner.owner.loadDescriptor(alloc, group_id, "docs");
+            defer descriptor.deinit(alloc);
+            const namespace = descriptor.identity;
+            const identity: @import("antfly_local_sources").storage_db_relational_index_raft_contract.Identity = .{ .id = @splat(1), .plan_digest = @splat(2), .owner_digest = @splat(3), .ordinal = 0, .namespace = .{ .table_id = namespace.table_id, .shard_id = namespace.shard_id, .range_id = namespace.range_id }, .owner_group_id = group_id };
+            const participant = try antfly.public_api.distributed_txn.participantIdForGroup(alloc, "docs", group_id);
+            defer alloc.free(participant);
+            const participants = [_][]const u8{participant};
+            const txn_a: antfly.db.types.TxnId = @splat(0x0a);
+            const txn_b: antfly.db.types.TxnId = @splat(0x0b);
+            for ([_]antfly.db.types.TxnId{ txn_a, txn_b }, 0..) |txn, i| {
+                _ = try apply_sm.write_source.applyReplicatedBatchGroupLocal(alloc, group_id, "docs", .{ .transaction = .{ .begin = .{ .txn_id = txn, .begin_timestamp = 100 + i, .created_at_ns = 100 + i, .topology_epoch = 1, .participants = &participants } } });
+            }
+            const barrier = try data_raft_batch.encodeProtocolBarrier(alloc, "docs", data_raft_batch.source_pin_protocol_version);
+            defer alloc.free(barrier);
+            const prepare_a = try data_raft_batch.encodeWithStorageOwnerDescriptor(alloc, "docs", .{ .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"alpha\"}" }}, .transaction = .{ .prepare = .{ .txn_id = txn_a, .topology_epoch = 1 } } }, descriptor.view());
+            defer alloc.free(prepare_a);
+            const prepare_b = try data_raft_batch.encodeWithStorageOwnerDescriptor(alloc, "docs", .{ .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"beta\"}" }}, .transaction = .{ .prepare = .{ .txn_id = txn_b, .topology_epoch = 1 } } }, descriptor.view());
+            defer alloc.free(prepare_b);
+            const entries = [_]raft_engine.core.Entry{
+                .{ .term = 1, .index = 1, .entry_type = .normal, .data = barrier },
+                .{ .term = 1, .index = 2, .entry_type = .normal, .data = prepare_a },
+                .{ .term = 1, .index = 3, .entry_type = .normal, .data = prepare_b },
+            };
+            try apply_sm.registerApplyOutcomeWaiter(group_id, 3, 1);
+            try RaftTableApplyStateMachine.applyReady(&apply_sm, group_id, null, &entries, &.{});
+            try std.testing.expectEqual(@as(u64, 3), apply_sm.appliedIndex(group_id));
+            try std.testing.expectEqual(error.IntentConflict, apply_sm.takeApplyOutcome(group_id, 3).?.failed.toError());
+            const observed = try linked_owner.owner.raftIndexOwnerObservationAtRoot(alloc, group_id, "docs", identity, .{});
+            try std.testing.expectEqual(@as(u64, 2), observed.observation.applied.?.raft.index);
+            // Materialize and restore a genuine rejected-entry gap:
+            // applied prefix three, native mutation two. Preserve the
+            // winning prepare's intents, never snapshot the failed
+            // prepare as if it had committed.
+            const raw_path = try std.fmt.allocPrint(alloc, "{s}/gap-projection", .{replica_root});
+            defer alloc.free(raw_path);
+            var raw = try DataRaftApplyStore.init(alloc, .{ .root_dir = raw_path, .native_source_delegate = true });
+            defer raw.deinit();
+            const encoded = try antfly.raft.state_machine.encodeCommittedEntries(alloc, &entries);
+            defer alloc.free(encoded);
+            try raw.applyBatch(group_id, 3, encoded);
+            var prepared = (try raw.prepareSnapshot(group_id, 3)) orelse return error.TestExpectedSnapshot;
+            defer prepared.deinit();
+            try std.testing.expect(prepared.requiresNative());
+            var captured: kernel_owner_client.NativeSnapshotCapture = .{ .handle = try RaftTableApplyStateMachine.captureNativeSnapshot(&apply_sm, group_id, 3) };
+            defer captured.deinit();
+            try prepared.attachNative(captured.handle.?);
+            captured.handle = null;
+            var materialized = try prepared.materializeFile(alloc);
+            defer materialized.deinit(alloc);
+            const snapshot_bytes = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, materialized.path, alloc, .limited(materialized.size + 1));
+            defer alloc.free(snapshot_bytes);
+            try std.testing.expect(@import("../raft/native_snapshot_delegate.zig").isNative(snapshot_bytes));
+            const target_raw_path = try std.fmt.allocPrint(alloc, "{s}/gap-target-projection", .{replica_root});
+            defer alloc.free(target_raw_path);
+            const target_path = try std.fmt.allocPrint(alloc, "{s}/gap-target-primary", .{replica_root});
+            defer alloc.free(target_path);
+            var target = try DataRaftApplyStore.init(alloc, .{ .root_dir = target_raw_path, .native_source_delegate = true });
+            defer target.deinit();
+            const incoming: @import("kernel_owner_abi").SnapshotPrepareRequest = .{ .path = .fromSlice(target_path), .table_name = .fromSlice("docs"), .group_id = group_id, .lsm_root_generation = 2, .identity_table_id = namespace.table_id, .identity_shard_id = namespace.shard_id, .identity_range_id = namespace.range_id, .schema_json = .fromSlice(descriptor.schema_json), .encoded_snapshot = .fromSlice(snapshot_bytes), .projection_store = target.handle, .expected_applied_index = 3 };
+            {
+                var interrupted = try kernel_owner_client.Snapshot.prepare(incoming);
+                interrupted.deinit();
+            }
+            try std.testing.expectEqual(@as(u64, 3), (try target.latestBatch(group_id)).?.commit_index);
+            {
+                var staged = try kernel_owner_client.Snapshot.prepare(incoming);
+                defer staged.deinit();
+                try staged.promote();
+                _ = try staged.publishPrepared();
+                try staged.commit();
+            }
+            try std.testing.expectEqual(@as(u64, 3), (try target.latestBatch(group_id)).?.commit_index);
+            var restored = try kernel_owner_client.Owner.open(.{ .path = .fromSlice(target_path), .table_name = .fromSlice("docs"), .group_id = group_id, .lsm_root_generation = 2, .has_identity_namespace = 1, .identity_table_id = namespace.table_id, .identity_shard_id = namespace.shard_id, .identity_range_id = namespace.range_id, .schema_json = .fromSlice(descriptor.schema_json) });
+            defer restored.deinit();
+            const restored_cut = try restored.raftIndexOwnerObservation(alloc, "docs", identity, .{});
+            try std.testing.expectEqualDeep(observed.observation, restored_cut);
+            const retry_json = try antfly.public_api.table_writes.encodeStorageKernelBatchRequest(alloc, .{ .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"beta\"}" }}, .transaction = .{ .prepare = .{ .txn_id = txn_b, .topology_epoch = 1 } } });
+            defer alloc.free(retry_json);
+            try std.testing.expectError(error.IntentConflict, restored.replicatedBatchAtRaftEntryJson("docs", retry_json, 1, 4));
+            try std.testing.expectEqualDeep(restored_cut, try restored.raftIndexOwnerObservation(alloc, "docs", identity, .{}));
+        }
+
         test "data raft apply records transaction conflicts without stopping replica progress" {
             // Invalid lifecycle commands are deterministic Raft outcomes, not
             // apply-loop retries that can strand every following decision.
@@ -37668,8 +37788,24 @@ fn consumerTests() type {
             for (0..5000) |i| try apply_sm.registerApplyOutcomeWaiter(88, i + 1, 1);
             defer for (0..5000) |i| apply_sm.cancelApplyOutcomeWaiter(88, i + 1);
 
-            try RaftTableApplyStateMachine.applyReady(&apply_sm, group_id, null, &entries, &.{});
-            try std.testing.expectEqual(@as(u64, 8), apply_sm.appliedIndex(group_id));
+            var native_index: u64 = 0;
+            for (entries) |entry| {
+                try RaftTableApplyStateMachine.applyReady(&apply_sm, group_id, null, &.{entry}, &.{});
+                try std.testing.expectEqual(entry.index, apply_sm.appliedIndex(group_id));
+                if (comptime linked_storage) {
+                    // The snapshot separately names the applied prefix and
+                    // last native mutation. Semantic no-ops must not fabricate
+                    // a native receipt or lose their proposer's typed failure.
+                    if (entry.index == 1 or entry.index == 4 or entry.index == 6 or entry.index == 8) native_index = entry.index;
+                    const namespace = descriptor.?.identity;
+                    const identity: @import("antfly_local_sources").storage_db_relational_index_raft_contract.Identity = .{ .id = @splat(1), .plan_digest = @splat(2), .owner_digest = @splat(3), .ordinal = 0, .namespace = .{ .table_id = namespace.table_id, .shard_id = namespace.shard_id, .range_id = namespace.range_id }, .owner_group_id = group_id };
+                    const observed = try linked_owner.owner.raftIndexOwnerObservationAtRoot(alloc, group_id, "docs", identity, .{});
+                    try std.testing.expectEqual(descriptor.?.generation, observed.root_generation);
+                    try std.testing.expect(observed.observation.binding == null);
+                    try std.testing.expectEqual(native_index, observed.observation.applied.?.raft.index);
+                    try std.testing.expectEqual(entry.term, observed.observation.applied.?.raft.term);
+                }
+            }
             try std.testing.expectEqual(.succeeded, apply_sm.takeApplyOutcome(group_id, 1).?);
             const conflict = apply_sm.takeApplyOutcome(group_id, 2) orelse return error.TestExpectedEqual;
             switch (conflict) {

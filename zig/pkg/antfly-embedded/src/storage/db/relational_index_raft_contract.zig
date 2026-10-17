@@ -66,6 +66,9 @@ pub const Observation = struct {
     pub const max_json_bytes = 32 * 1024;
     format_version: u16,
     binding: ?jobs.Binding = null,
+    /// Last mutation committed by this store, not the host's completed Raft
+    /// prefix/read index. Rejected commands and protocol barriers may leave a
+    /// gap; they must never be mistaken for a committed phase receipt.
     applied: ?positions.Position = null,
     fenced: ?publication.Receipt = null,
     reserved: ?publication.Receipt = null,

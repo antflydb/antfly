@@ -10613,3 +10613,55 @@ is avoided. Both paths free all measured bytes. This is an allocation comparison
 not a throughput benchmark; no throughput gain is claimed. Final source-boundary,
 control-catalog, licensing, formatting and immutable-inventory checks pass. Cache
 GC was previewed only; this checkpoint removed no artifacts or user data.
+
+### Leased Raft owner facts and rejected-entry snapshot qualification
+
+Raft observation/preparation now use the provisioned owner's existing admission
+queue and a shared identity-scoped lease helper. The returned root generation is
+copied from that exact lease before release, never recovered from a later route
+lookup. Both adapters retain deadline/cancellation checks and the compiled
+owner's durable authority/namespace validation. Root provenance alone grants no
+leadership, enrollment, metadata permission or signing authority. Native controls
+retain their existing behavior through the same renamed acquisition helper.
+
+An important receiver invariant is now explicit: `Observation.applied` is the
+native store's last committed mutation identity, **not** the host's completed
+Raft prefix or ReadIndex. A rejected prepare or protocol barrier may advance the
+host without changing that mutation receipt. The native snapshot format records
+both `through_index` and `native_index` and explicitly permits the latter to lag.
+Advancing a fabricated native receipt merely to equalize those values would be
+the wrong fix, as would treating a completed rejected entry as a fence ACK.
+
+The first diagnostic equality assertion reproduced host index two/native index
+one after an intent conflict, but this alone contradicted an assumed invariant,
+not the actual snapshot contract. Qualification now preserves the distinction
+and checks typed rejection outcomes between successful entries. The new snapshot
+scenario commits a real native-snapshot protocol barrier, a winning prepare and a
+rejected conflicting prepare. It captures both stores at host prefix three with
+native mutation two, materializes the snapshot, interrupts restore after raw
+projection preparation, retries publication, and verifies the restored mutation
+cut and winning intent by rejecting the conflicting prepare again. No protocol
+guard or rejection classification is weakened. These use supplied committed
+entries and a real compiled owner/LSM, not network consensus qualification.
+
+Owner-adapter tests additionally check cancellation/deadline/foreign-group
+rejection before acquisition, native-versus-Raft authority isolation, actual
+root provenance and read-only preparation on a separate Raft owner. The native
+recovery fixture now derives its metadata incarnation from the plan's actual
+table guard instead of supplying a conflicting constant; the production
+incarnation check remains unchanged.
+
+Final combined Debug validation passes both Raft regressions and all three owner
+adapter contracts: 110/110 steps, zero skips/failures/leaks in
+`/private/tmp/antfly-sql-rejected-raft-snapshot-and-owner-verified-debug.log`.
+The observed `RetainedEffectsFull` warning is the existing intentional retry
+fault in the transaction regression, not a failing or skipped test. The earlier
+snapshot fixture correctly hit the barrier and staging-lease guards; the final
+scenario uses the actual barrier and releases staging before opening the target.
+Source-boundary, control-catalog, licensing, formatting and original-inventory
+audits pass. No original SQL cases are newly
+qualified: 531 implemented / 132 rejected / 113 superseded / 810 unresolved.
+Authenticated Raft execution, enrolled-root signing, the complete source/claims/
+install/cancel/standby lifecycle and original-case fault qualification remain
+unfinished. Two inactive diagnostic binaries (about 600 MiB) were removed for
+headroom; they are rebuildable, and their test logs and all source/user data remain.
