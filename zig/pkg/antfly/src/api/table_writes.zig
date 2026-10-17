@@ -14287,10 +14287,6 @@ pub const ProvisionedTableWriteSource = struct {
                 std.log.warn("managed startup restore recovery failed phase=repair_probe class={s}", .{@errorName(err)});
                 return err;
             };
-        const has_generated_producers = if (configured_indexes) |summary|
-            summary.has_generated_producers
-        else
-            false;
         // Restore repair intentionally uses a workerless exclusive owner. An
         // ordinary cold index repair, however, can enqueue generated provider
         // work whose lifetime spans many bounded repair quanta. Promote that
@@ -14415,14 +14411,13 @@ pub const ProvisionedTableWriteSource = struct {
 
         // Configuration establishes capability, never ownership. Inspect the
         // exact durable shard state with workers disabled, and promote only an
-        // interrupted generated pipeline into the resident writer cache. A
-        // clean generated shard remains a bounded startup inspection and is
+        // interrupted generated or resolver pipeline into the resident writer
+        // cache. A clean shard remains a bounded startup inspection and is
         // closed below instead of retaining one worker set per local shard.
         if (!use_live_owner and
             !cold_open_uses_writer_cache and
-            has_generated_producers and
             self.write_cache != null and
-            try managedDbNeedsResidentGeneratedRecovery(alloc, db))
+            try managedDbNeedsResidentReplayRecovery(alloc, db))
         {
             std.debug.assert(cached_db != null and uncached_db == null);
             cached_db.?.deinit(alloc);
@@ -30894,15 +30889,30 @@ fn managedDbNeedsGeneratedCoverageReplay(alloc: std.mem.Allocator, db: *db_mod.D
     return try db.generatedCoverageReplayNeeded(alloc);
 }
 
-/// Exact cold-start admission for a long-lived generated owner. Configuration
-/// only proves that a producer exists; durable replay or missing source
+/// Exact cold-start admission for a long-lived replay owner. Configuration
+/// only proves that a producer or resolver exists; durable replay or missing source
 /// outcomes prove that the producer has work which must survive this bounded
 /// startup quantum.
-fn managedDbNeedsResidentGeneratedRecovery(alloc: std.mem.Allocator, db: *db_mod.DB) !bool {
-    if (!db.core.hasGeneratedEnrichmentTargets()) return false;
-    const enrichment = db.pendingWorkStats().enrichment;
+fn managedDbNeedsResidentReplayRecovery(alloc: std.mem.Allocator, db: *db_mod.DB) !bool {
+    const has_generated = db.core.hasGeneratedEnrichmentTargets();
+    if (!has_generated and !db.hasConfiguredResolvers()) return false;
+    const pending = db.pendingWorkStats();
+    if (hasStartupOwnedResolverReplayDebt(pending, .isolated)) return true;
+    if (!has_generated) return false;
+    const enrichment = pending.enrichment;
     if (enrichment.applied_sequence < enrichment.target_sequence) return true;
     return try db.generatedCoverageReplayNeeded(alloc);
+}
+
+fn hasStartupOwnedResolverReplayDebt(pending: anytype, owner: ManagedCatchUpOwner) bool {
+    const workers = [_]bool{ pending.resolution_worker_started, pending.promotion_worker_started };
+    for ([_]db_mod.types.ReplayStageStats{ pending.resolution, pending.promotion }, workers) |stage, worker_started| {
+        // Healthy resident workers own their ordinary lag without taking the
+        // group-exclusive startup lease away from foreground readers.
+        if (owner == .live_writer and worker_started) continue;
+        if (stage.enabled and (stage.catch_up_required or stage.blocked or stage.applied_sequence < stage.target_sequence)) return true;
+    }
+    return false;
 }
 
 /// Debt that must retain the group-exclusive catch-up owner instead of being
@@ -30916,6 +30926,7 @@ fn managedDbHasNonRepairCatchUpDebt(
     owner: ManagedCatchUpOwner,
 ) !bool {
     const pending_work = db.pendingWorkStats();
+    if (hasStartupOwnedResolverReplayDebt(pending_work, owner)) return true;
     // The resident executor is the sole producer for ordinary derived replay.
     // Its lag is build activity, not startup repair, and must remain compatible
     // with readers. Cold/isolated owners still need the broad replay path.
@@ -31016,7 +31027,8 @@ fn catchUpManagedDb(
         !resident_enrichment.worker_failed;
     var had_debt = generated_coverage_replay_needed;
     const derived_replay_debt = hasStartupOwnedReplayDebt(before, resident_owns_derived);
-    had_debt = had_debt or derived_replay_debt;
+    const resolver_replay_debt = hasStartupOwnedResolverReplayDebt(pending_work_before, owner);
+    had_debt = had_debt or derived_replay_debt or resolver_replay_debt;
     const repair_metadata_rebuild_pending = pending_work_before.repair_metadata_rebuild_pending;
     const enrichment_before = pending_work_before.enrichment;
     if (enrichment_before.enabled and
@@ -31188,7 +31200,7 @@ fn catchUpManagedDb(
         // phase-marker-only quanta.
         try finishManagedMaintenanceStatusPublication(source, table_name, publishRuntimeStatusSnapshotWithStartupPhase(source, alloc, table_name, group_id, .artifact_rebuild, db));
         std.log.info("managed restore repair quantum complete group_id={d} repaired={} steps={d}", .{ group_id, repaired_restore_runtime, repair_steps });
-    } else if (runs_broad_debt and derived_replay_debt) {
+    } else if (runs_broad_debt and (derived_replay_debt or resolver_replay_debt)) {
         var pass: usize = 0;
         var last_debt_signature = try startupReplayDebtSignature(alloc, db);
         while (pass < max_startup_catch_up_replay_passes) : (pass += 1) {
@@ -31432,6 +31444,13 @@ fn catchUpManagedDb(
                 .made_progress = made_progress,
             };
         }
+        if (hasStartupOwnedResolverReplayDebt(db.pendingWorkStats(), owner)) {
+            return .{
+                .had_debt = initial_repair_debt,
+                .cleared_debt = false,
+                .made_progress = made_progress,
+            };
+        }
         if (db.denseArtifactRebuildMaintenanceNeeded(alloc) catch |err| {
             std.log.warn("managed startup catch-up post-check dense rebuild probe failed table={s} err={}", .{ table_name, err });
             return err;
@@ -31546,6 +31565,13 @@ fn startupReplayDebtSignature(alloc: std.mem.Allocator, db: *db_mod.DB) !Startup
         signature.applied_sum += status.applied_sequence;
         signature.target_sum += status.target_sequence;
         if (status.catch_up_required) signature.remaining += 1;
+    }
+    const pending = db.pendingWorkStats();
+    for ([_]db_mod.types.ReplayStageStats{ pending.resolution, pending.promotion }) |stage| {
+        if (!stage.enabled) continue;
+        signature.applied_sum += stage.applied_sequence;
+        signature.target_sum += stage.target_sequence;
+        if (stage.catch_up_required or stage.blocked or stage.applied_sequence < stage.target_sequence) signature.remaining += 1;
     }
     return signature;
 }
@@ -56681,6 +56707,88 @@ fn implementationTests() type {
 
             write_cache.deinit();
             try std.testing.expectEqual(@as(usize, 0), leadership.calls);
+        }
+
+        test "managed startup catch-up retains resolver-only recovery after reopen" {
+            const alloc = std.testing.allocator;
+            const NoCatalog = struct {
+                fn iface() table_catalog.CatalogSource {
+                    return .{
+                        .ptr = undefined,
+                        .vtable = &.{
+                            .admin_snapshot = adminSnapshot,
+                            .free_admin_snapshot = freeAdminSnapshot,
+                            .routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                            .linearizable_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                            .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
+                        },
+                    };
+                }
+
+                fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+                    return error.UnexpectedCatalogCall;
+                }
+
+                fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+            };
+            var tmp = std.testing.tmpDir(.{});
+            defer tmp.cleanup();
+            const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/resolver-recovery", .{tmp.sub_path});
+            defer alloc.free(path);
+            const options: db_mod.OpenOptions = .{
+                .open_mode = .writer_no_replay,
+                .start_index_workers = false,
+                .start_optional_runtime_workers = false,
+                .start_resolver_workers = false,
+                .ttl_cleanup = .{ .enabled = false },
+            };
+            {
+                var db = try db_mod.DB.open(alloc, path, options);
+                defer db.close();
+                try db.addIndex(.{ .name = "graph", .kind = .graph, .config_json =
+                    \\{"source":{"artifact":"relations_v1","path":"$.relations[*]","format":"extraction_relation"},"artifact":{"name":"relations_v1","kind":"asset","source":{"type":"field","value":"relations"},"content_type":"application/json"}}
+                });
+                try db.batch(.{ .writes = &.{.{ .key = "doc", .value = "{\"relations\":{\"entities\":[]}}" }}, .sync_level = .full_index });
+                try db.runUntilIdle();
+                db.core.lockApply();
+                defer db.core.unlockApply();
+                _ = try db.core.upsertResolver(.{
+                    .name = "kg",
+                    .table = "entities",
+                    .source_artifact = "relations_v1",
+                    .resolution_artifact = "resolution_v1",
+                    .key_template = "{{ _entity.text }}",
+                    .config_generation = 1,
+                });
+            }
+            var reopened = try db_mod.DB.open(alloc, path, options);
+            defer reopened.close();
+            const indexes = try reopened.listDerivedReplayDebt(alloc);
+            defer {
+                for (indexes) |*index| index.deinit(alloc);
+                alloc.free(indexes);
+            }
+            for (indexes) |index| try std.testing.expect(!index.catch_up_required);
+            const pending = reopened.pendingWorkStats();
+            try std.testing.expect(pending.enrichment.applied_sequence >= pending.enrichment.target_sequence);
+            try std.testing.expect(pending.resolution.catch_up_required or pending.promotion.catch_up_required);
+            try std.testing.expect(try managedDbHasNonRepairCatchUpDebt(alloc, &reopened, .isolated));
+            try std.testing.expect(try managedDbHasNonRepairCatchUpDebt(alloc, &reopened, .live_writer));
+            try std.testing.expect(try managedDbNeedsResidentReplayRecovery(alloc, &reopened));
+            var resident_pending = pending;
+            resident_pending.resolution_worker_started = true;
+            resident_pending.promotion_worker_started = true;
+            try std.testing.expect(!hasStartupOwnedResolverReplayDebt(resident_pending, .live_writer));
+            try std.testing.expect(hasStartupOwnedResolverReplayDebt(resident_pending, .isolated));
+
+            var source = ProvisionedTableWriteSource.init(path, NoCatalog.iface());
+            defer source.deinit();
+            const result = try catchUpManagedDb(&source, alloc, 7001, "docs", &reopened, false, .isolated, .all_debt, .{});
+            try std.testing.expect(result.had_debt);
+            try std.testing.expect(result.made_progress);
+            try std.testing.expect(result.cleared_debt);
+            try std.testing.expect(!hasStartupOwnedResolverReplayDebt(reopened.pendingWorkStats(), .isolated));
+            try std.testing.expect(!(try managedDbNeedsResidentReplayRecovery(alloc, &reopened)));
         }
 
         test "managed startup catch-up invalidates stale cached writer status after replay clears debt" {
