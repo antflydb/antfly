@@ -10956,3 +10956,67 @@ Formatting, generated control catalog, Apache/license and inventory checks
 pass. GC previewed only (`/private/tmp/antfly-sql-nullability-projection-gc-preview.log`)
 and deleted nothing in this checkpoint. Totals remain 531 implemented /
 132 rejected / 113 superseded / 810 unresolved.
+
+### Bounded physical nullability scan
+
+The existing typed-row iterator now has a physical nullability mode rather
+than a second independent cursor implementation. It checks only the requested
+column null metadata across historical layouts; healthy rows produce no JSON
+or value projection. A violation returns one owned key and an empty typed
+projection, then leaves that reader in a failed terminal state. Physical
+record budgets include orphan companion families, and empty nonterminal pages
+retain their continuation instead of claiming scan completion.
+
+This mode rejects indexes, predicates, custom filters, RLS leases, narrowed
+primary bounds and ordinary payload projections. It deliberately includes
+TTL-hidden physical rows. A query cursor cannot be repurposed after it has
+already advanced, nor can a partially completed validation cursor switch to
+query visibility or another nullability projection. Projection identities hash
+the ordered, length-framed column names, independently of schema/publication
+authority. Explicit resume copies a structurally valid owned-range physical
+row cursor under the existing 1 MiB physical-job continuation limit. The owner
+still must authenticate the durable predecessor and exact source cut before
+using this read-side resume operation.
+
+Page output and continuation allocations finish before the reader updates
+its next cursor; cancellation and allocation failures do not consume a prefix.
+Historical pins remain managed by the iterator's existing snapshot-local
+cache. Dynamic row probes do not retain pointers after a binding is evicted.
+Wall-time slicing bounds read preparation only: a replicated progress command
+must bind its actual cursor/count, never replay a wall-time stopping decision.
+
+The new `antfly-relational-nullability-scan-test` target passes both native LSM
+tests with zero skips/leaks and 51/51 build steps
+(`/private/tmp/antfly-sql-nullability-owner-scan-ttl-debug.log`). Coverage includes
+cold persisted rows, JSON-null provenance, unchanged primary bytes, retained
+snapshots under live writes, bounded empty/orphan pages, explicit resume,
+projection mismatch, sticky violations, filtered-reader rejection, TTL-hidden
+NULLs, cancellation after row inspection and an allocation-failure sweep.
+The first TTL fixture omitted its required metadata timestamp declaration and
+was corrected; production schema validation was not relaxed. The four portable
+probe/component tests also pass in
+`/private/tmp/antfly-sql-nullability-resume-components-retry-debug.log`.
+
+This completes the read-side streaming operator, not distributed validation-only
+DDL. Durable job/progress records, fenced source admission and drain, signed
+owner receipts, index-preserving compatible-schema installation, all-owner
+publication and cancellation/restart fault qualification remain open. The
+public tightening path retains its guarded rewrite until those protocols are
+fully integrated. No original disposition is reclassified. About 1.6 GiB of
+explicitly identified obsolete local test binaries/objects were removed for
+build headroom; logs, source, user data, other worktrees and current artifacts
+were retained. Repository-wide GC was previewed only.
+
+The complete Debug SQL regression gate passes 896 portable plus 234 native
+tests (1,130 passed; only the four existing opt-in benchmarks skipped), with
+21/21 build steps in `/private/tmp/antfly-sql-nullability-stream-full-debug.log`.
+Formatting, source/control-catalog, Apache/license and inventory checks pass;
+the Apache product closure now covers 2,070 source files. Totals remain
+531 implemented / 132 rejected / 113 superseded / 810 unresolved.
+
+Final review strengthened the native fixture without changing production code:
+it now persists epoch-1 rows, adds an epoch-2 column with changed ordinals,
+reopens cold storage, scans both old and new frames, and rejects historical
+absence as SQL NULL. The original row remains physically encoded at epoch 1.
+Both final native tests pass with zero skips/leaks and 51/51 build steps in
+`/private/tmp/antfly-sql-nullability-owner-scan-epochs-debug.log`.

@@ -30,7 +30,7 @@ pub const Control = struct {
     context: ?*anyopaque = null,
     checkpoint: ?*const fn (?*anyopaque) anyerror!void = null,
 
-    fn ensureActive(self: Control) !void {
+    pub fn ensureActive(self: Control) !void {
         if (self.checkpoint) |call| try call(self.context);
     }
 };
@@ -41,6 +41,8 @@ pub const Control = struct {
 pub const Plan = struct {
     alloc: Allocator,
     names: []const []const u8,
+    /// Logical projection identity, separate from owner/schema authority.
+    identity: [32]u8,
 
     pub fn init(alloc: Allocator, table: schema.TableSchema, layout: *const codec.PhysicalLayout, fields: []const []const u8, context: Control) !Plan {
         try context.ensureActive();
@@ -56,6 +58,8 @@ pub const Plan = struct {
         defer seen.deinit(alloc);
         try seen.ensureTotalCapacity(alloc, @intCast(fields.len));
         var name_bytes: usize = 0;
+        var hash = std.crypto.hash.Blake3.init(.{});
+        hash.update("antfly/nullability-projection/v1");
         for (fields, names) |field, *name| {
             try context.ensureActive();
             name_bytes = std.math.add(usize, name_bytes, field.len) catch return error.InvalidNullabilityProjection;
@@ -65,8 +69,14 @@ pub const Plan = struct {
             name.* = try alloc.dupe(u8, field);
             initialized += 1;
             seen.putAssumeCapacityNoClobber(name.*, {});
+            var length: [8]u8 = undefined;
+            std.mem.writeInt(u64, &length, name.*.len, .little);
+            hash.update(&length);
+            hash.update(name.*);
         }
-        return .{ .alloc = alloc, .names = names };
+        var identity: [32]u8 = undefined;
+        hash.final(&identity);
+        return .{ .alloc = alloc, .names = names, .identity = identity };
     }
 
     pub fn deinit(self: *Plan) void {
@@ -87,6 +97,20 @@ pub const Plan = struct {
             ordinal.* = if (layout.ordinalForName(table.relational_columns, name)) |index| @intCast(index) else null;
         }
         return .{ .alloc = alloc, .layout = layout, .columns = table.relational_columns, .ordinals = ordinals };
+    }
+
+    /// A reader may evict historical bindings between rows. Probe through its
+    /// current immutable row view instead of caching borrowed layout pointers
+    /// beyond that row's lifetime. No per-row allocation or payload decoding.
+    pub fn firstNullInRow(self: *const Plan, row: codec.OrdinalRowView, context: Control) !?usize {
+        try context.ensureActive();
+        try requireLayout(row.table_schema, row.layout);
+        for (self.names, 0..) |name, i| {
+            if (i % 256 == 0) try context.ensureActive();
+            const ordinal = row.ordinalForName(name) orelse return i;
+            if (try row.isSqlNull(ordinal)) return i;
+        }
+        return null;
     }
 };
 

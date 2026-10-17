@@ -28,6 +28,212 @@ const time = @import("antfly_platform").time;
 const alloc = std.testing.allocator;
 const docstore = @import("../docstore.zig");
 
+const NullabilityScanFixture = struct {
+    const validation = @import("relational_nullability.zig");
+    fn open(database: *db_mod.DB, a: std.mem.Allocator, request: rows.Request, now_ns: u64) !rows.Reader {
+        database.core.lockApplyShared();
+        defer database.core.unlockApplyShared();
+        var view = database.core.acquireSchemaView() orelse return error.RelationalTableRequired;
+        defer view.release();
+        return rows.Reader.open(a, database.core.store, view, null, request, now_ns);
+    }
+    fn projection(reader: *rows.Reader, names: []const []const u8) !validation.Plan {
+        return validation.Plan.init(alloc, reader.active.tableSchema().*, reader.active.physicalLayout(), names, .{});
+    }
+    fn finish(reader: *rows.Reader, plan: *const validation.Plan) !usize {
+        var count: usize = 0;
+        for (0..32) |_| {
+            const previous = try alloc.dupe(u8, reader.after.items);
+            defer alloc.free(previous);
+            var page = try reader.nextNullabilityPage(alloc, null, .{ .records = 1, .time_ns = std.time.ns_per_s }, plan, .{});
+            defer page.deinit();
+            try std.testing.expectEqual(@as(?usize, null), page.violation_column);
+            try std.testing.expectEqual(@as(usize, 0), page.page.rows.len);
+            try std.testing.expect(page.page.records_examined <= 1);
+            count += page.rows_examined;
+            if (!page.page.more) return count;
+            try std.testing.expect(std.mem.order(u8, page.after, previous) == .gt);
+        }
+        return error.NullabilityScanDidNotFinish;
+    }
+};
+
+test "relational index system nullability scan bounds physical pages retains snapshots and resumes exact projections" {
+    const Check = NullabilityScanFixture;
+    var directory = try @import("../../common/test_directory.zig").TestDirectory.init("nullability-pages");
+    defer directory.cleanup();
+    const options: db_mod.OpenOptions = .{ .start_optional_runtimes = false, .primary_backend = .{ .lsm = .{ .flush_threshold = 2 } } };
+    {
+        var database = try db_mod.DB.open(alloc, directory.path(), options);
+        defer database.close();
+        try database.setSchemaJson(alloc,
+            \\{"version":1,"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"n":{"type":"integer","nullable":true},"j":{"type":"json","nullable":true},"body":{"type":"string"}},"additionalProperties":false}}}}
+        );
+        const payload = try alloc.alloc(u8, 128 * 1024);
+        defer alloc.free(payload);
+        @memset(payload, 'x');
+        const large = try std.fmt.allocPrint(alloc, "{{\"n\":1,\"j\":null,\"body\":\"{s}\"}}", .{payload});
+        defer alloc.free(large);
+        try database.batch(.{ .timestamp_ns = 100, .writes = &.{
+            .{ .key = "a", .value = large, .json_null_fields = &.{"j"} },
+            .{ .key = "b", .value = "{\"n\":2,\"j\":{}}" },
+            .{ .key = "c", .value = "{\"n\":3,\"j\":[]}" },
+            .{ .key = "d", .value = "{\"n\":4,\"j\":false}" },
+        } });
+        for ([_][]const u8{ "0-orphan", "aa-orphan", "z-orphan" }) |name| {
+            const key = try internal.ttlKeyAlloc(alloc, name);
+            defer alloc.free(key);
+            const stamp: [8]u8 = @splat(0);
+            try database.core.store.put(key, &stamp);
+        }
+        try database.setSchemaJson(alloc,
+            \\{"version":2,"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"ahead":{"type":"string","nullable":true},"n":{"type":"integer","nullable":true},"j":{"type":"json","nullable":true},"body":{"type":"string"}},"additionalProperties":false}}}}
+        );
+    }
+    // The source rows are now cold persisted LSM data.
+    var database = try db_mod.DB.open(alloc, directory.path(), options);
+    defer database.close();
+    var reader = try Check.open(&database, alloc, .{}, 1000);
+    defer reader.deinit();
+    try std.testing.expectEqual(@as(u32, 2), reader.active.version());
+    var twin = try rows.Reader.openSnapshot(alloc, try reader.read.forkRead(), reader.authenticated, reader.active, null, .{}, 1000);
+    defer twin.deinit();
+    var plan = try Check.projection(&reader, &.{ "n", "j" });
+    defer plan.deinit();
+    const primary = try internal.relationalRowKeyAlloc(alloc, "a");
+    defer alloc.free(primary);
+    const before = try database.core.store.get(alloc, primary);
+    defer alloc.free(before);
+    try std.testing.expectEqual(@as(u32, 1), try @import("algebraic/relational_row_codec.zig").rowSchemaVersion(before));
+    {
+        var first = try reader.nextNullabilityPage(alloc, null, .{ .records = 1, .time_ns = std.time.ns_per_s }, &plan, .{});
+        defer first.deinit();
+        try std.testing.expect(first.page.more);
+        try std.testing.expectEqual(@as(usize, 0), first.rows_examined);
+        try std.testing.expectEqual(@as(usize, 0), first.page.rows.len);
+        try std.testing.expect(first.after.len != 0);
+        try twin.resumeNullabilityScan(&plan, .{ .projection_identity = plan.identity, .after = first.after }, .{});
+    }
+    // Live writes must not alter either retained source cut. This is a read
+    // isolation test, not a claim that a snapshot alone fences publication.
+    try database.batch(.{ .timestamp_ns = 200, .writes = &.{
+        .{ .key = "b", .value = "{\"n\":null,\"j\":{}}" },
+        .{ .key = "e", .value = "{\"n\":null,\"j\":{}}" },
+    } });
+    var different = try Check.projection(&reader, &.{ "j", "n" });
+    defer different.deinit();
+    try std.testing.expectError(error.InvalidNullabilityProjection, reader.nextNullabilityPage(alloc, null, .{}, &different, .{}));
+    try std.testing.expectEqual(@as(usize, 4), try Check.finish(&reader, &plan));
+    try std.testing.expectEqual(@as(usize, 4), try Check.finish(&twin, &plan));
+    try std.testing.expectError(error.InvalidNullabilityProjection, reader.nextTypedPage(alloc, null, .{}));
+    try std.testing.expectError(error.InvalidNullabilityProjection, reader.lookupTypedRow(alloc, "a"));
+    const after = try database.core.store.get(alloc, primary);
+    defer alloc.free(after);
+    try std.testing.expectEqualSlices(u8, before, after);
+
+    // A column added in the active epoch is absent in historical frames, not
+    // the value of whichever old column happened to occupy its new ordinal.
+    var historical = try Check.open(&database, alloc, .{}, 1000);
+    defer historical.deinit();
+    var added = try Check.projection(&historical, &.{"ahead"});
+    defer added.deinit();
+    var absent = try historical.nextNullabilityPage(alloc, null, .{ .records = 32, .time_ns = std.time.ns_per_s }, &added, .{});
+    defer absent.deinit();
+    try std.testing.expectEqual(@as(?usize, 0), absent.violation_column);
+    try std.testing.expectEqualStrings("a", absent.page.rows[0].key);
+    try std.testing.expectEqual(@as(u32, 1), absent.page.rows[0].schema_version);
+
+    var current = try Check.open(&database, alloc, .{}, 1000);
+    defer current.deinit();
+    var failed = try current.nextNullabilityPage(alloc, null, .{ .records = 32, .time_ns = std.time.ns_per_s }, &plan, .{});
+    defer failed.deinit();
+    try std.testing.expectEqual(@as(?usize, 0), failed.violation_column);
+    try std.testing.expectEqual(@as(usize, 2), failed.rows_examined);
+    try std.testing.expectEqual(@as(usize, 1), failed.page.rows.len);
+    try std.testing.expectEqualStrings("b", failed.page.rows[0].key);
+    try std.testing.expectEqual(@as(usize, 0), failed.page.rows[0].typed.?.object.count());
+    try std.testing.expectEqual(@as(usize, 0), failed.page.rows[0].json.len);
+    try std.testing.expectError(error.NullabilityValidationFailed, current.nextNullabilityPage(alloc, null, .{}, &plan, .{}));
+
+    var fresh = try Check.open(&database, alloc, .{}, 1000);
+    defer fresh.deinit();
+    var forged = plan.identity;
+    forged[0] ^= 1;
+    try std.testing.expectError(error.InvalidNullabilityProjection, fresh.resumeNullabilityScan(&plan, .{ .projection_identity = forged, .after = failed.after }, .{}));
+    try std.testing.expectError(error.InvalidNullabilityProjection, fresh.resumeNullabilityScan(&plan, .{ .projection_identity = plan.identity, .after = "\xff" }, .{}));
+    try std.testing.expectEqual(@as(usize, 0), fresh.after.items.len);
+}
+
+test "relational index system nullability scan rejects filtered coverage includes expired rows and rolls back failed pages" {
+    const Check = NullabilityScanFixture;
+    var directory = try @import("../../common/test_directory.zig").TestDirectory.init("nullability-coverage");
+    defer directory.cleanup();
+    var database = try db_mod.DB.open(alloc, directory.path(), .{ .start_optional_runtimes = false, .primary_backend = .{ .lsm = .{} } });
+    defer database.close();
+    try database.setSchemaJson(alloc,
+        \\{"version":1,"storage_mode":"relational","default_type":"row","ttl_duration_ns":1,"document_schemas":{"row":{"schema":{"type":"object","properties":{"n":{"type":"integer","nullable":true},"_timestamp":{"type":"datetime"}},"additionalProperties":false}}}}
+    );
+    try database.batch(.{ .timestamp_ns = 100, .writes = &.{.{ .key = "a", .value = "{\"n\":null}" }} });
+    var normal = try Check.open(&database, alloc, .{}, 1000);
+    defer normal.deinit();
+    var hidden = try normal.nextTypedPage(alloc, null, .{});
+    defer hidden.deinit();
+    try std.testing.expectEqual(@as(usize, 0), hidden.rows.len);
+    var reader = try Check.open(&database, alloc, .{}, 1000);
+    defer reader.deinit();
+    var plan = try Check.projection(&reader, &.{"n"});
+    defer plan.deinit();
+    try std.testing.expectError(error.InvalidNullabilityProjection, normal.nextNullabilityPage(alloc, null, .{}, &plan, .{}));
+    const Cancel = struct {
+        calls: usize = 0,
+        fn check(raw: ?*anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.calls += 1;
+            if (self.calls == 6) return error.Canceled;
+        }
+    };
+    var cancellation: Cancel = .{};
+    try std.testing.expectError(error.Canceled, reader.nextNullabilityPage(alloc, null, .{}, &plan, .{ .context = &cancellation, .checkpoint = Cancel.check }));
+    try std.testing.expect(reader.source != null);
+    try std.testing.expectEqual(@as(usize, 0), reader.after.items.len);
+    try std.testing.expect(reader.nullability_projection == null);
+    try std.testing.expect(!reader.nullability_failed);
+    var found = try reader.nextNullabilityPage(alloc, null, .{}, &plan, .{});
+    defer found.deinit();
+    try std.testing.expectEqual(@as(?usize, 0), found.violation_column);
+    try std.testing.expectEqualStrings("a", found.page.rows[0].key);
+    try std.testing.expectEqual(@as(usize, 1), found.rows_examined);
+
+    for ([_]rows.Request{
+        .{ .fields = &.{"n"} },
+        .{ .conditions = &.{.{ .column = "n", .op = .is_not_null }} },
+        .{ .primary_lower = .{ .key = "b" } },
+    }) |request| {
+        var restricted = try Check.open(&database, alloc, request, 1000);
+        defer restricted.deinit();
+        try std.testing.expectError(error.InvalidNullabilityProjection, restricted.nextNullabilityPage(alloc, null, .{}, &plan, .{}));
+    }
+    var public = try database.beginRelationalRows(alloc, .{});
+    defer public.deinit();
+    try std.testing.expectError(error.InvalidNullabilityProjection, public.nextNullabilityPage(alloc, null, .{}, &plan, .{}));
+    const Allocation = struct {
+        fn run(a: std.mem.Allocator, db: *db_mod.DB, projection: *const Check.validation.Plan) !void {
+            var validation_reader = try Check.open(db, a, .{}, 1000);
+            defer validation_reader.deinit();
+            var page = validation_reader.nextNullabilityPage(a, null, .{}, projection, .{}) catch |err| {
+                try std.testing.expectEqual(@as(usize, 0), validation_reader.after.items.len);
+                try std.testing.expect(validation_reader.nullability_projection == null);
+                try std.testing.expect(!validation_reader.nullability_failed);
+                return err;
+            };
+            defer page.deinit();
+            try std.testing.expectEqualStrings("a", page.page.rows[0].key);
+        }
+    };
+    try Allocation.run(alloc, &database, &plan);
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(alloc, Allocation.run, .{ &database, &plan });
+}
+
 test "relational index system Raft owner controls commit authentic phase cuts atomically and recover" {
     const api = @import("../../schema/mod.zig");
     const compiler = @import("../../schema/relational_declarations.zig");
