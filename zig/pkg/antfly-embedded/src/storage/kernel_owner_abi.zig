@@ -19,7 +19,7 @@
 const failure_abi = @import("runtime_failure_abi");
 
 // Storage layouts evolve independently of the shared failure envelope.
-pub const abi_version: u32 = 92;
+pub const abi_version: u32 = 93;
 pub const Status = failure_abi.Status;
 pub const FailureBoundary = failure_abi.FailureBoundary;
 pub const FailureIdentity = failure_abi.FailureIdentity;
@@ -2303,6 +2303,13 @@ pub extern fn antfly_storage_wal_open(
 ) callconv(.c) Status;
 
 pub extern fn antfly_storage_wal_close(wal: ?*anyopaque) callconv(.c) void;
+
+/// Static append admission; does not reserve space or advance the WAL.
+pub extern fn antfly_storage_wal_admit_append_bytes(
+    wal: ?*anyopaque,
+    version: u32,
+    data_len: u64,
+) callconv(.c) Status;
 
 pub extern fn antfly_storage_wal_append(
     wal: ?*anyopaque,

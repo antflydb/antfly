@@ -100,6 +100,12 @@ pub const Publisher = struct {
     vtable: *const VTable,
 
     pub const Identity = struct { table_id: u64, shard_id: u64, timeline_id: u64, epoch: u64 };
+    pub const RecordAdmission = struct {
+        kind: outbox.Kind,
+        codec: @import("replication_record.zig").PayloadCodec,
+        payload_bytes: usize,
+        namespace: Namespace,
+    };
     pub const VTable = struct {
         next_lsn: *const fn (*anyopaque) u64,
         identity: *const fn (*anyopaque) Identity,
@@ -107,6 +113,9 @@ pub const Publisher = struct {
         recover: *const fn (AsyncEffectMirror, outbox.Kind, outbox.DurableReplicationOutbox, Namespace) anyerror!u64,
         preflight: *const fn (AsyncEffectMirror, bool) anyerror!void,
         complete: *const fn (AsyncEffectMirror, u64) anyerror!void,
+        /// Explicit support is mandatory for new owner control records. Older
+        /// adapters cannot silently commit an unpublishable outbox obligation.
+        admit_record: ?*const fn (AsyncEffectMirror, RecordAdmission) anyerror!void = null,
         note_published: *const fn (AsyncEffectMirror, u64) void = ignorePublished,
         note_failure: *const fn (AsyncEffectMirror) void = ignoreFailure,
         equal_capture: *const fn (AsyncEffectMirror, AsyncEffectMirror) bool = equalEmptyCapture,
@@ -122,6 +131,10 @@ pub const Publisher = struct {
 
     pub fn nextLsn(self: Publisher) u64 {
         return self.vtable.next_lsn(self.ptr);
+    }
+    pub fn admitRecord(self: Publisher, mirror: AsyncEffectMirror, request: RecordAdmission) !void {
+        std.debug.assert(self.ptr == mirror.publisher.ptr and self.vtable == mirror.publisher.vtable);
+        return (self.vtable.admit_record orelse return error.UnsupportedReplicationRecordAdmission)(mirror, request);
     }
     pub fn identity(self: Publisher) Identity {
         return self.vtable.identity(self.ptr);

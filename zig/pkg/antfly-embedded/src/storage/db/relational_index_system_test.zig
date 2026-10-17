@@ -687,6 +687,7 @@ test "relational index system nullability job native metadata journal preserves 
         fail_after: bool = false,
         async_only: bool = false,
         completions: usize = 0,
+        reject_admission: bool = false,
         fn selfOf(mirror: contract.AsyncEffectMirror) *@This() {
             return @ptrCast(@alignCast(mirror.publisher.ptr));
         }
@@ -723,8 +724,13 @@ test "relational index system nullability job native metadata journal preserves 
             try self.base.publisher.complete(self.base, lsn);
             self.completions += 1;
         }
+        fn admit(mirror: contract.AsyncEffectMirror, request: contract.Publisher.RecordAdmission) !void {
+            const self = selfOf(mirror);
+            if (self.reject_admission) return error.WalRecordTooLarge;
+            try self.base.publisher.admitRecord(self.base, request);
+        }
         fn asMirror(self: *@This()) contract.AsyncEffectMirror {
-            return .{ .publisher = .{ .ptr = self, .vtable = &.{ .next_lsn = next, .identity = identity, .publish = publish, .recover = recover, .preflight = preflight, .complete = complete } }, .mutation_barrier = self.barrier, .requirements = .{ .synchronous = !self.async_only, .durable_outbox = !self.async_only, .preflight = !self.async_only } };
+            return .{ .publisher = .{ .ptr = self, .vtable = &.{ .next_lsn = next, .identity = identity, .publish = publish, .recover = recover, .preflight = preflight, .complete = complete, .admit_record = admit } }, .mutation_barrier = self.barrier, .requirements = .{ .synchronous = !self.async_only, .durable_outbox = !self.async_only, .preflight = !self.async_only } };
         }
     };
     const Driver = struct {
@@ -789,6 +795,28 @@ test "relational index system nullability job native metadata journal preserves 
         primary_db.local_execution.replication_async_metadata_mirror = publisher.asMirror();
         primary_db.local_execution.replication_async_batch_mirror = publisher.asMirror();
         const begin: owner.Command = .{ .binding = binding, .action = .begin, .payload = candidate.inputs };
+        const before_admission_clock = try F.clock(&primary_db);
+        {
+            var legacy = publisher.asMirror();
+            var legacy_vtable = legacy.publisher.vtable.*;
+            legacy_vtable.admit_record = null;
+            legacy.publisher.vtable = &legacy_vtable;
+            primary_db.local_execution.replication_async_metadata_mirror = legacy;
+            primary_db.local_execution.replication_async_batch_mirror = legacy;
+            try std.testing.expectError(error.UnsupportedReplicationRecordAdmission, Driver.command(&primary_db, begin));
+        }
+        primary_db.local_execution.replication_async_metadata_mirror = publisher.asMirror();
+        primary_db.local_execution.replication_async_batch_mirror = publisher.asMirror();
+        publisher.reject_admission = true;
+        try std.testing.expectError(error.WalRecordTooLarge, Driver.command(&primary_db, begin));
+        publisher.reject_admission = false;
+        try std.testing.expectEqual(before_admission_clock, try F.clock(&primary_db));
+        {
+            var read = try primary_db.core.store.beginReadTxn();
+            defer read.abort();
+            try std.testing.expect(try F.job.load(&read) == null);
+            try std.testing.expect(!try @import("durable_outbox_store.zig").hasPendingTxn(&read));
+        }
         const admitted = try Driver.command(&primary_db, begin);
         try std.testing.expect(admitted.replication_pending and !admitted.duplicate);
         try std.testing.expectEqualStrings("InjectedSchemaJournalUnavailable", admitted.error_name.?);
@@ -902,6 +930,59 @@ test "relational index system nullability job native metadata journal preserves 
         try std.testing.expectEqual(try F.clock(&primary_db), try F.clock(&peer_db));
         try std.testing.expect(publisher.completions > 0);
     }
+}
+
+test "relational index system nullability job publisher admission uses the actual WAL static limit" {
+    const contract = @import("replication_contract.zig");
+    const record = @import("replication_record.zig");
+    var directory = try @import("../../common/test_directory.zig").TestDirectory.init("schema-journal-admission");
+    defer directory.cleanup();
+    const log_path = try std.fmt.allocPrintSentinel(alloc, "{s}/log", .{directory.path()}, 0);
+    defer alloc.free(log_path);
+    const slots_path = try std.fmt.allocPrintSentinel(alloc, "{s}/slots", .{directory.path()}, 0);
+    defer alloc.free(slots_path);
+    var journal = try primary_mod.Primary.open(alloc, log_path, slots_path, .{ .cluster_id = 71, .table_id = 72, .shard_id = 73, .timeline_id = 1, .epoch = 1 }, .{
+        .replication_log_options = .{ .wal_options = .{ .lsm_options = .{ .wal_hard_limit_bytes = 4096 } } },
+    });
+    defer journal.close();
+    const mirror = hot_standby_publisher_adapter.bindMirror(&journal, .{});
+    const request: contract.Publisher.RecordAdmission = .{
+        .kind = .metadata_control,
+        .codec = .binary,
+        .payload_bytes = 100,
+        .namespace = .{ .table_id = 72, .shard_id = 73, .range_id = 74 },
+    };
+    try mirror.publisher.admitRecord(mirror, request);
+    var large = request;
+    large.payload_bytes = 4096;
+    try std.testing.expectError(error.WalRecordTooLarge, mirror.publisher.admitRecord(mirror, large));
+    large.payload_bytes = std.math.maxInt(usize);
+    try std.testing.expectError(error.UnsupportedReplicationRecordAdmission, mirror.publisher.admitRecord(mirror, large));
+    var wrong = request;
+    wrong.codec = .json;
+    try std.testing.expectError(error.UnsupportedReplicationRecordAdmission, mirror.publisher.admitRecord(mirror, wrong));
+    wrong = request;
+    wrong.kind = .schema;
+    try std.testing.expectError(error.UnsupportedReplicationRecordAdmission, mirror.publisher.admitRecord(mirror, wrong));
+    wrong = request;
+    wrong.namespace.table_id += 1;
+    try std.testing.expectError(error.IdentityNamespaceMismatch, mirror.publisher.admitRecord(mirror, wrong));
+    try std.testing.expectEqual(@as(u64, 0), journal.lastLsn());
+    // The size-only admission actually agrees with a physical append, not an
+    // unrelated guessed frame cap. Its exact boundary includes both WAL keys,
+    // next-LSN metadata and the physical state codec's entry framing.
+    const overhead = 77 + record.header_size;
+    var boundary = request;
+    boundary.payload_bytes = 4096 - overhead;
+    try mirror.publisher.admitRecord(mirror, boundary);
+    boundary.payload_bytes += 1;
+    try std.testing.expectError(error.WalRecordTooLarge, mirror.publisher.admitRecord(mirror, boundary));
+    const body = try alloc.alloc(u8, 4096 - overhead);
+    defer alloc.free(body);
+    @memset(body, 7);
+    _ = try journal.append(.{ .kind = .checkpoint, .payload_codec = .binary, .payload = body });
+    try std.testing.expectEqual(@as(u64, 1), journal.lastLsn());
+    try std.testing.expectError(error.WalRecordTooLarge, journal.log.wal.admitAppendBytes(std.math.maxInt(usize)));
 }
 
 const NullabilityScanFixture = struct {

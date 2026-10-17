@@ -11318,3 +11318,60 @@ Inventory remains 531 implemented / 132 rejected / 113 superseded /
 810 unresolved. About 700 MiB of inspected, inactive, superseded local test
 binaries/objects were reclaimed during final regression verification; these
 are regenerable cache outputs, not source, logs or current verified artifacts.
+
+### Publisher and physical WAL admission before schema-control commit
+
+A metadata-control producer now requires an explicit publisher record-admission
+operation before entering apply. Publishers without that operation fail closed,
+including otherwise valid async adapters; neither generic preflight nor a
+caller-supplied capability flag implies support for this record. The request
+binds kind, codec, namespace and the exact finalized frame length. Existing
+non-control mutation publishers retain their previous contract.
+
+The server adapter admits only the supported binary schema-control kind and
+bounded versioned frame size, verifies the real primary table/shard scope, adds
+the replication envelope, and asks the actual WAL owner to check static append
+admissibility. The WAL calculation uses its physical state codec with lengths
+for the ordinary entry and next-LSN metadata; it does not allocate payload-sized
+buffers, guess an unrelated HTTP/body limit, reserve an LSN or take an apply
+lock. Read-only owners, unrepresentable values and a record whose exact physical
+size exceeds the configured hard WAL limit reject before a local schema job or
+publication obligation can commit. Fresh publication rechecks this limit;
+recovery may still recognize an already appended exact record without requiring
+a new append. Transient retention pressure, exhausted disk and I/O failures are
+not falsely promised away by static admission: the durable outbox remains their
+retry mechanism.
+
+Private kernel ABI 93 adds the same length-only operation to the opaque WAL
+client/owner boundary. It validates the ABI version and handle and preserves
+the existing exact error identities. It exposes neither a backend pointer nor
+physical tuning in the control consumer. This is local publisher/format
+admission, not metadata cohort capabilities, root adoption or publication
+authorization; those public activation prerequisites remain unfinished.
+
+The native Debug gate passes eight tests, zero skips/leaks and 51/51 build
+steps in `/private/tmp/antfly-sql-native-owner-admission-debug.log`. Tests cover
+missing publisher support and injected rejection with no job, clock advance
+or outbox, wrong codec/kind/namespace, maximum sizes, the exact configured
+physical WAL boundary and a real append at that boundary. The final preceding
+owner-ordering SQL rerun passes 896 portable plus 234 native tests, four existing
+opt-in benchmarks skipped, 21/21 build steps, in
+`/private/tmp/antfly-sql-native-schema-owner-final-full-debug.log`.
+
+The linked opaque-owner regression is tracked separately. Its initial build
+failed compiling an inference archive with `NoSpaceLeft`, not a test assertion;
+only inspected inactive outputs belonging to earlier task verification were
+reclaimed before retrying. Current source, logs, verified admission outputs and
+other worktrees were preserved. No original disposition is reclassified.
+
+The linked retry passes all three opaque-WAL tests, zero skips/leaks and
+49/49 build steps, in
+`/private/tmp/antfly-sql-native-owner-admission-opaque-retry-debug.log`. The
+consumer calls the real archived owner through the new ABI operation; coverage
+checks invalid ABI versions/null handles, unchanged LSN after size-only
+admission, exact `WalRecordTooLarge` identity and read-only rejection, alongside
+existing durability, idempotency, truncation and reopen tests. Formatting,
+control-catalog, Apache-boundary, license and inventory audits pass. About
+2.5 GiB of specifically inspected inactive earlier test binaries/objects were
+reclaimed for these builds; no broad cache or repository cleanup ran. A final
+full Debug SQL gate for the admission changes is tracked separately.

@@ -1277,6 +1277,11 @@ test "opaque WAL preserves durable operations and exact failure identity" {
     defer std.testing.allocator.free(path_z);
     var wal = try wal_client.WAL.open(path_z.ptr, TestWalOptions{});
     defer wal.close();
+    try wal.admitAppendBytes(5);
+    try std.testing.expectError(error.WalRecordTooLarge, wal.admitAppendBytes(std.math.maxInt(usize)));
+    try std.testing.expectEqual(@as(u64, 0), wal.lastLsn());
+    try std.testing.expectEqual(abi.Status.invalid_abi, abi.antfly_storage_wal_admit_append_bytes(wal.handle, abi.abi_version - 1, 5));
+    try std.testing.expectEqual(abi.Status.invalid_argument, abi.antfly_storage_wal_admit_append_bytes(null, abi.abi_version, 5));
     try std.testing.expectEqual(@as(u64, 1), try wal.append("alpha"));
     try std.testing.expectEqual(@as(u64, 2), try wal.append("beta"));
     try std.testing.expectEqual(@as(u64, 2), wal.lastLsn());
@@ -1319,6 +1324,7 @@ test "opaque WAL preserves durable operations and exact failure identity" {
     }
     var read_only = try wal_client.WAL.open(read_only_z.ptr, TestWalOptions{ .read_only = true });
     defer read_only.close();
+    try std.testing.expectError(error.ReadOnly, read_only.admitAppendBytes(5));
     try std.testing.expectError(error.ReadOnly, read_only.append("rejected"));
 
     try std.testing.expectError(

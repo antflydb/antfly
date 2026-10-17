@@ -106,6 +106,7 @@ pub const kernel_wal_owner = antfly.kernel_wal_owner;
 pub const storageWalOpen = kernel_wal_owner.open;
 pub const storageWalClose = kernel_wal_owner.close;
 pub const storageWalAppend = kernel_wal_owner.append;
+pub const storageWalAdmitAppendBytes = kernel_wal_owner.admitAppendBytes;
 pub const storageWalAppendIdempotent = kernel_wal_owner.appendIdempotent;
 pub const storageWalSync = kernel_wal_owner.sync;
 pub const storageWalTruncatePrefix = kernel_wal_owner.truncatePrefix;

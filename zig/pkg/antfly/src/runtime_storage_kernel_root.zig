@@ -213,6 +213,7 @@ comptime {
     exportInternal(&storage_kernel_exports.storageWalOpen, "antfly_storage_wal_open");
     exportInternal(&storage_kernel_exports.storageWalClose, "antfly_storage_wal_close");
     exportInternal(&storage_kernel_exports.storageWalAppend, "antfly_storage_wal_append");
+    exportInternal(&storage_kernel_exports.storageWalAdmitAppendBytes, "antfly_storage_wal_admit_append_bytes");
     exportInternal(&storage_kernel_exports.storageWalAppendIdempotent, "antfly_storage_wal_append_idempotent");
     exportInternal(&storage_kernel_exports.storageWalSync, "antfly_storage_wal_sync");
     exportInternal(&storage_kernel_exports.storageWalTruncatePrefix, "antfly_storage_wal_truncate_prefix");

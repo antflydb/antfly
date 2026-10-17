@@ -8907,7 +8907,15 @@ pub const DB = struct {
             try self.enforceReplicationWriteGate();
             if (metadata_control) try self.preflightReplicationMetadataSyncCommit() else try self.preflightReplicationBatchSyncCommit();
             if (other_mirror != null and !mirrored) return error.ReplicationPublisherUnavailable;
-            if (mirrored) try prepared.preparePayload();
+            if (mirrored) {
+                try prepared.preparePayload();
+                if (metadata_control) try selected_mirror.?.publisher.admitRecord(selected_mirror.?, .{
+                    .kind = .metadata_control,
+                    .codec = .binary,
+                    .payload_bytes = prepared.payload.?.bytes.len,
+                    .namespace = prepared.namespace(),
+                });
+            }
         }
         var outcome: @TypeOf(prepared.*).ApplyOutcome = undefined;
         {
