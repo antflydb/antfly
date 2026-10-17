@@ -10665,3 +10665,72 @@ Authenticated Raft execution, enrolled-root signing, the complete source/claims/
 install/cancel/standby lifecycle and original-case fault qualification remain
 unfinished. Two inactive diagnostic binaries (about 600 MiB) were removed for
 headroom; they are rebuildable, and their test logs and all source/user data remain.
+
+### Metadata-derived Raft signing and local scope (not activation)
+
+The private owner-permission request can select the receiving server's own
+node/store registration. This is a lookup key, not an authority bit. In the same
+permission snapshot, metadata derives a fixed-size Raft signing view from the
+current live store header, explicit root enrollment, serving replica placement,
+exact range namespace, reader capabilities and targeted group/runtime reports.
+The runtime must declare Raft source authority for that namespace. Missing or
+stale facts produce no signer; durable read/decode failures are not converted to
+absence. The view records the actual replica ID and root generation, not a
+fabricated native binding or caller-selected root. It is not a leader lease or
+proof that a new lifecycle protocol is supported by every group member.
+
+Native permission rejects a Raft-reporter selector. Decoded decisions reject
+unsolicited views, foreign node/store selections and mixed authority. Phase
+signing requires the immutable metadata/job binding, the physical owner's
+validated observation and original retained fence/reservation receipt, exact
+group/namespace/node/store/reporter/replica/root-generation agreement and the
+actual local leader term and completed prefix. A later-term recovery signs the
+original cut; it never substitutes the current term/index. Root-key mismatch,
+missing cuts, tampered evidence, stale terms and lagging completed prefixes fail
+closed. Signing failure alone is not evidence that a committed effect aborted.
+
+The DataServer scope reader obtains leadership from its real Raft host and
+the durable replica identity from that host's exact replica-catalog point read.
+Raft status identifies the physical voting node, not the durable replica ID;
+those identities must not be conflated. The scope retains the catalog revision
+for subsequent proposal revalidation; the revision itself is not a lease.
+It reuses frozen-read capture's shared-completion check under
+the nonblocking owner mutex. It does not infer completion from a raw projection
+or native mutation watermark, and does not generate a new reporter incarnation
+during recovery. Rooted owner observations now retain their requested identity,
+so an absent job cannot lose group/namespace context. The integration test uses
+a real campaign/no-op apply/step-down and a real compiled LSM owner: physical
+node two is distinct from durable replica five, and a completed no-op still leaves
+the native mutation receipt absent. Scope reads reject mutex contention,
+cancellation/deadlines and missing reporter identity before unsafe acquisition.
+Missing and foreign replica-catalog records fail closed, and replacing a catalog
+record changes the captured revision. The fixture explicitly publishes a root
+generation through the storage-generation mechanism; an untracked zero
+generation must fail recovery checks before leadership is consulted.
+
+The metadata-store gate exercises enrollment and current placement/report faults;
+component signing tests use supplied logical cuts and deterministic keys and are
+not consensus qualification. The host test does not claim network/multi-replica
+fault coverage. The initial publication gate passes 72 contracts plus its decoder
+floor companion, 60/60 steps, zero skips/failures/leaks in
+`/private/tmp/antfly-sql-raft-signer-authority-debug.log`. Final combined Debug
+validation passes 79 tests and 129/129 steps with zero skips/failures/leaks in
+`/private/tmp/antfly-sql-raft-signer-published-scope-final-debug.log`: the 72
+publication contracts, mandatory decoder-floor companion, three real-host/
+compiled-boundary runtime tests and three source-owner adapter contracts.
+Formatting, license headers, Apache source boundary (2068 files), control-source
+catalog and immutable original-inventory checks pass. Cache GC was previewed
+only; no cross-worktree cache deletion was performed.
+
+The receiver/proposer is not mounted: exact-term proposal CAS, the all-member
+full-lifecycle barrier, source/claims/install/cancel/standby execution and
+distributed original-case qualification remain unfinished. Re-attestation of
+retained Raft receipts after reporter/root replacement also remains unfinished;
+the native-only recovery grant is not reused for Raft. Public Raft admission
+and generic index-control proposal guards remain closed; no standalone reporter
+namespace/enrollment activation is enabled. No original cases are newly credited:
+531 implemented / 132 rejected / 113 superseded / 810 unresolved. The metadata
+view uses bounded point reads; no throughput improvement is claimed. Inactive
+failed-fixture binaries and seven superseded test executable/object pairs
+(about 5.8 GiB total) were removed for headroom. They are rebuildable; source,
+logs, current successful validation artifacts and user data remain.

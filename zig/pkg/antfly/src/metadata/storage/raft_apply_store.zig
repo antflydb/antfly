@@ -6008,7 +6008,7 @@ pub const OwnerAckTestFixture = if (@import("builtin").is_test) struct {
                 try store.applyStandaloneCommand(group, .{ .begin_relational_index_publication = begin });
                 var prepared = try plan.prepare(a);
                 defer prepared.deinit();
-                const owner_request: index_publication.OwnerRequest = .{ .table_id = plan.before.table_id, .group_id = owners[0].range.group_id, .id = plan.id, .operation = .fence, .projection = .admission };
+                const owner_request: index_publication.OwnerRequest = .{ .table_id = plan.before.table_id, .group_id = owners[0].range.group_id, .id = plan.id, .operation = .fence, .projection = .admission, .raft_reporter = if (authority == .raft) .{ .node_id = 2, .store_id = 3 } else null };
                 {
                     const work = @import("../relational_index_work.zig");
                     const discovered = try store.relationalIndexWorkJson(a, group, .{ .discover = 0 });
@@ -6047,6 +6047,8 @@ pub const OwnerAckTestFixture = if (@import("builtin").is_test) struct {
                     try std.testing.expect(decision.value.dispatch != null and decision.value.inputs != null);
                     // Registration alone cannot authorize signing.
                     try std.testing.expect(decision.value.native_signing == null);
+                    try std.testing.expect(decision.value.raft_signing == null);
+                    if (authority == .raft) try std.testing.expectError(error.IndexOwnerReceiptChanged, decision.value.raftSigningView(owner_request));
                     var candidate = try decision.value.inputs.?.prepareCandidate(a, decision.value.head);
                     defer candidate.deinit();
                     try std.testing.expectEqualSlices(u8, prepared.candidate.next.value, candidate.next.value);
@@ -6095,7 +6097,25 @@ pub const OwnerAckTestFixture = if (@import("builtin").is_test) struct {
                         try std.testing.expectEqualDeep(identity, view.identity);
                         try std.testing.expectEqual(@as(u64, 4), view.reporter_incarnation);
                         try std.testing.expectEqualSlices(u8, &try native_binding.digest(), &view.binding_digest);
-                    } else try std.testing.expect(decision.value.native_signing == null);
+                    } else {
+                        try std.testing.expect(decision.value.native_signing == null);
+                        const view = try decision.value.raftSigningView(owner_request);
+                        try std.testing.expectEqualDeep(identity, view.identity);
+                        try std.testing.expectEqualDeep(owners[0].namespace, view.namespace);
+                        try std.testing.expectEqual(owners[0].range.group_id, view.group_id);
+                        try std.testing.expectEqual(@as(u64, 4), view.reporter_incarnation);
+                        try std.testing.expectEqual(@as(u64, 5), view.replica_id);
+                        try std.testing.expectEqual(@as(u64, 6), view.root_generation);
+                        try std.testing.expectEqual(@as(u64, 2), view.reported_term);
+                        try std.testing.expectEqual(@as(u64, 10), view.reported_applied_index);
+                        var foreign_reporter = owner_request;
+                        foreign_reporter.raft_reporter.?.node_id += 1;
+                        const foreign_reply = try store.relationalIndexOwnerDecisionJson(a, group, foreign_reporter);
+                        defer a.free(foreign_reply);
+                        var foreign_decision = try std.json.parseFromSlice(index_publication.OwnerDecision, a, foreign_reply, .{});
+                        defer foreign_decision.deinit();
+                        try std.testing.expectError(error.IndexOwnerReceiptChanged, foreign_decision.value.raftSigningView(foreign_reporter));
+                    }
                 }
                 if (authority == .native) {
                     var foreign_binding_ack = ack;
@@ -6178,6 +6198,17 @@ pub const OwnerAckTestFixture = if (@import("builtin").is_test) struct {
                     const placement_bytes = try encodePlacementIntent(a, changed_placement);
                     defer a.free(placement_bytes);
                     try txn.put(try placementKeyForGroup(&buf, group, owners[0].range.group_id, 2), placement_bytes);
+                    if (authority == .raft) {
+                        const view = try store.raftIndexSigningViewTxn(&txn, group, incarnation, prepared.owners[0].owner, .{ .node_id = 2, .store_id = 3 }, prepared.head.reader_requirements);
+                        switch (fault) {
+                            .root_identity, .reader_role, .reader_unknown, .reader_semantic, .reader_encoding, .placement_store, .placement_state, .source_mode, .source_namespace, .source_unknown, .range_namespace => try std.testing.expect(view == null),
+                            .reporter => try std.testing.expectEqual(changed.reporter_incarnation, view.?.reporter_incarnation),
+                            .root_generation => try std.testing.expectEqual(changed_runtime[0].lsm_root_generation, view.?.root_generation),
+                            .placement_replica => try std.testing.expectEqual(changed_placement.record.replica_id, view.?.replica_id),
+                            .observed_position => try std.testing.expectEqual(@as(u64, 0), view.?.reported_applied_index),
+                            else => try std.testing.expect(view != null),
+                        }
+                    }
                     if (fault == .active_job or fault == .lifecycle) {
                         try std.testing.expectError(error.GenerationPublicationChanged, store.prepareRelationalIndexOwnerAckTxn(&txn, group, bytes));
                     } else if ((fault == .observed_position or fault == .placement_replica or fault == .placement_store or fault == .placement_state) and authority == .native) {
@@ -18925,6 +18956,53 @@ pub const RaftApplyStore = struct {
         return view;
     }
 
+    /// One reporter's enrolled root and serving placement from the same
+    /// permission snapshot. Request IDs select records, never grant authority.
+    /// A missing/stale report returns no signer; corrupt durable reads propagate.
+    fn raftIndexSigningViewTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group_id: u64, incarnation: metadata_incarnation.MetadataClusterIncarnation, owner: index_progress.Owner, reporter: index_publication.RaftReporter, requirements: ?@import("antfly_local_sources").common_schema_readers.ReaderRequirements) !?index_publication.RaftSigningView {
+        try reporter.validate();
+        try owner.validate();
+        if (owner.authority != .raft) return error.InvalidGenerationPublication;
+        const current = (try self.loadStoreHeaderTxn(txn, group_id, reporter.store_id)) orelse return null;
+        defer metadata_table_manager.freeStore(self.alloc, current);
+        if (current.store_id != reporter.store_id or current.node_id != reporter.node_id or !current.live or
+            current.reporter_incarnation == 0 or current.replica_root_incarnation == 0 or
+            std.mem.allEqual(u8, &current.replica_root_public_key, 0) or !metadata_table_manager.storeServesTableData(current.role)) return null;
+        if (requirements) |required| if (!current.schema_reader.supports(required)) return null;
+        const identity: store_root_enrollment.Identity = .{ .metadata_incarnation = incarnation, .node_id = current.node_id, .store_id = current.store_id, .root_incarnation = current.replica_root_incarnation, .public_key = current.replica_root_public_key };
+        self.requireStoreRootEnrollmentTxn(txn, group_id, identity) catch |err| switch (err) {
+            error.StoreRootEnrollmentChanged => return null,
+            else => return err,
+        };
+        var buf: [256]u8 = undefined;
+        const range_bytes = (try stagingGet(txn, try rangeKeyForGroup(&buf, group_id, owner.group_id))) orelse return null;
+        const range = try decodeRangeRecord(self.alloc, range_bytes);
+        defer metadata_table_manager.freeRange(self.alloc, range);
+        if (range.group_id != owner.group_id or range.table_id != owner.namespace.table_id or
+            metadata_table_manager.rangeDocIdentityShardId(range) != owner.namespace.shard_id or
+            metadata_table_manager.rangeDocIdentityRangeId(range) != owner.namespace.range_id) return null;
+        const placement = (try self.loadPlacementIntentTxn(txn, try placementKeyForGroup(&buf, group_id, owner.group_id, reporter.node_id))) orelse return null;
+        defer raft_reconciler.freeIntentOwned(self.alloc, placement);
+        if (placement.store_id != current.store_id or placement.record.group_id != owner.group_id or
+            placement.record.local_node_id != current.node_id or placement.record.replica_id == 0 or placement.serving_state != .serving) return null;
+        var arena = std.heap.ArenaAllocator.init(self.alloc);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const address = try ReportAddress.active(a, txn, group_id, current.store_id);
+        const report = (try readStoreGroupReportTxn(a, txn, group_id, address, owner.group_id, true)) orelse return null;
+        if (report.runtime_statuses.len != 1 or report.group_statuses.len != 1) return null;
+        const runtime = report.runtime_statuses[0];
+        const status = report.group_statuses[0];
+        if (runtime.group_id != owner.group_id or runtime.table_id != owner.namespace.table_id or
+            runtime.store_id != current.store_id or runtime.node_id != current.node_id or runtime.lsm_root_generation == 0 or
+            status.group_id != owner.group_id or status.raft_term == 0) return null;
+        const source = runtime.source_authority orelse return null;
+        if (source.kind != .raft or source.sequence != 0 or !std.mem.eql(u8, &source.namespace, &@import("antfly_local_sources").storage_db_online_source_contract.namespaceBytes(owner.namespace))) return null;
+        const view: index_publication.RaftSigningView = .{ .identity = identity, .reporter_incarnation = current.reporter_incarnation, .group_id = owner.group_id, .namespace = owner.namespace, .replica_id = placement.record.replica_id, .root_generation = runtime.lsm_root_generation, .reported_term = status.raft_term, .reported_applied_index = status.raft_applied_index };
+        try view.validate(incarnation, owner);
+        return view;
+    }
+
     pub fn relationalIndexWorkJson(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, request: @import("../relational_index_work.zig").Query) ![]u8 {
         try request.validate();
         var txn = try self.store.beginReadTxn();
@@ -18952,6 +19030,7 @@ pub const RaftApplyStore = struct {
         };
         const owner = try index_progress.OwnerState.decode(try txn.get(try index_publication.ownerKey(&buf, group_id, request.table_id, ordinal)));
         if (owner.owner.group_id != request.group_id or owner.owner.ordinal != ordinal) return error.InvalidCatalogRecord;
+        if (request.raft_reporter != null and owner.owner.authority != .raft) return error.InvalidGenerationPublication;
         const permission = try index_publication.ownerPermission(head, owner, request.operation);
         try index_publication.requireActivePointer(&txn, group_id, head);
         const incarnation = (try decodeMetadataIncarnationRecord(try txn.get(try metadataIncarnationKeyForGroup(&buf, group_id)))).incarnation;
@@ -19010,6 +19089,7 @@ pub const RaftApplyStore = struct {
         }
         decision.dispatch = d;
         if (owner.owner.authority == .native) decision.native_signing = try self.nativeIndexSigningViewTxn(&txn, group_id, incarnation);
+        if (request.raft_reporter) |reporter| decision.raft_signing = try self.raftIndexSigningViewTxn(&txn, group_id, incarnation, owner.owner, reporter, head.reader_requirements);
         if (owner.owner.authority == .native and request.operation == .validate)
             decision.target_expectation = try index_delivery.targetExpectation(alloc, &txn, group_id, head, owner, incarnation);
         if (owner.owner.authority == .native and request.operation == .install) {

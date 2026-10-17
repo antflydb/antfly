@@ -3637,6 +3637,7 @@ pub const ProvisionedKernelOwnerSource = struct {
     }
 
     pub const RootedRaftIndexOwnerObservation = struct {
+        identity: raft_index_control.Identity,
         root_generation: u64,
         observation: raft_index_control.Observation,
     };
@@ -3650,7 +3651,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         const normalized = try platformDeadlineContext(context);
         var cancellation = normalized.cancellation;
         const result = try lease.owner().raftIndexOwnerObservation(alloc, table_name, identity, .{ .execution_deadline_ns = normalized.deadline_ns, .cancellation_ctx = &cancellation, .cancellation_fn = cancellationTokenRequested });
-        return .{ .root_generation = lease.entry.generation, .observation = result };
+        return .{ .identity = identity, .root_generation = lease.entry.generation, .observation = result };
     }
 
     pub const RootedRaftIndexOwnerPreparation = struct {

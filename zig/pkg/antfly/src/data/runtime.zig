@@ -10298,6 +10298,12 @@ pub const DataServer = struct {
         // caller's frozen apply lock. Failure releases the capture immediately.
         if (!self.data_raft_mutex.tryLock()) return error.ReadUnavailable;
         defer self.data_raft_mutex.unlock();
+        return self.captureFrozenReadProofLocked(group_id);
+    }
+
+    /// Caller holds data_raft_mutex. Both frozen reads and private index
+    /// receipts use the shared completed boundary, never a raw/native marker.
+    fn captureFrozenReadProofLocked(self: *DataServer, group_id: u64) !antfly.raft.ReadSafetyBarrier.FrozenProof {
         const raft = self.data_raft orelse return error.NotLeader;
         const apply_sm = self.data_raft_apply orelse return error.NotLeader;
         if (!raft.host.http_host.host.isLocalLeader(group_id)) return error.NotLeader;
@@ -11639,6 +11645,35 @@ pub const DataServer = struct {
         // must not turn that progress into an apparent failed mutation.
         if (result.needsSigning()) self.signNativeIndexOwnerResult(alloc, &result);
         return result;
+    }
+
+    /// Bind a leased owner observation to actual local Raft leadership and the
+    /// shared completed prefix. This reads no caller-supplied term/replica and
+    /// never creates a new reporter identity during receipt recovery. Proposal
+    /// must still CAS this exact term; this snapshot is not a leadership lease.
+    fn raftIndexLocalScope(self: *DataServer, group_id: u64, rooted: antfly.public_api.ProvisionedKernelOwnerSource.RootedRaftIndexOwnerObservation, context: antfly.public_api.operation.RequestContext) !@import("../metadata/relational_index_publication.zig").RaftLocalScope {
+        try context.ensureActive();
+        try rooted.identity.validate();
+        if (group_id == 0 or rooted.identity.owner_group_id != group_id) return error.PrivateIndexOwnerJobChanged;
+        if (rooted.root_generation == 0) return error.PrivateIndexRootRecoveryRequired;
+        try rooted.observation.validate(rooted.identity);
+        const registration = self.store_registration orelse return error.IndexOwnerReceiptChanged;
+        lockAtomic(&self.reporter_incarnation_mutex);
+        const reporter = self.reporter_incarnation;
+        self.reporter_incarnation_mutex.unlock();
+        if (reporter == 0) return error.IndexOwnerReceiptChanged;
+        if (!self.data_raft_mutex.tryLock()) return error.ReadUnavailable;
+        defer self.data_raft_mutex.unlock();
+        const proof = try self.captureFrozenReadProofLocked(group_id);
+        const host = self.data_raft.?.host.http_host.host;
+        const status = host.raftStatus(group_id) orelse return error.UnknownGroup;
+        if (host.cfg.local_node_id != registration.node_id or status.id != registration.node_id) return error.IndexOwnerReceiptChanged;
+        var point = (try host.readReplicaCatalogRecord(self.alloc, group_id)) orelse return error.ReplicaCatalogUnavailable;
+        defer point.deinit(self.alloc);
+        const record = point.record orelse return error.ReplicaCatalogUnavailable;
+        if (record.group_id != group_id or record.local_node_id != registration.node_id or record.replica_id == 0 or point.token.revision == 0) return error.IndexOwnerReceiptChanged;
+        try context.ensureActive();
+        return .{ .group_id = group_id, .namespace = rooted.identity.namespace, .reporter = .{ .node_id = registration.node_id, .store_id = registration.store_id }, .reporter_incarnation = reporter, .replica_id = record.replica_id, .replica_catalog_revision = point.token.revision, .root_generation = rooted.root_generation, .leader_term = proof.term, .completed_index = proof.applied_index };
     }
 
     fn signNativeIndexOwnerResult(self: *DataServer, alloc: std.mem.Allocator, result: anytype) void {
@@ -42177,6 +42212,107 @@ fn consumerTests() type {
             try std.testing.expectEqual(@as(u16, 12), DataServer.requiredRaftBatchProtocolVersion(.{
                 .restore_staging = .{ .finish = .{ .scope = @splat(4), .phase = .validated } },
             }));
+        }
+
+        test "raft index owner scope binds actual leadership and leased roots" {
+            const a = std.testing.allocator;
+            const group: u64 = 301;
+            var directory = try @import("antfly_local_sources").common_test_directory.TestDirectory.init("raft-index-local-scope");
+            defer directory.cleanup();
+            const Catalog = struct {
+                fn snapshot(_: *anyopaque) !antfly.metadata_api.AdminSnapshot {
+                    return .{ .status = .{ .metadata_group_id = 1, .metrics = .{} }, .tables = @constCast(&[_]antfly.metadata.table_manager.TableRecord{.{ .table_id = 101, .name = "items", .schema_json = "{\"version\":1,\"storage_mode\":\"relational\",\"default_type\":\"row\",\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"integer\"}},\"additionalProperties\":false}}}}" }}), .ranges = @constCast(&[_]antfly.metadata.table_manager.RangeRecord{.{ .table_id = 101, .group_id = group, .range_id = group, .start_key = "", .end_key = null }}), .stores = &.{}, .placement_intents = &.{}, .split_transitions = &.{}, .merge_transitions = &.{} };
+                }
+                fn free(_: *anyopaque, _: *antfly.metadata_api.AdminSnapshot) void {}
+                fn source() antfly.public_api.table_catalog.CatalogSource {
+                    return .{ .ptr = undefined, .vtable = &.{ .admin_snapshot = snapshot, .free_admin_snapshot = free, .routing_snapshot = antfly.public_api.table_catalog.TestAdminRoutingAdapter(snapshot, free).routingSnapshot, .linearizable_routing_snapshot = antfly.public_api.table_catalog.TestAdminRoutingAdapter(snapshot, free).linearizableSnapshot, .free_routing_snapshot = antfly.public_api.table_catalog.TestAdminRoutingAdapter(snapshot, free).freeRoutingSnapshot } };
+                }
+            };
+            var apply_sm = try RaftTableApplyStateMachine.init(a, directory.path(), Catalog.source(), null);
+            var published_storage = antfly.public_api.ProvisionedGroupStorage.init(a);
+            defer published_storage.deinit();
+            // This scope requires an explicitly published physical root, not
+            // the zero generation used for an untracked current directory.
+            try published_storage.bumpGroupVisibleRootGenerations(&.{group});
+            _ = apply_sm.write_source.withGroupVisibleRootGeneration(published_storage.groupVisibleRootGenerationSource());
+            var linked_owner = antfly.public_api.table_writes.LinkedTestOwner.init(&apply_sm.write_source) catch |err| {
+                apply_sm.deinit();
+                return err;
+            };
+            defer linked_owner.deinitOwner();
+            defer apply_sm.deinit();
+            apply_sm.attachKernelOwnerSource(linked_owner.owner);
+            const rooted = try linked_owner.owner.raftIndexOwnerObservationAtRoot(a, group, "items", .{ .id = @splat(1), .plan_digest = @splat(2), .owner_digest = @splat(3), .ordinal = 0, .namespace = .{ .table_id = 101, .shard_id = group, .range_id = group }, .owner_group_id = group }, .{});
+            var storage = raft_engine.core.MemoryStorage.init(a);
+            defer storage.deinit();
+            var factory = DataDescriptorFactory.init(a, &storage);
+            defer factory.deinit();
+            var replica_catalog = antfly.raft.catalog.MemoryReplicaCatalog.init(a);
+            defer replica_catalog.deinit();
+            // The HTTP shell is not exercised: its initialized host is the
+            // real Raft engine, with actual campaign/apply/step-down events.
+            var service: antfly.raft.ManagedHttpHostService = undefined;
+            service.host.owned_wal_replica_provider = null;
+            service.host.owned_file_replica_provider = null;
+            var actual_host = antfly.raft.host.Host.init(a, .{ .local_node_id = 2 }, .{ .io = std.testing.io, .descriptor_factory = factory.iface(), .replica_catalog = replica_catalog.catalog(), .runtime_hooks = .{ .state_machine = apply_sm.stateMachine() } });
+            var http_shell: antfly.raft.host.HttpHost = undefined;
+            http_shell.host = &actual_host;
+            service.host.http_host = &http_shell;
+            const host = &actual_host;
+            defer host.deinit();
+            // Production's descriptor uses physical node two for Raft voting;
+            // receipt authority must still name durable replica five.
+            const admitted: antfly.raft.catalog.ReplicaRecord = .{ .group_id = group, .replica_id = 5, .local_node_id = 2 };
+            _ = try host.ensureReplica(admitted);
+            var server: DataServer = undefined;
+            server.alloc = a;
+            server.store_registration = .{ .node_id = 2, .store_id = 3 };
+            server.reporter_incarnation_mutex = .unlocked;
+            server.reporter_incarnation = 4;
+            server.data_raft_mutex = .unlocked;
+            server.data_raft = &service;
+            server.data_raft_apply = &apply_sm;
+            try std.testing.expectError(error.NotLeader, server.raftIndexLocalScope(group, rooted, .{}));
+            try host.runtime_host.campaignGroup(group);
+            for (0..8) |_| _ = try host.runtime_host.processReady(group);
+            const actual = try server.raftIndexLocalScope(group, rooted, .{});
+            try std.testing.expectEqual(group, actual.group_id);
+            try std.testing.expectEqualDeep(rooted.identity.namespace, actual.namespace);
+            try std.testing.expectEqual(@as(u64, 2), actual.reporter.node_id);
+            try std.testing.expectEqual(@as(u64, 5), actual.replica_id);
+            try std.testing.expectEqual(@as(u64, 2), host.raftStatus(group).?.id);
+            try std.testing.expect(actual.replica_catalog_revision != 0);
+            try std.testing.expectEqual(rooted.root_generation, actual.root_generation);
+            try std.testing.expectEqual(host.raftStatus(group).?.hard.current_term, actual.leader_term);
+            try std.testing.expectEqual(@as(u64, 1), actual.completed_index);
+            try std.testing.expect(rooted.observation.applied == null);
+            var foreign = rooted;
+            foreign.root_generation = 0;
+            try std.testing.expectError(error.PrivateIndexRootRecoveryRequired, server.raftIndexLocalScope(group, foreign, .{}));
+            try std.testing.expectError(error.PrivateIndexOwnerJobChanged, server.raftIndexLocalScope(group + 1, rooted, .{}));
+            server.reporter_incarnation = 0;
+            try std.testing.expectError(error.IndexOwnerReceiptChanged, server.raftIndexLocalScope(group, rooted, .{}));
+            try std.testing.expectEqual(@as(u64, 0), server.reporter_incarnation);
+            server.reporter_incarnation = 4;
+            try std.testing.expect(try replica_catalog.catalog().removeReplica(group));
+            try std.testing.expectError(error.ReplicaCatalogUnavailable, server.raftIndexLocalScope(group, rooted, .{}));
+            try replica_catalog.catalog().upsertReplica(admitted);
+            const restored_scope = try server.raftIndexLocalScope(group, rooted, .{});
+            try std.testing.expect(restored_scope.replica_catalog_revision > actual.replica_catalog_revision);
+            var foreign_record = admitted;
+            foreign_record.local_node_id += 1;
+            try replica_catalog.catalog().upsertReplica(foreign_record);
+            try std.testing.expectError(error.IndexOwnerReceiptChanged, server.raftIndexLocalScope(group, rooted, .{}));
+            try replica_catalog.catalog().upsertReplica(admitted);
+            try std.testing.expect(server.data_raft_mutex.tryLock());
+            try std.testing.expectError(error.ReadUnavailable, server.raftIndexLocalScope(group, rooted, .{}));
+            server.data_raft_mutex.unlock();
+            var signal = std.atomic.Value(bool).init(true);
+            var uninitialized: DataServer = undefined;
+            try std.testing.expectError(error.Canceled, uninitialized.raftIndexLocalScope(group, rooted, .{ .cancellation = .fromAtomic(&signal) }));
+            try std.testing.expectError(error.DeadlineExceeded, uninitialized.raftIndexLocalScope(group, rooted, .{ .deadline_ns = 0 }));
+            try host.runtime_host.step(group, .{ .msg_type = .heartbeat, .from = 99, .to = 2, .term = actual.leader_term + 1, .commit_index = actual.completed_index });
+            try std.testing.expectError(error.NotLeader, server.raftIndexLocalScope(group, rooted, .{}));
         }
 
         test "raft index owner observation crosses the compiled storage boundary" {

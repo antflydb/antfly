@@ -640,6 +640,9 @@ pub const OwnerRequest = struct {
     /// At most the destinations touched by one bounded source batch. The
     /// metadata service derives their routes; callers never supply descriptors.
     claim_groups: ?ClaimGroups = null,
+    /// Trusted receiver selects its own registration. This is only a lookup
+    /// key; metadata derives and verifies replica/root authority independently.
+    raft_reporter: ?RaftReporter = null,
 
     pub fn validate(self: OwnerRequest) !void {
         if (self.table_id == 0 or self.group_id == 0 or std.mem.allEqual(u8, &self.id, 0) or
@@ -649,6 +652,16 @@ pub const OwnerRequest = struct {
             if (self.operation != .build or self.projection != .permission) return error.InvalidGenerationPublication;
             try groups.validate();
         }
+        if (self.raft_reporter) |reporter| try reporter.validate();
+    }
+};
+
+pub const RaftReporter = struct {
+    node_id: u64,
+    store_id: u64,
+
+    pub fn validate(self: RaftReporter) !void {
+        if (self.node_id == 0 or self.store_id == 0) return error.InvalidGenerationPublication;
     }
 };
 
@@ -720,6 +733,52 @@ pub const NativeSigningView = struct {
             .root_incarnation = self.identity.root_incarnation,
         };
         if (!std.mem.eql(u8, &try binding.digest(), &self.binding_digest)) return error.InvalidCatalogRecord;
+    }
+};
+
+/// Fixed-size enrolled reporter/placement facts from the permission read.
+/// Neither this view nor a status report is a current Raft leader lease.
+/// The receiver separately pins its actual leader term and physical owner root.
+pub const RaftLocalScope = struct {
+    group_id: u64,
+    namespace: local.storage_db_doc_identity.Namespace,
+    reporter: RaftReporter,
+    reporter_incarnation: u64,
+    replica_id: u64,
+    replica_catalog_revision: u64,
+    root_generation: u64,
+    leader_term: u64,
+    completed_index: u64,
+};
+
+pub const RaftSigningView = struct {
+    identity: @import("store_root_enrollment.zig").Identity,
+    reporter_incarnation: u64,
+    group_id: u64,
+    namespace: local.storage_db_doc_identity.Namespace,
+    replica_id: u64,
+    root_generation: u64,
+    reported_term: u64,
+    reported_applied_index: u64,
+
+    pub fn validate(self: RaftSigningView, incarnation: local.metadata_incarnation.MetadataClusterIncarnation, owner: progress.Owner) !void {
+        try owner.validate();
+        self.identity.validate() catch return error.InvalidCatalogRecord;
+        if (owner.authority != .raft or self.group_id != owner.group_id or !self.namespace.eql(owner.namespace) or
+            self.reporter_incarnation == 0 or self.replica_id == 0 or self.root_generation == 0 or self.reported_term == 0 or
+            !std.mem.eql(u8, &self.identity.metadata_incarnation, &incarnation)) return error.InvalidCatalogRecord;
+    }
+
+    /// These are trusted local-host/leased-owner facts, never RPC fields.
+    /// Matching a report does not pin leadership: proposal must still CAS the
+    /// exact local term and cross the durable all-member capability barrier.
+    pub fn requireLocal(self: RaftSigningView, actual: RaftLocalScope) !void {
+        try actual.reporter.validate();
+        if (actual.group_id != self.group_id or !actual.namespace.eql(self.namespace) or
+            actual.reporter.node_id != self.identity.node_id or actual.reporter.store_id != self.identity.store_id or
+            actual.reporter_incarnation != self.reporter_incarnation or actual.replica_id != self.replica_id or actual.replica_catalog_revision == 0 or
+            actual.root_generation != self.root_generation or actual.leader_term < self.reported_term or
+            actual.completed_index < self.reported_applied_index) return error.IndexOwnerReceiptChanged;
     }
 };
 
@@ -928,6 +987,7 @@ pub const OwnerDecision = struct {
     dispatch: ?Dispatch = null,
     inputs: ?Inputs = null,
     native_signing: ?NativeSigningView = null,
+    raft_signing: ?RaftSigningView = null,
     claim_routes: ?ClaimRoutes = null,
     target_expectation: ?local.storage_db_relational_index_owner_job.private_claims.TargetExpectation = null,
     native_install: ?NativeInstallGrant = null,
@@ -987,6 +1047,14 @@ pub const OwnerDecision = struct {
             if (self.disposition != .execute or self.owner.owner.authority != .native) return error.InvalidCatalogRecord;
             try view.validate(self.metadata_incarnation);
         }
+        if (request.raft_reporter) |reporter| {
+            if (self.owner.owner.authority != .raft) return error.InvalidGenerationPublication;
+            if (self.raft_signing) |view| {
+                if (self.disposition != .execute) return error.InvalidCatalogRecord;
+                try view.validate(self.metadata_incarnation, self.owner.owner);
+                if (view.identity.node_id != reporter.node_id or view.identity.store_id != reporter.store_id) return error.InvalidCatalogRecord;
+            }
+        } else if (self.raft_signing != null) return error.InvalidCatalogRecord;
         if (self.attestation) |grant| {
             if (self.disposition != .acknowledged or self.owner.owner.authority != .native or
                 self.dispatch != null or self.inputs != null or self.native_signing != null or grant.table_name.len == 0)
@@ -1017,6 +1085,37 @@ pub const OwnerDecision = struct {
 
     pub fn raftExecutionIdentity(self: OwnerDecision, request: OwnerRequest) !raft_control.Identity {
         return self.executionIdentity(request, .raft);
+    }
+
+    /// The request's reporter is selected by the receiving server's local
+    /// registration, not an RPC body. Missing enrollment/membership/reporting
+    /// facts cannot fall back to a native binding or unsigned execution.
+    pub fn raftSigningView(self: OwnerDecision, request: OwnerRequest) !RaftSigningView {
+        _ = try self.raftExecutionIdentity(request);
+        _ = request.raft_reporter orelse return error.InvalidGenerationPublication;
+        return self.raft_signing orelse return error.IndexOwnerReceiptChanged;
+    }
+
+    /// Sign only a phase cut read from the leased physical owner's validated
+    /// observation. The receiver obtains both decision and observation itself;
+    /// neither is accepted from a remote mutation body. A signing error is not
+    /// evidence that an already committed effect aborted.
+    pub fn signRaftControl(self: OwnerDecision, request: OwnerRequest, observed: raft_control.Observation, actual: RaftLocalScope, root: local.storage_db_root_signing_identity.State) !Ack {
+        const view = try self.raftSigningView(request);
+        const identity = try self.raftExecutionIdentity(request);
+        try observed.validate(identity);
+        const binding = observed.binding orelse return error.PrivateIndexRootRecoveryRequired;
+        _ = try self.raftControl(request, binding);
+        const receipt = (switch (request.operation) {
+            .fence => observed.fenced,
+            .reserve => observed.reserved,
+            else => return error.InvalidGenerationPublication,
+        }) orelse return error.PrivateIndexRootRecoveryRequired;
+        try view.requireLocal(actual);
+        if (receipt.position.raft.term > actual.leader_term or receipt.position.raft.index > actual.completed_index) return error.IndexOwnerReceiptChanged;
+        const ack: Ack = .{ .table_id = request.table_id, .expected_revision = self.head.revision, .signed = .{ .receipt = receipt, .proof = try (RootProof{ .identity = view.identity, .reporter_incarnation = actual.reporter_incarnation, .authority = .{ .raft = actual.replica_id }, .root_generation = actual.root_generation, .signature = undefined }).sign(root, try receipt.digest()) } };
+        try ack.validate();
+        return ack;
     }
 
     fn executionIdentity(self: OwnerDecision, request: OwnerRequest, authority: progress.Authority) !raft_control.Identity {
@@ -2542,6 +2641,65 @@ test "relational index publication Raft decisions bind immutable admission and e
     try std.testing.expectEqual(.fenced, fence.effect);
     try std.testing.expectEqualDeep(binding, fence.binding);
     try std.testing.expect(fence.inputs_b64 == null);
+    // Synthetic metadata/local observations qualify signing scope checks, not
+    // commit authenticity. Real retained cuts and metadata enrollment are
+    // independently exercised by the physical-owner and metadata-store gates.
+    const seed: [32]u8 = @splat(9);
+    const pair = try std.crypto.sign.Ed25519.KeyPair.generateDeterministic(seed);
+    const root: local.storage_db_root_signing_identity.State = .{ .seed = seed, .root_incarnation = 7, .public_key = pair.public_key.toBytes() };
+    var sign_request = request;
+    sign_request.raft_reporter = .{ .node_id = 2, .store_id = 3 };
+    var signing = decision;
+    signing.raft_signing = .{ .identity = .{ .metadata_incarnation = decision.metadata_incarnation, .node_id = 2, .store_id = 3, .root_incarnation = root.root_incarnation, .public_key = root.public_key }, .reporter_incarnation = 4, .group_id = request.group_id, .namespace = identity.namespace, .replica_id = 5, .root_generation = 6, .reported_term = 7, .reported_applied_index = 2 };
+    const actual: RaftLocalScope = .{ .group_id = request.group_id, .namespace = identity.namespace, .reporter = sign_request.raft_reporter.?, .reporter_incarnation = 4, .replica_id = 5, .replica_catalog_revision = 1, .root_generation = 6, .leader_term = 7, .completed_index = 2 };
+    const cut: local.storage_db_receipt_position.Position = .{ .raft = .{ .term = 7, .index = 2 } };
+    const observation: raft_control.Observation = .{ .format_version = 1, .binding = binding, .applied = cut, .fenced = .{ .owner = decision.owner.owner, .action = .fenced, .position = cut, .candidate_digest = decision.head.candidate_digest, .reservation_digest = decision.head.reservation_digest, .evidence_digest = try raft_control.effectEvidence(binding, .fenced, cut) } };
+    const signed = try signing.signRaftControl(sign_request, observation, actual, root);
+    try signed.signed.verifySignature();
+    try std.testing.expectEqual(decision.head.revision, signed.expected_revision);
+    try std.testing.expectEqual(@as(u64, 5), signed.signed.proof.authority.raft);
+    try std.testing.expectEqualDeep(cut, signed.signed.receipt.position);
+    inline for (.{ "reporter_incarnation", "replica_id", "root_generation" }) |field| {
+        var foreign = actual;
+        @field(foreign, field) += 1;
+        try std.testing.expectError(error.IndexOwnerReceiptChanged, signing.signRaftControl(sign_request, observation, foreign, root));
+    }
+    var foreign = actual;
+    foreign.replica_catalog_revision = 0;
+    try std.testing.expectError(error.IndexOwnerReceiptChanged, signing.signRaftControl(sign_request, observation, foreign, root));
+    foreign = actual;
+    foreign.group_id += 1;
+    try std.testing.expectError(error.IndexOwnerReceiptChanged, signing.signRaftControl(sign_request, observation, foreign, root));
+    foreign = actual;
+    foreign.namespace.range_id += 1;
+    try std.testing.expectError(error.IndexOwnerReceiptChanged, signing.signRaftControl(sign_request, observation, foreign, root));
+    foreign = actual;
+    foreign.reporter.node_id += 1;
+    try std.testing.expectError(error.IndexOwnerReceiptChanged, signing.signRaftControl(sign_request, observation, foreign, root));
+    foreign = actual;
+    foreign.reporter.store_id += 1;
+    try std.testing.expectError(error.IndexOwnerReceiptChanged, signing.signRaftControl(sign_request, observation, foreign, root));
+    foreign = actual;
+    foreign.leader_term -= 1;
+    try std.testing.expectError(error.IndexOwnerReceiptChanged, signing.signRaftControl(sign_request, observation, foreign, root));
+    foreign = actual;
+    foreign.completed_index -= 1;
+    try std.testing.expectError(error.IndexOwnerReceiptChanged, signing.signRaftControl(sign_request, observation, foreign, root));
+    foreign = actual;
+    foreign.leader_term += 1;
+    foreign.completed_index += 10;
+    const later = try signing.signRaftControl(sign_request, observation, foreign, root);
+    try std.testing.expectEqualDeep(cut, later.signed.receipt.position);
+    var wrong_root = root;
+    wrong_root.root_incarnation += 1;
+    try std.testing.expectError(error.InvalidGenerationPublication, signing.signRaftControl(sign_request, observation, actual, wrong_root));
+    var incomplete = observation;
+    incomplete.fenced = null;
+    try std.testing.expectError(error.PrivateIndexRootRecoveryRequired, signing.signRaftControl(sign_request, incomplete, actual, root));
+    incomplete = observation;
+    incomplete.fenced.?.evidence_digest[0] ^= 1;
+    try std.testing.expectError(error.InvalidControlReceiptPosition, signing.signRaftControl(sign_request, incomplete, actual, root));
+    try std.testing.expectError(error.InvalidCatalogRecord, signing.raftSigningView(request));
     inline for (.{ "id", "plan_digest", "owner_digest", "integrity_reserved", "integrity_candidate", "schema_before", "inputs_digest" }) |field| {
         var changed = binding;
         @field(changed, field)[0] ^= 1;

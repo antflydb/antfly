@@ -200,6 +200,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "raft batch protocol preflight fingerprint fences every applying replica set",
         "raft index owner controls require their decoder but cannot bypass metadata admission",
         "raft index owner observation crosses the compiled storage boundary",
+        "raft index owner scope binds actual leadership and leased roots",
         "raft batch protocol plan resolves only current group applying peers",
         "raft batch protocol cache reuses only short lived negative evidence",
         "raft batch protocol activation is reusable only in its accepted leader term",
