@@ -514,6 +514,10 @@
 // _ZZ48termite_gliner_boundary_attention_tc_f16_compactE9run_start has been demoted
 // _ZZ48termite_gliner_boundary_attention_tc_f16_compactE9run_count has been demoted
 // _ZZ48termite_gliner_boundary_attention_tc_f16_compactE10run_bucket has been demoted
+// _ZZ43termite_embedding_gemma2_norm_residual_bf16E8warp_sum has been demoted
+// _ZZ43termite_embedding_gemma2_norm_residual_bf16E3inv has been demoted
+// _ZZ39termite_embedding_gemma2_scale_rms_bf16E8warp_sum has been demoted
+// _ZZ39termite_embedding_gemma2_scale_rms_bf16E3inv has been demoted
 // _ZZ38termite_linear_bias_f32_tile_rows_colsILj2ELj4ELj0EEvPfPKfS2_S2_S2_jjjE7partial has been demoted
 // _ZZ38termite_linear_bias_f32_tile_rows_colsILj2ELj4ELj1EEvPfPKfS2_S2_S2_jjjE7partial has been demoted
 // _ZZ38termite_linear_bias_f32_tile_rows_colsILj2ELj4ELj2EEvPfPKfS2_S2_S2_jjjE7partial has been demoted
@@ -371836,5 +371840,816 @@ $L__BB426_5:
 	setp.neu.f32 	%p21, %f119, %f1;
 	selp.f32 	%f172, 0f7FFFFFFF, %f118, %p21;
 	bra.uni 	$L__BB426_10;
+
+}
+	// .globl	termite_embedding_gemma2_native_vision_bf16
+.visible .entry termite_embedding_gemma2_native_vision_bf16(
+	.param .u64 termite_embedding_gemma2_native_vision_bf16_param_0,
+	.param .u64 termite_embedding_gemma2_native_vision_bf16_param_1,
+	.param .u64 termite_embedding_gemma2_native_vision_bf16_param_2,
+	.param .u64 termite_embedding_gemma2_native_vision_bf16_param_3,
+	.param .u32 termite_embedding_gemma2_native_vision_bf16_param_4,
+	.param .u32 termite_embedding_gemma2_native_vision_bf16_param_5,
+	.param .u32 termite_embedding_gemma2_native_vision_bf16_param_6,
+	.param .u32 termite_embedding_gemma2_native_vision_bf16_param_7
+)
+.maxntid 256, 1, 1
+{
+
+
+
+	ret;
+
+}
+	// .globl	termite_embedding_gemma2_norm_residual_bf16
+.visible .entry termite_embedding_gemma2_norm_residual_bf16(
+	.param .u64 termite_embedding_gemma2_norm_residual_bf16_param_0,
+	.param .u64 termite_embedding_gemma2_norm_residual_bf16_param_1,
+	.param .u64 termite_embedding_gemma2_norm_residual_bf16_param_2,
+	.param .u64 termite_embedding_gemma2_norm_residual_bf16_param_3,
+	.param .u64 termite_embedding_gemma2_norm_residual_bf16_param_4,
+	.param .u64 termite_embedding_gemma2_norm_residual_bf16_param_5,
+	.param .u32 termite_embedding_gemma2_norm_residual_bf16_param_6,
+	.param .u32 termite_embedding_gemma2_norm_residual_bf16_param_7,
+	.param .f32 termite_embedding_gemma2_norm_residual_bf16_param_8
+)
+{
+	.reg .pred 	%p<77>;
+	.reg .b16 	%rs<51>;
+	.reg .f32 	%f<97>;
+	.reg .b32 	%r<134>;
+	.reg .b64 	%rd<46>;
+	// demoted variable
+	.shared .align 4 .b8 _ZZ43termite_embedding_gemma2_norm_residual_bf16E8warp_sum[32];
+	// demoted variable
+	.shared .align 4 .f32 _ZZ43termite_embedding_gemma2_norm_residual_bf16E3inv;
+
+	ld.param.u64 	%rd16, [termite_embedding_gemma2_norm_residual_bf16_param_0];
+	ld.param.u64 	%rd13, [termite_embedding_gemma2_norm_residual_bf16_param_1];
+	ld.param.u64 	%rd17, [termite_embedding_gemma2_norm_residual_bf16_param_2];
+	ld.param.u64 	%rd18, [termite_embedding_gemma2_norm_residual_bf16_param_3];
+	ld.param.u64 	%rd14, [termite_embedding_gemma2_norm_residual_bf16_param_4];
+	ld.param.u64 	%rd15, [termite_embedding_gemma2_norm_residual_bf16_param_5];
+	ld.param.u32 	%r27, [termite_embedding_gemma2_norm_residual_bf16_param_6];
+	ld.param.u32 	%r26, [termite_embedding_gemma2_norm_residual_bf16_param_7];
+	ld.param.f32 	%f17, [termite_embedding_gemma2_norm_residual_bf16_param_8];
+	cvta.to.global.u64 	%rd1, %rd18;
+	cvta.to.global.u64 	%rd2, %rd17;
+	cvta.to.global.u64 	%rd3, %rd16;
+	mov.u32 	%r1, %ctaid.x;
+	setp.ge.u32 	%p1, %r1, %r27;
+	@%p1 bra 	$L__BB428_49;
+
+	mul.wide.u32 	%rd4, %r26, %r1;
+	mov.u32 	%r133, %tid.x;
+	setp.ge.u32 	%p2, %r133, %r26;
+	mov.f32 	%f92, 0f00000000;
+	@%p2 bra 	$L__BB428_4;
+
+	mov.f32 	%f92, 0f00000000;
+	mov.u32 	%r3, %ntid.x;
+	mov.u32 	%r129, %r133;
+
+$L__BB428_3:
+	cvt.u64.u32 	%rd19, %r129;
+	add.s64 	%rd20, %rd4, %rd19;
+	shl.b64 	%rd21, %rd20, 1;
+	add.s64 	%rd22, %rd2, %rd21;
+	ld.global.u16 	%rs19, [%rd22];
+	// begin inline asm
+	{ mov.b32 %f20, {0,%rs19};}
+
+	// end inline asm
+	fma.rn.f32 	%f92, %f20, %f20, %f92;
+	add.s32 	%r129, %r129, %r3;
+	setp.lt.u32 	%p3, %r129, %r26;
+	@%p3 bra 	$L__BB428_3;
+
+$L__BB428_4:
+	mov.b32 	%r28, %f92;
+	mov.u32 	%r29, 2;
+	mov.u32 	%r30, 31;
+	mov.u32 	%r31, 16;
+	mov.u32 	%r32, -1;
+	shfl.sync.down.b32 	%r33|%p4, %r28, %r31, %r30, %r32;
+	mov.b32 	%f21, %r33;
+	add.f32 	%f22, %f92, %f21;
+	mov.b32 	%r34, %f22;
+	mov.u32 	%r35, 8;
+	shfl.sync.down.b32 	%r36|%p5, %r34, %r35, %r30, %r32;
+	mov.b32 	%f23, %r36;
+	add.f32 	%f24, %f22, %f23;
+	mov.b32 	%r37, %f24;
+	mov.u32 	%r38, 4;
+	shfl.sync.down.b32 	%r39|%p6, %r37, %r38, %r30, %r32;
+	mov.b32 	%f25, %r39;
+	add.f32 	%f26, %f24, %f25;
+	mov.b32 	%r40, %f26;
+	shfl.sync.down.b32 	%r41|%p7, %r40, %r29, %r30, %r32;
+	mov.b32 	%f27, %r41;
+	add.f32 	%f28, %f26, %f27;
+	mov.b32 	%r42, %f28;
+	mov.u32 	%r43, 1;
+	shfl.sync.down.b32 	%r44|%p8, %r42, %r43, %r30, %r32;
+	mov.b32 	%f29, %r44;
+	add.f32 	%f4, %f28, %f29;
+	and.b32  	%r6, %r133, 31;
+	setp.ne.s32 	%p9, %r6, 0;
+	shr.u32 	%r45, %r133, 3;
+	and.b32  	%r46, %r45, 536870908;
+	mov.u32 	%r47, _ZZ43termite_embedding_gemma2_norm_residual_bf16E8warp_sum;
+	add.s32 	%r7, %r47, %r46;
+	@%p9 bra 	$L__BB428_6;
+
+	st.shared.f32 	[%r7], %f4;
+
+$L__BB428_6:
+	bar.sync 	0;
+	shl.b32 	%r48, %r133, 2;
+	add.s32 	%r8, %r47, %r48;
+	setp.gt.u32 	%p10, %r133, 31;
+	@%p10 bra 	$L__BB428_11;
+
+	mov.u32 	%r50, %ntid.x;
+	shr.u32 	%r51, %r50, 5;
+	setp.ge.u32 	%p11, %r133, %r51;
+	mov.f32 	%f93, 0f00000000;
+	@%p11 bra 	$L__BB428_9;
+
+	ld.shared.f32 	%f93, [%r8];
+
+$L__BB428_9:
+	mov.b32 	%r52, %f93;
+	mov.u32 	%r53, 2;
+	mov.u32 	%r54, 31;
+	mov.u32 	%r55, 16;
+	mov.u32 	%r56, -1;
+	shfl.sync.down.b32 	%r57|%p12, %r52, %r55, %r54, %r56;
+	mov.b32 	%f31, %r57;
+	add.f32 	%f32, %f93, %f31;
+	mov.b32 	%r58, %f32;
+	mov.u32 	%r59, 8;
+	shfl.sync.down.b32 	%r60|%p13, %r58, %r59, %r54, %r56;
+	mov.b32 	%f33, %r60;
+	add.f32 	%f34, %f32, %f33;
+	mov.b32 	%r61, %f34;
+	mov.u32 	%r62, 4;
+	shfl.sync.down.b32 	%r63|%p14, %r61, %r62, %r54, %r56;
+	mov.b32 	%f35, %r63;
+	add.f32 	%f36, %f34, %f35;
+	mov.b32 	%r64, %f36;
+	shfl.sync.down.b32 	%r65|%p15, %r64, %r53, %r54, %r56;
+	mov.b32 	%f37, %r65;
+	add.f32 	%f38, %f36, %f37;
+	mov.b32 	%r66, %f38;
+	mov.u32 	%r67, 1;
+	shfl.sync.down.b32 	%r68|%p16, %r66, %r67, %r54, %r56;
+	mov.b32 	%f39, %r68;
+	add.f32 	%f7, %f38, %f39;
+	setp.ne.s32 	%p17, %r133, 0;
+	@%p17 bra 	$L__BB428_11;
+
+	cvt.rn.f32.u32 	%f40, %r26;
+	div.rn.f32 	%f41, %f7, %f40;
+	add.f32 	%f42, %f41, %f17;
+	rsqrt.approx.f32 	%f43, %f42;
+	st.shared.f32 	[_ZZ43termite_embedding_gemma2_norm_residual_bf16E3inv], %f43;
+
+$L__BB428_11:
+	bar.sync 	0;
+	@%p2 bra 	$L__BB428_32;
+
+	ld.shared.f32 	%f8, [_ZZ43termite_embedding_gemma2_norm_residual_bf16E3inv];
+	mov.u32 	%r9, %ntid.x;
+	setp.eq.s64 	%p19, %rd15, 0;
+	@%p19 bra 	$L__BB428_24;
+
+	cvta.to.global.u64 	%rd5, %rd15;
+	mov.u32 	%r130, %r133;
+
+$L__BB428_14:
+	cvt.u64.u32 	%rd23, %r130;
+	add.s64 	%rd6, %rd4, %rd23;
+	shl.b64 	%rd24, %rd6, 1;
+	add.s64 	%rd25, %rd2, %rd24;
+	ld.global.u16 	%rs20, [%rd25];
+	// begin inline asm
+	{ mov.b32 %f44, {0,%rs20};}
+
+	// end inline asm
+	mul.f32 	%f46, %f44, %f8;
+	mul.wide.u32 	%rd26, %r130, 2;
+	add.s64 	%rd27, %rd1, %rd26;
+	ld.global.u16 	%rs21, [%rd27];
+	// begin inline asm
+	{ mov.b32 %f45, {0,%rs21};}
+
+	// end inline asm
+	mul.f32 	%f47, %f46, %f45;
+	mov.b32 	%r69, %f47;
+	and.b32  	%r70, %r69, 2147483647;
+	setp.gt.u32 	%p20, %r70, 2139095040;
+	shl.b32 	%r71, %r69, 16;
+	shr.u32 	%r72, %r69, 16;
+	cvt.u16.u32 	%rs22, %r72;
+	selp.b32 	%r11, 0, %r71, %p20;
+	selp.b16 	%rs45, 32767, %rs22, %p20;
+	setp.gt.u32 	%p21, %r11, -2147483648;
+	@%p21 bra 	$L__BB428_16;
+
+	setp.ne.s32 	%p22, %r11, -2147483648;
+	and.b16  	%rs23, %rs45, 1;
+	setp.eq.b16 	%p23, %rs23, 1;
+	not.pred 	%p24, %p23;
+	or.pred  	%p25, %p22, %p24;
+	@%p25 bra 	$L__BB428_17;
+
+$L__BB428_16:
+	add.s16 	%rs45, %rs45, 1;
+
+$L__BB428_17:
+	add.s64 	%rd7, %rd3, %rd24;
+	ld.global.u16 	%rs24, [%rd7];
+	// begin inline asm
+	{ mov.b32 %f48, {0,%rs24};}
+
+	// end inline asm
+	// begin inline asm
+	{ mov.b32 %f49, {0,%rs45};}
+
+	// end inline asm
+	add.f32 	%f50, %f48, %f49;
+	mov.b32 	%r73, %f50;
+	and.b32  	%r74, %r73, 2147483647;
+	setp.gt.u32 	%p26, %r74, 2139095040;
+	shl.b32 	%r75, %r73, 16;
+	shr.u32 	%r76, %r73, 16;
+	cvt.u16.u32 	%rs26, %r76;
+	selp.b32 	%r12, 0, %r75, %p26;
+	selp.b16 	%rs46, 32767, %rs26, %p26;
+	setp.gt.u32 	%p27, %r12, -2147483648;
+	@%p27 bra 	$L__BB428_19;
+
+	setp.ne.s32 	%p28, %r12, -2147483648;
+	and.b16  	%rs27, %rs46, 1;
+	setp.eq.b16 	%p29, %rs27, 1;
+	not.pred 	%p30, %p29;
+	or.pred  	%p31, %p28, %p30;
+	@%p31 bra 	$L__BB428_20;
+
+$L__BB428_19:
+	add.s16 	%rs46, %rs46, 1;
+
+$L__BB428_20:
+	// begin inline asm
+	{ mov.b32 %f51, {0,%rs46};}
+
+	// end inline asm
+	ld.global.u16 	%rs29, [%rd5];
+	// begin inline asm
+	{ mov.b32 %f52, {0,%rs29};}
+
+	// end inline asm
+	mul.f32 	%f53, %f51, %f52;
+	mov.b32 	%r77, %f53;
+	and.b32  	%r78, %r77, 2147483647;
+	setp.gt.u32 	%p32, %r78, 2139095040;
+	shl.b32 	%r79, %r77, 16;
+	shr.u32 	%r80, %r77, 16;
+	cvt.u16.u32 	%rs30, %r80;
+	selp.b32 	%r13, 0, %r79, %p32;
+	selp.b16 	%rs47, 32767, %rs30, %p32;
+	setp.gt.u32 	%p33, %r13, -2147483648;
+	@%p33 bra 	$L__BB428_22;
+
+	setp.ne.s32 	%p34, %r13, -2147483648;
+	and.b16  	%rs31, %rs47, 1;
+	setp.eq.b16 	%p35, %rs31, 1;
+	not.pred 	%p36, %p35;
+	or.pred  	%p37, %p34, %p36;
+	@%p37 bra 	$L__BB428_23;
+
+$L__BB428_22:
+	add.s16 	%rs47, %rs47, 1;
+
+$L__BB428_23:
+	st.global.u16 	[%rd7], %rs47;
+	add.s32 	%r130, %r130, %r9;
+	setp.lt.u32 	%p38, %r130, %r26;
+	@%p38 bra 	$L__BB428_14;
+	bra.uni 	$L__BB428_32;
+
+$L__BB428_24:
+	mov.u32 	%r131, %r133;
+
+$L__BB428_25:
+	cvt.u64.u32 	%rd29, %r131;
+	add.s64 	%rd8, %rd4, %rd29;
+	shl.b64 	%rd30, %rd8, 1;
+	add.s64 	%rd31, %rd2, %rd30;
+	ld.global.u16 	%rs32, [%rd31];
+	// begin inline asm
+	{ mov.b32 %f54, {0,%rs32};}
+
+	// end inline asm
+	mul.f32 	%f56, %f54, %f8;
+	mul.wide.u32 	%rd32, %r131, 2;
+	add.s64 	%rd33, %rd1, %rd32;
+	ld.global.u16 	%rs33, [%rd33];
+	// begin inline asm
+	{ mov.b32 %f55, {0,%rs33};}
+
+	// end inline asm
+	mul.f32 	%f57, %f56, %f55;
+	mov.b32 	%r81, %f57;
+	and.b32  	%r82, %r81, 2147483647;
+	setp.gt.u32 	%p39, %r82, 2139095040;
+	shl.b32 	%r83, %r81, 16;
+	shr.u32 	%r84, %r81, 16;
+	cvt.u16.u32 	%rs34, %r84;
+	selp.b32 	%r16, 0, %r83, %p39;
+	selp.b16 	%rs48, 32767, %rs34, %p39;
+	setp.gt.u32 	%p40, %r16, -2147483648;
+	@%p40 bra 	$L__BB428_27;
+
+	setp.ne.s32 	%p41, %r16, -2147483648;
+	and.b16  	%rs35, %rs48, 1;
+	setp.eq.b16 	%p42, %rs35, 1;
+	not.pred 	%p43, %p42;
+	or.pred  	%p44, %p41, %p43;
+	@%p44 bra 	$L__BB428_28;
+
+$L__BB428_27:
+	add.s16 	%rs48, %rs48, 1;
+
+$L__BB428_28:
+	add.s64 	%rd9, %rd3, %rd30;
+	ld.global.u16 	%rs36, [%rd9];
+	// begin inline asm
+	{ mov.b32 %f58, {0,%rs36};}
+
+	// end inline asm
+	// begin inline asm
+	{ mov.b32 %f59, {0,%rs48};}
+
+	// end inline asm
+	add.f32 	%f60, %f58, %f59;
+	mov.b32 	%r85, %f60;
+	and.b32  	%r86, %r85, 2147483647;
+	setp.gt.u32 	%p45, %r86, 2139095040;
+	shl.b32 	%r87, %r85, 16;
+	shr.u32 	%r88, %r85, 16;
+	cvt.u16.u32 	%rs38, %r88;
+	selp.b32 	%r17, 0, %r87, %p45;
+	selp.b16 	%rs49, 32767, %rs38, %p45;
+	setp.gt.u32 	%p46, %r17, -2147483648;
+	@%p46 bra 	$L__BB428_30;
+
+	setp.ne.s32 	%p47, %r17, -2147483648;
+	and.b16  	%rs39, %rs49, 1;
+	setp.eq.b16 	%p48, %rs39, 1;
+	not.pred 	%p49, %p48;
+	or.pred  	%p50, %p47, %p49;
+	@%p50 bra 	$L__BB428_31;
+
+$L__BB428_30:
+	add.s16 	%rs49, %rs49, 1;
+
+$L__BB428_31:
+	st.global.u16 	[%rd9], %rs49;
+	add.s32 	%r131, %r131, %r9;
+	setp.lt.u32 	%p51, %r131, %r26;
+	@%p51 bra 	$L__BB428_25;
+
+$L__BB428_32:
+	setp.eq.s64 	%p52, %rd14, 0;
+	@%p52 bra 	$L__BB428_49;
+
+	bar.sync 	0;
+	mov.f32 	%f95, 0f00000000;
+	@%p2 bra 	$L__BB428_36;
+
+	mov.f32 	%f95, 0f00000000;
+	mov.u32 	%r19, %ntid.x;
+	mov.u32 	%r132, %r133;
+
+$L__BB428_35:
+	cvt.u64.u32 	%rd35, %r132;
+	add.s64 	%rd36, %rd4, %rd35;
+	shl.b64 	%rd37, %rd36, 1;
+	add.s64 	%rd38, %rd3, %rd37;
+	ld.global.u16 	%rs40, [%rd38];
+	// begin inline asm
+	{ mov.b32 %f63, {0,%rs40};}
+
+	// end inline asm
+	fma.rn.f32 	%f95, %f63, %f63, %f95;
+	add.s32 	%r132, %r132, %r19;
+	setp.lt.u32 	%p54, %r132, %r26;
+	@%p54 bra 	$L__BB428_35;
+
+$L__BB428_36:
+	mov.b32 	%r89, %f95;
+	mov.u32 	%r90, 2;
+	mov.u32 	%r91, 31;
+	mov.u32 	%r92, 16;
+	mov.u32 	%r93, -1;
+	shfl.sync.down.b32 	%r94|%p55, %r89, %r92, %r91, %r93;
+	mov.b32 	%f64, %r94;
+	add.f32 	%f65, %f95, %f64;
+	mov.b32 	%r95, %f65;
+	mov.u32 	%r96, 8;
+	shfl.sync.down.b32 	%r97|%p56, %r95, %r96, %r91, %r93;
+	mov.b32 	%f66, %r97;
+	add.f32 	%f67, %f65, %f66;
+	mov.b32 	%r98, %f67;
+	mov.u32 	%r99, 4;
+	shfl.sync.down.b32 	%r100|%p57, %r98, %r99, %r91, %r93;
+	mov.b32 	%f68, %r100;
+	add.f32 	%f69, %f67, %f68;
+	mov.b32 	%r101, %f69;
+	shfl.sync.down.b32 	%r102|%p58, %r101, %r90, %r91, %r93;
+	mov.b32 	%f70, %r102;
+	add.f32 	%f71, %f69, %f70;
+	mov.b32 	%r103, %f71;
+	mov.u32 	%r104, 1;
+	shfl.sync.down.b32 	%r105|%p59, %r103, %r104, %r91, %r93;
+	mov.b32 	%f72, %r105;
+	add.f32 	%f12, %f71, %f72;
+	@%p9 bra 	$L__BB428_38;
+
+	st.shared.f32 	[%r7], %f12;
+
+$L__BB428_38:
+	bar.sync 	0;
+	@%p10 bra 	$L__BB428_43;
+
+	mov.u32 	%r106, %ntid.x;
+	shr.u32 	%r107, %r106, 5;
+	setp.ge.u32 	%p62, %r133, %r107;
+	mov.f32 	%f96, 0f00000000;
+	@%p62 bra 	$L__BB428_41;
+
+	ld.shared.f32 	%f96, [%r8];
+
+$L__BB428_41:
+	mov.b32 	%r108, %f96;
+	mov.u32 	%r109, 2;
+	mov.u32 	%r110, 31;
+	mov.u32 	%r111, 16;
+	mov.u32 	%r112, -1;
+	shfl.sync.down.b32 	%r113|%p63, %r108, %r111, %r110, %r112;
+	mov.b32 	%f74, %r113;
+	add.f32 	%f75, %f96, %f74;
+	mov.b32 	%r114, %f75;
+	mov.u32 	%r115, 8;
+	shfl.sync.down.b32 	%r116|%p64, %r114, %r115, %r110, %r112;
+	mov.b32 	%f76, %r116;
+	add.f32 	%f77, %f75, %f76;
+	mov.b32 	%r117, %f77;
+	mov.u32 	%r118, 4;
+	shfl.sync.down.b32 	%r119|%p65, %r117, %r118, %r110, %r112;
+	mov.b32 	%f78, %r119;
+	add.f32 	%f79, %f77, %f78;
+	mov.b32 	%r120, %f79;
+	shfl.sync.down.b32 	%r121|%p66, %r120, %r109, %r110, %r112;
+	mov.b32 	%f80, %r121;
+	add.f32 	%f81, %f79, %f80;
+	mov.b32 	%r122, %f81;
+	mov.u32 	%r123, 1;
+	shfl.sync.down.b32 	%r124|%p67, %r122, %r123, %r110, %r112;
+	mov.b32 	%f82, %r124;
+	add.f32 	%f15, %f81, %f82;
+	setp.ne.s32 	%p68, %r133, 0;
+	@%p68 bra 	$L__BB428_43;
+
+	cvt.rn.f32.u32 	%f83, %r26;
+	div.rn.f32 	%f84, %f15, %f83;
+	add.f32 	%f85, %f84, %f17;
+	rsqrt.approx.f32 	%f86, %f85;
+	st.shared.f32 	[_ZZ43termite_embedding_gemma2_norm_residual_bf16E3inv], %f86;
+
+$L__BB428_43:
+	bar.sync 	0;
+	@%p2 bra 	$L__BB428_49;
+
+	ld.shared.f32 	%f16, [_ZZ43termite_embedding_gemma2_norm_residual_bf16E3inv];
+	mov.u32 	%r22, %ntid.x;
+	cvta.to.global.u64 	%rd10, %rd13;
+	cvta.to.global.u64 	%rd11, %rd14;
+
+$L__BB428_45:
+	cvt.u64.u32 	%rd39, %r133;
+	add.s64 	%rd12, %rd4, %rd39;
+	shl.b64 	%rd40, %rd12, 1;
+	add.s64 	%rd41, %rd3, %rd40;
+	ld.global.u16 	%rs41, [%rd41];
+	// begin inline asm
+	{ mov.b32 %f87, {0,%rs41};}
+
+	// end inline asm
+	mul.f32 	%f89, %f87, %f16;
+	mul.wide.u32 	%rd42, %r133, 2;
+	add.s64 	%rd43, %rd11, %rd42;
+	ld.global.u16 	%rs42, [%rd43];
+	// begin inline asm
+	{ mov.b32 %f88, {0,%rs42};}
+
+	// end inline asm
+	mul.f32 	%f90, %f89, %f88;
+	mov.b32 	%r125, %f90;
+	and.b32  	%r126, %r125, 2147483647;
+	setp.gt.u32 	%p70, %r126, 2139095040;
+	shl.b32 	%r127, %r125, 16;
+	shr.u32 	%r128, %r125, 16;
+	cvt.u16.u32 	%rs43, %r128;
+	selp.b32 	%r24, 0, %r127, %p70;
+	selp.b16 	%rs50, 32767, %rs43, %p70;
+	setp.gt.u32 	%p71, %r24, -2147483648;
+	@%p71 bra 	$L__BB428_47;
+
+	setp.ne.s32 	%p72, %r24, -2147483648;
+	and.b16  	%rs44, %rs50, 1;
+	setp.eq.b16 	%p73, %rs44, 1;
+	not.pred 	%p74, %p73;
+	or.pred  	%p75, %p72, %p74;
+	@%p75 bra 	$L__BB428_48;
+
+$L__BB428_47:
+	add.s16 	%rs50, %rs50, 1;
+
+$L__BB428_48:
+	add.s64 	%rd45, %rd10, %rd40;
+	st.global.u16 	[%rd45], %rs50;
+	add.s32 	%r133, %r133, %r22;
+	setp.lt.u32 	%p76, %r133, %r26;
+	@%p76 bra 	$L__BB428_45;
+
+$L__BB428_49:
+	ret;
+
+}
+	// .globl	termite_embedding_gemma2_scale_rms_bf16
+.visible .entry termite_embedding_gemma2_scale_rms_bf16(
+	.param .u64 termite_embedding_gemma2_scale_rms_bf16_param_0,
+	.param .u64 termite_embedding_gemma2_scale_rms_bf16_param_1,
+	.param .u64 termite_embedding_gemma2_scale_rms_bf16_param_2,
+	.param .u32 termite_embedding_gemma2_scale_rms_bf16_param_3,
+	.param .u32 termite_embedding_gemma2_scale_rms_bf16_param_4,
+	.param .f32 termite_embedding_gemma2_scale_rms_bf16_param_5,
+	.param .f32 termite_embedding_gemma2_scale_rms_bf16_param_6
+)
+{
+	.reg .pred 	%p<38>;
+	.reg .b16 	%rs<24>;
+	.reg .f32 	%f<48>;
+	.reg .b32 	%r<73>;
+	.reg .b64 	%rd<20>;
+	// demoted variable
+	.shared .align 4 .b8 _ZZ39termite_embedding_gemma2_scale_rms_bf16E8warp_sum[32];
+	// demoted variable
+	.shared .align 4 .f32 _ZZ39termite_embedding_gemma2_scale_rms_bf16E3inv;
+
+	ld.param.u64 	%rd7, [termite_embedding_gemma2_scale_rms_bf16_param_0];
+	ld.param.u64 	%rd9, [termite_embedding_gemma2_scale_rms_bf16_param_1];
+	ld.param.u64 	%rd8, [termite_embedding_gemma2_scale_rms_bf16_param_2];
+	ld.param.u32 	%r13, [termite_embedding_gemma2_scale_rms_bf16_param_3];
+	ld.param.u32 	%r12, [termite_embedding_gemma2_scale_rms_bf16_param_4];
+	ld.param.f32 	%f9, [termite_embedding_gemma2_scale_rms_bf16_param_5];
+	ld.param.f32 	%f10, [termite_embedding_gemma2_scale_rms_bf16_param_6];
+	cvta.to.global.u64 	%rd1, %rd9;
+	mov.u32 	%r1, %ctaid.x;
+	setp.ge.u32 	%p1, %r1, %r13;
+	@%p1 bra 	$L__BB429_23;
+
+	mul.wide.u32 	%rd2, %r12, %r1;
+	mov.u32 	%r72, %tid.x;
+	setp.ge.u32 	%p2, %r72, %r12;
+	mov.f32 	%f46, 0f00000000;
+	@%p2 bra 	$L__BB429_7;
+
+	mov.f32 	%f46, 0f00000000;
+	mov.u32 	%r3, %ntid.x;
+	mov.u32 	%r71, %r72;
+
+$L__BB429_3:
+	cvt.u64.u32 	%rd10, %r71;
+	add.s64 	%rd11, %rd2, %rd10;
+	shl.b64 	%rd12, %rd11, 1;
+	add.s64 	%rd13, %rd1, %rd12;
+	ld.global.u16 	%rs10, [%rd13];
+	// begin inline asm
+	{ mov.b32 %f13, {0,%rs10};}
+
+	// end inline asm
+	mul.f32 	%f14, %f13, %f9;
+	mov.b32 	%r14, %f14;
+	and.b32  	%r15, %r14, 2147483647;
+	setp.gt.u32 	%p3, %r15, 2139095040;
+	shl.b32 	%r16, %r14, 16;
+	shr.u32 	%r17, %r14, 16;
+	cvt.u16.u32 	%rs11, %r17;
+	selp.b32 	%r5, 0, %r16, %p3;
+	selp.b16 	%rs21, 32767, %rs11, %p3;
+	setp.gt.u32 	%p4, %r5, -2147483648;
+	@%p4 bra 	$L__BB429_5;
+
+	setp.ne.s32 	%p5, %r5, -2147483648;
+	and.b16  	%rs12, %rs21, 1;
+	setp.eq.b16 	%p6, %rs12, 1;
+	not.pred 	%p7, %p6;
+	or.pred  	%p8, %p5, %p7;
+	@%p8 bra 	$L__BB429_6;
+
+$L__BB429_5:
+	add.s16 	%rs21, %rs21, 1;
+
+$L__BB429_6:
+	// begin inline asm
+	{ mov.b32 %f15, {0,%rs21};}
+
+	// end inline asm
+	fma.rn.f32 	%f46, %f15, %f15, %f46;
+	add.s32 	%r71, %r71, %r3;
+	setp.lt.u32 	%p9, %r71, %r12;
+	@%p9 bra 	$L__BB429_3;
+
+$L__BB429_7:
+	mov.b32 	%r18, %f46;
+	mov.u32 	%r19, 2;
+	mov.u32 	%r20, 31;
+	mov.u32 	%r21, 16;
+	mov.u32 	%r22, -1;
+	shfl.sync.down.b32 	%r23|%p10, %r18, %r21, %r20, %r22;
+	mov.b32 	%f16, %r23;
+	add.f32 	%f17, %f46, %f16;
+	mov.b32 	%r24, %f17;
+	mov.u32 	%r25, 8;
+	shfl.sync.down.b32 	%r26|%p11, %r24, %r25, %r20, %r22;
+	mov.b32 	%f18, %r26;
+	add.f32 	%f19, %f17, %f18;
+	mov.b32 	%r27, %f19;
+	mov.u32 	%r28, 4;
+	shfl.sync.down.b32 	%r29|%p12, %r27, %r28, %r20, %r22;
+	mov.b32 	%f20, %r29;
+	add.f32 	%f21, %f19, %f20;
+	mov.b32 	%r30, %f21;
+	shfl.sync.down.b32 	%r31|%p13, %r30, %r19, %r20, %r22;
+	mov.b32 	%f22, %r31;
+	add.f32 	%f23, %f21, %f22;
+	mov.b32 	%r32, %f23;
+	mov.u32 	%r33, 1;
+	shfl.sync.down.b32 	%r34|%p14, %r32, %r33, %r20, %r22;
+	mov.b32 	%f24, %r34;
+	add.f32 	%f4, %f23, %f24;
+	and.b32  	%r35, %r72, 31;
+	setp.ne.s32 	%p15, %r35, 0;
+	@%p15 bra 	$L__BB429_9;
+
+	shr.u32 	%r36, %r72, 3;
+	and.b32  	%r37, %r36, 536870908;
+	mov.u32 	%r38, _ZZ39termite_embedding_gemma2_scale_rms_bf16E8warp_sum;
+	add.s32 	%r39, %r38, %r37;
+	st.shared.f32 	[%r39], %f4;
+
+$L__BB429_9:
+	bar.sync 	0;
+	setp.gt.u32 	%p16, %r72, 31;
+	@%p16 bra 	$L__BB429_14;
+
+	mov.u32 	%r40, %ntid.x;
+	shr.u32 	%r41, %r40, 5;
+	setp.ge.u32 	%p17, %r72, %r41;
+	mov.f32 	%f47, 0f00000000;
+	@%p17 bra 	$L__BB429_12;
+
+	shl.b32 	%r42, %r72, 2;
+	mov.u32 	%r43, _ZZ39termite_embedding_gemma2_scale_rms_bf16E8warp_sum;
+	add.s32 	%r44, %r43, %r42;
+	ld.shared.f32 	%f47, [%r44];
+
+$L__BB429_12:
+	mov.b32 	%r45, %f47;
+	mov.u32 	%r46, 2;
+	mov.u32 	%r47, 31;
+	mov.u32 	%r48, 16;
+	mov.u32 	%r49, -1;
+	shfl.sync.down.b32 	%r50|%p18, %r45, %r48, %r47, %r49;
+	mov.b32 	%f26, %r50;
+	add.f32 	%f27, %f47, %f26;
+	mov.b32 	%r51, %f27;
+	mov.u32 	%r52, 8;
+	shfl.sync.down.b32 	%r53|%p19, %r51, %r52, %r47, %r49;
+	mov.b32 	%f28, %r53;
+	add.f32 	%f29, %f27, %f28;
+	mov.b32 	%r54, %f29;
+	mov.u32 	%r55, 4;
+	shfl.sync.down.b32 	%r56|%p20, %r54, %r55, %r47, %r49;
+	mov.b32 	%f30, %r56;
+	add.f32 	%f31, %f29, %f30;
+	mov.b32 	%r57, %f31;
+	shfl.sync.down.b32 	%r58|%p21, %r57, %r46, %r47, %r49;
+	mov.b32 	%f32, %r58;
+	add.f32 	%f33, %f31, %f32;
+	mov.b32 	%r59, %f33;
+	mov.u32 	%r60, 1;
+	shfl.sync.down.b32 	%r61|%p22, %r59, %r60, %r47, %r49;
+	mov.b32 	%f34, %r61;
+	add.f32 	%f7, %f33, %f34;
+	setp.ne.s32 	%p23, %r72, 0;
+	@%p23 bra 	$L__BB429_14;
+
+	cvt.rn.f32.u32 	%f35, %r12;
+	div.rn.f32 	%f36, %f7, %f35;
+	add.f32 	%f37, %f36, %f10;
+	rsqrt.approx.f32 	%f38, %f37;
+	st.shared.f32 	[_ZZ39termite_embedding_gemma2_scale_rms_bf16E3inv], %f38;
+
+$L__BB429_14:
+	bar.sync 	0;
+	@%p2 bra 	$L__BB429_23;
+
+	ld.shared.f32 	%f8, [_ZZ39termite_embedding_gemma2_scale_rms_bf16E3inv];
+	mov.u32 	%r7, %ntid.x;
+	cvta.to.global.u64 	%rd3, %rd8;
+	cvta.to.global.u64 	%rd4, %rd7;
+
+$L__BB429_16:
+	cvt.u64.u32 	%rd5, %r72;
+	add.s64 	%rd6, %rd2, %rd5;
+	shl.b64 	%rd14, %rd6, 1;
+	add.s64 	%rd15, %rd1, %rd14;
+	ld.global.u16 	%rs14, [%rd15];
+	// begin inline asm
+	{ mov.b32 %f39, {0,%rs14};}
+
+	// end inline asm
+	mul.f32 	%f40, %f39, %f9;
+	mov.b32 	%r62, %f40;
+	and.b32  	%r63, %r62, 2147483647;
+	setp.gt.u32 	%p25, %r63, 2139095040;
+	shl.b32 	%r64, %r62, 16;
+	shr.u32 	%r65, %r62, 16;
+	cvt.u16.u32 	%rs15, %r65;
+	selp.b32 	%r9, 0, %r64, %p25;
+	selp.b16 	%rs22, 32767, %rs15, %p25;
+	setp.gt.u32 	%p26, %r9, -2147483648;
+	@%p26 bra 	$L__BB429_18;
+
+	setp.ne.s32 	%p27, %r9, -2147483648;
+	and.b16  	%rs16, %rs22, 1;
+	setp.eq.b16 	%p28, %rs16, 1;
+	not.pred 	%p29, %p28;
+	or.pred  	%p30, %p27, %p29;
+	@%p30 bra 	$L__BB429_19;
+
+$L__BB429_18:
+	add.s16 	%rs22, %rs22, 1;
+
+$L__BB429_19:
+	// begin inline asm
+	{ mov.b32 %f41, {0,%rs22};}
+
+	// end inline asm
+	mul.f32 	%f43, %f41, %f8;
+	shl.b64 	%rd16, %rd5, 1;
+	add.s64 	%rd17, %rd3, %rd16;
+	ld.global.u16 	%rs18, [%rd17];
+	// begin inline asm
+	{ mov.b32 %f42, {0,%rs18};}
+
+	// end inline asm
+	mul.f32 	%f44, %f43, %f42;
+	mov.b32 	%r66, %f44;
+	and.b32  	%r67, %r66, 2147483647;
+	setp.gt.u32 	%p31, %r67, 2139095040;
+	shl.b32 	%r68, %r66, 16;
+	shr.u32 	%r69, %r66, 16;
+	cvt.u16.u32 	%rs19, %r69;
+	selp.b32 	%r10, 0, %r68, %p31;
+	selp.b16 	%rs23, 32767, %rs19, %p31;
+	setp.gt.u32 	%p32, %r10, -2147483648;
+	@%p32 bra 	$L__BB429_21;
+
+	setp.ne.s32 	%p33, %r10, -2147483648;
+	and.b16  	%rs20, %rs23, 1;
+	setp.eq.b16 	%p34, %rs20, 1;
+	not.pred 	%p35, %p34;
+	or.pred  	%p36, %p33, %p35;
+	@%p36 bra 	$L__BB429_22;
+
+$L__BB429_21:
+	add.s16 	%rs23, %rs23, 1;
+
+$L__BB429_22:
+	add.s64 	%rd19, %rd4, %rd14;
+	st.global.u16 	[%rd19], %rs23;
+	cvt.u32.u64 	%r70, %rd5;
+	add.s32 	%r72, %r70, %r7;
+	setp.lt.u32 	%p37, %r72, %r12;
+	@%p37 bra 	$L__BB429_16;
+
+$L__BB429_23:
+	ret;
 
 }

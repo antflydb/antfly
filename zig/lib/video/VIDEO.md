@@ -573,3 +573,9 @@ The `NATIVE_VISION` qualification profile runs batched native online-softmax
 attention without score/probability arenas or cuDNN. Video admission drops the
 completed media peak before the BF16 backbone, using the actual expanded length.
 These changes do not establish NVIDIA speedups without completed-device timings.
+
+The native CUDA vision tower now keeps attention inputs/output in BF16. Rotary
+packing preserves the existing F32 arithmetic and conversion boundary, while the
+native head-64 kernel stores BF16 output directly for projection. This removes
+per-layer whole-tensor F32 bridges without changing the tiled attention reduction.
+The opt-in native-vision identity is versioned for the typed BF16 implementation.

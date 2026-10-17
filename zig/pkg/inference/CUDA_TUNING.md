@@ -1216,8 +1216,9 @@ pending NVIDIA hardware qualification.
 | `PACKED_PROJECTIONS=1` | Pack immutable Q/K/V and gate/up weights once, execute one GEMM per group and split columns without changing BF16 bits. |
 | `GRAPH_REPLAY=1` | Four retained arenas for singleton text inputs through 256 tokens, bucketed in multiples of 64; upload fresh input/masks before replay and read back the compact result afterward. |
 | `IMAGE_BATCH=1` | Existing image cohort opt-in also permits up to four staged video pictures. cuDNN vision plans carry the full batch dimension. |
-| `NATIVE_VISION=1` | Native batched head-64 tensor-core attention with online softmax. Reuses the bundled tiled kernel, avoids score/probability arenas and cuDNN dependency, and takes precedence over cuDNN vision routes for deterministic qualification. |
+| `NATIVE_VISION=1` | Native batched head-64 tensor-core attention with BF16 inputs/output and online softmax. Fused rotary packing feeds attention and projection without whole-tensor F32 bridges. No score/probability arenas or cuDNN dependency. The typed BF16 implementation carries a new native-vision identity version. |
 | `MEDIA_BATCH=1` | Up to four ordered text/image/audio groups share preparation waves and length-bucketed BF16 backbone calls. CUDA Pillow resize, reference audio resampling and manual placeholder ordering remain explicit. |
+| `FUSED_BACKBONE=1` | Fuse post-attention norm/residual/pre-FFN norm, post-FFN norm/residual, PLE scale/norm, and PLE norm/residual/scalar. Explicit BF16 conversions preserve intermediate boundaries; six launches per encoder layer are removed. |
 
 Packed weights retain up to 512 MiB, and each of the four graph arenas has a
 64 MiB ceiling. Every retained allocation holds both physical context accounting
@@ -1267,3 +1268,17 @@ sequence, host metadata and encoder workspace. Prepared cohort execution keeps
 future preparation and projected peers admitted; it does not release their peak
 while a subsequent producer wave may still need it. The final ready wave drops
 completed preparation reservations before acquiring its encoder supplement.
+
+The native BF16 vision kernel retains the existing tiled online-softmax reduction
+and BF16 output rounding. Qualification includes bitwise comparison against the
+previous F32-boundary native kernel for batched and partial-tile inputs.
+`FUSED_BACKBONE` has a distinct identity bit and an observed
+`--require-route fused_backbone` gate. Run the GPU fused-versus-unfused boundary
+test and pinned pretrained vectors/rankings before enabling it in production.
+
+CUDA singleton and cohort audio use the same model sample ceiling, reference
+resampler and expanded-token limit. WAV/FLAC duration headers bound admission
+without decoding PCM; unknown durations retain the full model token envelope.
+Decoded samples, packed features and final encoder phases remain separately
+bounded. A preparation-wave memory decline falls back through the existing
+singleton route instead of imposing a different duration limit.

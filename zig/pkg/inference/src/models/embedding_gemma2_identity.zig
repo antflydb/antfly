@@ -36,6 +36,7 @@ pub fn forCudaPolicy(artifact_identity: [64]u8, policy: @import("../ops/cuda/emb
         hash.update("\x00optimized-v1");
         hash.update(&.{policy.arithmeticBits()});
     }
+    if (policy.native_vision) hash.update("\x00native-vision-bf16-v2");
     hash.update(&.{0});
     hash.update(&artifact_identity);
     return std.fmt.bytesToHex(hash.finalResult(), .lower);
@@ -236,7 +237,7 @@ test "embeddinggemma2 precision identities preserve F32 pins and isolate CUDA re
 
 test "embeddinggemma2 CUDA optimized identities isolate every arithmetic profile" {
     const Policy = @import("../ops/cuda/embedding_gemma2_policy.zig").Policy;
-    const profiles = [_]Policy{ .{}, .{ .extended_flash = true }, .{ .fused_vision = true }, .{ .packed_projections = true }, .{ .graph_replay = true }, .{ .image_batch = true }, .{ .native_vision = true }, .{ .media_batch = true } };
+    const profiles = [_]Policy{ .{}, .{ .extended_flash = true }, .{ .fused_vision = true }, .{ .packed_projections = true }, .{ .graph_replay = true }, .{ .image_batch = true }, .{ .native_vision = true }, .{ .media_batch = true }, .{ .fused_backbone = true } };
     const artifacts = fromDigests(@splat(@splat(7)));
     for (profiles, 0..) |left, i| for (profiles[i + 1 ..]) |right| try std.testing.expect(!std.mem.eql(u8, &forCudaPolicy(artifacts, left), &forCudaPolicy(artifacts, right)));
 }

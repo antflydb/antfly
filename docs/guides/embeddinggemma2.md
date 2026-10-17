@@ -37,7 +37,9 @@ attention. Mean pooling includes every active token: BOS, EOS, task prefixes and
 expanded media tokens. Padding is excluded. The result is L2 normalized. Reduced
 sizes 512, 256 and 128 truncate the 768-vector and then normalize again. The
 8192-token limit includes all expanded media tokens and wrappers; overflow fails
-instead of silently truncating input. Audio is limited to 30 seconds per part.
+instead of silently truncating input. Native CPU/Metal audio parts are limited to 30 seconds. CUDA singleton and
+cohort audio share the model sample ceiling and the expanded 8192-token limit,
+subject to the admitted decode and preparation memory budgets.
 
 Task types are `RETRIEVAL_DOCUMENT` (default), `RETRIEVAL_QUERY`,
 `QUESTION_ANSWERING`, `FACT_VERIFICATION`, `CODE_RETRIEVAL_QUERY`,
@@ -1115,3 +1117,9 @@ cohorts with preparation overlap and batched BF16 backbone execution. Both are
 session-frozen, change `model_identity`, and remain opt-in until NVIDIA vector,
 ranking and performance qualification. The comparison harness can require observed
 execution with `--require-route native_vision` and `--require-route media_batch`.
+
+`ANTFLY_INFERENCE_CUDA_EMBEDDING_GEMMA2_FUSED_BACKBONE=1` enables fused
+normalization/residual/scaling kernels with explicit BF16 rounding boundaries.
+It changes `model_identity` and remains opt-in pending NVIDIA qualification.
+The BF16 native vision implementation also versions its existing opt-in identity;
+reload and qualify models before using the resulting pin.

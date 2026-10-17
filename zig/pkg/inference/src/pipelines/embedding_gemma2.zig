@@ -1322,9 +1322,10 @@ fn cudaGroupRequest(group: Group, options: Options) !@import("../backends/sessio
                 host = @max(host, try std.math.add(usize, 64 * 1024 * 1024, try std.math.mul(usize, pixels, 12)));
                 tower = @max(tower, try projector.embeddingGemma2ImageScratch(info.width, info.height, 2 * 1024 * 1024 * 1024));
             },
-            .audio => {
-                tokens = try std.math.add(usize, tokens, 1024);
-                host = @max(host, 128 * 1024 * 1024);
+            .audio => |bytes| {
+                const audio_tokens = try projector.embeddingGemma2EncodedAudioSequenceBound(bytes);
+                tokens = try std.math.add(usize, tokens, audio_tokens);
+                host = @max(host, 64 * 1024 * 1024 + audio_tokens * 32 * 1024);
                 tower = @max(tower, 512 * 1024 * 1024);
             },
             else => return error.BatchIncompatible,

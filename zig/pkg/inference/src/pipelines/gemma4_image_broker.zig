@@ -81,7 +81,7 @@ pub fn groupShape(group: grouped.Group) !micro.Shape {
         },
         .audio => |bytes| {
             result.bytes = try std.math.add(usize, result.bytes, bytes.len);
-            result.tokens = @min(@as(usize, 8192), result.tokens + 1024);
+            result.tokens = @min(@as(usize, 8192), try std.math.add(usize, result.tokens, try projector.embeddingGemma2EncodedAudioSequenceBound(bytes)));
         },
         .pcm => |pcm| {
             result.bytes = try std.math.add(usize, result.bytes, try std.math.mul(usize, pcm.samples.len, @sizeOf(f32)));

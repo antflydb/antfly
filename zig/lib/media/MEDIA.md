@@ -410,3 +410,16 @@ continues to use live cohort members and original result indexes. The profile is
 part of the embedding identity and defaults off pending NVIDIA qualification.
 Singleton CUDA mixed requests retire preprocessing admission after composition;
 image header geometry determines the initial bounds.
+
+EmbeddingGemma2 Metal audio cohorts encode bounded groups of conformer layers
+with at most one submitted group and one encoding group. The group size is
+limited by a 384-MiB activation envelope inside the existing audio reservation;
+large inputs retain synchronous single-layer execution. Matrix views detach to
+their command frame before rotation. Cancellation drains submitted work before
+layer inputs/weights leave scope, and external frame owners keep submission
+control. Diagnostics and `ANTFLY_EMBEDDINGGEMMA2_DISABLE_PIPELINED_AUDIO=1` retain
+the per-layer wait path for comparison.
+
+CUDA audio preparation derives its sample limit from the same model config for
+singleton and mixed cohorts. Header duration bounds include media wrappers;
+unknown lengths use the full token ceiling without a PCM inspection pass.

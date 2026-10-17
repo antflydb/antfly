@@ -1156,6 +1156,17 @@ fn encodeAudioFeaturesResident(cb: *const ComputeBackend, allocator: std.mem.All
 
 /// Rowwise conformer projections/FFNs run once over all clips. Only temporal
 /// attention and convolution split at clip boundaries; padding cannot leak.
+const AudioFramePlan = struct { layers: usize = 1, in_flight: usize = 1 };
+fn audioFramePlan(rows: usize, hidden: usize, intermediate: usize) AudioFramePlan {
+    if (rows == 0 or hidden == 0 or intermediate == 0) return .{};
+    const floats = std.math.add(usize, std.math.mul(usize, hidden, 12) catch return .{}, std.math.mul(usize, intermediate, 4) catch return .{}) catch return .{};
+    const bytes = std.math.mul(usize, std.math.mul(usize, rows, floats) catch return .{}, 4) catch return .{};
+    // At most one submitted group and one encoding group. Views and activation
+    // buffers for both fit inside the existing 768-MiB audio reservation.
+    const group = @min(@as(usize, 4), (384 * 1024 * 1024) / (std.math.mul(usize, bytes, 2) catch return .{}));
+    return if (group == 0) .{} else .{ .layers = group, .in_flight = 2 };
+}
+
 fn encodeAudioFeatureCohortResident(cb: *const ComputeBackend, allocator: std.mem.Allocator, store: *ProjectorWeights, cfg: AudioConfig, features_list: []const *AudioFeatures, lengths: ?[]usize) !ResidentEncodedAudio {
     if (features_list.len == 0 or features_list.len > 4 or (lengths != null and lengths.?.len != features_list.len)) return error.InvalidInputShape;
     const features = features_list[0];
@@ -1199,16 +1210,43 @@ fn encodeAudioFeatureCohortResident(cb: *const ComputeBackend, allocator: std.me
     defer layer_inputs.deinit(cb);
     layer_inputs.segments = subsampled.segments;
 
+    const grouped_frames = cohort and cb.kind() == .metal and store.huggingface and cfg.exclude_farthest_key and
+        !cb.decoderRuntimeHasActiveFrame() and !cb.decoderRuntimeHasSubmittedFrame() and !profile_enabled and std.meta.eql(audioHostOps(), AudioHostOps{}) and platform.env.getenv("ANTFLY_EMBEDDINGGEMMA2_STAGES") == null and
+        !platform.env.getenvBool("ANTFLY_EMBEDDINGGEMMA2_DISABLE_PIPELINED_AUDIO");
+    const frame_plan = if (grouped_frames) audioFramePlan(subsampled.seq_len, cfg.audio_hidden, cfg.intermediate_size) else AudioFramePlan{};
+    const pipelined = grouped_frames and frame_plan.in_flight == 2 and cb.decoderRuntimeSetWhisperPipelinedFrames(true);
+    var pending_frame = false;
+    // Drain before layer inputs, hidden outputs, and cached weights leave scope.
+    defer {
+        if (frame_active) {
+            cb.decoderRuntimeCancelFrame() catch {};
+            frame_active = false;
+        }
+        if (pending_frame) cb.decoderRuntimeWaitSubmittedFrame() catch {};
+        if (pipelined) _ = cb.decoderRuntimeSetWhisperPipelinedFrames(false);
+    }
+
     for (0..cfg.block_count) |layer| {
         try cb.checkExecutionControl();
         if (cohort and cb.kind() == .metal and !cb.decoderRuntimeHasActiveFrame()) frame_active = try cb.decoderRuntimeBeginFrame();
         const next = try audioLayer(cb, allocator, store, cfg, hidden, &layer_inputs, layer);
         cb.free(hidden);
         hidden = next;
-        if (cohort and frame_active) {
-            try cb.decoderRuntimeSubmitAndWaitFrame();
-            frame_active = false;
-            try @import("../ops/metal_compute.zig").MetalCompute.releaseEmbeddingGemma2ActivationViews(cb);
+        if (cohort and frame_active and ((layer + 1) % frame_plan.layers == 0 or layer + 1 == cfg.block_count)) {
+            if (pipelined) {
+                try @import("../ops/metal_compute.zig").MetalCompute.detachEmbeddingGemma2ActivationViews(cb);
+                if (pending_frame) {
+                    try cb.decoderRuntimeWaitSubmittedFrame();
+                    pending_frame = false;
+                }
+                try cb.decoderRuntimeSubmitFrame();
+                frame_active = false;
+                pending_frame = true;
+            } else {
+                try cb.decoderRuntimeSubmitAndWaitFrame();
+                frame_active = false;
+                try @import("../ops/metal_compute.zig").MetalCompute.releaseEmbeddingGemma2ActivationViews(cb);
+            }
         }
         store.releaseCompletedNativeLayer();
         if (store.gguf == null) {
@@ -1230,9 +1268,15 @@ fn encodeAudioFeatureCohortResident(cb: *const ComputeBackend, allocator: std.me
     const projected = try cb.linearNoBias(normed, projection_w, subsampled.seq_len, cfg.output_hidden, cfg.text_hidden);
     defer cb.free(projected);
     audioProfileMark(.tail);
+    if (pending_frame) {
+        if (frame_active) try @import("../ops/metal_compute.zig").MetalCompute.detachEmbeddingGemma2ActivationViews(cb);
+        try cb.decoderRuntimeWaitSubmittedFrame();
+        pending_frame = false;
+    }
     if (frame_active) {
         try cb.decoderRuntimeSubmitAndWaitFrame();
         frame_active = false;
+        if (cohort and cb.kind() == .metal) try @import("../ops/metal_compute.zig").MetalCompute.releaseEmbeddingGemma2ActivationViews(cb);
     }
 
     if (store.gguf == null) try embeddingGemma2StageTensor(cb, allocator, "audio_projected", projected);
@@ -1430,9 +1474,38 @@ pub const PreparedAudio = struct {
 pub fn prepareEmbeddingGemma2Audio(allocator: std.mem.Allocator, bytes: []const u8, options: audio.DecodeOptions) !PreparedAudio {
     return prepareEmbeddingGemma2AudioWithPacking(allocator, bytes, options, true);
 }
+/// Inspect only trustworthy sample-count headers. Unknown durations retain the
+/// full model envelope; admission must never infer a 30-second input limit.
+pub fn embeddingGemma2EncodedAudioSequenceBound(bytes: []const u8) !usize {
+    const generic = @import("inference_audio");
+    const format = generic.detectFormat(bytes) orelse return error.UnsupportedAudioFormat;
+    const info: ?struct { samples: usize, rate: u32 } = switch (format) {
+        .wav => wav: {
+            const parsed = try generic.wav.parseData(bytes);
+            const frame_bytes = try std.math.mul(usize, parsed.channels, parsed.format.bits_per_sample / 8);
+            if (frame_bytes == 0 or parsed.data.len % frame_bytes != 0) return error.InvalidAudioInput;
+            break :wav .{ .samples = parsed.data.len / frame_bytes, .rate = parsed.format.sample_rate };
+        },
+        .flac => flac: {
+            const parsed = try generic.flac.parseStreamInfo(bytes);
+            break :flac if (parsed.total_samples != 0) .{ .samples = std.math.cast(usize, parsed.total_samples) orelse return error.AudioTooLarge, .rate = parsed.sample_rate } else null;
+        },
+        else => null,
+    };
+    if (info) |known| {
+        if (known.rate == 0) return error.UnsupportedAudioFormat;
+        const samples = (try std.math.mul(u128, known.samples, 16000) + known.rate - 1) / known.rate;
+        if (samples > embeddingGemma2AudioConfig().max_audio_samples) return error.EmbeddingSequenceTooLong;
+        // ceil(samples/640) bounds output stride, plus BOS/EOS/media wrappers.
+        return @min(@as(usize, 8192), @as(usize, @intCast((samples + 639) / 640)) + 4);
+    }
+    return 8192;
+}
+
 pub fn prepareEmbeddingGemma2AudioForBackend(a: std.mem.Allocator, bytes: []const u8, options: audio.DecodeOptions, backend: @import("../backends/backends.zig").BackendType) !PreparedAudio {
     if (backend != .cuda) return prepareEmbeddingGemma2AudioWithPacking(a, bytes, options, backend != .native);
-    return prepareAudioCpuBounded(a, bytes, options, 128, true, true, 480_000, 64 * 1024 * 1024, true);
+    const cfg = embeddingGemma2AudioConfig();
+    return prepareAudioCpuBounded(a, bytes, options, cfg.mel_bins, cfg.reject_audio_truncation, true, cfg.max_audio_samples, 64 * 1024 * 1024, true);
 }
 pub fn prepareEmbeddingGemma2AudioWithPacking(allocator: std.mem.Allocator, bytes: []const u8, options: audio.DecodeOptions, pack_device: bool) !PreparedAudio {
     return prepareAudioCpu(allocator, bytes, options, 128, true, pack_device);
@@ -1446,6 +1519,12 @@ fn prepareAudioCpuBounded(allocator: std.mem.Allocator, audio_bytes: []const u8,
         else => return if (reference_resample) error.InvalidAudioInput else err,
     };
     defer decoded.deinit();
+    if (reference_resample and audio.detectFormat(audio_bytes) == .flac) {
+        // STREAMINFO is useful for admission only when decode agrees. Reject
+        // a false duration before allocating resampling/packed feature buffers.
+        const info = try @import("inference_audio").flac.parseStreamInfo(audio_bytes);
+        if (info.total_samples != 0 and info.total_samples != decoded.samples.len) return error.InvalidAudioInput;
+    }
     if (strict) for (decoded.samples) |sample| if (!std.math.isFinite(sample)) return error.InvalidAudioSamples;
     return prepareAudioPcmBounded(allocator, .{ .samples = decoded.samples, .sample_rate = decoded.sample_rate }, mel_bins, strict, pack_gpu, max_samples, reference_resample);
 }
@@ -6719,7 +6798,7 @@ fn populateAudioCohortWeights(store: *@import("../ops/native_compute.zig").Weigh
     try putSmallAudioWeight(store, "a.pre_encode.out.weight", &.{ 24, 16 }, null);
     try putSmallAudioWeight(store, "a.pre_encode.out.bias", &.{24}, null);
     try putSmallAudioWeight(store, "mm.a.input_projection.weight", &.{ 8, 24 }, null);
-    for (0..2) |layer| {
+    for (0..8) |layer| {
         for ([_][]const u8{ "ffn_norm", "ffn_post_norm", "ffn_norm_1", "ffn_post_norm_1", "attn_pre_norm", "attn_post_norm", "norm_conv", "conv_norm", "ln2" }) |suffix| {
             const name = try std.fmt.allocPrint(a, "a.blk.{d}.{s}.weight", .{ layer, suffix });
             defer a.free(name);
@@ -6752,7 +6831,7 @@ fn checkAudioCohort(cb: ComputeBackend, reference: ComputeBackend) !void {
             compute.require_f32_linears = true;
         }
     }
-    const cfg = AudioConfig{ .text_hidden = 8, .audio_hidden = 16, .output_hidden = 24, .intermediate_size = 32, .block_count = 2, .head_count = 2, .mel_bins = 8, .conv_channels0 = 4, .conv_channels1 = 2, .layer_norm_eps = 1e-6, .exclude_farthest_key = true };
+    const cfg = AudioConfig{ .text_hidden = 8, .audio_hidden = 16, .output_hidden = 24, .intermediate_size = 32, .block_count = 8, .head_count = 2, .mel_bins = 8, .conv_channels0 = 4, .conv_channels1 = 2, .layer_norm_eps = 1e-6, .exclude_farthest_key = true };
     var first_data: [57 * 8]f32 = undefined;
     var second_data: [13 * 8]f32 = undefined;
     for (&first_data, 0..) |*x, i| x.* = @sin(@as(f32, @floatFromInt(i)) * 0.173);
@@ -6770,9 +6849,29 @@ fn checkAudioCohort(cb: ComputeBackend, reference: ComputeBackend) !void {
     defer ref_weights.deinit();
     var lengths: [2]usize = undefined;
     const transfers = @import("../ops/media_residency_test.zig").Transfers.snapshot(cb);
+    const submits_before = cb.debugTimingSnapshot().provider.decoder_runtime_frame_submits;
     const combined = try encodeAudioFeatureCohortResident(&cb, a, &weights, cfg, &.{ &first, &second }, &lengths);
     defer cb.free(combined.embeddings);
     try transfers.expectUnchanged(cb);
+    if (cb.kind() == .metal and !platform.env.getenvBool("ANTFLY_EMBEDDINGGEMMA2_DISABLE_PIPELINED_AUDIO") and !gemma4AudioMetalProfileEnabled() and platform.env.getenv("ANTFLY_EMBEDDINGGEMMA2_STAGES") == null) {
+        const submits = cb.debugTimingSnapshot().provider.decoder_runtime_frame_submits - submits_before;
+        try std.testing.expect(submits > 0 and submits < cfg.block_count + 3);
+        std.debug.print("embeddinggemma2 audio_cohort layers={} frame_submits={}\n", .{ cfg.block_count, submits });
+        try std.testing.expect(!cb.decoderRuntimeHasActiveFrame() and !cb.decoderRuntimeHasSubmittedFrame());
+        const Pending = struct {
+            fn check(raw: ?*anyopaque) !void {
+                const backend: *const ComputeBackend = @ptrCast(@alignCast(raw.?));
+                if (backend.decoderRuntimeHasSubmittedFrame()) return error.Cancelled;
+            }
+        };
+        var interrupted = cb;
+        interrupted.execution_control = .{ .ptr = @constCast(&cb), .check_fn = Pending.check };
+        var interrupted_weights = ProjectorWeights.initHuggingFace(&interrupted, a);
+        defer interrupted_weights.deinit();
+        try std.testing.expectError(error.Cancelled, encodeAudioFeatureCohortResident(&interrupted, a, &interrupted_weights, cfg, &.{ &first, &second }, &lengths));
+        try std.testing.expect(!cb.decoderRuntimeHasActiveFrame() and !cb.decoderRuntimeHasSubmittedFrame());
+    }
+
     const actual = try cb.toFloat32(combined.embeddings, a);
     defer a.free(actual);
     var offset: usize = 0;
@@ -6805,6 +6904,34 @@ fn checkAudioCohort(cb: ComputeBackend, reference: ComputeBackend) !void {
     const retried = try cb.toFloat32(retry.embeddings, a);
     defer a.free(retried);
     for (actual, retried) |x, y| try std.testing.expectApproxEqAbs(x, y, 1e-6);
+    if (cb.kind() == .metal) {
+        try std.testing.expect(cb.decoderRuntimeSetWhisperPipelinedFrames(true));
+        defer _ = cb.decoderRuntimeSetWhisperPipelinedFrames(false);
+        var external_pending = false;
+        defer if (external_pending) cb.decoderRuntimeWaitSubmittedFrame() catch {};
+        try std.testing.expect(try cb.decoderRuntimeBeginFrame());
+        const precursor = (try cb.multiplyScalar(combined.embeddings, 1)).?;
+        defer cb.free(precursor);
+        try @import("../ops/metal_compute.zig").MetalCompute.detachEmbeddingGemma2ActivationViews(&cb);
+        try cb.decoderRuntimeSubmitFrame();
+        external_pending = true;
+        var external_active = try cb.decoderRuntimeBeginFrame();
+        try std.testing.expect(external_active);
+        defer if (external_active) cb.decoderRuntimeCancelFrame() catch {};
+        const external = try encodeAudioFeatureCohortResident(&cb, a, &weights, cfg, &.{ &first, &second }, &lengths);
+        defer cb.free(external.embeddings);
+        try std.testing.expect(cb.decoderRuntimeHasActiveFrame());
+        try std.testing.expect(cb.decoderRuntimeHasSubmittedFrame());
+        try @import("../ops/metal_compute.zig").MetalCompute.detachEmbeddingGemma2ActivationViews(&cb);
+        try cb.decoderRuntimeWaitSubmittedFrame();
+        external_pending = false;
+        try cb.decoderRuntimeSubmitAndWaitFrame();
+        external_active = false;
+        try @import("../ops/metal_compute.zig").MetalCompute.releaseEmbeddingGemma2ActivationViews(&cb);
+        const external_values = try cb.toFloat32(external.embeddings, a);
+        defer a.free(external_values);
+        for (actual, external_values) |x, y| try std.testing.expectApproxEqAbs(x, y, 3e-4);
+    }
 }
 
 test "embeddinggemma2 native conformer cohort preserves clip boundaries and cancellation retry" {
@@ -6812,4 +6939,35 @@ test "embeddinggemma2 native conformer cohort preserves clip boundaries and canc
 }
 test "embeddinggemma2 Metal conformer cohort preserves clip boundaries without activation downloads" {
     try @import("../ops/media_residency_test.zig").onMetal(populateAudioCohortWeights, checkAudioCohort);
+}
+
+test "embeddinggemma2 CUDA audio preparation accepts model-valid clips beyond thirty seconds" {
+    const a = std.testing.allocator;
+    const generic = @import("inference_audio");
+    const samples = try a.alloc(f32, 40 * 16000);
+    defer a.free(samples);
+    @memset(samples, 0.125);
+    const bytes = try generic.wav.encodeMono(a, samples, .{ .sample_rate = 16000, .audio_format = 1, .bits_per_sample = 16 });
+    defer a.free(bytes);
+    var prepared = try prepareEmbeddingGemma2AudioForBackend(a, bytes, .{}, .cuda);
+    defer prepared.deinit();
+    try std.testing.expect(prepared.tokenCount() > 750);
+    const bound = try embeddingGemma2EncodedAudioSequenceBound(bytes);
+    try std.testing.expect(bound >= prepared.tokenCount() + 4);
+    try std.testing.expect(bound < 1100);
+    try std.testing.expectEqual(@as(usize, 8192), try embeddingGemma2EncodedAudioSequenceBound("OggSxxxxxxxx"));
+    // Same header with an invalid rate must fail before any PCM allocation.
+    const rate: [4]u8 = bytes[24..28].*;
+    @memset(bytes[24..28], 0);
+    try std.testing.expectError(error.UnsupportedAudioFormat, embeddingGemma2EncodedAudioSequenceBound(bytes));
+    @memcpy(bytes[24..28], &rate);
+}
+
+test "embeddinggemma2 Metal audio frame groups bound two live groups and avoid overflow" {
+    try std.testing.expectEqual(AudioFramePlan{ .layers = 4, .in_flight = 2 }, audioFramePlan(64, 1024, 4096));
+    for ([_]usize{ 64, 256, 512, 1024, 2048, 8192 }) |rows| {
+        const plan = audioFramePlan(rows, 1024, 4096);
+        if (plan.in_flight == 2) try std.testing.expect(rows * (1024 * 12 + 4096 * 4) * 4 * plan.layers * 2 <= 384 * 1024 * 1024);
+    }
+    try std.testing.expectEqual(AudioFramePlan{}, audioFramePlan(std.math.maxInt(usize), 1024, 4096));
 }

@@ -37276,6 +37276,25 @@ test "embeddinggemma2 ordered media matches official F32 oracle" {
         try std.testing.expect(cos >= @as(f64, if (metal) 0.9999 else 0.99999));
         try std.testing.expect(max_abs <= @as(f64, if (metal) 1e-3 else 1e-4));
     }
+    // Qualify the resident conformer cohort and pooled backbone against the
+    // same pretrained audio oracle, including Metal's bounded frame pipeline.
+    const audio_groups: [2]grouped.Group = @splat(.{ .content = &.{.{ .audio = audio_bytes }} });
+    var audio_errors: [2]?anyerror = @splat(null);
+    const audio_batch = try grouped.embedGroupCohort(a, loaded.session, loaded.getTokenizer(), &audio_groups, .{}, loaded.embeddingExecutionLock(), node.extractionExecutionControl(null), &audio_errors);
+    defer {
+        freeDirectDenseVectors(a, audio_batch.vectors);
+        a.free(audio_batch.input_tokens);
+    }
+    const audio_reference = parsed.value.object.get("cases").?.array.items[1];
+    var audio_expected: [768]f32 = undefined;
+    for (&audio_expected, audio_reference.object.get("embedding").?.array.items) |*dest, value| dest.* = @floatCast(value.float);
+    for (audio_batch.vectors, audio_batch.input_tokens, audio_errors) |vector, count, err| {
+        try std.testing.expectEqual(@as(?anyerror, null), err);
+        try std.testing.expectEqual(audio_reference.object.get("token_ids").?.array.items.len, count);
+        for (vector, audio_expected) |actual, expected| try std.testing.expectApproxEqAbs(expected, actual, @as(f32, if (metal) 1e-3 else 1e-4));
+        const similarity = try @import("antfly_decisions").scoring.cosine(vector, &audio_expected, 768);
+        try std.testing.expect(similarity >= @as(f64, if (metal) 0.9999 else 0.99999));
+    }
     // Qualify real batched raster execution against the encoded-image path.
     // Use different aspect ratios and padded renderer strides, preserving the
     // same pixels in the PNG reference. No full-page copy exists in serving.

@@ -48,6 +48,7 @@ pub const Stats = struct {
     packed_projection_launches: u64 = 0,
     fused_vision_launches: u64 = 0,
     extended_flash_launches: u64 = 0,
+    fused_backbone_launches: u64 = 0,
 };
 
 pub const Contrastive = struct {
@@ -85,6 +86,9 @@ pub const Module = struct {
     training_rope_vjp: driver.CUfunction,
     split_columns: driver.CUfunction,
     vision_rope_pack: driver.CUfunction,
+    native_vision: driver.CUfunction,
+    norm_residual: driver.CUfunction,
+    scale_rms: driver.CUfunction,
     attention: driver.CUfunction,
     local_flash_attention: driver.CUfunction,
     attention_softmax: driver.CUfunction,
@@ -147,6 +151,9 @@ pub const Module = struct {
             .training_rope_vjp = try function(ctx, m, "termite_embedding_gemma2_training_rope_vjp_f32"),
             .split_columns = try function(ctx, m, "termite_embedding_gemma2_split_columns_bf16"),
             .vision_rope_pack = try function(ctx, m, "termite_embedding_gemma2_vision_rope_pack_bf16"),
+            .native_vision = try function(ctx, m, "termite_embedding_gemma2_native_vision_bf16"),
+            .norm_residual = try function(ctx, m, "termite_embedding_gemma2_norm_residual_bf16"),
+            .scale_rms = try function(ctx, m, "termite_embedding_gemma2_scale_rms_bf16"),
             .attention = try function(ctx, m, "termite_embedding_gemma2_attention_bf16"),
             .local_flash_attention = try function(ctx, m, "termite_embedding_gemma2_attention_local_flash_bf16"),
             .attention_softmax = try function(ctx, m, "termite_embedding_gemma2_attention_softmax_bf16"),
@@ -372,6 +379,71 @@ pub const Module = struct {
         var s = scale;
         var args = [_]?*anyopaque{ @ptrCast(&op), @ptrCast(&tp), @ptrCast(&ip), @ptrCast(&r), @ptrCast(&v), @ptrCast(&h), @ptrCast(&s) };
         try self.launch1d(ctx, self.lookup, &args, count);
+    }
+
+    pub fn launchNormResidual(self: *Module, ctx: *Context, hidden: Buffer, next: Buffer, branch: Buffer, post_weight: Buffer, next_weight: ?Buffer, scalar: ?Buffer, rows: u32, width: u32, eps: f32) !void {
+        if (rows == 0 or width == 0 or !std.math.isFinite(eps) or eps <= 0) return error.InvalidEmbeddingGemma2Shape;
+        const bytes = try std.math.mul(usize, try std.math.mul(usize, rows, width), 2);
+        try require(hidden, bytes);
+        try require(branch, bytes);
+        try require(post_weight, @as(usize, width) * 2);
+        if (next_weight) |weight| {
+            try require(weight, @as(usize, width) * 2);
+            try require(next, bytes);
+            if (next.ptr == hidden.ptr) return error.InvalidEmbeddingGemma2Shape;
+        }
+        if (scalar) |weight| try require(weight, 2);
+        var hp = hidden.ptr;
+        var np = next.ptr;
+        var bp = branch.ptr;
+        var pp = post_weight.ptr;
+        var wp = if (next_weight) |weight| weight.ptr else 0;
+        var sp = if (scalar) |weight| weight.ptr else 0;
+        var r = rows;
+        var w = width;
+        var e = eps;
+        var args = [_]?*anyopaque{ @ptrCast(&hp), @ptrCast(&np), @ptrCast(&bp), @ptrCast(&pp), @ptrCast(&wp), @ptrCast(&sp), @ptrCast(&r), @ptrCast(&w), @ptrCast(&e) };
+        try launch(ctx, self.norm_residual, &args, .{ rows, 1, 1 }, .{ 256, 1, 1 });
+        self.stats_.launches += 1;
+        self.stats_.fused_backbone_launches += 1;
+    }
+    pub fn launchScaleRms(self: *Module, ctx: *Context, output: Buffer, input: Buffer, weight: Buffer, rows: u32, width: u32, scale: f32, eps: f32) !void {
+        if (rows == 0 or width == 0 or !std.math.isFinite(eps) or eps <= 0 or !std.math.isFinite(scale)) return error.InvalidEmbeddingGemma2Shape;
+        const bytes = try std.math.mul(usize, try std.math.mul(usize, rows, width), 2);
+        try require(output, bytes);
+        try require(input, bytes);
+        try require(weight, @as(usize, width) * 2);
+        var op = output.ptr;
+        var ip = input.ptr;
+        var wp = weight.ptr;
+        var r = rows;
+        var w = width;
+        var v = scale;
+        var e = eps;
+        var args = [_]?*anyopaque{ @ptrCast(&op), @ptrCast(&ip), @ptrCast(&wp), @ptrCast(&r), @ptrCast(&w), @ptrCast(&v), @ptrCast(&e) };
+        try launch(ctx, self.scale_rms, &args, .{ rows, 1, 1 }, .{ 256, 1, 1 });
+        self.stats_.launches += 1;
+        self.stats_.fused_backbone_launches += 1;
+    }
+    pub fn launchNativeVision(self: *Module, ctx: *Context, output: Buffer, q: Buffer, k: Buffer, v: Buffer, batch: usize, sequence: usize) !void {
+        if (batch == 0 or batch > 8 or sequence == 0 or sequence > 3136 or !@import("artifact.zig").hasBf16WmmaCodeFor(ctx.info.compute_major, ctx.info.compute_minor)) return error.InvalidEmbeddingGemma2Shape;
+        const bytes = batch * sequence * 768 * 2;
+        try require(output, bytes);
+        try require(q, bytes);
+        try require(k, bytes);
+        try require(v, bytes);
+        var op = output.ptr;
+        var qp = q.ptr;
+        var kp = k.ptr;
+        var vp = v.ptr;
+        var b: u32 = @intCast(batch);
+        var seq: u32 = @intCast(sequence);
+        var heads: u32 = 12;
+        var dim: u32 = 64;
+        var args = [_]?*anyopaque{ @ptrCast(&op), @ptrCast(&qp), @ptrCast(&kp), @ptrCast(&vp), @ptrCast(&b), @ptrCast(&seq), @ptrCast(&heads), @ptrCast(&dim) };
+        try launch(ctx, self.native_vision, &args, .{ @intCast(batch * 12 * ((sequence + 31) / 32)), 1, 1 }, .{ 256, 1, 1 });
+        self.stats_.launches += 1;
+        self.stats_.attention_launches += 1;
     }
 
     pub fn launchRmsNorm(self: *Module, ctx: *Context, out: Buffer, input: Buffer, weight: ?Buffer, rows: u32, width: u32, eps: f32) !void {
@@ -1170,7 +1242,7 @@ test "embeddinggemma2 CUDA extended flash matches scalar attention with mask hol
     if (comptime !@import("build_options").enable_cuda) return error.SkipZigTest;
     var ctx = try Context.initDefault();
     defer ctx.deinit();
-    if (!artifact.hasBf16WmmaCodeFor(ctx.info.compute_major, ctx.info.compute_minor)) return error.SkipZigTest;
+    if (!@import("artifact.zig").hasBf16WmmaCodeFor(ctx.info.compute_major, ctx.info.compute_minor)) return error.SkipZigTest;
     const allocator = std.testing.allocator;
     var module = try Module.init(&ctx);
     defer module.deinit(&ctx);
