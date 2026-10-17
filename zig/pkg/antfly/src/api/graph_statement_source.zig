@@ -166,7 +166,18 @@ pub const Statement = struct {
         fn call(ptr: *anyopaque, a: std.mem.Allocator, body: []const u8) ![]u8 {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             try validate(ptr);
-            return self.read.invoke(a, body);
+            return self.invoke(a, body);
+        }
+        fn invoke(self: *@This(), a: std.mem.Allocator, body: []const u8) ![]u8 {
+            // Arena vtables have different addresses across compiled libraries.
+            // Peel caller arenas before the owner boundary, so owner scratch
+            // can release quota as it decodes each document. Transfer only the
+            // private JSON response back into the caller's requested allocator.
+            const temporary = cypher.backend.reclaimingAllocator(a);
+            if (temporary.ptr == a.ptr and temporary.vtable == a.vtable) return self.read.invoke(a, body);
+            const response = try self.read.invoke(temporary, body);
+            defer temporary.free(response);
+            return a.dupe(u8, response);
         }
     };
     fn capture(ptr: *anyopaque, a: std.mem.Allocator, target: cypher.distributed.Target) !?cypher.distributed.Fence {
@@ -199,7 +210,7 @@ pub const Statement = struct {
             for (self.set.targets, self.set.snapshots) |target, snapshot| {
                 if (!std.mem.eql(u8, target.table, request.table)) continue;
                 const owner: *Owner = @ptrCast(@alignCast(snapshot.ptr));
-                return owner.read.invoke(a, body);
+                return owner.invoke(a, body);
             }
             return error.CypherInvalidOwner;
         }
@@ -208,7 +219,7 @@ pub const Statement = struct {
             var owners: std.ArrayList(observation.Owner) = .empty;
             for (self.set.targets, self.set.snapshots) |target, snapshot| {
                 const owner: *Owner = @ptrCast(@alignCast(snapshot.ptr));
-                const bytes = try owner.read.invoke(arena.allocator(), body);
+                const bytes = try owner.invoke(arena.allocator(), body);
                 const cut = try std.json.parseFromSliceLeaky(observation.Cut, arena.allocator(), bytes, .{});
                 const plan = try self.planFor(target);
                 try owners.append(arena.allocator(), .{ .table = target.table, .fence = plan.fence, .predicates = cut.predicates, .proofs = cut.proofs });

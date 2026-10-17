@@ -368,6 +368,27 @@ def test_authenticated_cypher_property_plans_and_sql_overlays(monkeypatch):
                 assert endpoint_counted["rows"] == [
                     [{"type": "integer", "value": "31824"}]
                 ]
+        statistics = call(
+            f"/graphs/{hops}/query",
+            {
+                "query": "MATCH (a:H)-[:R*6..6]->(b:H) RETURN count(*),sum(b.score),min(b.score),max(b.score),count(DISTINCT b)",
+                "limits": {"explored_edges": 1000, "intermediate_states": 30000},
+            },
+        )
+        assert statistics["rows"][0][0] == {"type": "integer", "value": "31824"}, (
+            statistics
+        )
+        assert statistics["rows"][0][-1] == {"type": "integer", "value": "12"}, (
+            statistics
+        )
+        grouped_alias = call(
+            f"/graphs/{hops}/query",
+            {
+                "query": "MATCH (a:H)-[:R*6..6]->(b:H) RETURN b.score AS endpoint,count(*) AS total ORDER BY endpoint",
+                "limits": {"explored_edges": 1000, "intermediate_states": 30000},
+            },
+        )
+        assert sum(int(row[1]["value"]) for row in grouped_alias["rows"]) == 31824
         start = time.monotonic()
         counted_sql = call(
             "/sql",
@@ -429,6 +450,55 @@ def test_authenticated_cypher_property_plans_and_sql_overlays(monkeypatch):
             },
         )
         assert merged["rows"] == [[{"type": "integer", "value": "800"}]], merged
+        payload_table = table + "_document_payload"
+        call("/tables/" + payload_table, {"num_shards": 1})
+        for start in range(0, 200, 50):
+            call(
+                f"/tables/{payload_table}/batch",
+                {
+                    "inserts": {
+                        f"n{i}": {
+                            "body": "needle",
+                            "payload": "x" * 8192,
+                            "literal.field": 7,
+                        }
+                        for i in range(start, start + 50)
+                    },
+                    "sync_level": "full_index",
+                },
+            )
+        call(
+            "/graphs/" + payload_table,
+            {"labels": [{"name": "P", "table": payload_table}], "relationships": []},
+        )
+        for query in (
+            "MATCH (n:P) RETURN count(*)",
+            f"CALL antfly.search('{payload_table}',{{query:'body:needle',mode:'text',limit:200}}) YIELD score RETURN count(*)",
+        ):
+            pruned = call(
+                f"/graphs/{payload_table}/query",
+                {"query": query, "limits": {"memory_bytes": 8 << 20}},
+            )
+            assert pruned["rows"] == [[{"type": "integer", "value": "200"}]], pruned
+        for expression, expected in (
+            ("min(n.body)", {"type": "string", "value": "needle"}),
+            ("min(n.`literal.field`)", {"type": "integer", "value": "7"}),
+        ):
+            projected = call(
+                f"/graphs/{payload_table}/query",
+                {"query": f"MATCH (n:P) RETURN {expression}"},
+            )
+            assert projected["rows"] == [[expected]], projected
+        call("/sql", {"statement": f"CREATE INDEX {hops}_id ON {hops}(id)"})
+        related = call(
+            f"/graphs/{hops}/query",
+            {
+                "query": "MATCH (a:H {id:'n0'}) UNWIND $ids AS id MERGE (b:H {id:id}) MERGE (a)-[:R]->(b) RETURN count(*)",
+                "parameters": {"ids": [f"fresh{i}" for i in range(800)]},
+            },
+        )
+        assert related["rows"] == [[{"type": "integer", "value": "800"}]], related
+        assert related["stats"]["explored_edges"] < 1000, related
         script = (
             Path(__file__).resolve().parents[2]
             / "scripts"

@@ -107,6 +107,7 @@ const Database = struct {
 const Native = root.native.Adapter(Database, void, Cursor);
 const Authority = struct {
     deny_b: bool = false,
+    saw_secret: bool = false,
     revocations: usize = 0,
     hide_relationships: bool = false,
     fn bind(_: *anyopaque, _: root.catalog.Graph) !void {}
@@ -126,6 +127,7 @@ const Authority = struct {
     }
     fn project(ptr: *anyopaque, a: A, node: *const v.Node) !?*const v.Node {
         const self: *@This() = @ptrCast(@alignCast(ptr));
+        if ((v.Value{ .node = node }).property("secret") == .string) self.saw_secret = true;
         if (self.deny_b and std.mem.eql(u8, node.identity.key, "b")) return null;
         const filtered = try a.create(v.Node);
         filtered.* = node.*;
@@ -275,4 +277,28 @@ test "native capture and routed owner predicates share the statement work ceilin
     defer large.deinit();
     try std.testing.expect(large.overlay.captured.intermediate_states > 1_000_000);
     try std.testing.expect(large.overlay.captured.intermediate_states < 8_000_000);
+}
+
+test "native required fields prune after full policy checks and own projected values" {
+    var docs: Database = .{ .name = "docs" };
+    var authority: Authority = .{};
+    var native: Native = .{ .tables = &.{.{ .name = "docs", .db = &docs }}, .authority = authority.callbacks(), .ttl_now_ns = 1 };
+    const selected: root.catalog.Graph = .{ .name = "alpha", .incarnation = 2, .revision = 1, .labels = &.{.{ .name = "Alpha", .table = "docs", .predicate = &.{.{ .name = "title", .value = .{ .string = "Alpha" } }} }}, .relationships = &.{} };
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const backend = native.backend();
+    try backend.vtable.bind(backend.ptr, a, selected);
+    backend.vtable.set_read_fields.?(backend.ptr, &.{});
+    const node = (try backend.vtable.get(backend.ptr, a, .{ .table = "docs", .key = "a" })).?;
+    try std.testing.expect(authority.saw_secret);
+    try std.testing.expectEqual(@as(usize, 0), node.properties.len);
+    try std.testing.expectEqualStrings("Alpha", node.labels[0]);
+    try std.testing.expectEqualStrings("a", node.identity.key);
+    backend.vtable.set_read_fields.?(backend.ptr, &.{ "title", "secret" });
+    const projected = (try backend.vtable.get(backend.ptr, a, .{ .table = "docs", .key = "a" })).?;
+    try std.testing.expectEqual(@as(usize, 1), projected.properties.len);
+    try std.testing.expectEqualStrings("Alpha", (v.Value{ .node = projected }).property("title").string);
+    authority.deny_b = true;
+    try std.testing.expect((try backend.vtable.get(backend.ptr, a, .{ .table = "docs", .key = "b" })) == null);
 }

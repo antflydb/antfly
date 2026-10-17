@@ -1297,7 +1297,7 @@ charging physical reads again. Their route
 enumeration remains combinatorial when uniqueness requires it; neither vertex
 compression nor early deduplication may discard valid qualifying trails.
 
-Eligible ALL-path count reductions discover authorized adjacency from sparse
+Eligible ALL-path endpoint reductions discover authorized adjacency from sparse
 (pattern edge, hop, identity) states. Rejected intermediate node predicates leave
 the branches behind those nodes unopened. Finite bounds and a DAG proof permit prefix
 compression under trail and node uniqueness; repeatable walks admit bounded
@@ -1311,11 +1311,17 @@ counts can report overflow. SQL GRAPH_TABLE exposes this through the exact-count
 cursor hook under the same owner cut, with SQL residuals and ordinal selection
 retaining ordinary pulls.
 
-Endpoint-local predicates, grouping keys and non-distinct `count(expression)`
-consume weighted endpoint rows from those same states. Counts of nullable
-properties ignore NULL without discarding their groups. Expressions depending on
-intermediate entities, paths, DISTINCT or unsupported consumers retain exact
-route production. The optimizer never substitutes shortest-path semantics for ALL.
+Endpoint-local predicates, grouping keys, COUNT/SUM/AVG/MIN/MAX and their
+DISTINCT variants consume weighted endpoint rows from those same states.
+Projection aliases in ORDER BY resolve in the projection scope before dependency
+checks. Single fixed-hop reductions retain page-at-a-time streaming, since they
+have no shared prefixes to compress. Nullable arguments ignore NULL without discarding their groups. DISTINCT
+tracks argument values independently of route multiplicities. Integer weighted
+sums use wide intermediates, floating sums preserve finite cancellation, and AVG
+combines weighted means. Saturated path counts cannot serve as approximate
+numeric weights: SUM/AVG retain exact route production when multiplicities are
+not representable. Expressions depending on intermediate entities, paths or
+unsupported consumers retain exact route production. The optimizer never substitutes shortest-path semantics for ALL.
 
 SQL pull cursors retain the selective interior anchor, traverse a reversed prefix,
 restore source path order and resume the suffix with shared uniqueness and deferred
@@ -1334,6 +1340,33 @@ ordered staged phase and opaque native continuation tokens. Bounded scalar
 constant folding shares checked runtime arithmetic when constructing seeks;
 failed folds remain residuals so overflow and division errors keep their runtime
 semantics.
+
+Fixed-edge matches with two bound endpoints use transaction-local relationship
+pair postings, with lazy scalar-property indexes and collision residuals. Native
+backends without pair seeks populate a retained adjacency domain once under the
+same statement cut and physical/work quotas. Later MERGE probes reuse that index;
+new relationships and postimage changes maintain it incrementally. Pair indexes
+are allocated only when requested, preserve parallel logical IDs, and recheck
+producer authority and tombstones. Candidate pages borrow dense postings rather
+than copying or sorting a complete match set for every pull.
+Mutation normalization and postimage projection decode RPC scaffolding in
+reclaimable call-local scratch and retain only canonical entities for the
+statement. Projected document hits use native point lookups rather than opening
+a scan session per hit.
+
+Document-profile reads decode and authorize full records in reclaimable scratch,
+then retain only requested fields before owner serialization. Caller arenas are
+peeled before compiled owner boundaries; temporary decoding can release its
+quota even when library-local arena vtables have different addresses. Owners
+whose native readers enforce full-record policies and whose authority hooks
+check identity independently certify storage projection; those document reads
+retain query and label-predicate fields before row materialization. Custom
+property-inspecting policies keep full decoding. Full-entity consumers retain
+full records. The known `antfly.search` procedure participates in
+entity lineage and property liveness, including renamed node yields, score-only
+results and later MATCH/WITH consumers. Unknown procedures retain conservative
+full-entity behavior. Search membership and row-policy checks still precede top-k
+selection and property pruning.
 
 `antfly.search` no longer scans the table to enumerate allowed IDs. Unrestricted
 table labels without row policies use native indexed search directly. Restricted

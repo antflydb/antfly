@@ -45,6 +45,10 @@ pub fn Adapter(comptime DB: type, comptime GraphIndex: type, comptime EdgeScanCu
             project_relationship: *const fn (*anyopaque, A, *const v.Relationship) anyerror!?*const v.Relationship,
             search: ?*const fn (*anyopaque, A, []const u8, b.SearchInput) anyerror!b.SearchPage = null,
             read_authorization: ?*const fn (*anyopaque, A, []const u8) anyerror!ReadAuthorization = null,
+            /// The native reader enforces full-record policies, and project
+            /// independently checks authority by identity rather than requiring
+            /// unrequested node properties. Label predicates are still retained.
+            storage_projection: bool = false,
         };
         tables: []const Table,
         authority: Authority,
@@ -75,6 +79,22 @@ pub fn Adapter(comptime DB: type, comptime GraphIndex: type, comptime EdgeScanCu
                     }
                 };
                 query.fields = fields.items;
+            } else if (self.authority.storage_projection) {
+                var fields: std.StringHashMapUnmanaged(void) = .empty;
+                for (required) |field| try fields.put(a, field, {});
+                for (self.graph.?.labels) |label| for (label.predicate) |entry| try fields.put(a, entry.name, {});
+                // Native document selectors interpret path syntax. Preserve
+                // literal Cypher property names by falling back to full reads
+                // whenever a name could be interpreted as a selector.
+                var keys = fields.keyIterator();
+                while (keys.next()) |field| for (field.*) |byte| {
+                    if (!std.ascii.isAlphanumeric(byte) and byte != '_') return opts;
+                };
+                const names = try a.alloc([]const u8, fields.count());
+                var iterator = fields.keyIterator();
+                for (names) |*name| name.* = iterator.next().?.*;
+                opts.fields = names;
+                opts.include_all_fields = false;
             };
             return opts;
         }
@@ -155,6 +175,25 @@ pub fn Adapter(comptime DB: type, comptime GraphIndex: type, comptime EdgeScanCu
             self.graph = graph;
         }
         pub fn node(self: *Self, a: A, table: []const u8, key: []const u8, json: []const u8) !?*const v.Node {
+            const fields = self.read_fields orelse return self.fullNode(a, table, key, json);
+            // Membership and policies inspect complete documents. Decode them
+            // in reclaimable scratch, then retain only the authorized projection.
+            var scratch = std.heap.ArenaAllocator.init(b.reclaimingAllocator(a));
+            defer scratch.deinit();
+            const temporary = scratch.allocator();
+            const authorized = (try self.fullNode(temporary, table, key, json)) orelse return null;
+            var projected = authorized.*;
+            var properties: std.ArrayList(v.Entry) = .empty;
+            for (authorized.properties) |entry| for (fields) |field| {
+                if (std.mem.eql(u8, entry.name, field)) {
+                    try properties.append(temporary, entry);
+                    break;
+                }
+            };
+            projected.properties = properties.items;
+            return (try (v.Value{ .node = &projected }).clone(a)).node;
+        }
+        fn fullNode(self: *Self, a: A, table: []const u8, key: []const u8, json: []const u8) !?*const v.Node {
             const value = try v.Value.fromJson(a, try std.json.parseFromSliceLeaky(std.json.Value, a, json, .{ .parse_numbers = false }));
             if (value != .map) return error.CypherInvalidDocument;
             const result = try a.create(v.Node);
@@ -328,7 +367,12 @@ pub fn Adapter(comptime DB: type, comptime GraphIndex: type, comptime EdgeScanCu
             const result = if (comptime @hasDecl(DB, "cypherDocumentScanOptions")) projected: {
                 if (self.read_fields != null) {
                     const opts = try self.scanOptions(temporary, db, .{ .inclusive_from = true, .include_documents = true, .limit = 1, .row_policy_principal_proof = authorization.proof, .row_policy_database = authorization.database, .execution_deadline_ns = authorization.deadline_ns });
-                    if (opts.relational_query == null) break :projected try self.getFull(a, temporary, db, identity, authorization);
+                    if (opts.relational_query == null) {
+                        if (opts.include_all_fields) break :projected try self.getFull(a, temporary, db, identity, authorization);
+                        var document = (try db.getDocument(temporary, identity.key, .{ .fields = opts.fields, .include_all_fields = false, .row_policy_principal_proof = authorization.proof, .row_policy_database = authorization.database, .execution_deadline_ns = authorization.deadline_ns })) orelse break :projected null;
+                        defer document.deinit(temporary);
+                        break :projected try self.node(a, identity.table, identity.key, document.json);
+                    }
                     var page = try db.scan(temporary, identity.key, identity.key, opts);
                     defer page.deinit(temporary);
                     break :projected if (page.documents.len == 0) null else try self.node(a, identity.table, identity.key, page.documents[0].json);

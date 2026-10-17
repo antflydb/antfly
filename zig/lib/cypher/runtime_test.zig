@@ -931,6 +931,10 @@ test "lazy lower bound probes preserve cyclic trail history and multiplicity" {
 test "property liveness retains complete entities at unknown consumers" {
     const Case = struct { query: []const u8, fields: ?[]const []const u8 };
     for ([_]Case{
+        .{ .query = "CALL antfly.search('docs',{query:'needle'}) YIELD score RETURN sum(score)", .fields = &.{} },
+        .{ .query = "CALL antfly.search('docs',{query:'needle'}) YIELD node AS n RETURN n.title", .fields = &.{"title"} },
+        .{ .query = "CALL antfly.search('docs',{query:'needle'}) YIELD node AS n WITH n AS m RETURN m.rank", .fields = &.{"rank"} },
+        .{ .query = "CALL antfly.search('docs',{query:'needle'}) YIELD node AS n RETURN n", .fields = null },
         .{ .query = "MATCH (n:Document) RETURN count(*)", .fields = &.{} },
         .{ .query = "MATCH (n:Document {id:'a'}) RETURN n.rank", .fields = &.{ "id", "rank" } },
         .{ .query = "MATCH (n:Document) WHERE n.rank>1 RETURN labels(n),antfly.documentKey(n)", .fields = &.{"rank"} },
@@ -1606,6 +1610,9 @@ test "weighted endpoint reductions agree with exact cyclic and acyclic route bag
         "RETURN count(b),count(b.missing),count(*)",
         "WHERE b.rank>=2 RETURN count(b)",
         "RETURN b.rank,count(b),count(b.missing),count(*) ORDER BY b.rank",
+        "RETURN b.rank AS endpoint,count(*) AS total,sum(b.rank),min(b.rank),max(b.rank) ORDER BY endpoint",
+        "RETURN count(DISTINCT b),sum(DISTINCT b.rank),min(DISTINCT b.rank),max(b.rank)",
+        "RETURN sum(b.missing),min(b.missing),max(b.missing),avg(b.missing)",
         "WHERE a.rank<b.rank RETURN a.rank,b.rank,count(*) ORDER BY a.rank,b.rank",
     }) |tail| {
         var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -1630,4 +1637,50 @@ test "weighted endpoint reductions agree with exact cyclic and acyclic route bag
         defer expected.deinit();
         try std.testing.expectEqualStrings(try std.json.Stringify.valueAlloc(a, expected.rows, .{}), try std.json.Stringify.valueAlloc(a, result.rows, .{}));
     };
+}
+
+test "saturated path counts never become approximate SUM or AVG weights" {
+    for ([_][]const u8{ "sum(1e-30)", "avg(1e-30)" }) |reduction| {
+        const text = try std.fmt.allocPrint(std.testing.allocator, "MATCH REPEATABLE ELEMENTS (a:Document)-[:CITES*63..63]-(b:Document) RETURN {s}", .{reduction});
+        defer std.testing.allocator.free(text);
+        var diagnostic: c.Diagnostic = .{};
+        var compiled = try c.compile(std.testing.allocator, text, .{}, &diagnostic);
+        defer compiled.deinit();
+        var fixture: Fixture = .{};
+        try std.testing.expectError(error.CypherStateBudgetExceeded, runtime.execute(std.testing.allocator, fixture.backend(), graph, &compiled, &.{}, .{ .intermediate_states = 20000 }));
+    }
+    try check("MATCH REPEATABLE ELEMENTS (a:Document)-[:CITES*63..63]-(b:Document) RETURN min(1),max(1),count(DISTINCT b)", "[[1,1,3]]");
+}
+
+test "mutation RPC scratch is bounded across large postimages and returns owned entities" {
+    const rpc = @import("rpc.zig");
+    const Channel = struct {
+        fn call(_: *anyopaque, a: std.mem.Allocator, body: []const u8) ![]u8 {
+            try std.testing.expect(body.len > 8192);
+            return a.dupe(u8,
+                \\{"values":[{"type":"node","value":{"identity":{"table":"docs","key":"a"},"labels":["Document"],"properties":{"type":"map","value":{"title":{"type":"string","value":"Alpha"}}}}}]}
+            );
+        }
+    };
+    var state: u8 = 0;
+    var client: rpc.Client = .{ .channel = .{ .ptr = &state, .call = Channel.call }, .incarnation = 1, .revision = 1 };
+    var budget: @import("budget.zig") = .{ .backing = std.testing.allocator, .limit = 2 << 20 };
+    var arena = std.heap.ArenaAllocator.init(budget.allocator());
+    defer arena.deinit();
+    const a = arena.allocator();
+    const payload: [8192]u8 = @splat('x');
+    const node: v.Node = .{ .identity = .{ .table = "docs", .key = "a" }, .labels = &.{"Document"}, .properties = &.{.{ .name = "payload", .value = .{ .string = &payload } }} };
+    var retained: std.ArrayList(*const v.Node) = .empty;
+    const backend = client.backend();
+    for (0..200) |_| {
+        try retained.append(a, try backend.vtable.normalize_node.?(backend.ptr, a, &node, true));
+        try retained.append(a, (try backend.vtable.project_postimage.?(backend.ptr, a, &node)).?);
+        try std.testing.expectEqual(@as(usize, 0), (try backend.vtable.document_relationships.?(backend.ptr, a, &node)).len);
+    }
+    for (retained.items) |owned| {
+        try std.testing.expectEqualStrings("a", owned.identity.key);
+        try std.testing.expectEqualStrings("Document", owned.labels[0]);
+        try std.testing.expectEqualStrings("Alpha", (v.Value{ .node = owned }).property("title").string);
+    }
+    try std.testing.expect(budget.peak < 2 << 20);
 }

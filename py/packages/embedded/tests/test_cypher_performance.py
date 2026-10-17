@@ -1049,6 +1049,32 @@ def test_all_paths_count_uses_dag_states_for_native_and_sql(graph_db):
         else:
             assert result["rows"] == [[{"type": "integer", "value": str(expected)}]]
         assert result["stats"]["explored_edges"] <= 1000
+    grouped = db.cypher_json(
+        "g",
+        {
+            "query": "MATCH (a:D)-[:R*6..6]->(b:D) RETURN b.score AS endpoint,count(*) AS total ORDER BY endpoint",
+            "limits": {"explored_edges": 1000, "intermediate_states": 30000},
+        },
+    )
+    assert [[cell["value"] for cell in row] for row in grouped["rows"]] == [
+        [str(endpoint), str(comb(endpoint, 6))] for endpoint in range(6, size)
+    ]
+    reduced = db.cypher_json(
+        "g",
+        {
+            "query": "MATCH (a:D)-[:R*6..6]->(b:D) RETURN count(*),sum(b.score),min(b.score),max(b.score),avg(b.score),count(DISTINCT b)",
+            "limits": {"explored_edges": 1000, "intermediate_states": 30000, "memory_bytes": 4 << 20},
+        },
+    )
+    total = sum(endpoint * comb(endpoint, 6) for endpoint in range(6, size))
+    assert [cell["value"] for cell in reduced["rows"][0]] == [
+        str(expected),
+        str(total),
+        "6",
+        "17",
+        pytest.approx(total / expected),
+        "12",
+    ]
     rejected = db.cypher_json(
         "g",
         {
@@ -1165,3 +1191,22 @@ def test_sql_interior_anchor_stops_at_outer_demand(graph_db):
     assert len(rows) == 1
     assert rows[0][0].startswith("l") and rows[0][1].startswith("r")
     assert time.monotonic() - start < 5
+
+
+def test_relationship_merge_indexes_bound_pairs_and_reuses_native_adjacency(graph_db):
+    db = graph_db
+    db.sql("CREATE INDEX docs_id ON docs(id)")
+    db.cypher_json("g", {"query": "CREATE (:D {id:'root'})"})
+    query = "MATCH (a:D {id:'root'}) UNWIND $ids AS id MERGE (b:D {id:id}) MERGE (a)-[:R]->(b) RETURN count(*)"
+    result = db.cypher_json("g", {"query": query, "parameters": {"ids": [f"n{i}" for i in range(800)]}})
+    assert result["rows"] == [[{"type": "integer", "value": "800"}]]
+    assert result["stats"]["explored_edges"] == 0
+    assert result["stats"]["intermediate_states"] < 100000
+    repeated = db.cypher_json(
+        "g", {"query": query, "parameters": {"ids": [f"n{i}" for i in range(200)]}, "limits": {"explored_edges": 1200}}
+    )
+    assert repeated["rows"] == [[{"type": "integer", "value": "200"}]]
+    assert repeated["stats"]["explored_edges"] <= 1200
+    assert db.cypher_json("g", {"query": "MATCH ()-[:R]->() RETURN count(*)"})["rows"] == [
+        [{"type": "integer", "value": "800"}]
+    ]

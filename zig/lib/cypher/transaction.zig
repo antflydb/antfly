@@ -55,10 +55,148 @@ pub const Overlay = struct {
     relationships: std.ArrayList(Relationship) = .empty,
     relationship_positions: std.HashMapUnmanaged(v.RelationshipIdentity, usize, v.RelationshipIdentity.Context, std.hash_map.default_max_load_percentage) = .empty,
     mutations: std.ArrayList(b.Mutation) = .empty,
+    pairs: std.HashMapUnmanaged(Pair, PairBucket, Pair.Context, std.hash_map.default_max_load_percentage) = .empty,
+    pair_keys: std.AutoHashMapUnmanaged(usize, Pair) = .empty,
+    pair_indexed: bool = false,
+    captured_adjacency: std.HashMapUnmanaged(Adjacency, void, Adjacency.Context, std.hash_map.default_max_load_percentage) = .empty,
     max_entities: usize = 65536,
     max_anchors: usize = 1_000_000,
     max_edges: usize = 1_000_000,
     captured: b.StartupWork = .{},
+    const Pair = struct {
+        source: v.Identity,
+        target: v.Identity,
+        index: []const u8,
+        type: []const u8,
+        const Context = struct {
+            pub fn hash(_: @This(), pair: Pair) u64 {
+                return std.hash.Wyhash.hash(std.hash.Wyhash.hash((v.Identity.Context{}).hash(pair.source), pair.index) ^ (v.Identity.Context{}).hash(pair.target), pair.type);
+            }
+            pub fn eql(_: @This(), left: Pair, right: Pair) bool {
+                return left.source.eql(right.source) and left.target.eql(right.target) and std.mem.eql(u8, left.index, right.index) and std.mem.eql(u8, left.type, right.type);
+            }
+        };
+    };
+    const PairBucket = struct { positions: Positions = .empty, properties: std.StringHashMapUnmanaged(StagedIndex) = .empty };
+    const Adjacency = struct {
+        identity: v.Identity,
+        index: []const u8,
+        type: []const u8,
+        direction: ast.Direction,
+        const Context = struct {
+            pub fn hash(_: @This(), key: Adjacency) u64 {
+                return std.hash.Wyhash.hash(std.hash.Wyhash.hash((v.Identity.Context{}).hash(key.identity), key.index), key.type) ^ @backingInt(key.direction);
+            }
+            pub fn eql(_: @This(), left: Adjacency, right: Adjacency) bool {
+                return left.identity.eql(right.identity) and left.direction == right.direction and std.mem.eql(u8, left.index, right.index) and std.mem.eql(u8, left.type, right.type);
+            }
+        };
+    };
+    fn pairProperty(self: *Overlay, index: *StagedIndex, position: usize, remove: bool) !void {
+        const a = self.alloc.?;
+        try self.charge(1);
+        if (index.hashes.fetchRemove(position)) |old| _ = index.buckets.getPtr(old.value).?.swapRemove(position);
+        if (remove) return;
+        const hash = (try self.scalarHash((v.Value{ .relationship = self.relationships.items[position].value }).property(index.property))) orelse return;
+        const bucket = try index.buckets.getOrPut(a, hash);
+        if (!bucket.found_existing) bucket.value_ptr.* = .empty;
+        try bucket.value_ptr.put(a, position, {});
+        try index.hashes.put(a, position, hash);
+    }
+    fn indexPair(self: *Overlay, position: usize) !void {
+        if (!self.pair_indexed) return;
+        try self.charge(1);
+        const a = self.alloc.?;
+        if (self.pair_keys.fetchRemove(position)) |old| {
+            const bucket = self.pairs.getPtr(old.value).?;
+            _ = bucket.positions.swapRemove(position);
+            var indexes = bucket.properties.valueIterator();
+            while (indexes.next()) |index| try self.pairProperty(index, position, true);
+        }
+        const relationship = self.relationships.items[position];
+        if (relationship.deleted) return;
+        const value = relationship.value;
+        const pair: Pair = .{ .source = value.source, .target = value.target, .index = value.index, .type = value.type };
+        const entry = try self.pairs.getOrPut(a, pair);
+        if (!entry.found_existing) entry.value_ptr.* = .{};
+        try entry.value_ptr.positions.put(a, position, {});
+        try self.pair_keys.put(a, position, pair);
+        var indexes = entry.value_ptr.properties.valueIterator();
+        while (indexes.next()) |index| try self.pairProperty(index, position, false);
+    }
+    fn pairCandidates(self: *Overlay, _: A, pair: Pair, filters: []const b.PropertyFilter) ![]const usize {
+        const bucket = self.pairs.getPtr(pair) orelse return &.{};
+        var best: []const usize = bucket.positions.keys();
+        for (filters) |filter| {
+            if (filter.op != .eq) continue;
+            const hash = (try self.scalarHash(filter.value)) orelse continue;
+            const slot = try bucket.properties.getOrPut(self.alloc.?, filter.property);
+            if (!slot.found_existing) {
+                slot.key_ptr.* = try self.alloc.?.dupe(u8, filter.property);
+                slot.value_ptr.* = .{ .table = "", .property = slot.key_ptr.* };
+                for (bucket.positions.keys()) |position| try self.pairProperty(slot.value_ptr, position, false);
+            }
+            const candidates = if (slot.value_ptr.buckets.get(hash)) |positions| positions.keys() else &.{};
+            if (candidates.len < best.len) best = candidates;
+        }
+        return best;
+    }
+    fn expandBetween(ptr: *anyopaque, a: A, mapping: c.Relationship, identity: v.Identity, peer: v.Identity, direction: ast.Direction, filters: []const b.PropertyFilter, after: ?[]const u8, limit: usize, max_examined: usize) !b.Page(*const v.Relationship) {
+        const self = cast(ptr);
+        try checkpoint(ptr);
+        if (limit == 0) return error.CypherInvalidBackendPage;
+        if (!self.active) {
+            if (self.base.vtable.expand_between) |between| return between(self.base.ptr, a, mapping, identity, peer, direction, filters, after, limit, max_examined);
+            return self.base.vtable.expand(self.base.ptr, a, mapping, identity, direction, after, limit);
+        }
+        if (!self.pair_indexed) {
+            self.pair_indexed = true;
+            for (0..self.relationships.items.len) |position| try self.indexPair(position);
+        }
+        var examined: usize = 0;
+        const adjacency: Adjacency = .{ .identity = identity, .index = mapping.index, .type = mapping.name, .direction = direction };
+        if (self.lazy and !self.captured_adjacency.contains(adjacency)) {
+            // Native stores without a pair seek are indexed once per retained
+            // adjacency domain. Staged edges join the same postings incrementally.
+            var cursor: ?[]const u8 = null;
+            var scratch = std.heap.ArenaAllocator.init(b.reclaimingAllocator(a));
+            defer scratch.deinit();
+            var cursor_bytes: std.ArrayList(u8) = .empty;
+            const cursor_allocator = b.reclaimingAllocator(a);
+            defer cursor_bytes.deinit(cursor_allocator);
+            while (true) {
+                _ = scratch.reset(.retain_capacity);
+                const page = try self.lazyExpand(scratch.allocator(), mapping, identity, direction, cursor, @min(128, @max(1, max_examined -| examined)));
+                const count = page.examined orelse page.items.len;
+                if (count > @min(self.max_edges, max_examined) -| examined) return error.CypherEdgeBudgetExceeded;
+                examined += count;
+                // lazyExpand has retained native identities and pair postings.
+                const next = page.next orelse break;
+                const continuation = try std.json.parseFromSliceLeaky(LazyCursor, scratch.allocator(), next, .{});
+                if (continuation.staged) break;
+                if (examined == max_examined) return error.CypherEdgeBudgetExceeded;
+                cursor_bytes.clearRetainingCapacity();
+                try cursor_bytes.appendSlice(cursor_allocator, next);
+                cursor = cursor_bytes.items;
+            }
+            const retained = self.alloc.?;
+            try self.captured_adjacency.put(retained, .{ .identity = .{ .table = try retained.dupe(u8, identity.table), .key = try retained.dupe(u8, identity.key) }, .index = try retained.dupe(u8, mapping.index), .type = try retained.dupe(u8, mapping.name), .direction = direction }, {});
+        }
+        const outgoing = if (direction != .in) try self.pairCandidates(a, .{ .source = identity, .target = peer, .index = mapping.index, .type = mapping.name }, filters) else &.{};
+        const incoming = if (direction != .out and (!identity.eql(peer) or direction == .in)) try self.pairCandidates(a, .{ .source = peer, .target = identity, .index = mapping.index, .type = mapping.name }, filters) else &.{};
+        const count = outgoing.len + incoming.len;
+        const offset = if (after) |encoded| try std.fmt.parseUnsigned(usize, encoded, 10) else 0;
+        if (offset > count) return error.CypherInvalidBackendCursor;
+        const end = offset + @min(limit, count - offset);
+        var output: std.ArrayList(*const v.Relationship) = .empty;
+        for (offset..end) |candidate| {
+            const position = if (candidate < outgoing.len) outgoing[candidate] else incoming[candidate - outgoing.len];
+            try self.charge(1);
+            const relationship = self.relationships.items[position];
+            if (!relationship.deleted and try self.producerVisible(a, relationship.value)) try output.append(a, relationship.value);
+        }
+        return .{ .items = try output.toOwnedSlice(a), .examined = examined + end - offset, .next = if (end < count) try std.fmt.allocPrint(a, "{d}", .{end}) else null };
+    }
     const Positions = std.AutoArrayHashMapUnmanaged(usize, void);
     const StagedIndex = struct {
         table: []const u8,
@@ -162,7 +300,7 @@ pub const Overlay = struct {
     const Reference = struct { position: usize, version: usize };
     const Node = struct { value: *v.Node, deleted: bool = false, created: bool = false, dirty: bool = false, projection_cached: bool = false, projected: ?*const v.Node = null };
     const Relationship = struct { value: *v.Relationship, deleted: bool = false, created: bool = false, dirty: bool = false, version: usize = 0, from_base: bool = false };
-    const plain_vtable: b.Backend.VTable = .{ .bind = bind, .checkpoint = checkpoint, .scan = scan, .scan_where = scanWhere, .get = get, .get_many = getMany, .get_relationship = getRelationship, .expand = expand, .search = search, .set_work = setWork, .set_read_fields = setReadFields, .begin = begin, .startup_work = startupWork, .mutate = mutate, .commit = commit, .rollback = rollback, .new_identity = newIdentity };
+    const plain_vtable: b.Backend.VTable = .{ .bind = bind, .checkpoint = checkpoint, .scan = scan, .scan_where = scanWhere, .get = get, .get_many = getMany, .get_relationship = getRelationship, .expand = expand, .expand_between = expandBetween, .search = search, .set_work = setWork, .set_read_fields = setReadFields, .begin = begin, .startup_work = startupWork, .mutate = mutate, .commit = commit, .rollback = rollback, .new_identity = newIdentity };
     const projecting_vtable: b.Backend.VTable = projected: {
         var value = plain_vtable;
         value.project_node = projectNode;
@@ -362,6 +500,7 @@ pub const Overlay = struct {
         try self.relationship_positions.put(a, .{ .identity = value.identity, .index = value.index }, self.relationships.items.len);
         self.relationships.appendAssumeCapacity(relationship);
         try self.indexReferences(a, self.relationships.items.len - 1);
+        try self.indexPair(self.relationships.items.len - 1);
     }
     fn indexReferences(self: *Overlay, a: A, position: usize) !void {
         const relationship = &self.relationships.items[position];
@@ -391,6 +530,7 @@ pub const Overlay = struct {
         const value = self.relationships.items[position].value;
         try self.relationship_positions.put(a, .{ .identity = value.identity, .index = value.index }, position);
         try self.indexReferences(a, position);
+        try self.indexPair(position);
     }
     fn findRelationship(self: *Overlay, identity: v.RelationshipIdentity) ?*Relationship {
         const position = self.relationship_positions.get(identity) orelse return null;
@@ -762,6 +902,7 @@ pub const Overlay = struct {
                 }
                 relationship.value.properties = try self.properties(a, relationship.value.properties, updates, replace);
                 relationship.dirty = true;
+                try self.indexPair(self.relationship_positions.get(.{ .identity = relationship.value.identity, .index = relationship.value.index }).?);
             },
         }
     }
@@ -782,7 +923,10 @@ pub const Overlay = struct {
         if (self.references.get(identity)) |references| for (references.items) |reference| {
             try self.charge(1);
             const relationship = self.currentReference(reference) orelse continue;
-            if ((!fields_only or relationship.value.ownership == .field) and try ownedBy(a, relationship.value, identity)) relationship.deleted = true;
+            if ((!fields_only or relationship.value.ownership == .field) and try ownedBy(a, relationship.value, identity)) {
+                relationship.deleted = true;
+                try self.indexPair(reference.position);
+            }
         };
     }
     fn refreshDocumentRelationships(self: *Overlay, a: A, node: *const v.Node) !void {
@@ -843,6 +987,7 @@ pub const Overlay = struct {
                 if (relationship.value.ownership != .explicit) return error.CypherDerivedRelationshipMutation;
                 relationship.deleted = true;
                 relationship.dirty = true;
+                try self.indexPair(self.relationship_positions.get(identity).?);
             },
             .delete_node => |deletion| {
                 _ = (try self.ensureNode(a, deletion.identity)) orelse return error.CypherDeletedEntity;
@@ -854,12 +999,14 @@ pub const Overlay = struct {
                     if (try ownedBy(a, relationship.value, deletion.identity) and !(relationship.value.source.eql(deletion.identity) or relationship.value.target.eql(deletion.identity))) {
                         relationship.deleted = true;
                         relationship.dirty = true;
+                        try self.indexPair(reference.position);
                         continue;
                     }
                     if (!(relationship.value.source.eql(deletion.identity) or relationship.value.target.eql(deletion.identity))) continue;
                     if (!deletion.detach) return error.CypherNodeHasRelationships;
                     relationship.deleted = true;
                     relationship.dirty = true;
+                    try self.indexPair(reference.position);
                 };
                 const current = self.findNode(deletion.identity).?;
                 current.deleted = true;
@@ -896,5 +1043,9 @@ pub const Overlay = struct {
         self.relationships = .empty;
         self.relationship_positions = .empty;
         self.mutations = .empty;
+        self.pairs = .empty;
+        self.pair_keys = .empty;
+        self.pair_indexed = false;
+        self.captured_adjacency = .empty;
     }
 };

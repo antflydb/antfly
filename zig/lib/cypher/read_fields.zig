@@ -55,6 +55,16 @@ const Plan = struct {
                 // complete values. Preserve outer bindings for later clauses.
                 self.entities = outer;
             },
+            .call => |procedure| {
+                try self.walk(procedure.args);
+                if (std.mem.eql(u8, procedure.name, "antfly.search")) {
+                    for (procedure.yields) |yield| {
+                        _ = self.entities.remove(yield.alias);
+                        if (std.mem.eql(u8, yield.name, "node")) try self.entities.put(self.a, yield.alias, {});
+                    }
+                    try self.walk(procedure.predicate);
+                } else self.full = true;
+            },
             .unwind => |u| {
                 try self.walk(u.expression.*);
                 _ = self.entities.remove(u.alias);

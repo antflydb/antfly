@@ -804,9 +804,13 @@ const Engine = struct {
         count: u64 = 0,
         sum: v.Value = .{ .integer = 0 },
         mean: f64 = 0,
+        mean_weight: f64 = 0,
         best: v.Value = .null,
         collected: std.ArrayList(v.Value) = .empty,
         fn add(self: *StreamingAggregate, engine: *Engine, row: Row) !void {
+            return self.addWeighted(engine, row, 1);
+        }
+        fn addWeighted(self: *StreamingAggregate, engine: *Engine, row: Row, multiplicity: u64) !void {
             const value = if (self.function.star) v.Value{ .integer = 1 } else try engine.eval(self.function.args[0], row, null);
             if (value == .null) return;
             // MIN/MAX are duplicate insensitive and need no distinct set.
@@ -825,8 +829,13 @@ const Engine = struct {
                 try self.distinct_index.insert(retained, hash, self.distinct_values.items.len);
                 try self.distinct_values.append(retained, owned);
             }
-            self.count += 1;
-            if (std.ascii.eqlIgnoreCase(self.function.name, "count")) return;
+            const weight = if (self.function.distinct or std.ascii.eqlIgnoreCase(self.function.name, "min") or std.ascii.eqlIgnoreCase(self.function.name, "max")) 1 else multiplicity;
+            const prior_count = self.count;
+            self.count +|= weight;
+            if (std.ascii.eqlIgnoreCase(self.function.name, "count")) {
+                self.count = try addPathCount(prior_count, weight);
+                return;
+            }
             if (std.ascii.eqlIgnoreCase(self.function.name, "collect")) {
                 const retained = self.arena.allocator();
                 const owned = if (self.function.distinct) self.distinct_values.items[self.distinct_values.items.len - 1] else try value.clone(retained);
@@ -835,11 +844,37 @@ const Engine = struct {
             }
             if (std.ascii.eqlIgnoreCase(self.function.name, "sum")) {
                 if (value != .integer and value != .number) return error.CypherTypeMismatch;
-                self.sum = try engine.binary(.add, self.sum, value);
+                if (self.sum == .integer and value == .integer) {
+                    // A wide intermediate avoids a spurious product overflow
+                    // when the current sum offsets a repeated value.
+                    const sum = @as(i128, self.sum.integer) + @as(i128, value.integer) * @as(i128, weight);
+                    self.sum = .{ .integer = std.math.cast(i64, sum) orelse return error.CypherNumericOverflow };
+                } else {
+                    if (weight == 1) {
+                        self.sum = try engine.binary(.add, self.sum, value);
+                    } else {
+                        // A finite current sum can offset an overflowing f64
+                        // product. Wider arithmetic keeps that cancellation.
+                        const combined = @as(f128, try self.sum.numeric()) + @as(f128, try value.numeric()) * @as(f128, @floatFromInt(weight));
+                        const number: f64 = @floatCast(combined);
+                        if (!std.math.isFinite(number)) return error.CypherNumericOverflow;
+                        self.sum = .{ .number = number };
+                    }
+                }
                 return;
             }
             if (std.ascii.eqlIgnoreCase(self.function.name, "avg")) {
-                self.mean = numbers.nextAverage(self.mean, try value.numeric(), @intCast(self.count));
+                const number = try value.numeric();
+                const added: f64 = @floatFromInt(weight);
+                const total = self.mean_weight + added;
+                if (prior_count == 0) self.mean = number else if (weight == 1 and total < @as(f64, @floatFromInt(std.math.maxInt(usize)))) {
+                    self.mean = numbers.nextAverage(self.mean, number, @intFromFloat(total));
+                } else {
+                    const fraction = added / total;
+                    const difference = number - self.mean;
+                    self.mean = if (std.math.isFinite(difference)) self.mean + difference * fraction else self.mean * (self.mean_weight / total) + number * fraction;
+                }
+                self.mean_weight = total;
                 if (!std.math.isFinite(self.mean)) return error.CypherNumericOverflow;
                 return;
             }
@@ -1031,15 +1066,7 @@ const Engine = struct {
             } else if (!fold.has_keys and fold.groups.items[0].source.len == 0) {
                 fold.groups.items[0].source = (try (v.Value{ .map = row }).clone(fold.retained)).map;
             }
-            for (fold.groups.items[found.?].states) |*accumulator| {
-                if (fold.weight == 1) {
-                    try accumulator.add(engine, row);
-                } else {
-                    const aggregate_call = accumulator.function;
-                    std.debug.assert(!aggregate_call.distinct and std.ascii.eqlIgnoreCase(aggregate_call.name, "count"));
-                    if (aggregate_call.star or (try engine.eval(aggregate_call.args[0], row, null)) != .null) accumulator.count = try addPathCount(accumulator.count, fold.weight);
-                }
-            }
+            for (fold.groups.items[found.?].states) |*accumulator| try accumulator.addWeighted(engine, row, fold.weight);
             if (fold.distinct_goal) |goal| if (fold.groups.items.len >= goal) return error.CypherStreamComplete;
         }
         fn demand(fold: *@This()) usize {
@@ -1107,11 +1134,21 @@ const Engine = struct {
             break :blk true;
         };
         const count_endpoints = !count_shortest and !operation.optional and operation.paths.len == 1 and path.selector == .all and grouped and middle.len == 0 and calls.items.len != 0 and blk: {
-            for (calls.items) |expression| if (expression.value.call.distinct or !std.ascii.eqlIgnoreCase(expression.value.call.name, "count")) break :blk false;
+            // One fixed hop has no shared prefixes to compress. Keep its
+            // page-at-a-time fold instead of retaining the whole adjacency.
+            if (path.edges.len == 1 and path.edges[0].min_hops == 1 and path.edges[0].max_hops == 1) break :blk false;
+            for (calls.items) |expression| {
+                const name = expression.value.call.name;
+                if (!std.ascii.eqlIgnoreCase(name, "count") and !std.ascii.eqlIgnoreCase(name, "sum") and !std.ascii.eqlIgnoreCase(name, "avg") and !std.ascii.eqlIgnoreCase(name, "min") and !std.ascii.eqlIgnoreCase(name, "max")) break :blk false;
+            }
             for (input) |row| {
                 if (operation.predicate) |predicate| if (!endpointExpression(predicate, path, row)) break :blk false;
                 for (projection.items) |item| if (!endpointExpression(item.expression, path, row)) break :blk false;
-                for (projection.order) |order| if (!endpointExpression(order.expression, path, row)) break :blk false;
+                var order_scope = row;
+                for (projection.items) |item| if (item.alias) |alias| {
+                    order_scope = try self.replace(order_scope, alias, .null);
+                };
+                for (projection.order) |order| if (!endpointExpression(order.expression, path, order_scope)) break :blk false;
             }
             break :blk true;
         };
@@ -2183,7 +2220,23 @@ const Engine = struct {
             }
             std.mem.swap(Counts, &current, &endpoints);
         }
-        if (mode != .repeatable and !try self.lowerAcyclic(&graph)) {
+        // Saturated counts prove COUNT overflow but are not numeric weights.
+        // Never approximate SUM/AVG with the overflow sentinel.
+        var exact_weights = true;
+        if (self.count_endpoints) {
+            const needs_weights = for (self.stream_fold.?.calls) |expression| {
+                const aggregate_call = expression.value.call;
+                if (!aggregate_call.distinct and (std.ascii.eqlIgnoreCase(aggregate_call.name, "sum") or std.ascii.eqlIgnoreCase(aggregate_call.name, "avg"))) break true;
+            } else false;
+            if (needs_weights) {
+                var weights = current.valueIterator();
+                while (weights.next()) |weight| if (weight.* > std.math.maxInt(i64)) {
+                    exact_weights = false;
+                    break;
+                };
+            }
+        }
+        if (!exact_weights or (mode != .repeatable and !try self.lowerAcyclic(&graph))) {
             const previous = self.lower_graph;
             self.lower_graph = &graph;
             defer self.lower_graph = previous;
@@ -2224,7 +2277,7 @@ const Engine = struct {
                 break :blk true;
             },
             .call => |scalar_call| blk: {
-                const safe = for ([_][]const u8{ "count", "id", "labels", "properties", "keys", "size", "coalesce", "abs", "toInteger", "toFloat", "toString" }) |name| {
+                const safe = for ([_][]const u8{ "count", "sum", "avg", "min", "max", "id", "labels", "properties", "keys", "size", "coalesce", "abs", "toInteger", "toFloat", "toString" }) |name| {
                     if (std.ascii.eqlIgnoreCase(name, scalar_call.name)) break true;
                 } else false;
                 if (!safe) break :blk false;
@@ -2760,7 +2813,21 @@ const Engine = struct {
                 if (page_scope != null) self.cache_reads = true;
                 defer if (page_scope) |scope| scope.leave(self);
                 try self.checkpoint();
-                const page = try self.expandEdges(mapping_index, mapping, current.identity, edge.direction, cursor, if (self.stream_fold) |fold| fold.demand() else 128);
+                const demand = if (self.stream_fold) |fold| fold.demand() else 128;
+                const page = pair: {
+                    if (self.lower_graph == null and hops == 0 and edge.min_hops == 1 and edge.max_hops == 1) {
+                        if (self.backend.vtable.expand_between) |between| if (path.nodes[edge_index + 1].alias) |alias| if (lookup(input.row, alias)) |bound| {
+                            if (bound != .node) break :pair backend_mod.Page(*const v.Relationship){ .items = &.{} };
+                            var filters: std.ArrayList(backend_mod.PropertyFilter) = .empty;
+                            for (edge.properties) |property| if (self.constant(property.value, input.row)) |value| try filters.append(self.a, .{ .property = property.name, .value = value });
+                            const page = try between(self.backend.ptr, self.a, mapping, current.identity, bound.node.identity, edge.direction, filters.items, cursor, demand, self.limits.explored_edges -| self.stats.explored_edges);
+                            try self.accountEdges(page);
+                            break :pair page;
+                        };
+                    }
+                    break :pair try self.expandEdges(mapping_index, mapping, current.identity, edge.direction, cursor, demand);
+                };
+
                 try self.prefetchEndpoints(page.items, current.identity, outgoing, incoming);
                 for (page.items) |relationship| {
                     var used = false;
@@ -4024,3 +4091,32 @@ const Engine = struct {
         return rows;
     }
 };
+
+test "weighted numeric reductions keep finite cancellation and checked integer bounds" {
+    const Noop = struct {
+        fn checkpoint(_: *anyopaque) !void {}
+    };
+    var state: u8 = 0;
+    var engine: Engine = .{ .a = std.testing.allocator, .scratch_allocator = std.testing.allocator, .regex = undefined, .backend = .{ .ptr = &state, .vtable = &.{ .bind = undefined, .checkpoint = Noop.checkpoint, .scan = undefined, .get = undefined, .expand = undefined } }, .graph = undefined, .source = "", .parameters = &.{}, .limits = .{} };
+    engine.values = .{ .a = engine.a, .ptr = &engine, .charge = Engine.chargeWork };
+    var operand: ast.Expr = .{ .span = .{}, .value = .{ .literal = .{ .number = 1e308 } } };
+    var reduction: Engine.StreamingAggregate = .{ .function = .{ .name = "sum", .args = &.{&operand} }, .arena = std.heap.ArenaAllocator.init(std.testing.allocator), .distinct_arena = std.heap.ArenaAllocator.init(std.testing.allocator) };
+    defer reduction.arena.deinit();
+    defer reduction.distinct_arena.deinit();
+    reduction.sum = .{ .number = -1e308 };
+    try reduction.addWeighted(&engine, &.{}, 2);
+    try std.testing.expectEqual(@as(f64, 1e308), reduction.result().number);
+    operand.value = .{ .literal = .{ .integer = std.math.maxInt(i64) } };
+    reduction.sum = .{ .integer = -std.math.maxInt(i64) };
+    try reduction.addWeighted(&engine, &.{}, 2);
+    try std.testing.expectEqual(std.math.maxInt(i64), reduction.result().integer);
+    reduction.sum = .{ .integer = 0 };
+    try std.testing.expectError(error.CypherNumericOverflow, reduction.addWeighted(&engine, &.{}, 2));
+    operand.value = .{ .literal = .{ .number = 1e308 } };
+    reduction.function.name = "avg";
+    reduction.count = 1;
+    reduction.mean = -1e308;
+    reduction.mean_weight = 1;
+    try reduction.addWeighted(&engine, &.{}, 2);
+    try std.testing.expectApproxEqRel(@as(f64, 1e308 / 3.0), reduction.result().number, 1e-14);
+}

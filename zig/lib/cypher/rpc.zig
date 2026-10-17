@@ -100,8 +100,11 @@ pub const Client = struct {
     }
     fn normalizeNode(ptr: *anyopaque, a: A, node: *const v.Node, apply_defaults: bool) !*const v.Node {
         const self = cast(ptr);
-        const document = try std.json.parseFromSliceLeaky(std.json.Value, a, try std.json.Stringify.valueAlloc(a, v.Value{ .map = node.properties }, .{}), .{ .parse_numbers = false });
-        const reply = try self.invoke(a, .{ .operation = .normalize, .graph_incarnation = self.incarnation, .graph_revision = self.revision, .table = node.identity.table, .identity = node.identity, .document = document, .apply_defaults = apply_defaults });
+        var scratch = std.heap.ArenaAllocator.init(b.reclaimingAllocator(a));
+        defer scratch.deinit();
+        const temporary = scratch.allocator();
+        const document = try std.json.parseFromSliceLeaky(std.json.Value, temporary, try std.json.Stringify.valueAlloc(temporary, v.Value{ .map = node.properties }, .{}), .{ .parse_numbers = false });
+        const reply = try self.invoke(temporary, .{ .operation = .normalize, .graph_incarnation = self.incarnation, .graph_revision = self.revision, .table = node.identity.table, .identity = node.identity, .document = document, .apply_defaults = apply_defaults });
         if (reply.values.len != 1) return error.CypherInvalidBackendPage;
         const value = try wire.transport(a, reply.values[0]);
         if (value != .node or !value.node.identity.eql(node.identity)) return error.CypherInvalidBackendPage;
@@ -109,11 +112,18 @@ pub const Client = struct {
     }
     fn projectPostimage(ptr: *anyopaque, a: A, node: *const v.Node) !?*const v.Node {
         const self = cast(ptr);
-        const document = try std.json.parseFromSliceLeaky(std.json.Value, a, try std.json.Stringify.valueAlloc(a, v.Value{ .map = node.properties }, .{}), .{ .parse_numbers = false });
+        var scratch = std.heap.ArenaAllocator.init(b.reclaimingAllocator(a));
+        defer scratch.deinit();
+        const temporary = scratch.allocator();
+        const document = try std.json.parseFromSliceLeaky(std.json.Value, temporary, try std.json.Stringify.valueAlloc(temporary, v.Value{ .map = node.properties }, .{}), .{ .parse_numbers = false });
         return (try self.projectDocument(a, node.identity, document, &.{}, false)).node;
     }
     pub fn projectDocument(self: *Client, a: A, identity: v.Identity, document: std.json.Value, json_null_fields: []const []const u8, include_relationships: bool) !Projection {
-        const reply = try self.invoke(a, .{ .operation = .project, .graph_incarnation = self.incarnation, .graph_revision = self.revision, .table = identity.table, .identity = identity, .document = document, .json_null_fields = json_null_fields, .include_relationships = include_relationships });
+        // Retain canonical entities, not JSON request/response scaffolding for
+        // every postimage in a large mutation statement.
+        var scratch = std.heap.ArenaAllocator.init(b.reclaimingAllocator(a));
+        defer scratch.deinit();
+        const reply = try self.invoke(scratch.allocator(), .{ .operation = .project, .graph_incarnation = self.incarnation, .graph_revision = self.revision, .table = identity.table, .identity = identity, .document = document, .json_null_fields = json_null_fields, .include_relationships = include_relationships });
         if (reply.values.len == 0) return .{ .node = null };
         if (reply.values.len != 1) return error.CypherInvalidBackendPage;
         const value = try wire.transport(a, reply.values[0]);
@@ -128,7 +138,10 @@ pub const Client = struct {
     }
     fn documentRelationships(ptr: *anyopaque, a: A, node: *const v.Node) ![]const *const v.Relationship {
         const self = cast(ptr);
-        const document = try std.json.parseFromSliceLeaky(std.json.Value, a, try std.json.Stringify.valueAlloc(a, v.Value{ .map = node.properties }, .{}), .{ .parse_numbers = false });
+        var scratch = std.heap.ArenaAllocator.init(b.reclaimingAllocator(a));
+        defer scratch.deinit();
+        const temporary = scratch.allocator();
+        const document = try std.json.parseFromSliceLeaky(std.json.Value, temporary, try std.json.Stringify.valueAlloc(temporary, v.Value{ .map = node.properties }, .{}), .{ .parse_numbers = false });
         return (try self.projectDocument(a, node.identity, document, &.{}, true)).relationships;
     }
     fn scan(ptr: *anyopaque, a: A, table: []const u8, after: ?[]const u8, limit: usize) !b.Page(*const v.Node) {

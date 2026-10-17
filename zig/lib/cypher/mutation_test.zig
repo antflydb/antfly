@@ -1264,3 +1264,48 @@ test "staged index candidates use authorized projected property values" {
         try std.testing.expectEqual(@as(usize, if (hidden) 0 else 1), found);
     }
 }
+
+test "bound relationship MERGE indexes pairs and scalar properties with linear work" {
+    const Host = struct {
+        fn commit(_: *anyopaque, _: A, _: []const b.Mutation) !void {}
+    };
+    inline for ([_]bool{ false, true }) |parallel| {
+        var previous: usize = 0;
+        for ([_]usize{ 200, 400, 800 }) |count| {
+            var fixture = Fixture.init();
+            defer fixture.arena.deinit();
+            var overlay: root.transaction.Overlay = .{ .base = fixture.backend(), .host = .{ .ptr = &fixture, .new_identity = Fixture.identity, .commit = Host.commit }, .lazy = true };
+            const text = try std.fmt.allocPrint(fixture.arena.allocator(), if (parallel) "CREATE (a:Person),(b:Person) WITH a,b UNWIND range(1,{d}) AS i MERGE (a)-[:KNOWS {{age:i}}]->(b) RETURN count(*)" else "CREATE (a:Person) WITH a UNWIND range(1,{d}) AS i MERGE (b:Person {{age:i}}) MERGE (a)-[:KNOWS]->(b) RETURN count(*)", .{count});
+            var diagnostic: root.compiler.Diagnostic = .{};
+            var compiled = try root.compiler.compile(std.testing.allocator, text, .{}, &diagnostic);
+            defer compiled.deinit();
+            var result = try root.runtime.execute(std.testing.allocator, overlay.backend(), graph, &compiled, &.{}, .{});
+            defer result.deinit();
+            try std.testing.expectEqual(@as(i64, @intCast(count)), result.rows[0][0].integer);
+            try std.testing.expectEqual(count, overlay.relationships.items.len);
+            try std.testing.expectEqual(@as(usize, 0), result.stats.explored_edges);
+            if (previous != 0) try std.testing.expect(result.stats.intermediate_states < previous * 3);
+            previous = result.stats.intermediate_states;
+        }
+    }
+}
+
+test "pair indexes track postimage updates deletion parallel bags incoming edges and self loops" {
+    const Host = struct {
+        fn commit(_: *anyopaque, _: A, _: []const b.Mutation) !void {}
+    };
+    for ([_]bool{ false, true }) |lazy| {
+        var fixture = Fixture.init();
+        defer fixture.arena.deinit();
+        var overlay: root.transaction.Overlay = .{ .base = fixture.backend(), .host = .{ .ptr = &fixture, .new_identity = Fixture.identity, .commit = Host.commit }, .lazy = lazy };
+        const text = "CREATE (a:Person),(b:Person),(a)-[r:KNOWS {age:1}]->(b),(a)-[s:KNOWS {age:1}]->(b) WITH a,b,r,s MATCH (a)-[m:KNOWS {age:1}]->(b) WITH a,b,r,s,count(m) AS before SET r.age=2 DELETE s WITH a,b,before MATCH (b)<-[m:KNOWS {age:2}]-(a) WITH a,before,count(m) AS after CREATE (a)-[:KNOWS {age:2}]->(a) WITH a,before,after MATCH (a)-[loop:KNOWS]-(a) RETURN before,after,count(loop)";
+        var diagnostic: root.compiler.Diagnostic = .{};
+        var compiled = try root.compiler.compile(std.testing.allocator, text, .{}, &diagnostic);
+        defer compiled.deinit();
+        var result = try root.runtime.execute(std.testing.allocator, overlay.backend(), graph, &compiled, &.{}, .{});
+        defer result.deinit();
+        try std.testing.expectEqual(@as(i64, 2), result.rows[0][0].integer);
+        try std.testing.expectEqual(@as(i64, 1), result.rows[0][1].integer);
+        try std.testing.expectEqual(@as(i64, 1), result.rows[0][2].integer);
+    }
+}
