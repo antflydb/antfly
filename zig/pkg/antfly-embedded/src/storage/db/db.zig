@@ -3931,8 +3931,10 @@ pub const DB = struct {
             // marker. A writable owner builds the directory once, before range
             // initialization or core open read the namespace; read-only opens
             // keep failing closed.
-            if (!openModeRequiresReadOnlyBackends(opts.open_mode))
-                try doc_identity.upgradeImportedLiveDirectoryAlloc(alloc, &opened_primary.store, .none);
+            if (!openModeRequiresReadOnlyBackends(opts.open_mode)) {
+                const upgrade_control = if (opts.initial_owner_range) |*initial| initial.cancellationToken() else types.CancellationToken.none;
+                try doc_identity.upgradeImportedLiveDirectoryAlloc(alloc, &opened_primary.store, upgrade_control);
+            }
             if (opts.initial_owner_range) |initial| try range_state_mod.initializeOwnerRange(alloc, &opened_primary.store, initial);
             profile.primary_store_ns = elapsedSince(open_primary_started_ns);
             const core_resources_started_ns = monotonicTimeNs();
@@ -69549,6 +69551,83 @@ test "db writable reopen builds the live identity directory for a legacy identit
     });
     defer filtered.deinit();
     try std.testing.expectEqual(@as(u32, 2), filtered.total_hits);
+}
+
+test "db legacy identity upgrade respects canceled owner open" {
+    try testLegacyIdentityCanceledOpen(.canceled);
+}
+
+test "db legacy identity upgrade respects expired owner deadline" {
+    try testLegacyIdentityCanceledOpen(.expired);
+}
+
+test "db legacy identity upgrade can retry after cancellation before marker publication" {
+    try testLegacyIdentityCanceledOpen(.before_marker);
+}
+
+fn testLegacyIdentityCanceledOpen(control: enum { canceled, expired, before_marker }) !void {
+    const a = std.testing.allocator;
+    var tmp = try TestDirectory.init("db-legacy-open-control");
+    defer tmp.cleanup();
+    {
+        var db = try DB.open(a, tmp.path(), .{ .start_optional_runtimes = false, .start_index_workers = false });
+        defer db.close();
+        try db.batch(.{ .writes = &.{.{ .key = "doc", .value = "{}" }}, .sync_level = .write });
+        const live = try internal_keys.identityLiveDocToOrdinalKeyAlloc(a, "doc");
+        defer a.free(live);
+        try db.core.store.putBatch(&.{}, &.{ live, &internal_keys.identity_live_directory_manifest_key, range_state_mod.range_key });
+    }
+    const CancelAfterScan = struct {
+        remaining_checks: usize = 2,
+
+        fn check(raw: *const anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(@constCast(raw)));
+            if (self.remaining_checks == 0) return error.Canceled;
+            self.remaining_checks -= 1;
+        }
+    };
+    var after_scan = CancelAfterScan{};
+    var canceled = std.atomic.Value(bool).init(control == .canceled);
+    try std.testing.expectError(if (control != .expired) error.Canceled else error.DeadlineExceeded, DB.open(a, tmp.path(), .{
+        .start_optional_runtimes = false,
+        .start_index_workers = false,
+        .initial_owner_range = .{
+            .range = .{ .start = "", .end = "" },
+            .namespace = doc_identity.default_namespace,
+            // Two checks admit entry and the row; the next check stops marker
+            // publication after the buffered live-directory write is flushed.
+            .cancellation = if (control == .before_marker)
+                .{ .ptr = &after_scan, .check_fn = CancelAfterScan.check }
+            else
+                .fromAtomic(&canceled),
+            .deadline_ns = if (control == .expired) 0 else null,
+        },
+    }));
+    {
+        var primary = try openPrimaryStore(a, tmp.path(), .{});
+        defer {
+            primary.store.close();
+            primary.owner.close(a);
+        }
+        // An aborted owner must not publish the completed migration marker.
+        try std.testing.expectError(error.NotFound, primary.store.get(a, &internal_keys.identity_live_directory_manifest_key));
+        const live = try internal_keys.identityLiveDocToOrdinalKeyAlloc(a, "doc");
+        defer a.free(live);
+        if (control == .before_marker) {
+            const value = try primary.store.get(a, live);
+            defer a.free(value);
+        } else {
+            try std.testing.expectError(error.NotFound, primary.store.get(a, live));
+        }
+    }
+    // A later owner can resume even if cancellation left partial directory rows.
+    var reopened = try DB.open(a, tmp.path(), .{
+        .start_optional_runtimes = false,
+        .start_index_workers = false,
+        .initial_owner_range = .{ .range = .{ .start = "", .end = "" }, .namespace = doc_identity.default_namespace },
+    });
+    defer reopened.close();
+    try doc_identity.validateStoreAlloc(a, reopened.core.store);
 }
 
 test "db strict namespace reopen recovers after identity reassignment repair" {
