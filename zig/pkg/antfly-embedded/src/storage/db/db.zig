@@ -584,6 +584,10 @@ pub const OpenOptions = struct {
     primary_only_readonly: bool = false,
     initial_owner_range: ?range_state_mod.InitialOwnerRange = null,
     initial_child_bootstrap: ?@import("relational_initial_child_publication.zig").Bootstrap = null,
+    /// Recover an existing physical catalog for committed control, never seed
+    /// a namespace/schema from current metadata hints or create an empty root.
+    /// Requires an exact namespace and already-bound source authority.
+    require_existing_catalog: bool = false,
     map_size: usize = 256 * 1024 * 1024,
     no_sync: bool = false,
     primary_backend: PrimaryBackend = .{ .lsm = db_config.primary_lsm_options_default },
@@ -3688,6 +3692,8 @@ pub const DB = struct {
     pub fn open(alloc: Allocator, path: []const u8, requested_opts: OpenOptions) !DB {
         return blk: {
             var opts = requested_opts;
+            if (opts.require_existing_catalog and (opts.identity_namespace == null or opts.online_source_authority == null or opts.table_storage != null or
+                opts.schema_before_index_load != null or opts.initial_owner_range != null or opts.initial_child_bootstrap != null)) return error.InvalidArgument;
             if (opts.initial_child_bootstrap) |bootstrap| {
                 try bootstrap.validate();
                 if (opts.identity_namespace == null or !opts.identity_namespace.?.eql(bootstrap.namespace) or
@@ -3722,6 +3728,11 @@ pub const DB = struct {
                 }
                 break :blk_runtime owned_backend_runtime.?.runtime;
             };
+            if (opts.require_existing_catalog and opts.physical_root_mode == .filesystem_managed) {
+                const io = backend_runtime.filesystemIo() orelse return error.BackendRuntimeIoUnavailable;
+                // Check before generation-lock admission can create any path.
+                try std.Io.Dir.cwd().access(io, path, .{});
+            }
             var generation_read_lease = if (opts.staged_generation) |staged_generation| staged_blk: {
                 try staged_generation.validatePath(path);
                 break :staged_blk null;
@@ -3787,6 +3798,11 @@ pub const DB = struct {
                 publication_recovery.deinit();
             var primary_lsm_background_executor: lsm_backend_mod.BackgroundExecutor = undefined;
             var effective_primary_backend = opts.primary_backend;
+            if (opts.require_existing_catalog) switch (effective_primary_backend) {
+                .lsm => |*lsm_opts| lsm_opts.backend.create_if_missing = false,
+                .lsm_memory => |*lsm_opts| lsm_opts.backend.create_if_missing = false,
+                .mem => {},
+            };
             var effective_index_backends = opts.index_backends;
             if (openModeRequiresReadOnlyBackends(opts.open_mode)) {
                 applyReadOnlyToPrimaryBackend(&effective_primary_backend);
@@ -3855,8 +3871,16 @@ pub const DB = struct {
             try recoverIncompletePortableImport(
                 alloc,
                 &opened_primary.store,
-                openModeRequiresReadOnlyBackends(opts.open_mode),
+                opts.require_existing_catalog or openModeRequiresReadOnlyBackends(opts.open_mode),
             );
+            if (opts.require_existing_catalog) {
+                var read = try opened_primary.store.beginReadTxn();
+                defer read.abort();
+                _ = try @import("table_catalog.zig").Catalog.decode(try read.get(@import("table_catalog.zig").key));
+                const namespace = (try doc_identity.loadNamespaceTxn(&read)) orelse return error.IdentityNamespaceMismatch;
+                if (!namespace.eql(opts.identity_namespace.?)) return error.IdentityNamespaceMismatch;
+                _ = try @import("../source_authority.zig").require(&read, opts.online_source_authority.?, @import("online_source_contract.zig").namespaceBytes(namespace));
+            }
             if (opts.initial_owner_range) |initial| try range_state_mod.initializeOwnerRange(alloc, &opened_primary.store, initial);
             profile.primary_store_ns = elapsedSince(open_primary_started_ns);
             const core_resources_started_ns = monotonicTimeNs();

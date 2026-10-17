@@ -11846,3 +11846,68 @@ cold-root preparation, worker shutdown draining, actual data-log dispatch,
 metadata plan/ACK/root adoption and coordinated publication/release remain
 required. Decoder version 24 is still unadvertised; the new ABI alone is not
 production schema activation. No original parity case is reclassified.
+
+### Durable-catalog-only cold recovery before worker integration
+
+Tracing the source control worker exposed an ordering hazard: ordinary owner
+open can reconcile current metadata's schema/index hints before a compact
+committed control validates its durable predecessor. A cold worker must recover
+the actual physical state, not first install the schema it is meant to verify.
+Private owner ABI 97 adds an explicit `durable_only` catalog mode for this
+data-Raft recovery path. Schema/index/bootstrap/initial-range/dense-placement
+hints and unknown/reserved modes are rejected, rather than ignored or trusted.
+The live owner is catalog-deferred, without autonomous replay or derived workers;
+that is not public serving admission. Native jobs keep their existing native
+owner/journal path and no native clock is manufactured for a Raft owner.
+
+`DB.OpenOptions.require_existing_catalog` checks a filesystem root before
+generation-lock admission and disables primary-backend creation. Before core
+initialization it verifies an existing catalog, exact persisted namespace and
+already-bound source-authority domain. A missing namespace cannot be inferred
+from the request, even for an empty root. Schema, range, child-bootstrap and
+dense-placement initialization hints are incompatible with this option. The
+ordinary default remains unchanged.
+
+Portable-import admission uses the existing shared recovery machinery in
+non-mutating mode: an incomplete import is rejected, not rolled back by a
+speculative control open. Committed-marker housekeeping is left to the normal
+authorized path. Durable restore/initial-child publication state is loaded by
+the same DB lifecycle as document tables; unpublished/canceled children and
+unpublished restore roots cannot obtain this owner. The existing restore
+bootstrap/publication path is neither replaced nor bypassed. A published
+restored root can use the new mode.
+
+The physical archive fixture exercises document and relational tables, each
+with an existing full-text index and row. It verifies exact row/schema/index/
+ordered-marker/source-clock preservation, missing-root non-creation, wrong
+namespace/domain rejection, poisoned/unknown hints, and incomplete-import
+marker/catalog preservation through a raw read-only LSM audit. Canonical hidden
+child markers deny admission without request-side bootstrap hints. The restore
+handoff fixture rejects cold admission before publication and accepts it after
+the existing publication operation. The five-control Raft fixture also resumes
+from a durable-only cold open while frozen.
+
+The final Debug owner/source/job gate passes 58 owner tests, 47 owner-source
+tests and 10 native/Raft job tests, zero skips/failures/leaks and 120/120 build
+steps in `/private/tmp/antfly-sql-schema-durable-open-qualified-final-debug.log`.
+The preceding final log exposed a malformed synthetic hidden-child fixture
+without its durable namespace. The seed now persists that namespace; neither
+the early namespace guard nor the hidden-publication assertion was relaxed.
+Source boundary, control catalog, licenses, formatting and the unchanged
+531 implemented / 132 rejected / 113 superseded / 810 unresolved inventory pass.
+The full Debug SQL invocation in
+`/private/tmp/antfly-sql-schema-durable-open-sql-debug.log` completed its
+900-test suite with 896 passes and four skips, then failed with
+`unable to make path .zig-cache/o/...: FileNotFound`. The worktree cache
+directory was absent on inspection. This is not a passing full SQL gate;
+the remaining dependent suite was not qualified by that invocation.
+
+The source queue/cache still needs actual integration: exact group/table/root/
+namespace and entry/command matching, job and byte credits before input cloning,
+per-group prefix preservation, and control-lane ticket destruction before owner
+lease release. Root retirement, cancellation and shutdown must drain queued,
+preparing, ready and in-flight work without waiting under Raft progress or
+returning a post-commit cancellation error. Cold recovery must use this mode,
+not reconcile speculative descriptors. Actual dispatch, metadata permission/
+ACK/root adoption and coordinated publication/release remain required; decoder
+24 is still unadvertised. No original parity disposition is reclassified.

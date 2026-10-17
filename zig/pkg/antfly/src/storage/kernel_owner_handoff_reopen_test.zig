@@ -106,6 +106,11 @@ test "storage owner Raft schema controls cross the checked archive and recover t
         defer context.deinit();
         var deferred_catalog: u8 = 0;
         const open: abi.OpenRequest = .{ .context = context.handle, .path = .fromSlice(peer_path), .table_name = .fromSlice("rows"), .group_id = 72, .has_identity_namespace = 1, .identity_table_id = namespace.table_id, .identity_shard_id = namespace.shard_id, .identity_range_id = namespace.range_id, .online_source_authority = 1, .schema_json = .fromSlice(before), .indexes_json = .fromSlice("{}"), .owner_catalog_deferred_out = &deferred_catalog };
+        var durable_open = open;
+        durable_open.catalog_mode = .durable_only;
+        durable_open.historical_raft_apply = 1;
+        durable_open.schema_json = .{};
+        durable_open.indexes_json = .{};
         var peer = try client.Owner.open(open);
         var peer_live = true;
         defer if (peer_live) peer.deinit();
@@ -184,9 +189,9 @@ test "storage owner Raft schema controls cross the checked archive and recover t
         try Driver.apply(&primary, &peer, .{ .binding = binding, .action = .freeze }, 2, 11);
         peer.deinit();
         peer_live = false;
-        peer = try client.Owner.open(open);
+        peer = try client.Owner.open(durable_open);
         peer_live = true;
-        try std.testing.expectEqual(@as(u8, 0), deferred_catalog);
+        try std.testing.expectEqual(@as(u8, 1), deferred_catalog);
         var index: u64 = 12;
         for (0..8) |_| {
             var page = try primary.prepareRaftSchemaOwnerPage(binding, .{ .records = 1, .time_ns = std.time.ns_per_s }, .{});
@@ -227,6 +232,128 @@ test "storage owner Raft schema controls cross the checked archive and recover t
         defer a.free(terminal_wire);
         try peer.applyRaftSchemaOwnerControl("rows", terminal_wire, 3, index + 1, .{});
         try peer.applyRaftSchemaOwnerControl("rows", wire, 2, 10, .{});
+    }
+}
+
+test "storage owner durable catalog cold open preserves relational and document state without descriptor hints" {
+    const a = std.testing.allocator;
+    const local = @import("antfly_local_sources");
+    const namespace: local.storage_db_doc_identity_namespace.Namespace = .{ .table_id = 7, .shard_id = 172, .range_id = 272 };
+    const relational =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"n":{"type":"integer"}},"additionalProperties":false}}}}
+    ;
+    const document =
+        \\{"version":1,"storage_mode":"document","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"n":{"type":"integer"}},"additionalProperties":false}}}}
+    ;
+    const options: db_mod.OpenOptions = .{ .identity_namespace = namespace, .online_source_authority = .raft, .start_index_workers = false, .start_optional_runtimes = false };
+    for ([_][]const u8{ relational, document }) |schema_json| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const path = try tmp.dir.realPathFileAlloc(std.testing.io, ".", a);
+        defer a.free(path);
+        var existing_options = options;
+        existing_options.require_existing_catalog = true;
+        existing_options.open_mode = .writer_no_replay;
+        const missing = try std.fs.path.join(a, &.{ path, "missing" });
+        defer a.free(missing);
+        try std.testing.expectError(error.FileNotFound, db_mod.DB.open(a, missing, existing_options));
+        try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(std.testing.io, missing, .{}));
+        {
+            var seed = try db_mod.DB.open(a, path, options);
+            defer seed.close();
+            try local.storage_local_write.configureStorageKernelOwnerDb(a, &seed, "rows", schema_json, "{\"old\":{\"type\":\"full_text\"}}", null, null, null, null, null);
+            try seed.applyOrderedCommittedMutation(.{ .timestamp_ns = 100, .writes = &.{.{ .key = "a", .value = "{\"n\":1}" }} }, .{ .term = 1, .index = 1 }, false);
+            try std.testing.expect(seed.hasIndex("old"));
+        }
+        var context: client.Context = .{};
+        try context.ensure();
+        defer context.deinit();
+        var deferred_catalog: u8 = 0;
+        const open: abi.OpenRequest = .{ .context = context.handle, .path = .fromSlice(path), .table_name = .fromSlice("rows"), .group_id = 72, .catalog_mode = .durable_only, .historical_raft_apply = 1, .has_identity_namespace = 1, .identity_table_id = namespace.table_id, .identity_shard_id = namespace.shard_id, .identity_range_id = namespace.range_id, .owner_catalog_deferred_out = &deferred_catalog };
+        var bad = open;
+        bad.catalog_mode = @fromBackingInt(@intCast(255));
+        try std.testing.expectError(error.InvalidArgument, client.Owner.open(bad));
+        bad = open;
+        bad.schema_json = .{ .ptr = @ptrFromInt(1), .len = 1 };
+        try std.testing.expectError(error.InvalidArgument, client.Owner.open(bad));
+        bad = open;
+        bad.indexes_json = .fromSlice("{}");
+        try std.testing.expectError(error.InvalidArgument, client.Owner.open(bad));
+        bad = open;
+        bad.dense_embedding_storage = .primary_lsm;
+        try std.testing.expectError(error.InvalidArgument, client.Owner.open(bad));
+        {
+            var owner = try client.Owner.open(open);
+            defer owner.deinit();
+            try std.testing.expectEqual(@as(u8, 1), deferred_catalog);
+        }
+        var wrong = existing_options;
+        wrong.identity_namespace.?.range_id += 1;
+        try std.testing.expectError(error.IdentityNamespaceMismatch, db_mod.DB.open(a, path, wrong));
+        wrong = existing_options;
+        wrong.online_source_authority = .native;
+        try std.testing.expectError(error.OnlineSourceScopeChanged, db_mod.DB.open(a, path, wrong));
+        var audited = try db_mod.DB.open(a, path, existing_options);
+        defer audited.close();
+        try std.testing.expect(audited.hasIndex("old"));
+        try std.testing.expectEqual(@as(u32, 1), audited.core.schema.?.version);
+        try std.testing.expectEqualDeep(@as(?db_mod.OrderedApplyReceipt, .{ .term = 1, .index = 1 }), try audited.orderedApplyReceipt());
+        const row = (try audited.get(a, "a")).?;
+        defer a.free(row);
+        try std.testing.expectEqualStrings("{\"n\":1}", row);
+        var read = try audited.core.store.beginReadTxn();
+        defer read.abort();
+        const source = try local.storage_source_authority.require(&read, .raft, local.storage_db_online_source_contract.namespaceBytes(namespace));
+        try std.testing.expectEqual(@as(u64, 0), source.sequence);
+        {
+            // Cold control must not run ordinary writer import rollback: that
+            // could erase rows before the owner has proved this generation.
+            const pending_path = try std.fs.path.join(a, &.{ path, "pending" });
+            defer a.free(pending_path);
+            const marker_key = "\x00\x00__metadata__:portable_import_in_progress_v1";
+            const publishing = "antfly-portable-import-publishing-v2\n";
+            {
+                var pending = try db_mod.DB.open(a, pending_path, options);
+                defer pending.close();
+                try pending.setSchemaJson(a, schema_json);
+                try pending.applyOrderedCommittedMutation(.{ .timestamp_ns = 100, .writes = &.{.{ .key = "a", .value = "{\"n\":1}" }} }, .{ .term = 1, .index = 1 }, false);
+                try pending.core.store.putBatch(&.{.{ .key = marker_key, .value = publishing }}, &.{});
+            }
+            try std.testing.expectError(error.IncompletePortableImport, db_mod.DB.open(a, pending_path, existing_options));
+            var backend = try local.storage_lsm_backend.BackendHandle.open(a, pending_path, .{ .backend = .{ .read_only = true, .create_if_missing = false } });
+            defer backend.close();
+            var runtime_store = try backend.backend.runtimeStore(a, .{ .name = "docs" });
+            var raw = local.storage_docstore.DocStore.openRuntime(a, runtime_store) catch |err| {
+                runtime_store.deinit();
+                return err;
+            };
+            defer raw.close();
+            const marker = try raw.get(a, marker_key);
+            defer a.free(marker);
+            try std.testing.expectEqualStrings(publishing, marker);
+            const catalog_bytes = try raw.get(a, local.storage_db_table_catalog.key);
+            defer a.free(catalog_bytes);
+            try std.testing.expectEqual(@as(u32, 1), (try local.storage_db_table_catalog.Catalog.decode(catalog_bytes)).active_schema_version);
+        }
+        {
+            // A durable hidden marker is a denial even without request-side
+            // bootstrap hints. This fixture claims no provisioning authority.
+            const hidden_path = try std.fs.path.join(a, &.{ path, "hidden" });
+            defer a.free(hidden_path);
+            const initial = local.storage_db_relational_initial_child_publication;
+            const record: initial.Record = .{ .phase = .hidden, .plan_id = @splat(1), .plan_digest = @splat(2), .namespace = namespace, .schema_version = 1, .row_count = 0, .schema_digest = @splat(3), .public_schema_json_digest = @splat(4), .catalog_digest = @splat(5), .provision_term = 1, .provision_index = 1 };
+            const encoded = try record.encode();
+            {
+                var hidden = try db_mod.DB.open(a, hidden_path, options);
+                defer hidden.close();
+                try local.storage_db_doc_identity.writeNamespaceToStore(hidden.core.store, namespace);
+                try hidden.setSchemaJson(a, schema_json);
+                try hidden.core.store.put(initial.key, &encoded);
+            }
+            var hidden_open = open;
+            hidden_open.path = .fromSlice(hidden_path);
+            try std.testing.expectError(error.InitialChildNotPublished, client.Owner.open(hidden_open));
+        }
     }
 }
 
@@ -332,12 +459,23 @@ test "storage owner handoff receipt survives shared-context hidden to public reo
         defer parsed.deinit();
         try std.testing.expectEqual(@as(u64, 11), (parsed.value orelse return error.GenerationHandoffInstallMissing).applied_index);
     }
+    var durable_open = options;
+    durable_open.catalog_mode = .durable_only;
+    durable_open.historical_raft_apply = 1;
+    durable_open.schema_json = .{};
+    durable_open.indexes_json = .{};
+    durable_open.restore_bootstrap_json = .{};
+    try std.testing.expectError(error.RestoreStagingScopeChanged, client.Owner.open(durable_open));
     {
         var promoted = try db_mod.DB.open(alloc, path, .{ .identity_namespace = namespace, .primary_backend = .{ .lsm = .{} }, .start_index_workers = false, .start_optional_runtimes = false });
         defer promoted.close();
         _ = try promoted.finishRestoreStaging(alloc, scope.digest(), .published);
     }
     options.restore_bootstrap_json = .{};
+    {
+        var durable = try client.Owner.open(durable_open);
+        defer durable.deinit();
+    }
     // The published catalog descriptor supplies its canonical schema. The
     // CAPI then enables stale-schema rejection and optional runtimes, unlike
     // the private bootstrap open above.

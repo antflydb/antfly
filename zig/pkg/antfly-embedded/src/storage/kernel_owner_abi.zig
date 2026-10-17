@@ -19,7 +19,7 @@
 const failure_abi = @import("runtime_failure_abi");
 
 // Storage layouts evolve independently of the shared failure envelope.
-pub const abi_version: u32 = 96;
+pub const abi_version: u32 = 97;
 pub const Status = failure_abi.Status;
 pub const FailureBoundary = failure_abi.FailureBoundary;
 pub const FailureIdentity = failure_abi.FailureIdentity;
@@ -1104,6 +1104,14 @@ pub const RestoreAdmission = extern struct {
     native_manifest_sha256: BorrowedBytes = .{},
 };
 
+pub const OwnerCatalogMode = enum(u8) {
+    descriptor = 0,
+    /// Existing durable catalog only, unpublished and without autonomous
+    /// replay/derived workers. No schema/index/bootstrap hints are accepted.
+    durable_only = 1,
+    _,
+};
+
 pub const OpenRequest = extern struct {
     version: u32 = abi_version,
     _reserved0: u32 = 0,
@@ -1135,7 +1143,8 @@ pub const OpenRequest = extern struct {
     /// Optional result: the physical owner opened for exact topology control
     /// while current-catalog index reconciliation remains fence-deferred.
     owner_catalog_deferred_out: ?*u8 = null,
-    _restore_reserved: [4]u8 = @splat(0),
+    catalog_mode: OwnerCatalogMode = .descriptor,
+    _restore_reserved: [3]u8 = @splat(0),
     target_observer: TargetObserver = .{},
     transaction_recovery: TransactionRecoveryConfig = .{},
     runtime_hooks: RuntimeHooksConfig = .{},

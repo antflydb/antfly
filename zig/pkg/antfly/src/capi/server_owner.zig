@@ -3277,6 +3277,17 @@ pub fn storageOwnerOpen(
 ) callconv(.c) kernel_owner_abi.Status {
     out_owner.* = null;
     if (request.version != kernel_owner_abi.abi_version) return .invalid_abi;
+    const durable_catalog = switch (request.catalog_mode) {
+        .descriptor => false,
+        .durable_only => true,
+        _ => return .invalid_argument,
+    };
+    if (request._reserved0 != 0 or !std.mem.allEqual(u8, &request._reserved1, 0) or
+        !std.mem.allEqual(u8, &request._restore_reserved, 0)) return .invalid_argument;
+    if (durable_catalog and (request.historical_raft_apply != 1 or request.has_identity_namespace != 1 or
+        request.online_source_authority != 1 or request.dense_embedding_storage != .persisted or request.schema_json.len != 0 or request.indexes_json.len != 0 or
+        request.restore_bootstrap_json.len != 0 or request.initial_child_bootstrap_json.len != 0 or
+        request.has_initial_range != 0 or request.restore_cancel_recovery != 0 or request.restore_ha_replay != 0)) return .invalid_argument;
     const path = request.path.slice();
     const table_name = request.table_name.slice();
     if (path.len == 0 or table_name.len == 0) return .invalid_argument;
@@ -3399,6 +3410,8 @@ pub fn storageOwnerOpen(
         if (!namespace.eql(initial_child_bootstrap.?.value.namespace)) return storageOwnerStatusFromError(error.InvalidInitialChildPublication);
     }
     var open_options = db_mod.OpenOptions{
+        .require_existing_catalog = durable_catalog,
+        .open_mode = if (durable_catalog) .writer_no_replay else .writer,
         .online_source_authority = std.enums.fromInt(antfly.capi_dependencies.storage_source_authority.Kind, request.online_source_authority) orelse return .invalid_argument,
         .table_storage = switch (request.dense_embedding_storage) {
             .persisted => null,
@@ -3415,7 +3428,7 @@ pub fn storageOwnerOpen(
         .backend_runtime = if (owner_context) |context| context.backend_runtime.ptr() else null,
         .identity_namespace = identity_namespace,
         .initial_child_bootstrap = if (initial_child_bootstrap) |value| value.value else null,
-        .prefer_existing_identity_namespace = identity_namespace != null,
+        .prefer_existing_identity_namespace = !durable_catalog and identity_namespace != null,
         .transaction_recovery = if (recovery) |value| value.dbConfig() else .{},
         .resolution_candidate_source = if (runtime_hooks) |value| value.candidateSource() else null,
         .artifact_publication_dispatcher = if (runtime_hooks) |value| value.artifactPublicationDispatcher() else null,
@@ -3427,8 +3440,8 @@ pub fn storageOwnerOpen(
         .index_backends = .{ .dense_native_migration_policy_source = if (runtime_hooks) |value| value.nativeMigrationPolicy() else null },
         .secret_store = if (owner_context) |context| context.secret_store else null,
         .remote_content = if (owner_context) |context| context.remoteContent() else null,
-        .start_optional_runtimes = restore_bootstrap == null and initial_child_bootstrap == null,
-        .start_index_workers = restore_bootstrap == null and initial_child_bootstrap == null,
+        .start_optional_runtimes = !durable_catalog and restore_bootstrap == null and initial_child_bootstrap == null,
+        .start_index_workers = !durable_catalog and restore_bootstrap == null and initial_child_bootstrap == null,
     };
     if (request.has_initial_range > 1 or request.initial_range_control.version != kernel_owner_abi.abi_version or request.initial_range_control.has_execution_deadline > 1) return .invalid_argument;
     if (request.has_initial_range != 0) {
@@ -3508,7 +3521,15 @@ pub fn storageOwnerOpen(
     });
     // Configuration can start DB-owned workers. Publish their pointers only
     // after the DB occupies its final address, and drain them on failure.
-    if (restore_bootstrap) |bootstrap| {
+    if (durable_catalog) {
+        // DB.open loaded the actual row/layout/index state. Compact committed
+        // controls carry no public descriptor and authorize no reconciliation.
+        if (handle.db.local_execution.restore_staging_required.load(.acquire))
+            return storageOwnerStatusFromError(error.RestoreStagingScopeChanged);
+        if (handle.db.local_execution.initial_child_hidden.load(.acquire))
+            return storageOwnerStatusFromError(error.InitialChildNotPublished);
+        if (request.owner_catalog_deferred_out) |out| out.* = 1;
+    } else if (restore_bootstrap) |bootstrap| {
         local_write.configureRestoreOwnerDb(alloc, &handle.db, bootstrap.value, request.restore_cancel_recovery != 0, request.restore_ha_replay != 0) catch |err| return storageOwnerStatusFromError(err);
     } else {
         const deferred = local_write.configureStorageKernelOwnerDbAtOpen(
@@ -3530,7 +3551,7 @@ pub fn storageOwnerOpen(
     // permanent address with configuration installed; use the same startup as
     // resident caches so relational builds, retirement and durable outboxes
     // make progress. Hidden restore owners must remain unpublished/quiescent.
-    if (restore_bootstrap == null) {
+    if (!durable_catalog and restore_bootstrap == null) {
         handle.db.activateResolverReplayRuntimes() catch |err| {
             return storageOwnerStatusFromError(err);
         };

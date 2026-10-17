@@ -115,7 +115,7 @@ pub fn add(
     const handoff_tests = @import("linked_tests.zig").add(b, .{
         .name = "storage-owner-handoff-reopen-tests",
         .root_module = physical_module,
-        .filters = &.{ "storage owner handoff receipt survives shared-context hidden to public reopen", "storage owner Raft schema controls cross the checked archive" },
+        .filters = &.{ "storage owner handoff receipt survives shared-context hidden to public reopen", "storage owner Raft schema controls cross the checked archive", "storage owner durable catalog cold open" },
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
     handoff_tests.executable.root_module.addObject(test_metadata.object);
