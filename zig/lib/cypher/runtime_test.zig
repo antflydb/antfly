@@ -2000,6 +2000,71 @@ test "optional compressed bags preserve per-input null extension and dead bindin
     }
 }
 
+test "compressed admission and ordered bags agree with exact trails and preserve eager errors" {
+    const Dag = struct {
+        fn expand(ptr: *anyopaque, a: std.mem.Allocator, mapping: catalog.Relationship, identity: v.Identity, direction: c.ast.Direction, after: ?[]const u8, limit: usize) !b.Page(*const v.Relationship) {
+            const page = try Fixture.expand(ptr, a, mapping, identity, direction, after, limit);
+            var out: std.ArrayList(*const v.Relationship) = .empty;
+            for (page.items) |edge| if (!std.mem.eql(u8, edge.identity.key, "ba")) try out.append(a, edge);
+            return .{ .items = out.items };
+        }
+    };
+    for ([_]bool{ false, true }) |dag| for ([_][]const u8{ "MATCH", "OPTIONAL MATCH" }) |verb| for ([_][]const u8{
+        "",                              " WHERE a.rank>=0",              " WHERE b.rank>=0",            " WHERE a.rank<0", " WHERE a.id IS NOT NULL",
+        " WHERE a.rank>1 AND b.rank>=2", " WHERE b.rank>=2 AND a.rank>1", " WHERE a.rank<2 OR b.rank>2",
+    }) |predicate| for ([_][]const u8{
+        "RETURN count(*),sum(b.rank),min(a.rank)",
+        "WITH b ORDER BY b.rank DESC RETURN count(*),min(b.rank),max(b.rank)",
+        "WITH b ORDER BY b.rank SKIP 1 LIMIT 3 RETURN b.rank ORDER BY b.rank",
+        "WITH b WHERE b.rank>0 WITH b ORDER BY b.rank DESC SKIP 2 LIMIT 4 RETURN count(*),sum(b.rank)",
+        "WITH b.rank AS score ORDER BY score DESC LIMIT 4 RETURN score",
+        "WITH b ORDER BY b.missing,b.rank DESC LIMIT 4 RETURN b.rank",
+        "WITH b ORDER BY b.rank LIMIT 0 RETURN count(*)",
+    }) |tail| {
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const prefix = try std.fmt.allocPrint(a, "{s} (a:Document)-[:CITES*0..3]->(b:Document){s}", .{ verb, predicate });
+        var diagnostic: c.Diagnostic = .{};
+        var compiled = try c.compile(a, try std.fmt.allocPrint(a, "{s} {s}", .{ prefix, tail }), .{}, &diagnostic);
+        defer compiled.deinit();
+        // SKIP 0 is an explicit selection barrier, including when a later
+        // order-insensitive consumer makes a pure sort unobservable.
+        var exact = try c.compile(a, try std.fmt.allocPrint(a, "{s} WITH * ORDER BY a.rank,b.rank SKIP 0 {s}", .{ prefix, tail }), .{}, &diagnostic);
+        defer exact.deinit();
+        var fixture: Fixture = .{};
+        var callbacks = fixture.backend().vtable.*;
+        if (dag) callbacks.expand = Dag.expand;
+        const backend: b.Backend = .{ .ptr = &fixture, .vtable = &callbacks };
+        var result = try runtime.execute(a, backend, graph, &compiled, &.{}, .{});
+        defer result.deinit();
+        var expected = try runtime.execute(a, backend, graph, &exact, &.{}, .{});
+        defer expected.deinit();
+        try std.testing.expectEqualStrings(try std.json.Stringify.valueAlloc(a, expected.rows, .{}), try std.json.Stringify.valueAlloc(a, result.rows, .{}));
+    };
+    for ([_][]const u8{
+        "MATCH (a:Document)-[:CITES*0..2]->(b:Document) WHERE a.rank<0 AND 1/0=1 RETURN count(*)",
+        "MATCH (a:Document)-[:CITES*0..2]->(b:Document) WHERE 1/0=1 AND a.rank<0 RETURN count(*)",
+        "MATCH (a:Document)-[:CITES*1..2 {weight:1/0}]->(b:Document) WHERE a.rank<0 RETURN count(*)",
+        "MATCH (a:Document)-[:CITES*0..2]->(b:Document) WITH b ORDER BY 1/0 RETURN count(*)",
+        "MATCH (a:Document)-[:CITES*0..2]->(b:Document) WITH b,1/0 AS dead ORDER BY b.rank RETURN count(*)",
+    }) |text| {
+        var diagnostic: c.Diagnostic = .{};
+        var compiled = try c.compile(std.testing.allocator, text, .{}, &diagnostic);
+        defer compiled.deinit();
+        var fixture: Fixture = .{};
+        try std.testing.expectError(error.CypherDivisionByZero, runtime.execute(std.testing.allocator, fixture.backend(), graph, &compiled, &.{}, .{}));
+    }
+}
+
+test "middle sort keeps property errors across heterogeneous outer inputs" {
+    var diagnostic: c.Diagnostic = .{};
+    var compiled = try c.compile(std.testing.allocator, "UNWIND [{rank:1},0] AS x MATCH (a:Document)-[:CITES*0..2]->(b:Document) WITH b ORDER BY x.rank RETURN count(*)", .{}, &diagnostic);
+    defer compiled.deinit();
+    var fixture: Fixture = .{};
+    try std.testing.expectError(error.CypherTypeMismatch, runtime.execute(std.testing.allocator, fixture.backend(), graph, &compiled, &.{}, .{}));
+}
+
 test "zero aggregate demand skips partition planning and graph work" {
     var diagnostic: c.Diagnostic = .{};
     var compiled = try c.compile(std.testing.allocator, "MATCH (a:Document)-[:CITES*1..]->(b:Document) RETURN sum(a.rank),sum(b.rank) LIMIT 0", .{}, &diagnostic);

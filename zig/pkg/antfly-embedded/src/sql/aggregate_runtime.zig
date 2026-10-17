@@ -354,7 +354,7 @@ fn supportsWeights(bound: *const binding.Bound) bool {
     if (bound.ordered.len != 0) return false;
     for (bound.specs) |spec| {
         if (spec.kind == .pattern_set) return false;
-        if ((spec.kind == .sum or spec.kind == .avg) and spec.input_type != .integer and spec.input_element != .numeric) return false;
+        if (!spec.distinct and (spec.kind == .sum or spec.kind == .avg) and spec.input_type != .integer and spec.input_element != .numeric) return false;
     }
     if (bound.input.predicate) |program| if (!program.repeatable()) return false;
     for (bound.input.projections) |program| if (program) |value| if (!value.repeatable()) return false;

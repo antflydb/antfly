@@ -2115,6 +2115,9 @@ fn Engine(comptime Context: type) type {
             pending_failure: ?anyerror = null,
             weighted: bool = false,
             partitioned: bool = false,
+            child_slots: bool = false,
+            weighted_plan: ?@import("weighted_relation.zig").Plan = null,
+            requested_fields: ?[]const []const u8 = null,
 
             fn iface(self: *Adapter) catalog.Backend {
                 return .{ .regex_execution = self.engine.context.backend.regex_execution, .scalar_control = self.engine.context.backend.scalar_control, .execution_io = self.engine.context.backend.execution_io, .spill_manager = self.engine.context.spill, .ptr = self, .decision_provider = self.engine.context.backend.decision_provider, .pinned_statement_snapshot = true, .vtable = &.{ .resolve = resolve, .scan = scan, .open_scan = open, .mutate = mutate, .checkpoint = Adapter.checkpoint, .aggregate_partials = openAggregatePartials } };
@@ -2183,60 +2186,75 @@ fn Engine(comptime Context: type) type {
                 self.ordinal += batch.len();
                 return .{ .native = .{ .values = values, .names = names }, .selection = selection, .after = if (batch.len() != 0) try std.fmt.allocPrint(a, "{d}", .{self.ordinal}) else null };
             }
+            fn untouched(self: *Adapter) bool {
+                return self.ordinal == 0 and self.pending_failure == null and self.iterator.pages == 0 and
+                    !self.iterator.apply_mode and self.iterator.recursive_id == null;
+            }
             fn enableWeights(ptr: *anyopaque, multiplicity: catalog.Multiplicity) !bool {
                 const self: *Adapter = @ptrCast(@alignCast(ptr));
-                if (self.ordinal != 0 or self.pending_failure != null or self.iterator.pages != 0 or self.iterator.apply_mode or self.iterator.recursive_id != null or self.iterator.node.operation != .scan) return false;
-                const cursor = self.engine.cursors[self.iterator.node.operation.scan.index];
-                self.weighted = if (cursor.enable_weights) |enable| try enable(cursor.ptr, multiplicity) else false;
+                if (!self.untouched()) return false;
+                const a = self.engine.context.arena;
+                const fields = self.requested_fields orelse blk: {
+                    const names = try a.alloc([]const u8, self.iterator.node.columns.len);
+                    for (self.iterator.node.columns, names) |column, *name| name.* = column.internal;
+                    break :blk names;
+                };
+                const plan = (try @import("weighted_relation.zig").Plan.init(a, self.iterator.node, &.{.{ .fields = fields, .multiplicity = multiplicity }})) orelse return false;
+                const cursor = self.engine.cursors[plan.source.operation.scan.index];
+                // The projected capability can narrow a physical graph bag
+                // before its first pull, including a single dependency group.
+                self.child_slots = if (cursor.enable_aggregate_weights) |enable| try enable(cursor.ptr, plan.physical) else false;
+                self.weighted = self.child_slots or if (cursor.enable_weights) |enable| try enable(cursor.ptr, multiplicity) else false;
+                if (self.weighted) self.weighted_plan = plan;
                 return self.weighted;
             }
             fn enableAggregateWeights(ptr: *anyopaque, requests: []const catalog.AggregateWeight) !bool {
                 const self: *Adapter = @ptrCast(@alignCast(ptr));
-                if (self.ordinal != 0 or self.pending_failure != null or self.iterator.pages != 0 or self.iterator.apply_mode or self.iterator.recursive_id != null or self.iterator.node.operation != .scan) return false;
-                const source = self.iterator.node.operation.scan;
-                const cursor = self.engine.cursors[source.index];
+                if (!self.untouched()) return false;
+                const plan = (try @import("weighted_relation.zig").Plan.init(self.engine.context.arena, self.iterator.node, requests)) orelse return false;
+                const cursor = self.engine.cursors[plan.source.operation.scan.index];
                 const enable = cursor.enable_aggregate_weights orelse return false;
-                const a = self.engine.context.arena;
-                const mapped = try a.alloc(catalog.AggregateWeight, requests.len);
-                for (requests, mapped) |request, *out| {
-                    const fields = try a.alloc([]const u8, request.fields.len);
-                    for (request.fields, fields) |field, *name| {
-                        name.* = for (self.iterator.node.columns, source.source_columns) |column, physical| {
-                            if (std.mem.eql(u8, field, column.internal)) break physical;
-                        } else return false;
-                    }
-                    out.* = .{ .fields = fields, .multiplicity = request.multiplicity };
-                }
-                self.partitioned = try enable(cursor.ptr, mapped);
+                self.partitioned = try enable(cursor.ptr, plan.physical);
+                self.child_slots = self.partitioned;
                 self.weighted = self.partitioned;
+                if (self.weighted) self.weighted_plan = plan;
                 return self.partitioned;
             }
             fn nextWeighted(self: *Adapter, a: Allocator, limit: u32) !catalog.Page {
-                const scan_source = self.iterator.node.operation.scan;
+                const plan = self.weighted_plan orelse return error.InvalidSqlBackendResponse;
+                const scan_source = plan.source.operation.scan;
                 const cursor = self.engine.cursors[scan_source.index];
                 try self.engine.context.checkpoint();
                 self.iterator.pages += 1;
                 if (self.iterator.pages > self.engine.context.limits.scan_pages) return error.SqlProgramLimitExceeded;
-                var page = try cursor.next(cursor.ptr, a, limit);
+                const wanted: u32 = @intCast(@min(limit, @max(@as(usize, 1), self.engine.context.limits.retained_bytes / (16 * 1024 + plan.width * @sizeOf(Datum) * 16))));
+                var page = try cursor.next(cursor.ptr, a, wanted);
                 defer page.deinit();
-                if (page.rows.len > limit or page.rows.len > self.engine.context.limits.scan_rows -| self.engine.visited) return error.InvalidSqlBackendResponse;
+                if (page.rows.len > wanted or page.rows.len > self.engine.context.limits.scan_rows -| self.engine.visited) return error.InvalidSqlBackendResponse;
                 const weights = page.multiplicities orelse return error.InvalidSqlBackendResponse;
-                if (weights.len != page.rows.len) return error.InvalidSqlBackendResponse;
+                if (weights.len != page.rows.len or (page.aggregate_slots != null) != self.child_slots) return error.InvalidSqlBackendResponse;
                 self.engine.visited += page.rows.len;
-                const names = try a.alloc([]const u8, self.iterator.node.columns.len);
-                for (self.iterator.node.columns, names) |column, *name| name.* = column.internal;
+                const names = try a.alloc([]const u8, plan.source.columns.len);
+                for (plan.source.columns, names) |column, *name| name.* = column.internal;
                 const layout = try catalog.Row.TypedLayout.init(a, names);
-                const rows = try a.alloc(catalog.Row, page.rows.len);
-                for (page.rows, rows) |row, *out| {
+                var rows: std.ArrayList(catalog.Row) = .empty;
+                var retained_weights: std.ArrayList(u64) = .empty;
+                for (page.rows, weights) |row, weight| {
+                    try self.engine.context.checkpoint();
                     const values = try a.alloc(Datum, names.len);
-                    for (scan_source.source_columns, self.iterator.node.columns, values) |name, column, *value| {
+                    for (scan_source.source_columns, plan.source.columns, values) |name, column, *value| {
                         const cell = try @import("joined_mutation.zig").cell(a, row, name);
                         value.* = try operators.cloneDatum(a, try describe.coerceDatum(a, cell, column.type, column.element_type));
                     }
+                    const input = try catalog.Row.fromDatums(a, row.id, layout, values);
+                    const projected = (try plan.project(a, self.engine.context, input, page.aggregate_slots)) orelse continue;
                     self.ordinal += 1;
-                    out.* = try catalog.Row.fromDatums(a, try std.fmt.allocPrint(a, "{d}", .{self.ordinal}), layout, values);
+                    var output = projected;
+                    output.id = try std.fmt.allocPrint(a, "{d}", .{self.ordinal});
+                    try rows.append(a, output);
+                    try retained_weights.append(a, weight);
                 }
-                return .{ .rows = rows, .multiplicities = try a.dupe(u64, weights), .aggregate_slots = if (page.aggregate_slots) |slots| if (self.partitioned) try a.dupe(usize, slots) else return error.InvalidSqlBackendResponse else if (self.partitioned) return error.InvalidSqlBackendResponse else null, .after = if (page.after) |after| try a.dupe(u8, after) else null };
+                return .{ .rows = rows.items, .multiplicities = retained_weights.items, .aggregate_slots = if (self.partitioned) try a.dupe(usize, page.aggregate_slots.?) else null, .after = if (page.after) |after| try a.dupe(u8, after) else null };
             }
             fn countRows(ptr: *anyopaque) !?u64 {
                 const self: *Adapter = @ptrCast(@alignCast(ptr));
@@ -2248,10 +2266,11 @@ fn Engine(comptime Context: type) type {
                 const cursor = self.engine.cursors[scan_node.index];
                 return if (cursor.count_rows) |count_rows| try count_rows(cursor.ptr) else null;
             }
-            fn open(ptr: *anyopaque, _: Allocator, _: catalog.Table, _: catalog.Scan) !?catalog.Cursor {
+            fn open(ptr: *anyopaque, _: Allocator, _: catalog.Table, request: catalog.Scan) !?catalog.Cursor {
                 const self: *Adapter = @ptrCast(@alignCast(ptr));
                 if (self.opened) return error.InvalidSqlBackendResponse;
                 self.opened = true;
+                self.requested_fields = try self.engine.context.arena.dupe([]const u8, request.fields);
                 return .{ .ptr = self, .next = next, .next_columns = if (hasPatterns(self.iterator.node, 0)) null else nextColumns, .count_rows = countRows, .enable_weights = enableWeights, .enable_aggregate_weights = enableAggregateWeights, .close = close };
             }
             fn close(_: *anyopaque) void {}

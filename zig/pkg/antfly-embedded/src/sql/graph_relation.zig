@@ -351,7 +351,7 @@ pub const Cursor = struct {
     fn enableAggregateWeights(ptr: *anyopaque, requests: []const catalog.AggregateWeight) !bool {
         const self: *Cursor = @ptrCast(@alignCast(ptr));
         if (self.position != 0 or self.resume_position != 0 or self.request.primary_key != null or self.request.graph_source_ordinals or self.weight_passes.len != 0) return false;
-        if (requests.len < 2 or requests.len > 256) return false;
+        if (requests.len == 0 or requests.len > 256) return false;
         for (self.request.fields) |field| if (std.mem.eql(u8, field, "_id")) return false;
         for (self.request.conditions) |condition| if (std.mem.eql(u8, condition.column, "_id")) return false;
         const stream = self.stream orelse return false;
@@ -367,9 +367,13 @@ pub const Cursor = struct {
             for (request.fields) |field| try fields[direction].put(a, field, {});
             if (multiplicity == .exact) multiplicities[direction] = .exact;
         }
-        if (slots[0].items.len == 0 or slots[1].items.len == 0) return false;
-        const passes = try a.alloc(WeightPass, 2);
-        for (passes, 0..) |*pass, i| {
+        const pass_count: usize = @as(usize, @intFromBool(slots[0].items.len != 0)) + @as(usize, @intFromBool(slots[1].items.len != 0));
+        const passes = try a.alloc(WeightPass, pass_count);
+        var position: usize = 0;
+        for (0..2) |i| {
+            if (slots[i].items.len == 0) continue;
+            const pass = &passes[position];
+            position += 1;
             var names: std.ArrayList([]const u8) = .empty;
             var keys = fields[i].keyIterator();
             while (keys.next()) |name| try names.append(a, name.*);

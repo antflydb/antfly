@@ -1328,8 +1328,8 @@ cursor hook under the same owner cut, with SQL residuals and ordinal selection
 retaining ordinary pulls. SQL aggregates can additionally negotiate a weighted
 endpoint cursor before their first pull. Only endpoint-local graph projections
 and deterministic SQL inputs qualify. Multiplicities reach SQL reducers through
-transparent scan adapters: checked wide integer and exact NUMERIC states, NULLs,
-DISTINCT, grouping, filters and spill retain their SQL behavior. Floating SUM/AVG,
+bag-preserving scan and projection adapters: checked wide integer and exact NUMERIC states, NULLs,
+DISTINCT, grouping, filters and spill retain their SQL behavior. Non-DISTINCT floating SUM/AVG,
 ordered aggregates, observable source ordinals, route-sensitive expressions and
 nontransparent relational operators retain ordinary rows. Scalar repeatability is
 checked independently of parallel execution support: CASE, Boolean expressions,
@@ -1359,6 +1359,16 @@ or coupled dependencies decline negotiation and preserve ordinary execution.
 Private tagged continuations keep partial pulls within one pass; they do not
 change the public graph continuation contract.
 
+Derived tables and inlined CTEs preserve these capabilities through repeatable
+scalar projections and filters. A bounded relational plan maps each reducer's
+required outputs through aliases and computed expressions to physical graph
+fields before opening a pass. Predicates remain live in every pass; demanded
+computations run in their assigned pass, and unused computations that could fail
+retain their error dependencies. Projected rows carry explicit aligned weights
+and active aggregate slots through filtering and pagination. Joins, set operators,
+materialized relations, ordering, windows and cardinality-changing stages decline
+this capability. No aggregate expression is algebraically rewritten.
+
 Read phases share a bounded, quota-accounted cache of raw adjacency pages across
 anchors. Cache keys include mapping, direction, identity and continuation; each
 capture still applies its own property residuals and uniqueness proof. Admission
@@ -1382,6 +1392,13 @@ retains its own complete accumulator; the original projection, ordering and
 pagination run once over the completed states. Grouped or coupled endpoint
 consumers keep their ordinary plan; no algebraic SUM rewrite changes NULL,
 overflow or arithmetic behavior.
+Read-only endpoint predicates separate provably total anchor-local admission
+from residual endpoint evaluation. Admission filters roots before collecting a
+batch; the residual must observe only the emitted endpoint. The totality proof
+covers nullable entity properties and comparisons, preserving eager Boolean
+errors by retaining an entire predicate whenever any operand can fail. Range
+predicates alone do not override batching orientation; selective point seeks and
+bound identities retain priority.
 A declined proof resumes each original anchor before emitting compressed rows;
 soft batch allocation failure flushes retained roots and disables admission.
 Unbounded DAG segments first form the exact mandatory minimum-hop frontier,
@@ -1390,6 +1407,10 @@ operator applies relationship properties and multiplicities in both phases; no
 subtraction from saturated counts can conceal a qualifying overflow. Long bounded ranges, including selective singleton anchors,
 can use the same reduction when a bounded closure proof shows every captured
 route fits the upper bound; other ranges retain the product-state reducer.
+Fixed single-hop segments transfer their frontier directly to the next segment,
+applying target-node constraints during insertion. They share the same captured
+arc eligibility and uniqueness proof without copying every frontier through an
+extra endpoint table.
 
 Endpoint-local predicates, grouping keys, COUNT/SUM/AVG/MIN/MAX and their
 DISTINCT variants consume weighted endpoint rows from those same states.
@@ -1409,8 +1430,14 @@ input actually matched before its downstream filters. An unmatched input emits
 one null-extended row; downstream filtering never creates a replacement row.
 This match marker is independent of saturated multiplicities and aggregate passes.
 Wildcard DISTINCT includes every binding in its dependency proof; observing
-an interior node or route retains exact production. Ordering, pagination,
-aggregation, writes and non-repeatable expressions remain pipeline barriers.
+an interior node or route retains exact production. Read-only intermediate
+ordering can be omitted before direct COUNT/MIN/MAX reductions when all affected
+projections, predicates and sort keys are provably total and no pagination
+observes their order. Ordered finite windows retain compressed endpoint bags in
+a weighted TopK heap: excess multiplicities are trimmed at the worst key, SKIP
+consumes weights, and only the requested window expands to rows. Saturated path
+counts remain sufficient for a finite window. Other ordering, aggregation,
+writes and non-repeatable expressions remain pipeline barriers.
 Endpoint-only RETURN DISTINCT also reduces the path product states directly,
 including saturated counts, while preserving the existing uniqueness proofs and
 exact cyclic fallback. Unordered DISTINCT with LIMIT retains demand-driven route
@@ -1491,7 +1518,13 @@ hits from an already-selected top-k result.
 `tests/test_cypher_performance.py` qualifies both Lite and directory storage:
 point reads/writes with a one-anchor ceiling, shared-label counts, bounded-memory
 terminal operators, SQL graph composition, shortest paths on a dense acyclic
-graph, and lazy incident-edge deletion. Core regressions cover computed top-k
+graph, and lazy incident-edge deletion. Weighted regression cases include
+indexed and unindexed root/endpoint predicates, computed derived-table and CTE
+projections, independent 100-hop SQL endpoint reductions, floating DISTINCT
+SUM/AVG, and finite ordered windows over saturated path bags. Core oracles compare
+compressed execution with exact cyclic and acyclic trails, including OPTIONAL
+null extension, partial bag pagination, eager Boolean errors, pattern-property
+errors, and heterogeneous outer bindings. Core regressions cover computed top-k
 values, stable ties, distinct label predicates, batched endpoint multiplicity,
 and Lite fork/cursor lifetime after parent close. Native search regressions
 exercise predicate labels alongside row policies and a selective posting in a

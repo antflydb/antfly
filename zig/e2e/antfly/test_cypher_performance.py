@@ -419,14 +419,18 @@ def test_authenticated_cypher_property_plans_and_sql_overlays(monkeypatch):
         )
         assert weighted_sql["rows"] == [["497250", "6", "17", "138"]], weighted_sql
         assert time.monotonic() - start < 10
+        # Keep the authenticated SQL adapter's weights through a computed
+        # derived relation; run the identical statement through pgwire below.
         mixed_statement = (
-            f"SELECT sum(q.s),sum(q.e),count(*),avg(q.s),avg(q.e) "
-            f"FROM GRAPH_TABLE({hops} MATCH {path} "
-            "COLUMNS(a.score AS s,b.score AS e)) q"
+            "SELECT sum(d.s),sum(d.e),count(*),avg(d.s),avg(d.e) FROM "
+            f"(SELECT q.s+1 AS s,q.e*2 AS e FROM GRAPH_TABLE({hops} MATCH {path} "
+            "COLUMNS(a.score AS s,b.score AS e)) q) d"
         )
         root_sum = sum(i * comb(17 - i, 6) for i in range(12))
         mixed_sql = call("/sql", {"statement": mixed_statement})
-        assert mixed_sql["rows"][0][:3] == [str(root_sum), "497250", "31824"], mixed_sql
+        assert mixed_sql["rows"][0][:3] == [str(root_sum + 31824), "994500", "31824"], (
+            mixed_sql
+        )
         # Exercise the same negotiated cursor behind the pgwire authority guard.
         pgwire = subprocess.run(
             [
@@ -446,10 +450,41 @@ def test_authenticated_cypher_property_plans_and_sql_overlays(monkeypatch):
         )
         assert pgwire.returncode == 0, pgwire.stderr
         assert pgwire.stdout.strip().split("|")[:3] == [
-            str(root_sum),
-            "497250",
+            str(root_sum + 31824),
+            "994500",
             "31824",
         ]
+        distinct_float = call(
+            "/sql",
+            {
+                "statement": f"SELECT sum(DISTINCT CAST(d.score AS DOUBLE PRECISION)),"
+                f"avg(DISTINCT CAST(d.score AS DOUBLE PRECISION)) FROM "
+                f"(SELECT q.score AS score FROM GRAPH_TABLE({hops} MATCH {path} "
+                "COLUMNS(b.score AS score)) q) d"
+            },
+        )
+        assert distinct_float["rows"][0] == pytest.approx([138, 11.5], rel=1e-14), (
+            distinct_float
+        )
+        for tail, expected in (
+            ("WHERE a.score>=0 RETURN sum(b.score)", ["497250"]),
+            ("WHERE b.score>=0 RETURN sum(b.score)", ["497250"]),
+            ("WITH b ORDER BY b.score RETURN count(*),min(b.score)", ["31824", "6"]),
+            (
+                "WITH b ORDER BY b.score DESC SKIP 100 LIMIT 25 RETURN count(*),sum(b.score)",
+                ["25", "425"],
+            ),
+        ):
+            optimized = call(
+                f"/graphs/{hops}/query",
+                {
+                    "query": "MATCH (a:H)-[:R*6..6]->(b:H) " + tail,
+                    "limits": {"explored_edges": 153, "intermediate_states": 30000},
+                },
+            )
+            assert [cell["value"] for cell in optimized["rows"][0]] == expected, (
+                optimized
+            )
         optional = call(
             f"/graphs/{hops}/query",
             {

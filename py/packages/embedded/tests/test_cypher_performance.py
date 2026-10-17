@@ -1470,6 +1470,19 @@ def test_presence_reductions_do_not_enumerate_or_require_exact_path_counts(graph
     empty = db.sql(f"SELECT min(q.score),count(DISTINCT q.score) FROM {relation} WHERE q.score<0")
     assert empty["rows"] == [[None, "0"]]
     assert empty["sql_nulls"] == [[True, False]]
+    assert db.sql(
+        f"SELECT sum(DISTINCT CAST(q.score AS DOUBLE PRECISION)),"
+        f"avg(DISTINCT CAST(q.score AS DOUBLE PRECISION)) FROM {relation}"
+    )["rows"] == [[64, 64]]
+    window = db.cypher_json(
+        "g",
+        {
+            "query": "MATCH (s:D {id:'start'})-[:R*64..64]->(b:D) "
+            "WITH b ORDER BY b.score SKIP 100 LIMIT 25 RETURN count(*),sum(b.score)",
+            "limits": {"intermediate_states": 10000, "explored_edges": 300},
+        },
+    )
+    assert [cell["value"] for cell in window["rows"][0]] == ["25", "1600"]
     # Mixing a presence-only reducer with COUNT requires exact bags. Keep this
     # case below saturation, with more paths than could ever be enumerated.
     relation = relation.replace("-[r62 IS R]->(m62 IS D)-[r63 IS R]->(b IS D)", "")
@@ -1510,6 +1523,11 @@ def test_pure_endpoint_expressions_keep_compressed_bags(graph_db):
         ("WITH b AS a WITH a.score AS b WHERE b>0 RETURN count(*),sum(b)", [paths, total]),
         ("WITH DISTINCT b RETURN count(*),sum(b.score)", [size - 6, sum(range(6, size))]),
         ("WITH b WHERE b.score>0 RETURN count(*),sum(b.score)", [paths, total]),
+        ("WITH b ORDER BY b.score RETURN count(*),min(b.score),max(b.score)", [paths, 6, 15]),
+        ("WITH b ORDER BY b.score SKIP 2 LIMIT 5 RETURN count(*),sum(b.score)", [5, 35]),
+        ("WITH b ORDER BY b.score DESC SKIP 100 LIMIT 25 RETURN count(*),sum(b.score)", [25, 375]),
+        ("WITH b ORDER BY b.missing SKIP 2 LIMIT 5 RETURN count(*)", [5]),
+        ("WITH b ORDER BY b.score LIMIT 0 RETURN count(*)", [0]),
         (
             "UNWIND [b.score,b.score,null] AS score RETURN count(*),count(score),sum(score)",
             [3 * paths, 2 * paths, 2 * total],
@@ -1592,6 +1610,29 @@ def test_pure_endpoint_expressions_keep_compressed_bags(graph_db):
         [str(start_total), str(total)]
     ]
 
+    # Relational aliases, computed projections and predicates must retain
+    # weights through derived tables and CTEs, including independent reducers.
+    for source, prefix, expected in (
+        (f"(SELECT q.e AS score FROM {mixed_relation}) d", "", total),
+        (f"(SELECT q.e+1 AS score FROM {mixed_relation}) d", "", total + paths),
+        (f"(SELECT x.v AS score FROM (SELECT q.e+1 AS v FROM {mixed_relation}) x) d", "", total + paths),
+        ("saved d", f"WITH saved AS (SELECT q.e AS score FROM {mixed_relation}) ", total),
+        (f"(SELECT q.e AS score FROM {mixed_relation} WHERE q.e>=6) d", "", total),
+    ):
+        started = time.monotonic()
+        assert db.sql(f"{prefix}SELECT sum(d.score),count(*) FROM {source}")["rows"] == [[str(expected), str(paths)]]
+        assert time.monotonic() - started < 5
+    assert db.sql(f"SELECT sum(d.s),sum(d.e),count(*) FROM (SELECT q.s+1 AS s,q.e*2 AS e FROM {mixed_relation}) d")[
+        "rows"
+    ] == [[str(start_total + paths), str(total * 2), str(paths)]]
+    assert db.sql(
+        f"SELECT sum(d.score) FROM (SELECT CASE WHEN q.e>0 THEN q.e ELSE 1/0 END AS score FROM {mixed_relation}) d"
+    )["rows"] == [[str(total)]]
+    from antfly_embedded._sql import SQLStateError
+
+    with pytest.raises(SQLStateError, match="22012"):
+        db.sql(f"SELECT sum(d.e) FROM (SELECT q.e,1/(q.e-q.e) AS unused FROM {mixed_relation}) d")
+
     # An empty relation exhausts both negotiated passes, retaining the SQL
     # global group and its NULL sums / zero count.
     db.cypher_json("g", {"query": "MATCH ()-[r:R]->() DELETE r"})
@@ -1620,6 +1661,28 @@ def test_multi_anchor_reductions_share_work_across_bounded_batches(graph_db):
             str(size - 1),
         ]
         assert result["stats"]["explored_edges"] == size - 1
+
+    for indexed in (False, True):
+        if indexed:
+            db.sql("CREATE INDEX docs_score ON docs(score)")
+        for predicate, expected in (
+            ("a.score>=0", sum(i * i for i in range(size))),
+            ("b.score>=0", sum(i * i for i in range(size))),
+            ("a.id IS NOT NULL", sum(i * i for i in range(size))),
+            ("a.score<0", 0),
+            ("a.score>=200 AND b.score<350", sum(i * (i - 200) for i in range(201, 350))),
+            ("b.score<350 AND a.score>=200", sum(i * (i - 200) for i in range(201, 350))),
+        ):
+            filtered = db.cypher_json(
+                "g",
+                {
+                    "query": f"MATCH (a:D)-[:R*1..]->(b:D) WHERE {predicate} RETURN sum(b.score)",
+                    "limits": {"explored_edges": size - 1, "intermediate_states": 100000},
+                },
+            )
+            assert filtered["rows"] == [[{"type": "integer", "value": str(expected)}]]
+            if predicate == "a.score<0":
+                assert filtered["stats"]["explored_edges"] == 0
 
     # The planner should make start-only consumers just as efficient as the
     # equivalent reversed pattern, without opening a less selective anchor.
@@ -1711,10 +1774,7 @@ def test_sql_weighted_reductions_batch_starting_nodes(graph_db):
         # Reorient start-only COLUMNS too; the SQL cursor still owns one read cut.
         result = db.sql(f"SELECT sum(q.score) FROM GRAPH_TABLE(g MATCH {path} COLUMNS(a.score AS score)) q")
         assert result["rows"] == [[str(sum(range(size - hops)))]]
-        # Two 100-hop passes exceed the shared million-state allowance; keep
-        # that single-endpoint coverage while qualifying mixed bags at 60 hops.
-        if hops == 100:
-            continue
+        # Fixed-hop frontier transfer keeps both passes below the ordinary ceiling.
         mixed_relation = (
             f"GRAPH_TABLE(g MATCH {path} COLUMNS(a.score AS s,b.score AS e,a.missing AS sm,b.missing AS em)) q"
         )
@@ -1732,6 +1792,12 @@ def test_sql_weighted_reductions_batch_starting_nodes(graph_db):
                 None,
                 "0",
             ]
+        ]
+        derived = db.sql(
+            f"SELECT sum(d.s),sum(d.e),count(*) FROM (SELECT q.s+1 AS s,q.e*2 AS e FROM {mixed_relation}) d"
+        )
+        assert derived["rows"] == [
+            [str(sum(range(size - hops)) + size - hops), str(2 * sum(range(hops, size))), str(size - hops)]
         ]
         empty = db.sql(f"SELECT sum(q.s),sum(q.e),count(*) FROM {mixed_relation} WHERE false")
         assert empty["rows"] == [[None, None, "0"]]

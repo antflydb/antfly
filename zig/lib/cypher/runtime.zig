@@ -174,7 +174,8 @@ pub const NodeCursor = struct {
         self.columns = columns;
         self.weighted = true;
         self.multiplicity = plan.multiplicity;
-        self.weighted_seeds = .{ .path = plan.path, .input = .{ .row = &.{} }, .mode = clauses[0].operation.match.mode, .budget = .{ .backing = self.budget.allocator(), .limit = @min(8 << 20, self.engine.limits.memory_bytes / 16) } };
+        const predicates = try self.engine.batchPredicates(plan.path, &.{}, clauses[0].operation.match.predicate);
+        self.weighted_seeds = .{ .admission = predicates.admission, .residual = predicates.residual, .path = plan.path, .input = .{ .row = &.{} }, .mode = clauses[0].operation.match.mode, .budget = .{ .backing = self.budget.allocator(), .limit = @min(8 << 20, self.engine.limits.memory_bytes / 16) } };
     }
     /// Negotiate endpoint bags before the first pull. Route-observing queries
     /// retain the ordinary cursor; every declined per-anchor proof does too.
@@ -196,7 +197,8 @@ pub const NodeCursor = struct {
         clauses[0].operation.match.paths = try self.engine.a.dupe(ast.Path, &.{planned});
         self.query.clauses = clauses;
         if (try self.engine.batchEligible(planned, &.{}, operation, projection, &.{})) {
-            self.weighted_seeds = .{ .path = planned, .input = .{ .row = &.{} }, .mode = operation.mode, .budget = .{ .backing = self.budget.allocator(), .limit = @min(8 << 20, self.engine.limits.memory_bytes / 16) } };
+            const predicates = try self.engine.batchPredicates(planned, &.{}, operation.predicate);
+            self.weighted_seeds = .{ .admission = predicates.admission, .residual = predicates.residual, .path = planned, .input = .{ .row = &.{} }, .mode = operation.mode, .budget = .{ .backing = self.budget.allocator(), .limit = @min(8 << 20, self.engine.limits.memory_bytes / 16) } };
         }
         self.weighted = true;
         self.multiplicity = multiplicity;
@@ -208,7 +210,7 @@ pub const NodeCursor = struct {
         self.pending_position = 0;
         const e = self.engine;
         e.weighted_sink = .{ .ptr = self, .emit = emitWeighted, .multiplicity = self.multiplicity };
-        e.stream_predicate = self.query.clauses[0].operation.match.predicate;
+        e.stream_predicate = if (self.weighted_seeds != null and input.row.len == 0) self.weighted_seeds.?.residual else self.query.clauses[0].operation.match.predicate;
         defer {
             e.weighted_sink = null;
             e.stream_predicate = null;
@@ -543,6 +545,7 @@ pub const NodeCursor = struct {
         state.row = row;
         child.state = (try e.constrain(state, value, pattern.properties)) orelse return;
         if (!try e.constraintsMatch(child.state.constraints, row, true)) return;
+        if (self.weighted_seeds) |seeds| if (seeds.admission) |predicate| if ((try (try e.eval(predicate, row, null)).truth()) != true) return;
         if (collect) if (self.weighted_seeds) |*seeds| if (!seeds.disabled) {
             seeds.append(value.node) catch |err| {
                 if (err != error.OutOfMemory or !seeds.budget.exhausted) return err;
@@ -1237,7 +1240,7 @@ const Engine = struct {
             try engine.state();
             if (fold.record_rows) fold.matched.* +|= std.math.cast(usize, fold.weight) orelse std.math.maxInt(usize);
             if (fold.top.*) |*top| {
-                try top.add(row);
+                try top.addWeighted(row, fold.weight);
                 if (fold.projection.order.len == 0 and top.picks.items.len == top.capacity) return error.CypherStreamComplete;
                 return;
             }
@@ -1273,6 +1276,93 @@ const Engine = struct {
             return 128;
         }
     };
+    /// A deliberately small total-expression proof. It never suppresses
+    /// arithmetic, function, parameter or scalar-property errors. Entity shape
+    /// is known at MATCH/WITH boundaries; comparison operators return NULL for
+    /// incompatible Cypher values rather than raising a type error.
+    fn totalExpression(self: *Engine, expression: *const ast.Expr, shape: Row) bool {
+        return switch (expression.value) {
+            .literal => true,
+            .variable => |name| lookup(shape, name) != null,
+            .parameter => |name| lookup(self.parameters, name) != null,
+            .property => |p| p.base.value == .variable and blk: {
+                const known = lookup(shape, p.base.value.variable) orelse break :blk false;
+                break :blk known == .boolean and known.boolean;
+            },
+            .unary => |u| switch (u.op) {
+                .is_null, .is_not_null => self.totalExpression(u.operand, shape),
+                .not => self.totalPredicate(u.operand, shape),
+                else => false,
+            },
+            .binary => |b| switch (b.op) {
+                .eq, .neq, .lt, .lte, .gt, .gte, .starts_with, .ends_with, .contains => self.totalExpression(b.left, shape) and self.totalExpression(b.right, shape),
+                .@"and", .@"or", .xor => self.totalPredicate(b.left, shape) and self.totalPredicate(b.right, shape),
+                else => false,
+            },
+            .comparison => |c| blk: {
+                for (c.operands) |operand| if (!self.totalExpression(operand, shape)) break :blk false;
+                break :blk true;
+            },
+            else => false,
+        };
+    }
+    fn totalPredicate(self: *Engine, expression: *const ast.Expr, shape: Row) bool {
+        return switch (expression.value) {
+            .literal => |value| value == .boolean or value == .null,
+            .parameter => |name| blk: {
+                const value = lookup(self.parameters, name) orelse break :blk false;
+                break :blk value == .boolean or value == .null;
+            },
+            .binary, .comparison, .unary => self.totalExpression(expression, shape),
+            else => false,
+        };
+    }
+    fn pathShape(self: *Engine, path: ast.Path, row: Row) !Row {
+        var shape: Row = &.{};
+        for (row) |entry| shape = try self.replace(shape, entry.name, .{ .boolean = entry.value == .node or entry.value == .map or entry.value == .null });
+        for (path.nodes) |node| if (node.alias) |alias| {
+            shape = try self.replace(shape, alias, .{ .boolean = true });
+        };
+        for (path.edges) |edge| if (edge.alias) |alias| {
+            shape = try self.replace(shape, alias, .{ .boolean = false });
+        };
+        if (path.alias) |alias| {
+            shape = try self.replace(shape, alias, .{ .boolean = false });
+        }
+        return shape;
+    }
+    const BatchPredicates = struct { admission: ?*const ast.Expr = null, residual: ?*const ast.Expr = null };
+    fn conjunction(self: *Engine, left: ?*const ast.Expr, right: ?*const ast.Expr) !?*const ast.Expr {
+        if (left == null) return right;
+        if (right == null) return left;
+        const expression = try self.a.create(ast.Expr);
+        expression.* = .{ .span = left.?.span, .depth = @max(left.?.depth, right.?.depth) + 1, .value = .{ .binary = .{ .op = .@"and", .left = left.?, .right = right.? } } };
+        return expression;
+    }
+    fn splitAdmission(self: *Engine, path: ast.Path, row: Row, predicate: *const ast.Expr) !BatchPredicates {
+        const AnchorScope = struct {
+            alias: ?[]const u8,
+            outer: Row,
+            pub fn permits(scope: @This(), name: []const u8) bool {
+                if (scope.alias) |alias| if (std.mem.eql(u8, name, alias)) return true;
+                return lookup(scope.outer, name) != null;
+            }
+        };
+        if (@import("expressions.zig").rowLocal(predicate, AnchorScope{ .alias = path.nodes[0].alias, .outer = row })) return .{ .admission = predicate };
+        if (predicate.value == .binary and predicate.value.binary.op == .@"and") {
+            const left = try self.splitAdmission(path, row, predicate.value.binary.left);
+            const right = try self.splitAdmission(path, row, predicate.value.binary.right);
+            return .{ .admission = try self.conjunction(left.admission, right.admission), .residual = try self.conjunction(left.residual, right.residual) };
+        }
+        return .{ .residual = predicate };
+    }
+    fn batchPredicates(self: *Engine, path: ast.Path, row: Row, predicate: ?*const ast.Expr) !BatchPredicates {
+        const expression = predicate orelse return .{};
+        // Cypher evaluates both Boolean operands. Moving a conjunct must not
+        // conceal an error in another conjunct or in a deleted entity read.
+        if (!self.read_only or !self.totalPredicate(expression, try self.pathShape(path, row))) return .{ .residual = expression };
+        return self.splitAdmission(path, row, expression);
+    }
     const Names = std.StringHashMapUnmanaged(void);
     fn retainReferences(self: *Engine, names: *Names, candidates: Row, expression: *const ast.Expr) !void {
         const Visitor = struct {
@@ -1298,6 +1388,56 @@ const Engine = struct {
             },
             else => false,
         };
+    }
+    /// Ordering cannot affect a later COUNT/MIN/MAX when the intervening
+    /// pipeline and all sort/argument reads are total. Otherwise retain the
+    /// original barrier, including its observable errors and row selection.
+    fn elideMiddleOrder(self: *Engine, input: []const Row, operation: ast.Match, middle: []const ast.Clause, projection: ast.Projection) ![]const ast.Clause {
+        const ordered = for (middle) |clause| {
+            if (clause.operation == .project and clause.operation.project.value.order.len != 0) break true;
+        } else false;
+        if (!ordered or projection.items.len == 0 or !self.read_only) return middle;
+        for (projection.items) |item| {
+            if (item.expression.value != .call) return middle;
+            const aggregate_call = item.expression.value.call;
+            if (!std.ascii.eqlIgnoreCase(aggregate_call.name, "count") and !std.ascii.eqlIgnoreCase(aggregate_call.name, "min") and !std.ascii.eqlIgnoreCase(aggregate_call.name, "max")) return middle;
+        }
+        var shape: Row = &.{};
+        if (input.len != 0) for (input[0]) |entry| {
+            // Outer inputs may have heterogeneous types across rows.
+            shape = try self.replace(shape, entry.name, .{ .boolean = false });
+        };
+        for (operation.paths) |path| {
+            for (path.nodes) |node| if (node.alias) |alias| {
+                shape = try self.replace(shape, alias, .{ .boolean = true });
+            };
+            for (path.edges) |edge| if (edge.alias) |alias| {
+                shape = try self.replace(shape, alias, .{ .boolean = false });
+            };
+            if (path.alias) |alias| {
+                shape = try self.replace(shape, alias, .{ .boolean = false });
+            }
+        }
+        for (middle) |clause| {
+            if (clause.operation != .project) return middle;
+            const step = clause.operation.project.value;
+            if (step.skip != null or step.limit != null) return middle;
+            var next: Row = if (step.wildcard) shape else &.{};
+            for (step.items) |item| {
+                if (!self.totalExpression(item.expression, shape)) return middle;
+                const node = item.expression.value == .variable and (lookup(shape, item.expression.value.variable) orelse v.Value{ .boolean = false }).boolean;
+                next = try self.replace(next, item.alias orelse try self.expressionName(item.expression), .{ .boolean = node });
+            }
+            var scope = shape;
+            for (next) |entry| scope = try self.replace(scope, entry.name, entry.value);
+            if (step.predicate) |predicate| if (!self.totalPredicate(predicate, scope)) return middle;
+            for (step.order) |order| if (!self.totalExpression(order.expression, scope)) return middle;
+            shape = next;
+        }
+        for (projection.items) |item| for (item.expression.value.call.args) |arg| if (!self.totalExpression(arg, shape)) return middle;
+        const output = try self.a.dupe(ast.Clause, middle);
+        for (output) |*clause| clause.operation.project.value.order = &.{};
+        return output;
     }
     /// Backward liveness may discard only total, side-effect-free reads. Keep
     /// expressions which could raise an error, even when their result is dead.
@@ -1450,7 +1590,7 @@ const Engine = struct {
                 if (@import("expressions.zig").containsPattern(entry.value)) return null;
             };
         }
-        const middle = try self.pruneMiddle(input, operation, original_middle, projection);
+        const middle = try self.pruneMiddle(input, operation, try self.elideMiddleOrder(input, operation, original_middle, projection), projection);
         var grouped = projection.distinct;
         for (projection.items) |item| {
             grouped = grouped or aggregates(item.expression);
@@ -1504,7 +1644,8 @@ const Engine = struct {
             for (calls.items) |expression| if (expression.value.call.distinct or !expression.value.call.star or !std.ascii.eqlIgnoreCase(expression.value.call.name, "count")) break :blk false;
             break :blk true;
         };
-        const count_endpoints = !count_shortest and operation.paths.len == 1 and path.selector == .all and grouped and blk: {
+        const weighted_top = !grouped and projection.limit != null and projection.order.len != 0;
+        const count_endpoints = !count_shortest and operation.paths.len == 1 and path.selector == .all and (grouped or weighted_top) and blk: {
             // Unordered DISTINCT with a row goal can finish after one route.
             // Preserve that demand rather than capturing the whole closure.
             if (calls.items.len == 0 and projection.order.len == 0 and projection.predicate == null and projection.limit != null) break :blk false;
@@ -1628,7 +1769,8 @@ const Engine = struct {
                 const planned_path = if (count_shortest or count_endpoints) try self.reductionPath(path, row, operation, pass.projection, middle) else path;
                 var planned = operation;
                 if (count_shortest or count_endpoints) planned.paths = &.{planned_path};
-                var batch: AnchorBatch = .{ .path = planned_path, .input = .{ .row = row }, .mode = operation.mode, .budget = .{ .backing = self.scratch_allocator, .limit = @min(8 << 20, self.limits.memory_bytes / 16) } };
+                const predicates = try self.batchPredicates(planned_path, row, operation.predicate);
+                var batch: AnchorBatch = .{ .admission = predicates.admission, .residual = predicates.residual, .path = planned_path, .input = .{ .row = row }, .mode = operation.mode, .budget = .{ .backing = self.scratch_allocator, .limit = @min(8 << 20, self.limits.memory_bytes / 16) } };
                 defer if (batch.arena) |*arena| arena.deinit();
                 const saved_batch = self.anchor_batch;
                 self.anchor_batch = if ((count_shortest or count_endpoints) and try self.batchEligible(planned_path, row, planned, pass.projection, middle)) &batch else null;
@@ -2393,7 +2535,8 @@ const Engine = struct {
     }
     fn matchPath(self: *Engine, input: MatchState, original: ast.Path, mode: ast.PathMode, predicate: ?*const ast.Expr, output: *std.ArrayList(MatchState)) anyerror!void {
         var path = original;
-        if (!path.execution_reversed and !path.execution_prefix and path.nodes.len > 2) {
+        const batch_planned = if (self.anchor_batch) |batch| batch.path.nodes.ptr == path.nodes.ptr else false;
+        if (!batch_planned and !path.execution_reversed and !path.execution_prefix and path.nodes.len > 2) {
             var anchor: usize = 0;
             var score = try self.anchorScore(path.nodes[0], predicate, input.row);
             for (path.nodes[1..], 1..) |node, index| {
@@ -2405,7 +2548,7 @@ const Engine = struct {
             }
             if (anchor != 0 and anchor + 1 != path.nodes.len) return self.matchInterior(input, path, mode, predicate, anchor, output);
         }
-        if (!path.execution_reversed and path.edges.len != 0 and
+        if (!batch_planned and !path.execution_reversed and path.edges.len != 0 and
             try self.anchorScore(path.nodes[path.nodes.len - 1], predicate, input.row) > try self.anchorScore(path.nodes[0], predicate, input.row))
         {
             const nodes = try self.a.dupe(ast.Node, path.nodes);
@@ -2634,6 +2777,15 @@ const Engine = struct {
                     if (proof.maximum <= upper) topological = proof.order;
                 }
             }
+            if (edge.min_hops == 1 and upper == 1) {
+                // A fixed transition has no zero-hop acceptance. Apply its
+                // destination admission while transferring weights directly,
+                // without scanning/copying an extra frontier per pattern edge.
+                try chargeWork(self, next.capacity());
+                try self.advanceLowerTarget(&graph, domain, edge, &current, &next, path.nodes[edge_index + 1]);
+                std.mem.swap(Counts, &current, &next);
+                continue;
+            }
             try chargeWork(self, endpoints.capacity());
             endpoints.clearRetainingCapacity();
             if (topological != null) {
@@ -2757,6 +2909,9 @@ const Engine = struct {
         return true;
     }
     fn advanceLower(self: *Engine, graph: *LowerGraph, domain: usize, edge: ast.Edge, current: *std.AutoHashMapUnmanaged(usize, u64), next: *std.AutoHashMapUnmanaged(usize, u64)) !void {
+        return self.advanceLowerTarget(graph, domain, edge, current, next, null);
+    }
+    fn advanceLowerTarget(self: *Engine, graph: *LowerGraph, domain: usize, edge: ast.Edge, current: *std.AutoHashMapUnmanaged(usize, u64), next: *std.AutoHashMapUnmanaged(usize, u64), target: ?ast.Node) !void {
         next.clearRetainingCapacity();
         var candidates = current.iterator();
         while (candidates.next()) |candidate| {
@@ -2780,6 +2935,11 @@ const Engine = struct {
                 if (!outgoing and !incoming) continue;
                 if (!try self.constantProperties(.{ .relationship = relationship }, edge.properties, graph.input.row)) continue;
                 arc.eligible = true;
+                if (target) |pattern| {
+                    const reached = graph.nodes.items[arc.target].node;
+                    if (!try self.nodeMatches(reached, pattern) or !boundNodeMatches(reached, pattern, graph.input.row) or
+                        !try self.constantProperties(.{ .node = reached }, pattern.properties, graph.input.row)) continue;
+                }
                 const entry = try next.getOrPut(self.a, arc.target);
                 entry.value_ptr.* = mergePathWays(if (entry.found_existing) entry.value_ptr.* else 0, ways);
             }
@@ -2892,6 +3052,8 @@ const Engine = struct {
         arena: ?std.heap.ArenaAllocator = null,
         nodes: std.ArrayList(*const v.Node) = .empty,
         disabled: bool = false,
+        admission: ?*const ast.Expr = null,
+        residual: ?*const ast.Expr = null,
         fn flush(self: *@This(), engine: *Engine, output: *std.ArrayList(MatchState)) anyerror!void {
             if (self.nodes.items.len == 0) {
                 if (self.arena) |*arena| arena.deinit();
@@ -2901,7 +3063,14 @@ const Engine = struct {
             const previous = engine.anchor_batch;
             engine.anchor_batch = null;
             defer engine.anchor_batch = previous;
-            if (!try engine.countAllPaths(self.input, self.path, self.mode, self.nodes.items, output)) {
+            const original_predicate = engine.stream_predicate;
+            engine.stream_predicate = self.residual;
+            const compressed = engine.countAllPaths(self.input, self.path, self.mode, self.nodes.items, output) catch |err| {
+                engine.stream_predicate = original_predicate;
+                return err;
+            };
+            engine.stream_predicate = original_predicate;
+            if (!compressed) {
                 for (self.nodes.items) |node| {
                     const row = (try engine.bind(self.input.row, self.path.nodes[0].alias, .{ .node = node })).?;
                     try engine.startPath(.{ .row = row }, self.path, self.mode, node, output);
@@ -2950,20 +3119,37 @@ const Engine = struct {
         reversed.execution_reversed = !path.execution_reversed;
         return if (try self.batchEligible(reversed, row, operation, projection, middle)) reversed else path;
     }
+    fn batchAnchorScore(self: *Engine, node: ast.Node, predicate: ?*const ast.Expr, row: Row) !usize {
+        if (node.alias) |alias| if (lookup(row, alias) != null) return 1_000_000;
+        if (self.anchorKey(predicate, node.alias, row) != null) return 100_000;
+        var filters: std.ArrayList(backend_mod.PropertyFilter) = .empty;
+        try self.labelFilters(node, &filters);
+        for (node.properties) |property| if (self.constant(property.value, row)) |value| try filters.append(self.a, .{ .property = property.name, .value = value });
+        if (predicate) |expression| if (node.alias) |alias| try self.predicateFilters(expression, alias, row, &filters);
+        var seeks: usize = 0;
+        for (filters.items) |filter| if (filter.op == .eq or filter.op == .in) {
+            seeks += 1;
+        };
+        // A range residual is not a cardinality estimate. Keep batching unless
+        // a point/equality admission actually justifies a different anchor.
+        return (if (self.backend.vtable.scan_where != null) @as(usize, 100) * @min(seeks, 999) else 0) + @intFromBool(node.labels.len > 0);
+    }
     fn batchEligible(self: *Engine, path: ast.Path, row: Row, operation: ast.Match, projection: ast.Projection, middle: []const ast.Clause) !bool {
         if (path.selector != .all or path.edges.len == 0 or path.execution_prefix) return false;
         if (path.nodes[0].alias) |alias| if (lookup(row, alias) != null) return false;
         for (path.nodes) |node| for (node.properties) |entry| if (self.constant(entry.value, row) == null) return false;
         for (path.edges) |edge| for (edge.properties) |entry| if (self.constant(entry.value, row) == null) return false;
-        const score = try self.anchorScore(path.nodes[0], operation.predicate, row);
-        for (path.nodes[1..]) |node| if (try self.anchorScore(node, operation.predicate, row) > score) return false;
+        const score = try self.batchAnchorScore(path.nodes[0], operation.predicate, row);
+        for (path.nodes[1..]) |node| if (try self.batchAnchorScore(node, operation.predicate, row) > score) return false;
         const independent: EndpointScope = .{ .path = path, .row = row, .include_start = false };
-        if (operation.predicate) |predicate| if (!@import("expressions.zig").rowLocal(predicate, independent)) return false;
+        const predicates = try self.batchPredicates(path, row, operation.predicate);
+        if (predicates.residual) |predicate| if (!@import("expressions.zig").rowLocal(predicate, independent)) return false;
         return self.pipelineLocal(path, row, middle, projection, false);
     }
     fn startPath(self: *Engine, input: MatchState, path: ast.Path, mode: ast.PathMode, node: *const v.Node, output: *std.ArrayList(MatchState)) anyerror!void {
         if (self.anchor_batch) |batch| {
             if (!batch.disabled and path.nodes.ptr == batch.path.nodes.ptr and input.used.len == 0 and input.constraints.len == 0) {
+                if (batch.admission) |predicate| if ((try (try self.eval(predicate, input.row, null)).truth()) != true) return;
                 batch.append(node) catch |err| {
                     if (err != error.OutOfMemory or !batch.budget.exhausted) return err;
                     batch.disabled = true;
@@ -4360,7 +4546,7 @@ const Engine = struct {
             else => std.fmt.allocPrint(self.a, "expression@{}", .{expression.span.start}),
         };
     }
-    const Projected = struct { row: Row, source: Row, group: ?[]const Row, keys: []const v.Value, sequence: usize = 0 };
+    const Projected = struct { row: Row, source: Row, group: ?[]const Row, keys: []const v.Value, sequence: usize = 0, weight: usize = 1 };
     const EvalScope = struct {
         a: A,
         values: value_work.Work,
@@ -4418,7 +4604,7 @@ const Engine = struct {
         const a = arena.allocator();
         const row = (try (v.Value{ .map = candidate.row }).clone(a)).map;
         const keys = (try (v.Value{ .list = candidate.keys }).clone(a)).list;
-        return .{ .arena = arena, .value = .{ .row = row, .source = &.{}, .group = null, .keys = keys, .sequence = candidate.sequence } };
+        return .{ .arena = arena, .value = .{ .row = row, .source = &.{}, .group = null, .keys = keys, .sequence = candidate.sequence, .weight = candidate.weight } };
     }
     const TopK = struct {
         engine: *Engine,
@@ -4427,6 +4613,7 @@ const Engine = struct {
         skip: usize,
         capacity: usize,
         sequence: usize = 0,
+        total: usize = 0,
         picks: std.ArrayList(Pick) = .empty,
         columns: std.ArrayList([]const u8) = .empty,
         fn init(engine: *Engine, projection: ast.Projection, first: Row) !TopK {
@@ -4443,6 +4630,9 @@ const Engine = struct {
             for (self.picks.items) |*pick| pick.arena.deinit();
         }
         fn add(self: *TopK, source: Row) !void {
+            return self.addWeighted(source, 1);
+        }
+        fn addWeighted(self: *TopK, source: Row, weight: u64) !void {
             const engine = self.engine;
             defer self.sequence += 1;
             var scratch = std.heap.ArenaAllocator.init(engine.scratch_allocator);
@@ -4459,22 +4649,18 @@ const Engine = struct {
             if (self.projection.predicate) |predicate| if ((try (try engine.eval(predicate, context, null)).truth()) != true) return;
             const keys = try engine.a.alloc(v.Value, self.projection.order.len);
             for (self.projection.order, keys) |order, *key| key.* = try engine.eval(order.expression, context, null);
-            const candidate: Projected = .{ .row = row.items, .source = &.{}, .group = null, .keys = keys, .sequence = self.sequence };
-            if (self.capacity == 0) return;
-            if (self.picks.items.len == self.capacity and try engine.compareProjected(candidate, self.picks.items[0].value, self.projection.order) != .lt) return;
+            const candidate: Projected = .{ .row = row.items, .source = &.{}, .group = null, .keys = keys, .sequence = self.sequence, .weight = @intCast(@min(@as(u128, weight), self.capacity)) };
+            if (self.capacity == 0 or weight == 0) return;
+            if (self.total == self.capacity and try engine.compareProjected(candidate, self.picks.items[0].value, self.projection.order) != .lt) return;
             var pick = try engine.clonePick(candidate);
             var owned = true;
             defer if (owned) pick.arena.deinit();
-            if (self.picks.items.len == self.capacity) {
-                self.picks.items[0].arena.deinit();
-                self.picks.items[0] = pick;
-                owned = false;
-                try engine.siftPicks(self.picks.items, self.projection.order);
-            } else {
-                // The heap storage belongs to the statement, never a row arena.
-                try self.picks.append(self.retained, pick);
-                owned = false;
-                if (self.projection.limit == null) return;
+            // One heap entry represents a whole identical projected bag.
+            // Trim weights at the worst key rather than inserting K copies.
+            try self.picks.append(self.retained, pick);
+            owned = false;
+            var total = @as(u128, self.total) + candidate.weight;
+            if (self.projection.limit != null) {
                 var position = self.picks.items.len - 1;
                 while (position > 0) {
                     const parent = (position - 1) / 2;
@@ -4482,21 +4668,44 @@ const Engine = struct {
                     std.mem.swap(Pick, &self.picks.items[parent], &self.picks.items[position]);
                     position = parent;
                 }
+                while (total > self.capacity) {
+                    const discarded: usize = @intCast(@min(total - self.capacity, self.picks.items[0].value.weight));
+                    self.picks.items[0].value.weight -= discarded;
+                    total -= discarded;
+                    if (self.picks.items[0].value.weight == 0) {
+                        self.picks.items[0].arena.deinit();
+                        const last = self.picks.pop().?;
+                        if (self.picks.items.len != 0) {
+                            self.picks.items[0] = last;
+                            try engine.siftPicks(self.picks.items, self.projection.order);
+                        }
+                    }
+                }
             }
+            self.total = std.math.cast(usize, total) orelse return error.CypherNumericOverflow;
         }
         fn finish(self: *TopK, final: bool) ![]const Row {
             const engine = self.engine;
             const projected = try engine.a.alloc(Projected, self.picks.items.len);
-            for (self.picks.items, projected) |pick, *item| item.* = .{ .row = (try (v.Value{ .map = pick.value.row }).clone(engine.a)).map, .source = &.{}, .group = null, .keys = (try (v.Value{ .list = pick.value.keys }).clone(engine.a)).list, .sequence = pick.value.sequence };
+            for (self.picks.items, projected) |pick, *item| item.* = .{ .row = (try (v.Value{ .map = pick.value.row }).clone(engine.a)).map, .source = &.{}, .group = null, .keys = (try (v.Value{ .list = pick.value.keys }).clone(engine.a)).list, .sequence = pick.value.sequence, .weight = pick.value.weight };
             // Sort only the retained window, using input sequence for stable ties.
             if (self.projection.order.len == 0 and self.projection.limit != null) std.mem.sort(Projected, projected, {}, struct {
                 fn less(_: void, left: Projected, right: Projected) bool {
                     return left.sequence < right.sequence;
                 }
             }.less) else if (self.projection.order.len != 0) try engine.sort(projected, self.projection.order);
-            const start = @min(self.skip, projected.len);
-            const output = try engine.a.alloc(Row, projected.len - start);
-            for (projected[start..], output) |item, *row| row.* = item.row;
+            var skip = @min(self.skip, self.total);
+            const output = try engine.a.alloc(Row, self.total - skip);
+            var position: usize = 0;
+            for (projected) |item| {
+                const discarded = @min(skip, item.weight);
+                skip -= discarded;
+                for (0..item.weight - discarded) |_| {
+                    try engine.state();
+                    output[position] = item.row;
+                    position += 1;
+                }
+            }
             if (final) engine.columns = try self.columns.toOwnedSlice(engine.a);
             return output;
         }
