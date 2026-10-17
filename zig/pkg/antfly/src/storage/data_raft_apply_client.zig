@@ -39,6 +39,9 @@ pub const AppliedDataBatch = struct {
 
 pub const RaftApplyStore = struct {
     native_snapshot_delegate: ?@import("../raft/native_snapshot_delegate.zig").Delegate = null,
+    /// Retain the same immutable construction contract sent to the owner so
+    /// the compiled projection adapter cannot lose its second-store requirement.
+    native_source_delegate: bool = false,
     handle: ?*anyopaque,
 
     pub fn init(_: std.mem.Allocator, cfg: RaftApplyStoreConfig) !RaftApplyStore {
@@ -50,7 +53,7 @@ pub const RaftApplyStore = struct {
             .context = cfg.context,
             .root_dir = .fromSlice(cfg.root_dir),
         }, &handle));
-        return .{ .handle = handle orelse return error.StorageKernelFailure };
+        return .{ .handle = handle orelse return error.StorageKernelFailure, .native_source_delegate = cfg.native_source_delegate };
     }
 
     pub fn deinit(self: *RaftApplyStore) void {

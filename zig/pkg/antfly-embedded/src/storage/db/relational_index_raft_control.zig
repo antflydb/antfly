@@ -32,21 +32,12 @@ const publication = @import("relational_index_publication_progress.zig");
 const positions = @import("receipt_position.zig");
 const Entry = receipts.OrderedApplyReceipt;
 
-pub const Effect = enum(u8) { admitted, fenced, reserved };
+const contract = @import("relational_index_raft_contract.zig");
+pub const Effect = contract.Effect;
+pub const Command = contract.Command;
+pub const validateBatchRequest = contract.validateBatchRequest;
 pub const Admission = @import("relational_index_cancellation_intent.zig").Intent;
 pub const prefix = jobs.key ++ ":raft:";
-pub const Command = struct {
-    effect: Effect,
-    binding: jobs.Binding,
-    inputs_b64: ?[]const u8 = null,
-
-    pub fn validate(self: Command) !void {
-        _ = try self.binding.encode();
-        if (self.binding.authority != .raft or self.binding.phase != .fencing or
-            ((self.effect == .admitted) != (self.inputs_b64 != null))) return error.InvalidPrivateIndexOwnerJob;
-        if (self.inputs_b64) |bytes| if (bytes.len == 0 or bytes.len > std.base64.standard.Encoder.calcSize(inputs.max_bytes)) return error.InvalidPrivateIndexInputs;
-    }
-};
 
 pub const Cut = struct {
     entry: Entry,

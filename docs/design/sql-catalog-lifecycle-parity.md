@@ -10367,3 +10367,77 @@ Checkpoint validation (Debug):
   `/private/tmp/antfly-sql-raft-index-control-final-capi-debug.log`.
 - Formatting, source licensing, the 2,066-source Apache boundary and immutable
   original-inventory audit pass. Cache GC was previewed only; nothing deleted.
+
+### Private Raft index control transport and two-store recovery
+
+The admission/drain/reservation kernel now has a data-only private batch
+contract, separate from preparation and store apply. The exact wire frame rejects
+public requests, unprefixed aliases, row-semantics wrappers, unknown fields,
+caller-supplied positions and mixed mutations. Borrowed-tree framing and input
+size checks run before typed manifest duplication or row normalization. The
+isolated-request validator checks every request field against its default shape;
+owned empty arrays are compared by semantic length, not pointer identity.
+
+Committed-entry dispatch supplies the actual group, term and index separately.
+The group-aware adapter validates isolation and group identity before replay
+checks, skips already-applied entries before preparing against a newer catalog,
+and otherwise commits the native effect and ordered marker atomically. Ordinary
+local batches, unscoped ordered adapters and the not-yet-implemented standby
+envelope cannot silently drop the control.
+
+Raft batch protocol 23 denotes support for these three controls ONLY. The
+projection decoder requires a durable protocol barrier, the actual matching
+group and a configured native delegate before accepting an entry. It cannot
+acknowledge a projection-only no-op as index progress. This is not a complete
+distributed-index lifecycle capability: source/build/install/cancel and standby
+still require their own complete implementation and versioned admission.
+The projection's immutable mount contract is also checked by DataStateMachine:
+if the actual delegate is absent, entries and snapshots are rejected before
+projection writes or applied-index publication. A configured projection flag
+alone cannot stand in for the second store.
+Both the direct projection builder and compiled storage consumer preserve this
+mount requirement. The compiled client retains the exact construction setting
+sent through its ABI, and the managed-host adapter exposes it to the state
+machine. Its regression rejects an unmounted client before even accessing the
+foreign handle.
+
+The two-store regression uses the real projection store, LSM native owner,
+committed batch decoder, group-aware adapter and DataStateMachine applied sink.
+It rejects missing/old barriers, missing delegates and foreign groups, and
+injects failures between projection commit, native commit and applied-index
+publication. Both stores are reopened before replay; phase receipts keep their
+original committed cuts across subsequent terms and retries. Allocation probes
+also cover owned codec cleanup and rejection without a derived allocation.
+These are supplied-entry state-machine fault tests, not network-consensus or
+metadata-leadership qualification.
+
+Generic proposal dispatch explicitly rejects these controls before consulting
+Raft state or appending a barrier. A decoded binding is NOT metadata permission.
+The dedicated independently authorized receiver and complete source/build,
+claim/install/cancel/standby lifecycle remain unfinished; metadata PrepareCut's
+unsupported-Raft guard remains unchanged. No standalone reporter namespace or
+retirement activation is enabled. Original case dispositions remain 531
+implemented / 132 rejected / 113 superseded / 810 unresolved.
+
+Checkpoint validation (Debug):
+
+- Final index gate: 274 contracts plus its Raft snapshot companion, no
+  skips/failures/leaks, 51/51 steps in
+  `/private/tmp/antfly-sql-raft-index-wire-final-system-debug.log`.
+- Final SQL regression: 881 core plus 234 server contracts, four existing
+  opt-in skips, no failures/leaks, 21/21 steps in
+  `/private/tmp/antfly-sql-raft-index-wire-final-sql-debug.log`.
+- Server decoder/admission gate: one focused contract, no skips/failures/leaks,
+  91/91 steps in
+  `/private/tmp/antfly-sql-raft-index-wire-runtime-mount-debug.log`.
+- Compiled projection/host mount gate: 48/48 steps, seven host contracts plus
+  eleven declaration companions, no skips/failures/leaks in
+  `/private/tmp/antfly-sql-raft-index-wire-host-mount-debug.log`.
+- Native owner-control ABI compatibility: six contracts, no skips/failures/leaks,
+  52/52 steps in `/private/tmp/antfly-sql-raft-index-wire-final-capi-debug.log`.
+- Existing protocol preflight, replica-set planning, cache/term fencing and
+  activation cleanup: five contracts, no skips/failures/leaks, 91/91 steps in
+  `/private/tmp/antfly-sql-raft-index-wire-protocol-regression-debug.log`.
+- Source licensing, the 2,067-source Apache boundary, formatting, generated
+  control-source catalog and immutable original inventory audit pass. Cache GC
+  was previewed only; no caches or user data were deleted.

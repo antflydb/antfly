@@ -30,6 +30,7 @@ pub fn applyOrdered(
     req: types.BatchRequest,
     identity: types.OrderedApplyReceipt,
 ) anyerror!void {
+    if (req.relational_index_owner_control != null) return error.InvalidBatchRequest;
     const db = physicalOwner(owner);
     const mirror_scoped_restore = requiresDurableLifecycleReplication(req) and db.local_execution.replication_async_batch_mirror != null;
     // Hot standby is process-local and includes this node's Raft follower roots.
@@ -72,6 +73,23 @@ pub fn applyOrdered(
     };
 }
 
+/// The group and position originate in the committed-entry callback, not in
+/// the command. Old replay skips preparation against a newer owner catalog.
+pub fn applyOrderedGroup(owner: anytype, group_id: u64, req: types.BatchRequest, identity: types.OrderedApplyReceipt) anyerror!void {
+    const control = @import("antfly_local_sources").storage_db_relational_index_raft_contract;
+    try control.validateBatchRequest(req);
+    const command = req.relational_index_owner_control orelse return applyOrdered(owner, req, identity);
+    if (group_id == 0 or command.binding.fence.owner_group_id != group_id) return error.PrivateIndexOwnerJobChanged;
+    const db = physicalOwner(owner);
+    if (try db.orderedMutationAlreadyApplied(identity)) return;
+    var prepared = db.prepareRaftIndexOwnerControl(command) catch |err| {
+        if (try db.orderedMutationAlreadyApplied(identity)) return;
+        return err;
+    };
+    defer prepared.deinit();
+    try db.applyCommittedRaftIndexOwnerControl(&prepared, group_id, identity);
+}
+
 pub fn captureSnapshot(owner: anytype, group_id: u64, through_index: u64) !snapshots.Capture {
     const db = physicalOwner(owner);
     if (group_id == 0) return error.InvalidSnapshot;
@@ -108,7 +126,7 @@ pub fn applyStorageKernelReplicatedBatchAtRaftEntry(
     if (req.transaction != null)
         try @import("server_transaction_dispatch.zig").applyReplicatedTransactionMutationAtRaftEntry(alloc, db, table_name, group_id, req, raft_entry)
     else
-        try applyOrdered(&db, req, raft_entry);
+        try applyOrderedGroup(&db, group_id, req, raft_entry);
 }
 
 /// The seed coordinator verifies the complete manifest and every artifact before

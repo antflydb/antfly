@@ -640,8 +640,14 @@ pub const RaftApplyStore = struct {
                 .prepare_snapshot = prepareSnapshot,
                 .install_snapshot = installSnapshotFromRaft,
                 .apply_batch = applyBatch,
+                .requires_apply_delegate = requiresApplyDelegate,
             },
         };
+    }
+
+    fn requiresApplyDelegate(ptr: *anyopaque) bool {
+        const self: *RaftApplyStore = @ptrCast(@alignCast(ptr));
+        return self.native_source_delegate;
     }
 
     pub fn latestBatch(self: *RaftApplyStore, group_id: u64) !?AppliedDataBatch {
@@ -2055,7 +2061,7 @@ pub const RaftApplyStore = struct {
             .prepare_split, .start_split, .finalize_split, .rollback_split => |transition| alloc.free(transition.split_key),
             .merge_receiver_checkpoint => |checkpoint| checkpoint.deinit(alloc),
             .merge_page_fence => |payload| alloc.free(payload),
-            .acknowledge_split, .merge_source_transition, .merge_copy_fence, .set_raft_batch_protocol, .require_source_pin_protocol, .topology_guard, .topology_end, .flush_split_delta => {},
+            .acknowledge_split, .merge_source_transition, .merge_copy_fence, .set_raft_batch_protocol, .require_source_pin_protocol, .require_raft_batch_protocol, .topology_guard, .topology_end, .flush_split_delta => {},
         }
     }
 
@@ -2109,7 +2115,7 @@ pub const RaftApplyStore = struct {
                 .prepare_split, .start_split, .finalize_split, .rollback_split => |transition| alloc.free(transition.split_key),
                 .merge_receiver_checkpoint => |checkpoint| checkpoint.deinit(alloc),
                 .merge_page_fence => |payload| alloc.free(payload),
-                .acknowledge_split, .merge_source_transition, .merge_copy_fence, .set_raft_batch_protocol, .require_source_pin_protocol, .topology_guard, .topology_end, .flush_split_delta => {},
+                .acknowledge_split, .merge_source_transition, .merge_copy_fence, .set_raft_batch_protocol, .require_source_pin_protocol, .require_raft_batch_protocol, .topology_guard, .topology_end, .flush_split_delta => {},
             };
             operations.deinit(alloc);
         }
@@ -2414,6 +2420,14 @@ pub const RaftApplyStore = struct {
         defer decoded.deinit(alloc);
         if (decoded.protocol_barrier_version) |version| {
             try operations.append(alloc, .{ .set_raft_batch_protocol = version });
+            return;
+        }
+        if (decoded.batch.req.relational_index_owner_control) |command| {
+            if (!native_source_delegate) return error.StorageKernelOwnerUnavailable;
+            try operations.append(alloc, .{ .require_raft_batch_protocol = .{
+                .version = data_raft_batch.index_owner_control_protocol_version,
+                .owner_group_id = command.binding.fence.owner_group_id,
+            } });
             return;
         }
         const native_transfer = decoded.batch.req.restore_staging != null or

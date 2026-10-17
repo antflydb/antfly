@@ -12362,6 +12362,7 @@ pub const DataServer = struct {
     }
 
     fn requiredRaftBatchProtocolVersion(req: antfly.db.types.BatchRequest) u16 {
+        if (req.relational_index_owner_control != null) return data_raft_batch.index_owner_control_protocol_version;
         if (antfly.db.types.requiresGraphRelationshipProtocol(req)) return @import("../common/data_raft_protocol.zig").batch_graph_cleanup_generation_protocol_version;
         if (@import("antfly_local_sources").api_batch.requiresRowSemanticsEnvelope(req.writes, req.predicates))
             return @import("../common/data_raft_protocol.zig").batch_row_semantics_protocol_version;
@@ -12908,6 +12909,9 @@ pub const DataServer = struct {
     ) !void {
         try @import("antfly_local_sources").storage_db_artifact_publication.validateRequest(alloc, req);
         try @import("antfly_local_sources").storage_db_artifact_publication_transport.validateBatchRequest(req);
+        // A decoded Raft command is not metadata permission. A dedicated
+        // receiver must independently obtain the live owner decision first.
+        if (req.relational_index_owner_control != null) return error.UnsupportedNativeIndexOwner;
         // Do not allow a private/direct batch route to bypass the metadata
         // admission policy. This happens before a protocol barrier or a data
         // entry can be appended, so rejection is never an ambiguous outcome.
@@ -42037,6 +42041,26 @@ fn consumerTests() type {
             try std.testing.expectEqual(@as(u16, 12), DataServer.requiredRaftBatchProtocolVersion(.{
                 .restore_staging = .{ .finish = .{ .scope = @splat(4), .phase = .validated } },
             }));
+        }
+
+        test "raft index owner controls require their decoder but cannot bypass metadata admission" {
+            const Command = @typeInfo(@FieldType(antfly.db.types.BatchRequest, "relational_index_owner_control")).optional.child;
+            // Intentionally invalid: capability classification and generic-route
+            // rejection must not assume that decoding authorized the binding.
+            const request: antfly.db.types.BatchRequest = .{ .relational_index_owner_control = .{
+                .effect = .fenced,
+                .binding = std.mem.zeroInit(@FieldType(Command, "binding"), .{ .authority = .raft, .fence = .{ .role = .index_build } }),
+            } };
+            try std.testing.expectEqual(data_raft_batch.index_owner_control_protocol_version, DataServer.requiredRaftBatchProtocolVersion(request));
+            var mixed = request;
+            mixed.writes = &.{.{ .key = "row", .value = "{}" }};
+            try std.testing.expectEqual(data_raft_batch.index_owner_control_protocol_version, DataServer.requiredRaftBatchProtocolVersion(mixed));
+            // This rejection must happen before consulting any host, leader,
+            // protocol activation cache or remote metadata state.
+            var server: DataServer = undefined;
+            for ([_]antfly.db.types.BatchRequest{ request, mixed }) |batch_request| {
+                try std.testing.expectError(error.UnsupportedNativeIndexOwner, server.proposeRaftBatchGroupWithLeaderWait(std.testing.allocator, 11, "docs", batch_request, .{ .discovery = .cached }, 0));
+            }
         }
 
         test "raft batch protocol preflight fingerprint fences every applying replica set" {

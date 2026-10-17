@@ -397,6 +397,8 @@ pub const BatchRequest = struct {
     relational_activation: ?@import("relational_integrity_activation_contract.zig").Command = null,
     relational_retirement: ?@import("relational_integrity_retirement_contract.zig").Command = null,
     relational_index_maintenance: ?@import("relational_index_maintenance_contract.zig").Command = null,
+    /// Private ordered owner control. Never admitted from public batch JSON.
+    relational_index_owner_control: ?@import("relational_index_raft_contract.zig").Command = null,
     timestamp_ns: u64 = 0,
     sync_level: SyncLevel = .write,
     /// Internal single-participant transaction contract. Transform expansion

@@ -7944,6 +7944,8 @@ pub const DB = struct {
     /// Apply an already decoded committed batch. The mutation and its replay
     /// receipt remain in the same primary-store transaction.
     pub fn applyReplicatedBatch(self: *DB, mutation: replicated_mutation.Batch, sequence: u64) !void {
+        // Its ordered standby envelope is not mounted; never drop the control.
+        if (mutation.request.relational_index_owner_control != null) return error.InvalidBatchRequest;
         if (mutation.index_owner_control) |frame| {
             try frame.validate();
             if (sequence == 0 or mutation.receipt != .native or !std.meta.eql(mutation.receipt.native, frame.position)) return error.InvalidControlReceiptPosition;
@@ -9130,6 +9132,8 @@ pub const DB = struct {
     /// the global serialization fence. The bound prevents catalog churn from
     /// turning one request into unbounded CPU/provider work.
     fn batchInternal(self: *DB, req: types.BatchRequest, profile: ?*BatchProfile, opts: BatchExecutionOptions) anyerror!void {
+        // Only a committed group adapter supplies the actual group and index.
+        if (req.relational_index_owner_control != null) return error.InvalidBatchRequest;
         try types.validateGraphEndpointCleanupCommand(req);
         var lake_schema_view = self.core.acquireSchemaView();
         defer if (lake_schema_view) |*view| view.release();

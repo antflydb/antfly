@@ -75,6 +75,82 @@ test "relational index system Raft owner controls commit authentic phase cuts at
     var admission = try db.prepareRaftIndexOwnerAdmission(header, candidate.inputs.bytes);
     defer admission.deinit();
     const binding = admission.command.binding;
+    const Wire = struct {
+        fn roundtrip(backing: std.mem.Allocator, command: raft.Command) !void {
+            const codec = @import("../../api/batch.zig");
+            const request: db_mod.types.BatchRequest = .{ .relational_index_owner_control = command, .timestamp_ns = 18446744073709551600 };
+            const encoded = try codec.encodeBatchRequest(backing, request);
+            defer backing.free(encoded);
+            var decoded = try codec.parseInternalBatchRequest(backing, encoded);
+            defer decoded.deinit(backing);
+            try std.testing.expectEqualDeep(command, decoded.req.relational_index_owner_control.?);
+            try std.testing.expectEqual(request.timestamp_ns, decoded.req.timestamp_ns);
+        }
+    };
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(alloc, Wire.roundtrip, .{admission.command});
+    {
+        const codec = @import("../../api/batch.zig");
+        const request: db_mod.types.BatchRequest = .{ .relational_index_owner_control = admission.command };
+        const encoded = try codec.encodeBatchRequest(alloc, request);
+        defer alloc.free(encoded);
+        try std.testing.expectError(error.InvalidBatchRequest, codec.parseBatchRequest(alloc, encoded));
+        const wrapped = try std.fmt.allocPrint(alloc, "[\"row-semantics-batch-v1\",{s}]", .{encoded});
+        defer alloc.free(wrapped);
+        try std.testing.expectError(error.InvalidBatchRequest, codec.parseInternalBatchRequest(alloc, wrapped));
+        try std.testing.expectError(error.InvalidBatchRequest, db.batch(request));
+        try std.testing.expectError(error.InvalidBatchRequest, db.applyOrderedCommittedMutation(request, .{ .term = 1, .index = 10 }, false));
+        try std.testing.expectError(error.InvalidBatchRequest, server_test_adapter.applyOrdered(&db, request, .{ .term = 1, .index = 10 }));
+        try std.testing.expectError(error.InvalidBatchRequest, db.applyReplicatedBatch(.{ .request = request, .receipt = .{ .ordered = .{ .term = 1, .index = 10 } } }, 1));
+        for (0..7) |variant| {
+            var mixed = request;
+            switch (variant) {
+                0 => mixed.writes = &.{.{ .key = "smuggled", .value = "{}" }},
+                1 => mixed.deletes = &.{"smuggled"},
+                2 => mixed.restore_staging_scope = @splat(1),
+                3 => mixed.activate_range_tracking = true,
+                4 => mixed.schema_version = 1,
+                5 => mixed.row_policy_principal_proof = "smuggled",
+                6 => mixed.sync_level = .full_index,
+                else => unreachable,
+            }
+            try std.testing.expectError(error.InvalidBatchRequest, codec.encodeBatchRequest(alloc, mixed));
+        }
+        var parsed_wire = try std.json.parseFromSlice(std.json.Value, alloc, encoded, .{ .parse_numbers = false });
+        defer parsed_wire.deinit();
+        const owned = parsed_wire.arena.allocator();
+        const inserts = parsed_wire.value.object.getPtr("inserts").?;
+        try inserts.object.put(owned, "row", .{ .string = "{}" });
+        var no_allocations: std.heap.FixedBufferAllocator = .init(&.{});
+        try std.testing.expectError(error.InvalidBatchRequest, codec.parseInternalBatchValue(no_allocations.allocator(), parsed_wire.value));
+        _ = inserts.object.swapRemove("row");
+        try parsed_wire.value.object.put(owned, "future_control", .{ .bool = true });
+        const unknown = try std.json.Stringify.valueAlloc(alloc, parsed_wire.value, .{});
+        defer alloc.free(unknown);
+        try std.testing.expectError(error.InvalidBatchRequest, codec.parseInternalBatchRequest(alloc, unknown));
+        _ = parsed_wire.value.object.swapRemove("future_control");
+        const control = parsed_wire.value.object.getPtr("_relational_index_owner_control").?;
+        const original_inputs = control.object.get("inputs_b64").?;
+        const oversized = try alloc.alloc(u8, std.base64.standard.Encoder.calcSize(@import("relational_index_inputs.zig").max_bytes) + 1);
+        defer alloc.free(oversized);
+        @memset(oversized, 'A');
+        try control.object.put(owned, "inputs_b64", .{ .string = oversized });
+        // No derived manifest allocation may occur before rejecting the bound.
+        var exhausted: std.heap.FixedBufferAllocator = .init(&.{});
+        try std.testing.expectError(error.InvalidPrivateIndexInputs, codec.parseInternalBatchValue(exhausted.allocator(), parsed_wire.value));
+        try control.object.put(owned, "inputs_b64", original_inputs);
+        try control.object.put(owned, "position", .{ .integer = 999 });
+        const caller_cut = try std.json.Stringify.valueAlloc(alloc, parsed_wire.value, .{});
+        defer alloc.free(caller_cut);
+        try std.testing.expectError(error.InvalidBatchRequest, codec.parseInternalBatchRequest(alloc, caller_cut));
+        const alias = control.*;
+        _ = parsed_wire.value.object.swapRemove("_relational_index_owner_control");
+        try parsed_wire.value.object.put(owned, "relational_index_owner_control", alias);
+        const public_alias = try std.json.Stringify.valueAlloc(alloc, parsed_wire.value, .{});
+        defer alloc.free(public_alias);
+        try std.testing.expectError(error.InvalidBatchRequest, codec.parseBatchRequest(alloc, public_alias));
+        try std.testing.expectError(error.InvalidBatchRequest, codec.parseInternalBatchRequest(alloc, public_alias));
+        try std.testing.expectEqual(@as(u64, 1), (try db.orderedApplyReceipt()).?.index);
+    }
     {
         db.local_execution.restore_staging_required.store(true, .release);
         defer db.local_execution.restore_staging_required.store(false, .release);
@@ -252,6 +328,7 @@ test "relational index system Raft owner controls commit authentic phase cuts at
         try db.core.store.putBatch(&.{.{ .key = &cut_key, .value = saved }}, &.{});
         try std.testing.expectEqualDeep(reserved, (try db.raftIndexOwnerReceipt(11, binding, .reserved)).?);
     }
+    try @import("antfly_server_test_sources").local_test_sources.storage_relational_index_raft_apply.run(admission.command);
 }
 
 test {

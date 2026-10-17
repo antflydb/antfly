@@ -197,6 +197,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "distributed online merge admission declines both owners and direct source proposals",
         "data raft raw topology rejection advances delegate with exact typed outcome",
         "raft batch protocol preflight fingerprint fences every applying replica set",
+        "raft index owner controls require their decoder but cannot bypass metadata admission",
         "raft batch protocol plan resolves only current group applying peers",
         "raft batch protocol cache reuses only short lived negative evidence",
         "raft batch protocol activation is reusable only in its accepted leader term",

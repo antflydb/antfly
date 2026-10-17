@@ -440,6 +440,7 @@ pub const OwnedBatchRequest = struct {
     relational_activation: ?std.json.Parsed(@import("../storage/db/relational_integrity_activation_contract.zig").Command) = null,
     relational_retirement: ?std.json.Parsed(@import("../storage/db/relational_integrity_retirement_contract.zig").Command) = null,
     relational_index_maintenance: ?std.json.Parsed(@import("../storage/db/relational_index_maintenance_contract.zig").Command) = null,
+    relational_index_owner_control: ?std.json.Parsed(@import("../storage/db/relational_index_raft_contract.zig").Command) = null,
     relational_topology: ?std.json.Parsed(@import("../storage/db/relational_integrity_topology_contract.zig").Command) = null,
     relational_generation_gc: ?std.json.Parsed(@import("../storage/db/relational_integrity_generation_retirement.zig").GcCommand) = null,
     row_policy_publication: ?std.json.Parsed(@import("../system_catalog/policies.zig").InstallRequest) = null,
@@ -472,6 +473,7 @@ pub const OwnedBatchRequest = struct {
         if (self.relational_activation) |*activation| activation.deinit();
         if (self.relational_retirement) |*retirement| retirement.deinit();
         if (self.relational_index_maintenance) |*retirement| retirement.deinit();
+        if (self.relational_index_owner_control) |*control| control.deinit();
         if (self.relational_topology) |*topology| topology.deinit();
         if (self.relational_generation_gc) |*page| page.deinit();
         if (self.row_policy_publication) |*publication| publication.deinit();
@@ -637,8 +639,36 @@ fn parseBatchValue(alloc: std.mem.Allocator, input_value: std.json.Value, allow_
     } else input_value;
     if (root_value != .object) return error.InvalidBatchRequest;
     const root = root_value.object;
+    if (root.contains("relational_index_owner_control")) return error.InvalidBatchRequest;
     if (!allow_internal and (root.get("_graph_writes") != null or root.get("_graph_deletes") != null))
         return error.InvalidBatchRequest;
+
+    var relational_index_owner_control = if (root.get("_relational_index_owner_control")) |value| control: {
+        if (!allow_internal or versioned) return error.InvalidBatchRequest;
+        // Exact control framing rejects unknown effects before normalization.
+        for (root.keys()) |name| {
+            if (!std.mem.eql(u8, name, "_relational_index_owner_control") and
+                !std.mem.eql(u8, name, "inserts") and !std.mem.eql(u8, name, "deletes") and
+                !std.mem.eql(u8, name, "sync_level") and !std.mem.eql(u8, name, "_timestamp_ns")) return error.InvalidBatchRequest;
+        }
+        if (root.get("inserts")) |inserts| if (inserts != .null and (inserts != .object or inserts.object.count() != 0)) return error.InvalidBatchRequest;
+        if (root.get("deletes")) |deletes| if (deletes != .null and (deletes != .array or deletes.array.items.len != 0)) return error.InvalidBatchRequest;
+        // Check the borrowed manifest before typed parsing duplicates it. The
+        // general batch string limit is larger than this control's input budget.
+        if (value != .object) return error.InvalidBatchRequest;
+        if (value.object.get("inputs_b64")) |input| {
+            if (input != .null) {
+                if (input != .string or input.string.len == 0 or
+                    input.string.len > std.base64.standard.Encoder.calcSize(@import("../storage/db/relational_index_inputs.zig").max_bytes)) return error.InvalidPrivateIndexInputs;
+            }
+        }
+        const parsed = std.json.parseFromValue(@import("../storage/db/relational_index_raft_contract.zig").Command, alloc, value, .{ .allocate = .alloc_always, .ignore_unknown_fields = false }) catch |err| {
+            if (err == error.OutOfMemory) return err;
+            return error.InvalidBatchRequest;
+        };
+        break :control @as(?std.json.Parsed(@import("../storage/db/relational_index_raft_contract.zig").Command), parsed);
+    } else null;
+    errdefer if (relational_index_owner_control) |*control| control.deinit();
 
     var page_effects: ?std.json.Parsed(MergePageEffects) = null;
     errdefer if (page_effects) |*effects| effects.deinit();
@@ -1471,6 +1501,7 @@ fn parseBatchValue(alloc: std.mem.Allocator, input_value: std.json.Value, allow_
         .relational_activation = relational_activation,
         .relational_retirement = relational_retirement,
         .relational_index_maintenance = relational_index_maintenance,
+        .relational_index_owner_control = relational_index_owner_control,
         .relational_topology = relational_topology,
         .relational_generation_gc = relational_generation_gc,
         .row_policy_publication = row_policy_publication,
@@ -1503,6 +1534,7 @@ fn parseBatchValue(alloc: std.mem.Allocator, input_value: std.json.Value, allow_
             .relational_activation = if (relational_activation) |activation| activation.value else null,
             .relational_retirement = if (relational_retirement) |retirement| retirement.value else null,
             .relational_index_maintenance = if (relational_index_maintenance) |maintenance| maintenance.value else null,
+            .relational_index_owner_control = if (relational_index_owner_control) |control| control.value else null,
             .relational_topology = if (relational_topology) |topology| topology.value else null,
             .relational_generation_gc = if (relational_generation_gc) |page| page.value else null,
             .row_policy_publication = if (row_policy_publication) |publication| publication.value else null,
@@ -1544,6 +1576,7 @@ fn parseBatchValue(alloc: std.mem.Allocator, input_value: std.json.Value, allow_
         },
     };
     try @import("../storage/range_protection.zig").validateRequest(result_value.req);
+    try @import("../storage/db/relational_index_raft_contract.zig").validateBatchRequest(result_value.req);
     if (!allow_internal) {
         const keys = @import("../storage/internal_keys.zig");
         for (result_value.req.writes) |write| if (keys.isGraphEndpointCleanupControlKey(write.key)) return error.InvalidBatchRequest;
@@ -1602,6 +1635,7 @@ pub fn encodeBatchRequest(alloc: std.mem.Allocator, req: db_mod.types.BatchReque
 }
 
 fn encodeBatchRequestOwned(alloc: std.mem.Allocator, req: db_mod.types.BatchRequest) ![]u8 {
+    try @import("../storage/db/relational_index_raft_contract.zig").validateBatchRequest(req);
     try @import("../storage/db/artifact_publication.zig").validateRequest(alloc, req);
     try @import("../storage/db/artifact_publication_transport.zig").validateBatchRequest(req);
     if (req.row_policy_publication) |publication| {
@@ -1790,6 +1824,10 @@ fn encodeBatchRequestOwned(alloc: std.mem.Allocator, req: db_mod.types.BatchRequ
         const encoded = try std.json.Stringify.valueAlloc(alloc, retirement, .{});
         defer alloc.free(encoded);
         try writer.writeAll(encoded);
+    }
+    if (req.relational_index_owner_control) |control| {
+        try writer.writeAll(",\"_relational_index_owner_control\":");
+        try writer.print("{f}", .{std.json.fmt(control, .{})});
     }
     if (req.relational_topology) |topology| {
         try writer.writeAll(",\"_relational_topology\":");
