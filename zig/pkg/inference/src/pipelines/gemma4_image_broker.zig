@@ -121,10 +121,20 @@ pub fn submit(broker: *micro.Broker, allocator: std.mem.Allocator, io: std.Io, m
         if ((shape(group) catch return null) == null) general = true;
         if (group.content.len != 1 or (groups[0].content.len == 1 and @backingInt(std.meta.activeTag(group.content[0])) != @backingInt(std.meta.activeTag(groups[0].content[0])))) general = true;
     }
-    if (general and session.backend() == .cuda) return null;
+    if (session.backend() == .cuda) {
+        const media_batch = if (factory.getEmbeddingGemma2CudaPolicy(session)) |policy| policy.media_batch else false;
+        // Audio uses the shared prepared-group scheduler so CUDA keeps its
+        // reference resampling and BF16 backbone instead of the F32 route.
+        if (groups[0].content[0] == .audio and media_batch) general = true;
+        if (general and !media_batch) return null;
+        if (general) for (groups) |group| for (group.content) |part| switch (part) {
+            .text, .image, .audio => {},
+            else => return null,
+        };
+    }
     const audio_mode = !general and groups[0].content.len == 1 and groups[0].content[0] == .audio;
     if (!general and ((audio_mode and (!cfg.audio or !options.resident_audio)) or (!audio_mode and !cfg.vision))) return null;
-    if (session.backend() == .cuda and (audio_mode or grouped.imageCohortLimit(session) == 1)) return null;
+    if (session.backend() == .cuda and !general and (audio_mode or grouped.imageCohortLimit(session) == 1)) return null;
     var capacity: usize = @min(@as(usize, 4), max_batch);
     if (capacity == 0) return error.InvalidImageBatch;
     try control.check();

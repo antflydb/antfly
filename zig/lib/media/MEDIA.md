@@ -400,3 +400,13 @@ outlive prepared tensors. Packed projection and graph caches hold separate
 retained admission, with bounded storage and synchronized ownership transitions.
 See [CUDA_TUNING.md](../../pkg/inference/CUDA_TUNING.md#embeddinggemma-2-encoder-optimization-profiles)
 for optional arithmetic profiles and qualification requirements.
+
+CUDA ordered text/image/audio groups use the prepared-wave scheduler when the
+session's `MEDIA_BATCH` qualification profile is enabled. CPU preparation overlaps
+device execution; projected rows remain resident and the ordered composer keeps
+manual placeholders, Pillow image policy and reference audio resampling intact.
+Length buckets run the BF16 backbone in batches of at most four. Queue cancellation
+continues to use live cohort members and original result indexes. The profile is
+part of the embedding identity and defaults off pending NVIDIA qualification.
+Singleton CUDA mixed requests retire preprocessing admission after composition;
+image header geometry determines the initial bounds.

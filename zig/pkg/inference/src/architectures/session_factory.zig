@@ -8335,6 +8335,15 @@ fn refineGptConfigFromManifestTensorMetadata(
     try refineGptConfigFromStore(allocator, store, all_names, config);
 }
 
+/// Arithmetic policy is frozen with the session identity, never re-read by queues.
+pub fn getEmbeddingGemma2CudaPolicy(session: Session) ?@import("../ops/cuda/embedding_gemma2_policy.zig").Policy {
+    if (comptime !build_options.enable_cuda) return null;
+    if (session.vtable != &arch_vtable) return null;
+    const self: *ArchSession = @ptrCast(@alignCast(session.ptr));
+    if (self.backend_type != .cuda or self.arch_config != .embedding_gemma2) return null;
+    return self.backend_data.cuda.compute.embedding_gemma2_policy;
+}
+
 pub fn getCudaRuntimeStats(session: Session) ?CudaRuntimeStats {
     if (comptime !build_options.enable_cuda) return null;
     if (session.vtable != &arch_vtable) return null;

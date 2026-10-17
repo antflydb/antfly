@@ -613,6 +613,8 @@ CUDA_ROUTES = {
     "packed_projections": "packed_projection_launches_total",
     "graph_replay": "embedding_graph_replays_total",
     "batched_vision": "vision_batched_executes_total",
+    "native_vision": "native_vision_launches_total",
+    "media_batch": "media_batches_total",
 }
 
 

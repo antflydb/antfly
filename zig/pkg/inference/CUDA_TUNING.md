@@ -1216,6 +1216,8 @@ pending NVIDIA hardware qualification.
 | `PACKED_PROJECTIONS=1` | Pack immutable Q/K/V and gate/up weights once, execute one GEMM per group and split columns without changing BF16 bits. |
 | `GRAPH_REPLAY=1` | Four retained arenas for singleton text inputs through 256 tokens, bucketed in multiples of 64; upload fresh input/masks before replay and read back the compact result afterward. |
 | `IMAGE_BATCH=1` | Existing image cohort opt-in also permits up to four staged video pictures. cuDNN vision plans carry the full batch dimension. |
+| `NATIVE_VISION=1` | Native batched head-64 tensor-core attention with online softmax. Reuses the bundled tiled kernel, avoids score/probability arenas and cuDNN dependency, and takes precedence over cuDNN vision routes for deterministic qualification. |
+| `MEDIA_BATCH=1` | Up to four ordered text/image/audio groups share preparation waves and length-bucketed BF16 backbone calls. CUDA Pillow resize, reference audio resampling and manual placeholder ordering remain explicit. |
 
 Packed weights retain up to 512 MiB, and each of the four graph arenas has a
 64 MiB ceiling. Every retained allocation holds both physical context accounting
@@ -1233,16 +1235,35 @@ interruption contract. Capture failure cannot return stale output.
 
 The comparison harness records CUDA controls and observed route counters. Use
 `--require-route extended_flash`, `--require-route fused_vision`,
-`--require-route packed_projections` or `--require-route graph_replay` to reject a
+`--require-route packed_projections`, `--require-route graph_replay`,
+`--require-route native_vision` or `--require-route media_batch` to reject a
 qualification run where the requested optimization never executed. A workload
 must exercise the route: e.g. short repeated queries for replay, media for vision,
 and medium/long sequences for extended flash. `--require-route batched_vision`
 requires actual multi-image/frame execution, not just an enabled environment flag.
 
-NVIDIA qualification must run the GPU split/rotary differential tests, ordered
+NVIDIA qualification must run the native attention partial-tile/batch differential tests, mixed-cohort versus
+singleton vectors and cancellation/retry, GPU split/rotary differential tests, ordered
 resident composition versus legacy BF16 boundaries (with checkpoint/media oracle
 environment paths), masked
 local/global tile-tail tests, fresh-input graph replay test, pretrained matched
 BF16 comparison, and completed-device performance/memory measurements before
 promoting any profile. Compilation and portable policy tests do not establish a
 GPU speedup or numerical parity.
+
+CUDA resize preparation retains four immutable geometry/pixel-policy plans within
+an 8 MiB coefficient ceiling. Two pinned source slots (at most 64 MiB each) wait
+only for their own H2D completion events before reuse. A cache hit builds/uploads
+no coefficients and imposes no resize completion barrier. Retained coefficient
+host/device storage and pinned sources hold shared admission leases separately
+from request peaks. Geometry eviction and teardown drain readers; admission or
+pinned-memory declines retain the synchronous uncached path. Resize hit/miss and
+transfer counters expose actual reuse.
+
+Ordered CUDA admission inspects image headers before decode, bounds text lengths
+and retained media rows, and reserves the maximum of tower and encoder peaks.
+Once preparation completes, singleton mixed/video requests retain only the actual
+sequence, host metadata and encoder workspace. Prepared cohort execution keeps
+future preparation and projected peers admitted; it does not release their peak
+while a subsequent producer wave may still need it. The final ready wave drops
+completed preparation reservations before acquiring its encoder supplement.

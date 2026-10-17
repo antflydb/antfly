@@ -199,17 +199,25 @@ pub fn prepare(
     max_audio_decode_working_bytes: usize,
     control: ?InferenceExecutionControl,
 ) !Prepared {
-    return prepareImpl(cb, allocator, tok, prefix, parts, max_tokens, max_audio_decode_working_bytes, control, false);
+    return prepareImpl(cb, allocator, tok, prefix, parts, max_tokens, max_audio_decode_working_bytes, control, false, null);
 }
 
 /// The caller keeps the backend and its execution lock alive through encoding.
 pub fn prepareResident(cb: *const ComputeBackend, allocator: std.mem.Allocator, tok: Tokenizer, prefix: []const u8, parts: []const Part, max_tokens: usize, max_audio_decode_working_bytes: usize, control: ?InferenceExecutionControl) !Prepared {
     if (comptime !@import("build_options").enable_cuda) return error.UnsupportedEmbeddingGemma2Backend;
     if (cb.kind() != .cuda) return error.UnsupportedEmbeddingGemma2Backend;
-    return prepareImpl(cb, allocator, tok, prefix, parts, max_tokens, max_audio_decode_working_bytes, control, true);
+    return prepareImpl(cb, allocator, tok, prefix, parts, max_tokens, max_audio_decode_working_bytes, control, true, null);
 }
 
-fn prepareImpl(cb: *const ComputeBackend, allocator: std.mem.Allocator, tok: Tokenizer, prefix: []const u8, parts: []const Part, max_tokens: usize, max_audio_decode_working_bytes: usize, control: ?InferenceExecutionControl, resident: bool) !Prepared {
+/// Borrowed projected rows indexed by content part; the composer retains views.
+pub const Projected = struct { tensor: ops.CT, tokens: usize };
+pub fn prepareResidentProjected(cb: *const ComputeBackend, allocator: std.mem.Allocator, tok: Tokenizer, prefix: []const u8, parts: []const Part, max_tokens: usize, control: ?InferenceExecutionControl, projected: []const ?Projected) !Prepared {
+    if (comptime !@import("build_options").enable_cuda) return error.UnsupportedEmbeddingGemma2Backend;
+    if (cb.kind() != .cuda or parts.len != projected.len) return error.InvalidInputShape;
+    return prepareImpl(cb, allocator, tok, prefix, parts, max_tokens, 64 * 1024 * 1024, control, true, projected);
+}
+
+fn prepareImpl(cb: *const ComputeBackend, allocator: std.mem.Allocator, tok: Tokenizer, prefix: []const u8, parts: []const Part, max_tokens: usize, max_audio_decode_working_bytes: usize, control: ?InferenceExecutionControl, resident: bool, projected: ?[]const ?Projected) !Prepared {
     if (parts.len == 0) return error.EmptyEmbeddingInput;
     if (max_tokens == 0 or max_tokens > 8192) return error.InvalidEmbeddingTokenLimit;
     // Video is outside this serving lane, including manual placeholders.
@@ -227,8 +235,21 @@ fn prepareImpl(cb: *const ComputeBackend, allocator: std.mem.Allocator, tok: Tok
     }
     // Towers run first because their dynamic token counts define marker
     // expansion. Their owned outputs remain in content-part order here.
-    for (parts) |part| {
+    for (parts, 0..) |part, part_index| {
         try checkControl(control);
+        if (projected) |rows| if (rows[part_index]) |row| {
+            const kind: @FieldType(Media, "kind") = switch (part) {
+                .image => .image,
+                .audio => .audio,
+                else => return error.InvalidInputShape,
+            };
+            if (row.tokens == 0) return error.EmptyMediaEmbedding;
+            const tensor = try cb.sliceRows2D(allocator, row.tensor, 0, row.tokens, hidden_size);
+            errdefer cb.free(tensor);
+            try media.append(allocator, .{ .kind = kind, .tensor = tensor, .backend = cb, .tokens = row.tokens });
+            continue;
+        };
+
         switch (part) {
             .text => {},
             .image => |bytes| {

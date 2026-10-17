@@ -563,3 +563,13 @@ preserves the 32-frame/model-token limits. Cleanup drains failed work and owns a
 partial staging slots. Batched cuDNN plans preserve independent attention per
 picture. Profile identity and NVIDIA qualification are documented in
 [CUDA_TUNING.md](../../pkg/inference/CUDA_TUNING.md#embeddinggemma-2-encoder-optimization-profiles).
+
+The CUDA EmbeddingGemma2 resize path caches coefficient plans by source/target
+geometry and pixel preparation policy. Model-owned plans and pinned copy staging
+remove success-path per-picture stream drains; source slots wait for H2D events,
+while NVDEC surface release retains its separate RGB-conversion fence. Retention
+is bounded and shared-admitted, with a synchronous uncached fallback on pressure.
+The `NATIVE_VISION` qualification profile runs batched native online-softmax
+attention without score/probability arenas or cuDNN. Video admission drops the
+completed media peak before the BF16 backbone, using the actual expanded length.
+These changes do not establish NVIDIA speedups without completed-device timings.

@@ -158,6 +158,13 @@ pub const CudaContext = struct {
     }
 
     pub fn deinit(self: *CudaContext) void {
+        self.releaseResources();
+        self.driver.deinit();
+    }
+
+    /// Leave driver entry points loaded for host-only cleanup after a lost
+    /// context has relinquished all in-flight device references.
+    pub fn releaseResources(self: *CudaContext) void {
         if (self.ctx != null) {
             _ = self.driver.fns.cuCtxSetCurrent(self.ctx);
         }
@@ -174,7 +181,6 @@ pub const CudaContext = struct {
             _ = self.driver.fns.cuDevicePrimaryCtxRelease(self.device);
             self.ctx = null;
         }
-        self.driver.deinit();
     }
 
     pub fn makeCurrent(self: *CudaContext) driver_mod.Error!void {

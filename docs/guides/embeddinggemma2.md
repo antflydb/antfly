@@ -1107,3 +1107,11 @@ identity pins and remain subject to matched BF16 qualification. See the reposito
 `zig/pkg/inference/CUDA_TUNING.md` for profile controls, retained memory limits and
 route-evidence gates. Mixed CUDA inputs compose their ordered text/media rows on
 device; repeated video samples reuse projection while preserving logical slots.
+
+CUDA additionally offers `ANTFLY_INFERENCE_CUDA_EMBEDDING_GEMMA2_NATIVE_VISION=1`
+for native batched tiled vision attention and
+`ANTFLY_INFERENCE_CUDA_EMBEDDING_GEMMA2_MEDIA_BATCH=1` for ordered mixed-media/audio
+cohorts with preparation overlap and batched BF16 backbone execution. Both are
+session-frozen, change `model_identity`, and remain opt-in until NVIDIA vector,
+ranking and performance qualification. The comparison harness can require observed
+execution with `--require-route native_vision` and `--require-route media_batch`.

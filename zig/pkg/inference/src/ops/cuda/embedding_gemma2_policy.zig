@@ -22,12 +22,16 @@ pub const Policy = struct {
     packed_projections: bool = false,
     graph_replay: bool = false,
     image_batch: bool = false,
+    native_vision: bool = false,
+    media_batch: bool = false,
     pub fn arithmeticBits(self: Policy) u8 {
-        return @as(u8, @intFromBool(self.extended_flash)) | (@as(u8, @intFromBool(self.fused_vision)) << 1) | (@as(u8, @intFromBool(self.packed_projections)) << 2) | (@as(u8, @intFromBool(self.graph_replay)) << 3) | (@as(u8, @intFromBool(self.image_batch)) << 4);
+        return @as(u8, @intFromBool(self.extended_flash)) | (@as(u8, @intFromBool(self.fused_vision)) << 1) | (@as(u8, @intFromBool(self.packed_projections)) << 2) | (@as(u8, @intFromBool(self.graph_replay)) << 3) | (@as(u8, @intFromBool(self.image_batch)) << 4) | (@as(u8, @intFromBool(self.native_vision)) << 5) | (@as(u8, @intFromBool(self.media_batch)) << 6);
     }
 };
 pub fn configured() Policy {
     return .{
+        .native_vision = env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_EMBEDDING_GEMMA2_NATIVE_VISION", false),
+        .media_batch = env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_EMBEDDING_GEMMA2_MEDIA_BATCH", false),
         .extended_flash = env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_EMBEDDING_GEMMA2_EXTENDED_FLASH", false),
         .fused_vision = env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_EMBEDDING_GEMMA2_FUSED_VISION", false),
         .packed_projections = env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_EMBEDDING_GEMMA2_PACKED_PROJECTIONS", false),
@@ -38,6 +42,6 @@ pub fn configured() Policy {
 
 test "embeddinggemma2 CUDA arithmetic profiles are disjoint including graph padding and image cohorts" {
     const std = @import("std");
-    const profiles = [_]Policy{ .{}, .{ .extended_flash = true }, .{ .fused_vision = true }, .{ .packed_projections = true }, .{ .graph_replay = true }, .{ .image_batch = true } };
+    const profiles = [_]Policy{ .{}, .{ .extended_flash = true }, .{ .fused_vision = true }, .{ .packed_projections = true }, .{ .graph_replay = true }, .{ .image_batch = true }, .{ .native_vision = true }, .{ .media_batch = true } };
     for (profiles, 0..) |left, i| for (profiles[i + 1 ..]) |right| try std.testing.expect(left.arithmeticBits() != right.arithmeticBits());
 }

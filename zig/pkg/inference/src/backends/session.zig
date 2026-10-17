@@ -243,7 +243,7 @@ pub const RunAdmission = struct {
             // ~60 MiB reusable layer arena live alongside the bounded
             // vision-attention arena and F32 bridge tensors. Reserve their
             // measured peak plus headroom independently of the Lt workspace.
-            const fixed = 80 * 1024 * 1024 + 384 * 1024 * 1024;
+            const fixed = 80 * 1024 * 1024 + (if (request.preprocessing_complete) @as(usize, 0) else 384 * 1024 * 1024);
             return try addBytes(try addBytes(try addBytes(arena, states), staging), try addBytes(attention, fixed));
         }
         // Attention and FFN phases are sequential, so reserve the larger peak
@@ -325,6 +325,9 @@ pub const RunRequest = struct {
     output_kv_bytes: usize = 0,
     workspace_bytes: usize = 0,
     host_preprocess_bytes: usize = 0,
+    /// Media towers have completed; their transient peak is no longer live.
+    /// Retained model caches carry independent leases.
+    preprocessing_complete: bool = false,
     /// Host input bytes still covered by a separate live permit. This credit
     /// is limited to input + preprocessing residency and lets callers compose
     /// CPU preprocessing with backend execution without a release/reacquire
@@ -2031,4 +2034,18 @@ test "embeddinggemma2 stage supplements preserve base admission and reject overc
     retry.deinit();
     base.deinit();
     try std.testing.expectEqual(memory.AdmissionAmounts{}, controller.snapshot());
+}
+
+test "embeddinggemma2 CUDA phased admission retires media peak without borrowing" {
+    var controller = memory.AdmissionController{};
+    const admission = RunAdmission{ .controller = &controller, .backend_class = .gpu, .limits = .{}, .static_workspace_bytes = 0, .check_live_memory = false, .model_profile = .{ .hidden_size = 512, .intermediate_size = 2048, .attention_heads = 4, .embedding_gemma2_cuda = true } };
+    const before = try admission.estimateRequest(.{ .sequence = 1024, .host_preprocess_bytes = 128 * 1024 * 1024 }, &.{});
+    const after = try admission.estimateRequest(.{ .sequence = 64, .host_preprocess_bytes = 1024, .preprocessing_complete = true }, &.{});
+    try std.testing.expect(before.backend_scratch_bytes > after.backend_scratch_bytes + 384 * 1024 * 1024);
+    var lease = try controller.tryAcquire(.gpu, .{}, before, false);
+    defer lease.release();
+    try lease.retain(after);
+    try std.testing.expectEqual(after, controller.snapshot());
+    try std.testing.expectError(error.InvalidAdmissionLeaseReduction, lease.retain(before));
+    try std.testing.expectEqual(after, controller.snapshot());
 }

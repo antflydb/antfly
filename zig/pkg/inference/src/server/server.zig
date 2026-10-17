@@ -20560,7 +20560,7 @@ pub const Node = struct {
         for (groups, compact) |maybe, *value| {
             if (maybe) |group| value.* = group else complete = false;
         }
-        var coalesced = if (complete and loaded.session.backend() != .cuda) try self.tryEmbedGemma4MediaGroups(a, loaded, compact, active_options, control, active_contract) else null;
+        var coalesced = if (complete) try self.tryEmbedGemma4MediaGroups(a, loaded, compact, active_options, control, active_contract) else null;
         if (coalesced) |*batch| {
             defer batch.deinit();
             for (batch.items, 0..) |*item, index| switch (item.result) {

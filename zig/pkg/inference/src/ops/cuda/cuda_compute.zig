@@ -2309,6 +2309,9 @@ pub const CudaCompute = struct {
     embedding_gemma2: ?embedding_gemma2_cuda.Module = null,
     embedding_gemma2_weights_validated: bool = false,
     embedding_gemma2_vision_weights_validated: bool = false,
+    embedding_gemma2_resize: @import("embedding_gemma2_resize.zig").Cache = .{},
+    embedding_gemma2_native_vision_launches: usize = 0,
+    embedding_gemma2_media_batches: usize = 0,
     embedding_gemma2_execution: @import("embedding_gemma2_execution.zig").Cache = .{},
     embedding_gemma2_policy: @import("embedding_gemma2_policy.zig").Policy = .{},
     /// Opt-in diagnostic access to borrowed LayerNorm backward tensors. The
@@ -2571,12 +2574,15 @@ pub const CudaCompute = struct {
     /// kernel remains a fail-closed fallback and is counted in runtime stats.
     /// Preserve the BF16 lookup/scale rounding contract without a host bounce.
     pub fn configureEmbeddingGemma2Admission(self: *CudaCompute, admission: ?@import("video_cache_budget.zig").Admission) !void {
-        if (!std.meta.eql(self.ctx.video_cache_budget.admission, admission))
+        if (!std.meta.eql(self.ctx.video_cache_budget.admission, admission)) {
             try self.embedding_gemma2_execution.clear(self.allocator, &self.ctx);
+            try self.embedding_gemma2_resize.clear(&self.ctx);
+        }
         try self.ctx.configureVideoAdmission(admission);
     }
 
     pub fn evictEmbeddingGemma2Caches(self: *CudaCompute) !void {
+        try self.embedding_gemma2_resize.clear(&self.ctx);
         try self.embedding_gemma2_execution.clear(self.allocator, &self.ctx);
         _ = try self.ctx.evictVideoDecoder();
     }
@@ -2706,7 +2712,7 @@ pub const CudaCompute = struct {
         defer if (platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_EMBEDDING_GEMMA2_STATS", false)) {
             const after = module.stats();
             std.log.info(
-                "embedding_gemma2_stats batch={} sequence={} encoder_sequence={} requested_dim={} cublaslt_matmuls={} scalar_matmul_fallbacks={} attention_scalar_fallbacks={} attention_launches={} kernel_launches={} output_bytes={} packed_projection_launches_total={} fused_vision_launches_total={} extended_flash_launches_total={} embedding_graph_replays_total={} vision_batched_executes_total={}",
+                "embedding_gemma2_stats batch={} sequence={} encoder_sequence={} requested_dim={} cublaslt_matmuls={} scalar_matmul_fallbacks={} attention_scalar_fallbacks={} attention_launches={} kernel_launches={} output_bytes={} packed_projection_launches_total={} fused_vision_launches_total={} extended_flash_launches_total={} embedding_graph_replays_total={} vision_batched_executes_total={} native_vision_launches_total={} resize_cache_hits_total={} resize_cache_misses_total={} media_batches_total={}",
                 .{
                     batch,
                     sequence,
@@ -2723,6 +2729,10 @@ pub const CudaCompute = struct {
                     after.extended_flash_launches,
                     self.stats.cuda_graph_capture_replays,
                     if (self.embedding_gemma2_cudnn) |cudnn| cudnn.stats().vision_batched_executes else 0,
+                    self.embedding_gemma2_native_vision_launches,
+                    self.embedding_gemma2_resize.hits,
+                    self.embedding_gemma2_resize.misses,
+                    self.embedding_gemma2_media_batches,
                 },
             );
         };
@@ -3073,6 +3083,7 @@ pub const CudaCompute = struct {
 
     pub fn deinit(self: *CudaCompute) void {
         const retained_cleanup_failed = failed: {
+            self.embedding_gemma2_resize.clear(&self.ctx) catch break :failed true;
             self.embedding_gemma2_execution.clear(self.allocator, &self.ctx) catch break :failed true;
             break :failed false;
         };
@@ -3195,8 +3206,12 @@ pub const CudaCompute = struct {
             self.cublaslt = null;
         }
         self.kernels.unload(&self.ctx);
-        self.ctx.deinit();
-        if (retained_cleanup_failed) self.embedding_gemma2_execution.releaseAfterContextDestroyed(self.allocator);
+        self.ctx.releaseResources();
+        if (retained_cleanup_failed) {
+            self.embedding_gemma2_execution.releaseAfterContextDestroyed(self.allocator);
+            self.embedding_gemma2_resize.releaseAfterContextDestroyed(&self.ctx);
+        }
+        self.ctx.driver.deinit();
     }
 
     pub fn computeBackend(self: *CudaCompute) ops.ComputeBackend {
@@ -20042,6 +20057,73 @@ fn preprocessEmbeddingGemma2Patches(self: *CudaCompute, rgb: []const u8, residen
     if (width > 65535 or height > 65535 or source_bytes > 64 * 1024 * 1024 or horizontal_bytes > 128 * 1024 * 1024) return null;
     const image = @import("antfly_image");
     try image.work_control.check();
+    const resize_misses = self.embedding_gemma2_resize.misses;
+    const cached = self.embedding_gemma2_resize.plan(self.allocator, &self.ctx, .{ .width = width, .height = height, .target_width = target_width, .target_height = target_height, .resident = resident != null }) catch |err| {
+        if (!embeddingGemma2ResizeCachePressure(err)) return err;
+        try self.embedding_gemma2_resize.clear(&self.ctx);
+        return preprocessEmbeddingGemma2PatchesUncached(self, rgb, resident, width, height, stride, target_width, target_height);
+    };
+    if (self.embedding_gemma2_resize.misses != resize_misses) self.stats.h2d_bytes += cached.bytes;
+    const module = try self.embeddingGemma2Module();
+    var owned_source = buffer_mod.DeviceBuffer{};
+    defer releaseDeviceBuffer(self, &owned_source);
+    const source = resident orelse staged: {
+        owned_source = try allocDeviceBuffer(self, source_bytes);
+        self.embedding_gemma2_resize.uploadSource(&self.ctx, owned_source, rgb[0..source_bytes]) catch |err| {
+            if (!embeddingGemma2ResizeCachePressure(err)) return err;
+            try self.embedding_gemma2_resize.clear(&self.ctx);
+            return preprocessEmbeddingGemma2PatchesUncached(self, rgb, resident, width, height, stride, target_width, target_height);
+        };
+        self.stats.h2d_bytes += source_bytes;
+        break :staged owned_source;
+    };
+    const x_starts = cached.device[0];
+    const x_offsets = cached.device[1];
+    const x_weights = cached.device[2];
+    const y_starts = cached.device[3];
+    const y_offsets = cached.device[4];
+    const y_weights = cached.device[5];
+    var horizontal = try allocDeviceBuffer(self, horizontal_bytes);
+    defer releaseDeviceBuffer(self, &horizontal);
+    const count = try checkedMul(patches, 768);
+    const shape = try allocShape2(self.allocator, patches, 768);
+    errdefer self.allocator.free(shape);
+    var output = try allocDeviceBuffer(self, try checkedMul(count, @sizeOf(f32)));
+    errdefer releaseDeviceBuffer(self, &output);
+    errdefer self.ctx.synchronize() catch {};
+    try module.launchPillowHorizontal(&self.ctx, horizontal, source, x_starts, x_offsets, x_weights, width, height, target_width, @intCast(stride), cached.x.precision_bits);
+    try module.launchPillowVerticalPatches(&self.ctx, output, horizontal, y_starts, y_offsets, y_weights, height, target_width, target_height, cached.y.precision_bits);
+    // Coefficients and pinned uploads are model-owned; temporary device
+    // buffers return to the stream-ordered pool without a success barrier.
+    try image.work_control.check();
+    return createTensor(self, output, shape, count);
+}
+
+fn embeddingGemma2ResizeCachePressure(err: anyerror) bool {
+    return switch (err) {
+        error.ResourceLimitExceeded, error.ResourceTemporarilyUnavailable, error.CudaMemoryLimitExceeded, error.CudaHostAllocationFailed, error.CudaSymbolMissing => true,
+        else => false,
+    };
+}
+
+// Optional retention must never make an otherwise admissible request fail.
+fn preprocessEmbeddingGemma2PatchesUncached(self: *CudaCompute, rgb: []const u8, resident: ?buffer_mod.DeviceBuffer, width: u32, height: u32, stride: usize, target_width: u32, target_height: u32) !?CT {
+    if (self.capability_profile != .embedding_gemma2 or self.ctx.info.compute_major < 8) return null;
+    if (width == 0 or height == 0 or target_width == 0 or target_height == 0 or target_width % 16 != 0 or target_height % 16 != 0) return error.InvalidShape;
+    const row_bytes = try checkedMul(width, 3);
+    if (stride < row_bytes) return error.InvalidShape;
+    const source_bytes = try std.math.add(usize, try checkedMul(height - 1, stride), row_bytes);
+    if ((if (resident) |device| device.len else rgb.len) < source_bytes) return error.InvalidShape;
+    const grid_x = target_width / 16;
+    const grid_y = target_height / 16;
+    const patches = try checkedMul(grid_x, grid_y);
+    try (embedding_gemma2_vision.Plan{ .sequence = patches, .grid_x = grid_x, .grid_y = grid_y }).validate();
+    const horizontal_bytes = try checkedMul(try checkedMul(height, target_width), 3);
+    // Bound the extra staging independently of the general media admission.
+    // Decline unusually large sources before any device work is submitted.
+    if (width > 65535 or height > 65535 or source_bytes > 64 * 1024 * 1024 or horizontal_bytes > 128 * 1024 * 1024) return null;
+    const image = @import("antfly_image");
+    try image.work_control.check();
     var x = try image.processing.buildPillowBicubicAxis(self.allocator, width, target_width, resident != null);
     defer x.deinit();
     var y = try image.processing.buildPillowBicubicAxis(self.allocator, height, target_height, resident != null);
@@ -20160,7 +20242,7 @@ fn runEmbeddingGemma2VisionTowerOp(ctx: *anyopaque, input_ct: CT, sequence: usiz
         try allocBuf(&owned, self.allocator, self, rows * intermediate * 4)
     else
         buffer_mod.DeviceBuffer{};
-    const fused = if (self.embedding_gemma2_policy.fused_vision)
+    const fused = if (self.embedding_gemma2_policy.fused_vision and !self.embedding_gemma2_policy.native_vision)
         try embeddingGemma2VisionPlan(self, batch, sequence)
     else
         null;
@@ -20242,6 +20324,25 @@ fn sdpaEmbeddingGemma2Vision(ctx: *anyopaque, q_ct: CT, k_ct: CT, v_ct: CT, batc
     try ensureCount(q_tensor, count);
     try ensureCount(k_tensor, count);
     try ensureCount(v_tensor, count);
+
+    // The native online-softmax kernel consumes the same scaled Q and BF16
+    // boundaries as this model's cuBLAS fallback. Its reduction order differs,
+    // so keep a distinct identity/qualification profile. Try it before cuDNN
+    // to make qualification deterministic even when cuDNN is installed.
+    if (self.embedding_gemma2_policy.native_vision and cuda_artifact.hasBf16WmmaCodeFor(self.ctx.info.compute_major, self.ctx.info.compute_minor)) {
+        const shape = try dupeShape(self.allocator, q_tensor.shape);
+        errdefer self.allocator.free(shape);
+        var device = try allocDeviceBuffer(self, count * @sizeOf(f32));
+        errdefer releaseDeviceBuffer(self, &device);
+        errdefer self.ctx.synchronize() catch {};
+        if (try self.kernels.launchQwen3VlVisionAttentionTcBf16M32N16(&self.ctx, device, q_tensor.buffer, k_tensor.buffer, v_tensor.buffer, batch, seq_len, num_heads, head_dim)) {
+            self.embedding_gemma2_native_vision_launches += 1;
+            self.stats.launch_attention += 1;
+            return createTensor(self, device, shape, count);
+        }
+        releaseDeviceBuffer(self, &device);
+        self.allocator.free(shape);
+    }
 
     if (try tryEmbeddingGemma2VisionCudnn(self, q_tensor, k_tensor, v_tensor, batch, seq_len, num_heads, head_dim)) |result|
         return result;
@@ -25911,4 +26012,68 @@ test "embeddinggemma2 CUDA retained graph replay reads fresh request inputs" {
         try compute.ctx.synchronize();
         for (actual) |value| try std.testing.expectEqual(@as(f32, @floatFromInt(iteration * 2)), @as(f32, @bitCast(@as(u32, value) << 16)));
     }
+}
+
+test "embeddinggemma2 CUDA native batched vision matches fallback across partial tiles" {
+    if (comptime !@import("build_options").enable_cuda) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var compute = try CudaCompute.init(a);
+    defer compute.deinit();
+    if (compute.cublaslt == null or !cuda_artifact.hasBf16WmmaCodeFor(compute.ctx.info.compute_major, compute.ctx.info.compute_minor)) return error.SkipZigTest;
+    const cb = compute.computeBackend();
+    for ([_]usize{ 17, 65, 128 }) |sequence| {
+        const count = 2 * sequence * 768;
+        const host = try a.alloc(f32, count);
+        defer a.free(host);
+        for (host, 0..) |*v, i| v.* = @as(f32, @floatFromInt(@as(i32, @intCast(i % 37)) - 18)) / 32.0;
+        const input = try cb.fromFloat32Shape(host, &.{ @intCast(2 * sequence), 768 });
+        defer cb.free(input);
+        compute.embedding_gemma2_policy.native_vision = false;
+        const reference = (try sdpaEmbeddingGemma2Vision(&compute, input, input, input, 2, sequence, 12, 64)).?;
+        defer cb.free(reference);
+        const expected = try cb.toFloat32(reference, a);
+        defer a.free(expected);
+        compute.embedding_gemma2_policy.native_vision = true;
+        const before = compute.embedding_gemma2_native_vision_launches;
+        const result = (try sdpaEmbeddingGemma2Vision(&compute, input, input, input, 2, sequence, 12, 64)).?;
+        defer cb.free(result);
+        try std.testing.expectEqual(before + 1, compute.embedding_gemma2_native_vision_launches);
+        const actual = try cb.toFloat32(result, a);
+        defer a.free(actual);
+        for (expected, actual) |x, y| try std.testing.expectApproxEqAbs(x, y, 0.005);
+    }
+}
+
+test "embeddinggemma2 CUDA cached resize is bitwise equal for fresh host and resident pixels" {
+    if (comptime !@import("build_options").enable_cuda) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var compute = try CudaCompute.init(a);
+    defer compute.deinit();
+    if (compute.ctx.info.compute_major < 8) return error.SkipZigTest;
+    compute.capability_profile = .embedding_gemma2;
+    const cb = compute.computeBackend();
+    const width = 37;
+    const height = 29;
+    const stride = width * 3 + 5;
+    var pixels: [stride * height]u8 = undefined;
+    var source = try buffer_mod.DeviceBuffer.alloc(&compute.ctx, pixels.len);
+    defer source.free(&compute.ctx);
+    for ([_]bool{ false, true }) |resident| {
+        for (0..3) |iteration| {
+            for (&pixels, 0..) |*pixel, i| pixel.* = @truncate(i * 17 + iteration * 31);
+            if (resident) try source.copyFromHost(&compute.ctx, &pixels);
+            const device: ?buffer_mod.DeviceBuffer = if (resident) source else null;
+            const expected = (try preprocessEmbeddingGemma2PatchesUncached(&compute, &pixels, device, width, height, stride, 32, 48)).?;
+            defer cb.free(expected);
+            const actual = (try preprocessEmbeddingGemma2Patches(&compute, &pixels, device, width, height, stride, 32, 48)).?;
+            defer cb.free(actual);
+            const x = try cb.toFloat32(expected, a);
+            defer a.free(x);
+            const y = try cb.toFloat32(actual, a);
+            defer a.free(y);
+            try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(x), std.mem.sliceAsBytes(y));
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 2), compute.embedding_gemma2_resize.misses);
+    try std.testing.expectEqual(@as(usize, 4), compute.embedding_gemma2_resize.hits);
 }

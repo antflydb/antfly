@@ -198,10 +198,12 @@ class ComparisonContracts(unittest.TestCase):
 class CudaRouteTests(unittest.TestCase):
     def test_qualification_requires_executed_routes(self):
         routes = compare.cuda_routes(
-            "extended_flash_launches_total=3 extended_flash_launches_total=9 embedding_graph_replays_total=4"
+            "extended_flash_launches_total=3 extended_flash_launches_total=9 embedding_graph_replays_total=4 native_vision_launches_total=2 media_batches_total=1"
         )
         self.assertEqual(routes["extended_flash"], 9)
-        compare.require_cuda_routes(routes, ["extended_flash", "graph_replay"])
+        compare.require_cuda_routes(
+            routes, ["extended_flash", "graph_replay", "native_vision", "media_batch"]
+        )
         with self.assertRaisesRegex(ValueError, "fused_vision"):
             compare.require_cuda_routes(routes, ["fused_vision"])
         self.assertEqual(

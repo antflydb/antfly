@@ -1430,6 +1430,10 @@ pub const PreparedAudio = struct {
 pub fn prepareEmbeddingGemma2Audio(allocator: std.mem.Allocator, bytes: []const u8, options: audio.DecodeOptions) !PreparedAudio {
     return prepareEmbeddingGemma2AudioWithPacking(allocator, bytes, options, true);
 }
+pub fn prepareEmbeddingGemma2AudioForBackend(a: std.mem.Allocator, bytes: []const u8, options: audio.DecodeOptions, backend: @import("../backends/backends.zig").BackendType) !PreparedAudio {
+    if (backend != .cuda) return prepareEmbeddingGemma2AudioWithPacking(a, bytes, options, backend != .native);
+    return prepareAudioCpuBounded(a, bytes, options, 128, true, true, 480_000, 64 * 1024 * 1024, true);
+}
 pub fn prepareEmbeddingGemma2AudioWithPacking(allocator: std.mem.Allocator, bytes: []const u8, options: audio.DecodeOptions, pack_device: bool) !PreparedAudio {
     return prepareAudioCpu(allocator, bytes, options, 128, true, pack_device);
 }
