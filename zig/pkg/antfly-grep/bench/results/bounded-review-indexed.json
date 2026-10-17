@@ -1,0 +1,87 @@
+{
+  "platform": "macOS-27.0.1-arm64-arm-64bit",
+  "binary_sha256": "abaca853e733c85c56286043ff302fb1558e89b246c31e29b6d8dae07456ca85",
+  "fixture_sha256": "db2e034461ea8fc94d704cd2a057abe24ccc94e8b3289ff58ff829676d94abd5",
+  "delay_ms_per_request": 40,
+  "limitations": "Synthetic equal HTTP/provider latency; no live provider or storage service.",
+  "runs": {
+    "sequential": [
+      {
+        "seconds": 0.976619667,
+        "requests": 17,
+        "output_sha256": "bf981bc10301137305e68b2c2730c9a5da404fffa3cc8ef4461f69246243112a"
+      },
+      {
+        "seconds": 0.9489859589999998,
+        "requests": 17,
+        "output_sha256": "bf981bc10301137305e68b2c2730c9a5da404fffa3cc8ef4461f69246243112a"
+      },
+      {
+        "seconds": 0.9945793329999999,
+        "requests": 17,
+        "output_sha256": "bf981bc10301137305e68b2c2730c9a5da404fffa3cc8ef4461f69246243112a"
+      },
+      {
+        "seconds": 0.9535284590000002,
+        "requests": 17,
+        "output_sha256": "bf981bc10301137305e68b2c2730c9a5da404fffa3cc8ef4461f69246243112a"
+      },
+      {
+        "seconds": 0.9524468749999997,
+        "requests": 17,
+        "output_sha256": "bf981bc10301137305e68b2c2730c9a5da404fffa3cc8ef4461f69246243112a"
+      },
+      {
+        "seconds": 0.9448638749999994,
+        "requests": 17,
+        "output_sha256": "bf981bc10301137305e68b2c2730c9a5da404fffa3cc8ef4461f69246243112a"
+      },
+      {
+        "seconds": 0.9306891660000005,
+        "requests": 17,
+        "output_sha256": "bf981bc10301137305e68b2c2730c9a5da404fffa3cc8ef4461f69246243112a"
+      }
+    ],
+    "prefetch": [
+      {
+        "seconds": 0.516052958,
+        "requests": 17,
+        "output_sha256": "bf981bc10301137305e68b2c2730c9a5da404fffa3cc8ef4461f69246243112a"
+      },
+      {
+        "seconds": 0.5541148749999998,
+        "requests": 17,
+        "output_sha256": "bf981bc10301137305e68b2c2730c9a5da404fffa3cc8ef4461f69246243112a"
+      },
+      {
+        "seconds": 0.5686147089999993,
+        "requests": 17,
+        "output_sha256": "bf981bc10301137305e68b2c2730c9a5da404fffa3cc8ef4461f69246243112a"
+      },
+      {
+        "seconds": 0.5330103749999999,
+        "requests": 17,
+        "output_sha256": "bf981bc10301137305e68b2c2730c9a5da404fffa3cc8ef4461f69246243112a"
+      },
+      {
+        "seconds": 0.5307866250000011,
+        "requests": 17,
+        "output_sha256": "bf981bc10301137305e68b2c2730c9a5da404fffa3cc8ef4461f69246243112a"
+      },
+      {
+        "seconds": 0.5097349999999992,
+        "requests": 17,
+        "output_sha256": "bf981bc10301137305e68b2c2730c9a5da404fffa3cc8ef4461f69246243112a"
+      },
+      {
+        "seconds": 0.514907749999999,
+        "requests": 17,
+        "output_sha256": "bf981bc10301137305e68b2c2730c9a5da404fffa3cc8ef4461f69246243112a"
+      }
+    ]
+  },
+  "median_seconds": {
+    "sequential": 0.9524468749999997,
+    "prefetch": 0.5307866250000011
+  }
+}

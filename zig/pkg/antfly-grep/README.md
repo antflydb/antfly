@@ -267,7 +267,10 @@ all configured tables. The default `prefetch: true` overlaps one retained-snapsh
 with matching/decisions using one persistent producer. At most two decoded pages are
 live (each bounded by `max_page_memory`, plus bounded HTTP response buffers). Set
 `prefetch: false` for sequential retrieval. Quiet searches and finite per-file match
-limits disable speculation; document/request limits and cancellation remain enforced.
+limits disable speculation. Decision searches with explicit `--max-requests` also
+retrieve sequentially so speculative pages cannot displace foreground evaluations,
+including when the explicit value equals the default. Document/request limits and
+cancellation remain enforced.
 `--table-filter JSON` passes an additional Antfly query
 filter before pagination. Filters, globs, file types, counts, replacements,
 context, quiet mode and lexical/decision output share their local implementations.
@@ -792,9 +795,16 @@ immutable context is sent once in `contexts`, with `context_index` on targets.
 Supporting Antfly decision servers validate references and bound expanded inputs to 1
 MiB each and 16 MiB total; effective input bytes and answer identities equal legacy
 requests. The default `legacy` mode supports existing endpoints; an unsupported shared
-version fails explicitly. This reduces transport bytes, not model input tokens. Cache v5
-hashes each immutable region once and includes its digest alongside target text,
-credential/question scope, and broad/direct mode; older cache entries become misses.
+version fails explicitly. This reduces transport bytes, not model input tokens.
+Per-target cache identities hash each immutable region once and include its digest
+alongside target text, credential/question scope, and broad/direct mode. Cache v6
+records bounded ordered batches with one stat/read per warm batch and atomic
+publication. Valid partial scores survive failed evaluations; missing scores are
+reevaluated. Existing v5 per-target entries remain readable and migrate on use.
+Changing batch grouping can cause a safe miss. Warm hits do not refresh expiry;
+corrupt, expired, or differently scoped entries cannot supply evidence. Concurrent
+writers may replace one another’s partial cache records, reducing hits but never
+changing score identity.
 Fixture request bytes are recorded
 separately from provider token usage; fixture results do not establish model
 quality or actual provider cost.
@@ -904,3 +914,68 @@ differential cases, and 10,167 codec fuzz runs. Linux executes ARM64 instruction
 inside a Linux VM/container on the ARM64 host with two CPUs; it is not independent
 Linux hardware. No live decision provider was contacted. Main PR CI still needs
 its commit-specific approval.
+
+
+### Bounded output, cache and preparation follow-up
+
+Column-only output retains the first span on each selected record; statistics
+count occurrences without allocating one span per occurrence. JSON, color,
+replacement, only-matching and vimgrep retain their required complete match data.
+Rendering borrows the scanner's stable spans instead of copying them again.
+Directory workers grow outside the discovery queue mutex, with one growth in
+flight and inline traversal if spawning fails. No additional unbounded queue or
+thread pool is introduced.
+
+GLiNER decision preparation reuses exact task encodings and exact normalized text
+tokenization within one request. Separate bounded maps admit up to 128 tasks and
+128 texts with at most 4 MiB of retained token arrays. New unique entries beyond
+the caps use the same uncached encoder. Full original rows, attention masks,
+marker positions, task packing, logits and token accounting are preserved.
+Bidirectional encoder activations are recomputed for each row: this optimization
+reduces preparation work, without assuming shared text has context-independent
+model activations. It applies to the GLiNER decision pipeline; other model
+architectures retain their existing preparation paths.
+
+A symbolized repetitive-bzip2 sample identifies inverse-BWT pointer traversal and
+block construction as the dominant decoder work. Frequency accumulation now
+happens during MTF/RLE symbol decoding, counting whole runs at once and removing
+the subsequent histogram scan. The four-byte BWT links and bounded streaming
+buffers are preserved. Further encoder/JIT or workspace expansion requires a
+measured benefit and equivalent results.
+
+
+The follow-up qualification records executable identities and source hashes in
+[`bounded-review-validation.json`](bench/results/bounded-review-validation.json).
+All 137 CLI tests pass on macOS (two platform skips) and ARM64 Linux (one skip),
+alongside five existing real-server indexed tests, 15 decision-contract tests,
+the native preparation-equivalence fixture, 1,000 generated differential cases,
+and 10,138 codec fuzz runs. The legacy-cache migration fixture also verifies
+credential isolation. No live provider or model assets were used.
+
+Paired medians against PR head `02c9684b96`:
+
+| Workload | Before | After | Scope |
+|---|---:|---:|---|
+| Dense column output, 1 MiB line | 40.24 ms | 8.08 ms | Native macOS; peak RSS 100.3 → 4.9 MiB |
+| Dense column output with statistics | 39.97 ms | 7.75 ms | Native macOS; exact counters checked |
+| Warm decision cache, 2,048 lines | 82.30 ms | 29.95 ms | Loopback fixture; zero provider requests |
+| Repetitive bzip2, 16 MiB | 196.34 ms | 144.08 ms | Native macOS; rg 206.68 ms on this loaded run |
+| Repetitive bzip2, 16 MiB | 140.70 ms | 107.13 ms | Linux VM, one CPU/worker; rg 105.76 ms |
+| High-entropy bzip2, 16 MiB | 1,264.04 ms | 824.92 ms | Linux VM, one CPU/worker; CPU 965.41 → 815.90 ms |
+
+Default-budget indexed overlap still takes 530.79 ms versus 952.45 ms sequentially
+with identical output and all 17 requests (40 ms simulated latency). Explicit
+request budgets prioritize foreground decisions; the two-request regression
+returns the same 1,000 matching lines whether prefetch is configured on or off.
+
+Raw trials, output hashes, load and RSS appear in `bounded-review-*.json`.
+These are shared-host measurements with unrelated builds active. The initial
+Linux two-CPU run has mixed elapsed results, including slower repository search
+and repetitive bzip2 despite lower decoder CPU time; the one-CPU codec rerun
+makes the repetitive decoder improvement clearer. High-entropy one-CPU timings
+are flagged as high variance for every binary, so elapsed-time gains there are
+provisional. A 31-round macOS repository-only rerun measures search at 32.02 → 31.97 ms
+and discovery at 8.15 → 8.13 ms, approximately unchanged (rg 40.26/12.39 ms).
+Discovery is modestly faster in the first Linux run. No universal
+repository speedup, independent-Linux-hardware result, live encoder speedup,
+model quality or billed-token improvement is claimed.
