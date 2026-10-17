@@ -1438,13 +1438,22 @@ def test_presence_reductions_do_not_enumerate_or_require_exact_path_counts(graph
         assert [[cell.get("value") for cell in row] for row in result["rows"]] == [values]
         assert result["stats"]["explored_edges"] == 254
         assert result["stats"]["intermediate_states"] < 5000
+    early = db.cypher_json(
+        "g",
+        {
+            "query": "MATCH (s:D {id:'start'})-[:R*64..64]->(b:D) RETURN DISTINCT b.score LIMIT 1",
+            "limits": {"explored_edges": 64},
+        },
+    )
+    assert early["rows"] == [[{"type": "integer", "value": "64"}]]
+    assert early["stats"]["explored_edges"] == 64
     sql_pattern = "(a IS D)" + "".join(f"-[r{i} IS R]->(m{i} IS D)" for i in range(63)) + "-[r63 IS R]->(b IS D)"
     relation = f"GRAPH_TABLE(g MATCH {sql_pattern} WHERE a.id='start' COLUMNS(b.score AS score,b.missing AS missing)) q"
     assert db.sql(
         f"SELECT min(q.score),max(q.score),count(DISTINCT q.score),"
         f"sum(DISTINCT q.score),avg(DISTINCT q.score),"
         f"bool_and(q.score>0),bool_or(q.score<0),count(DISTINCT q.missing) FROM {relation}"
-    )["rows"] == [["64", "64", "1", "64", "64", True, False, "0"]]
+    )["rows"] == [["64", "64", "1", "64", 64, True, False, "0"]]
     assert db.sql(
         f"SELECT q.score,min(q.score),count(DISTINCT q.score) FROM {relation} WHERE q.score IN (64,65) GROUP BY q.score"
     )["rows"] == [["64", "64", "1"]]
@@ -1455,6 +1464,6 @@ def test_presence_reductions_do_not_enumerate_or_require_exact_path_counts(graph
     # case below saturation, with more paths than could ever be enumerated.
     relation = relation.replace("-[r62 IS R]->(m62 IS D)-[r63 IS R]->(b IS D)", "")
     relation = relation.replace("(m61 IS D)", "(b IS D)")
-    assert db.sql(f"SELECT min(q.score),count(*),sum(q.score) FROM {relation}")["rows"] == [
-        ["62", str(2**62), str(62 * 2**62)]
-    ]
+    assert db.sql(f"SELECT min(q.score),count(*),sum(q.score-61),sum(CAST(q.score AS NUMERIC)) FROM {relation}")[
+        "rows"
+    ] == [["62", str(2**62), str(2**62), str(62 * 2**62)]]

@@ -1210,6 +1210,9 @@ const Engine = struct {
             break :blk true;
         };
         const count_endpoints = !count_shortest and !operation.optional and operation.paths.len == 1 and path.selector == .all and grouped and middle.len == 0 and blk: {
+            // Unordered DISTINCT with a row goal can finish after one route.
+            // Preserve that demand rather than capturing the whole closure.
+            if (calls.items.len == 0 and projection.order.len == 0 and projection.predicate == null and projection.limit != null) break :blk false;
             // One fixed hop has no shared prefixes to compress. Keep its
             // page-at-a-time fold instead of retaining the whole adjacency.
             if (path.edges.len == 1 and path.edges[0].min_hops == 1 and path.edges[0].max_hops == 1) break :blk false;

@@ -1348,7 +1348,9 @@ Endpoint-local predicates, grouping keys, COUNT/SUM/AVG/MIN/MAX and their
 DISTINCT variants consume weighted endpoint rows from those same states.
 Endpoint-only RETURN DISTINCT also reduces the path product states directly,
 including saturated counts, while preserving the existing uniqueness proofs and
-exact cyclic fallback. DISTINCT ordering accepts expressions composed of projected
+exact cyclic fallback. Unordered DISTINCT with LIMIT retains demand-driven route
+production, so a small row goal need not capture a complete closure. DISTINCT
+ordering accepts expressions composed of projected
 values, including an unaliased property such as `b.score`. Structural references
 read the computed projection value even when an alias shadows the source entity;
 discarded properties remain inaccessible.
