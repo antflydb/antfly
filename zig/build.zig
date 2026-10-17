@@ -1089,6 +1089,7 @@ pub fn create(b: *std.Build) ?Artifacts {
     production_antfly_imports.configureEmbedded(b, lite_main_mod, link_libc);
     lite_main_mod.addImport("antfly-client", antfly_client_pkg_mod);
     lite_main_mod.addImport("antfly_inference_host", production_antfly_imports.inference_host);
+    lite_main_mod.addImport("antfly_inference_engine", production_antfly_imports.inference_engine);
     build_info.link(lite_main_mod);
     const lite_main = b.addExecutable(.{
         .name = "antfly-lite",
@@ -1120,6 +1121,7 @@ pub fn create(b: *std.Build) ?Artifacts {
     production_antfly_imports.configureEmbedded(b, lite_main_tests.root_module, link_libc);
     lite_main_tests.root_module.addImport("antfly-client", antfly_client_pkg_mod);
     lite_main_tests.root_module.addImport("antfly_inference_host", production_antfly_imports.inference_host);
+    lite_main_tests.root_module.addImport("antfly_inference_engine", production_antfly_imports.inference_engine);
     // Unit tests use the stable test version; only final products link release metadata.
     lite_main_tests.root_module.addImport("build_info", build_info.module);
     const run_lite_main_tests = addFilteredTestRunArtifact(b, lite_main_tests);
