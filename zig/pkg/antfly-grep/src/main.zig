@@ -43,6 +43,7 @@ const help =
     \\  -a, --text                 Search files containing NUL bytes
     \\      --max-file-size N      File/stdin byte ceiling (default unlimited)
     \\      --json                JSON Lines events
+    \\      --json-compact        Version 2 JSON with per-file provenance references
     \\
     \\  -o, --only-matching        Print each matching span
     \\  -r, --replace TEXT         Capture replacement ($1, ${name})

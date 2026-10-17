@@ -41,27 +41,71 @@ NATIVE_LIBRARY = str(Path(sys.argv.pop(1)).resolve())
 
 def read_batch(path):
     data = path.read_bytes()
+    if path.suffix == ".bin":
+        slot_size, ways = (
+            (256, 16)
+            if "small" in path.name
+            else (1024, 8)
+            if "medium" in path.name
+            else (4096, 8)
+        )
+        scores, written, records = [], [], []
+        for way in range(ways):
+            h = data[way * 80 : (way + 1) * 80]
+            if len(h) != 80 or h[76:80] != b"AGB1":
+                continue
+            size = struct.unpack_from("<I", h, 64)[0]
+            offset = ways * 80 + way * (slot_size - 80)
+            body = data[offset : offset + size]
+            if hashlib.sha256(h[:32] + h[64:] + body).digest() != h[32:64]:
+                continue
+            count = struct.unpack_from("<I", body)[0]
+            values = [struct.unpack_from("<dq", body, 4 + i * 16) for i in range(count)]
+            records.append((way, offset, len(scores), count))
+            scores.extend(
+                score if math.isfinite(score) else None for score, _ in values
+            )
+            written.extend(
+                stamp if math.isfinite(score) else None for score, stamp in values
+            )
+        return {"version": 9, "scores": scores, "written": written, "_records": records}
     count = struct.unpack_from("<I", data, 64)[0]
     values = [struct.unpack_from("<dq", data, 68 + i * 16) for i in range(count)]
     return {
         "key": data[:32].hex(),
         "version": 8,
         "scores": [score if math.isfinite(score) else None for score, _ in values],
-        "written": [
-            written if math.isfinite(score) else None for score, written in values
-        ],
+        "written": [stamp if math.isfinite(score) else None for score, stamp in values],
     }
 
 
 def write_batch(path, record):
-    body = struct.pack("<I", len(record["scores"]))
-    for score, written in zip(record["scores"], record["written"]):
-        body += struct.pack(
-            "<dq", score if score is not None else math.nan, written or 0
+    def payload(start, count):
+        body = struct.pack("<I", count)
+        for score, stamp in zip(
+            record["scores"][start : start + count],
+            record["written"][start : start + count],
+        ):
+            body += struct.pack(
+                "<dq", score if score is not None else math.nan, stamp or 0
+            )
+        return body
+
+    if "_records" in record:
+        data = bytearray(path.read_bytes())
+        for way, offset, start, count in record["_records"]:
+            body = payload(start, count)
+            h = way * 80
+            data[offset : offset + len(body)] = body
+            data[h + 32 : h + 64] = hashlib.sha256(
+                data[h : h + 32] + data[h + 64 : h + 80] + body
+            ).digest()
+        path.write_bytes(data)
+    else:
+        body = payload(0, len(record["scores"]))
+        path.write_bytes(
+            bytes.fromhex(record["key"]) + hashlib.sha256(body).digest() + body
         )
-    path.write_bytes(
-        bytes.fromhex(record["key"]) + hashlib.sha256(body).digest() + body
-    )
 
 
 class DecisionHandler(BaseHTTPRequestHandler):
@@ -227,6 +271,20 @@ class DecisionHandler(BaseHTTPRequestHandler):
                     item["input"] = (
                         body["contexts"][item["context_index"]] + "\n" + item["input"]
                     )
+        if self.server.mode == "split_partial":
+            text = body["inputs"][0]["input"]
+            status = (
+                413
+                if "LEFT" in text and "RIGHT" in text
+                else 503
+                if "RIGHT" in text
+                else 0
+            )
+            if status:
+                self.send_response(status)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
         if self.server.mode == "prefetch" and len(self.server.requests) == 1:
             self.server.prefetch_seen = self.server.index_next.wait(2)
         if "state" in body:
@@ -585,7 +643,7 @@ class CliTests(unittest.TestCase):
         directory = self.root / "scores"
         batches = [
             timestamp
-            for path in directory.glob("batch-v8-*")
+            for path in directory.glob("batch-v9-*")
             for timestamp in read_batch(path)["written"]
             if timestamp is not None
         ]
@@ -645,6 +703,51 @@ class CliTests(unittest.TestCase):
         self.assertFalse(summary["stats"]["complete"])
         self.assertEqual(len(self.server.requests), before)
 
+    def test_parallel_scalar_hits_are_promoted_and_clean_batches_stay_untouched(self):
+        self.write("a.txt", "".join(f"STOP({i})\n" for i in range(8)))
+        args = [
+            *self.decision_args(),
+            "--unit=line",
+            "--context-lines=0",
+            "--threads=4",
+            "--batch-size=2",
+            "--no-refine",
+            "--cache-dir=scores",
+            "a.txt",
+        ]
+        expected = self.raw_cli(*args).stdout
+        directory = self.root / "scores"
+        for path in directory.glob("batch-v9-*"):
+            path.unlink()
+        calls = len(self.server.requests)
+        self.assertEqual(expected, self.raw_cli(*args, "--max-requests=1").stdout)
+        self.assertEqual(calls, len(self.server.requests))
+        paths = list(directory.glob("batch-v9-*"))
+        self.assertTrue(paths, "scalar-only waves must create batch records")
+        (directory / "scores-v2.bin").unlink()
+        self.assertEqual(expected, self.raw_cli(*args, "--cached-only").stdout)
+
+        def headers():
+            result = {}
+            for path in directory.glob("batch-v9-*"):
+                raw = path.read_bytes()
+                for way, _, _, _ in read_batch(path)["_records"]:
+                    header = raw[way * 80 : (way + 1) * 80]
+                    result[header[:32]] = header
+            return result
+
+        before = headers()
+        self.write(
+            "a.txt", "".join(f"STOP({i})\n" for i in range(7)) + "STOP(changed)\n"
+        )
+        self.raw_cli(*args, "--max-requests=1")
+        after = headers()
+        self.assertGreaterEqual(
+            sum(after.get(key) == value for key, value in before.items()),
+            3,
+            "unaffected batch headers must not be rewritten",
+        )
+
     def test_source_preparation_cache_reuse_revision_and_corruption(self):
         self.write("a.py", "def retry():\n    STOP()\n")
         args = [*self.decision_args(), "--json", "a.py"]
@@ -653,7 +756,7 @@ class CliTests(unittest.TestCase):
         self.assertEqual(
             json.loads(warm.stdout.splitlines()[-1])["stats"]["source_cache_hits"], 1
         )
-        records = list((self.root / ".cache/antfly-grep/decisions").glob("source-v2-*"))
+        records = list((self.root / ".cache/antfly-grep/decisions").glob("source-v3-*"))
         self.assertEqual(len(records), 1)
         if os.name != "nt":
             self.assertEqual(records[0].stat().st_mode & 0o777, 0o600)
@@ -683,9 +786,9 @@ class CliTests(unittest.TestCase):
         self.raw_cli(*args, "--batch-size=8")
         directory = self.root / "scores"
         self.raw_cli(*args, "--batch-size=3")
-        for path in directory.glob("batch-v8-*"):
+        for path in directory.glob("batch-v9-*"):
             data = read_batch(path)
-            self.assertEqual(data["version"], 8)
+            self.assertEqual(data["version"], 9)
             data["written"] = [
                 1 if score is not None else None for score in data["scores"]
             ]
@@ -716,10 +819,20 @@ class CliTests(unittest.TestCase):
         ]
         first = self.raw_cli(*args)
         directory = self.root / "scores"
-        for path in directory.glob("batch-v8-*"):
+        for path in directory.glob("batch-v9-*"):
             record = read_batch(path)
-            old = path.with_name("batch-v6-" + record["key"])
-            old.write_text(json.dumps({"version": 6, "scores": record["scores"]}))
+            raw = path.read_bytes()
+            for way, _, start, count in record["_records"]:
+                key = raw[way * 80 : way * 80 + 32].hex()
+                old = path.with_name("batch-v6-" + key)
+                old.write_text(
+                    json.dumps(
+                        {
+                            "version": 6,
+                            "scores": record["scores"][start : start + count],
+                        }
+                    )
+                )
             path.unlink()
         (directory / "scores-v2.bin").unlink(missing_ok=True)
         count = len(self.server.requests)
@@ -729,6 +842,77 @@ class CliTests(unittest.TestCase):
             os.utime(path, (1, 1))
         self.raw_cli(*args, "--cached-only", code=2)
         self.assertEqual(len(self.server.requests), count)
+
+    def test_previous_artifact_layout_migrates_without_provider_calls(self):
+        self.write("a.py", "def retry():\n    STOP()\n")
+        args = [
+            *self.decision_args(),
+            "--json",
+            "--threads=1",
+            "--cache-dir=scores",
+            "a.py",
+        ]
+        self.raw_cli(*args)
+        directory = self.root / "scores"
+        old_times = []
+        for path in list(directory.glob("*.bin")):
+            if path.name == "scores-v2.bin":
+                path.unlink()
+                continue
+            data = path.read_bytes()
+            is_source = path.name.startswith("source-v3-")
+            size, ways, buckets = (
+                (262144, 4, 1024)
+                if is_source
+                else (256, 16, 4096)
+                if "small" in path.name
+                else (1024, 8, 2048)
+                if "medium" in path.name
+                else (4096, 8, 512)
+            )
+            for way in range(ways):
+                h = data[way * 80 : (way + 1) * 80]
+                if len(h) != 80 or h[76:] not in (b"AGB1", b"AGP1"):
+                    continue
+                length = struct.unpack_from("<I", h, 64)[0]
+                offset = ways * 80 + (
+                    sum(
+                        struct.unpack_from("<I", data, prior * 80 + 64)[0]
+                        for prior in range(way)
+                    )
+                    if h[76:] == b"AGP1"
+                    else way * (size - 80)
+                )
+                body = data[offset : offset + length]
+                key = h[:32]
+                # All tested score shapes fit the same old size class.
+                namespace = (
+                    "source-v2"
+                    if is_source
+                    else path.name.rsplit("-", 1)[0].replace("v9", "v8")
+                )
+                bucket = int.from_bytes(key[:2], "little") % buckets
+                old_way = 0
+                while (directory / f"{namespace}-{bucket:03x}-{old_way}").exists():
+                    old_way += 1
+                old = directory / f"{namespace}-{bucket:03x}-{old_way}"
+                old.write_bytes(key + hashlib.sha256(body).digest() + body)
+                if not is_source:
+                    old_times.extend(read_batch(old)["written"])
+            path.unlink()
+        calls = len(self.server.requests)
+        result = self.raw_cli(*args, "--max-requests=1")
+        self.assertEqual(calls, len(self.server.requests))
+        self.assertEqual(
+            json.loads(result.stdout.splitlines()[-1])["stats"]["source_cache_hits"], 1
+        )
+        self.assertTrue(list(directory.glob("source-v3-*")))
+        new_times = [
+            stamp
+            for path in directory.glob("batch-v9-*")
+            for stamp in read_batch(path)["written"]
+        ]
+        self.assertEqual(sorted(old_times), sorted(new_times))
 
     def test_indexed_projection_avoids_unused_content_and_metadata(self):
         document = self.indexed_doc("large.py", "STOP\n" + "x" * 262144)
@@ -1319,7 +1503,7 @@ class CliTests(unittest.TestCase):
         self.raw_cli(*args)
         self.assertEqual(len(self.server.requests), requests)
         for cache in (self.root / "scores").iterdir():
-            if cache.name.startswith("batch-v8-"):
+            if cache.name.startswith("batch-v9-"):
                 record = read_batch(cache)
                 record["written"] = [
                     1 if score is not None else None for score in record["scores"]
@@ -1588,6 +1772,167 @@ class CliTests(unittest.TestCase):
         body = self.server.requests[0][2]
         self.assertEqual(len(body["questions"]), 2)
         self.assertEqual(len(body["inputs"]), 1)
+
+    def test_failed_single_input_split_never_caches_partial_score(self):
+        self.write("a.txt", "LEFT noise " * 80 + "\n" + "RIGHT STOP retry " * 40 + "\n")
+        args = [
+            *self.decision_args(),
+            "--no-refine",
+            "--chunk-lines=1000",
+            "--retries=0",
+            "--threads=1",
+            "--cache-dir=scores",
+            "a.txt",
+        ]
+        self.server.mode = "split_partial"
+        self.raw_cli(*args, code=2)
+        self.assertEqual(len(self.server.requests), 3)
+        # Old cache generations could publish the low left-half score under
+        # the whole input. Such records must not reenter through migration.
+        body = self.server.requests[0][2]
+        old_key = hashlib.sha256()
+        for part in [
+            b"antfly-grep-decisions-v5",
+            self.decision_args()[-1].encode(),
+            b"fixture",
+            b"",
+            b"http",
+            b"",
+            b"",
+            b"find retry enforcement",
+            b"region",
+            b"direct",
+            hashlib.sha256(b"").digest(),
+            body["inputs"][0]["input"].encode(),
+        ]:
+            old_key.update(len(part).to_bytes(8, "little"))
+            old_key.update(part)
+        for field in (b"filters", b"only", b"not"):
+            old_key.update(field)
+        (self.root / "scores" / old_key.hexdigest()).write_text("0.1")
+        self.server.mode = "ok"
+        self.server.requests.clear()
+        result = self.raw_cli(*args)
+        self.assertTrue(
+            self.server.requests,
+            "whole input must be reevaluated after an incomplete subdivision",
+        )
+        self.assertIn(b"STOP", result.stdout)
+        calls = len(self.server.requests)
+        self.assertEqual(result.stdout, self.raw_cli(*args).stdout)
+        self.assertEqual(len(self.server.requests), calls)
+
+    def test_compact_json_preserves_matches_and_references_file_provenance(self):
+        for name in ("a", "b"):
+            self.write(name, "STOP retry\n" * 64)
+        for extra in ([], [*self.decision_args(), "--no-cache", "--no-refine"]):
+            regular = self.raw_cli(
+                "--json",
+                *extra,
+                "STOP" if not extra else "a",
+                *(["a", "b"] if not extra else []),
+            )
+            compact = self.raw_cli(
+                "--json-compact",
+                *extra,
+                "STOP" if not extra else "a",
+                *(["a", "b"] if not extra else []),
+            )
+            rows = [json.loads(line) for line in compact.stdout.splitlines()]
+            legacy = [json.loads(line) for line in regular.stdout.splitlines()]
+            files = {}
+            matches = []
+            for row in rows:
+                self.assertEqual(row["result_schema_version"], 2)
+                if row["type"] == "begin":
+                    self.assertNotIn(row["file_id"], files)
+                    files[row["file_id"]] = row
+                    self.assertIn("source", row)
+                elif row["type"] in ("match", "context", "end"):
+                    self.assertIn(row["file_id"], files)
+                    self.assertNotIn("source", row)
+                if row["type"] == "match":
+                    data = dict(row["data"], path=files[row["file_id"]]["data"]["path"])
+                    matches.append(data)
+
+            def canonical(rows):
+                return sorted(json.dumps(row, sort_keys=True) for row in rows)
+
+            self.assertEqual(
+                canonical(matches),
+                canonical(row["data"] for row in legacy if row["type"] == "match"),
+            )
+            self.assertLess(len(compact.stdout), len(regular.stdout) * 0.7)
+        repeated = self.raw_cli("--json-compact", "STOP", "a", "a")
+        observations = [
+            json.loads(line)["file_id"]
+            for line in repeated.stdout.splitlines()
+            if json.loads(line)["type"] == "begin"
+        ]
+        self.assertEqual(len(observations), 2)
+        self.assertEqual(len(set(observations)), 2)
+        # Last output mode wins; finite budgets still emit complete JSON records.
+        standard = self.raw_cli("--json-compact", "--json", "STOP", "a")
+        self.assertEqual(
+            json.loads(standard.stdout.splitlines()[0])["result_schema_version"], 1
+        )
+        limited = self.raw_cli(
+            "--json-compact", "--max-output-bytes=1500", "STOP", "a", code=2
+        )
+        for line in limited.stdout.splitlines():
+            json.loads(line)
+        self.write("bytes", b"\xff STOP\x00")
+        binary = self.raw_cli(
+            "--json-compact", "--no-unicode", "-a", "--null-data", "STOP", "bytes"
+        )
+        row = next(
+            json.loads(line)
+            for line in binary.stdout.splitlines()
+            if json.loads(line)["type"] == "match"
+        )
+        self.assertIn("bytes", row["data"]["lines"])
+
+    def test_compact_indexed_json_disambiguates_revisions_and_file_overviews(self):
+        docs = [
+            self.indexed_doc("same.py", "def retry():\n    STOP()\n") for _ in range(2)
+        ]
+        docs[1]["revision"] = "other-revision"
+        config = self.table_config(docs)
+        result = self.raw_cli("--json-compact", "--table-config", config, "STOP")
+        rows = [json.loads(line) for line in result.stdout.splitlines()]
+        begins = [row for row in rows if row["type"] == "begin"]
+        self.assertEqual(len(begins), 2)
+        self.assertEqual(len({row["file_id"] for row in begins}), 2)
+        files = {row["file_id"]: row["source"] for row in begins}
+        self.assertEqual(
+            {source["revision"] for source in files.values()},
+            {docs[0]["revision"], docs[1]["revision"]},
+        )
+        self.assertTrue(
+            all(row["file_id"] in files for row in rows if row["type"] == "match")
+        )
+        self.assertNotIn("file_id", rows[-1])
+        self.server.mode = "exploration"
+        overview = self.raw_cli(
+            "ask",
+            "retry",
+            "--model=fixture",
+            "--endpoint",
+            self.decision_args()[-1],
+            "--json-compact",
+            "--no-cache",
+            "--table-config",
+            config,
+        )
+        overview_rows = [json.loads(line) for line in overview.stdout.splitlines()]
+        overview_files = {
+            row["file_id"] for row in overview_rows if row["type"] == "begin"
+        }
+        self.assertTrue(any(row["type"] == "file" for row in overview_rows))
+        for row in overview_rows:
+            if row["type"] == "file":
+                self.assertIn(row["file_id"], overview_files)
+                self.assertNotIn("source", row)
 
     def test_retry_split_and_independent_line_discovery(self):
         self.write("a", "def retry():\n    STOP\n    noise\n")
@@ -4378,7 +4723,7 @@ class CliTests(unittest.TestCase):
             "a",
         ]
         first = self.raw_cli(*args)
-        records = list((self.root / "scores").glob("batch-v8-*"))
+        records = list((self.root / "scores").glob("batch-v9-*"))
         self.assertTrue(records)
         self.assertLess(len(records), 32)
         requests = len(self.server.requests)
@@ -4386,6 +4731,21 @@ class CliTests(unittest.TestCase):
         self.assertEqual(first.stdout, self.raw_cli(*args).stdout)
         self.assertEqual(len(self.server.requests), requests)
         self.assertEqual(mtimes, [p.stat().st_mtime_ns for p in records])
+        # Sequential partial batches resolved entirely by scalar hits are
+        # repaired too, so subsequent searches need no scalar fallback.
+        for path in records:
+            data = read_batch(path)
+            data["scores"][0] = None
+            write_batch(path, data)
+        self.assertEqual(first.stdout, self.raw_cli(*args, "--threads=1").stdout)
+        self.assertEqual(len(self.server.requests), requests)
+        self.assertTrue(
+            all(
+                score is not None
+                for path in records
+                for score in read_batch(path)["scores"]
+            )
+        )
         # Missing entries are reevaluated; valid zero scores remain cache hits.
         for path in records:
             data = read_batch(path)
@@ -4447,7 +4807,7 @@ class CliTests(unittest.TestCase):
         self.server.requests.clear()
         self.assertEqual(expected, self.raw_cli(*args).stdout)
         self.assertEqual(len(self.server.requests), 0)
-        self.assertTrue(list(directory.glob("batch-v8-*")))
+        self.assertTrue(list(directory.glob("batch-v9-*")))
         for path in set(legacy):
             path.unlink()
         self.assertEqual(expected, self.raw_cli(*args).stdout)

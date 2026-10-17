@@ -154,6 +154,7 @@ pub const Options = struct {
     text: bool = false,
     binary: bool = false,
     json: bool = false,
+    json_compact: bool = false,
     help: bool = false,
     version: bool = false,
     before: usize = 0,
@@ -195,6 +196,7 @@ pub const Options = struct {
         self.files_with_matches = false;
         self.files_without_match = false;
         self.json = false;
+        self.json_compact = false;
         switch (mode) {
             .count => self.count = true,
             .count_matches => self.count_matches = true,
@@ -453,6 +455,12 @@ pub const Options = struct {
                 }
                 if (std.mem.eql(u8, name, "--no-context-separator")) {
                     self.context_separator = "";
+                    continue;
+                }
+                if (std.mem.eql(u8, name, "--json-compact")) {
+                    if (inline_value != null) return error.UnexpectedFlagValue;
+                    self.setMode(.json);
+                    self.json_compact = true;
                     continue;
                 }
                 const toggles = .{ .{ "--fixed-strings", "fixed" }, .{ "--ignore-case", "ignore_case" }, .{ "--word-regexp", "word" }, .{ "--line-regexp", "whole_line" }, .{ "--invert-match", "invert" }, .{ "--line-number", "line_numbers" }, .{ "--files-with-matches", "files_with_matches" }, .{ "--count", "count" }, .{ "--quiet", "quiet" }, .{ "--files", "files" }, .{ "--hidden", "hidden" }, .{ "--no-ignore", "no_ignore" }, .{ "--text", "text" }, .{ "--json", "json" }, .{ "--help", "help" }, .{ "--version", "version" } };

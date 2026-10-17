@@ -40,7 +40,18 @@ def signature(argv, cwd, env, json_output=False, unordered=False):
         # Native provenance and per-process elapsed/printed-byte accounting
         # intentionally differ. Compare source bytes, every match span and path.
         rows = [json.loads(line) for line in value.splitlines()]
-        matches = [row["data"] for row in rows if row["type"] == "match"]
+        files = {
+            row["file_id"]: row["data"]["path"]
+            for row in rows
+            if row["type"] == "begin" and "file_id" in row
+        }
+        matches = [
+            dict(row["data"], path=files[row["file_id"]])
+            if "file_id" in row
+            else row["data"]
+            for row in rows
+            if row["type"] == "match"
+        ]
         value = json.dumps(matches, sort_keys=True, separators=(",", ":")).encode()
     elif unordered:
         value = b"\n".join(sorted(value.splitlines()))
@@ -52,6 +63,11 @@ def main():
     parser.add_argument("binary", type=Path)
     parser.add_argument("--baseline", type=Path, required=True)
     parser.add_argument("--repository", type=Path)
+    parser.add_argument(
+        "--compact",
+        action="store_true",
+        help="Measure compact candidate JSON against standard baseline/oracle JSON after reconstruction",
+    )
     parser.add_argument("--rounds", type=int, default=11)
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
@@ -112,6 +128,8 @@ def main():
                     *(
                         ["--files", "-g", "!*.never", "."]
                         if case == "exclusion" and n == "ripgrep"
+                        else ["--json-compact", *flags[1:]]
+                        if args.compact and case == "dense-json" and n == "antfly-grep"
                         else flags
                     ),
                 ]
@@ -130,7 +148,16 @@ def main():
                 if expected is not None and expected != output:
                     raise RuntimeError(f"{case}: mismatched output for {name}")
                 expected = output
-                entries[name] = {"output": output, "runs": []}
+                output_bytes = len(
+                    subprocess.run(
+                        argv, cwd=cwd, env=env, capture_output=True, check=False
+                    ).stdout
+                )
+                entries[name] = {
+                    "output": output,
+                    "output_bytes": output_bytes,
+                    "runs": [],
+                }
                 measure(argv, cwd, env)
             order = list(commands)
             random.Random(case).shuffle(order)

@@ -71,6 +71,7 @@ _arguments -s \
  '--include-zero[include-zero]' \
  '--invert-match[invert-match]' \
  '--json[json]' \
+ '--json-compact[json-compact]' \
  '--library[library]:value:_files' \
  '--line-buffered[line-buffered]' \
  '--line-number[line-number]' \

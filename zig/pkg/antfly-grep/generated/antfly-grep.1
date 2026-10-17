@@ -30,6 +30,7 @@ Use '-' for stdin; '--' ends option parsing.
   -a, --text                 Search files containing NUL bytes
       --max-file-size N      File/stdin byte ceiling (default unlimited)
       --json                JSON Lines events
+      --json-compact        Version 2 JSON with per-file provenance references
 
   -o, --only-matching        Print each matching span
   -r, --replace TEXT         Capture replacement ($1, ${name})
@@ -307,6 +308,9 @@ See antfly-grep --help and the package README for semantics.
 See antfly-grep --help and the package README for semantics.
 .TP
 .B --json
+See antfly-grep --help and the package README for semantics.
+.TP
+.B --json-compact
 See antfly-grep --help and the package README for semantics.
 .TP
 .B --library

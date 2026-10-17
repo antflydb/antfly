@@ -25,7 +25,6 @@ pub const Store = struct {
     file: ?std.Io.File = null,
     legacy: ?std.Io.File = null,
     legacy_opened: bool = false,
-    opened: bool = false,
     writable: bool = false,
     write_failed: bool = false,
     const slots = 16384;
@@ -40,13 +39,28 @@ pub const Store = struct {
         return std.fs.path.join(a, &.{ o.cache_dir.?, "scores-v2.bin" });
     }
     fn readFile(self: *Store, a: A, io: std.Io, o: *const Options) ?std.Io.File {
-        if (!self.opened) {
-            self.opened = true;
+        if (self.file == null) {
             const name = path(a, o) catch return null;
             defer a.free(name);
             self.file = std.Io.Dir.cwd().openFile(io, name, .{}) catch null;
         }
         return self.file;
+    }
+    // A failed open is a wave-local observation: another client may create
+    // the table later. Callers probe once per wave, then reuse live descriptors.
+    pub fn available(self: *Store, a: A, io: std.Io, o: *const Options) bool {
+        const current = self.readFile(a, io, o);
+        const old = self.readLegacyFile(a, io, o);
+        return current != null or old != null;
+    }
+    fn readLegacyFile(self: *Store, a: A, io: std.Io, o: *const Options) ?std.Io.File {
+        if (!self.legacy_opened) {
+            self.legacy_opened = true;
+            const name = std.fs.path.join(a, &.{ o.cache_dir.?, "scores-v1.bin" }) catch return null;
+            defer a.free(name);
+            self.legacy = std.Io.Dir.cwd().openFile(io, name, .{}) catch null;
+        }
+        return self.legacy;
     }
     fn writeFile(self: *Store, a: A, io: std.Io, o: *const Options) ?std.Io.File {
         if (self.writable) return self.file;
@@ -55,10 +69,9 @@ pub const Store = struct {
         const name = path(a, o) catch return null;
         defer a.free(name);
         std.Io.Dir.cwd().createDirPath(io, o.cache_dir.?) catch return null;
-        const file = std.Io.Dir.cwd().createFile(io, name, .{ .read = true, .truncate = false, .permissions = .fromMode(0o600) }) catch return null;
+        const file = std.Io.Dir.cwd().createFile(io, name, .{ .read = true, .truncate = false, .permissions = if (@import("builtin").os.tag == .windows) .default_file else .fromMode(0o600) }) catch return null;
         if (self.file) |previous| previous.close(io);
         self.file = file;
-        self.opened = true;
         self.writable = true;
         return file;
     }
@@ -82,12 +95,7 @@ pub const Store = struct {
             const n = file.readPositionalAll(io, &bucket, offset(&key)) catch 0;
             for (0..n / record_size) |way| if (valid(io, o, &key, bucket[way * record_size ..][0..record_size])) |entry| return entry;
         }
-        if (!self.legacy_opened) {
-            self.legacy_opened = true;
-            const name = std.fs.path.join(a, &.{ o.cache_dir.?, "scores-v1.bin" }) catch return null;
-            defer a.free(name);
-            self.legacy = std.Io.Dir.cwd().openFile(io, name, .{}) catch null;
-        }
+        _ = self.readLegacyFile(a, io, o);
         if (self.legacy) |file| {
             var record: [record_size]u8 = undefined;
             const old_offset = @as(u64, std.mem.readInt(u16, key[0..2], .little)) * record_size;
@@ -164,4 +172,24 @@ test "score buckets coalesce collisions without exceeding fixed capacity" {
     };
     try std.testing.expectEqual(@as(usize, 4), hits);
     try std.testing.expect((try store.file.?.stat(io)).size <= Store.max_bytes);
+}
+
+test "score reader discovers a table created by another client" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const io = std.testing.io;
+    const directory = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    const options = Options{ .cache_dir = directory };
+    var reader: Store = .{};
+    defer reader.deinit(io);
+    var writer: Store = .{};
+    defer writer.deinit(io);
+    const key: [64]u8 = @splat('a');
+    try std.testing.expect(!reader.available(a, io, &options));
+    writer.put(a, io, &options, &key, 0.75);
+    try std.testing.expect(reader.available(a, io, &options));
+    try std.testing.expectEqual(@as(f64, 0.75), reader.get(a, io, &options, &key).?.score);
 }

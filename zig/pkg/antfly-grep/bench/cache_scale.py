@@ -35,6 +35,11 @@ def main():
     parser.add_argument("--library", type=Path, required=True)
     parser.add_argument("--files", type=int, default=2048)
     parser.add_argument("--rounds", type=int, default=5)
+    parser.add_argument(
+        "--compact",
+        action="store_true",
+        help="Use compact JSON for the candidate; reconstruct match payloads before comparison",
+    )
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
     if args.files < 1 or args.rounds < 1:
@@ -90,7 +95,9 @@ def main():
                 "--max-requests=unlimited",
                 "--cache-dir",
                 str(root / name),
-                "--json",
+                "--json-compact"
+                if args.compact and name == "antfly-grep"
+                else "--json",
                 "src",
             ]
             result = subprocess.run(
@@ -122,10 +129,25 @@ def main():
             report["cases"][name]["cache_allocated_bytes"] = sum(
                 getattr(p.stat(), "st_blocks", 0) * 512 for p in (root / name).iterdir()
             )
+            report["cases"][name]["output_bytes"] = len(result.stdout)
+            files = {
+                row["file_id"]: row["data"]["path"]
+                for row in rows
+                if row["type"] == "begin" and "file_id" in row
+            }
+            for row in rows:
+                if row["type"] == "match" and "file_id" in row:
+                    row["data"]["path"] = files[row["file_id"]]
             signatures.append(
                 sorted(
                     json.dumps(
-                        {"type": row["type"], "data": row.get("data")}, sort_keys=True
+                        {
+                            "type": row["type"],
+                            "data": row.get("data"),
+                            "probability": row.get("probability"),
+                            "scope": row.get("scope"),
+                        },
+                        sort_keys=True,
                     )
                     for row in rows
                     if row["type"] == "match"

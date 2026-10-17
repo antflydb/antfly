@@ -71,6 +71,7 @@ complete -c antfly-grep -l include-sensitive
 complete -c antfly-grep -l include-zero
 complete -c antfly-grep -l invert-match
 complete -c antfly-grep -l json
+complete -c antfly-grep -l json-compact
 complete -c antfly-grep -l library -r
 complete -c antfly-grep -l line-buffered
 complete -c antfly-grep -l line-number

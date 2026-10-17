@@ -45,7 +45,7 @@ pub const Snapshot = struct {
         const name = try std.fmt.bufPrint(&name_buffer, "antfly-grep-{s}.tmp", .{std.fmt.bytesToHex(nonce, .lower)});
         const path = try std.fs.path.join(a, &.{ temporary_dir orelse "/tmp", name });
         defer a.free(path);
-        var file = try std.Io.Dir.cwd().createFile(io, path, .{ .read = true, .exclusive = true, .permissions = .fromMode(0o600) });
+        var file = try std.Io.Dir.cwd().createFile(io, path, .{ .read = true, .exclusive = true, .permissions = if (@import("builtin").os.tag == .windows) .default_file else .fromMode(0o600) });
         defer file.close(io);
         // No pathname survives interruption; only this open descriptor can
         // access the source snapshot after creation.

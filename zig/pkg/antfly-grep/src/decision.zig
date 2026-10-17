@@ -55,6 +55,7 @@ pub const Client = struct {
     cache_hits: usize = 0,
     allow_parallel: bool = true,
     cache_checked: bool = false,
+    legacy_cache: ?@import("artifact_cache.zig").LegacyPresence = null,
     local: ?*@import("local_decider.zig").Runtime = null,
     shared_local: ?*@import("local_decider.zig").Runtime = null,
     cache_scope: ?[32]u8 = null,
@@ -105,7 +106,9 @@ pub const Client = struct {
         const keys = try a.alloc([64]u8, if (caching) inputs.len else 0);
         const written = try a.alloc(?i64, inputs.len);
         @memset(written, null);
-        if (caching) try self.cachedWave(a, inputs, scores, keys, written);
+        const repairs = try a.alloc(bool, if (caching) std.math.divCeil(usize, inputs.len, self.options.batch_size) catch unreachable else 0);
+        @memset(repairs, false);
+        if (caching) try self.cachedWave(a, inputs, scores, keys, written, repairs);
         var missing: std.ArrayList(Input) = .empty;
         var indices: std.ArrayList(usize) = .empty;
         for (inputs, 0..) |input, i| {
@@ -115,8 +118,22 @@ pub const Client = struct {
             try missing.append(a, copy);
             try indices.append(a, i);
         }
-        if (missing.items.len == 0) return;
+        if (missing.items.len == 0) {
+            if (caching) self.repairBatches(a, scores, keys, written, repairs);
+            return;
+        }
         if (self.options.cached_only) return error.DecisionCacheMiss;
+        // Worker batches identical to an original shape persist themselves.
+        // Only shapes changed by compaction require a parent-side repair.
+        if (caching) {
+            var offset: usize = 0;
+            while (offset < indices.items.len) {
+                const n = @min(self.options.batch_size, indices.items.len - offset);
+                const first = indices.items[offset];
+                if (first % self.options.batch_size == 0 and indices.items[offset + n - 1] == first + n - 1 and n == @min(self.options.batch_size, inputs.len - first)) repairs[first / self.options.batch_size] = false;
+                offset += n;
+            }
+        }
         const unresolved = try a.alloc(f64, missing.items.len);
         @memset(unresolved, std.math.nan(f64));
         const learned_at = try a.alloc(?i64, missing.items.len);
@@ -133,33 +150,41 @@ pub const Client = struct {
             scores[index] = score;
             written[index] = timestamp;
         }
-        if (caching) {
-            var offset: usize = 0;
-            while (offset < inputs.len) {
-                const n = @min(self.options.batch_size, inputs.len - offset);
-                self.storeBatch(a, &batchKey(keys[offset..][0..n]), scores[offset..][0..n], written[offset..][0..n]) catch {};
-                offset += n;
-            }
-        }
+        if (caching) self.repairBatches(a, scores, keys, written, repairs);
         if (failure) |err| return err;
     }
-    fn cachedEntry(self: *Client, a: Allocator, key_hex: *const [64]u8) !?@import("score_store.zig").Entry {
-        return self.score_store.get(a, self.io, self.options, key_hex) orelse try self.cached(a, key_hex);
+    fn cachedEntry(self: *Client, a: Allocator, key_hex: *const [64]u8, use_store: bool) !?@import("score_store.zig").Entry {
+        return (if (use_store) self.score_store.get(a, self.io, self.options, key_hex) else null) orelse try self.cached(a, key_hex);
     }
-    fn cachedWave(self: *Client, a: Allocator, inputs: []const Input, scores: []f64, keys: [][64]u8, written: []?i64) !void {
+    fn cachedWave(self: *Client, a: Allocator, inputs: []const Input, scores: []f64, keys: [][64]u8, written: []?i64, repairs: []bool) !void {
         for (inputs, keys) |input, *key_hex| key_hex.* = self.key(input);
         var offset: usize = 0;
         while (offset < inputs.len) {
             const n = @min(self.options.batch_size, inputs.len - offset);
             _ = try self.cachedBatch(a, &batchKey(keys[offset..][0..n]), scores[offset..][0..n], written[offset..][0..n]);
+            repairs[offset / self.options.batch_size] = for (scores[offset..][0..n]) |score| {
+                if (!std.math.isFinite(score)) break true;
+            } else false;
             offset += n;
         }
+        const has_missing = for (scores) |score| {
+            if (!std.math.isFinite(score)) break true;
+        } else false;
+        const use_store = has_missing and self.score_store.available(a, self.io, self.options);
         for (keys, scores, written) |*key_hex, *score, *timestamp| {
-            if (!std.math.isFinite(score.*)) if (try self.cachedEntry(a, key_hex)) |entry| {
+            if (!std.math.isFinite(score.*)) if (try self.cachedEntry(a, key_hex, use_store)) |entry| {
                 score.* = entry.score;
                 timestamp.* = entry.written;
             };
             if (std.math.isFinite(score.*)) self.cache_hits += 1;
+        }
+    }
+    fn repairBatches(self: *Client, a: Allocator, scores: []const f64, keys: []const [64]u8, written: []const ?i64, repairs: []const bool) void {
+        for (repairs, 0..) |dirty, batch| {
+            if (!dirty) continue;
+            const offset = batch * self.options.batch_size;
+            const n = @min(self.options.batch_size, scores.len - offset);
+            self.storeBatch(a, &batchKey(keys[offset..][0..n]), scores[offset..][0..n], written[offset..][0..n]) catch {};
         }
     }
     /// Stable worker storage and clients survive batch waves. A wave borrows
@@ -309,12 +334,16 @@ pub const Client = struct {
         @memset(written, null);
         defer if (created) |out| @memcpy(out, written);
         const batch_hit = if (self.cache_checked) false else try self.cachedBatch(a, &batch_key, probabilities, written);
+        const has_missing = for (probabilities) |score| {
+            if (!std.math.isFinite(score)) break true;
+        } else false;
+        const use_store = caching and !self.cache_checked and has_missing and self.score_store.available(a, self.io, self.options);
         var missing: std.ArrayList(Input) = .empty;
         var indices: std.ArrayList(usize) = .empty;
         for (inputs, 0..) |input, i| {
             if (std.math.isFinite(probabilities[i])) {
                 self.cache_hits += 1;
-            } else if (if (caching and !self.cache_checked) try self.cachedEntry(a, &keys[i]) else null) |entry| {
+            } else if (if (caching and !self.cache_checked) try self.cachedEntry(a, &keys[i], use_store) else null) |entry| {
                 probabilities[i] = entry.score;
                 written[i] = entry.written;
                 self.cache_hits += 1;
@@ -324,7 +353,7 @@ pub const Client = struct {
             }
         }
         if (missing.items.len == 0) {
-            if (!batch_hit) self.storeBatch(a, &batch_key, probabilities, written) catch {};
+            if (has_missing) self.storeBatch(a, &batch_key, probabilities, written) catch {};
             return;
         }
         if (self.options.cached_only) return error.DecisionCacheMiss;
@@ -344,6 +373,14 @@ pub const Client = struct {
         }
         if (learned or !batch_hit) self.storeBatch(a, &batch_key, probabilities, written) catch {};
         if (failure) |err| return err;
+    }
+    fn subdivisionPoint(text: []const u8) ?usize {
+        if (text.len <= 256) return null;
+        var split = text.len / 2;
+        while (split < text.len and text[split] != '\n') split += 1;
+        if (split == text.len) return null;
+        split += 1;
+        return if (split == text.len) null else split;
     }
     fn key(self: *Client, input: Input) [64]u8 {
         if (input.derived_key) |value| return value;
@@ -387,12 +424,21 @@ pub const Client = struct {
             hash.update("document-scope-v1");
             hash.update(&scope);
         }
+        // Pre-fix records cannot prove that both subdivisions completed.
+        // Invalidate only shapes exposed to that bug; other legacy scores
+        // retain their identities and remain eligible for migration.
+        if (subdivisionPoint(input.input) != null) hash.update("complete-subdivision-v1");
         var digest: [32]u8 = undefined;
         hash.final(&digest);
         return std.fmt.bytesToHex(digest, .lower);
     }
+    fn legacy(self: *Client) @import("artifact_cache.zig").LegacyPresence {
+        if (self.legacy_cache == null) self.legacy_cache = @import("artifact_cache.zig").LegacyPresence.scan(self.io, self.options.cache_dir.?);
+        return self.legacy_cache.?;
+    }
     fn cached(self: *Client, a: Allocator, key_hex: []const u8) !?@import("score_store.zig").Entry {
         if (self.options.no_cache or self.options.cache_ttl_seconds == 0 or self.options.cache_dir == null) return null;
+        if (!self.legacy().scalars) return null;
         const path = try std.fs.path.join(a, &.{ self.options.cache_dir.?, key_hex });
         const stat = std.Io.Dir.cwd().statFile(self.io, path, .{}) catch return null;
         const now = std.Io.Clock.real.now(self.io).nanoseconds;
@@ -414,6 +460,17 @@ pub const Client = struct {
     fn batchCache(self: *Client, count: usize) @import("artifact_cache.zig").Cache {
         // Size classes bound bytes without wasting a maximum-size slot on every
         // tiny batch. More ways retain dense small-record working sets.
+        const size = 84 + count * 16;
+        return if (size <= 256)
+            .{ .directory = self.options.cache_dir.?, .namespace = "batch-v9-small", .buckets = 4096, .ways = 16, .limit = 256 }
+        else if (size <= 1024)
+            .{ .directory = self.options.cache_dir.?, .namespace = "batch-v9-medium", .buckets = 2048, .ways = 8, .limit = 1024 }
+        else
+            .{ .directory = self.options.cache_dir.?, .namespace = "batch-v9-large", .buckets = 512, .ways = 8, .limit = 4096 };
+    }
+    fn legacyBatchCache(self: *Client, count: usize) @import("artifact_cache.zig").Legacy {
+        // Size classes bound bytes without wasting a maximum-size slot on every
+        // tiny batch. More ways retain dense small-record working sets.
         const size = 68 + count * 16;
         return if (size <= 256)
             .{ .directory = self.options.cache_dir.?, .namespace = "batch-v8-small", .buckets = 4096, .ways = 16, .limit = 256 }
@@ -430,7 +487,14 @@ pub const Client = struct {
     const ScoreRecord = struct { bits: u64, written: u64 };
     fn cachedBatch(self: *Client, a: Allocator, key_hex: []const u8, scores: []f64, written: []?i64) !bool {
         if (self.options.no_cache or self.options.cache_ttl_seconds == 0 or self.options.cache_dir == null) return false;
-        if (self.batchCache(scores.len).load(a, self.io, digestKey(key_hex))) |bytes| cached: {
+        var migrated = false;
+        const payload = self.batchCache(scores.len).load(a, self.io, digestKey(key_hex)) orelse blk: {
+            if (!self.legacy().batches) break :blk null;
+            const old = self.legacyBatchCache(scores.len).load(a, self.io, digestKey(key_hex)) orelse break :blk null;
+            migrated = true;
+            break :blk old;
+        };
+        if (payload) |bytes| cached: {
             var reader = @import("cache_codec.zig").Reader{ .bytes = bytes };
             const entries = reader.get([]ScoreRecord, a) catch break :cached;
             if (reader.bytes.len != 0 or entries.len != scores.len) break :cached;
@@ -447,8 +511,10 @@ pub const Client = struct {
                 score.* = value;
                 timestamp.* = created;
             }
+            if (migrated) self.storeBatch(a, key_hex, scores, written) catch {};
             return true;
         }
+        if (!self.legacy().batches) return false;
         for ([_]u8{ 7, 6 }) |version| if (try self.cachedBatchVersion(a, key_hex, scores, written, version)) {
             self.storeBatch(a, key_hex, scores, written) catch {};
             // Keep legacy evidence until explicit cache cleanup: a best-effort
@@ -483,7 +549,7 @@ pub const Client = struct {
     fn storeBatch(self: *Client, a: Allocator, key_hex: []const u8, scores: []const f64, written: []const ?i64) !void {
         if (self.options.no_cache or self.options.cached_only or self.options.cache_ttl_seconds == 0 or self.options.cache_dir == null) return;
         // Bound allocation before encoding; oversized shapes retain scalar reuse.
-        if (scores.len > (4096 - 68) / 16) return;
+        if (scores.len > (4096 - 84) / 16) return;
         var any = false;
         const entries = try a.alloc(ScoreRecord, scores.len);
         for (scores, written, entries) |score, timestamp, *entry| {
@@ -506,19 +572,15 @@ pub const Client = struct {
                 if (self.last_status == 413 or self.last_status == 422 or err == error.DecisionRequestTooLarge) {
                     if (inputs.len == 1) {
                         const input = inputs[0];
-                        if (input.input.len <= 256) return err;
-                        var split = input.input.len / 2;
-                        while (split < input.input.len and input.input[split] != '\n') split += 1;
-                        if (split == input.input.len or split == 0) return err;
-                        split += 1;
-                        if (split == input.input.len) return err;
+                        const split = subdivisionPoint(input.input) orelse return err;
                         const left = Input{ .id = input.id, .input = input.input[0..split], .context = input.context, .context_hash = input.context_hash };
                         const right = Input{ .id = input.id, .input = input.input[split..], .context = input.context, .context_hash = input.context_hash };
                         var scores: [2]f64 = @splat(std.math.nan(f64));
                         self.request(&.{left}, scores[0..1]) catch |failure| {
                             return failure;
                         };
-                        probabilities[0] = scores[0];
+                        // A subdivision is not evidence for the whole input.
+                        // Publish only after every half has completed.
                         try self.request(&.{right}, scores[1..2]);
                         probabilities[0] = @max(scores[0], scores[1]);
                         return;

@@ -19,10 +19,11 @@ const std = @import("std");
 const source = @import("source.zig");
 const A = std.mem.Allocator;
 pub const Line = struct { start: usize, end: usize };
+pub const State = struct { legacy: ?bool = null };
 pub const Prepared = struct { lines: []Line, index: source.Index };
 const limit = 256 * 1024;
 fn cache(directory: []const u8) @import("artifact_cache.zig").Cache {
-    return .{ .directory = directory, .namespace = "source-v2", .buckets = 1024, .limit = limit };
+    return .{ .directory = directory, .namespace = "source-v3", .buckets = 1024, .limit = limit };
 }
 const parser_digest = @import("grep_cache_options").parser_digest;
 fn identity(path: []const u8, bytes: []const u8, delimiter: u8, crlf: bool, scope: ?[32]u8) [32]u8 {
@@ -40,12 +41,12 @@ fn identity(path: []const u8, bytes: []const u8, delimiter: u8, crlf: bool, scop
     hash.final(&digest);
     return digest;
 }
-pub fn get(a: A, io: std.Io, o: *const @import("options.zig").Options, path: []const u8, bytes: []const u8, scope: ?[32]u8, hit: *bool) !Prepared {
+pub fn get(a: A, io: std.Io, o: *const @import("options.zig").Options, path: []const u8, bytes: []const u8, scope: ?[32]u8, hit: *bool, state: *State) !Prepared {
     const delimiter: u8 = if (o.null_data) 0 else '\n';
     const enabled = !o.no_cache and o.cache_dir != null;
     const key = if (enabled) identity(path, bytes, delimiter, o.crlf, scope) else @as([32]u8, @splat(0));
     hit.* = false;
-    if (enabled) if (load(a, io, o.cache_dir.?, key, bytes, delimiter, o.crlf)) |prepared| {
+    if (enabled) if (load(a, io, o.cache_dir.?, key, bytes, delimiter, o.crlf, !o.cached_only, state)) |prepared| {
         hit.* = true;
         return prepared;
     };
@@ -64,8 +65,16 @@ pub fn lines(a: A, bytes: []const u8, delimiter: u8, crlf: bool) ![]Line {
     if (start < bytes.len) try out.append(a, .{ .start = start, .end = bytes.len });
     return out.toOwnedSlice(a);
 }
-fn load(a: A, io: std.Io, directory: []const u8, key: [32]u8, bytes: []const u8, delimiter: u8, crlf: bool) ?Prepared {
-    const record = cache(directory).load(a, io, key) orelse return null;
+fn load(a: A, io: std.Io, directory: []const u8, key: [32]u8, bytes: []const u8, delimiter: u8, crlf: bool, migrate: bool, state: *State) ?Prepared {
+    var legacy = false;
+    const record = cache(directory).load(a, io, key) orelse blk: {
+        if (state.legacy == null) state.legacy = @import("artifact_cache.zig").LegacyPresence.scan(io, directory).sources;
+        if (!state.legacy.?) return null;
+        const old: @import("artifact_cache.zig").Legacy = .{ .directory = directory, .namespace = "source-v2", .buckets = 1024, .limit = limit };
+        const body = old.load(a, io, key) orelse return null;
+        legacy = true;
+        break :blk body;
+    };
     var reader = @import("cache_codec.zig").Reader{ .bytes = record };
     const value = reader.get(Prepared, a) catch return null;
     if (reader.bytes.len != 0) return null;
@@ -89,6 +98,7 @@ fn load(a: A, io: std.Io, directory: []const u8, key: [32]u8, bytes: []const u8,
         if (decl.parent) |parent| if (parent >= value.index.declarations.len or parent == i) return null;
     }
     for (value.index.calls) |call| if (call.line < 1 or call.line > value.lines.len or call.column < 1 or call.start_byte > call.end_byte or call.end_byte > bytes.len) return null;
+    if (legacy and migrate) store(a, io, directory, key, value);
     return value;
 }
 fn store(a: A, io: std.Io, directory: []const u8, key: [32]u8, value: Prepared) void {

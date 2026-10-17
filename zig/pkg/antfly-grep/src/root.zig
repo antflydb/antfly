@@ -92,7 +92,9 @@ pub const Search = struct {
     file_path_triage: bool = false,
     transcoding: bool = false,
     stream_eof: bool = false,
+    source_cache_state: @import("source_cache.zig").State = .{},
     json_started: bool = false,
+    compact_file_id: [64]u8 = undefined,
     file_output_start: usize = 0,
     file_started: ?std.Io.Timestamp = null,
     evidence: ?*@import("evidence.zig").Evidence = null,
@@ -1468,7 +1470,7 @@ pub const Search = struct {
         var prepared: ?@import("source_cache.zig").Prepared = null;
         const lines = if (self.options.ask != null) blk: {
             var hit = false;
-            prepared = try @import("source_cache.zig").get(a, self.io, self.options, path_name, bytes, self.decider.cache_scope, &hit);
+            prepared = try @import("source_cache.zig").get(a, self.io, self.options, path_name, bytes, self.decider.cache_scope, &hit, &self.source_cache_state);
             self.summary.source_cache_hits += @intFromBool(hit);
             break :blk prepared.?.lines;
         } else try lineRangesWith(a, bytes, if (self.options.null_data) 0 else '\n', self.options.crlf);
@@ -1826,6 +1828,7 @@ pub const Search = struct {
         var calls: std.ArrayList(@import("source.zig").Call) = .empty;
         for (evidence.index.calls) |call| if (call.line > 0 and call.line <= selected.len and selected[call.line - 1]) try calls.append(a, call);
         if (self.options.json) {
+            if (self.options.json_compact) try self.jsonBegin(path);
             try self.json(.{ .type = "file", .path = path, .relevance = self.best_probability, .file_preview_score = evidence.file_score, .selection = .{ .query = self.options.ask, .additional_queries = self.options.queries.items, .lexical_prefilters = self.options.patterns.items, .policies = .{ .filters = self.options.filters.items, .only = self.options.only.items, .exclude = self.options.not.items }, .file_threshold = self.options.file_threshold, .region_threshold = self.options.threshold, .refined = self.options.refine, .reason = if (any_selected) "scored_source_evidence" else "file_preview_reading_lead" }, .match = if (any_selected) "strong" else "lead", .reading_leads = evidence.index.declarations, .regions = regions.items[0..@min(regions.items.len, self.options.max_regions_per_file)], .lines = rows.items, .calls = calls.items, .omitted = .{ .lines = omitted_lines, .bytes = omitted_bytes, .regions = regions.items.len - @min(regions.items.len, self.options.max_regions_per_file) }, .parse_complete = evidence.index.complete, .complete = self.summary.complete });
             return;
         }
@@ -2121,17 +2124,18 @@ pub const Search = struct {
             hits.items.len -= 1;
         };
         if (self.options.json) {
-            const encoded_path = try jsonText(a, path_name);
-            if (!self.json_started) {
-                try self.json(.{ .type = "begin", .data = .{ .path = encoded_path } });
-                self.json_started = true;
-            }
+            const encoded_path = if (self.options.json_compact) JsonText{ .text = null, .bytes = null } else try jsonText(a, path_name);
+            try self.jsonBegin(path_name);
             const raw = self.raw_line orelse text;
-            const utf8 = std.unicode.utf8ValidateSlice(text);
+            const utf8 = self.options.json_compact or std.unicode.utf8ValidateSlice(text);
             const encoded = if (utf8) null else try base64(a, text);
             const subs = JsonSubmatches{ .matcher = &self.matcher, .text = text, .terminated = terminated, .runs = if (self.replay_spans and matched) self.cachedRuns() else null, .hits = if (self.replay_spans and self.current_hits == null and matched and p == null and !self.options.invert) null else hits.items };
             const raw_valid = std.unicode.utf8ValidateSlice(raw);
-            try self.json(.{ .type = if (matched) "match" else "context", .data = .{ .path = encoded_path, .lines = JsonText{ .text = if (raw_valid) raw else null, .bytes = if (raw_valid) null else try base64(a, raw) }, .line_number = line, .absolute_offset = byte_offset, .submatches = subs }, .path = if (encoded_path.text != null) path_name else null, .path_bytes_base64 = encoded_path.bytes, .line_number = line, .byte_offset = byte_offset, .text = if (utf8) text else null, .bytes_base64 = encoded, .probability = p, .scope = if (p != null and !independent) "region" else "line" });
+            if (self.options.json_compact) {
+                try self.json(.{ .type = if (matched) "match" else "context", .data = .{ .lines = JsonText{ .text = if (raw_valid) raw else null, .bytes = if (raw_valid) null else try base64(a, raw) }, .line_number = line, .absolute_offset = byte_offset, .submatches = subs }, .probability = p, .scope = if (p != null and !independent) "region" else "line" });
+            } else {
+                try self.json(.{ .type = if (matched) "match" else "context", .data = .{ .path = encoded_path, .lines = JsonText{ .text = if (raw_valid) raw else null, .bytes = if (raw_valid) null else try base64(a, raw) }, .line_number = line, .absolute_offset = byte_offset, .submatches = subs }, .path = if (encoded_path.text != null) path_name else null, .path_bytes_base64 = encoded_path.bytes, .line_number = line, .byte_offset = byte_offset, .text = if (utf8) text else null, .bytes_base64 = encoded, .probability = p, .scope = if (p != null and !independent) "region" else "line" });
+            }
             return;
         }
         if ((self.options.heading orelse false) and self.render_filename) {
@@ -2490,6 +2494,32 @@ pub const Search = struct {
     fn jsonStats(self: *Search, before: Summary) JsonStats {
         return .{ .searches = self.summary.files - before.files, .searches_with_match = self.summary.files_with_matches - before.files_with_matches, .bytes_searched = self.summary.bytes - before.bytes, .bytes_printed = self.output_bytes, .matched_lines = self.summary.matches - before.matches, .matches = self.summary.occurrences - before.occurrences };
     }
+    fn jsonBegin(self: *Search, path: []const u8) !void {
+        if (self.json_started) return;
+        const encoded_path = try jsonText(self.a, path);
+        defer if (encoded_path.bytes) |bytes| self.a.free(bytes);
+        if (self.options.json_compact) {
+            // Opaque per-observation identity: repeated paths can change within
+            // one wall-clock tick. No shared counter or scheduling dependency.
+            const source = try std.json.Stringify.valueAlloc(self.a, self.provenance, .{});
+            defer self.a.free(source);
+            var hash = std.crypto.hash.sha2.Sha256.init(.{});
+            hash.update("antfly-grep-file-v2");
+            var nonce: [16]u8 = undefined;
+            self.io.random(&nonce);
+            hash.update(&nonce);
+            var len: [8]u8 = undefined;
+            std.mem.writeInt(u64, &len, path.len, .little);
+            hash.update(&len);
+            hash.update(path);
+            hash.update(source);
+            var digest: [32]u8 = undefined;
+            hash.final(&digest);
+            self.compact_file_id = std.fmt.bytesToHex(digest, .lower);
+            try self.json(.{ .type = "begin", .data = .{ .path = encoded_path, .record_delimiter = if (self.options.null_data) "nul" else "lf", .crlf = self.options.crlf } });
+        } else try self.json(.{ .type = "begin", .data = .{ .path = encoded_path } });
+        self.json_started = true;
+    }
     fn jsonEnd(self: *Search, path: []const u8, before: Summary) !void {
         if (!self.options.json or !self.json_started) return;
         var stats = self.jsonStats(before);
@@ -2500,7 +2530,9 @@ pub const Search = struct {
         stats.elapsed = .{ .secs = @intCast(@divFloor(elapsed, 1_000_000_000)), .nanos = @intCast(@mod(elapsed, 1_000_000_000)), .human = human };
         const encoded_path = try jsonText(self.a, path);
         defer if (encoded_path.bytes) |bytes| self.a.free(bytes);
-        try self.json(.{ .type = "end", .data = .{ .path = encoded_path, .binary_offset = self.binary_offset, .stats = stats } });
+        if (self.options.json_compact) {
+            try self.json(.{ .type = "end", .data = .{ .binary_offset = self.binary_offset, .stats = stats } });
+        } else try self.json(.{ .type = "end", .data = .{ .path = encoded_path, .binary_offset = self.binary_offset, .stats = stats } });
         self.json_started = false;
     }
     const AtomicRecord = struct {
@@ -2551,22 +2583,36 @@ pub const Search = struct {
         const Envelope = struct {
             value: @TypeOf(value),
             source: @TypeOf(self.provenance),
+            compact: bool,
+            file_id: ?[64]u8,
             pub fn jsonStringify(envelope: @This(), json_writer: *std.json.Stringify) !void {
                 try json_writer.beginObject();
                 inline for (@typeInfo(@FieldType(@This(), "value")).@"struct".field_names) |field_name| {
                     try json_writer.objectField(field_name);
                     try json_writer.write(@field(envelope.value, field_name));
                 }
-                if (@hasField(@TypeOf(value), "type") and !std.mem.eql(u8, envelope.value.type, "summary")) {
+                if (envelope.compact) {
                     try json_writer.objectField("result_schema_version");
-                    try json_writer.write(@as(u32, 1));
-                    try json_writer.objectField("source");
-                    try json_writer.write(envelope.source);
+                    try json_writer.write(@as(u32, 2));
+                    if (envelope.file_id) |id| {
+                        try json_writer.objectField("file_id");
+                        try json_writer.write(@as([]const u8, &id));
+                    }
+                }
+                if (@hasField(@TypeOf(value), "type") and !std.mem.eql(u8, envelope.value.type, "summary")) {
+                    if (!envelope.compact) {
+                        try json_writer.objectField("result_schema_version");
+                        try json_writer.write(@as(u32, 1));
+                    }
+                    if (!envelope.compact or envelope.file_id == null or std.mem.eql(u8, envelope.value.type, "begin")) {
+                        try json_writer.objectField("source");
+                        try json_writer.write(envelope.source);
+                    }
                 }
                 try json_writer.endObject();
             }
         };
-        try std.json.Stringify.value(Envelope{ .value = value, .source = self.provenance }, .{}, writer);
+        try std.json.Stringify.value(Envelope{ .value = value, .source = self.provenance, .compact = self.options.json_compact, .file_id = if (self.options.json_compact and (@hasField(@TypeOf(value), "type") and (std.mem.eql(u8, value.type, "begin") or (self.json_started and !std.mem.eql(u8, value.type, "summary") and !std.mem.eql(u8, value.type, "inventory") and !std.mem.eql(u8, value.type, "omitted_files"))))) self.compact_file_id else null }, .{}, writer);
         try writer.writeByte('\n');
     }
     fn json(self: *Search, value: anytype) !void {

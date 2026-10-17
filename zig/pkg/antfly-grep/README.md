@@ -42,6 +42,28 @@ printf 'hello\nworld\n' | antfly-grep hello
 antfly-grep --json retry ./src
 ```
 
+`--json` preserves the version 1 event format. `--json-compact` opts into
+version 2 JSON Lines for lower serialization, transfer, and consumer costs:
+
+```sh
+antfly-grep --json-compact retry ./src
+antfly-grep --ask 'retry enforcement' --model MODEL --json-compact ./src
+```
+
+A `begin` event contains the encoded path in `data.path`, the complete `source`
+provenance, record delimiter (`lf` or `nul`), CRLF mode, and an opaque `file_id`
+for that observation. `match`, `context`, `file` overview and `end` events refer
+back to it with `file_id`; they do not repeat provenance. Match/context `data`
+contains `lines`, `line_number`, `absolute_offset`, and `submatches`, retaining
+binary base64 values and byte coordinates. The repeated top-level path/text/offset
+aliases are omitted; `probability` and `scope` remain. `end.data` retains statistics
+and binary offset. Every version 2 event declares `result_schema_version: 2`.
+Consumers must retain identities until their `end` event and may receive an
+incomplete stream on cancellation or failure. Errors before a file begins retain
+their own path/provenance; summary and inventory events need no file reference.
+The last output-mode flag wins. Output and pending-output budgets still apply
+atomically to complete records. Regular JSON remains unchanged.
+
 Without paths, nonterminal stdin is searched; otherwise the current directory is
 searched recursively. Use `.` to force file search in a pipeline, `-` for stdin,
 and `--` to end options. Non-multiline exact search and semantic stdin processing
@@ -205,7 +227,11 @@ and 32 request lanes. Use `--help` for the separate grep-style defaults.
 Transient requests retry with exponential backoff and jitter, respect numeric and HTTP-date
 Retry-After (including obsolete HTTP-date formats), and reduce concurrent request lanes until the provider recovers.
 Oversized batches split, including newline-based subdivision of a rejected single
-input. Each attempt consumes the request budget. Valid partial results survive
+input. A subdivided input becomes cacheable only when every half completes;
+partial scores cannot be cached under the whole input's identity. Inputs that can
+be subdivided use a new evidence-key generation, so pre-fix incomplete scores
+cannot reenter through legacy migration; other legacy identities remain reusable.
+Each attempt consumes the request budget. Valid partial results survive
 terminal failures and incomplete searches exit 2.
 
 `--batch-size` defaults to 8 (maximum 128). Cache keys include endpoint/model,
@@ -1114,10 +1140,10 @@ reusing derived cache keys and preserving original timestamps. Entirely cached p
 also bypass worker dispatch. A regression removes the library after warming
 scores and verifies that both normal and cached-only searches still succeed.
 
-Decision batch cache v8 records each score's original creation time. Re-batching,
-legacy migration and partial-cache repairs cannot rejuvenate old evidence. V6/V7
+Decision batch cache v9 records each score's original creation time. Re-batching,
+legacy migration and partial-cache repairs cannot rejuvenate old evidence. V6/V7/V8
 batches and scoped v5 scalar files remain readable with their original file age;
-new records use a separate versioned namespace. V8 uses packed little-endian
+new records use a separate versioned namespace. V9 uses packed little-endian
 score/timestamp pairs in three size classes: 256-byte slots (4,096 buckets,
 16 ways), 1-KiB slots (2,048 buckets, 8 ways), and 4-KiB slots (512 buckets,
 8 ways), capped at 48 MiB of logical record bytes. Filesystem blocks and inode
@@ -1129,7 +1155,15 @@ holds 16,384 four-way buckets of checksummed 64-byte records (4 MiB).
 One positional read retrieves an entire bucket. It retains individual
 input identities when batch shapes change. Collisions are evictions and cause
 misses, never score substitution; concurrent torn writes also cause misses. The
-exact-batch tier keeps the ordinary one-record warm-hit path. Pinning
+exact-batch tier keeps the ordinary warm-hit path. V9 coalesces each bucket's
+headers into one file and one read, then reads the matching body. No per-way
+open/stat loop or mmap is required. The header checksum includes the full key,
+length, age and body, so in-place racing writes cannot alias identities. Readers
+retry previously absent scalar tables at the next wave. Scalar-only hits are
+promoted into batch records; mixed waves repair only changed shapes and avoid
+rewriting worker batches that already have the original shape. Legacy presence
+is inventoried lazily once per client, avoiding repeated negative probes on new
+caches. Pinning
 `--model-revision` prevents reuse after a model generation changes.
 
 Source preparation is independent of questions. An artifact stores line offsets,
@@ -1138,8 +1172,12 @@ and authorization/revision scope. Its identity includes the projection source,
 Zig version and every pinned parser/grammar source byte; parser updates invalidate
 artifacts automatically. The private, atomically replaced artifacts occupy at
 most 1,024 four-way buckets of 256 KiB per slot (1 GiB total).
-V2 stores portable binary offset/index records rather than JSON and evicts the
-oldest written artifact in a full bucket. Old V1 source artifacts are disposable
+V3 stores portable binary offset/index records and evicts the oldest written
+artifact in a full bucket. A bucket contains one contiguous header directory and
+compact bodies, published by atomic rename. Unlike fixed large offsets, this
+layout does not allocate empty slot gaps on filesystems without sparse writes;
+rewrites are bounded by the four-slot bucket size. V2 per-way artifacts migrate
+after validation during writable searches, preserving their exact identities. Old V1 source artifacts are disposable
 and no longer read; `cache clear` removes them. Full digest and checksum
 validation precedes reuse;
 collisions, oversized preparations or invalid records fall back to parsing. Source
@@ -1267,3 +1305,52 @@ Validation includes 160 CLI tests on each platform (two macOS skips, one Linux
 skip), native unit/hardening/tooling checks, six real-server indexed scenarios,
 1,000 generated differential cases, five labeled fixture questions and all 35
 Apache-boundary checker tests. Full upstream conformance remains unproven.
+
+
+### Coalesced cache buckets and compact JSON qualification
+
+The follow-up fixes incomplete subdivision caching and previously absent score
+tables, promotes scalar-only waves, and repairs only changed batch shapes. It
+replaces per-way artifact probes with coalesced bucket headers. Source buckets
+pack their bodies rather than allocating fixed large gaps. `--json-compact`
+provides the opt-in version 2 event contract documented above; packaged man pages
+and shell completions include the option.
+
+Five paired warm runs over 2,048 generated Python files (65,536 selected source
+lines), using the same native inference fixture and checking reconstructed match
+payloads, probabilities, and scopes:
+
+| Measurement | Previous PR head | Coalesced buckets |
+|---|---:|---:|
+| Median elapsed, regular JSON | 1092 ms | 732 ms |
+| Median system CPU | 767 ms | 450 ms |
+| Allocated cache bytes (`st_blocks * 512`) | 45,801,472 | 26,210,304 |
+| Cache files | 10,159 | 4,438 |
+| Warm inference calls | 0 | 0 |
+| Source-preparation hits | 1,754 | 1,754 |
+| Median peak RSS | 66.8 MiB | 66.9 MiB |
+
+The separately paired compact run emits 19,070,307 bytes versus
+49,065,982 bytes with regular JSON (61% fewer), with identical
+reconstructed results and no warm inference. Its median elapsed is
+724 ms versus 967 ms for the previous head.
+These are fixture-only results on a shared macOS ARM64 host with warm filesystem
+caches. They do not establish independent-host, cold-cache, provider latency,
+billing, or model-quality improvements. Memory remains approximately unchanged.
+
+The 15-run dense-output matrix remains workload-dependent: regular dense JSON
+measured 25.9 ms versus 25.5 ms for the previous head, while literal `-o`
+measured 6.1 ms versus 5.8 ms and regex color 12.7 ms versus 12.8 ms.
+The separate compact matrix measured 25.4 ms for compact candidate JSON versus
+25.6 ms for standard baseline JSON on the single dense record. A one-file warm
+source case measured 11.0 ms versus 10.8 ms. These small workloads include startup and
+shared-host scheduling; the repository-scale cache gain is not a blanket latency
+guarantee.
+
+Evidence: [cache scaling](bench/results/bucket-review-cache-scale.json),
+[compact scaling](bench/results/bucket-review-compact-scale.json),
+[output matrix](bench/results/bucket-review-output.json),
+[compact output matrix](bench/results/bucket-review-compact-output.json), and
+[incremental checks](bench/results/bucket-review-incremental.json). Binary/source
+identities and validation limits are in
+[bucket-review-validation.json](bench/results/bucket-review-validation.json).
