@@ -27,6 +27,7 @@ pub const lsm_backend = @import("antfly_local_sources").storage_lsm_backend;
 
 test {
     _ = sql_primary_key_rewrite_integration_test;
+    _ = @import("api/sql_nullability_lifecycle_integration_test.zig");
     _ = @import("api/sql_index_lifecycle_integration_test.zig");
     _ = @import("api/sql_expression_index_lifecycle_integration_test.zig");
     _ = @import("api/sql_default_lifecycle_integration_test.zig");

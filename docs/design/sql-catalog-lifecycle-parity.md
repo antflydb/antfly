@@ -10789,3 +10789,62 @@ preserved. No original dispositions change:
 end-to-end staged-publication and distributed fault qualification of these
 originals is still required. Inventory remains 531 implemented / 132 rejected /
 113 superseded / 810 unresolved.
+
+### Mounted nullability semantics and the validation-only gap
+
+The original pinned contracts were inspected in full, including their setup and
+work classification. sql-0744 requests NOT NULL validation without a row
+rewrite; sql-0745 is metadata-only relaxation. Both original setups include a
+UUID primary key. The current BIGINT/default/generated-value campaign is useful
+semantic/recovery evidence, but cannot substitute for that complete setup or
+the intended validation-only implementation.
+
+The new mounted campaign submits the unchanged original SQL through real
+metadata/data services with authenticated donor routing. It checks unauthorized
+nonadmission, existing-NULL rejection with unchanged owner/schema/complete rows,
+explicit repair, successful publication, subsequent NULL-write rejection,
+unchanged no-op epochs, metadata-only relaxation retaining the physical owner,
+defaults/generated values and complete postimages after cold data-owner restart.
+Pending or unknown admission is recovered through its retained job ID, never by
+replaying ALTER. A shared serving-schema helper verifies the actual data owner
+matches metadata before testing writes; the existing default campaign uses the
+same helper and remains green.
+
+The combined Debug gate passes six tests and 80/80 steps with zero
+skips/failures/leaks in
+`/private/tmp/antfly-sql-nullability-mounted-zero-epoch-debug.log`.
+The first sandboxed listener run correctly failed the no-skips gate, not passed
+as a skip. The first authorized run caught a fixture's incorrect epoch-one
+assumption; creation legitimately starts at epoch zero. Neither production
+guard was weakened. The independent PostgreSQL lifecycle gate passes all 17
+tests again. Both exact registered evidence gates pass through the inventory
+runner in `/private/tmp/antfly-sql-nullability-registered-evidence-debug.log`,
+with zero native skips. The same native run node is attached to the ordinary
+integration aggregate, without duplicating its campaign in the build DAG.
+Formatting, license/source-boundary and control-catalog checks pass. Cache GC
+was previewed only; about 2.7 GiB of explicitly validated inactive older test
+outputs were removed, retaining source/user data, logs and current artifacts.
+
+The remaining performant shape is a durable validation-only schema publication:
+
+- Bind the exact predecessor, successor nullability delta, namespace/range
+  cohort and reader capabilities before admitting owner work.
+- Use the existing durable owner fence/drain and publication interfaces, not
+  an unchecked metadata CAS or a separate restore authority. Validate only the
+  affected logical columns through their immutable layouts, in bounded
+  resumable steps; do not re-encode rows, clone owners or rebuild unchanged
+  indexes.
+- Close the concurrent-write/transaction race through the owner fence or an
+  equivalently durable candidate-write barrier before accepting complete
+  validation receipts. A read-only snapshot by itself is insufficient.
+- Publish the schema epoch only after every required owner proves validation;
+  retain the physical owner, primary row bytes/versions and unaffected catalog.
+  Failure/cancellation must preserve the old active declaration and recover
+  fences safely across delayed commands, owner replacement and restart.
+- Qualify zero primary-row writes, projected read amplification, bounded
+  apply-lock time and the full distributed fault matrix. The exact UUID-primary-
+  key original setup remains a separate required gate.
+
+Both dispositions remain unresolved with explicit partial evidence. Totals
+remain 531 implemented / 132 rejected / 113 superseded / 810 unresolved. No
+validation-only performance win or complete distributed activation is claimed.

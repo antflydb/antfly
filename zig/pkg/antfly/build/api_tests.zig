@@ -38,7 +38,7 @@ pub const AddTestsResult = struct {
     run_lib_api_standalone_backup_restore_tests: *std.Build.Step.Run,
     distributed_query_availability_step: *std.Build.Step,
     run_public_api_parity_aggregate_tests: *std.Build.Step.Run,
-    run_sql_owner_lifecycle_tests: [2]*std.Build.Step.Run,
+    run_sql_owner_lifecycle_tests: [3]*std.Build.Step.Run,
     run_lib_api_auth_tests: *std.Build.Step.Run,
     run_algebraic_dynamic_template_tests: *std.Build.Step.Run,
     run_lib_api_connections_tests: *std.Build.Step.Run,
@@ -2160,6 +2160,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .root_module = sql_owner_lifecycle_test_mod,
         .filters = &.{
             "mounted SQL ADD PRIMARY KEY publishes only validated fresh generation",
+            "mounted SQL original nullability validates staged generations and preserves relaxation across restart",
             "mounted SQL original unique indexes enforce exact postimages across owner restart",
             "mounted SQL original expression indexes build maintain partial keys and recover owners",
             "mounted SQL unsupported atomic index owner preserves definite nonadmission across restart",
@@ -2188,6 +2189,10 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     sql_primary_key_rewrite_run.addArg("--require-no-skips");
     b.step("antfly-api-sql-primary-key-rewrite-test", "Run mounted SQL primary-key rewrite publication and failure cases")
         .dependOn(&sql_primary_key_rewrite_run.step);
+    const sql_nullability_run = addFilteredTestRunArtifactWithRuntimeFilters(b, sql_owner_lifecycle_tests, &.{"mounted SQL original nullability validates staged generations and preserves relaxation across restart"});
+    sql_nullability_run.addArg("--require-no-skips");
+    b.step("antfly-api-sql-nullability-lifecycle-test", "Run original nullability DDL through staged validation, publication, enforcement and cold owner recovery")
+        .dependOn(&sql_nullability_run.step);
     const sql_index_lifecycle_run = addFilteredTestRunArtifactWithRuntimeFilters(b, sql_owner_lifecycle_tests, &.{"mounted SQL original unique indexes enforce exact postimages across owner restart"});
     sql_index_lifecycle_run.addArg("--require-no-skips");
     b.step("antfly-api-sql-index-lifecycle-test", "Run exact original index DDL, data-owner enforcement and restart qualification")
@@ -2516,7 +2521,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .run_lib_api_standalone_backup_restore_tests = run_lib_api_standalone_backup_restore_tests,
         .distributed_query_availability_step = lib_api_distributed_query_availability_test_step,
         .run_public_api_parity_aggregate_tests = run_public_api_parity_aggregate_tests,
-        .run_sql_owner_lifecycle_tests = .{ sql_primary_key_rewrite_run, sql_index_lifecycle_run },
+        .run_sql_owner_lifecycle_tests = .{ sql_primary_key_rewrite_run, sql_index_lifecycle_run, sql_nullability_run },
         .run_lib_api_auth_tests = run_lib_api_auth_tests,
         .run_algebraic_dynamic_template_tests = run_algebraic_dynamic_template_tests,
         .run_lib_api_connections_tests = run_lib_api_connections_tests,

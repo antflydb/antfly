@@ -52,50 +52,10 @@ fn alter(ctx: *fixture.Context, statement: []const u8) !void {
 
 /// Observe both publication and the actual serving schema. This is a bounded
 /// pure read; no DDL or mutation is replayed while propagation catches up.
-const Owner = struct { table_id: u64, version: u32 };
+const Owner = fixture.ServingSchema;
 
 fn waitSchema(ctx: *fixture.Context, minimum: u32) !Owner {
-    const domain = local.system_catalog_domain;
-    const lookup: domain.ResolveMany = .{ .relations = &.{.{ .name = "usage_records" }}, .include_query_definitions = true };
-    const metadata = server.StatusSource.fromMetadataHttpService(ctx.metadata.server.svc);
-    const reader = ctx.data.http_server.?.table_reads orelse return error.MissingOwnerReadSource;
-    const deadline = platform.time.monotonicNs() +| 15 * std.time.ns_per_s;
-    while (platform.time.monotonicNs() < deadline) {
-        try ctx.checkDrivers();
-        const bytes = metadata.systemCatalog(ctx.alloc, .{ .deadline_ns = deadline }, .{ .resolve_many = lookup }) catch |err| switch (err) {
-            error.CatalogPublicationProofPending, error.CatalogOccupancyNotReady => {
-                try ctx.io.sleep(.fromMilliseconds(20), .awake);
-                continue;
-            },
-            else => return err,
-        };
-        defer ctx.alloc.free(bytes);
-        var resolved = try std.json.parseFromSlice(domain.ResolvedMany, ctx.alloc, bytes, .{});
-        defer resolved.deinit();
-        try resolved.value.validateRelations(lookup);
-        if (resolved.value.relations[0]) |relation| {
-            if (relation.owner.schema_version >= minimum) {
-                const observed = reader.lookup(ctx.alloc, relation.table.name, "", .{
-                    .relational_topology_json = "{\"mode\":\"public_schema\"}",
-                    .execution_deadline_ns = deadline,
-                }, .read_index) catch |err| switch (err) {
-                    error.GroupLeaderUnavailable, error.LeaderUnavailable, error.NotLeader, error.UnknownGroup, error.ReadIndexTimeout, error.ReadUnavailable, error.StorageReadTemporarilyUnavailable, error.TableNotFound, error.IntegrityCatalogChanged => null,
-                    else => return err,
-                };
-                if (observed) |value| {
-                    var response = value;
-                    defer response.deinit(ctx.alloc);
-                    var public = try std.json.parseFromSlice([]const u8, ctx.alloc, response.json, .{});
-                    defer public.deinit();
-                    var schema = try std.json.parseFromSlice(struct { version: u32 }, ctx.alloc, public.value, .{ .ignore_unknown_fields = true });
-                    defer schema.deinit();
-                    if (schema.value.version == relation.owner.schema_version) return .{ .table_id = relation.owner.table_id, .version = schema.value.version };
-                }
-            }
-        }
-        try ctx.io.sleep(.fromMilliseconds(20), .awake);
-    }
-    return error.DefaultLifecycleSchemaTimeout;
+    return fixture.waitServingSchema(ctx, "usage_records", minimum);
 }
 
 const Expected = struct { id: []const u8, status: ?[]const u8, amount: ?[]const u8 };

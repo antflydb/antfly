@@ -209,6 +209,54 @@ pub const Context = struct {
     }
 };
 
+/// Observe the serving owner's schema as well as metadata publication. A
+/// routing/catalog read alone does not prove data-owner propagation finished.
+pub const ServingSchema = struct { table_id: u64, version: u32 };
+
+pub fn waitServingSchema(ctx: *Context, name: []const u8, minimum: u32) !ServingSchema {
+    const domain = @import("antfly_local_sources").system_catalog_domain;
+    const lookup: domain.ResolveMany = .{ .relations = &.{.{ .name = name }}, .include_query_definitions = true };
+    const metadata = http_server.StatusSource.fromMetadataHttpService(ctx.metadata.server.svc);
+    const reader = ctx.data.http_server.?.table_reads orelse return error.MissingOwnerReadSource;
+    const deadline = platform.time.monotonicNs() +| 15 * std.time.ns_per_s;
+    while (platform.time.monotonicNs() < deadline) {
+        try ctx.checkDrivers();
+        const bytes = metadata.systemCatalog(ctx.alloc, .{ .deadline_ns = deadline }, .{ .resolve_many = lookup }) catch |err| switch (err) {
+            error.CatalogPublicationProofPending, error.CatalogOccupancyNotReady => {
+                try ctx.io.sleep(.fromMilliseconds(20), .awake);
+                continue;
+            },
+            else => return err,
+        };
+        defer ctx.alloc.free(bytes);
+        var resolved = try std.json.parseFromSlice(domain.ResolvedMany, ctx.alloc, bytes, .{});
+        defer resolved.deinit();
+        try resolved.value.validateRelations(lookup);
+        if (resolved.value.relations[0]) |relation| {
+            if (relation.owner.schema_version >= minimum) {
+                const observed = reader.lookup(ctx.alloc, relation.table.name, "", .{
+                    .relational_topology_json = "{\"mode\":\"public_schema\"}",
+                    .execution_deadline_ns = deadline,
+                }, .read_index) catch |err| switch (err) {
+                    error.GroupLeaderUnavailable, error.LeaderUnavailable, error.NotLeader, error.UnknownGroup, error.ReadIndexTimeout, error.ReadUnavailable, error.StorageReadTemporarilyUnavailable, error.TableNotFound, error.IntegrityCatalogChanged => null,
+                    else => return err,
+                };
+                if (observed) |value| {
+                    var response = value;
+                    defer response.deinit(ctx.alloc);
+                    var public = try std.json.parseFromSlice([]const u8, ctx.alloc, response.json, .{});
+                    defer public.deinit();
+                    var schema = try std.json.parseFromSlice(struct { version: u32 }, ctx.alloc, public.value, .{ .ignore_unknown_fields = true });
+                    defer schema.deinit();
+                    if (schema.value.version == relation.owner.schema_version) return .{ .table_id = relation.owner.table_id, .version = schema.value.version };
+                }
+            }
+        }
+        try ctx.io.sleep(.fromMilliseconds(20), .awake);
+    }
+    return error.SqlOwnerSchemaTimeout;
+}
+
 pub fn run(comptime Campaign: type) !void {
     const alloc = std.testing.allocator;
     const process_alloc = platform.allocator.processAllocator(alloc);

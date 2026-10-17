@@ -2,6 +2,8 @@
   "ledger_format": 1,
   "inventory_sha256": "c203a4dcf0094b75e1d3764e90beebddaf844a9ce604543c0a4dbc0ffe8ae173",
   "gates": {
+    "sql-original-nullability-lifecycle-native-debug": {"command":["zig","build","antfly-api-sql-nullability-lifecycle-test","-Doptimize=Debug","-j1"],"cwd":"zig","timeout_seconds":1800},
+    "sql-original-nullability-lifecycle-postgres": {"command":["uv","run","--offline","--no-project","--with","psycopg[binary]==3.3.6","python","-m","unittest","discover","-s","scripts","-p","test_sql_catalog_lifecycle.py"],"cwd":".","timeout_seconds":180},
     "sql-original-table-creation-native-debug": {"command":["zig","build","antfly-api-sql-table-creation-test","-Doptimize=Debug","-j1"],"cwd":"zig","timeout_seconds":1800},
     "sql-original-table-creation-postgres": {"command":["uv","run","--no-project","--with","psycopg[binary]==3.3.6","python","-m","unittest","discover","-s","scripts","-p","test_sql_table_creation_lifecycle.py"],"cwd":".","timeout_seconds":180},
     "sql-original-default-lifecycle-native-debug": {"command":["zig","build","antfly-api-sql-default-lifecycle-test","-Doptimize=Debug","-j1"],"cwd":"zig","timeout_seconds":1800},
@@ -7499,12 +7501,20 @@
     {
       "id": "sql-0744",
       "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "reason": "Exact original SQL runs through real metadata/data owners. Existing-NULL failure preserves the old owner and complete rows; explicit repair, publication, future-write enforcement, defaults/generated values, no-op epochs and cold owner recovery are verified against PostgreSQL semantics. Current tightening still uses a full physical rewrite rather than the desired validation-only publication. Original UUID-primary-key setup and the complete distributed fault matrix remain unqualified; this is partial evidence, not completion.",
+      "evidence": [
+        {"path":"zig/pkg/antfly/src/api/sql_nullability_lifecycle_integration_test.zig","test":"mounted SQL original nullability validates staged generations and preserves relaxation across restart","gate":"sql-original-nullability-lifecycle-native-debug"},
+        {"path":"zig/pkg/antfly/src/api/sql_nullability_lifecycle_integration_test.zig","test":"mounted SQL original nullability validates staged generations and preserves relaxation across restart","gate":"sql-original-nullability-lifecycle-postgres"}
+      ]
     },
     {
       "id": "sql-0745",
       "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "reason": "Exact original DROP NOT NULL uses the guarded metadata/schema CAS, retains physical owner identity, preserves defaults/generated values, accepts explicit NULL, does not advance an already matching schema epoch and survives cold owner restart. PostgreSQL independently verifies the nullability lifecycle. The original UUID-primary-key setup and complete distributed fault matrix remain unqualified; this is partial evidence, not completion.",
+      "evidence": [
+        {"path":"zig/pkg/antfly/src/api/sql_nullability_lifecycle_integration_test.zig","test":"mounted SQL original nullability validates staged generations and preserves relaxation across restart","gate":"sql-original-nullability-lifecycle-native-debug"},
+        {"path":"zig/pkg/antfly/src/api/sql_nullability_lifecycle_integration_test.zig","test":"mounted SQL original nullability validates staged generations and preserves relaxation across restart","gate":"sql-original-nullability-lifecycle-postgres"}
+      ]
     },
     {
       "id": "sql-0746",
