@@ -66,12 +66,19 @@ const Overlay = struct {
         errdefer arena.deinit();
         const a = arena.allocator();
         var rows: std.ArrayList(catalog.Row) = .empty;
+        var layout: ?*const catalog.Row.TypedLayout = null;
         while (rows.items.len < limit) {
             const native = try self.peek();
             const staged: ?catalog.Row = if (self.staged_index < self.staged.len) self.staged[self.staged_index] else null;
             const use_staged = if (staged) |row| native == null or std.mem.lessThan(u8, row.id, native.?.id) else false;
             const row = if (use_staged) staged.? else native orelse break;
-            try rows.append(a, try cloneRow(a, row));
+            // peek() can release the native page before this output page is
+            // returned. Transfer complete cells, sharing one owned directory
+            // across the emitted page rather than cloning it for every row.
+            if (row.typed_cells) |cells| if (layout == null) {
+                layout = try cells.layout.clone(a);
+            };
+            try rows.append(a, try row.cloneWithLayout(a, layout));
             if (use_staged) self.staged_index += 1 else self.native_index += 1;
         }
         const more = (try self.peek()) != null or self.staged_index < self.staged.len;
@@ -86,17 +93,6 @@ const Overlay = struct {
         self.alloc.destroy(self);
     }
 };
-fn cloneJson(a: std.mem.Allocator, value: Json) !Json {
-    return std.json.parseFromSliceLeaky(Json, a, try std.json.Stringify.valueAlloc(a, value, .{}), .{ .parse_numbers = false });
-}
-fn cloneRow(a: std.mem.Allocator, row: catalog.Row) !catalog.Row {
-    var result = row;
-    result.id = try a.dupe(u8, row.id);
-    result.value = try cloneJson(a, row.value);
-    result.sql_nulls = if (row.sql_nulls) |nulls| try a.dupe(bool, nulls) else null;
-    result.document = if (row.document) |document| try cloneJson(a, document) else null;
-    return result;
-}
 fn matches(row: catalog.Row, conditions: []const catalog.Condition) !bool {
     for (conditions) |condition| {
         const cell = try row.cell(condition.column);
@@ -162,7 +158,7 @@ pub fn open(alloc: std.mem.Allocator, native: catalog.Cursor, session: *Session,
             try projected.put(a, field, cell.value);
             sql_null.* = cell.sql_null;
         }
-        try rows.append(a, try cloneRow(a, .{ .id = row.id, .version = row.version, .value = .{ .object = projected }, .sql_nulls = projected_nulls, .expected_content_digest = row.expected_content_digest, .document = row.document }));
+        try rows.append(a, try (catalog.Row{ .id = row.id, .version = row.version, .value = .{ .object = projected }, .sql_nulls = projected_nulls, .expected_content_digest = row.expected_content_digest, .document = row.document }).cloneOwned(a));
     }
     std.mem.sort(catalog.Row, rows.items, {}, struct {
         fn less(_: void, arow: catalog.Row, brow: catalog.Row) bool {
@@ -171,4 +167,67 @@ pub fn open(alloc: std.mem.Allocator, native: catalog.Cursor, session: *Session,
     }.less);
     self.staged = rows.items;
     return .{ .ptr = self, .next = Overlay.next, .close = Overlay.close };
+}
+
+test "SQL overlay native pages retain typed cells after source page release" {
+    const a = std.testing.allocator;
+    const Fixture = struct {
+        sent: bool = false,
+        fn next(raw: *anyopaque, _: std.mem.Allocator, _: u32) !catalog.Page {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.sent) return .{ .rows = &.{} };
+            self.sent = true;
+            // Independently owned native pages really free their payload when
+            // peek() reaches EOF, even if the caller retains its own arena.
+            var arena = std.heap.ArenaAllocator.init(a);
+            errdefer arena.deinit();
+            const owned = arena.allocator();
+            const layout = try catalog.Row.TypedLayout.init(owned, &.{ "n", "a", "j", "sql_null" });
+            const array = try @import("../sql/array_text.zig").decode(owned, .int64, "[-1:1]={9007199254740993,NULL,2}", .{});
+            const rows = try owned.alloc(catalog.Row, 2);
+            for (rows, 0..) |*row, i| {
+                row.* = try catalog.Row.fromDatums(owned, if (i == 0) "a" else "b", layout, &.{
+                    catalog.Row.Cell.json(.{ .integer = 9007199254740993 + @as(i64, @intCast(i)) }),
+                    catalog.Row.Cell.typedArray(&array.value),
+                    catalog.Row.Cell.json(.null),
+                    .{},
+                });
+                row.version = 7;
+            }
+            return .{ .rows = rows, .owned_arena = arena };
+        }
+        fn close(_: *anyopaque) void {}
+    };
+    var fixture: Fixture = .{};
+    var overlay: Overlay = .{
+        .alloc = a,
+        .arena = .init(a),
+        .native = .{ .ptr = &fixture, .next = Fixture.next, .close = Fixture.close },
+        .native_arena = .init(a),
+        .staged = &.{},
+    };
+    defer {
+        if (overlay.page) |*page| page.deinit();
+        overlay.native_arena.deinit();
+        overlay.arena.deinit();
+    }
+    var page = try Overlay.next(&overlay, a, 2);
+    defer page.deinit();
+    try std.testing.expect(overlay.native_done and overlay.page == null);
+    try std.testing.expectEqual(@as(usize, 2), page.rows.len);
+    try std.testing.expect(page.rows[0].typed_cells.?.layout == page.rows[1].typed_cells.?.layout);
+    var expected = try @import("../sql/array_text.zig").decode(a, .int64, "[-1:1]={9007199254740993,NULL,2}", .{});
+    defer expected.deinit();
+    for (page.rows, 0..) |row, i| {
+        try std.testing.expectEqualStrings(if (i == 0) "a" else "b", row.id);
+        try std.testing.expectEqual(@as(u64, 7), row.version);
+        try std.testing.expectEqual(9007199254740993 + @as(i64, @intCast(i)), (try row.cell("n")).value.integer);
+        const cell = try row.cell("a");
+        try std.testing.expect(!cell.sql_null and cell.value == .null);
+        var work: @import("../sql/array_value.zig").Budget = .{};
+        try std.testing.expectEqual(std.math.Order.eq, try expected.value.compare((cell.array orelse return error.ExpectedNativeArrayCell).*, &work));
+        const json_null = try row.cell("j");
+        try std.testing.expect(!json_null.sql_null and json_null.value == .null);
+        try std.testing.expect((try row.cell("sql_null")).sql_null);
+    }
 }

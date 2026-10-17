@@ -190,7 +190,7 @@ pub const Projection = struct {
 
     /// The returned directory belongs to the page, not this scan/cursor. Bind
     /// once per page, and reuse across every row regardless of array length.
-    pub fn pageLayout(self: Projection, alloc: std.mem.Allocator) !?catalog.Row.TypedLayout {
+    pub fn pageLayout(self: Projection, alloc: std.mem.Allocator) !?*const catalog.Row.TypedLayout {
         if (!self.has_typed_cells) return null;
         const names = try alloc.alloc([]const u8, self.columns.len);
         for (self.columns, names) |column, *name| name.* = try alloc.dupe(u8, column.name);
@@ -200,7 +200,7 @@ pub const Projection = struct {
     /// Adapt an already parsed native projection. Metadata is page-owned and
     /// payloads borrow that same page's pinned JSON tree. No JSON reparsing or
     /// nested JSONB/string cloning occurs. Legacy scalar-only pages stay cheap.
-    pub fn adaptBorrowed(self: Projection, alloc: std.mem.Allocator, layout: ?catalog.Row.TypedLayout, row: catalog.Row) !catalog.Row {
+    pub fn adaptBorrowed(self: Projection, alloc: std.mem.Allocator, layout: ?*const catalog.Row.TypedLayout, row: catalog.Row) !catalog.Row {
         if (!self.has_typed_cells) return row;
         if (row.typed_cells) |native| {
             var direct = native.layout.names.len == self.columns.len;

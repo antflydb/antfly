@@ -458,7 +458,30 @@ fn releaseGate(gate: *PathGate) void {
 // worker. SQL sessions, cursor IDs, and child handles remain connection-local.
 pub const Owner = struct {
     const MaintenanceKey = struct { table_id: u64, incarnation: u128 };
-    const MaintenanceSchedule = struct { shadow_next: bool = true, live: bool = true };
+    const MaintenanceSchedule = struct {
+        shadow_next: bool = true,
+        live: bool = true,
+        ttl: h.db_mod.types.TTLCleanupStats = .{},
+        last_ttl_error: ?anyerror = null,
+        next_ttl_ns: i96 = 0,
+    };
+    const ttl_counter_fields = .{ "acquisition_count", "runs", "scanned_timestamps", "deleted_docs", "scanned_graph_candidates", "expired_graph_sources", "expired_graph_artifacts", "error_count", "lease_acquire_failures", "lost_leases" };
+
+    fn recordTtlTurn(total: *h.db_mod.types.TTLCleanupStats, before: h.db_mod.types.TTLCleanupStats, after: h.db_mod.types.TTLCleanupStats) void {
+        inline for (ttl_counter_fields) |field| @field(total, field) +|= @field(after, field) -| @field(before, field);
+        total.last_run_ns = @max(total.last_run_ns, after.last_run_ns);
+        total.last_acquired_ms = @max(total.last_acquired_ms, after.last_acquired_ms);
+    }
+
+    /// Native TTL is driven under this owner's gate. Count completed turns at
+    /// that lifetime, rather than losing them when a serving DB view refreshes.
+    /// Configuration and current lease state still come from the live runtime.
+    pub fn overlayTtlStats(self: *Owner, database: *h.db_mod.DB, stats: *h.db_mod.types.TTLCleanupStats) void {
+        const schedule = self.maintenance_schedules.get(.{ .table_id = database.core.identity_namespace.table_id, .incarnation = database.root_incarnation }) orelse return;
+        inline for (ttl_counter_fields) |field| @field(stats, field) = @max(@field(stats, field), @field(schedule.ttl, field));
+        stats.last_run_ns = @max(stats.last_run_ns, schedule.ttl.last_run_ns);
+        stats.last_acquired_ms = @max(stats.last_acquired_ms, schedule.ttl.last_acquired_ms);
+    }
 
     path: []const u8,
     options: api.LiteResolvedOpenOptions,
@@ -472,13 +495,13 @@ pub const Owner = struct {
     // Owner lifetime, rather than DB-runtime lifetime: snapshot refreshes must
     // not reset a table's replay/construction alternation.
     maintenance_schedules: std.AutoHashMapUnmanaged(MaintenanceKey, MaintenanceSchedule) = .empty,
-    next_ttl_ns: i96 = 0,
     wake: std.Io.Event = .unset,
     current: ?*h.Handle = null,
     retired: std.ArrayList(*h.Handle) = .empty,
     maintenance_snapshot: ?*h.Handle = null,
     maintenance_table_cursor: usize = 0,
     maintenance_round_pending: bool = false,
+    maintenance_round_ttl_pending: bool = false,
     maintenance_capture_misses: u8 = 0,
     // Connection-owner lifetime totals, protected by the path gate. They survive
     // foreground runtime refreshes and distinguish conflicts from a moving tip.
@@ -623,11 +646,35 @@ pub const Owner = struct {
         self.wake.set(h.handleLockIo());
     }
 
-    fn hasPendingGeneratedEnrichment(database: *h.db_mod.DB) bool {
+    fn hasPendingReplay(database: *h.db_mod.DB) !bool {
         if (database.hasPendingGraphReplacements()) return true;
-        const runtime = database.enrichment_runtime orelse return false;
-        return database.core.hasGeneratedEnrichmentTargets() and
-            runtime.stats().applied_sequence < database.core.nextEnrichmentSequence();
+        const target = database.core.nextDerivedSequence();
+        const state = h.db_mod.enrichment_state;
+        if (database.enrichment_runtime) |runtime| {
+            const stats = runtime.stats();
+            // Durable retry/notification targets also need reconciliation.
+            // The runtime may know a newer target than this view's cached
+            // journal watermark; ignoring it strands debt across reopen.
+            if (stats.retrying or stats.applied_sequence < @max(target, stats.target_sequence)) return true;
+        } else if (database.core.hasGeneratedEnrichmentTargets()) {
+            const applied = try state.loadAppliedSequence(alloc, database.core.store, "generated");
+            const status = try state.loadRuntimeStatus(alloc, database.core.store, "generated");
+            if (status.retrying or applied < @max(target, status.target_sequence)) return true;
+        }
+        // Producer completion does not prove resolver/promotion completion.
+        // Foreground native views need not own these runtimes, so inspect the
+        // two durable watermarks instead of constructing providers on idle polls.
+        if (database.core.index_manager.resolvers.items.len != 0) {
+            if (database.resolution_runtime) |runtime| {
+                const stats = runtime.stats();
+                if (stats.applied_sequence < @max(target, stats.target_sequence)) return true;
+            } else if (try state.loadAppliedSequence(alloc, database.core.store, "resolution") < target) return true;
+            if (database.promotion_runtime) |runtime| {
+                const stats = runtime.stats();
+                if (stats.applied_sequence < @max(target, stats.target_sequence)) return true;
+            } else if (try state.loadAppliedSequence(alloc, database.core.store, "promotion") < target) return true;
+        }
+        return false;
     }
 
     fn lookupEmbedding(ptr: *anyopaque, a: std.mem.Allocator, key: [32]u8) !?[]f32 {
@@ -849,10 +896,10 @@ pub const Owner = struct {
         try @import("sql_ddl.zig").recover(foreground);
         try @import("tables.zig").loadAvailable(foreground);
         if (self.options.open_mode == .writer) {
-            if (hasPendingGeneratedEnrichment(&foreground.db)) self.maintenance_pending = true;
+            if (try hasPendingReplay(&foreground.db)) self.maintenance_pending = true;
             var tables = foreground.embedded_tables.valueIterator();
             while (tables.next()) |table| {
-                if (hasPendingGeneratedEnrichment(&table.*.db)) self.maintenance_pending = true;
+                if (try hasPendingReplay(&table.*.db)) self.maintenance_pending = true;
             }
         }
         // Prune dropped/recreated namespaces without retaining names or old
@@ -888,13 +935,31 @@ pub const Owner = struct {
         // TTL is a short publication for the selected table, never a drain of
         // every namespace under one file lease.
         const now = std.Io.Clock.awake.now(io).nanoseconds;
-        if (now >= self.next_ttl_ns) {
-            if (database.ttl_runtime) |ttl| try ttl.runOnce();
-            if (self.maintenance_table_cursor == 0) {
+        var ttl_more = false;
+        if (now >= schedule.next_ttl_ns) {
+            // Each namespace owns its cleanup cadence. Failure still consumes
+            // this slot and propagates for authority reconciliation; bounded
+            // successful pages yield briefly without delaying other tables.
+            defer {
                 const config = self.options.ttl_cleanup orelse h.db_mod.ttl_runtime.Config{};
-                self.next_ttl_ns = now + @as(i96, config.interval_ms) * std.time.ns_per_ms;
+                const delay = if (ttl_more) config.page_interval_ms else config.interval_ms;
+                schedule.next_ttl_ns = now + @as(i96, @max(1, delay)) * std.time.ns_per_ms;
+            }
+            if (database.ttl_runtime) |ttl| {
+                const before = ttl.stats();
+                defer recordTtlTurn(&schedule.ttl, before, ttl.stats());
+                ttl.runOnce() catch |err| {
+                    self.publication_stats.maintenance_errors +|= 1;
+                    self.publication_stats.last_maintenance_error = @errorName(err);
+                    if (schedule.last_ttl_error == null or schedule.last_ttl_error.? != @as(anyerror, err)) std.log.warn("native Lite TTL cleanup deferred table={s} err={s}", .{ if (selected) |table| table.name else "default", @errorName(err) });
+                    schedule.last_ttl_error = err;
+                    return err;
+                };
+                schedule.last_ttl_error = null;
+                ttl_more = ttl.needsAnotherPage();
             }
         }
+        self.maintenance_round_ttl_pending = self.maintenance_round_ttl_pending or ttl_more;
         const run_database = self.maintenance_pending;
         var turn_arena = std.heap.ArenaAllocator.init(alloc);
         defer turn_arena.deinit();
@@ -1018,14 +1083,16 @@ pub const Owner = struct {
         // even when its cached replay target looked complete this turn.
         pending = pending or publication.index_inputs_changed;
         self.maintenance_round_pending = self.maintenance_round_pending or pending;
+        const ttl_pending = self.maintenance_round_ttl_pending;
         if (self.maintenance_table_cursor == 0) {
+            self.maintenance_round_ttl_pending = false;
             // Mutations arriving during the detached turn still wake the owner;
             // replay debt is inspected again under the next capture fence.
             self.maintenance_pending = self.maintenance_round_pending;
             self.maintenance_round_pending = false;
         }
         self.collectRetired();
-        return self.maintenance_pending or self.maintenance_table_cursor != 0 or changed;
+        return self.maintenance_pending or self.maintenance_table_cursor != 0 or changed or ttl_pending;
     }
 
     pub fn maintenanceTurnForTest(self: *Owner) !bool {

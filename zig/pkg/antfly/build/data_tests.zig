@@ -274,7 +274,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .root_module = options.data_implementation_module,
         .filters = lib_data_runtime_tests.object.filters,
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
-        .max_rss = lib_data_runtime_tests.object.step.max_rss,
+        .max_rss = @import("runtime_memory.zig").testCompileMaxRss("data-runtime-implementation-tests", b.graph.host.result, target.result, options.data_implementation_module.optimize, lib_data_runtime_tests.object.step.max_rss),
     });
     // These independent broad test closures each exceeded the previous
     // compiler reservation. Keep their compilation serial on bounded hosts.

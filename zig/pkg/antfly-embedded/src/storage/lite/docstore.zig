@@ -1317,6 +1317,37 @@ pub const WriterAdmission = struct {
     leave: *const fn (*anyopaque) void,
 };
 
+/// Store publication can include durable I/O. Reserve a turn before waiting:
+/// a continuous group-commit writer must not barge ahead of queued vacuum,
+/// reader-release or maintenance work each time it drops the owner mutex.
+/// Keep the existing bounded-spin/yield policy without allocating wait nodes
+/// or depending on a foreign executor's futex namespace.
+const PublicationMutex = struct {
+    next_ticket: std.atomic.Value(u64) = .init(0),
+    serving_ticket: std.atomic.Value(u64) = .init(0),
+
+    pub fn lock(self: *@This()) void {
+        const Turn = struct {
+            serving: *std.atomic.Value(u64),
+            ticket: u64,
+            pub fn tryLock(turn: *@This()) bool {
+                return turn.serving.load(.acquire) == turn.ticket;
+            }
+        };
+        var turn = Turn{ .serving = &self.serving_ticket, .ticket = self.next_ticket.fetchAdd(1, .monotonic) };
+        platform_sync.lockYielding(&turn);
+    }
+
+    pub fn tryLock(self: *@This()) bool {
+        const serving = self.serving_ticket.load(.acquire);
+        return self.next_ticket.cmpxchgStrong(serving, serving +% 1, .monotonic, .monotonic) == null;
+    }
+
+    pub fn unlock(self: *@This()) void {
+        _ = self.serving_ticket.fetchAdd(1, .release);
+    }
+};
+
 pub const Store = struct {
     score_cache_owner: u64 = 0,
     allocator: Allocator,
@@ -1372,7 +1403,7 @@ pub const Store = struct {
     read_only: bool = false,
     /// Guarded by mutex. Secret publication failures fence every adapter until reopen.
     secret_store_uncertain: bool = false,
-    mutex: std.atomic.Mutex = .unlocked,
+    mutex: PublicationMutex = .{},
     writer_mutex: std.Io.Mutex = .init,
     writer_ready: std.Io.Condition = .init,
     generation_lock: std.Io.RwLock = .init,
@@ -4524,7 +4555,7 @@ fn truncateReplayLane(store: *Store, prefix: []const u8, yielding: bool, kind: u
 }
 
 fn lockStore(store: *Store) void {
-    platform_sync.lockYielding(&store.mutex);
+    store.mutex.lock();
 }
 
 fn testPath(allocator: Allocator, tmp: std.testing.TmpDir, name: []const u8) ![]u8 {
@@ -5536,6 +5567,56 @@ test "lite failed commit group discards every root and allows a clean retry" {
         try std.testing.expectEqualStrings("unpublished", try read.get("doc"));
     }
     try std.testing.expect((try store.checkWithCancel(null)).valid);
+}
+
+test "lite publication mutex reserves queued owners before a writer can reacquire" {
+    if (@import("builtin").single_threaded) return error.SkipZigTest;
+    const Waiter = struct {
+        mutex: *PublicationMutex,
+        entered: std.atomic.Value(bool) = .init(false),
+        release: std.atomic.Value(bool) = .init(false),
+        fn run(self: *@This()) void {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+            self.entered.store(true, .release);
+            while (!self.release.load(.acquire)) @import("antfly_platform").time.yieldNow();
+        }
+    };
+    const io = std.testing.io;
+    for ([_]u64{ 0, std.math.maxInt(u64) }) |seed| {
+        var mutex: PublicationMutex = .{};
+        mutex.next_ticket.store(seed, .monotonic);
+        mutex.serving_ticket.store(seed, .monotonic);
+        mutex.lock();
+        var held = true;
+        var waiter = Waiter{ .mutex = &mutex };
+        {
+            const thread = try std.Thread.spawn(.{}, Waiter.run, .{&waiter});
+            defer {
+                if (held) mutex.unlock();
+                waiter.release.store(true, .release);
+                thread.join();
+            }
+            const deadline = std.Io.Clock.awake.now(io).addDuration(.fromSeconds(5));
+            // Observe actual queue admission rather than relying on a sleep
+            // or a signal emitted before the waiter reaches the mutex.
+            while (mutex.next_ticket.load(.acquire) != seed +% 2) {
+                if (std.Io.Clock.awake.now(io).nanoseconds >= deadline.nanoseconds) return error.TestUnexpectedResult;
+                @import("antfly_platform").time.yieldNow();
+            }
+            mutex.unlock();
+            held = false;
+            const barged = mutex.tryLock();
+            if (barged) mutex.unlock();
+            try std.testing.expect(!barged);
+            while (!waiter.entered.load(.acquire)) {
+                if (std.Io.Clock.awake.now(io).nanoseconds >= deadline.nanoseconds) return error.TestUnexpectedResult;
+                @import("antfly_platform").time.yieldNow();
+            }
+        }
+        try std.testing.expect(mutex.tryLock());
+        mutex.unlock();
+    }
 }
 
 test "lite online vacuum publishes while group-commit mutations keep landing" {

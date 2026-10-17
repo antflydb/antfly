@@ -1531,6 +1531,33 @@ are 20/14 GiB, each including at least 25% headroom and fitting that budget
 alone. The policy never lowers an authored claim and leaves other test roots
 and build modes unchanged.
 
+Native Apple Silicon CPU Debug qualification on 2026-10-16 (Zig 0.17.0,
+macOS SDK 26.3.1) measured public-api-parity at 18,029,035,520 bytes,
+exceeding its 15 GiB authored reservation. Its native Darwin Debug floor
+is now 22 GiB, retaining more than 25% headroom. The floor never lowers an
+authored claim and does not apply to cross-host builds, release modes or
+other test objects. A 30 GiB local compiler budget can still overlap it
+with smaller work, but cannot admit another 15 GiB API compile alongside it.
+The same qualification measured the API document identity/restore root at
+14,373,978,112 bytes against its former 12 GiB claim. Its native Darwin Debug
+floor is 18 GiB with the same profile guards and headroom. The object now has
+the explicit name `api-docid-tests` for attribution and can be qualified via
+`zig build antfly-api-docid-test` without rebuilding unrelated unit roots.
+The API auth and derived-coverage roots measured 13,895,155,712 and
+14,097,039,360 bytes. Both receive a 17 GiB native Darwin Debug floor under
+the same guards; they retain their existing focused targets and now use
+explicit artifact names. Aggregate ownership exclusions follow the renamed
+artifacts, preserving test selection and coverage.
+The broad Raft fixture root also measured 14,420,606,976 bytes against its
+former 12 GiB claim. Its `raft-unit-tests` artifact uses a 17 GiB native Darwin
+Debug floor, retaining the existing `antfly-raft-test` target and ownership selection.
+The shared API table-write implementation test object measured 13,252,476,928
+bytes against its former 12 GiB claim. Its native Darwin Debug floor is 16 GiB;
+its existing name and all other profiles retain their scheduling behavior.
+The encrypted secret-backend fixture measured 15,418,605,568 bytes against its
+former 13 GiB claim. Its explicitly named `secret-backends-tests` artifact uses
+a 19 GiB native Darwin Debug floor and retains the existing focused target.
+
 The production smoke reproduces Lite table creation returning HTTP 202 with
 committed repair debt. Erased storage read/probe/batch and namespace handles
 had not all adopted the existing callback error-domain bridge. A raw Zig
@@ -1565,3 +1592,12 @@ file I/O and returned writer/reader dispatch. The ordinal suite passes 2/2,
 the shard audit passes, and all 28 runtime error-identity tests pass.
 The restored native-query-reuse and runtime-callback tests also execute and
 pass (2/2), rather than merely being accepted by the discovery audit.
+
+The same native Darwin Debug full qualification measured hosted truncate/FK
+recovery at 12,111,249,408 bytes and the data runtime implementation test object
+at 13,980,401,664 bytes. Their native Debug reservations are 15 and 17 GiB,
+respectively, retaining at least 25% headroom; other build profiles keep their
+authored reservations.
+The sibling self-FK and initial-FK recovery roots measured 11,942,445,056
+and 11,940,200,448 bytes, respectively; each native Darwin Debug claim is
+14 GiB with the same headroom policy.
