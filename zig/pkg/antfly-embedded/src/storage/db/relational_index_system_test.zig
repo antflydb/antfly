@@ -2135,6 +2135,106 @@ test "relational index system Raft owner controls commit authentic phase cuts at
         }
         try db.core.store.putBatch(&.{ .{ .key = source.head_key, .value = saved_head }, .{ .key = source.consumption_key, .value = saved_record } }, &.{});
     }
+    const claim_store = @import("relational_index_private_claims.zig");
+    const Integrity = @import("relational_integrity_contract.zig");
+    const Claims = struct {
+        fn prepare(database: *db_mod.DB, command: owner_control.ClaimCommand) !owner_control.PreparedClaims {
+            var read = try database.core.store.beginReadTxn();
+            defer read.abort();
+            return owner_control.PreparedClaims.init(alloc, &read, command);
+        }
+        fn allocations(a: std.mem.Allocator, database: *db_mod.DB, command: owner_control.ClaimCommand) !void {
+            var read = try database.core.store.beginReadTxn();
+            defer read.abort();
+            var prepared = try owner_control.PreparedClaims.init(a, &read, command);
+            defer prepared.deinit();
+        }
+    };
+    const first_claim: Integrity.Claim = .{ .tuple = first.command.candidates[0].unique_tuple.?, .parent_table = "usage_records", .parent_key = "a", .schema_version = binding.physical_candidate.schema_version };
+    var target = try Claims.prepare(&db, .{ .binding = reserved_binding, .claims = &.{first_claim} });
+    defer target.deinit();
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(alloc, Claims.allocations, .{ &db, target.command });
+    try std.testing.expectError(error.InvalidControlReceiptPosition, (owner_control.Effect{ .claims = target.command }).validate());
+    try std.testing.expectError(error.InvalidControlReceiptPosition, target.preparePayload());
+    try std.testing.expectError(error.PrivateIndexOwnerJobChanged, db.applyCommittedRaftIndexClaims(&target, 99, .{ .term = 7, .index = 80 }));
+    target.context.deadline_ns = 0;
+    try std.testing.expectError(error.DeadlineExceeded, db.applyCommittedRaftIndexClaims(&target, 11, .{ .term = 7, .index = 80 }));
+    target.context.deadline_ns = null;
+    {
+        var txn = try db.core.store.beginWriteTxn();
+        defer txn.abort();
+        const ExcludedOwner = struct {
+            lower: [33]u8,
+            pub fn byteRange(self: *const @This()) @import("types.zig").ByteRange {
+                return .{ .start = &self.lower, .end = "" };
+            }
+        };
+        var excluded: ExcludedOwner = undefined;
+        @memcpy(excluded.lower[0..32], &target.batch.entries[0].address.routing);
+        excluded.lower[32] = 0;
+        try std.testing.expectError(error.KeyOutOfRange, target.stageRaft(&excluded, &txn, 11, .{ .term = 7, .index = 80 }));
+        try target.stageRaft(db.core, &txn, 11, .{ .term = 7, .index = 80 });
+        _ = try txn.get(&target.batch.entries[0].address.claimKey());
+    }
+    {
+        var read = try db.core.store.beginReadTxn();
+        defer read.abort();
+        try std.testing.expectError(error.NotFound, read.get(&target.batch.entries[0].address.claimKey()));
+        try std.testing.expectError(error.NotFound, read.get(&claim_store.inventoryKey(target.batch.entries[0].address)));
+        try std.testing.expectEqual(@as(u64, 70), (try receipts.readOrderedApplyReceiptTxn(&read)).?.index);
+    }
+    try db.applyCommittedRaftIndexClaims(&target, 11, .{ .term = 7, .index = 80 });
+    const inventory_key = claim_store.inventoryKey(target.batch.entries[0].address);
+    const original_inventory = try db.core.store.get(alloc, &inventory_key);
+    defer alloc.free(original_inventory);
+    try std.testing.expectEqual(@as(usize, 48), original_inventory.len);
+    try std.testing.expectEqual(@as(u64, 7), std.mem.readInt(u64, original_inventory[0..8], .little));
+    try std.testing.expectEqual(@as(u64, 80), std.mem.readInt(u64, original_inventory[8..16], .little));
+    db.close();
+    db_live = false;
+    db = try db_mod.DB.open(alloc, directory.path(), options);
+    db_live = true;
+    var target_retry = try Claims.prepare(&db, target.command);
+    defer target_retry.deinit();
+    try std.testing.expectEqualDeep(@import("receipt_position.zig").Position{ .raft = .{ .term = 7, .index = 80 } }, target_retry.batch.entries[0].position.?);
+    try db.applyCommittedRaftIndexClaims(&target_retry, 11, .{ .term = 8, .index = 90 });
+    const second_claim: Integrity.Claim = .{ .tuple = "remote-source-tuple", .parent_table = "usage_records", .parent_key = "remote:b", .schema_version = binding.physical_candidate.schema_version };
+    var second_target = try Claims.prepare(&db, .{ .binding = reserved_binding, .claims = &.{second_claim} });
+    defer second_target.deinit();
+    try db.applyCommittedRaftIndexClaims(&second_target, 11, .{ .term = 8, .index = 95 });
+    var regrouped = try Claims.prepare(&db, .{ .binding = reserved_binding, .claims = &.{ second_claim, first_claim, first_claim } });
+    defer regrouped.deinit();
+    {
+        var txn = try db.core.store.beginWriteTxn();
+        defer txn.abort();
+        const outcome = try regrouped.batch.stageAt(&txn, .{ .raft = .{ .term = 9, .index = 100 } });
+        try std.testing.expect(outcome.duplicate);
+        try std.testing.expectEqual(@as(usize, 0), outcome.claims_added);
+        try std.testing.expectEqualDeep(@import("receipt_position.zig").Position{ .raft = .{ .term = 8, .index = 95 } }, outcome.position);
+    }
+    try db.applyCommittedRaftIndexClaims(&regrouped, 11, .{ .term = 9, .index = 100 });
+    var conflicting = first_claim;
+    conflicting.parent_key = "other-owner";
+    try std.testing.expectError(error.UniqueConstraintViolation, Claims.prepare(&db, .{ .binding = reserved_binding, .claims = &.{conflicting} }));
+    var raced = second_claim;
+    raced.tuple = "raced-source-tuple";
+    var winner = try Claims.prepare(&db, .{ .binding = reserved_binding, .claims = &.{raced} });
+    defer winner.deinit();
+    raced.parent_key = "loser";
+    var loser = try Claims.prepare(&db, .{ .binding = reserved_binding, .claims = &.{raced} });
+    defer loser.deinit();
+    try db.applyCommittedRaftIndexClaims(&winner, 11, .{ .term = 9, .index = 110 });
+    try std.testing.expectError(error.UniqueConstraintViolation, db.applyCommittedRaftIndexClaims(&loser, 11, .{ .term = 9, .index = 115 }));
+    try std.testing.expectEqual(@as(u64, 110), (try db.orderedApplyReceipt()).?.index);
+    {
+        var read = try db.core.store.beginReadTxn();
+        defer read.abort();
+        try std.testing.expectEqualSlices(u8, original_inventory, try read.get(&inventory_key));
+        const view = try claim_store.TransferView.init(&read);
+        const address = target.batch.entries[0].address;
+        try view.validateCompanion(&read, try Integrity.parseKey(&address.claimKey()), Integrity.hash(try read.get(&address.claimKey())));
+        try std.testing.expectEqual(@as(u64, 0), (try @import("../source_authority.zig").load(&read)).?.sequence);
+    }
     try @import("antfly_server_test_sources").local_test_sources.storage_relational_index_raft_apply.run(admission.command);
 }
 

@@ -40,16 +40,25 @@ authority: batch deletion, debt accounting, the original producer cut, the
 consumption cut and the apply watermark commit together. Empty-backlog producer
 resumption recovers its previous header from that journal. Recovery distinguishes
 producer order from later consumption order when other pages are already queued.
-Native proof adapters still reject Raft records. This does not yet wire replicated
+Target claim pairs and their immutable creation cuts also commit with the apply
+watermark. Native inventory values remain 40 bytes; Raft values use 48 bytes,
+retaining both term and index without repeating the binding per member. Exact
+retries and regrouping recover the maximum original member cut, not the current
+apply position, without growing a per-batch ledger. Range ownership and duplicate
+postimages are rechecked under apply exclusion. Native proof adapters still
+reject Raft records. This does not yet wire replicated
 claim delivery, validation, installation, cancellation or publication release
 through the public receiver.
 
 Verification: `zig build antfly-relational-index-system-test -Doptimize=Debug -j1`
-passes 288 storage tests and one server test, with no skips or leaks. The Raft
+passes 289 storage tests and one server test, with no skips or leaks. The Raft
 regression covers aborted apply, exact replay, retry cuts, physical membership,
 wrong-authority corruption, allocation failures and cold reopens. Consumption
 controls additionally cover expired apply, future cuts with valid checksums,
 retained-cut retry and resumed production after full and partial backlog drain.
+Target controls cover compact authority-bound encoding, committed cut bounds,
+actual range checks, aborted claim pairs, expired apply, conflicting prepared
+writers, cold retry, regrouping and unchanged original inventory bytes.
 
 ## Document conflict delivery (2026-10-17)
 

@@ -758,7 +758,7 @@ pub const max_bytes = 1024 * 1024;
 const key_len = prefix.len + 16 + 32 + 32;
 // AFC1 fixed fields/checksum, both paired keys, and the provenance value.
 // Count the actual bytes GC must carry, not just request string lengths.
-pub const claim_entry_overhead = 76 + key_len + integrity.key_len + inventory_value_len;
+pub const claim_entry_overhead = 76 + key_len + integrity.key_len + max_inventory_value_len;
 
 fn hash(bytes: []const u8) integrity.Digest {
     return integrity.hash(bytes);
@@ -849,6 +849,7 @@ const Entry = struct {
     value: []const u8,
     expected: ?[]const u8,
     sequence: u64 = 0,
+    position: ?Position = null,
 };
 
 fn bindingDigest(binding: jobs.Binding) !integrity.Digest {
@@ -861,6 +862,14 @@ fn bindingDigest(binding: jobs.Binding) !integrity.Digest {
 // registration already owns binding identity; duplicating that identity and a
 // claim hash as plaintext in every row adds bytes without additional integrity.
 pub const inventory_value_len = 40;
+pub const max_inventory_value_len = 48;
+
+fn positionNumber(position: Position) u64 {
+    return switch (position) {
+        .native => |cut| cut.sequence,
+        .raft => |cut| cut.index,
+    };
+}
 
 fn inventoryChecksum(key: []const u8, binding_digest: integrity.Digest, value_digest: integrity.Digest, cut: []const u8) integrity.Digest {
     var state = std.crypto.hash.Blake3.init(.{});
@@ -874,29 +883,86 @@ fn inventoryChecksum(key: []const u8, binding_digest: integrity.Digest, value_di
     return result;
 }
 
-fn encodeInventory(key: []const u8, binding_digest: integrity.Digest, value_digest: integrity.Digest, sequence: u64) [inventory_value_len]u8 {
-    var result: [inventory_value_len]u8 = undefined;
-    std.mem.writeInt(u64, result[0..8], sequence, .little);
-    @memcpy(result[8..], &inventoryChecksum(key, binding_digest, value_digest, result[0..8]));
-    return result;
+fn encodeInventory(key: []const u8, binding_digest: integrity.Digest, value_digest: integrity.Digest, position: Position, buffer: *[max_inventory_value_len]u8) ![]const u8 {
+    try position.validate();
+    const cut_len: usize = if (position == .native) 8 else 16;
+    if (position == .native) {
+        std.mem.writeInt(u64, buffer[0..8], position.native.sequence, .little);
+    } else {
+        std.mem.writeInt(u64, buffer[0..8], position.raft.term, .little);
+        std.mem.writeInt(u64, buffer[8..16], position.raft.index, .little);
+    }
+    @memcpy(buffer[cut_len..][0..32], &inventoryChecksum(key, binding_digest, value_digest, buffer[0..cut_len]));
+    return buffer[0 .. cut_len + 32];
 }
 
 fn decodeInventory(key: []const u8, value: []const u8, provenance: Provenance, value_digest: integrity.Digest) !u64 {
+    return positionNumber(try decodeInventoryPosition(key, value, provenance, value_digest));
+}
+
+fn decodeInventoryPosition(key: []const u8, value: []const u8, provenance: Provenance, value_digest: integrity.Digest) !Position {
     _ = try addressFromInventory(key);
-    if (value.len != inventory_value_len or
-        !std.mem.eql(u8, value[8..], &inventoryChecksum(key, provenance.binding_digest, value_digest, value[0..8]))) return error.InvalidPrivateIndexClaimInventory;
-    const sequence = std.mem.readInt(u64, value[0..8], .little);
+    const cut_len: usize = if (provenance.reserved_cut == .native) 8 else 16;
+    if (value.len != cut_len + 32 or
+        !std.mem.eql(u8, value[cut_len..], &inventoryChecksum(key, provenance.binding_digest, value_digest, value[0..cut_len]))) return error.InvalidPrivateIndexClaimInventory;
+    const position: Position = if (provenance.reserved_cut == .native)
+        .{ .native = .{ .namespace = provenance.reserved_cut.native.namespace, .sequence = std.mem.readInt(u64, value[0..8], .little) } }
+    else
+        .{ .raft = .{ .term = std.mem.readInt(u64, value[0..8], .little), .index = std.mem.readInt(u64, value[8..16], .little) } };
+    const sequence = positionNumber(position);
     if (sequence <= provenance.reserved or sequence > provenance.maximum) return error.InvalidPrivateIndexClaimInventory;
-    return sequence;
+    if (position.term() < provenance.reserved_cut.term() or position.term() > provenance.maximum_cut.term() or
+        (sequence == provenance.maximum and position.term() != provenance.maximum_cut.term())) return error.InvalidPrivateIndexClaimInventory;
+    return position;
+}
+
+test "relational index system compact claim cuts preserve authority and committed bounds" {
+    const binding_digest: integrity.Digest = @splat(2);
+    const value_digest: integrity.Digest = @splat(3);
+    const address = try integrity.Address.init(@splat(1), "opaque-tuple");
+    const key = inventoryKey(address);
+    const ns: @import("doc_identity_namespace.zig").Namespace = .{ .table_id = 1, .shard_id = 2, .range_id = 3 };
+    const native_provenance: Provenance = .{ .binding_digest = binding_digest, .reserved = 3, .maximum = 10, .reserved_cut = .{ .native = .{ .namespace = ns, .sequence = 3 } }, .maximum_cut = .{ .native = .{ .namespace = ns, .sequence = 10 } } };
+    const raft_provenance: Provenance = .{ .binding_digest = binding_digest, .reserved = 30, .maximum = 80, .reserved_cut = .{ .raft = .{ .term = 2, .index = 30 } }, .maximum_cut = .{ .raft = .{ .term = 4, .index = 80 } } };
+    var storage: [max_inventory_value_len]u8 = undefined;
+    const native: Position = .{ .native = .{ .namespace = ns, .sequence = 7 } };
+    const native_bytes = try encodeInventory(&key, binding_digest, value_digest, native, &storage);
+    try std.testing.expectEqual(inventory_value_len, native_bytes.len);
+    try std.testing.expectEqualDeep(native, try decodeInventoryPosition(&key, native_bytes, native_provenance, value_digest));
+    try std.testing.expectError(error.InvalidPrivateIndexClaimInventory, decodeInventoryPosition(&key, native_bytes, raft_provenance, value_digest));
+    const raft: Position = .{ .raft = .{ .term = 3, .index = 50 } };
+    const raft_bytes = try encodeInventory(&key, binding_digest, value_digest, raft, &storage);
+    try std.testing.expectEqual(max_inventory_value_len, raft_bytes.len);
+    try std.testing.expectEqualDeep(raft, try decodeInventoryPosition(&key, raft_bytes, raft_provenance, value_digest));
+    try std.testing.expectError(error.InvalidPrivateIndexClaimInventory, decodeInventoryPosition(&key, raft_bytes, native_provenance, value_digest));
+    storage[storage.len - 1] ^= 1;
+    try std.testing.expectError(error.InvalidPrivateIndexClaimInventory, decodeInventoryPosition(&key, &storage, raft_provenance, value_digest));
+    for ([_]Position{
+        .{ .raft = .{ .term = 4, .index = 81 } },
+        .{ .raft = .{ .term = 1, .index = 50 } },
+        .{ .raft = .{ .term = 3, .index = 80 } },
+        .{ .raft = .{ .term = 2, .index = 30 } },
+    }) |uncommitted| {
+        const bytes = try encodeInventory(&key, binding_digest, value_digest, uncommitted, &storage);
+        try std.testing.expectError(error.InvalidPrivateIndexClaimInventory, decodeInventoryPosition(&key, bytes, raft_provenance, value_digest));
+    }
 }
 
 const Provenance = struct {
     binding_digest: integrity.Digest,
     reserved: u64,
     maximum: u64,
+    reserved_cut: Position,
+    maximum_cut: Position,
 
     fn init(txn: anytype, binding: jobs.Binding) !Provenance {
         const namespace = @import("online_source_contract.zig").namespaceBytes(binding.fence.namespace);
+        if (binding.authority == .raft) {
+            _ = try authority.require(txn, .raft, namespace);
+            const reserved = (try @import("relational_index_raft_control.zig").receipt(txn, binding, .reserved)) orelse return error.InvalidControlReceiptPosition;
+            const applied = (try @import("apply_receipts.zig").readOrderedApplyReceiptTxn(txn)) orelse return error.InvalidControlReceiptPosition;
+            return .{ .binding_digest = try bindingDigest(binding), .reserved = reserved.position.raft.index, .maximum = applied.index, .reserved_cut = reserved.position, .maximum_cut = .{ .raft = .{ .term = applied.term, .index = applied.index } } };
+        }
         const current = try authority.require(txn, .native, namespace);
         const reserved = (try jobs.nativeEffectPosition(txn, binding, .reserved)) orelse return error.InvalidPrivateIndexNativeReceipt;
         var maximum = current.sequence;
@@ -910,7 +976,7 @@ const Provenance = struct {
             }
         }
         if (maximum < reserved.sequence) return error.InvalidPrivateIndexClaimInventory;
-        return .{ .binding_digest = try bindingDigest(binding), .reserved = reserved.sequence, .maximum = maximum };
+        return .{ .binding_digest = try bindingDigest(binding), .reserved = reserved.sequence, .maximum = maximum, .reserved_cut = .{ .native = reserved }, .maximum_cut = .{ .native = .{ .namespace = binding.fence.namespace, .sequence = maximum } } };
     }
 };
 
@@ -930,7 +996,7 @@ pub const Prepared = struct {
     }
 
     pub fn init(alloc: Allocator, txn: anytype, binding: jobs.Binding, claims: []const integrity.Claim) !Prepared {
-        if (claims.len == 0 or claims.len > max_claims or binding.authority != .native) return error.InvalidPrivateIndexClaimInventory;
+        if (claims.len == 0 or claims.len > max_claims) return error.InvalidPrivateIndexClaimInventory;
         var bytes: usize = 0;
         for (claims) |claim| {
             if (claim.state != .live or claim.schema_version != binding.physical_candidate.schema_version) return error.InvalidPrivateIndexClaimInventory;
@@ -964,8 +1030,8 @@ pub const Prepared = struct {
                 if (!std.mem.eql(u8, raw, value)) return error.UniqueConstraintViolation;
                 break :blk value;
             } else null;
-            const sequence = try checkInventory(txn, address, expected, provenance);
-            try entries.append(owned, .{ .address = address, .value = value, .expected = expected, .sequence = sequence });
+            const position = try checkInventoryPosition(txn, address, expected, provenance);
+            try entries.append(owned, .{ .address = address, .value = value, .expected = expected, .sequence = if (position) |cut| positionNumber(cut) else 0, .position = position });
         }
         // Stable transport order, independent of request order/coalescing.
         std.mem.sort(Entry, entries.items, {}, struct {
@@ -982,25 +1048,36 @@ pub const Prepared = struct {
     /// change. Retries and regrouping therefore add no metadata and recover an
     /// exact cut without a per-batch ledger or a global-clock approximation.
     pub fn stageOrdered(self: *const Prepared, txn: anytype, replay: ?Native) !OrderedOutcome {
+        if (self.binding.authority != .native) return error.InvalidControlReceiptPosition;
+        const result = try self.stageAt(txn, if (replay) |cut| .{ .native = cut } else null);
+        return .{ .position = result.position.native, .duplicate = result.duplicate, .claims_added = result.claims_added };
+    }
+
+    pub fn stageAt(self: *const Prepared, txn: anytype, replay: ?Position) !struct { position: Position, duplicate: bool, claims_added: usize } {
+        if (self.binding.authority == .raft and replay == null) return error.InvalidControlReceiptPosition;
         try jobs.requireReserved(txn, self.binding);
         const allocation = try requireRegistered(txn, self.binding);
         const namespace = @import("online_source_contract.zig").namespaceBytes(self.binding.fence.namespace);
-        const current = try authority.require(txn, .native, namespace);
+        const current = try authority.require(txn, if (self.binding.authority == .native) .native else .raft, namespace);
         const provenance = try Provenance.init(txn, self.binding);
         if (replay) |position| {
             try position.validate();
-            if (!position.namespace.eql(self.binding.fence.namespace)) return error.IdentityNamespaceMismatch;
+            try position.requireNamespace(self.binding.fence.namespace);
+            if ((position == .native) != (self.binding.authority == .native)) return error.InvalidControlReceiptPosition;
         }
         var changed: usize = 0;
-        var maximum: u64 = 0;
+        var maximum: ?Position = null;
         for (self.entries) |entry| {
             if (!std.mem.eql(u8, &entry.address.generation, &allocation.generation)) return error.InvalidPrivateIndexClaimInventory;
             const actual = try optional(txn, &entry.address.claimKey());
             if (actual) |value| {
                 if (!std.mem.eql(u8, value, entry.value)) return error.UniqueConstraintViolation;
-                const sequence = try checkInventory(txn, entry.address, entry.value, provenance);
-                if (entry.expected != null and sequence != entry.sequence) return error.VersionConflict;
-                maximum = @max(maximum, sequence);
+                const position = (try checkInventoryPosition(txn, entry.address, entry.value, provenance)).?;
+                if (entry.expected != null and !std.meta.eql(position, entry.position.?)) return error.VersionConflict;
+                if (maximum) |cut| {
+                    if (positionNumber(position) == positionNumber(cut) and !std.meta.eql(position, cut)) return error.InvalidPrivateIndexClaimInventory;
+                }
+                if (maximum == null or positionNumber(position) > positionNumber(maximum.?)) maximum = position;
             } else {
                 if (entry.expected != null) return error.VersionConflict;
                 _ = try checkInventory(txn, entry.address, null, provenance);
@@ -1008,21 +1085,28 @@ pub const Prepared = struct {
             }
         }
         if (changed == 0) {
-            if (replay) |position| if (position.sequence != maximum) return error.InvalidPrivateIndexClaimReceipt;
-            return .{ .position = .{ .namespace = self.binding.fence.namespace, .sequence = maximum }, .duplicate = true, .claims_added = 0 };
+            const cut = maximum orelse return error.InvalidPrivateIndexClaimInventory;
+            if (replay) |position| {
+                if (position == .native and !std.meta.eql(position, cut)) return error.InvalidPrivateIndexClaimReceipt;
+                if (positionNumber(position) < positionNumber(cut) or position.term() < cut.term() or
+                    (positionNumber(position) == positionNumber(cut) and position.term() != cut.term())) return error.InvalidControlReceiptPosition;
+            }
+            return .{ .position = cut, .duplicate = true, .claims_added = 0 };
         }
         if (try optional(txn, &InventoryValidation.key(self.binding)) != null) return error.PrivateIndexTargetSealed;
-        const sequence = std.math.add(u64, current.sequence, 1) catch return error.OnlineSourceCorrupt;
-        if (replay) |position| if (position.sequence != sequence) return error.OnlineSourceScopeChanged;
+        const position: Position = if (self.binding.authority == .raft) replay.? else .{ .native = .{ .namespace = self.binding.fence.namespace, .sequence = std.math.add(u64, current.sequence, 1) catch return error.OnlineSourceCorrupt } };
+        if (replay) |cut| if (!std.meta.eql(cut, position)) return error.OnlineSourceScopeChanged;
+        if (position == .raft and (position.raft.index <= provenance.maximum or position.raft.term < provenance.maximum_cut.raft.term)) return error.InvalidControlReceiptPosition;
         try txn.retained.bindPrivateClaims(allocation.generation, prefix);
         for (self.entries) |entry| {
             if (try optional(txn, &entry.address.claimKey()) != null) continue;
             const key = inventoryKey(entry.address);
             try txn.put(&entry.address.claimKey(), entry.value);
-            try txn.put(&key, &encodeInventory(&key, provenance.binding_digest, hash(entry.value), sequence));
+            var inventory_bytes: [max_inventory_value_len]u8 = undefined;
+            try txn.put(&key, try encodeInventory(&key, provenance.binding_digest, hash(entry.value), position, &inventory_bytes));
         }
-        _ = try authority.advance(txn, namespace, sequence);
-        return .{ .position = .{ .namespace = self.binding.fence.namespace, .sequence = sequence }, .duplicate = false, .claims_added = changed };
+        if (position == .native) _ = try authority.advance(txn, namespace, position.native.sequence);
+        return .{ .position = position, .duplicate = false, .claims_added = changed };
     }
 };
 
@@ -1031,11 +1115,15 @@ fn optionalEqual(a: ?[]const u8, b: ?[]const u8) bool {
 }
 
 fn checkInventory(txn: anytype, address: integrity.Address, expected: ?[]const u8, provenance: Provenance) !u64 {
+    return if (try checkInventoryPosition(txn, address, expected, provenance)) |position| positionNumber(position) else 0;
+}
+
+fn checkInventoryPosition(txn: anytype, address: integrity.Address, expected: ?[]const u8, provenance: Provenance) !?Position {
     const actual = try optional(txn, &inventoryKey(address));
     if (expected) |value| {
-        return decodeInventory(&inventoryKey(address), actual orelse return error.InvalidPrivateIndexClaimInventory, provenance, hash(value));
+        return try decodeInventoryPosition(&inventoryKey(address), actual orelse return error.InvalidPrivateIndexClaimInventory, provenance, hash(value));
     } else if (actual != null) return error.InvalidPrivateIndexClaimInventory;
-    return 0;
+    return null;
 }
 
 /// Durable, bounded claim-inventory verification. This freezes NEW claim
@@ -1509,7 +1597,7 @@ pub const TransferView = struct {
     pub fn init(txn: anytype) !TransferView {
         const binding = (try jobs.load(txn)) orelse return .{};
         if (binding.phase != .reserved) return .{};
-        return .{ .generation = (try requireRegistered(txn, binding)).generation, .provenance = if (binding.authority == .native) try Provenance.init(txn, binding) else null };
+        return .{ .generation = (try requireRegistered(txn, binding)).generation, .provenance = try Provenance.init(txn, binding) };
     }
 
     pub fn isPrivate(self: TransferView, generation: integrity.Generation) bool {

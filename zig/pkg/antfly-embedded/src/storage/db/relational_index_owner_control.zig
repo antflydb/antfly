@@ -225,7 +225,7 @@ pub const ClaimCommand = struct {
 
     pub fn validate(self: ClaimCommand) !void {
         _ = try self.binding.encode();
-        if (self.binding.authority != .native or self.binding.phase != .reserved) return error.InvalidPrivateIndexClaimInventory;
+        if (self.binding.phase != .reserved) return error.InvalidPrivateIndexClaimInventory;
         try (BoundedClaims{ .items = self.claims }).validate();
         for (self.claims) |claim| {
             if (claim.schema_version != self.binding.physical_candidate.schema_version or
@@ -327,7 +327,10 @@ pub const Effect = union(enum) {
     pub fn validate(self: Effect) !void {
         switch (self) {
             .control, .cancel_control => |value| try value.validate(),
-            .claims => |value| try value.validate(),
+            .claims => |value| {
+                try value.validate();
+                if (value.binding.authority != .native) return error.InvalidControlReceiptPosition;
+            },
             .consume => |value| {
                 try value.validate();
                 if (value.binding.authority != .native) return error.InvalidControlReceiptPosition;
@@ -470,7 +473,7 @@ pub const ClaimOutcome = struct {
         const actual = self.binding.encode() catch return error.InvalidPrivateIndexClaimReceipt;
         const expected = try command.binding.encode();
         self.position.validate() catch return error.InvalidPrivateIndexClaimReceipt;
-        if (!std.mem.eql(u8, &actual, &expected) or
+        if (command.binding.authority != .native or !std.mem.eql(u8, &actual, &expected) or
             !std.mem.eql(u8, &self.claims_digest, &expected_set.digest) or
             !self.position.namespace.eql(command.binding.fence.namespace) or
             self.claims_added > expected_set.count or
@@ -609,6 +612,7 @@ pub const PreparedClaims = struct {
     claims_digest: integrity.Digest,
     payload: ?[]u8 = null,
     prefix_len: usize = 0,
+    context: RequestContext = .{},
 
     pub fn init(alloc: Allocator, txn: anytype, command: ClaimCommand) !PreparedClaims {
         try command.validate();
@@ -625,6 +629,7 @@ pub const PreparedClaims = struct {
         self.* = undefined;
     }
     pub fn validate(self: *const PreparedClaims) !void {
+        try self.context.ensureActive();
         try self.command.validate();
     }
     pub fn namespace(self: *const PreparedClaims) @FieldType(Native, "namespace") {
@@ -637,17 +642,29 @@ pub const PreparedClaims = struct {
         return .{ .binding = self.command.binding, .claims_digest = self.claims_digest, .position = position, .duplicate = true };
     }
     pub fn stage(self: *PreparedClaims, core: anytype, txn: anytype, replay: ?Native) !ClaimOutcome {
+        try self.context.ensureActive();
+        if (self.command.binding.authority != .native) return error.InvalidControlReceiptPosition;
         // Actual receiving range, checked under apply exclusion; no caller-set
         // ownership flag or row owner's routing assumption is accepted.
         for (self.batch.entries) |entry| if (!core.byteRange().contains(&entry.address.routing)) return error.KeyOutOfRange;
         const result = try self.batch.stageOrdered(txn, replay);
         return .{ .binding = self.command.binding, .claims_digest = self.claims_digest, .position = result.position, .duplicate = result.duplicate, .claims_added = result.claims_added };
     }
+    pub fn stageRaft(self: *PreparedClaims, core: anytype, txn: anytype, owner_group: u64, entry: @import("apply_receipts.zig").OrderedApplyReceipt) !void {
+        try self.context.ensureActive();
+        if (self.command.binding.authority != .raft or owner_group == 0 or owner_group != self.command.binding.fence.owner_group_id) return error.PrivateIndexOwnerJobChanged;
+        const prior = try @import("apply_receipts.zig").readOrderedApplyReceiptTxn(txn);
+        if (try @import("apply_receipts.zig").orderedApplyDisposition(prior, entry) != .apply) return error.InvalidControlReceiptPosition;
+        if (prior) |value| if (entry.index <= value.index or entry.term < value.term) return error.InvalidControlReceiptPosition;
+        for (self.batch.entries) |value| if (!core.byteRange().contains(&value.address.routing)) return error.KeyOutOfRange;
+        _ = try self.batch.stageAt(txn, .{ .raft = .{ .term = entry.term, .index = entry.index } });
+    }
     pub fn hasPublicationReceipt(_: *const PreparedClaims) bool {
         return false;
     }
     pub fn populateReceipt(_: *const PreparedClaims, _: anytype, _: *ClaimOutcome) !void {}
     pub fn preparePayload(self: *PreparedClaims) !void {
+        if (self.command.binding.authority != .native) return error.InvalidControlReceiptPosition;
         try prepareNativePayload(self, "claims", self.command, max_claim_wire_bytes);
     }
     pub fn finalizePayload(self: *PreparedClaims, position: Native) ![]const u8 {
