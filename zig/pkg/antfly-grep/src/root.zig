@@ -26,6 +26,7 @@ pub const decision = @import("decision.zig");
 const Allocator = std.mem.Allocator;
 pub const Summary = struct {
     index_requests: usize = 0,
+    source_cache_hits: usize = 0,
     files: usize = 0,
     bytes: usize = 0,
     matches: usize = 0,
@@ -41,7 +42,7 @@ pub const Summary = struct {
     invalid_utf8_files: usize = 0,
     complete: bool = true,
 };
-pub const Line = struct { start: usize, end: usize };
+pub const Line = @import("source_cache.zig").Line;
 const Limits = @import("budget.zig").Limits;
 const Task = struct { prepared: bool = false, path: []const u8, display: []const u8, filename: bool, explicit_file: bool = false, timestamp: i96 = 0, result: ?[]u8 = null, score: f64 = 0 };
 const Region = @import("regions.zig").Region;
@@ -70,6 +71,10 @@ pub const Search = struct {
     input_buffer: ?[]u8 = null,
     raw_line: ?[]const u8 = null,
     replay_spans: bool = false,
+    span_runs: [64]SpanRun = undefined,
+    span_run_count: usize = 0,
+    span_runs_valid: bool = false,
+    row_occurrences: usize = 0,
     current_hits: ?[]const @import("matcher.zig").Match = null,
     current_hit_text: []const u8 = "",
     replacement_absolute_start: bool = true,
@@ -504,7 +509,7 @@ pub const Search = struct {
             local.shared_limits = &root.limits;
             local.decider.limits = &root.limits;
             local.decider.allow_parallel = root.tasks.items.len == 1;
-            local.decider.shared_local = if (root.decider.local) |*provider| provider else null;
+            local.decider.shared_local = if (root.decider.local) |provider| provider else null;
             while (!root.limits.cancel.load(.monotonic)) {
                 var queued: Task = undefined;
                 const task = if (ctx.queue) |queue| blk: {
@@ -555,7 +560,7 @@ pub const Search = struct {
             ctx.mutex.lockUncancelable(root.io);
             defer ctx.mutex.unlock(root.io);
             root.summary.occurrences_exact = root.summary.occurrences_exact and local.summary.occurrences_exact;
-            inline for (.{ "files", "bytes", "matches", "reading_leads", "occurrences", "files_with_matches", "regions_considered", "regions_evaluated", "errors", "skipped_paths", "invalid_utf8_files" }) |field| @field(root.summary, field) += @field(local.summary, field);
+            inline for (.{ "files", "bytes", "matches", "reading_leads", "occurrences", "files_with_matches", "regions_considered", "regions_evaluated", "errors", "skipped_paths", "invalid_utf8_files", "source_cache_hits" }) |field| @field(root.summary, field) += @field(local.summary, field);
             root.summary.complete = root.summary.complete and local.summary.complete;
             root.decider.requests += local.decider.requests;
             root.decider.input_tokens += local.decider.input_tokens;
@@ -681,6 +686,7 @@ pub const Search = struct {
         self.matcher.failure = null;
         self.current_hits = null;
         self.replay_spans = false;
+        self.span_runs_valid = false;
         self.binary_mode = false;
         self.binary_stop = false;
         self.binary_offset = null;
@@ -726,6 +732,7 @@ pub const Search = struct {
         local.binary_offset = null;
         local.current_hits = null;
         local.replay_spans = false;
+        local.span_runs_valid = false;
         local.raw_line = null;
         local.matcher.failure = null;
         local.file_started = std.Io.Clock.awake.now(self.io);
@@ -733,6 +740,7 @@ pub const Search = struct {
         local.replacement_absolute_start = true;
         local.replacement_file_context = false;
         local.color_enabled = self.options.color == .always or (self.options.color == .auto and self.stdout_tty);
+        local.decider.cache_scope = doc.cache_scope;
         local.decider.requests = 0;
         local.decider.cache_hits = 0;
         local.decider.input_tokens = 0;
@@ -744,7 +752,7 @@ pub const Search = struct {
         local.collecting = false;
         local.shared_limits = &self.limits;
         local.decider.limits = &self.limits;
-        local.decider.shared_local = if (self.decider.local) |*provider| provider else null;
+        local.decider.shared_local = if (self.decider.local) |provider| provider else null;
         local.provenance = doc.provenance;
         local.render_filename = self.options.filename orelse true;
         local.explicit_file = true;
@@ -755,7 +763,7 @@ pub const Search = struct {
         local.retaining_output = ranked;
         local.sink = if (ranked) &output.writer else &forward.writer;
         defer {
-            inline for (.{ "files", "bytes", "matches", "reading_leads", "occurrences", "files_with_matches", "regions_considered", "regions_evaluated", "errors", "skipped_paths", "invalid_utf8_files" }) |field| @field(self.summary, field) += @field(local.summary, field);
+            inline for (.{ "files", "bytes", "matches", "reading_leads", "occurrences", "files_with_matches", "regions_considered", "regions_evaluated", "errors", "skipped_paths", "invalid_utf8_files", "source_cache_hits" }) |field| @field(self.summary, field) += @field(local.summary, field);
             self.summary.complete = self.summary.complete and local.summary.complete;
             self.summary.occurrences_exact = self.summary.occurrences_exact and local.summary.occurrences_exact;
             self.decider.requests += local.decider.requests;
@@ -1164,9 +1172,11 @@ pub const Search = struct {
         defer hit_arena.deinit();
         defer self.current_hits = null;
         defer self.replay_spans = false;
+        self.span_runs_valid = false;
         while (!self.stopped()) {
             self.current_hits = null;
             self.replay_spans = false;
+            self.span_runs_valid = false;
             _ = hit_arena.reset(.retain_capacity);
             storage.clearRetainingCapacity();
             if (offset >= prefilter_checked_until and !(self.options.stop_on_nonmatch and count > 0) and self.options.ask == null and !self.options.invert and !self.options.passthru and self.options.before == 0 and after == 0) {
@@ -1256,19 +1266,13 @@ pub const Search = struct {
                     } else {
                         var spans = SpanIterator{ .matcher = &self.matcher, .text = text, .terminated = peek != null };
                         var total: usize = 0;
-                        var small: std.ArrayList(@import("matcher.zig").Match) = .empty;
+                        self.span_run_count = 0;
+                        self.span_runs_valid = true;
                         while (spans.next()) |span| {
-                            if (total < 64) try small.append(hit_arena.allocator(), .{ .span = span, .captures = &.{}, .names = &.{} });
+                            self.appendSpanRun(span);
                             total += 1;
                         }
                         if (self.matcher.failure) |err| return err;
-                        // Sparse regex rows reuse their preflight spans. Dense
-                        // rows replay from source with bounded storage instead
-                        // of growing a match array with occurrence count.
-                        if (total <= 64) {
-                            self.current_hits = small.items;
-                            self.current_hit_text = text;
-                        }
                         matched = spans.found;
                         exact_occurrences = total;
                     }
@@ -1384,6 +1388,7 @@ pub const Search = struct {
                         try self.write("\n");
                     }
                     self.raw_line = raw;
+                    self.row_occurrences = exact_occurrences orelse if (self.current_hits) |hits| hits.len else 1;
                     try self.emit(path_name, text, line, offset, true, probability);
                     shown = line;
                     after = self.options.after;
@@ -1443,6 +1448,7 @@ pub const Search = struct {
     }
     pub fn content(self: *Search, path_name: []const u8, bytes: []const u8) !void {
         self.replay_spans = false;
+        self.span_runs_valid = false;
         self.current_hits = null;
         if (self.shared_limits) |limits| if (!Limits.reserve(&limits.source_bytes, bytes.len, self.options.max_source_bytes)) return error.SourceBudgetExceeded;
         self.summary.files += 1;
@@ -1455,7 +1461,13 @@ pub const Search = struct {
         var arena = std.heap.ArenaAllocator.init(self.a);
         defer arena.deinit();
         const a = arena.allocator();
-        const lines = try lineRangesWith(a, bytes, if (self.options.null_data) 0 else '\n', self.options.crlf);
+        var prepared: ?@import("source_cache.zig").Prepared = null;
+        const lines = if (self.options.ask != null) blk: {
+            var hit = false;
+            prepared = try @import("source_cache.zig").get(a, self.io, self.options, path_name, bytes, self.decider.cache_scope, &hit);
+            self.summary.source_cache_hits += @intFromBool(hit);
+            break :blk prepared.?.lines;
+        } else try lineRangesWith(a, bytes, if (self.options.null_data) 0 else '\n', self.options.crlf);
         const selected = try a.alloc(bool, lines.len);
         @memset(selected, false);
         const probabilities: []f64 = if (self.options.ask != null) try a.alloc(f64, lines.len) else &.{};
@@ -1466,7 +1478,7 @@ pub const Search = struct {
             const evidence = try a.create(@import("evidence.zig").Evidence);
             const scores = try a.alloc(f64, lines.len);
             @memset(scores, std.math.nan(f64));
-            evidence.* = .{ .index = try @import("source.zig").parse(a, path_name, bytes), .line_scores = scores };
+            evidence.* = .{ .index = prepared.?.index, .line_scores = scores };
             self.evidence = evidence;
             if (self.options.jev_mode) {
                 const listing = try self.filePreview(a, path_name, bytes, lines, evidence.index);
@@ -2035,7 +2047,9 @@ pub const Search = struct {
             try w.writeAll(sep);
         }
         if (self.options.byte_offset) {
+            if (self.color_enabled) try @import("style.zig").start(w, self.options, "column");
             try w.print("{d}", .{offset});
+            if (self.color_enabled) try w.writeAll("\x1b[0m");
             if (linked and !self.options.column) try w.writeAll("\x1b]8;;\x1b\\");
             try w.writeAll(sep);
         }
@@ -2111,7 +2125,7 @@ pub const Search = struct {
             const raw = self.raw_line orelse text;
             const utf8 = std.unicode.utf8ValidateSlice(text);
             const encoded = if (utf8) null else try base64(a, text);
-            const subs = JsonSubmatches{ .matcher = &self.matcher, .text = text, .terminated = terminated, .hits = if (self.replay_spans and self.current_hits == null and matched and p == null and !self.options.invert) null else hits.items };
+            const subs = JsonSubmatches{ .matcher = &self.matcher, .text = text, .terminated = terminated, .runs = if (self.replay_spans and matched) self.cachedRuns() else null, .hits = if (self.replay_spans and self.current_hits == null and matched and p == null and !self.options.invert) null else hits.items };
             const raw_valid = std.unicode.utf8ValidateSlice(raw);
             try self.json(.{ .type = if (matched) "match" else "context", .data = .{ .path = encoded_path, .lines = JsonText{ .text = if (raw_valid) raw else null, .bytes = if (raw_valid) null else try base64(a, raw) }, .line_number = line, .absolute_offset = byte_offset, .submatches = subs }, .path = if (encoded_path.text != null) path_name else null, .path_bytes_base64 = encoded_path.bytes, .line_number = line, .byte_offset = byte_offset, .text = if (utf8) text else null, .bytes_base64 = encoded, .probability = p, .scope = if (p != null and !independent) "region" else "line" });
             return;
@@ -2165,16 +2179,19 @@ pub const Search = struct {
                 if (self.options.max_columns_preview) {
                     try output.writer.writeAll(text[0..self.options.max_columns]);
                     try output.writer.writeAll(" [... omitted end of long line]");
-                } else try output.writer.print("[Omitted long {s} line]", .{if (matched) "matching" else "context"});
+                } else if (self.color_enabled and matched and p == null) try output.writer.print("[Omitted long line with {d} matches]", .{hits.items.len}) else try output.writer.print("[Omitted long {s} line]", .{if (matched) "matching" else "context"});
                 try output.writer.writeByte('\n');
                 try self.write(output.written());
                 return;
             }
-            var start: usize = 0;
+            const trim_start = if (self.options.trim and self.options.replacement == null) text.len - std.mem.trimStart(u8, text, " \t").len else 0;
+            var start: usize = trim_start;
             for (hits.items) |hit| {
-                try output.writer.writeAll(text[start..hit.span.start]);
+                if (self.options.replacement == null and hit.span.end <= trim_start) continue;
+                const visible_start = @max(hit.span.start, trim_start);
+                try output.writer.writeAll(if (self.options.trim and start == 0) std.mem.trimStart(u8, text[start..visible_start], " \t") else text[start..visible_start]);
                 if (self.color_enabled) try @import("style.zig").start(&output.writer, self.options, "match");
-                if (self.options.replacement) |template| try output.writer.writeAll(try Matcher.replacement(a, template, text, hit)) else try output.writer.writeAll(text[hit.span.start..hit.span.end]);
+                if (self.options.replacement) |template| try output.writer.writeAll(try Matcher.replacement(a, template, text, hit)) else try output.writer.writeAll(text[visible_start..hit.span.end]);
                 if (self.color_enabled) try output.writer.writeAll("\x1b[0m");
                 start = hit.span.end;
             }
@@ -2187,6 +2204,32 @@ pub const Search = struct {
     /// The preflight iterator and renderer share zero-width/EOF semantics.
     /// Captures are never retained: capture-dependent rendering keeps its
     /// existing source-context path instead of entering replay mode.
+    /// A repeated stride/length run represents arbitrarily dense occurrences
+    /// without retaining one object per match. Irregular rows fall back to
+    /// replay after at most 64 runs, keeping per-worker span storage bounded.
+    const SpanRun = struct { start: usize, length: usize, stride: usize = 0, count: usize = 1 };
+    fn appendSpanRun(self: *Search, span: @import("matcher.zig").Span) void {
+        if (!self.span_runs_valid) return;
+        if (self.span_run_count > 0) {
+            const last = &self.span_runs[self.span_run_count - 1];
+            const previous = last.start + last.stride * (last.count - 1);
+            const stride = span.start - previous;
+            if (span.end - span.start == last.length and (last.count == 1 or stride == last.stride)) {
+                last.stride = stride;
+                last.count += 1;
+                return;
+            }
+        }
+        if (self.span_run_count == self.span_runs.len) {
+            self.span_runs_valid = false;
+            return;
+        }
+        self.span_runs[self.span_run_count] = .{ .start = span.start, .length = span.end - span.start };
+        self.span_run_count += 1;
+    }
+    fn cachedRuns(self: *Search) ?[]const SpanRun {
+        return if (self.span_runs_valid) self.span_runs[0..self.span_run_count] else null;
+    }
     const SpanIterator = struct {
         matcher: *Matcher,
         text: []const u8,
@@ -2197,12 +2240,26 @@ pub const Search = struct {
         found: bool = false,
         cached: ?[]const @import("matcher.zig").Match = null,
         cached_index: usize = 0,
+        runs: ?[]const SpanRun = null,
+        run_index: usize = 0,
+        run_offset: usize = 0,
         fn next(self: *SpanIterator) ?@import("matcher.zig").Span {
             if (self.cached) |hits| {
                 if (self.cached_index == hits.len) return null;
                 const span = hits[self.cached_index].span;
                 self.cached_index += 1;
                 return span;
+            }
+            if (self.runs) |runs| {
+                if (self.run_index == runs.len) return null;
+                const span_run = runs[self.run_index];
+                const start = span_run.start + self.run_offset * span_run.stride;
+                self.run_offset += 1;
+                if (self.run_offset == span_run.count) {
+                    self.run_index += 1;
+                    self.run_offset = 0;
+                }
+                return .{ .start = start, .end = start + span_run.length };
             }
             while (!self.done) {
                 const hit = self.matcher.find(self.text, self.cursor) orelse {
@@ -2227,12 +2284,13 @@ pub const Search = struct {
         text: []const u8,
         terminated: bool,
         hits: ?[]const @import("matcher.zig").Match,
+        runs: ?[]const SpanRun = null,
         pub fn jsonStringify(self: @This(), json_writer: *std.json.Stringify) !void {
             try json_writer.beginArray();
             if (self.hits) |hits| {
                 for (hits) |hit| try self.item(json_writer, hit.span);
             } else {
-                var spans = SpanIterator{ .matcher = self.matcher, .text = self.text, .terminated = self.terminated };
+                var spans = SpanIterator{ .matcher = self.matcher, .text = self.text, .terminated = self.terminated, .runs = self.runs };
                 while (spans.next()) |span| try self.item(json_writer, span);
                 if (self.matcher.failure != null) return error.WriteFailed;
             }
@@ -2311,7 +2369,7 @@ pub const Search = struct {
         output.writer.flush() catch |err| return output.failure orelse err;
     }
     fn renderReplay(self: *Search, writer: *std.Io.Writer, path: []const u8, text: []const u8, line: usize, offset: usize, terminated: bool) !void {
-        var spans = SpanIterator{ .matcher = &self.matcher, .text = text, .terminated = terminated, .cached = self.current_hits };
+        var spans = SpanIterator{ .matcher = &self.matcher, .text = text, .terminated = terminated, .cached = self.current_hits, .runs = self.cachedRuns() };
         var hit = spans.next();
         const delimiter: u8 = if (self.options.null_data) 0 else '\n';
         if (self.options.only_matching) {
@@ -2322,9 +2380,10 @@ pub const Search = struct {
             }
             while (hit) |span| : (hit = spans.next()) {
                 try self.prefix(writer, path, line, offset + span.start, span.start + 1, true);
-                if (self.color_enabled and span.start != span.end) try @import("style.zig").start(writer, self.options, "match");
-                try writer.writeAll(text[span.start..span.end]);
-                if (self.color_enabled and span.start != span.end) try writer.writeAll("\x1b[0m");
+                const visible = if (self.options.trim) std.mem.trimStart(u8, text[span.start..span.end], " \t") else text[span.start..span.end];
+                if (self.color_enabled and visible.len != 0) try @import("style.zig").start(writer, self.options, "match");
+                try writer.writeAll(visible);
+                if (self.color_enabled and visible.len != 0) try writer.writeAll("\x1b[0m");
                 try writer.writeByte(delimiter);
             }
         } else {
@@ -2333,15 +2392,15 @@ pub const Search = struct {
                 if (self.options.max_columns_preview) {
                     try writer.writeAll(text[0..self.options.max_columns]);
                     try writer.writeAll(" [... omitted end of long line]");
-                } else try writer.writeAll("[Omitted long matching line]");
+                } else if (self.color_enabled) try writer.print("[Omitted long line with {d} matches]", .{self.row_occurrences}) else try writer.writeAll("[Omitted long matching line]");
                 try writer.writeByte('\n');
                 return;
             }
-            var start: usize = 0;
-            const any = hit != null;
+            const trim_start = if (self.options.trim) text.len - std.mem.trimStart(u8, text, " \t").len else 0;
+            var start: usize = trim_start;
             while (hit) |span| {
                 hit = spans.next();
-                if (span.start == span.end) continue;
+                if (span.start == span.end or span.end <= trim_start) continue;
                 var end = span.end;
                 // Adjacent matches share one highlight range; zero-width spans
                 // affect selection/metadata, never terminal escape sequences.
@@ -2350,13 +2409,14 @@ pub const Search = struct {
                     end = @max(end, next.end);
                     hit = spans.next();
                 }
-                try writer.writeAll(text[start..span.start]);
+                const visible_start = @max(span.start, trim_start);
+                try writer.writeAll(text[start..visible_start]);
                 if (self.color_enabled) try @import("style.zig").start(writer, self.options, "match");
-                try writer.writeAll(text[span.start..end]);
+                try writer.writeAll(text[visible_start..end]);
                 if (self.color_enabled) try writer.writeAll("\x1b[0m");
                 start = end;
             }
-            try writer.writeAll(if (self.options.trim and !any) std.mem.trimStart(u8, text[start..], " \t") else text[start..]);
+            try writer.writeAll(text[start..]);
             try writer.writeByte(delimiter);
         }
         if (self.matcher.failure) |err| return err;
@@ -2501,16 +2561,7 @@ pub fn lineRanges(a: Allocator, bytes: []const u8) ![]Line {
     return lineRangesWith(a, bytes, '\n', true);
 }
 pub fn lineRangesWith(a: Allocator, bytes: []const u8, delimiter: u8, crlf: bool) ![]Line {
-    var lines: std.ArrayList(Line) = .empty;
-    errdefer lines.deinit(a);
-    var start: usize = 0;
-    for (bytes, 0..) |b, i| if (b == delimiter) {
-        const end = if (crlf and i > start and bytes[i - 1] == '\r') i - 1 else i;
-        try lines.append(a, .{ .start = start, .end = end });
-        start = i + 1;
-    };
-    if (start < bytes.len) try lines.append(a, .{ .start = start, .end = bytes.len });
-    return lines.toOwnedSlice(a);
+    return @import("source_cache.zig").lines(a, bytes, delimiter, crlf);
 }
 test "line offsets preserve CRLF and unterminated final lines" {
     const a = std.testing.allocator;
@@ -2530,4 +2581,27 @@ test {
     _ = @import("discovery.zig");
     _ = @import("decision.zig");
     _ = @import("regions.zig");
+}
+
+test "bounded span runs preserve sparse dense and zero width spans" {
+    var search: Search = undefined;
+    search.span_runs_valid = true;
+    search.span_run_count = 0;
+    for (0..262144) |i| search.appendSpanRun(.{ .start = i * 2, .end = i * 2 + 1 });
+    try std.testing.expect(search.span_runs_valid);
+    try std.testing.expectEqual(@as(usize, 1), search.span_run_count);
+    var spans = Search.SpanIterator{ .matcher = undefined, .text = "", .terminated = true, .runs = search.cachedRuns() };
+    var i: usize = 0;
+    while (spans.next()) |span| : (i += 1) {
+        try std.testing.expectEqual(i * 2, span.start);
+        try std.testing.expectEqual(i * 2 + 1, span.end);
+    }
+    try std.testing.expectEqual(@as(usize, 262144), i);
+    search.span_run_count = 0;
+    for (0..16) |j| search.appendSpanRun(.{ .start = j, .end = j });
+    try std.testing.expectEqual(@as(usize, 1), search.span_run_count);
+    search.span_run_count = 0;
+    for (0..128) |j| search.appendSpanRun(.{ .start = j * j, .end = j * j + (j % 3) });
+    try std.testing.expect(!search.span_runs_valid);
+    try std.testing.expectEqual(@as(usize, 64), search.span_run_count);
 }

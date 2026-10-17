@@ -77,6 +77,34 @@ pub const Local = struct {
         return a.dupe(u8, ptr[0..buffer.len]);
     }
 };
+/// Stable shared owner. Creating this object does not load a library or model.
+/// Initialization is serialized once; inference calls use the runtime's own
+/// concurrent C ABI after releasing the startup mutex.
+pub const Runtime = struct {
+    a: std.mem.Allocator,
+    io: std.Io,
+    options: *const Options,
+    mutex: std.Io.Mutex = .init,
+    provider: ?Local = null,
+    pub fn create(a: std.mem.Allocator, io: std.Io, options: *const Options) !*Runtime {
+        const self = try a.create(Runtime);
+        self.* = .{ .a = a, .io = io, .options = options };
+        return self;
+    }
+    pub fn deinit(self: *Runtime) void {
+        if (self.provider) |*provider| provider.deinit();
+        self.a.destroy(self);
+    }
+    pub fn decide(self: *Runtime, a: std.mem.Allocator, body: []const u8) ![]u8 {
+        self.mutex.lockUncancelable(self.io);
+        const provider = blk: {
+            defer self.mutex.unlock(self.io);
+            if (self.provider == null) self.provider = try Local.init(self.options);
+            break :blk &self.provider.?;
+        };
+        return provider.decide(a, body);
+    }
+};
 test "inference option ABI layout matches antfly.h v3" {
     try std.testing.expectEqual(@as(usize, 120), @sizeOf(InferenceOptions));
 }

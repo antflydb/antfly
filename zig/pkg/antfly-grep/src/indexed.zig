@@ -98,7 +98,7 @@ fn scan(search: anytype, http: *httpx.Client, config: Config, table: Table, coun
     const filter_arena = filters.allocator();
     const user_filter: ?std.json.Value = if (search.options.table_filter) |raw| (try std.json.parseFromSlice(std.json.Value, filter_arena, raw, .{ .allocate = .alloc_always })).value else null;
     const filter = try candidateFilter(filter_arena, search, table, user_filter);
-    var fetcher = Fetch{ .a = search.a, .io = search.io, .options = search.options, .limits = &search.limits, .config = config, .url = url, .document_field = table.document_field, .filter = filter, .http = http };
+    var fetcher = Fetch{ .a = search.a, .io = search.io, .options = search.options, .limits = &search.limits, .config = config, .url = url, .document_field = table.document_field, .filter = filter, .http = http, .fields = try projectionFields(filter_arena, search.options, table.document_field) };
     defer search.summary.index_requests += fetcher.summary.index_requests;
     // Finite decision budgets preserve foreground order: speculative page
     // requests must not consume the budget reserved by the user for evidence.
@@ -164,7 +164,10 @@ fn scan(search: anytype, http: *httpx.Client, config: Config, table: Table, coun
             const id = try document.string(hit, "_id");
             const source = document.field(hit, "_source") orelse return error.InvalidIndexResponse;
             const value = document.at(source, table.document_field) orelse return error.MissingGrepDocument;
-            const doc = try document.Document.parse(value, table.name, id, current_snapshot, std.Io.Clock.real.now(search.io).toSeconds());
+            var doc = if (metadataListing(search.options))
+                try document.Document.parseListing(value, table.name, id, current_snapshot, std.Io.Clock.real.now(search.io).toSeconds())
+            else
+                try document.Document.parse(value, table.name, id, current_snapshot, std.Io.Clock.real.now(search.io).toSeconds());
             if (!document.allowed(value, config.principals)) {
                 search.skipped();
                 continue;
@@ -173,6 +176,26 @@ fn scan(search: anytype, http: *httpx.Client, config: Config, table: Table, coun
                 search.skipped();
                 continue;
             }
+            // Scope evidence by the current authorized revision and endpoint.
+            // Authorization is rechecked on every scan before any cached data
+            // can be used; snapshots are deliberately not cache identities.
+            var scope = std.crypto.hash.sha2.Sha256.init(.{});
+            const permissions = try std.json.Stringify.valueAlloc(a, document.field(value, "permissions").?, .{});
+            for ([_][]const u8{ config.endpoint, search.options.table_token orelse "", table.name, id, doc.provenance.uri.?, doc.provenance.revision.?, permissions }) |part| {
+                var length: [8]u8 = undefined;
+                std.mem.writeInt(u64, &length, part.len, .little);
+                scope.update(&length);
+                scope.update(part);
+            }
+            for (config.principals) |principal| {
+                var length: [8]u8 = undefined;
+                std.mem.writeInt(u64, &length, principal.len, .little);
+                scope.update(&length);
+                scope.update(principal);
+            }
+            var scope_digest: [32]u8 = undefined;
+            scope.final(&scope_digest);
+            doc.cache_scope = scope_digest;
             search.indexDocument(doc) catch |err| try search.reportError(doc.path, err);
         }
         if (!has_next) return;
@@ -199,6 +222,7 @@ const Fetch = struct {
     url: []const u8,
     document_field: []const u8,
     filter: ?std.json.Value,
+    fields: []const []const u8,
     http: *httpx.Client,
     summary: struct { index_requests: usize = 0 } = .{},
     cancel: std.atomic.Value(bool) = .init(false),
@@ -268,7 +292,7 @@ const Fetch = struct {
             defer if (!retained) page.deinit(self.a);
             const a = page.arena.allocator();
             const memory = &page.memory;
-            const body = try std.json.Stringify.valueAlloc(a, .{ .query = .{ .match_all = .{} }, .filter_query = self.filter, .fields = [_][]const u8{self.document_field}, .order_by = .{.{ .field = "_id", .desc = false }}, .limit = page_size.*, .search_after = request.cursor, .remote_snapshot = request.snapshot, .timeout_ms = self.options.timeout_ms }, .{ .emit_null_optional_fields = false });
+            const body = try std.json.Stringify.valueAlloc(a, .{ .query = .{ .match_all = .{} }, .filter_query = self.filter, .fields = self.fields, .order_by = .{.{ .field = "_id", .desc = false }}, .limit = page_size.*, .search_after = request.cursor, .remote_snapshot = request.snapshot, .timeout_ms = self.options.timeout_ms }, .{ .emit_null_optional_fields = false });
             const auth = if (self.options.table_token) |token| try std.fmt.allocPrint(a, "Bearer {s}", .{token}) else null;
             const headers: ?[]const [2][]const u8 = if (auth) |value| &.{.{ "Authorization", value }} else null;
             var attempt: usize = 0;
@@ -346,7 +370,7 @@ fn backoff(search: anytype, attempt: usize, requested: u64) !void {
 fn candidateFilter(a: A, search: anytype, table: Table, user_filter: ?std.json.Value) !?std.json.Value {
     const index = table.candidate_index orelse return user_filter;
     const o = search.options;
-    if (o.ask != null or o.files or o.invert or o.files_without_match or o.include_zero or o.passthru or o.json or o.stats) return user_filter;
+    if ((o.ask != null and (o.patterns.items.len == 0 or o.jev_mode)) or o.files or o.invert or o.files_without_match or o.include_zero or o.passthru or o.json or o.stats) return user_filter;
     const literals = (try search.matcher.requiredLiterals(a)) orelse return user_filter;
     var grams: std.ArrayList(std.json.Value) = .empty;
     const certificate_bytes = try std.json.Stringify.valueAlloc(a, .{ .term = "raw-byte-trigrams-v1", .field = index.version_field }, .{});
@@ -387,4 +411,16 @@ fn candidateFilter(a: A, search: anytype, table: Table, user_filter: ?std.json.V
     if (user_filter == null) return candidates;
     const encoded = try std.json.Stringify.valueAlloc(a, .{ .conjuncts = .{ user_filter.?, candidates } }, .{});
     return (try std.json.parseFromSlice(std.json.Value, a, encoded, .{ .allocate = .alloc_always })).value;
+}
+
+fn metadataListing(o: *const @import("options.zig").Options) bool {
+    return o.files and !o.json and !o.stats and o.max_file_bytes == std.math.maxInt(usize) and !o.skip_oversize;
+}
+fn projectionFields(a: A, o: *const @import("options.zig").Options, field: []const u8) ![]const []const u8 {
+    if (o.json or o.ask != null or o.stats) return a.dupe([]const u8, &.{field});
+    var fields: std.ArrayList([]const u8) = .empty;
+    for ([_][]const u8{ "version", "path", "uri", "revision", "indexed_at", "permissions", "modified_at", "created_at", "accessed_at" }) |suffix|
+        try fields.append(a, try std.fmt.allocPrint(a, "{s}.{s}", .{ field, suffix }));
+    if (!metadataListing(o)) try fields.append(a, try std.fmt.allocPrint(a, "{s}.content", .{field}));
+    return fields.toOwnedSlice(a);
 }

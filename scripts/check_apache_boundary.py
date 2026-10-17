@@ -341,6 +341,7 @@ CONFIGURATION_IMPORTS = {
     "standalone_runtime_options",
     "antfly_lite_options",
     "build_options",
+    "grep_cache_options",
     "capi_build_options",
     "storage_source_options",
     "std",

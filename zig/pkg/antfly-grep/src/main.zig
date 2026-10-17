@@ -79,6 +79,8 @@ const help =
     \\      --models-dir PATH     Local model directory
     \\      --cache-ttl SECONDS  Score cache lifetime (86400; 0 bypasses)
     \\      --no-cache            Bypass persistent decision score cache
+    \\      --cached-only         Use cached decisions; no provider calls or table reads
+    \\      --model-revision ID   Include a pinned model generation in cache identity
     \\      --no-refine           Retain accepted declaration/block regions
     \\      --no-rank             Emit source order instead of score ranking
     \\      --triage              Enable model-based directory pruning

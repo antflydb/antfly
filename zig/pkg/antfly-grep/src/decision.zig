@@ -53,23 +53,26 @@ pub const Client = struct {
     limits: ?*@import("budget.zig").Limits = null,
     cache_hits: usize = 0,
     allow_parallel: bool = true,
-    local: ?@import("local_decider.zig").Local = null,
-    shared_local: ?*@import("local_decider.zig").Local = null,
+    local: ?*@import("local_decider.zig").Runtime = null,
+    shared_local: ?*@import("local_decider.zig").Runtime = null,
+    cache_scope: ?[32]u8 = null,
     last_status: u16 = 0,
     retry_after_ms: u64 = 0,
     input_tokens: usize = 0,
     output_tokens: usize = 0,
     pool: ?*Pool = null,
+    score_store: @import("score_store.zig").Store = .{},
     pub fn init(a: Allocator, io: std.Io, options: *const Options) Client {
         return .{ .a = a, .http = httpx.Client.init(a, io), .options = options, .io = io };
     }
     pub fn deinit(self: *Client) void {
         if (self.pool) |pool| pool.deinit();
         self.http.deinit();
-        if (self.local) |*local| local.deinit();
+        self.score_store.deinit(self.io);
+        if (self.local) |local| local.deinit();
     }
     pub fn ensureLocal(self: *Client) !void {
-        if (self.options.backend == .local and self.shared_local == null and self.local == null) self.local = try @import("local_decider.zig").Local.init(self.options);
+        if (!self.options.cached_only and self.options.backend == .local and self.shared_local == null and self.local == null) self.local = try @import("local_decider.zig").Runtime.create(self.a, self.io, self.options);
     }
     pub fn search(self: *Client, inputs: []const Input, scores: []f64) !void {
         try self.decideBatches(inputs, scores);
@@ -83,7 +86,6 @@ pub const Client = struct {
     }
 
     pub fn decideBatches(self: *Client, inputs: []const Input, scores: []f64) !void {
-        try self.ensureLocal();
         @memset(scores, std.math.nan(f64));
         if (!self.allow_parallel or self.options.jobs <= 1 or inputs.len <= self.options.batch_size) {
             var offset: usize = 0;
@@ -94,8 +96,37 @@ pub const Client = struct {
             }
             return;
         }
+        // Warm waves need neither worker startup nor a native runtime. Only
+        // all-hit waves take this shortcut; misses retain ordinary partial
+        // evidence and budget behavior in the worker path.
+        if (try self.cachedWave(inputs, scores)) return;
+        try self.ensureLocal();
         if (self.pool == null) self.pool = try Pool.create(self);
         try self.pool.?.run(self, inputs, scores);
+    }
+    fn cachedEntry(self: *Client, a: Allocator, key_hex: *const [64]u8) !?@import("score_store.zig").Entry {
+        return self.score_store.get(a, self.io, self.options, key_hex) orelse try self.cached(a, key_hex);
+    }
+    fn cachedWave(self: *Client, inputs: []const Input, scores: []f64) !bool {
+        if (self.options.no_cache or self.options.cache_ttl_seconds == 0 or self.options.cache_dir == null) return false;
+        var arena = std.heap.ArenaAllocator.init(self.a);
+        defer arena.deinit();
+        const a = arena.allocator();
+        var offset: usize = 0;
+        while (offset < inputs.len) {
+            const n = @min(self.options.batch_size, inputs.len - offset);
+            const keys = try a.alloc([64]u8, n);
+            for (inputs[offset..][0..n], keys) |input, *key_hex| key_hex.* = self.key(input);
+            const written = try a.alloc(?i64, n);
+            @memset(written, null);
+            _ = try self.cachedBatch(a, &batchKey(keys), scores[offset..][0..n], written);
+            for (keys, scores[offset..][0..n]) |*key_hex, *score| {
+                if (!std.math.isFinite(score.*)) score.* = (try self.cachedEntry(a, key_hex) orelse return false).score;
+            }
+            offset += n;
+        }
+        self.cache_hits += inputs.len;
+        return true;
     }
     /// Stable worker storage and clients survive batch waves. A wave borrows
     /// its inputs until all workers acknowledge completion; no work queue grows
@@ -200,7 +231,8 @@ pub const Client = struct {
             local.limits = parent.limits;
             local.query = parent.query;
             local.stage = parent.stage;
-            local.shared_local = parent.shared_local orelse if (parent.local) |*provider| provider else null;
+            local.cache_scope = parent.cache_scope;
+            local.shared_local = parent.shared_local orelse if (parent.local) |provider| provider else null;
             while (true) {
                 const start = ctx.index.fetchAdd(parent.options.batch_size, .monotonic);
                 if (start >= ctx.inputs.len) break;
@@ -230,14 +262,17 @@ pub const Client = struct {
         const keys = try a.alloc([64]u8, if (caching) inputs.len else 0);
         for (inputs[0..keys.len], keys) |input, *key_hex| key_hex.* = self.key(input);
         const batch_key = batchKey(keys);
-        const batch_hit = try self.cachedBatch(a, &batch_key, probabilities);
+        const written = try a.alloc(?i64, inputs.len);
+        @memset(written, null);
+        const batch_hit = try self.cachedBatch(a, &batch_key, probabilities, written);
         var missing: std.ArrayList(Input) = .empty;
         var indices: std.ArrayList(usize) = .empty;
         for (inputs, 0..) |input, i| {
             if (std.math.isFinite(probabilities[i])) {
                 self.cache_hits += 1;
-            } else if (if (caching) try self.cached(a, &keys[i]) else null) |score| {
-                probabilities[i] = score;
+            } else if (if (caching) try self.cachedEntry(a, &keys[i]) else null) |entry| {
+                probabilities[i] = entry.score;
+                written[i] = entry.written;
                 self.cache_hits += 1;
             } else {
                 try missing.append(a, input);
@@ -245,9 +280,10 @@ pub const Client = struct {
             }
         }
         if (missing.items.len == 0) {
-            if (!batch_hit) self.storeBatch(a, &batch_key, probabilities) catch {};
+            if (!batch_hit) self.storeBatch(a, &batch_key, probabilities, written) catch {};
             return;
         }
+        if (self.options.cached_only) return error.DecisionCacheMiss;
         const scores = try a.alloc(f64, missing.items.len);
         @memset(scores, std.math.nan(f64));
         var failure: ?anyerror = null;
@@ -258,9 +294,11 @@ pub const Client = struct {
         for (scores, indices.items) |score, index| {
             if (!std.math.isFinite(score)) continue;
             probabilities[index] = score;
+            written[index] = std.Io.Clock.real.now(self.io).toSeconds();
+            if (caching) self.score_store.put(a, self.io, self.options, &keys[index], score);
             learned = true;
         }
-        if (learned or !batch_hit) self.storeBatch(a, &batch_key, probabilities) catch {};
+        if (learned or !batch_hit) self.storeBatch(a, &batch_key, probabilities, written) catch {};
         if (failure) |err| return err;
     }
     fn key(self: *Client, input: Input) [64]u8 {
@@ -293,11 +331,22 @@ pub const Client = struct {
                 hash.update(policy);
             }
         }
+        if (self.options.model_revision) |revision| {
+            hash.update("model-revision-v1");
+            var len: [8]u8 = undefined;
+            std.mem.writeInt(u64, &len, revision.len, .little);
+            hash.update(&len);
+            hash.update(revision);
+        }
+        if (self.cache_scope) |scope| {
+            hash.update("document-scope-v1");
+            hash.update(&scope);
+        }
         var digest: [32]u8 = undefined;
         hash.final(&digest);
         return std.fmt.bytesToHex(digest, .lower);
     }
-    fn cached(self: *Client, a: Allocator, key_hex: []const u8) !?f64 {
+    fn cached(self: *Client, a: Allocator, key_hex: []const u8) !?@import("score_store.zig").Entry {
         if (self.options.no_cache or self.options.cache_ttl_seconds == 0 or self.options.cache_dir == null) return null;
         const path = try std.fs.path.join(a, &.{ self.options.cache_dir.?, key_hex });
         const stat = std.Io.Dir.cwd().statFile(self.io, path, .{}) catch return null;
@@ -307,7 +356,7 @@ pub const Client = struct {
         const bytes = std.Io.Dir.cwd().readFileAlloc(self.io, path, a, .limited(256)) catch return null;
         const score = std.fmt.parseFloat(f64, bytes) catch return null;
         if (!std.math.isFinite(score) or (score < 0 and score != -1) or score > 1) return null;
-        return score;
+        return .{ .score = score, .written = stat.mtime.toSeconds() };
     }
     fn batchKey(keys: []const [64]u8) [64]u8 {
         var hash = std.crypto.hash.sha2.Sha256.init(.{});
@@ -317,27 +366,36 @@ pub const Client = struct {
         hash.final(&digest);
         return std.fmt.bytesToHex(digest, .lower);
     }
-    fn cachedBatch(self: *Client, a: Allocator, key_hex: []const u8, scores: []f64) !bool {
+    fn cachedBatch(self: *Client, a: Allocator, key_hex: []const u8, scores: []f64, written: []?i64) !bool {
         if (self.options.no_cache or self.options.cache_ttl_seconds == 0 or self.options.cache_dir == null) return false;
-        const path = try std.fmt.allocPrint(a, "{s}/batch-v6-{s}", .{ self.options.cache_dir.?, key_hex });
+        if (try self.cachedBatchVersion(a, key_hex, scores, written, 7)) return true;
+        return self.cachedBatchVersion(a, key_hex, scores, written, 6);
+    }
+    fn cachedBatchVersion(self: *Client, a: Allocator, key_hex: []const u8, scores: []f64, written: []?i64, version: u8) !bool {
+        if (self.options.no_cache or self.options.cache_ttl_seconds == 0 or self.options.cache_dir == null) return false;
+        const path = try std.fmt.allocPrint(a, "{s}/batch-v{d}-{s}", .{ self.options.cache_dir.?, version, key_hex });
         const stat = std.Io.Dir.cwd().statFile(self.io, path, .{}) catch return false;
         const age = std.Io.Clock.real.now(self.io).nanoseconds - stat.mtime.nanoseconds;
         if (age < -300000000000 or age >= @as(i128, self.options.cache_ttl_seconds) * 1000000000) return false;
         const bytes = std.Io.Dir.cwd().readFileAlloc(self.io, path, a, .limited(16384)) catch return false;
-        const Record = struct { version: u8, scores: []const ?f64 };
+        const Record = struct { version: u8, scores: []const ?f64, written: ?[]const ?i64 = null };
         const record = std.json.parseFromSliceLeaky(Record, a, bytes, .{ .duplicate_field_behavior = .@"error" }) catch return false;
-        if (record.version != 6 or record.scores.len != scores.len) return false;
+        if (record.version != version or record.scores.len != scores.len or (version == 7 and record.written == null) or (record.written != null and record.written.?.len != scores.len)) return false;
         // Validate the whole page before making any of its evidence visible.
         for (record.scores) |score| if (score) |p| {
             if (!std.math.isFinite(p) or (p < 0 and p != -1) or p > 1) return false;
         };
-        for (record.scores, scores) |score, *out| if (score) |p| {
+        for (record.scores, scores, written, 0..) |score, *out, *timestamp, i| if (score) |p| {
+            const created = if (record.written) |times| times[i] orelse continue else stat.mtime.toSeconds();
+            const entry_age = @as(i128, std.Io.Clock.real.now(self.io).toSeconds()) - created;
+            if (entry_age < -300 or entry_age >= self.options.cache_ttl_seconds) continue;
             out.* = p;
+            timestamp.* = created;
         };
         return true;
     }
-    fn storeBatch(self: *Client, a: Allocator, key_hex: []const u8, scores: []const f64) !void {
-        if (self.options.no_cache or self.options.cache_ttl_seconds == 0 or self.options.cache_dir == null) return;
+    fn storeBatch(self: *Client, a: Allocator, key_hex: []const u8, scores: []const f64, written: []const ?i64) !void {
+        if (self.options.no_cache or self.options.cached_only or self.options.cache_ttl_seconds == 0 or self.options.cache_dir == null) return;
         var any = false;
         const entries = try a.alloc(?f64, scores.len);
         for (scores, entries) |score, *entry| {
@@ -346,7 +404,7 @@ pub const Client = struct {
         }
         if (!any) return;
         std.Io.Dir.cwd().createDirPath(self.io, self.options.cache_dir.?) catch return;
-        const path = try std.fmt.allocPrint(a, "{s}/batch-v6-{s}", .{ self.options.cache_dir.?, key_hex });
+        const path = try std.fmt.allocPrint(a, "{s}/batch-v7-{s}", .{ self.options.cache_dir.?, key_hex });
         var nonce: [12]u8 = undefined;
         self.io.random(&nonce);
         const suffix = std.fmt.bytesToHex(nonce, .lower);
@@ -355,12 +413,13 @@ pub const Client = struct {
         {
             var file = std.Io.Dir.cwd().createFile(self.io, temporary, .{ .exclusive = true }) catch return;
             defer file.close(self.io);
-            const bytes = try std.json.Stringify.valueAlloc(a, .{ .version = 6, .scores = entries }, .{});
+            const bytes = try std.json.Stringify.valueAlloc(a, .{ .version = 7, .scores = entries, .written = written }, .{});
             file.writeStreamingAll(self.io, bytes) catch return;
         }
         std.Io.Dir.cwd().rename(temporary, .cwd(), path, self.io) catch {};
     }
     fn request(self: *Client, inputs: []const Input, probabilities: []f64) !void {
+        if (self.options.cached_only) return error.DecisionCacheMiss;
         var attempt: usize = 0;
         while (true) {
             self.last_status = 0;
@@ -458,7 +517,7 @@ pub const Client = struct {
         } else if (self.requests >= self.options.max_requests) return error.RequestBudgetExceeded;
         if (self.options.backend == .local) {
             try self.ensureLocal();
-            const provider = self.shared_local orelse &self.local.?;
+            const provider = self.shared_local orelse self.local.?;
             const response = try provider.decide(self.a, body);
             defer self.a.free(response);
             self.requests += 1;

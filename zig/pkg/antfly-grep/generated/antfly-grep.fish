@@ -14,6 +14,7 @@ complete -c antfly-grep -l broad
 complete -c antfly-grep -l byte-offset
 complete -c antfly-grep -l cache-dir -r -a '(__fish_complete_directories)'
 complete -c antfly-grep -l cache-ttl -r
+complete -c antfly-grep -l cached-only
 complete -c antfly-grep -l case-sensitive
 complete -c antfly-grep -l chunk-lines -r
 complete -c antfly-grep -l color -r -f -a 'auto always never ansi'
@@ -93,6 +94,7 @@ complete -c antfly-grep -l max-source-bytes -r
 complete -c antfly-grep -l messages
 complete -c antfly-grep -l mmap
 complete -c antfly-grep -l model -r
+complete -c antfly-grep -l model-revision -r
 complete -c antfly-grep -l models-dir -r -a '(__fish_complete_directories)'
 complete -c antfly-grep -l multiline
 complete -c antfly-grep -l multiline-dotall

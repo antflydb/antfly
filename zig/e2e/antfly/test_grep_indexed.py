@@ -356,3 +356,59 @@ def test_native_grep_certified_candidates_and_legacy_fallback(stateful_api, tmp_
         )
         assert ordinary.returncode == candidates.returncode == 0
         assert ordinary.stdout == candidates.stdout
+
+
+def test_native_grep_narrow_listing_and_content_projection(stateful_api, tmp_path):
+    table = f"grep_projection_{time.time_ns()}"
+    stateful_api.create_table(table)
+    item = document("large.py", "needle FIRST\n" + "padding\n" * 32768)
+    item["grep"]["metadata"] = {"unused": "x" * 262144}
+    denied = document("secret.py", "needle SECRET\n")
+    denied["grep"]["permissions"] = {"public": False, "readers": ["other"]}
+    stateful_api.batch_write(
+        table, inserts={"a": item, "b": denied}, sync_level="full_text"
+    )
+    config = tmp_path / "projection.json"
+    config.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "endpoint": stateful_api.url,
+                "page_size": 1,
+                "max_response_bytes": 4096,
+                "tables": [{"name": table}],
+            }
+        )
+    )
+    env = {
+        k: v
+        for k, v in os.environ.items()
+        if not k.startswith(("ANTFLY_GREP_", "RIPGREP_"))
+    }
+    env.update(HOME=str(tmp_path), XDG_CONFIG_HOME=str(tmp_path))
+    listing = subprocess.run(
+        [grep_binary(), "--no-config", "--table-config", str(config), "--files"],
+        env=env,
+        capture_output=True,
+        timeout=90,
+    )
+    assert listing.returncode == 0, listing.stderr.decode()
+    assert listing.stdout == b"large.py\n"
+    # A finite source ceiling requires content and retains the regular behavior.
+    ceiling = subprocess.run(
+        [
+            grep_binary(),
+            "--no-config",
+            "--table-config",
+            str(config),
+            "--files",
+            "--max-filesize=1k",
+        ],
+        env=env,
+        capture_output=True,
+        timeout=90,
+    )
+    assert ceiling.returncode == 2
+    lexical = run_grep(tmp_path, stateful_api.url, table, "needle")
+    assert lexical.returncode == 0, lexical.stderr.decode()
+    assert b"FIRST" in lexical.stdout and b"SECRET" not in lexical.stdout

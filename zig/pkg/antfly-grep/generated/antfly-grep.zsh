@@ -14,6 +14,7 @@ _arguments -s \
  '--byte-offset[byte-offset]' \
  '--cache-dir[cache-dir]:value:_files -/' \
  '--cache-ttl[cache-ttl]:value:' \
+ '--cached-only[cached-only]' \
  '--case-sensitive[case-sensitive]' \
  '--chunk-lines[chunk-lines]:value:' \
  '--color[color]:value:(auto always never ansi)' \
@@ -93,6 +94,7 @@ _arguments -s \
  '--messages[messages]' \
  '--mmap[mmap]' \
  '--model[model]:value:' \
+ '--model-revision[model-revision]:value:' \
  '--models-dir[models-dir]:value:_files -/' \
  '--multiline[multiline]' \
  '--multiline-dotall[multiline-dotall]' \

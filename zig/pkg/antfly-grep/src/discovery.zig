@@ -512,7 +512,7 @@ pub const Discovery = struct {
             ignored = false;
         }
         var type_included = false;
-        if (!dir) {
+        if (!dir and override != true) {
             type_included = try self.included_types.matches(self.a, std.fs.path.basename(path));
             if (self.options.types.items.len != 0 and !type_included) return false;
             if (try self.excluded_types.matches(self.a, std.fs.path.basename(path))) return false;

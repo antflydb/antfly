@@ -31,15 +31,22 @@ pub const Provenance = struct {
 pub const Document = struct {
     path: []const u8,
     content: []const u8,
+    cache_scope: ?[32]u8 = null,
     provenance: Provenance,
     modified_at: ?i64 = null,
     created_at: ?i64 = null,
     accessed_at: ?i64 = null,
     pub fn parse(value: std.json.Value, table: []const u8, id: []const u8, snapshot: ?[]const u8, now: i64) !Document {
+        return parseSelected(value, table, id, snapshot, now, false);
+    }
+    pub fn parseListing(value: std.json.Value, table: []const u8, id: []const u8, snapshot: ?[]const u8, now: i64) !Document {
+        return parseSelected(value, table, id, snapshot, now, true);
+    }
+    fn parseSelected(value: std.json.Value, table: []const u8, id: []const u8, snapshot: ?[]const u8, now: i64, listing: bool) !Document {
         if (integer(field(value, "version")) != 1) return error.UnsupportedDocumentVersion;
         const path = try string(value, "path");
         if (path.len == 0 or path.len > 16384 or std.mem.indexOfScalar(u8, path, 0) != null) return error.InvalidDocumentPath;
-        const content = try string(value, "content");
+        const content = if (listing) "" else try string(value, "content");
         if (!std.unicode.utf8ValidateSlice(content)) return error.InvalidDocumentEncoding;
         const uri = try string(value, "uri");
         if (uri.len > 16384) return error.InvalidSourceUri;
@@ -54,7 +61,7 @@ pub const Document = struct {
         if (readers != .array) return error.InvalidDocumentPermissions;
         for (readers.array.items) |reader| if (reader != .string) return error.InvalidDocumentPermissions;
         if (field(value, "metadata")) |metadata| if (metadata != .object) return error.InvalidDocumentMetadata;
-        if (field(value, "regions")) |regions| {
+        if (!listing) if (field(value, "regions")) |regions| {
             if (regions != .array) return error.InvalidDocumentRegions;
             const line_count = std.mem.count(u8, content, "\n") + 1;
             for (regions.array.items) |region| {
@@ -62,7 +69,7 @@ pub const Document = struct {
                 const end = integer(field(region, "end_line")) orelse return error.InvalidDocumentRegions;
                 if (start < 1 or end < start or end > line_count) return error.InvalidDocumentRegions;
             }
-        }
+        };
         return .{ .path = path, .content = content, .modified_at = integer(field(value, "modified_at")), .created_at = integer(field(value, "created_at")), .accessed_at = integer(field(value, "accessed_at")), .provenance = .{ .backend = .antfly, .uri = uri, .table = table, .document_id = id, .revision = revision, .indexed_at = indexed_at, .observed_at = now, .snapshot = snapshot, .freshness = .indexed, .metadata = field(value, "metadata"), .source_regions = field(value, "regions") } };
     }
 };

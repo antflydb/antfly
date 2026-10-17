@@ -136,6 +136,23 @@ class DecisionHandler(BaseHTTPRequestHandler):
 
         docs = [doc for doc in docs if candidate_matches(body.get("filter_query"), doc)]
         hits = docs[: body["limit"]]
+        projected = []
+        for hit in hits:
+            selected = {}
+            for field in body["fields"]:
+                parts = field.split(".")
+                value = hit["_source"]
+                for part in parts:
+                    if not isinstance(value, dict) or part not in value:
+                        break
+                    value = value[part]
+                else:
+                    parent = selected
+                    for part in parts[:-1]:
+                        parent = parent.setdefault(part, {})
+                    parent[parts[-1]] = value
+            projected.append({**hit, "_source": selected})
+        hits = projected
         if mode == "cursor" and after:
             hits = self.server.index_documents[:1]
         snapshot = "changed" if mode == "changed" and after else "fixture-snapshot-v1"
@@ -335,6 +352,309 @@ class CliTests(unittest.TestCase):
             "metadata": {"provider": "s3"},
             "regions": [{"start_line": 1, "end_line": 1}],
         }
+
+    def test_positive_globs_override_types_in_local_and_indexed_discovery(self):
+        documents = [
+            self.indexed_doc(path) for path in ("x.py", "x.txt", ".x.py", ".x.txt")
+        ]
+        config = self.table_config(documents, page_size=8)
+        for doc in documents:
+            self.write(doc["path"], doc["content"])
+        for flags, expected in (
+            (["-tpy", "-g", "*.txt"], {"x.txt", ".x.txt"}),
+            (["-Tpy", "-g", "*.py"], {"x.py", ".x.py"}),
+            (["-tpy", "-g", "*"], {"x.py", "x.txt", ".x.py", ".x.txt", "tables.json"}),
+        ):
+            local = self.raw_cli("--files", *flags)
+            self.assertEqual(
+                {p.removeprefix("./") for p in local.stdout.decode().splitlines()},
+                expected,
+            )
+            indexed = self.raw_cli("--files", "--table-config", config, *flags)
+            self.assertEqual(
+                set(indexed.stdout.decode().splitlines()), expected - {"tables.json"}
+            )
+
+    def test_trim_and_color_output_combinations_match_ripgrep(self):
+        oracle = shutil.which("rg")
+        if not oracle:
+            self.skipTest("ripgrep unavailable")
+        for pattern in ("k", "k+", " +", "^", "^|k", "k|$", "a*"):
+            for source in (b"  kk kk\n", b"\tkk\n", b"kk", b"\n"):
+                for flags in (
+                    ["--color=always", "--trim"],
+                    ["--color=always", "-o", "-b"],
+                    ["--color=always", "-o", "-b", "--colors=column:fg:blue"],
+                    ["--color=always", "--max-columns=2"],
+                    ["--color=always", "--trim", "-o"],
+                ):
+                    expected = subprocess.run(
+                        [oracle, *flags, pattern],
+                        input=source,
+                        capture_output=True,
+                        env=self.env,
+                        timeout=5,
+                    )
+                    actual = self.raw_cli(
+                        *flags, pattern, input=source, code=expected.returncode
+                    )
+                    self.assertEqual(
+                        actual.stdout, expected.stdout, (flags, pattern, source)
+                    )
+
+    def test_cached_only_reports_misses_and_never_calls_provider(self):
+        self.write("a.py", "STOP\nnoise\n")
+        args = [
+            *self.decision_args(),
+            "--json",
+            "--unit",
+            "line",
+            "--context-lines=0",
+            "a.py",
+        ]
+        cold = self.raw_cli(*args, "--cached-only", code=2)
+        self.assertIn(b"DecisionCacheMiss", cold.stderr)
+        self.assertEqual(self.server.requests, [])
+        first = self.raw_cli(*args)
+        count = len(self.server.requests)
+        warm = self.raw_cli(*args, "--cached-only", "--max-requests=0")
+        summary = json.loads(warm.stdout.splitlines()[-1])
+        self.assertEqual(summary["requests"], 0)
+        self.assertTrue(summary["stats"]["complete"])
+        self.assertEqual(summary["stats"]["source_cache_hits"], 1)
+        self.assertEqual(len(self.server.requests), count)
+        self.write("a.py", "STOP changed\nnoise\n")
+        partial = self.raw_cli(*args, "--cached-only", code=2)
+        self.assertIn(b"DecisionCacheMiss", partial.stderr)
+        self.assertEqual(len(self.server.requests), count)
+        self.assertIn(b"STOP", first.stdout)
+        for extra in (
+            ["--no-cache"],
+            ["--cache-ttl=0"],
+            ["--pre=cat"],
+            ["--table-config=missing"],
+        ):
+            self.raw_cli(*args, "--cached-only", *extra, code=2)
+        self.assertEqual(len(self.server.requests), count)
+
+    def test_native_warm_cache_does_not_open_inference_library(self):
+        if b"linux-musl static" in self.raw_cli("--version").stdout:
+            self.skipTest("static musl cannot load fixture")
+        library = self.root / Path(NATIVE_LIBRARY).name
+        shutil.copyfile(NATIVE_LIBRARY, library)
+        self.write("a.py", "STOP\nnoise\n" * 16)
+        args = [
+            "--ask",
+            "retry",
+            "--model",
+            "fixture",
+            "--backend=local",
+            "--library",
+            str(library),
+            "--unit=line",
+            "--context-lines=0",
+            "--threads=4",
+            "a.py",
+        ]
+        first = self.raw_cli(*args)
+        library.unlink()
+        self.assertEqual(self.raw_cli(*args).stdout, first.stdout)
+        self.assertEqual(self.raw_cli(*args, "--cached-only").stdout, first.stdout)
+        self.assertEqual(self.server.requests, [])
+        self.write("a.py", "STOP changed\n")
+        self.raw_cli(*args, code=2)
+
+    def test_score_cache_reuses_changed_batch_shapes_and_model_revision(self):
+        self.write("a.txt", "STOP\nnoise\n" * 20)
+        args = [
+            *self.decision_args(),
+            "--unit=line",
+            "--context-lines=0",
+            "--threads=1",
+            "a.txt",
+        ]
+        first = self.raw_cli(*args, "--batch-size=8", "--model-revision=v1")
+        count = len(self.server.requests)
+        second = self.raw_cli(
+            *args, "--batch-size=3", "--model-revision=v1", "--cached-only"
+        )
+        self.assertEqual(second.stdout, first.stdout)
+        self.assertEqual(len(self.server.requests), count)
+        self.raw_cli(*args, "--model-revision=v2", "--cached-only", code=2)
+        self.assertEqual(len(self.server.requests), count)
+        self.assertLessEqual(
+            (self.root / ".cache/antfly-grep/decisions/scores-v1.bin").stat().st_size,
+            4 * 1024 * 1024,
+        )
+
+    def test_source_preparation_cache_reuse_revision_and_corruption(self):
+        self.write("a.py", "def retry():\n    STOP()\n")
+        args = [*self.decision_args(), "--json", "a.py"]
+        self.raw_cli(*args)
+        warm = self.raw_cli(*args)
+        self.assertEqual(
+            json.loads(warm.stdout.splitlines()[-1])["stats"]["source_cache_hits"], 1
+        )
+        records = list((self.root / ".cache/antfly-grep/decisions").glob("source-v1-*"))
+        self.assertEqual(len(records), 1)
+        if os.name != "nt":
+            self.assertEqual(records[0].stat().st_mode & 0o777, 0o600)
+        records[0].write_bytes(b"corrupt")
+        repaired = self.raw_cli(*args)
+        self.assertEqual(
+            json.loads(repaired.stdout.splitlines()[-1])["stats"]["source_cache_hits"],
+            0,
+        )
+        self.assertGreater(records[0].stat().st_size, 64)
+        self.write("a.py", "def retry():\n    STOP_changed()\n")
+        changed = self.raw_cli(*args)
+        self.assertEqual(
+            json.loads(changed.stdout.splitlines()[-1])["stats"]["source_cache_hits"], 0
+        )
+
+    def test_rebatching_preserves_each_scores_original_expiry(self):
+        self.write("a", "STOP\nnoise\n" * 8)
+        args = [
+            *self.decision_args(),
+            "--unit=line",
+            "--context-lines=0",
+            "--threads=1",
+            "--cache-dir=scores",
+            "a",
+        ]
+        self.raw_cli(*args, "--batch-size=8")
+        directory = self.root / "scores"
+        self.raw_cli(*args, "--batch-size=3")
+        for path in directory.glob("batch-v7-*"):
+            data = json.loads(path.read_text())
+            self.assertEqual(data["version"], 7)
+            data["written"] = [
+                1 if score is not None else None for score in data["scores"]
+            ]
+            path.write_text(json.dumps(data))
+        # The file itself is fresh; only the individual evidence is expired.
+        table = directory / "scores-v1.bin"
+        data = bytearray(table.read_bytes())
+        for offset in range(0, len(data), 64):
+            record = data[offset : offset + 64]
+            if len(record) == 64 and any(record[:32]):
+                record[32:40] = (1).to_bytes(8, "little", signed=True)
+                record[48:64] = hashlib.sha256(record[:48]).digest()[:16]
+                data[offset : offset + 64] = record
+        table.write_bytes(data)
+        before = len(self.server.requests)
+        expired = self.raw_cli(*args, "--cached-only", "--batch-size=3", code=2)
+        self.assertIn(b"DecisionCacheMiss", expired.stderr)
+        self.assertEqual(len(self.server.requests), before)
+
+    def test_v6_batches_migrate_without_refreshing_original_evidence_age(self):
+        self.write("a", "STOP\nnoise\n")
+        args = [
+            *self.decision_args(),
+            "--unit=line",
+            "--threads=1",
+            "--cache-dir=scores",
+            "a",
+        ]
+        first = self.raw_cli(*args)
+        directory = self.root / "scores"
+        for path in directory.glob("batch-v7-*"):
+            record = json.loads(path.read_text())
+            old = path.with_name(path.name.replace("batch-v7-", "batch-v6-"))
+            old.write_text(json.dumps({"version": 6, "scores": record["scores"]}))
+            path.unlink()
+        (directory / "scores-v1.bin").unlink(missing_ok=True)
+        count = len(self.server.requests)
+        self.assertEqual(self.raw_cli(*args, "--cached-only").stdout, first.stdout)
+        self.assertEqual(len(self.server.requests), count)
+        for path in directory.glob("batch-v6-*"):
+            os.utime(path, (1, 1))
+        self.raw_cli(*args, "--cached-only", code=2)
+        self.assertEqual(len(self.server.requests), count)
+
+    def test_indexed_projection_avoids_unused_content_and_metadata(self):
+        document = self.indexed_doc("large.py", "STOP\n" + "x" * 262144)
+        document["metadata"] = {"unused": "z" * 262144}
+        config = self.table_config([document], max_response_bytes=2048)
+        listing = self.raw_cli("--table-config", config, "--files")
+        self.assertEqual(listing.stdout, b"large.py\n")
+        fields = self.server.index_requests[0][2]["fields"]
+        self.assertNotIn("grep", fields)
+        self.assertNotIn("grep.content", fields)
+        self.assertIn("grep.permissions", fields)
+        document["content"] = "STOP\n"
+        config = self.table_config([document], max_response_bytes=2048)
+        self.server.index_requests.clear()
+        self.assertIn(b"STOP", self.raw_cli("--table-config", config, "STOP").stdout)
+        self.assertIn("grep.content", self.server.index_requests[0][2]["fields"])
+        self.assertNotIn("grep.metadata", self.server.index_requests[0][2]["fields"])
+
+    def test_indexed_decision_lexical_candidates_preserve_results(self):
+        docs = [
+            self.indexed_doc("a.py", "STOP target\n"),
+            self.indexed_doc("b.py", "irrelevant\n"),
+            self.indexed_doc("c.py", "other\n"),
+        ]
+        config = self.table_config(docs)
+        args = [*self.decision_args(), "--unit=line", "--no-cache", "-F", "-e", "STOP"]
+        first = self.raw_cli("--table-config", config, *args)
+        before = len(self.server.index_requests)
+        config = self.table_config(
+            docs,
+            tables=[
+                {
+                    "name": "source files",
+                    "candidate_index": {"version": 1, "field": "grep_trigrams"},
+                }
+            ],
+        )
+        self.server.index_requests.clear()
+        second = self.raw_cli("--table-config", config, *args)
+        self.assertEqual(second.stdout, first.stdout)
+        self.assertLess(len(self.server.index_requests), before)
+        self.assertIn("filter_query", self.server.index_requests[0][2])
+
+    def test_indexed_cache_scope_tracks_permissions_revision_and_principals(self):
+        docs = [self.indexed_doc()]
+        config = self.table_config(docs)
+        args = ["--table-config", config, *self.decision_args()]
+        self.raw_cli(*args)
+        requests = len(self.server.requests)
+        self.raw_cli(*args)
+        self.assertEqual(len(self.server.requests), requests)
+        self.server.index_documents[0]["_source"]["grep"]["revision"] = "new-version"
+        self.raw_cli(*args)
+        self.assertGreater(len(self.server.requests), requests)
+        requests = len(self.server.requests)
+        self.server.index_documents[0]["_source"]["grep"]["permissions"]["readers"] = [
+            "new-reader"
+        ]
+        self.raw_cli(*args)
+        self.assertGreater(len(self.server.requests), requests)
+        requests = len(self.server.requests)
+        self.server.index_documents[0]["_source"]["grep"]["permissions"]["public"] = (
+            False
+        )
+        self.raw_cli(*args, code=1)
+        self.assertEqual(len(self.server.requests), requests)
+
+    def test_torn_score_table_records_are_cache_misses(self):
+        self.write("a", "STOP\nnoise\n")
+        args = [
+            *self.decision_args(),
+            "--unit=line",
+            "--context-lines=0",
+            "--cache-dir=scores",
+            "a",
+        ]
+        self.raw_cli(*args, "--batch-size=8")
+        table = self.root / "scores/scores-v1.bin"
+        table.write_bytes(b"torn record")
+        # Changed batching avoids the exact-batch tier, forcing table validation.
+        self.raw_cli(*args, "--batch-size=1", "--cached-only", code=2)
+        requests = len(self.server.requests)
+        self.raw_cli(*args, "--batch-size=1")
+        self.assertGreater(len(self.server.requests), requests)
 
     def test_indexed_exact_scan_cursor_provenance_and_lexical_parity(self):
         documents = [
@@ -672,7 +992,7 @@ class CliTests(unittest.TestCase):
             "--table-config", config, "--sort", "modified", "-l", "STOP"
         ).stdout
         self.assertEqual(output, b"b.py\na.py\n")
-        self.assertEqual(self.server.index_requests[0][2]["fields"], ["source.grep"])
+        self.assertIn("source.grep.content", self.server.index_requests[0][2]["fields"])
         self.raw_cli("--table-config", config, "--sort", "created", "STOP", code=2)
 
     def test_indexed_decision_discovery_respects_dependency_directories(self):
@@ -820,6 +1140,15 @@ class CliTests(unittest.TestCase):
         self.assertEqual(len(self.server.requests), requests)
         for cache in (self.root / "scores").iterdir():
             os.utime(cache, (1, 1))
+        table = self.root / "scores/scores-v1.bin"
+        data = bytearray(table.read_bytes())
+        for offset in range(0, len(data), 64):
+            record = data[offset : offset + 64]
+            if len(record) == 64 and any(record[:32]):
+                record[32:40] = (1).to_bytes(8, "little", signed=True)
+                record[48:64] = hashlib.sha256(record[:48]).digest()[:16]
+                data[offset : offset + 64] = record
+        table.write_bytes(data)
         self.raw_cli(*args)
         self.assertGreater(len(self.server.requests), requests)
         requests = len(self.server.requests)
@@ -3862,7 +4191,7 @@ class CliTests(unittest.TestCase):
             "a",
         ]
         first = self.raw_cli(*args)
-        records = list((self.root / "scores").glob("batch-v6-*"))
+        records = list((self.root / "scores").glob("batch-v7-*"))
         self.assertTrue(records)
         self.assertLess(len(records), 32)
         requests = len(self.server.requests)
@@ -3875,12 +4204,14 @@ class CliTests(unittest.TestCase):
             data = json.loads(path.read_text())
             data["scores"][0] = None
             path.write_text(json.dumps(data))
+        (self.root / "scores/scores-v1.bin").unlink(missing_ok=True)
         self.assertEqual(first.stdout, self.raw_cli(*args).stdout)
         self.assertGreater(len(self.server.requests), requests)
         requests = len(self.server.requests)
         # Malformed/version-mismatched records must never supply evidence.
         for path in records:
             path.write_text('{"version":6,"scores":[2]}')
+        (self.root / "scores/scores-v1.bin").unlink(missing_ok=True)
         self.assertEqual(first.stdout, self.raw_cli(*args).stdout)
         self.assertGreater(len(self.server.requests), requests)
         self.assertFalse(list((self.root / "scores").glob("*.tmp")))
@@ -3929,7 +4260,7 @@ class CliTests(unittest.TestCase):
         self.server.requests.clear()
         self.assertEqual(expected, self.raw_cli(*args).stdout)
         self.assertEqual(len(self.server.requests), 0)
-        self.assertTrue(list(directory.glob("batch-v6-*")))
+        self.assertTrue(list(directory.glob("batch-v7-*")))
         for path in set(legacy):
             path.unlink()
         self.assertEqual(expected, self.raw_cli(*args).stdout)

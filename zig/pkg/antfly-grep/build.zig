@@ -41,6 +41,41 @@ pub fn addConfigured(b: *std.Build, target: std.Build.ResolvedTarget, optimize: 
     const syntax_codegen = b.addOptions();
     syntax_codegen.addOption(bool, "source_maps", false);
     syntax.addImport("codegen_options", syntax_codegen.createModule());
+    // Cache ABI includes every parser/grammar byte, projection code and Zig's
+    // compiler version. Source caches cannot outlive a parser implementation.
+    var parser_hash = std.crypto.hash.sha2.Sha256.init(.{});
+    parser_hash.update(@import("builtin").zig_version_string);
+    const cache_io = b.graph.io;
+    var parser_dir = b.root.openDir(cache_io, "lib/syntax/src", .{ .iterate = true }) catch @panic("open native parser sources");
+    defer parser_dir.close(cache_io);
+    var walker = parser_dir.walk(b.allocator) catch @panic("walk native parser sources");
+    defer walker.deinit();
+    b.dependOnDirectoryContents(b.path("lib/syntax/src"));
+    var parser_paths: std.ArrayList([]const u8) = .empty;
+    while (walker.next(cache_io) catch @panic("read parser paths")) |entry| if (entry.kind == .file) {
+        b.dependOnFileContents(b.path(b.fmt("lib/syntax/src/{s}", .{entry.path})));
+        parser_paths.append(b.allocator, b.allocator.dupe(u8, entry.path) catch @panic("parser path allocation")) catch @panic("parser path allocation");
+    } else if (entry.kind == .directory) {
+        b.dependOnDirectoryContents(b.path(b.fmt("lib/syntax/src/{s}", .{entry.path})));
+    };
+    std.mem.sort([]const u8, parser_paths.items, {}, struct {
+        fn less(_: void, lhs: []const u8, rhs: []const u8) bool {
+            return std.mem.order(u8, lhs, rhs) == .lt;
+        }
+    }.less);
+    for (parser_paths.items) |path| {
+        const bytes = parser_dir.readFileAlloc(cache_io, path, b.allocator, .limited(64 * 1024 * 1024)) catch @panic("read parser source");
+        parser_hash.update(path);
+        parser_hash.update(&.{0});
+        parser_hash.update(bytes);
+        b.allocator.free(bytes);
+    }
+    parser_hash.update(@embedFile("src/source.zig"));
+    var parser_digest: [32]u8 = undefined;
+    parser_hash.final(&parser_digest);
+    const cache_options = b.addOptions();
+    cache_options.addOption([32]u8, "parser_digest", parser_digest);
+    lib.addImport("grep_cache_options", cache_options.createModule());
     lib.addImport("antfly_syntax", syntax);
     lib.addImport("antfly_regex", regex);
     lib.addImport("httpx", http);

@@ -129,6 +129,8 @@ pub const Options = struct {
     queries: std.ArrayList([]const u8) = .empty,
     cache_ttl_seconds: u64 = 86400,
     no_cache: bool = false,
+    cached_only: bool = false,
+    model_revision: ?[]const u8 = null,
     cache_dir: ?[]const u8 = null,
     cache_clear: bool = false,
     refine: bool = true,
@@ -373,6 +375,7 @@ pub const Options = struct {
                     .{ "--one-file-system", "one_file_system" },
                     .{ "--type-list", "type_list" },
                     .{ "--no-cache", "no_cache" },
+                    .{ "--cached-only", "cached_only" },
                     .{ "--triage", "triage" },
                     .{ "--broad", "broad" },
                     .{ "--refine", "refine" },
@@ -563,7 +566,7 @@ pub const Options = struct {
                     self.max_requests = if (std.mem.eql(u8, value, "unlimited")) std.math.maxInt(usize) else try number(value);
                 } else if (std.mem.eql(u8, name, "--max-source-bytes")) {
                     if (self.jev_mode) self.source_excerpt_bytes = unlimited(try size(value)) else self.max_source_bytes = unlimited(try size(value));
-                } else if (std.mem.eql(u8, name, "--max-output-bytes")) self.max_output_bytes = unlimited(try size(value)) else if (std.mem.eql(u8, name, "--cache-dir")) self.cache_dir = value else if (std.mem.eql(u8, name, "--base-url")) self.endpoint = value else if (std.mem.eql(u8, name, "--query")) try self.queries.append(a, value) else if (std.mem.eql(u8, name, "--exclude")) try self.exclude.append(a, value) else if (std.mem.eql(u8, name, "--only")) try self.only.append(a, value) else if (std.mem.eql(u8, name, "--not")) try self.not.append(a, value) else if (std.mem.eql(u8, name, "--file")) try self.pattern_files.append(a, value) else if (std.mem.eql(u8, name, "--ignore-file")) try self.ignore_files.append(a, value) else if (std.mem.eql(u8, name, "--type")) try self.types.append(a, value) else if (std.mem.eql(u8, name, "--type-not")) try self.types_not.append(a, value) else if (std.mem.eql(u8, name, "--type-add")) try self.type_add.append(a, value) else if (std.mem.eql(u8, name, "--iglob")) {
+                } else if (std.mem.eql(u8, name, "--model-revision")) self.model_revision = value else if (std.mem.eql(u8, name, "--max-output-bytes")) self.max_output_bytes = unlimited(try size(value)) else if (std.mem.eql(u8, name, "--cache-dir")) self.cache_dir = value else if (std.mem.eql(u8, name, "--base-url")) self.endpoint = value else if (std.mem.eql(u8, name, "--query")) try self.queries.append(a, value) else if (std.mem.eql(u8, name, "--exclude")) try self.exclude.append(a, value) else if (std.mem.eql(u8, name, "--only")) try self.only.append(a, value) else if (std.mem.eql(u8, name, "--not")) try self.not.append(a, value) else if (std.mem.eql(u8, name, "--file")) try self.pattern_files.append(a, value) else if (std.mem.eql(u8, name, "--ignore-file")) try self.ignore_files.append(a, value) else if (std.mem.eql(u8, name, "--type")) try self.types.append(a, value) else if (std.mem.eql(u8, name, "--type-not")) try self.types_not.append(a, value) else if (std.mem.eql(u8, name, "--type-add")) try self.type_add.append(a, value) else if (std.mem.eql(u8, name, "--iglob")) {
                     try self.iglobs.append(a, value);
                     try self.glob_order.append(a, .{ .pattern = value, .insensitive = true });
                 } else if (std.mem.eql(u8, name, "--color")) self.color = if (std.mem.eql(u8, value, "ansi")) .always else std.meta.stringToEnum(@TypeOf(self.color), value) orelse return error.InvalidColor else if (std.mem.eql(u8, name, "--sort") or std.mem.eql(u8, name, "--sortr")) {
@@ -705,11 +708,12 @@ pub const Options = struct {
         if (self.backend == .typesafe and self.model == null) self.model = "jev-latest";
         if (self.ask != null and self.model == null) return error.DecisionModelRequired;
         if (!std.math.isFinite(self.threshold) or self.threshold < 0 or self.threshold > 1 or self.chunk_lines == 0 or self.batch_size == 0 or self.batch_size > 128 or self.timeout_ms == 0 or (self.max_file_bytes == 0 and !self.skip_oversize)) return error.InvalidNumber;
+        if (self.cached_only and (self.ask == null or self.no_cache or self.cache_ttl_seconds == 0 or self.table_config != null or self.pre != null or self.hostname_bin != null)) return error.ConflictingCachedOnlyFlags;
         if (self.files and (self.patterns.items.len > 0 or self.ask != null)) return error.ConflictingFlags;
         if (self.tables.items.len > 0 and self.table_config == null) return error.TableConfigRequired;
         if (self.max_index_documents == 0 or self.max_pending_output == 0) return error.InvalidNumber;
         if (self.table_config != null and self.inventory) return error.UnsupportedIndexedInventory;
-        if (self.jobs > 256 or self.max_requests == 0) return error.InvalidNumber;
+        if (self.jobs > 256 or (self.max_requests == 0 and !self.cached_only)) return error.InvalidNumber;
 
         if (self.column and !self.line_numbers_explicit) self.line_numbers = true;
 

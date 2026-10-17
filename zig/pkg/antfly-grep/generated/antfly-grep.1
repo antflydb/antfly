@@ -66,6 +66,8 @@ Use '-' for stdin; '--' ends option parsing.
       --models-dir PATH     Local model directory
       --cache-ttl SECONDS  Score cache lifetime (86400; 0 bypasses)
       --no-cache            Bypass persistent decision score cache
+      --cached-only         Use cached decisions; no provider calls or table reads
+      --model-revision ID   Include a pinned model generation in cache identity
       --no-refine           Retain accepted declaration/block regions
       --no-rank             Emit source order instead of score ranking
       --triage              Enable model-based directory pruning
@@ -134,6 +136,9 @@ See antfly-grep --help and the package README for semantics.
 See antfly-grep --help and the package README for semantics.
 .TP
 .B --cache-ttl
+See antfly-grep --help and the package README for semantics.
+.TP
+.B --cached-only
 See antfly-grep --help and the package README for semantics.
 .TP
 .B --case-sensitive
@@ -371,6 +376,9 @@ See antfly-grep --help and the package README for semantics.
 See antfly-grep --help and the package README for semantics.
 .TP
 .B --model
+See antfly-grep --help and the package README for semantics.
+.TP
+.B --model-revision
 See antfly-grep --help and the package README for semantics.
 .TP
 .B --models-dir
