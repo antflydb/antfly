@@ -1123,3 +1123,12 @@ normalization/residual/scaling kernels with explicit BF16 rounding boundaries.
 It changes `model_identity` and remains opt-in pending NVIDIA qualification.
 The BF16 native vision implementation also versions its existing opt-in identity;
 reload and qualify models before using the resulting pin.
+
+
+CUDA `PACKED_PROJECTIONS`, `GRAPH_REPLAY` and `EXTENDED_FLASH` opt-in profiles
+carry updated identities for bounded grouped PLE, cohort replay and portable
+WMMA tail padding. Reload and qualify the new pins before use. Graph replay is
+bounded to four items, 4096 padded rows and four 128-MiB arenas; grouped PLE uses
+at most 16 MiB of output scratch. BF16 composition avoids F32 widening for hard
+tokens and batched input storage. These implementation changes do not establish
+NVIDIA speedups without hardware measurements.

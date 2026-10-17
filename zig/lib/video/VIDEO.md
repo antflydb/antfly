@@ -579,3 +579,11 @@ packing preserves the existing F32 arithmetic and conversion boundary, while the
 native head-64 kernel stores BF16 output directly for projection. This removes
 per-layer whole-tensor F32 bridges without changing the tiled attention reduction.
 The opt-in native-vision identity is versioned for the typed BF16 implementation.
+
+
+CUDA media cohorts pack composed BF16 rows directly for the text backbone.
+Resident F32 video producers remain accepted and convert directly into the final
+BF16 encoder arena, including zero padding. Optional graph replay supports up to
+four items and 4096 padded rows, with shape-specific addresses, bounded retained
+admission and synchronized eviction. Grouped immutable PLE projections use a
+16-MiB output budget rather than retaining all 24 layers for long contexts.

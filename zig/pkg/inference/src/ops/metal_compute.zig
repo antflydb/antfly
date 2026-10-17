@@ -15524,9 +15524,22 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         defer input_mt.deinit();
         var weight_mt = (try self.gemma4AudioDeviceOperand(weight)) orelse return null;
         defer weight_mt.deinit();
-        if (try metal_runtime.decoderRuntimeGemma4AudioDepthwiseConv(self.provider_impl, input_mt, weight_mt, rows, dim, kernel_size)) |tensor| {
+        if (try metal_runtime.decoderRuntimeGemma4AudioDepthwiseConv(self.provider_impl, input_mt, weight_mt, rows, dim, kernel_size, null)) |tensor| {
             return self.ctFromOwnedMetalTensor(tensor);
         }
+        return null;
+    }
+
+    fn depthwiseCausalConv1dSegmentedOp(ctx: *anyopaque, input: CT, weight: CT, starts: CT, rows: usize, dim: usize, kernel_size: usize) anyerror!?CT {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        if (disableRuntimeElementwise()) return null;
+        var im = (try self.gemma4AudioDeviceOperand(input)) orelse return null;
+        defer im.deinit();
+        var wm = (try self.gemma4AudioDeviceOperand(weight)) orelse return null;
+        defer wm.deinit();
+        var sm = (try self.gemma4AudioDeviceOperand(starts)) orelse return null;
+        defer sm.deinit();
+        if (try metal_runtime.decoderRuntimeGemma4AudioDepthwiseConv(self.provider_impl, im, wm, rows, dim, kernel_size, sm)) |tensor| return self.ctFromOwnedMetalTensor(tensor);
         return null;
     }
 
@@ -15589,7 +15602,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             .k_scale = params.k_scale,
             .logit_cap = params.logit_cap,
             .invalid_value = params.invalid_value,
-            .reserved = @intFromBool(params.exclude_farthest_key),
+            .reserved = @as(u32, @intFromBool(params.exclude_farthest_key)) | (@as(u32, @intFromBool(params.segmented)) << 1),
         };
         if (try metal_runtime.decoderRuntimeGemma4AudioLocalAttention(self.provider_impl, q_mt, k_mt, v_mt, rel_mt, scales_mt, valid_mt, raw)) |tensor| {
             return self.ctFromOwnedMetalTensor(tensor);
@@ -33286,6 +33299,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         vt.clampScalar = clampScalarOp;
         vt.gluRows = gluRowsOp;
         vt.depthwiseCausalConv1d = depthwiseCausalConv1dOp;
+        vt.depthwiseCausalConv1dSegmented = depthwiseCausalConv1dSegmentedOp;
         vt.flattenChannelsTimeFreq = flattenChannelsTimeFreqOp;
         vt.channelLayerNormRelu = channelLayerNormReluOp;
         vt.gemma4AudioLocalAttention = gemma4AudioLocalAttentionOp;

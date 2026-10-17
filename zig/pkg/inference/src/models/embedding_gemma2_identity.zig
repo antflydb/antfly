@@ -36,6 +36,9 @@ pub fn forCudaPolicy(artifact_identity: [64]u8, policy: @import("../ops/cuda/emb
         hash.update("\x00optimized-v1");
         hash.update(&.{policy.arithmeticBits()});
     }
+    if (policy.extended_flash) hash.update("\x00extended-padding-v2");
+    if (policy.packed_projections) hash.update("\x00packed-ple-v2");
+    if (policy.graph_replay) hash.update("\x00cohort-graphs-v2");
     if (policy.native_vision) hash.update("\x00native-vision-bf16-v2");
     hash.update(&.{0});
     hash.update(&artifact_identity);

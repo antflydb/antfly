@@ -49,6 +49,7 @@ pub const Stats = struct {
     fused_vision_launches: u64 = 0,
     extended_flash_launches: u64 = 0,
     fused_backbone_launches: u64 = 0,
+    packed_ple_groups: u64 = 0,
 };
 
 pub const Contrastive = struct {
@@ -87,6 +88,7 @@ pub const Module = struct {
     split_columns: driver.CUfunction,
     vision_rope_pack: driver.CUfunction,
     native_vision: driver.CUfunction,
+    audio_segment_conv: driver.CUfunction,
     norm_residual: driver.CUfunction,
     scale_rms: driver.CUfunction,
     attention: driver.CUfunction,
@@ -151,6 +153,7 @@ pub const Module = struct {
             .training_rope_vjp = try function(ctx, m, "termite_embedding_gemma2_training_rope_vjp_f32"),
             .split_columns = try function(ctx, m, "termite_embedding_gemma2_split_columns_bf16"),
             .vision_rope_pack = try function(ctx, m, "termite_embedding_gemma2_vision_rope_pack_bf16"),
+            .audio_segment_conv = try function(ctx, m, "termite_embedding_gemma2_audio_segment_conv_f32"),
             .native_vision = try function(ctx, m, "termite_embedding_gemma2_native_vision_bf16"),
             .norm_residual = try function(ctx, m, "termite_embedding_gemma2_norm_residual_bf16"),
             .scale_rms = try function(ctx, m, "termite_embedding_gemma2_scale_rms_bf16"),
@@ -305,10 +308,11 @@ pub const Module = struct {
         var chunk: u32 = @intCast(p.chunk);
         var left: u32 = @intCast(p.context_left);
         var context: u32 = @intCast(p.context);
+        var flags: u32 = @as(u32, @intFromBool(p.exclude_farthest_key)) | (@as(u32, @intFromBool(p.segmented)) << 1);
         var ks = p.k_scale;
         var cap = p.logit_cap;
         var invalid = p.invalid_value;
-        var args = [_]?*anyopaque{ @ptrCast(&op), @ptrCast(&qp), @ptrCast(&kp), @ptrCast(&vp), @ptrCast(&rp), @ptrCast(&sp), @ptrCast(&mp), @ptrCast(&rows), @ptrCast(&hidden), @ptrCast(&heads), @ptrCast(&hd), @ptrCast(&chunk), @ptrCast(&left), @ptrCast(&context), @ptrCast(&ks), @ptrCast(&cap), @ptrCast(&invalid) };
+        var args = [_]?*anyopaque{ @ptrCast(&op), @ptrCast(&qp), @ptrCast(&kp), @ptrCast(&vp), @ptrCast(&rp), @ptrCast(&sp), @ptrCast(&mp), @ptrCast(&rows), @ptrCast(&hidden), @ptrCast(&heads), @ptrCast(&hd), @ptrCast(&chunk), @ptrCast(&left), @ptrCast(&context), @ptrCast(&ks), @ptrCast(&cap), @ptrCast(&invalid), @ptrCast(&flags) };
         try launch(ctx, self.audio_attention, &args, .{ rows, heads, 1 }, .{ 32, 1, 1 });
         self.stats_.launches += 1;
         self.stats_.attention_launches += 1;
@@ -381,6 +385,29 @@ pub const Module = struct {
         try self.launch1d(ctx, self.lookup, &args, count);
     }
 
+    pub fn notePackedPle(self: *Module) void {
+        self.stats_.packed_ple_groups += 1;
+    }
+
+    pub fn launchAudioSegmentConv(self: *Module, ctx: *Context, output: Buffer, input: Buffer, weight: Buffer, starts: Buffer, rows: u32, dim: u32, kernel_size: u32) !void {
+        if (rows == 0 or dim == 0 or kernel_size == 0) return error.InvalidEmbeddingGemma2Shape;
+        const count = try std.math.mul(usize, rows, dim);
+        if (count > std.math.maxInt(u32)) return error.InvalidEmbeddingGemma2Shape;
+        try require(output, count * 4);
+        try require(input, count * 4);
+        try require(starts, @as(usize, rows) * 4);
+        try require(weight, try std.math.mul(usize, try std.math.mul(usize, dim, kernel_size), 4));
+        var op = output.ptr;
+        var ip = input.ptr;
+        var wp = weight.ptr;
+        var sp = starts.ptr;
+        var r = rows;
+        var d = dim;
+        var k = kernel_size;
+        var args = [_]?*anyopaque{ @ptrCast(&op), @ptrCast(&ip), @ptrCast(&wp), @ptrCast(&sp), @ptrCast(&r), @ptrCast(&d), @ptrCast(&k) };
+        try self.launch1d(ctx, self.audio_segment_conv, &args, count);
+    }
+
     pub fn launchNormResidual(self: *Module, ctx: *Context, hidden: Buffer, next: Buffer, branch: Buffer, post_weight: Buffer, next_weight: ?Buffer, scalar: ?Buffer, rows: u32, width: u32, eps: f32) !void {
         if (rows == 0 or width == 0 or !std.math.isFinite(eps) or eps <= 0) return error.InvalidEmbeddingGemma2Shape;
         const bytes = try std.math.mul(usize, try std.math.mul(usize, rows, width), 2);
@@ -408,10 +435,14 @@ pub const Module = struct {
         self.stats_.fused_backbone_launches += 1;
     }
     pub fn launchScaleRms(self: *Module, ctx: *Context, output: Buffer, input: Buffer, weight: Buffer, rows: u32, width: u32, scale: f32, eps: f32) !void {
-        if (rows == 0 or width == 0 or !std.math.isFinite(eps) or eps <= 0 or !std.math.isFinite(scale)) return error.InvalidEmbeddingGemma2Shape;
+        return self.launchScaleRmsStrided(ctx, output, input, weight, rows, width, width, scale, eps);
+    }
+    /// Read a packed layer directly, retaining GEMM and scaled BF16 boundaries.
+    pub fn launchScaleRmsStrided(self: *Module, ctx: *Context, output: Buffer, input: Buffer, weight: Buffer, rows: u32, width: u32, input_stride: u32, scale: f32, eps: f32) !void {
+        if (rows == 0 or width == 0 or input_stride < width or (input_stride != width and output.ptr == input.ptr) or !std.math.isFinite(eps) or eps <= 0 or !std.math.isFinite(scale)) return error.InvalidEmbeddingGemma2Shape;
         const bytes = try std.math.mul(usize, try std.math.mul(usize, rows, width), 2);
         try require(output, bytes);
-        try require(input, bytes);
+        try require(input, try std.math.mul(usize, try std.math.add(usize, try std.math.mul(usize, rows - 1, input_stride), width), 2));
         try require(weight, @as(usize, width) * 2);
         var op = output.ptr;
         var ip = input.ptr;
@@ -420,7 +451,8 @@ pub const Module = struct {
         var w = width;
         var v = scale;
         var e = eps;
-        var args = [_]?*anyopaque{ @ptrCast(&op), @ptrCast(&ip), @ptrCast(&wp), @ptrCast(&r), @ptrCast(&w), @ptrCast(&v), @ptrCast(&e) };
+        var stride = input_stride;
+        var args = [_]?*anyopaque{ @ptrCast(&op), @ptrCast(&ip), @ptrCast(&wp), @ptrCast(&r), @ptrCast(&w), @ptrCast(&v), @ptrCast(&e), @ptrCast(&stride) };
         try launch(ctx, self.scale_rms, &args, .{ rows, 1, 1 }, .{ 256, 1, 1 });
         self.stats_.launches += 1;
         self.stats_.fused_backbone_launches += 1;
@@ -1246,46 +1278,63 @@ test "embeddinggemma2 CUDA extended flash matches scalar attention with mask hol
     const allocator = std.testing.allocator;
     var module = try Module.init(&ctx);
     defer module.deinit(&ctx);
-    for ([_]u32{ 64, 65, 129, 513 }) |sequence| {
-        for ([_]bool{ false, true }) |local| {
-            const shape = Attention{ .batch = 2, .seq = sequence, .q_heads = 4, .kv_heads = if (local) 2 else 1, .head_dim = if (local) 256 else 512, .local_radius = if (local) 512 else 0 };
-            const q_count = @as(usize, shape.batch) * sequence * shape.q_heads * shape.head_dim;
-            const kv_count = @as(usize, shape.batch) * sequence * shape.kv_heads * shape.head_dim;
-            const host = try allocator.alloc(u16, q_count);
-            defer allocator.free(host);
-            for (host, 0..) |*value, i| value.* = @truncate(@as(u32, @bitCast(@as(f32, @floatFromInt(i % 31)) / 64 - 0.25)) >> 16);
-            const masks = try allocator.alloc(i64, shape.batch * sequence);
-            defer allocator.free(masks);
-            for (masks, 0..) |*value, i| value.* = @intFromBool(i % 17 != 0 and i % sequence < sequence - 3);
-            var q = try Buffer.alloc(&ctx, q_count * 2);
-            defer q.free(&ctx);
-            var k = try Buffer.alloc(&ctx, kv_count * 2);
-            defer k.free(&ctx);
-            var v = try Buffer.alloc(&ctx, kv_count * 2);
-            defer v.free(&ctx);
-            var mask = try Buffer.alloc(&ctx, masks.len * 8);
-            defer mask.free(&ctx);
-            var expected = try Buffer.alloc(&ctx, q_count * 2);
-            defer expected.free(&ctx);
-            var actual = try Buffer.alloc(&ctx, q_count * 2);
-            defer actual.free(&ctx);
-            try q.copyFromHost(&ctx, std.mem.sliceAsBytes(host));
-            try k.copyFromHost(&ctx, std.mem.sliceAsBytes(host[0..kv_count]));
-            try v.copyFromHost(&ctx, std.mem.sliceAsBytes(host[0..kv_count]));
-            try mask.copyFromHost(&ctx, std.mem.sliceAsBytes(masks));
-            try module.launchAttention(&ctx, expected, q, k, v, mask, shape);
-            try module.launchLocalFlashAttention(&ctx, actual, q, k, v, mask, shape);
-            const reference = try allocator.alloc(u16, q_count);
-            defer allocator.free(reference);
-            const result = try allocator.alloc(u16, q_count);
-            defer allocator.free(result);
-            try expected.copyToHost(&ctx, std.mem.sliceAsBytes(reference));
-            try actual.copyToHost(&ctx, std.mem.sliceAsBytes(result));
-            try ctx.synchronize();
-            for (reference, result) |want, got| {
-                const x: f32 = @bitCast(@as(u32, want) << 16);
-                const y: f32 = @bitCast(@as(u32, got) << 16);
-                try std.testing.expectApproxEqAbs(x, y, 0.005);
+    for ([_]u32{ 64, 65, 129, 512, 513, 1024, 2048, 8192 }) |sequence| {
+        for ([_]u32{ 1, 2, 4 }) |batch| {
+            for (0..3) |mask_kind| {
+                for ([_]bool{ false, true }) |local| {
+                    const shape = Attention{ .batch = batch, .seq = sequence, .q_heads = 4, .kv_heads = if (local) 2 else 1, .head_dim = if (local) 256 else 512, .local_radius = if (local) 512 else 0 };
+                    const q_count = @as(usize, shape.batch) * sequence * shape.q_heads * shape.head_dim;
+                    const kv_count = @as(usize, shape.batch) * sequence * shape.kv_heads * shape.head_dim;
+                    const host = try allocator.alloc(u16, q_count);
+                    defer allocator.free(host);
+                    for (host, 0..) |*value, i| value.* = @truncate(@as(u32, @bitCast(@as(f32, @floatFromInt(i % 31)) / 64 - 0.25)) >> 16);
+                    const masks = try allocator.alloc(i64, shape.batch * sequence);
+                    defer allocator.free(masks);
+                    for (masks, 0..) |*value, i| value.* = @intFromBool(switch (mask_kind) {
+                        0 => true,
+                        1 => i % sequence < sequence - @as(u32, @intCast(3 + i / sequence)),
+                        else => i % 17 != 0 and i % sequence < sequence - 3,
+                    });
+                    var q = try Buffer.alloc(&ctx, q_count * 2);
+                    defer q.free(&ctx);
+                    var k = try Buffer.alloc(&ctx, kv_count * 2);
+                    defer k.free(&ctx);
+                    var v = try Buffer.alloc(&ctx, kv_count * 2);
+                    defer v.free(&ctx);
+                    var mask = try Buffer.alloc(&ctx, masks.len * 8);
+                    defer mask.free(&ctx);
+                    var expected = try Buffer.alloc(&ctx, q_count * 2);
+                    defer expected.free(&ctx);
+                    var actual = try Buffer.alloc(&ctx, q_count * 2);
+                    defer actual.free(&ctx);
+                    try q.copyFromHost(&ctx, std.mem.sliceAsBytes(host));
+                    try k.copyFromHost(&ctx, std.mem.sliceAsBytes(host[0..kv_count]));
+                    try v.copyFromHost(&ctx, std.mem.sliceAsBytes(host[0..kv_count]));
+                    try mask.copyFromHost(&ctx, std.mem.sliceAsBytes(masks));
+                    try ctx.synchronize();
+                    const clock = std.testing.io;
+                    const reference_start = std.Io.Clock.awake.now(clock);
+                    try module.launchAttention(&ctx, expected, q, k, v, mask, shape);
+                    try ctx.synchronize();
+                    const reference_ns = std.Io.Clock.awake.now(clock).nanoseconds - reference_start.nanoseconds;
+                    const candidate_start = std.Io.Clock.awake.now(clock);
+                    try module.launchLocalFlashAttention(&ctx, actual, q, k, v, mask, shape);
+                    try ctx.synchronize();
+                    const candidate_ns = std.Io.Clock.awake.now(clock).nanoseconds - candidate_start.nanoseconds;
+                    std.debug.print("embeddinggemma2 attention_qualification batch={} sequence={} local={} mask={} exact_ns={} flash_ns={}\n", .{ batch, sequence, local, mask_kind, reference_ns, candidate_ns });
+                    const reference = try allocator.alloc(u16, q_count);
+                    defer allocator.free(reference);
+                    const result = try allocator.alloc(u16, q_count);
+                    defer allocator.free(result);
+                    try expected.copyToHost(&ctx, std.mem.sliceAsBytes(reference));
+                    try actual.copyToHost(&ctx, std.mem.sliceAsBytes(result));
+                    try ctx.synchronize();
+                    for (reference, result) |want, got| {
+                        const x: f32 = @bitCast(@as(u32, want) << 16);
+                        const y: f32 = @bitCast(@as(u32, got) << 16);
+                        try std.testing.expectApproxEqAbs(x, y, 0.005);
+                    }
+                }
             }
         }
     }

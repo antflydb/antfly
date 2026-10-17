@@ -615,6 +615,7 @@ CUDA_ROUTES = {
     "batched_vision": "vision_batched_executes_total",
     "native_vision": "native_vision_launches_total",
     "media_batch": "media_batches_total",
+    "packed_ple": "packed_ple_groups_total",
     "fused_backbone": "fused_backbone_launches_total",
 }
 

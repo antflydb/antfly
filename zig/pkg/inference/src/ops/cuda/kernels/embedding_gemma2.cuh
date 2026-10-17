@@ -83,19 +83,20 @@ extern "C" __global__ void termite_gemma4_audio_local_attention_f32(
     const float* rel, const float* q_scales, const float* valid,
     unsigned int rows, unsigned int hidden, unsigned int heads,
     unsigned int head_dim, unsigned int chunk, unsigned int context_left,
-    unsigned int context, float k_scale, float logit_cap, float invalid_value) {
+    unsigned int context, float k_scale, float logit_cap, float invalid_value, unsigned int flags) {
     unsigned int lane = threadIdx.x;
     unsigned int query = blockIdx.x, head = blockIdx.y;
     if (query >= rows || head >= heads || lane >= 32u) return;
     size_t out_base = (size_t)query * hidden + (size_t)head * head_dim;
-    if (valid[query] == 0.0f) {
+    if ((flags & 2u) ? valid[query] <= 0.0f : valid[query] == 0.0f) {
         for (unsigned int d = lane; d < head_dim; d += 32u) out[out_base + d] = 0.0f;
         return;
     }
     float scores[24];
     #pragma unroll
     for (unsigned int i = 0; i < 24; ++i) scores[i] = invalid_value;
-    unsigned int block_start = (query / chunk) * chunk;
+    unsigned int clip_start = (flags & 2u) ? (unsigned int)valid[query] - 1u : 0u;
+    unsigned int block_start = clip_start + ((query - clip_start) / chunk) * chunk;
     unsigned int q_off = query - block_start;
     unsigned int past = context_left - 1u;
     float max_score = -INFINITY;
@@ -105,8 +106,8 @@ extern "C" __global__ void termite_gemma4_audio_local_attention_f32(
         // Official sliding mask uses distance < (context_left - 1), so a
         // distance exactly equal to `past` is excluded.
         if (rel_idx < 0 || rel_idx >= (int)context_left || key_idx < 0 ||
-            key_idx >= (int)rows || valid[key_idx] == 0.0f || key_idx > (int)query ||
-            query - (unsigned int)key_idx >= past) continue;
+            key_idx >= (int)rows || ((flags & 2u) ? valid[key_idx] != valid[query] : valid[key_idx] == 0.0f) || key_idx > (int)query ||
+            query - (unsigned int)key_idx > past - (flags & 1u)) continue;
         float score = 0.0f;
         size_t qb = (size_t)query * hidden + (size_t)head * head_dim;
         size_t kb = (size_t)key_idx * hidden + (size_t)head * head_dim;
@@ -134,6 +135,8 @@ extern "C" __global__ void termite_gemma4_audio_local_attention_f32(
         for (unsigned int c = 0; c < context; ++c) {
             int key_idx = (int)block_start + (int)c - (int)past;
             if (key_idx < 0 || key_idx >= (int)rows) continue;
+            if ((flags & 2u) ? valid[key_idx] != valid[query] : valid[key_idx] == 0.0f) continue;
+            if (key_idx > (int)query || query - (unsigned int)key_idx > past - (flags & 1u)) continue;
             value += (scores[c] / denominator) * v[(size_t)key_idx * hidden + (size_t)head * head_dim + d];
         }
         out[out_base + d] = denominator > 0.0f ? value : 0.0f;

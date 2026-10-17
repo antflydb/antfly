@@ -777,6 +777,8 @@ pub const Gemma4AudioLocalAttentionParams = struct {
     invalid_value: f32,
     /// HF Gemma4 audio masking uses distance < context_left - 1.
     exclude_farthest_key: bool = false,
+    /// Segmented entries carry +/- (clip_start + 1); negative is invalid.
+    segmented: bool = false,
 };
 pub const DecoderRuntimeApplyActivationRequest = backend_contracts.DecoderRuntimeApplyActivationRequest;
 pub const DecoderRuntimeApplyGeluBackwardRequest = backend_contracts.DecoderRuntimeApplyGeluBackwardRequest;
@@ -2006,6 +2008,8 @@ pub const ComputeBackend = struct {
 
         /// Gemma 4 audio conformer chunked local attention with relative
         /// position bias; see `Gemma4AudioLocalAttentionParams`.
+        /// Starts has one exact F32 clip start index per row; no cross-clip taps.
+        depthwiseCausalConv1dSegmented: ?*const fn (ctx: *anyopaque, input: CT, weight: CT, starts: CT, rows: usize, dim: usize, kernel_size: usize) anyerror!?CT = null,
         gemma4AudioLocalAttention: ?*const fn (ctx: *anyopaque, q: CT, k: CT, v: CT, rel: CT, q_dim_scales: CT, valid: CT, params: Gemma4AudioLocalAttentionParams) anyerror!?CT = null,
 
         /// Y = X + value. Backends may keep scalar adds on device; callers

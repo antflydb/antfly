@@ -1213,15 +1213,15 @@ pending NVIDIA hardware qualification.
 |---|---|
 | `EXTENDED_FLASH=1` | cuDNN global/local plans when available, otherwise bundled BF16 WMMA tiles across supported sequence lengths and SM80–SM120; masks and scalar tile tails remain explicit. Portable SM75 PTX never enters an empty WMMA body. |
 | `FUSED_VISION=1` | Fused F32 rotary/Q-scaling math directly into BF16 attention inputs, BF16 SDPA output directly into projection; one final widening at the tower boundary. Declined plans retain the existing path. |
-| `PACKED_PROJECTIONS=1` | Pack immutable Q/K/V and gate/up weights once, execute one GEMM per group and split columns without changing BF16 bits. |
-| `GRAPH_REPLAY=1` | Four retained arenas for singleton text inputs through 256 tokens, bucketed in multiples of 64; upload fresh input/masks before replay and read back the compact result afterward. |
+| `PACKED_PROJECTIONS=1` | Pack immutable Q/K/V and gate/up weights once, execute one GEMM per group and split columns. Also pack immutable PLE projections into groups bounded by 16 MiB, preserving BF16 GEMM/scale/norm boundaries. |
+| `GRAPH_REPLAY=1` | Four retained arenas keyed by batch, padded sequence and mask kind, through four items and 4096 total padded rows. Each arena has a 128-MiB ceiling and retained admission. Fresh typed inputs, masks and prefix lengths are uploaded before replay; compact results are read afterward. |
 | `IMAGE_BATCH=1` | Existing image cohort opt-in also permits up to four staged video pictures. cuDNN vision plans carry the full batch dimension. |
 | `NATIVE_VISION=1` | Native batched head-64 tensor-core attention with BF16 inputs/output and online softmax. Fused rotary packing feeds attention and projection without whole-tensor F32 bridges. No score/probability arenas or cuDNN dependency. The typed BF16 implementation carries a new native-vision identity version. |
 | `MEDIA_BATCH=1` | Up to four ordered text/image/audio groups share preparation waves and length-bucketed BF16 backbone calls. CUDA Pillow resize, reference audio resampling and manual placeholder ordering remain explicit. |
 | `FUSED_BACKBONE=1` | Fuse post-attention norm/residual/pre-FFN norm, post-FFN norm/residual, PLE scale/norm, and PLE norm/residual/scalar. Explicit BF16 conversions preserve intermediate boundaries; six launches per encoder layer are removed. |
 
 Packed weights retain up to 512 MiB, and each of the four graph arenas has a
-64 MiB ceiling. Every retained allocation holds both physical context accounting
+128 MiB ceiling. Every retained allocation holds both physical context accounting
 and shared backend scratch admission until synchronized eviction or teardown.
 Admission-policy changes evict these buffers before switching controllers.
 Video and mixed-input requests reclaim optional caches once on admission denial.
@@ -1282,3 +1282,28 @@ without decoding PCM; unknown durations retain the full model token envelope.
 Decoded samples, packed features and final encoder phases remain separately
 bounded. A preparation-wave memory decline falls back through the existing
 singleton route instead of imposing a different duration limit.
+
+
+Packed-projection and graph-replay identities are versioned for grouped PLE and
+cohort graphs. Packed PLE columns feed strided fused scale/RMS directly without
+a per-layer slice allocation or copy kernel. Grouped PLE changes GEMM output geometry and requires pretrained
+vector/ranking qualification; `--require-route packed_ple` requires observed
+execution. The extended-attention identity also versions 64-row tail padding on
+all architectures carrying a bundled BF16 WMMA image. Defaults retain the existing
+qualified architecture restrictions. The CUDA attention differential test covers
+1/2/4-item batches, dense/prefix/holey masks, partial tiles and contexts through
+8192; it records synchronized exact/flash wall times. These are qualification
+measurements, not a replacement for warmed full-pipeline benchmarks.
+
+CUDA ordered-media composition uses BF16 row storage. Hard lookup rounds once;
+F32 projected media converts during row insertion, and cohorts pack directly into
+zero-padded BF16 storage. The encoder accepts either resident F32 or BF16 input,
+so existing video producers remain compatible without a padded F32 staging arena.
+
+Audio QKV packing uses a checked 64-MiB output envelope instead of a 512-row
+cutoff. CUDA named audio packing follows `PACKED_PROJECTIONS`, retains F32 outputs
+through the existing linear dispatch and shares the packed-weight admission cap. Segmented audio attention carries signed clip-start tags alongside the
+ordinary validity mask; convolution shares per-row starts. One kernel writes the
+whole cohort, with no per-clip output assembly. Invalid rows and finite mask
+probabilities preserve isolated-clip semantics. Backends that decline segmented
+execution retain the existing per-clip fallback.

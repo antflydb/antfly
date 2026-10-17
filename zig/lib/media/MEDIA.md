@@ -423,3 +423,12 @@ the per-layer wait path for comparison.
 CUDA audio preparation derives its sample limit from the same model config for
 singleton and mixed cohorts. Header duration bounds include media wrappers;
 unknown lengths use the full token ceiling without a PCM inspection pass.
+
+
+Audio cohort projection packing is selected by a checked 64-MiB activation
+budget, including clips beyond the former 512-row threshold. Metal and CUDA
+attention and depthwise convolution process segmented cohorts directly into the
+final output allocation. Shared row metadata resets chunk alignment and causal
+taps at each clip boundary; signed validity tags distinguish invalid rows from
+out-of-clip keys even with finite mask values. Backend declines retain isolated
+per-clip execution. Metadata stays alive until all submitted groups complete.

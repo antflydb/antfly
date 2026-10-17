@@ -264,14 +264,15 @@ extern "C" __global__ void termite_embedding_gemma2_norm_residual_bf16(
 
 extern "C" __global__ void termite_embedding_gemma2_scale_rms_bf16(
     __nv_bfloat16* out, const __nv_bfloat16* input, const __nv_bfloat16* weight,
-    unsigned rows, unsigned width, float scale, float eps) {
+    unsigned rows, unsigned width, float scale, float eps, unsigned input_stride) {
     const unsigned row = blockIdx.x;
     if (row >= rows) return;
     const size_t base = (size_t)row * width;
+    const size_t input_base = (size_t)row * input_stride;
     __shared__ float warp_sum[8], inv;
     float sum = 0.0f;
     for (unsigned d = threadIdx.x; d < width; d += blockDim.x) {
-        float x = __bfloat162float(__float2bfloat16_rn(__bfloat162float(input[base + d]) * scale));
+        float x = __bfloat162float(__float2bfloat16_rn(__bfloat162float(input[input_base + d]) * scale));
         sum += x * x;
     }
     sum = eg2_warp_sum(sum);
@@ -284,7 +285,22 @@ extern "C" __global__ void termite_embedding_gemma2_scale_rms_bf16(
     }
     __syncthreads();
     for (unsigned d = threadIdx.x; d < width; d += blockDim.x) {
-        float x = __bfloat162float(__float2bfloat16_rn(__bfloat162float(input[base + d]) * scale));
+        float x = __bfloat162float(__float2bfloat16_rn(__bfloat162float(input[input_base + d]) * scale));
         out[base + d] = __float2bfloat16_rn(x * inv * __bfloat162float(weight[d]));
     }
+}
+
+extern "C" __global__ void termite_embedding_gemma2_audio_segment_conv_f32(
+    float* out, const float* input, const float* weight, const float* starts,
+    unsigned rows, unsigned dim, unsigned kernel_size) {
+    size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= (size_t)rows * dim) return;
+    unsigned row = i / dim, col = i % dim, start = (unsigned)starts[row];
+    float sum = 0.0f;
+    for (unsigned k = 0; k < kernel_size; ++k) {
+        if (row + k < kernel_size - 1 + start) continue;
+        unsigned source = row + k - (kernel_size - 1);
+        sum += input[(size_t)source * dim + col] * weight[(size_t)k * dim + col];
+    }
+    out[i] = sum;
 }

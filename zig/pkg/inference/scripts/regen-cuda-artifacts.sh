@@ -201,6 +201,7 @@ trap 'rm -f "$tmp_ptx" "$tmp_fatbin" "$tmp_sm89"; rmdir "$tmp_root"' EXIT
 required_symbols=(
   termite_embedding_gemma2_split_columns_bf16
   termite_embedding_gemma2_vision_rope_pack_bf16
+  termite_embedding_gemma2_audio_segment_conv_f32
   termite_embedding_gemma2_native_vision_bf16
   termite_embedding_gemma2_norm_residual_bf16
   termite_embedding_gemma2_scale_rms_bf16

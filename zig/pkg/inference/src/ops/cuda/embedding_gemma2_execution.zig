@@ -21,13 +21,15 @@ const Buffer = @import("buffer.zig").DeviceBuffer;
 const driver = @import("driver.zig");
 const memory = @import("../../runtime/tier/memory.zig");
 pub const packed_limit = 512 * 1024 * 1024;
-pub const arena_limit = 64 * 1024 * 1024;
+pub const arena_limit = 128 * 1024 * 1024;
+pub const graph_rows_limit = 4096;
 pub const Arena = struct {
     sequence: usize = 0,
+    batch: usize = 0,
     mask_kind: u8 = 0,
     attention_workspace: usize = 0,
     weight_generation: usize = 0,
-    buffers: [10]Buffer = @splat(.{}),
+    buffers: [11]Buffer = @splat(.{}),
     lease: ?memory.AdmissionLease = null,
     graph: driver.CUgraphExec = null,
     warm: bool = false,
@@ -115,9 +117,12 @@ pub const Cache = struct {
         return buffer;
     }
 
-    pub fn arena(self: *Cache, ctx: *Context, sequence: usize, mask_kind: u8, sizes: [10]usize) !?*Arena {
-        if (sequence == 0 or sequence > 256) return null;
-        for (&self.arenas) |*entry| if (entry.sequence == sequence and entry.mask_kind == mask_kind) return entry;
+    pub fn arena(self: *Cache, ctx: *Context, batch: usize, sequence: usize, mask_kind: u8, sizes: [11]usize) !?*Arena {
+        if (batch == 0 or batch > 4 or sequence == 0 or sequence > 8192 or batch > graph_rows_limit / sequence) return null;
+        for (&self.arenas) |*entry| if (entry.sequence == sequence and entry.batch == batch and entry.mask_kind == mask_kind) {
+            for (entry.buffers, sizes) |buffer, size| if (buffer.len != size) return error.InvalidCudaState;
+            return entry;
+        };
         var bytes: usize = 0;
         for (sizes) |size| bytes = try std.math.add(usize, bytes, size);
         if (bytes > arena_limit) return null;
@@ -126,7 +131,7 @@ pub const Cache = struct {
         entry.deinit(ctx);
         var lease = acquire(ctx, bytes) catch return null;
         errdefer if (lease) |*active| active.release();
-        var candidate = Arena{ .sequence = sequence, .mask_kind = mask_kind };
+        var candidate = Arena{ .sequence = sequence, .batch = batch, .mask_kind = mask_kind };
         errdefer for (&candidate.buffers) |*buffer| buffer.free(ctx);
         for (&candidate.buffers, sizes) |*buffer, size| {
             buffer.* = Buffer.alloc(ctx, size) catch {
@@ -146,7 +151,7 @@ fn acquire(ctx: *Context, bytes: usize) !?memory.AdmissionLease {
     return try admission.controller.tryAcquire(.gpu, admission.limits, .{ .backend_scratch_bytes = bytes }, admission.check_live_memory);
 }
 
-test "embeddinggemma2 execution cache bounds short graph buckets and packed retention" {
+test "embeddinggemma2 execution cache bounds cohort graph buckets and packed retention" {
     try std.testing.expectEqual(@as(usize, 4), @as(Cache, .{}).arenas.len);
     try std.testing.expect(arena_limit * 4 + packed_limit <= 1024 * 1024 * 1024);
 }
@@ -193,28 +198,34 @@ test "embeddinggemma2 execution cache retains shared admission and releases grap
     ctx.driver.fns.cuGraphExecDestroy = Mock.graph;
     var cache = Cache{};
     defer cache.clear(std.testing.allocator, &ctx) catch unreachable;
-    const first = (try cache.arena(&ctx, 64, 1, @splat(16))).?;
-    try std.testing.expect(first == (try cache.arena(&ctx, 64, 1, @splat(16))).?);
+    try std.testing.expect((try cache.arena(&ctx, 4, 1025, 0, @splat(16))) == null);
+    const first = (try cache.arena(&ctx, 1, 64, 1, @splat(16))).?;
+    try std.testing.expect(first == (try cache.arena(&ctx, 1, 64, 1, @splat(16))).?);
+    try std.testing.expectError(error.InvalidCudaState, cache.arena(&ctx, 1, 64, 1, @splat(32)));
     const pointer = first.buffers[0].ptr;
     first.graph = @ptrFromInt(3);
-    const holes = (try cache.arena(&ctx, 64, 2, @splat(16))).?;
-    try std.testing.expect(first != holes);
+    const cohort = (try cache.arena(&ctx, 1, 64, 2, @splat(16))).?;
+    try std.testing.expect(first != cohort);
     try std.testing.expectEqual(pointer, first.buffers[0].ptr);
     _ = (try cache.allocatePacked(std.testing.allocator, &ctx, "qkv", 512)).?;
-    try std.testing.expectEqual(@as(usize, 832), controller.snapshot().backend_scratch_bytes);
+    try std.testing.expectEqual(@as(usize, 864), controller.snapshot().backend_scratch_bytes);
     // The second owner has physical room but must respect shared pressure.
     var other = Cache{};
     defer other.clear(std.testing.allocator, &ctx) catch unreachable;
     try std.testing.expect((try other.allocatePacked(std.testing.allocator, &ctx, "gate", 256)) == null);
-    try std.testing.expectEqual(@as(usize, 832), ctx.device_allocations.snapshot().live);
+    try std.testing.expectEqual(@as(usize, 864), ctx.device_allocations.snapshot().live);
     try cache.clear(std.testing.allocator, &ctx);
     try std.testing.expectEqual(@as(usize, 1), Mock.graphs);
-    try std.testing.expectEqual(@as(usize, 21), Mock.frees);
+    try std.testing.expectEqual(@as(usize, 23), Mock.frees);
     try std.testing.expectEqual(@as(usize, 0), controller.snapshot().backend_scratch_bytes);
     try std.testing.expectEqual(@as(usize, 0), ctx.device_allocations.snapshot().live);
     _ = (try other.allocatePacked(std.testing.allocator, &ctx, "gate", 256)).?;
     try other.discardPacked(std.testing.allocator, &ctx, "gate");
     try std.testing.expectEqual(@as(usize, 0), ctx.device_allocations.snapshot().live);
+    const large = (try cache.arena(&ctx, 4, 1024, 1, @splat(16))).?;
+    try std.testing.expect(large == (try cache.arena(&ctx, 4, 1024, 1, @splat(16))).?);
+    const smaller_batch = (try cache.arena(&ctx, 2, 1024, 1, @splat(16))).?;
+    try std.testing.expect(large != smaller_batch);
 }
 
 test "embeddinggemma2 graph cancellation keeps capture retryable" {

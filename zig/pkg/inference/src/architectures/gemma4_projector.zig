@@ -1208,7 +1208,7 @@ fn encodeAudioFeatureCohortResident(cb: *const ComputeBackend, allocator: std.me
 
     var layer_inputs = try AudioLayerInputs.initCached(cb, allocator, store, cfg, subsampled.valid_mask);
     defer layer_inputs.deinit(cb);
-    layer_inputs.segments = subsampled.segments;
+    try layer_inputs.setSegments(cb, subsampled.segments);
 
     const grouped_frames = cohort and cb.kind() == .metal and store.huggingface and cfg.exclude_farthest_key and
         !cb.decoderRuntimeHasActiveFrame() and !cb.decoderRuntimeHasSubmittedFrame() and !profile_enabled and std.meta.eql(audioHostOps(), AudioHostOps{}) and platform.env.getenv("ANTFLY_EMBEDDINGGEMMA2_STAGES") == null and
@@ -2739,6 +2739,8 @@ const AudioLayerInputs = struct {
     segments: []const usize = &.{},
     rel_in: CT,
     valid_ct: CT,
+    segment_starts: ?CT = null,
+    segment_valid: ?CT = null,
     /// `[output_hidden]` ones for the final no-scale RMS norm.
     ones: CT,
     /// Per-block query scales (`q_scale * softplus(per_dim_scale)`), host
@@ -2831,9 +2833,37 @@ const AudioLayerInputs = struct {
         };
     }
 
+    fn setSegments(self: *AudioLayerInputs, cb: *const ComputeBackend, segments: []const usize) !void {
+        self.segments = segments;
+        if (segments.len == 0 or (cb.kind() != .metal and cb.kind() != .cuda)) return;
+        if (self.valid_mask.len > 16777216) return error.InvalidTensorShape;
+        const starts = try self.allocator.alloc(f32, self.valid_mask.len);
+        defer self.allocator.free(starts);
+        const tags = try self.allocator.alloc(f32, starts.len);
+        defer self.allocator.free(tags);
+        var offset: usize = 0;
+        for (segments) |span| {
+            if (span == 0 or span > starts.len - offset) return error.InvalidTensorShape;
+            for (offset..offset + span) |row| {
+                starts[row] = @floatFromInt(offset);
+                tags[row] = @as(f32, @floatFromInt(offset + 1)) * @as(f32, if (self.valid_mask[row]) 1 else -1);
+            }
+            offset += span;
+        }
+        if (offset != starts.len) return error.InvalidTensorShape;
+        const shape = [_]i32{@intCast(starts.len)};
+        const starts_ct = try deviceResidentFromFloat32(cb, starts, &shape);
+        errdefer cb.free(starts_ct);
+        const tags_ct = try deviceResidentFromFloat32(cb, tags, &shape);
+        self.segment_valid = tags_ct;
+        self.segment_starts = starts_ct;
+    }
+
     pub fn deinit(self: *AudioLayerInputs, cb: *const ComputeBackend) void {
         cb.free(self.rel_in);
         cb.free(self.valid_ct);
+        if (self.segment_starts) |tensor| cb.free(tensor);
+        if (self.segment_valid) |tensor| cb.free(tensor);
         cb.free(self.ones);
         for (self.scales_host) |item| self.allocator.free(item);
         self.allocator.free(self.scales_host);
@@ -2952,7 +2982,7 @@ fn audioLayer(
     defer cb.free(res_attn);
     audioProfileMark(.norms);
 
-    const lconv = try audioLightConv(cb, allocator, store, cfg, res_attn, rows, layer, inputs.segments);
+    const lconv = try audioLightConv(cb, allocator, store, cfg, res_attn, rows, layer, inputs.segments, inputs.segment_starts);
     defer cb.free(lconv);
     if (store.gguf == null and layer == 0) try embeddingGemma2StageTensor(cb, allocator, "audio_0_lconv1d", lconv);
     audioProfileMark(.lconv);
@@ -3023,6 +3053,7 @@ fn audioLightConv(
     rows: usize,
     layer: usize,
     segments: []const usize,
+    segment_starts: ?CT,
 ) !CT {
     var buf: [128]u8 = undefined;
     const pre_w = try projectorVectorWeightCt(cb, allocator, store, try fmt(&buf, "a.blk.{d}.norm_conv.weight", .{layer}), cfg.audio_hidden);
@@ -3032,7 +3063,7 @@ fn audioLightConv(
     defer cb.free(pw1);
     const glu = try applyGlu(cb, allocator, pw1, rows, cfg.audio_hidden);
     defer cb.free(glu);
-    const conv = try depthwiseCausalConvSegments(cb, allocator, store, glu, rows, cfg.audio_hidden, cfg.conv_kernel_size, segments, try fmt(&buf, "a.blk.{d}.conv_dw.weight", .{layer}));
+    const conv = try depthwiseCausalConvSegments(cb, allocator, store, glu, rows, cfg.audio_hidden, cfg.conv_kernel_size, segments, segment_starts, try fmt(&buf, "a.blk.{d}.conv_dw.weight", .{layer}));
     defer cb.free(conv);
     const conv_norm_w = try projectorVectorWeightCt(cb, allocator, store, try fmt(&buf, "a.blk.{d}.conv_norm.weight", .{layer}), cfg.audio_hidden);
     const conv_normed = try cb.rmsNorm(conv, conv_norm_w, cfg.audio_hidden, cfg.layer_norm_eps);
@@ -3044,8 +3075,13 @@ fn audioLightConv(
     return cb.add(input, pw2);
 }
 
+fn audioQkvFits(rows: usize, width: usize) bool {
+    const bytes = std.math.mul(usize, std.math.mul(usize, rows, width) catch return false, 3 * @sizeOf(f32)) catch return false;
+    return rows != 0 and width != 0 and bytes <= 64 * 1024 * 1024;
+}
+
 fn packedAudioQkv(cb: *const ComputeBackend, a: std.mem.Allocator, store: *ProjectorWeights, input: CT, rows: usize, width: usize, layer: usize) !?ops.LinearTripleResult {
-    if (store.gguf != null or rows > 512 or audioHostOps().clamp) return null;
+    if (store.gguf != null or !audioQkvFits(rows, width) or audioHostOps().clamp) return null;
     var specs: [3]ClampSpec = undefined;
     var names: [3][]u8 = undefined;
     var count: usize = 0;
@@ -3144,6 +3180,11 @@ fn audioKeyScale() f32 {
 /// the host reference.
 fn audioLocalAttention(cb: *const ComputeBackend, allocator: std.mem.Allocator, cfg: AudioConfig, q: CT, k: CT, v: CT, rel: CT, layer: usize, inputs: *const AudioLayerInputs) !CT {
     if (inputs.segments.len == 0) return audioLocalAttentionSingle(cb, allocator, cfg, q, k, v, rel, layer, inputs);
+    if (inputs.segment_valid) |validity| if (cfg.attention_context_right == 0 and !audioHostOps().attention) {
+        var params = audioLocalAttentionParams(cfg, inputs.valid_mask.len);
+        params.segmented = true;
+        if (try cb.gemma4AudioLocalAttention(q, k, v, rel, inputs.scales[layer], validity, params)) |result| return result;
+    };
     const output = (try cb.allocUninitF32Shape(&.{ @intCast(inputs.valid_mask.len), @intCast(cfg.audio_hidden) })) orelse return error.UnsupportedResidentGemma4Audio;
     errdefer cb.free(output);
     var offset: usize = 0;
@@ -3544,8 +3585,12 @@ fn applyGlu(cb: *const ComputeBackend, allocator: std.mem.Allocator, input: CT, 
     return cb.fromFloat32Shape(out, &shape);
 }
 
-fn depthwiseCausalConvSegments(cb: *const ComputeBackend, allocator: std.mem.Allocator, store: *ProjectorWeights, input: CT, rows: usize, hidden: usize, kernel_size: usize, segments: []const usize, name: []const u8) !CT {
+fn depthwiseCausalConvSegments(cb: *const ComputeBackend, allocator: std.mem.Allocator, store: *ProjectorWeights, input: CT, rows: usize, hidden: usize, kernel_size: usize, segments: []const usize, starts: ?CT, name: []const u8) !CT {
     if (segments.len == 0) return depthwiseCausalConv1d(cb, allocator, store, input, rows, hidden, kernel_size, name);
+    if (starts) |metadata| if (!audioHostOps().dwconv) if (cb.vtable.depthwiseCausalConv1dSegmented) |op| {
+        const weight = try depthwiseConvWeightCt(cb, allocator, store, name, kernel_size, hidden);
+        if (try op(cb.ptr, input, weight, metadata, rows, hidden, kernel_size)) |result| return result;
+    };
     const output = (try cb.allocUninitF32Shape(&.{ @intCast(rows), @intCast(hidden) })) orelse return error.UnsupportedResidentGemma4Audio;
     errdefer cb.free(output);
     var offset: usize = 0;
@@ -6832,16 +6877,16 @@ fn checkAudioCohort(cb: ComputeBackend, reference: ComputeBackend) !void {
         }
     }
     const cfg = AudioConfig{ .text_hidden = 8, .audio_hidden = 16, .output_hidden = 24, .intermediate_size = 32, .block_count = 8, .head_count = 2, .mel_bins = 8, .conv_channels0 = 4, .conv_channels1 = 2, .layer_norm_eps = 1e-6, .exclude_farthest_key = true };
-    var first_data: [57 * 8]f32 = undefined;
+    var first_data: [2105 * 8]f32 = undefined;
     var second_data: [13 * 8]f32 = undefined;
     for (&first_data, 0..) |*x, i| x.* = @sin(@as(f32, @floatFromInt(i)) * 0.173);
     for (&second_data, 0..) |*x, i| x.* = @cos(@as(f32, @floatFromInt(i)) * 0.271);
-    var first_mask: [57]bool = @splat(true);
+    var first_mask: [2105]bool = @splat(true);
     var second_mask: [13]bool = @splat(true);
     first_mask[0] = false;
     first_mask[16] = false;
     second_mask[12] = false;
-    var first = AudioFeatures{ .allocator = a, .data = &first_data, .resident = null, .mask = &first_mask, .frames = 57, .mel_bins = 8 };
+    var first = AudioFeatures{ .allocator = a, .data = &first_data, .resident = null, .mask = &first_mask, .frames = 2105, .mel_bins = 8 };
     var second = AudioFeatures{ .allocator = a, .data = &second_data, .resident = null, .mask = &second_mask, .frames = 13, .mel_bins = 8 };
     var weights = ProjectorWeights.initHuggingFace(&cb, a);
     defer weights.deinit();
@@ -6970,4 +7015,91 @@ test "embeddinggemma2 Metal audio frame groups bound two live groups and avoid o
         if (plan.in_flight == 2) try std.testing.expect(rows * (1024 * 12 + 4096 * 4) * 4 * plan.layers * 2 <= 384 * 1024 * 1024);
     }
     try std.testing.expectEqual(AudioFramePlan{}, audioFramePlan(std.math.maxInt(usize), 1024, 4096));
+}
+
+test "embeddinggemma2 audio QKV packing uses an overflow-safe activation budget" {
+    try std.testing.expect(audioQkvFits(751, 1024));
+    try std.testing.expect(audioQkvFits(4096, 1024));
+    try std.testing.expect(!audioQkvFits(8192, 1024));
+    try std.testing.expect(!audioQkvFits(std.math.maxInt(usize), 1024));
+}
+
+fn checkAudioSegmentKernels(cb: ComputeBackend, _: ComputeBackend) !void {
+    const a = std.testing.allocator;
+    const rows = 53;
+    const hidden = 32;
+    const dim = 16;
+    const spans = [_]usize{ 17, 31, 5 };
+    var data: [rows * hidden]f32 = undefined;
+    var rel: [13 * hidden]f32 = undefined;
+    var scales: [dim]f32 = @splat(0.25);
+    var starts: [rows]f32 = undefined;
+    var tags: [rows]f32 = undefined;
+    var mask: [rows]bool = undefined;
+    for (&data, 0..) |*x, i| x.* = @sin(@as(f32, @floatFromInt(i)) * 0.17) * 0.1;
+    for (&rel, 0..) |*x, i| x.* = @cos(@as(f32, @floatFromInt(i)) * 0.13) * 0.1;
+    var offset: usize = 0;
+    for (spans) |span| {
+        for (offset..offset + span) |row| {
+            starts[row] = @floatFromInt(offset);
+            mask[row] = row % 7 != 0;
+            tags[row] = @as(f32, @floatFromInt(offset + 1)) * @as(f32, if (mask[row]) 1 else -1);
+        }
+        offset += span;
+    }
+    const source = try cb.fromFloat32Shape(&data, &.{ rows, hidden });
+    defer cb.free(source);
+    const relative = try cb.fromFloat32Shape(&rel, &.{ 13, hidden });
+    defer cb.free(relative);
+    const scale = try cb.fromFloat32Shape(&scales, &.{dim});
+    defer cb.free(scale);
+    const validity = try cb.fromFloat32Shape(&tags, &.{rows});
+    defer cb.free(validity);
+    const metadata = try cb.fromFloat32Shape(&starts, &.{rows});
+    defer cb.free(metadata);
+    for ([_]f32{ -1e9, -3 }) |invalid| {
+        var params = ops.Gemma4AudioLocalAttentionParams{ .rows = rows, .hidden = hidden, .heads = 2, .head_dim = dim, .chunk = 12, .context_left = 13, .context = 24, .k_scale = audioKeyScale(), .logit_cap = 50, .invalid_value = invalid, .exclude_farthest_key = true, .segmented = true };
+        const before = @import("../ops/media_residency_test.zig").Transfers.snapshot(cb);
+        const result = (try cb.gemma4AudioLocalAttention(source, source, source, relative, scale, validity, params)) orelse return error.UnsupportedResidentGemma4Audio;
+        defer cb.free(result);
+        try before.expectUnchanged(cb);
+        const actual = try cb.toFloat32(result, a);
+        defer a.free(actual);
+        offset = 0;
+        for (spans) |span| {
+            params.rows = span;
+            params.segmented = false;
+            const values = data[offset * hidden ..][0 .. span * hidden];
+            const expected = try audioLocalAttentionReference(a, params, values, values, values, &rel, &scales, mask[offset..][0..span]);
+            defer a.free(expected);
+            for (expected, actual[offset * hidden ..][0 .. span * hidden]) |x, y| try std.testing.expectApproxEqAbs(x, y, 2e-5);
+            offset += span;
+        }
+    }
+    var weights: [3 * hidden]f32 = @splat(0.25);
+    const weight = try cb.fromFloat32Shape(&weights, &.{ 3, hidden });
+    defer cb.free(weight);
+    const before = @import("../ops/media_residency_test.zig").Transfers.snapshot(cb);
+    const op = cb.vtable.depthwiseCausalConv1dSegmented orelse return error.UnsupportedResidentGemma4Audio;
+    const result = (try op(cb.ptr, source, weight, metadata, rows, hidden, 3)) orelse return error.UnsupportedResidentGemma4Audio;
+    defer cb.free(result);
+    try before.expectUnchanged(cb);
+    const actual = try cb.toFloat32(result, a);
+    defer a.free(actual);
+    for (0..rows) |row| for (0..hidden) |col| {
+        var expected: f32 = 0;
+        for (0..3) |k| {
+            if (row + k < 2 + @as(usize, @intFromFloat(starts[row]))) continue;
+            expected += data[(row + k - 2) * hidden + col] * 0.25;
+        }
+        try std.testing.expectApproxEqAbs(expected, actual[row * hidden + col], 1e-6);
+    };
+}
+
+test "embeddinggemma2 Metal segmented audio kernels match isolated clips with finite masks" {
+    try @import("../ops/media_residency_test.zig").onMetal(@import("../ops/media_residency_test.zig").noWeights, checkAudioSegmentKernels);
+}
+
+test "embeddinggemma2 CUDA segmented audio kernels match isolated clips with finite masks" {
+    try @import("../ops/media_residency_test.zig").onCuda(@import("../ops/media_residency_test.zig").noWeights, checkAudioSegmentKernels);
 }

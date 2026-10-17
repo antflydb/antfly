@@ -1183,13 +1183,16 @@ fn packVideoRows(a: std.mem.Allocator, cb: *const ComputeBackend, rows: []const 
     const mask = try a.alloc(i64, sequence * rows.len);
     errdefer a.free(mask);
     @memset(mask, 0);
-    const input = (try cb.allocUninitF32Shape(&.{ @intCast(sequence * rows.len), 512 })) orelse return error.ResidentImageOperationUnavailable;
+    const input = if (cb.kind() == .cuda) cuda: {
+        const compute: *@import("../ops/cuda/cuda_compute.zig").CudaCompute = @ptrCast(@alignCast(cb.ptr));
+        break :cuda try compute.embeddingGemma2Composition(sequence * rows.len);
+    } else (try cb.allocUninitF32Shape(&.{ @intCast(sequence * rows.len), 512 })) orelse return error.ResidentImageOperationUnavailable;
     errdefer cb.free(input);
     var padding: usize = 0;
     for (rows) |row| padding = @max(padding, sequence - row.ids.len);
     var zero_tensor: ?CT = null;
     defer if (zero_tensor) |tensor| cb.free(tensor);
-    if (padding != 0) {
+    if (padding != 0 and cb.kind() != .cuda) {
         const zeros = try a.alloc(f32, padding * 512);
         defer a.free(zeros);
         @memset(zeros, 0);
@@ -1198,7 +1201,7 @@ fn packVideoRows(a: std.mem.Allocator, cb: *const ComputeBackend, rows: []const 
     for (rows, 0..) |row, index| {
         if (row.mask.len != row.ids.len) return error.InvalidInputShape;
         @memcpy(mask[index * sequence ..][0..row.mask.len], row.mask);
-        if (sequence > row.ids.len) {
+        if (sequence > row.ids.len and cb.kind() != .cuda) {
             if (!try cb.copyRows2D(a, input, index * sequence + row.ids.len, zero_tensor.?, 0, sequence - row.ids.len, 512)) return error.UnsupportedPrimitiveOp;
         }
         const source = row.tensor orelse if (row.embeddings) |values|
