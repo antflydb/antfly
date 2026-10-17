@@ -1,0 +1,158 @@
+name: Qualify native release archives
+
+on:
+  workflow_call:
+    inputs:
+      source_commit:
+        type: string
+        required: true
+      archive_os:
+        type: string
+        required: true
+permissions:
+  contents: read
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.platforms.outputs.matrix }}
+      products: ${{ steps.platforms.outputs.products }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.source_commit }}
+          persist-credentials: false
+      - name: Select production release platforms and products
+        id: platforms
+        env:
+          ARCHIVE_OS: ${{ inputs.archive_os }}
+        run: |
+          echo "matrix=$(python3 scripts/release/release_platforms.py github-matrix --archive-os "$ARCHIVE_OS")" >> "$GITHUB_OUTPUT"
+          echo "products=$(jq -c .runtime_products scripts/release/build-contract.json)" >> "$GITHUB_OUTPUT"
+
+  archives:
+    name: Qualify ${{ matrix.artifact_name }}
+    needs: plan
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 240
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    steps:
+      - name: Checkout requested revision
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.source_commit }}
+          persist-credentials: false
+          submodules: true
+
+      - name: Load pinned toolchain policy
+        id: toolchain
+        uses: ./.github/actions/load-toolchain-policy
+
+      - name: Verify production builder architecture
+        run: test "$(uname -m)" = "${{ matrix.zig_arch }}"
+
+      - name: Install Linux build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential clang lld llvm curl xz-utils git perl python3 linux-libc-dev ca-certificates time file
+
+      - name: Install Nix
+        uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31
+        with:
+          nix_path: nixpkgs=https://github.com/NixOS/nixpkgs/archive/${{ steps.toolchain.outputs.zig_nixpkgs_revision }}.tar.gz
+
+      - name: Install glibc-linked Zig
+        env:
+          ZIG_VERSION: ${{ steps.toolchain.outputs.zig_version }}
+          ZIG_NIX_ATTRIBUTE: ${{ steps.toolchain.outputs.zig_nix_attribute }}
+        run: |
+          zig_path="$(nix-build '<nixpkgs>' -A "$ZIG_NIX_ATTRIBUTE" --no-out-link)"
+          test "$("$zig_path/bin/zig" version)" = "$ZIG_VERSION"
+          compiler_description="$(file "$zig_path/bin/zig")"
+          echo "$compiler_description"
+          grep -q 'dynamically linked' <<<"$compiler_description"
+          echo "$zig_path/bin" >> "$GITHUB_PATH"
+
+      - name: Verify runtime boundaries and bounded runner
+        run: |
+          python3 zig/tools/analyze_zig_import_graph.py --check-runtime-boundary --check-codegen-boundary --check-api-kernel-boundary --json
+          python3 -m unittest zig/tools/test_analyze_zig_import_graph.py
+          python3 -m unittest zig/tools/test_patch_zig_0_16_build_runner_maxrss.py
+          python3 -m unittest zig/tools/test_run_bounded_zig_build.py
+
+      - name: Install pinned macOS cross-compilation SDK
+        if: ${{ matrix.macos_sdk == 'true' }}
+        env:
+          MACOS_SDK_VERSION: ${{ steps.toolchain.outputs.macos_cross_sdk_version }}
+          MACOS_SDK_SHA256: ${{ steps.toolchain.outputs.macos_cross_sdk_sha256 }}
+        run: |
+          sdk_archive="$RUNNER_TEMP/MacOSX${MACOS_SDK_VERSION}.sdk.tar.xz"
+          sdk_stage="$RUNNER_TEMP/macos-sdk"
+          curl --fail --location --retry 3 \
+            "https://github.com/joseluisq/macosx-sdks/releases/download/${MACOS_SDK_VERSION}/MacOSX${MACOS_SDK_VERSION}.sdk.tar.xz" \
+            -o "$sdk_archive"
+          echo "$MACOS_SDK_SHA256  $sdk_archive" | sha256sum --check --strict
+          mkdir -p "$sdk_stage"
+          tar -xJf "$sdk_archive" -C "$sdk_stage"
+
+          sdk_path="$sdk_stage/MacOSX${MACOS_SDK_VERSION}.sdk"
+          test -d "$sdk_path/System/Library/Frameworks/Metal.framework"
+          test -d "$sdk_path/System/Library/Frameworks/MetalPerformanceShaders.framework"
+          test -d "$sdk_path/System/Library/Frameworks/Accelerate.framework"
+          echo "SDK_PATH=$sdk_path" >> "$GITHUB_ENV"
+
+      - name: Build source-declared runtime archives
+        env:
+          RELEASE_TAG: v0.0.0-qualification
+          RUNTIME_PRODUCTS: ${{ needs.plan.outputs.products }}
+        run: |
+          set -euo pipefail
+          version="${RELEASE_TAG#v}"
+          while IFS= read -r product; do
+            build_args=(
+              --version "$version"
+              --target "${{ matrix.zig_target }}"
+              --optimize "${{ matrix.zig_optimize }}"
+              --out-dir dist/release-archives
+              --metal "${{ matrix.metal }}"
+              --system-blas "${{ matrix.system_blas }}"
+            )
+            if [ -n "${{ matrix.zig_jobs }}" ]; then
+              build_args+=(--jobs "${{ matrix.zig_jobs }}")
+            fi
+            prefix=antfly
+            if [ "$product" != server ]; then
+              prefix="antfly-$product"
+              build_args+=(--product "$product")
+            fi
+            archive="${prefix}_${version}_${{ matrix.archive_os }}_${{ matrix.archive_arch }}${{ matrix.archive_suffix }}.tar.gz"
+            build_args+=(--archive-name "$archive")
+            scripts/packaging/build_zig_release_archive.sh "${build_args[@]}"
+          done < <(jq -r '.[]' <<< "$RUNTIME_PRODUCTS")
+
+      - name: Verify native archive contents
+        run: python3 scripts/packaging/verify_native_archives.py --archive-dir dist/release-archives --platform '${{ toJSON(matrix) }}' --products '${{ needs.plan.outputs.products }}'
+
+      - name: Upload qualified archives
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: qualification-${{ matrix.artifact_name }}
+          path: dist/release-archives/*.tar.gz
+          if-no-files-found: error
+
+      - name: Upload compiler diagnostics
+        if: ${{ always() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: qualification-diagnostics-${{ matrix.artifact_name }}
+          path: |
+            ${{ runner.temp }}/antfly-zig-release-*/*attempt*.log
+            ${{ runner.temp }}/antfly-zig-release-*/archive-contents.txt
+            ${{ runner.temp }}/antfly-zig-release-*/zig-cache/o/*/libantfly.map
+          if-no-files-found: warn

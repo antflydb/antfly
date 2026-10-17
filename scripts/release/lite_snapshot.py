@@ -29,6 +29,7 @@ import zipfile
 from pathlib import Path
 
 from release_channels import normalize_release_version, python_version_from_release
+from release_platforms import load_policy
 
 NPM_PACKAGES = {
     "@antfly/embedded": "antfly-embedded",
@@ -68,15 +69,52 @@ def wheel_identity(path: Path) -> tuple[str, str]:
         return fields["Name"], fields["Version"]
 
 
-def expected_names(version: str) -> set[str]:
+LEGACY_WHEEL_PLATFORMS = [
+    "manylinux_2_28_x86_64",
+    "manylinux_2_28_aarch64",
+    "macosx_11_0_arm64",
+]
+
+
+def source_wheel_platforms() -> list[str]:
+    return [
+        platform["wheel_platform"]
+        for platform in load_policy()["platforms"]
+        if "pypi" in platform["consumers"]
+    ]
+
+
+def snapshot_wheel_platforms(manifest: dict) -> list[str]:
+    if manifest["schema_version"] == 1:
+        return LEGACY_WHEEL_PLATFORMS
+    platforms = manifest.get("wheel_platforms")
+    # Bind the filename projection into the immutable snapshot. A later
+    # controller policy change must not invalidate an older sealed release.
+    patterns = [
+        r"manylinux_[0-9]+_[0-9]+_x86_64",
+        r"manylinux_[0-9]+_[0-9]+_aarch64",
+        r"macosx_[0-9]+_[0-9]+_arm64",
+    ]
+    if (
+        not isinstance(platforms, list)
+        or len(platforms) != len(patterns)
+        or any(not isinstance(value, str) for value in platforms)
+        or any(
+            sum(bool(re.fullmatch(pattern, value)) for value in platforms) != 1
+            for pattern in patterns
+        )
+    ):
+        raise ValueError("Lite snapshot wheel platform set differs")
+    return platforms
+
+
+def expected_names(version: str, platforms: list[str] | None = None) -> set[str]:
     names = {f"{stem}-{version}.tgz" for stem in NPM_PACKAGES.values()}
     py_version = python_version_from_release(version)
     names.update(
         f"antfly_embedded-{py_version}-py3-none-{platform}.whl"
         for platform in (
-            "manylinux_2_28_x86_64",
-            "manylinux_2_28_aarch64",
-            "macosx_11_0_arm64",
+            platforms if platforms is not None else source_wheel_platforms()
         )
     )
     return names
@@ -92,7 +130,8 @@ def build(
         raise ValueError(f"snapshot directory is not empty: {out_dir}")
     out_dir.mkdir(parents=True, exist_ok=True)
     sources = [*npm_dir.glob("*.tgz"), *wheel_dir.glob("*.whl")]
-    if {item.name for item in sources} != expected_names(version):
+    platforms = source_wheel_platforms()
+    if {item.name for item in sources} != expected_names(version, platforms):
         raise ValueError(
             "Lite snapshot package set differs from the release platform policy"
         )
@@ -110,7 +149,8 @@ def build(
                 raise ValueError(f"unexpected wheel: {source}")
         shutil.copy2(source, out_dir / source.name)
     manifest = {
-        "schema_version": 1,
+        "schema_version": 2,
+        "wheel_platforms": platforms,
         "version": version,
         "python_version": python_version_from_release(version),
         "commit": commit,
@@ -126,24 +166,23 @@ def verify(snapshot_dir: Path, version: str, commit: str) -> None:
     version = normalize_release_version(version)
     manifest = json.loads((snapshot_dir / "lite-snapshot.json").read_text())
     if (
-        manifest.get("schema_version") != 1
+        manifest.get("schema_version") not in (1, 2)
         or manifest.get("version") != version
         or manifest.get("commit") != commit
     ):
         raise ValueError("Lite snapshot identity differs from the requested release")
     if manifest.get("python_version") != python_version_from_release(version):
         raise ValueError("Lite snapshot Python version differs")
+    names = expected_names(version, snapshot_wheel_platforms(manifest))
     artifacts = manifest.get("artifacts")
     if (
         not isinstance(artifacts, list)
-        or len(artifacts) != len(expected_names(version))
+        or len(artifacts) != len(names)
         or any(not isinstance(item, dict) for item in artifacts)
-        or {item.get("name") for item in artifacts} != expected_names(version)
+        or {item.get("name") for item in artifacts} != names
     ):
         raise ValueError("Lite snapshot artifact set differs")
-    if {path.name for path in snapshot_dir.iterdir()} != expected_names(version) | {
-        "lite-snapshot.json"
-    }:
+    if {path.name for path in snapshot_dir.iterdir()} != names | {"lite-snapshot.json"}:
         raise ValueError("Lite snapshot contains extra or missing files")
     for item in artifacts:
         path = snapshot_dir / item["name"]

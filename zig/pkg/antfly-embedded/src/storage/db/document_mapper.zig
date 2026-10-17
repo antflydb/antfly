@@ -6699,7 +6699,7 @@ test "relational index system NUMERIC array modifiers round before hashing and s
         }
     };
     try Run.run(a, table, &layout, json);
-    try std.testing.checkAllAllocationFailures(a, Run.run, .{ table, &layout, json });
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(a, Run.run, .{ table, &layout, json });
     const overflow =
         \\{"a":{"dimensions":[{"length":2,"lower_bound":-7}],"values":["12.345","99.995"],"sql_nulls":[false,false]}}
     ;

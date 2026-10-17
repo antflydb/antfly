@@ -29,6 +29,36 @@ ROOT = Path(__file__).resolve().parents[2]
 
 
 class ReleaseLicenseTests(unittest.TestCase):
+    def test_missing_macho_linker_fails_before_compilation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            tools = Path(directory)
+            for name, output in (("uname", "Linux"), ("llvm-config", str(tools))):
+                command = tools / name
+                command.write_text(f"#!/bin/sh\necho '{output}'\n")
+                command.chmod(0o755)
+            result = subprocess.run(
+                [
+                    "/bin/bash",
+                    str(ROOT / "scripts/packaging/build_zig_release_archive.sh"),
+                    "--version",
+                    "test",
+                    "--target",
+                    "aarch64-macos.15.0",
+                    "--archive-name",
+                    "test.tar.gz",
+                    "--out-dir",
+                    str(tools / "out"),
+                ],
+                env={**os.environ, "PATH": str(tools)},
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(result.returncode, 2)
+            self.assertIn(
+                "macOS cross builds require ld64.lld and llvm-nm", result.stderr
+            )
+            self.assertFalse((tools / "out").exists())
+
     def test_product_builds_and_archive_licenses(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -65,7 +95,7 @@ class ReleaseLicenseTests(unittest.TestCase):
                 "Path('build-args.json').write_text(json.dumps(args))\n"
                 "prefix = Path(args[args.index('--prefix') + 1])\n"
                 "inference = Path.cwd().name == 'inference'\n"
-                "library = 'lib/libantfly.dylib' if '-Dtarget=aarch64-macos' in args else 'lib/libantfly.so'\n"
+                "library = 'lib/libantfly.dylib' if any(arg.startswith('-Dtarget=aarch64-macos') for arg in args) else 'lib/libantfly.so'\n"
                 "names = ('bin/antfly-inference',) if inference else (('bin/antfly-lite',) if 'lite' in args else ('bin/antfly',)) + (library, 'include/antfly.h')\n"
                 "for name in names:\n"
                 "    path = prefix / name\n"
@@ -79,15 +109,35 @@ class ReleaseLicenseTests(unittest.TestCase):
                 'for shell in bash zsh fish; do echo fixture > "$1/antfly.$shell"; done\n'
             )
             completions.chmod(0o755)
+            tools = root / "tools"
+            llvm = root / "llvm/bin"
+            tools.mkdir()
+            llvm.mkdir(parents=True)
+            for name, script in {
+                "uname": "#!/bin/sh\necho Linux\n",
+                "llvm-config": f"#!/bin/sh\necho '{llvm}'\n",
+            }.items():
+                command = tools / name
+                command.write_text(script)
+                command.chmod(0o755)
+            for name in ("ld64.lld", "llvm-nm"):
+                command = llvm / name
+                command.write_text("#!/bin/sh\nexit 0\n")
+                command.chmod(0o755)
             policy = json.loads((ROOT / "scripts/release/platforms.json").read_text())
             optimize = {
                 entry["zig_target"]: entry["optimize"] for entry in policy["platforms"]
             }
+            darwin_target = next(
+                entry["zig_target"]
+                for entry in policy["platforms"]
+                if entry["archive_os"] == "Darwin"
+            )
             for product, target, steps, license_name in (
-                ("embedded", "aarch64-macos", ["lite"], "LICENSES/Apache-2.0.txt"),
-                ("lite", "aarch64-macos", ["lite"], "LICENSES/Apache-2.0.txt"),
-                ("inference", "aarch64-macos", [], "LICENSES/Apache-2.0.txt"),
-                ("server", "aarch64-macos", ["antfly", "capi"], "LICENSE"),
+                ("embedded", darwin_target, ["lite"], "LICENSES/Apache-2.0.txt"),
+                ("lite", darwin_target, ["lite"], "LICENSES/Apache-2.0.txt"),
+                ("inference", darwin_target, [], "LICENSES/Apache-2.0.txt"),
+                ("server", darwin_target, ["antfly", "capi"], "LICENSE"),
                 ("server", "aarch64-linux-musl", ["antfly", "capi"], "LICENSE"),
             ):
                 with self.subTest(product=product, target=target):
@@ -112,6 +162,7 @@ class ReleaseLicenseTests(unittest.TestCase):
                         ],
                         env={
                             **os.environ,
+                            "PATH": f"{tools}:{os.environ['PATH']}",
                             "RUNNER_TEMP": str(root / "build"),
                             "SOURCE_DATE_EPOCH": "0",
                         },
@@ -130,7 +181,7 @@ class ReleaseLicenseTests(unittest.TestCase):
                     self.assertEqual(
                         product == "server", "-Dapple-providers=false" in args
                     )
-                    if target == "aarch64-macos":
+                    if target == darwin_target:
                         self.assertNotIn("--max-rss-cap", args)
                     else:
                         self.assertEqual(
@@ -145,7 +196,7 @@ class ReleaseLicenseTests(unittest.TestCase):
                         self.assertNotIn("--build-file", inference_args)
                         self.assertNotIn("-Dapple-providers=false", inference_args)
                         for option in (
-                            "-Dtarget=aarch64-macos",
+                            f"-Dtarget={darwin_target}",
                             "-Dantfly-version=test",
                             "-Doptimize=fast",
                         ):
@@ -169,7 +220,7 @@ class ReleaseLicenseTests(unittest.TestCase):
                             "./scripts/apache_engine_files.txt",
                             "./scripts/embedded_asset_licenses.json",
                             "./lib/libantfly.dylib"
-                            if target == "aarch64-macos"
+                            if target == darwin_target
                             else "./lib/libantfly.so",
                             "./lib/pkgconfig/libantfly.pc",
                             "./include/antfly.h",

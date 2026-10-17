@@ -7,6 +7,9 @@ import pytest
 import antfly.client as client_module
 from antfly import AntflyClient, AntflyException, InferenceAPIError, InferenceCapacityError
 from antfly.client_generated.models import (
+    ChunkEmbeddingContext,
+    ChunkEmbeddingObject,
+    ChunkEmbeddingResponse,
     InferenceChatMessage,
     InferenceGenerateChatTemplateKwargs,
     InferenceGenerateRequest,
@@ -375,11 +378,15 @@ def test_chunk_embedding_stream_preserves_provenance_and_requires_terminal(termi
     install_transport(client, httpx.MockTransport(handle))
     with client.chunk_and_embed_stream({"input": "hé🐜", "embedding": {"model": "model"}}) as results:
         header = next(results)
+        assert isinstance(header, ChunkEmbeddingContext)
         assert header.model_identity == coverage["model_identity"]
         first = next(results)
+        assert isinstance(first, ChunkEmbeddingObject)
         assert first.to_dict() == item
         if terminal:
-            assert next(results).to_dict() == coverage
+            complete = next(results)
+            assert isinstance(complete, ChunkEmbeddingResponse)
+            assert complete.to_dict() == coverage
             with pytest.raises(StopIteration):
                 next(results)
         else:

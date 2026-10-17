@@ -182,8 +182,26 @@ def main() -> int:
         default="validate",
     )
     parser.add_argument("consumer", nargs="?")
+    parser.add_argument(
+        "--archive-os",
+        choices=("Linux", "Darwin"),
+        help="select release targets for archive qualification",
+    )
     args = parser.parse_args()
     policy = load_policy()
+    if args.archive_os:
+        if args.command != "github-matrix":
+            parser.error("--archive-os requires github-matrix")
+        policy = {
+            **policy,
+            "platforms": [
+                platform
+                for platform in policy["platforms"]
+                if platform["archive_os"] == args.archive_os
+            ],
+        }
+        if not policy["platforms"]:
+            parser.error(f"no {args.archive_os} release platforms")
     if args.command == "github-matrix":
         print(json.dumps(github_matrix(policy), separators=(",", ":")))
     elif args.command == "consumer-matrix":

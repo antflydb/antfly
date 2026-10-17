@@ -157,6 +157,8 @@ pub const PendingWorkStats = struct {
     enrichment: types.EnrichmentStats,
     resolution: types.ReplayStageStats = .{},
     promotion: types.ReplayStageStats = .{},
+    resolution_worker_started: bool = false,
+    promotion_worker_started: bool = false,
     text_merge: types.TextMergeStats = .{},
     repair_metadata_rebuild_pending: bool = false,
     graph_metric: index_manager_mod.IndexManager.GraphMetricPlannedWorkStats = .{},

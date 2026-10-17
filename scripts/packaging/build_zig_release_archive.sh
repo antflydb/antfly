@@ -156,6 +156,26 @@ if [ "$apple_providers" = true ]; then
   esac
 fi
 
+# Ubuntu installs the Mach-O linker under LLVM's versioned bindir. Resolve
+# it before compiling so a missing cross-link tool fails in seconds, not hours.
+case "$target" in
+  *macos*)
+    if [ "$(uname -s)" != Darwin ]; then
+      if ! command -v ld64.lld >/dev/null 2>&1; then
+        llvm_bin="$(llvm-config --bindir 2>/dev/null || true)"
+        if [ -n "$llvm_bin" ] && [ -x "$llvm_bin/ld64.lld" ]; then
+          export PATH="$llvm_bin:$PATH"
+        fi
+      fi
+      if ! command -v ld64.lld >/dev/null 2>&1 || ! command -v llvm-nm >/dev/null 2>&1; then
+        echo "macOS cross builds require ld64.lld and llvm-nm; install LLVM/lld and put LLVM's bin directory on PATH" >&2
+        exit 2
+      fi
+      ld64.lld --version
+    fi
+    ;;
+esac
+
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 source_date_epoch="${SOURCE_DATE_EPOCH:-$(git -C "$repo_root" show -s --format=%ct HEAD)}"
 if ! [[ "$source_date_epoch" =~ ^[0-9]+$ ]]; then

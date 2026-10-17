@@ -290,7 +290,7 @@ def validate(policy: dict) -> list[str]:
 
     for workflow_path in (
         ".github/workflows/antfly-artifact-build.yml",
-        ".github/workflows/diagnose-zig-arm64-bad-alloc.yml",
+        ".github/workflows/qualify-release-archives.yml",
         ".github/workflows/sdks-ci.yml",
         ".github/workflows/zig-inference-l4-spot.yml",
         ".github/workflows/zig-scale-tests.yml",
@@ -314,7 +314,7 @@ def validate(policy: dict) -> list[str]:
         "steps.toolchain.outputs.zig_aarch64_linux_sha256",
     )
 
-    diagnose_workflow_path = ".github/workflows/diagnose-zig-arm64-bad-alloc.yml"
+    diagnose_workflow_path = ".github/workflows/qualify-release-archives.yml"
     diagnose_workflow = (REPO_ROOT / diagnose_workflow_path).read_text()
     for policy_output in (
         "steps.toolchain.outputs.zig_nixpkgs_revision",
