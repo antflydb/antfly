@@ -91,6 +91,19 @@ def load_policy(path: Path = POLICY_PATH) -> dict[str, Any]:
         ids.add(platform_id)
         artifacts.add(artifact_name)
         archive_keys.add(archive_key)
+        if platform["archive_os"] == "Darwin":
+            target = re.fullmatch(
+                r"aarch64-macos\.(\d+)\.(\d+)(?:\.\d+)?", platform["zig_target"]
+            )
+            if target is None:
+                raise SystemExit(
+                    "Darwin releases require an explicit macOS deployment target"
+                )
+            expected_wheel = f"macosx_{target[1]}_{target[2]}_arm64"
+            if platform.get("wheel_platform") != expected_wheel:
+                raise SystemExit(
+                    f"Darwin wheel tag must match deployment target: {expected_wheel}"
+                )
         if platform.get("libc") == "glibc":
             expected = f"-linux-gnu.{glibc_minimum}"
             if expected not in platform["zig_target"]:

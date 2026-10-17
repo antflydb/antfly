@@ -640,6 +640,7 @@ pub fn demuxPacketsAlloc(allocator: std.mem.Allocator, packets: []const ogg.Pack
     var granule_base_decoded: u64 = 0;
 
     for (source_audio_packets) |packet| {
+        try @import("work_control.zig").check();
         const header = parseAudioPacketHeader(packet.bytes, headers) catch continue;
         const decoded_sample_count: u16 = if (previous_blocksize) |prev_blocksize|
             @intCast((@as(u32, prev_blocksize) + header.blocksize) / 4)
@@ -824,6 +825,7 @@ pub fn decodeDemuxedInterleavedAlloc(allocator: std.mem.Allocator, demuxed: Demu
     defer scratch.deinit();
 
     for (demuxed.audio_packets, 0..) |packet, packet_index| {
+        try @import("work_control.zig").check();
         const block = try decodeAudioPacketBlockAlloc(
             allocator,
             &scratch,
@@ -858,6 +860,80 @@ pub fn decodeDemuxedInterleavedAlloc(allocator: std.mem.Allocator, demuxed: Demu
         .channels = channels,
         .allocator = allocator,
     };
+}
+
+/// Overlap-add into a bounded rolling timeline. Samples are released only once
+/// no future packet's largest legal window can contribute to them.
+pub fn visitDemuxed(allocator: std.mem.Allocator, demuxed: Demuxed, sink: @import("pcm_sink.zig").Sink) !void {
+    const channels = demuxed.headers.identification.channels;
+    if (channels == 0 or demuxed.audio_packets.len == 0) return error.UnsupportedAudioFormat;
+    const small = demuxed.headers.identification.blocksize_small;
+    const large = demuxed.headers.identification.blocksize_large;
+    const short_plan = try sharedVorbisImdctPlan(small);
+    const long_plan = try sharedVorbisImdctPlan(large);
+    var scratch = VorbisDecodeScratch{ .allocator = allocator };
+    defer scratch.deinit();
+    const capacity = @as(usize, large) * 2;
+    const timeline = try allocator.alloc(f32, capacity * channels);
+    defer allocator.free(timeline);
+    @memset(timeline, 0);
+    const first = demuxed.audio_packets[0].header.blocksize / 2;
+    const playable = std.math.cast(usize, demuxed.playable_samples) orelse return error.UnsupportedAudioFormat;
+    const stop = try std.math.add(usize, first, playable);
+    var center: usize = first;
+    var base: usize = 0;
+    var emitted: usize = 0;
+    for (demuxed.audio_packets, 0..) |packet, index| {
+        try @import("work_control.zig").check();
+        if (index != 0) center = try std.math.add(usize, center, (demuxed.audio_packets[index - 1].header.blocksize + @as(usize, packet.header.blocksize)) / 4);
+        if (center < base or center - base + packet.header.blocksize / 2 > capacity) return error.UnsupportedAudioFormat;
+        const block = try decodeAudioPacketBlockAlloc(allocator, &scratch, demuxed.headers, packet.bytes, short_plan, long_plan);
+        try addPacketBlockToTimelineWithWindow(timeline, capacity, channels, block, center - base, small, packet.header);
+        const safe = if (index + 1 == demuxed.audio_packets.len) center + packet.header.blocksize / 2 else center + (packet.header.blocksize + @as(usize, demuxed.audio_packets[index + 1].header.blocksize)) / 4 -| large / 2;
+        const end = @min(stop, @max(base, safe));
+        const begin = @max(first, base);
+        if (end > begin) {
+            try sink.push(timeline[(begin - base) * channels .. (end - base) * channels], demuxed.headers.identification.sample_rate, channels);
+            emitted += end - begin;
+        }
+        const consumed = end - base;
+        std.mem.copyForwards(f32, timeline[0 .. (capacity - consumed) * channels], timeline[consumed * channels ..]);
+        @memset(timeline[(capacity - consumed) * channels ..], 0);
+        base = end;
+    }
+    if (emitted != playable) return error.UnsupportedAudioFormat;
+}
+const ChainSink = @import("chain_sink.zig").ChainSink;
+pub fn visitOgg(allocator: std.mem.Allocator, bytes: []const u8, sink: @import("pcm_sink.zig").Sink) !void {
+    var streams = try ogg.parsePacketStreamsAlloc(allocator, bytes);
+    defer streams.deinit();
+    if (streams.streams.len == 0) return error.UnsupportedAudioFormat;
+    var target_rate: u32 = 0;
+    var target_channels: u8 = 0;
+    for (streams.streams) |stream| {
+        var demuxed = try demuxPacketsAlloc(allocator, stream.packets);
+        defer demuxed.deinit();
+        target_rate = @max(target_rate, demuxed.headers.identification.sample_rate);
+        target_channels = @max(target_channels, demuxed.headers.identification.channels);
+    }
+    for (streams.streams) |stream| {
+        var demuxed = try demuxPacketsAlloc(allocator, stream.packets);
+        defer demuxed.deinit();
+        const rate = demuxed.headers.identification.sample_rate;
+        const channels = demuxed.headers.identification.channels;
+        if (rate == target_rate and channels == target_channels) {
+            try visitDemuxed(allocator, demuxed, sink);
+            continue;
+        }
+        const frames = std.math.cast(usize, demuxed.playable_samples) orelse return error.UnsupportedAudioFormat;
+        const previous = try allocator.alloc(f32, channels);
+        defer allocator.free(previous);
+        const output = try allocator.alloc(f32, @as(usize, target_channels) * 1024);
+        defer allocator.free(output);
+        var normalized = ChainSink{ .sink = sink, .source_rate = rate, .source_channels = channels, .target_rate = target_rate, .target_channels = target_channels, .source_frames = frames, .target_frames = resampledFrameCount(frames, rate, target_rate), .previous = previous, .output = output };
+        try visitDemuxed(allocator, demuxed, .{ .context = &normalized, .write = ChainSink.write });
+        try normalized.finish();
+    }
 }
 
 pub fn parseAudioPacketHeader(packet: []const u8, headers: Headers) !AudioPacketHeader {
@@ -3037,5 +3113,37 @@ test "decode checked-in vorbis fixtures to interleaved pcm" {
         // Reference closeness is asserted by the codec corpus test in
         // mod.zig; this pins the shape and that nothing went non-finite.
         for (decoded.samples) |sample| try std.testing.expect(std.math.isFinite(sample));
+    }
+}
+
+test "streaming audio chained vorbis preserves batch normalization across rate changes" {
+    const a = std.testing.allocator;
+    const chained = try buildSyntheticChainedVorbisOggAlloc(a, tone_ogg_bytes);
+    defer a.free(chained);
+    const Capture = struct {
+        expected: []const f32,
+        offset: usize = 0,
+        rate: u32,
+        channels: u8,
+        fn write(raw: *anyopaque, pcm: []const f32, rate: u32, channels: u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try std.testing.expectEqual(self.rate, rate);
+            try std.testing.expectEqual(self.channels, channels);
+            try std.testing.expect(pcm.len <= @as(usize, 8192) * channels);
+            try std.testing.expect(pcm.len <= self.expected.len - self.offset);
+            for (self.expected[self.offset..][0..pcm.len], pcm) |want, got| try std.testing.expectApproxEqAbs(want, got, 0.000001);
+            self.offset += pcm.len;
+        }
+    };
+    // Changing the identification rate keeps the entropy-coded fixture real
+    // while exercising fractional interpolation and the final repeated sample.
+    for ([_]u32{ 16000, 22050, 44100 }) |second_rate| {
+        const header = std.mem.indexOf(u8, chained[tone_ogg_bytes.len..], "\x01vorbis").? + tone_ogg_bytes.len;
+        std.mem.writeInt(u32, chained[header + 12 ..][0..4], second_rate, .little);
+        var expected = try decodeInterleavedOggAlloc(a, chained);
+        defer expected.deinit();
+        var capture = Capture{ .expected = expected.samples, .rate = expected.sample_rate, .channels = expected.channels };
+        try visitOgg(a, chained, .{ .context = &capture, .write = Capture.write });
+        try std.testing.expectEqual(expected.samples.len, capture.offset);
     }
 }

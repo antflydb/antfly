@@ -54,6 +54,10 @@ pub const AudioChunkOptions = if (build_options.bench_minimal_deps) struct {
     overlap_duration_ms: u32 = 0,
 } else lib.AudioChunkOptions;
 
+pub const EmbeddingTarget = if (build_options.bench_minimal_deps) @import("inference_api").ChunkEmbeddingTarget else lib.EmbeddingTarget;
+pub const MediaPolicy = if (build_options.bench_minimal_deps) @import("inference_api").MediaChunkPolicy else lib.MediaPolicy;
+
+pub const Replay = if (build_options.bench_minimal_deps) struct { source_version: []const u8, source_fingerprint: []const u8, plan_id: []const u8, ordinal: u64 } else lib.Replay;
 pub const Config = if (build_options.bench_minimal_deps) struct {
     provider: Provider,
     api_url: []const u8 = "",
@@ -64,22 +68,47 @@ pub const Config = if (build_options.bench_minimal_deps) struct {
     threshold: ?f32 = null,
     text: TextChunkOptions = .{},
     audio: AudioChunkOptions = .{},
+    embedding: ?EmbeddingTarget = null,
+    policy: ?MediaPolicy = null,
+    replay: ?Replay = null,
 
     pub fn clone(self: Config, alloc: Allocator) !Config {
-        return .{
-            .provider = self.provider,
-            .api_url = if (self.api_url.len > 0) try alloc.dupe(u8, self.api_url) else "",
-            .model = if (self.model.len > 0) try alloc.dupe(u8, self.model) else "",
-            .store_chunks = self.store_chunks,
-            .full_text_index_json = if (self.full_text_index_json.len > 0) try alloc.dupe(u8, self.full_text_index_json) else "",
-            .max_chunks = self.max_chunks,
-            .threshold = self.threshold,
-            .text = try self.text.clone(alloc),
-            .audio = self.audio,
-        };
+        var copy = Config{ .provider = self.provider, .store_chunks = self.store_chunks, .max_chunks = self.max_chunks, .threshold = self.threshold, .audio = self.audio, .policy = self.policy };
+        errdefer copy.deinit(alloc);
+        copy.api_url = try alloc.dupe(u8, self.api_url);
+        copy.model = try alloc.dupe(u8, self.model);
+        copy.full_text_index_json = try alloc.dupe(u8, self.full_text_index_json);
+        copy.text = try self.text.clone(alloc);
+        if (self.replay) |value| {
+            const version = try alloc.dupe(u8, value.source_version);
+            errdefer alloc.free(version);
+            const source = try alloc.dupe(u8, value.source_fingerprint);
+            errdefer alloc.free(source);
+            copy.replay = .{ .source_version = version, .source_fingerprint = source, .plan_id = try alloc.dupe(u8, value.plan_id), .ordinal = value.ordinal };
+        }
+        if (self.embedding) |value| {
+            var owned = value;
+            owned.model = try alloc.dupe(u8, value.model);
+            errdefer alloc.free(owned.model);
+            owned.task_type = if (value.task_type) |task| try alloc.dupe(u8, task) else null;
+            errdefer if (owned.task_type) |task| alloc.free(task);
+            owned.model_identity = if (value.model_identity) |identity| try alloc.dupe(u8, identity) else null;
+            copy.embedding = owned;
+        }
+        return copy;
     }
 
     pub fn deinit(self: *Config, alloc: Allocator) void {
+        if (self.replay) |value| {
+            alloc.free(value.source_version);
+            alloc.free(value.source_fingerprint);
+            alloc.free(value.plan_id);
+        }
+        if (self.embedding) |value| {
+            alloc.free(value.model);
+            if (value.task_type) |task| alloc.free(task);
+            if (value.model_identity) |identity| alloc.free(identity);
+        }
         if (self.api_url.len > 0) alloc.free(self.api_url);
         if (self.model.len > 0) alloc.free(self.model);
         if (self.full_text_index_json.len > 0) alloc.free(self.full_text_index_json);
@@ -172,7 +201,23 @@ pub fn parseConfigFromValue(alloc: Allocator, value: std.json.Value) !Config {
         }
     }
 
-    if (cfg.provider == .antfly and cfg.api_url.len > 0 and cfg.model.len == 0) return error.InvalidChunkerConfig;
+    if (value.object.get("embedding")) |target| {
+        var parsed = try std.json.parseFromValue(EmbeddingTarget, alloc, target, .{});
+        defer parsed.deinit();
+        var owned = parsed.value;
+        owned.model = try alloc.dupe(u8, owned.model);
+        errdefer alloc.free(owned.model);
+        owned.task_type = if (owned.task_type) |task| try alloc.dupe(u8, task) else null;
+        errdefer if (owned.task_type) |task| alloc.free(task);
+        owned.model_identity = if (owned.model_identity) |identity| try alloc.dupe(u8, identity) else null;
+        cfg.embedding = owned;
+    }
+    if (value.object.get("policy")) |policy| {
+        var parsed = try std.json.parseFromValue(MediaPolicy, alloc, policy, .{});
+        defer parsed.deinit();
+        cfg.policy = parsed.value;
+    }
+    if (cfg.provider == .antfly and cfg.api_url.len > 0 and cfg.model.len == 0 and cfg.embedding == null) return error.InvalidChunkerConfig;
     return cfg;
 }
 
@@ -260,6 +305,12 @@ pub fn stringifyAlloc(alloc: Allocator, cfg: Config) ![]u8 {
         }
         try out.append(alloc, '}');
     }
+    inline for (.{ "embedding", "policy" }) |name| if (@field(cfg, name)) |value| {
+        try appendJsonFieldName(alloc, &out, &wrote, name);
+        const encoded = try std.json.Stringify.valueAlloc(alloc, value, .{ .emit_null_optional_fields = false });
+        defer alloc.free(encoded);
+        try out.appendSlice(alloc, encoded);
+    };
     try out.append(alloc, '}');
     return try out.toOwnedSlice(alloc);
 }

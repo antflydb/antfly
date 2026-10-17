@@ -1595,6 +1595,11 @@ fn finishRestoreStaging(self: *DB, alloc: std.mem.Allocator, scope: @import("db/
     return .{ .value = self.finishRestoreStaging(alloc, scope, phase) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
 
+fn importPortableRestoreFileIntoUnpublishedEmpty(self: *DB, alloc: std.mem.Allocator, io: native.IoBorrow, file: std.Io.File, file_size: u64, options: engine.PortableRestoreImportOptions) engine.Outcome(void) {
+    var receiver = io.receive() catch |err| return .{ .failure = .init(@errorName(err)) };
+    return .{ .value = self.importPortableRestoreFileIntoUnpublishedEmpty(alloc, receiver.io(), file, file_size, options) catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
+
 fn importPortableFileIntoUnpublishedEmpty(self: *DB, alloc: std.mem.Allocator, io: native.IoBorrow, file: std.Io.File, file_size: u64, target_identity: @import("db/doc_identity.zig").Namespace) engine.Outcome(void) {
     var receiver = io.receive() catch |err| return .{ .failure = .init(@errorName(err)) };
     const received_io = receiver.io();

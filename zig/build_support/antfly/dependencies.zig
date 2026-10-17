@@ -766,6 +766,7 @@ pub fn create(b: *std.Build, comptime asking_build_zig: type) ?Shared {
             .regex = regex_mod,
             .jsonschema = jsonschema_mod,
             .image = image_mod,
+            .pdf = pdf_mod,
             .hash = hash_mod,
             .prometheus = prometheus_mod,
             .structlog = structlog_mod,

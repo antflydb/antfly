@@ -89,6 +89,29 @@ pub fn chunkTextWithProvider(
             .end_offset = offsets.end,
         };
         initialized += 1;
+        if (shared.metadata) |metadata| chunks[i].metadata = try metadata.clone(alloc);
+    }
+    return chunks;
+}
+
+/// Database adapter preserves media descriptors and fused vectors together.
+pub fn chunkMediaWithProvider(a: Allocator, cfg: chunking_types.Config, input: RemoteInput, provider: ?chunk_provider.Provider) ![]Chunk {
+    const source = try chunkInputWithProvider(a, cfg, input, provider);
+    defer freeRemoteChunks(a, source);
+    const chunks = try a.alloc(Chunk, source.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (chunks[0..initialized]) |*chunk| chunk.deinit(a);
+        a.free(chunks);
+    }
+    for (source, chunks) |remote, *chunk| {
+        chunk.* = .{ .chunk_id = remote.id, .start_offset = remote.start_char, .end_offset = remote.end_char, .start_time_ms = remote.start_time_ms, .end_time_ms = remote.end_time_ms, .frame_index = remote.frame_index, .frame_delay_ms = remote.frame_delay_ms };
+        initialized += 1;
+        chunk.mime_type = try a.dupe(u8, remote.mime_type);
+        chunk.owns_mime_type = true;
+        if (remote.text) |text| chunk.text = try a.dupe(u8, text);
+        if (remote.data) |data| chunk.data = try a.dupe(u8, data);
+        if (remote.metadata) |metadata| chunk.metadata = try metadata.clone(a);
     }
     return chunks;
 }
@@ -118,6 +141,7 @@ pub fn chunkInputWithProvider(
     // turns a permanently empty document field into a retry loop instead of
     // a clean zero-chunk skip.
     switch (input) {
+        .source => if (cfg.embedding == null) return error.ModelAwareChunkProviderRequired,
         .text => |text| if (text.len == 0) return try alloc.alloc(RemoteChunk, 0),
         .binary => |binary| if (binary.data.len == 0) return try alloc.alloc(RemoteChunk, 0),
     }
@@ -150,11 +174,12 @@ pub fn chunkInputWithProvider(
             break :blk try ChunkProviderBoundary.call("chunk_input", dispatch, chunk_input, .{ ptr, alloc, if (cfg.model.len > 0) cfg.model else "fixed", input, cfg });
         } else return error.InvalidChunkProvider;
         defer inference_chunker.types.freeChunks(alloc, chunks);
+        try validateModelChunks(cfg, chunks);
         try request_context.check();
         return try cloneRemoteChunks(alloc, chunks);
     };
     const endpoint_raw = resolved_endpoint orelse return try chunkInputDirect(alloc, cfg, input);
-    if (cfg.model.len == 0) return error.InvalidChunkerConfig;
+    if (cfg.model.len == 0 and cfg.embedding == null) return error.InvalidChunkerConfig;
     // Unlike `managed_embedder.zig`'s embedder/extractor base URLs, a
     // chunker's `api_url` reached this call unnormalized: a bare
     // `host:port` (the natural way to configure "the same inference
@@ -191,7 +216,8 @@ pub fn chunkInputWithProvider(
         fallback_capability_cache = remote_capabilities.Cache.init(alloc, http.io);
         capability_cache = &fallback_capability_cache.?;
     }
-    const model = if (cfg.model.len > 0) cfg.model else "fixed";
+    const model = if (cfg.embedding) |target| target.model else if (cfg.model.len > 0) cfg.model else "fixed";
+    const capability_task: inference_work.Operation = if (cfg.embedding != null) .embed else .chunk;
     var routing_header_storage: [1][2][]const u8 = undefined;
     const routing_header_count = try execution.routing.appendHeaders(&routing_header_storage, 0);
     const routing_headers = routing_header_storage[0..routing_header_count];
@@ -199,17 +225,19 @@ pub fn chunkInputWithProvider(
         http,
         endpoint,
         model,
-        .chunk,
+        capability_task,
         routing_headers,
         execution.waitContext(),
     );
     var attachment_transport: inference_work.AttachmentTransport = .base64_payload;
     if (capability_lease.capabilities) |capabilities| {
+        if (cfg.embedding != null and !capabilities.model_aware_chunking_v1) return error.ModelAwareChunkProviderRequired;
         if (capabilities.framed_attachments and switch (input) {
             .binary => true,
-            .text => false,
+            .text, .source => false,
         }) attachment_transport = .segmented_framed_binary;
         const shape: inference_work.InvocationShape = switch (input) {
+            .source => .{ .item_count = 1 },
             .text => |text| .{
                 .item_count = 1,
                 .modalities = .{ .text = true },
@@ -218,7 +246,7 @@ pub fn chunkInputWithProvider(
             },
             .binary => |binary| .{
                 .item_count = 1,
-                .modalities = inference_work.modalityForMimeType(binary.mime_type) orelse
+                .modalities = if (cfg.embedding != null and std.ascii.startsWithIgnoreCase(binary.mime_type, "video/")) .{ .image = true } else inference_work.modalityForMimeType(binary.mime_type) orelse
                     return error.UnsupportedChunkMediaType,
                 .encoded_media_bytes = try attachment_transport.wireSize(
                     binary.data.len,
@@ -227,7 +255,7 @@ pub fn chunkInputWithProvider(
                 .max_media_parts_per_item = 1,
             },
         };
-        try capabilities.validateInvocation(.chunk, shape);
+        if (cfg.embedding == null) try capabilities.validateInvocation(.chunk, shape);
     }
 
     const url = try std.fmt.allocPrint(alloc, "{s}/chunk", .{endpoint});
@@ -283,16 +311,31 @@ pub fn chunkInputWithProvider(
         if (resp.status.code == 409 and stale != null and
             std.ascii.eqlIgnoreCase(std.mem.trim(u8, stale.?, " \t"), "true"))
         {
-            try capability_cache.?.invalidate(endpoint, model, .chunk, routing_headers);
+            try capability_cache.?.invalidate(endpoint, model, capability_task, routing_headers);
             return error.InferenceCapabilitiesStale;
         }
         return error.ChunkRequestFailed;
     }
     const response_body = resp.body orelse return error.EmptyResponse;
-    const chunks = try parseChunkResponse(alloc, response_body);
+    const chunks = if (cfg.replay) |replay| try parseModelChunkResponse(alloc, response_body, replay) else try parseChunkResponse(alloc, response_body);
     errdefer inference_chunker.types.freeChunks(alloc, chunks);
+    try validateModelChunks(cfg, chunks);
     try execution.check(platform_time.monotonicNs());
     return chunks;
+}
+
+fn validateModelChunks(cfg: chunking_types.Config, chunks: []const RemoteChunk) !void {
+    const target = cfg.embedding orelse return;
+    for (chunks) |chunk| {
+        const metadata = chunk.metadata orelse return error.ModelAwareChunkProviderRequired;
+        if (!std.mem.eql(u8, target.model, metadata.model) or !std.mem.eql(u8, target.task_type orelse "RETRIEVAL_DOCUMENT", metadata.task_type)) return error.InvalidChunkerResponse;
+        if (target.dimensions) |dimensions| if (metadata.dimensions != dimensions) return error.InvalidChunkerResponse;
+        if (target.execute orelse true) {
+            const vector = metadata.embedding orelse return error.InvalidEmbeddingResponse;
+            if (vector.len != metadata.dimensions or vector.len == 0) return error.InvalidEmbeddingResponse;
+            for (vector) |value| if (!std.math.isFinite(value)) return error.InvalidEmbeddingResponse;
+        }
+    }
 }
 
 /// Mirrors `managed_embedder.zig`'s `normalizeAntflyInferenceBaseUrl`: a bare
@@ -311,6 +354,7 @@ fn normalizedAntflyChunkEndpointAlloc(alloc: Allocator, raw: []const u8) ![]u8 {
 }
 
 fn chunkInputDirect(alloc: Allocator, cfg: chunking_types.Config, input: RemoteInput) ![]RemoteChunk {
+    if (cfg.embedding != null) return error.ModelAwareChunkProviderRequired;
     var fixed_cfg = inference_chunker.FixedChunkConfig{};
     if (cfg.model.len > 0) fixed_cfg.model = cfg.model;
     if (cfg.max_chunks > 0) fixed_cfg.max_chunks = @intCast(cfg.max_chunks);
@@ -337,22 +381,22 @@ fn cloneRemoteChunks(alloc: Allocator, source: []const RemoteChunk) ![]RemoteChu
     }
 
     for (source, 0..) |chunk, i| {
-        chunks[i] = .{
-            .id = chunk.id,
-            .mime_type = try alloc.dupe(u8, chunk.mime_type),
-            .text = if (chunk.text) |text| try alloc.dupe(u8, text) else null,
-            .start_char = chunk.start_char,
-            .end_char = chunk.end_char,
-            .data = if (chunk.data) |data| try alloc.dupe(u8, data) else null,
-            .start_time_ms = chunk.start_time_ms,
-            .end_time_ms = chunk.end_time_ms,
-            .frame_index = chunk.frame_index,
-            .frame_delay_ms = chunk.frame_delay_ms,
-            .owns_mime_type = true,
-            .owns_text = chunk.text != null,
-            .owns_data = chunk.data != null,
-        };
+        chunks[i] = .{ .id = chunk.id, .mime_type = "", .start_char = chunk.start_char, .end_char = chunk.end_char, .start_time_ms = chunk.start_time_ms, .end_time_ms = chunk.end_time_ms, .frame_index = chunk.frame_index, .frame_delay_ms = chunk.frame_delay_ms };
         initialized += 1;
+        chunks[i].mime_type = try alloc.dupe(u8, chunk.mime_type);
+        chunks[i].owns_mime_type = true;
+        if (chunk.text) |text| {
+            chunks[i].text = try alloc.dupe(u8, text);
+            chunks[i].owns_text = true;
+        }
+        if (chunk.data) |data| {
+            chunks[i].data = try alloc.dupe(u8, data);
+            chunks[i].owns_data = true;
+        }
+        if (chunk.metadata) |metadata| {
+            chunks[i].metadata = try metadata.clone(alloc);
+            chunks[i].owns_metadata = true;
+        }
     }
     return chunks;
 }
@@ -373,15 +417,24 @@ const EncodedChunkRequest = struct {
     }
 };
 
+fn convertOptional(comptime T: type, value: anytype) ?T {
+    const v = value orelse return null;
+    var converted: T = undefined;
+    inline for (@typeInfo(T).@"struct".field_names) |name| @field(converted, name) = @field(v, name);
+    return converted;
+}
+
 fn encodeChunkRequest(
     alloc: Allocator,
     cfg: chunking_types.Config,
     input: RemoteInput,
     attachment_transport: inference_work.AttachmentTransport,
 ) !EncodedChunkRequest {
+    const continuation = if (cfg.replay) |replay| try std.fmt.allocPrint(alloc, "{s}:{d}", .{ replay.plan_id, replay.ordinal }) else null;
+    defer if (continuation) |cursor| alloc.free(cursor);
     const config: inference_api.ChunkConfig = .{
         .model = cfg.model,
-        .max_chunks = if (cfg.max_chunks > 0) cfg.max_chunks else null,
+        .max_chunks = if (cfg.replay != null) 1 else if (cfg.max_chunks > 0) cfg.max_chunks else null,
         .threshold = cfg.threshold,
         .text = if (cfg.text.target_tokens > 0 or cfg.text.overlap_tokens > 0 or cfg.text.separator.len > 0) .{
             .target_tokens = if (cfg.text.target_tokens > 0) cfg.text.target_tokens else null,
@@ -395,10 +448,20 @@ fn encodeChunkRequest(
     };
 
     switch (input) {
+        .source => |reference| {
+            if (cfg.embedding == null) return error.ModelAwareChunkProviderRequired;
+            const request = .{ .input = .{ .type = "source", .uri = reference.uri, .mime_type = reference.mime_type, .version = reference.version, .version_kind = @tagName(reference.version_kind), .length = reference.length }, .config = config, .embedding = convertOptional(inference_api.ChunkEmbeddingTarget, cfg.embedding), .policy = convertOptional(inference_api.MediaChunkPolicy, cfg.policy), .include_content = true, .continuation = continuation, .source_version = if (cfg.replay) |replay| replay.source_version else null };
+            return .{ .metadata_or_json = try httpx.json.Json.stringify(alloc, request) };
+        },
         .text => |text| {
             const request = inference_api.ChunkRequest{
                 .input = .{ .string = text },
                 .config = config,
+                .embedding = convertOptional(inference_api.ChunkEmbeddingTarget, cfg.embedding),
+                .policy = convertOptional(inference_api.MediaChunkPolicy, cfg.policy),
+                .include_content = if (cfg.embedding != null) true else null,
+                .continuation = continuation,
+                .source_version = if (cfg.replay) |replay| replay.source_version else null,
             };
             return .{ .metadata_or_json = try httpx.json.Json.stringify(alloc, request) };
         },
@@ -412,6 +475,11 @@ fn encodeChunkRequest(
             const request = struct {
                 input: inference_api.MediaContentPart,
                 config: inference_api.ChunkConfig,
+                embedding: ?inference_api.ChunkEmbeddingTarget,
+                policy: ?inference_api.MediaChunkPolicy,
+                include_content: ?bool,
+                continuation: ?[]const u8,
+                source_version: ?[]const u8,
             }{
                 .input = .{
                     .type = "media",
@@ -419,6 +487,11 @@ fn encodeChunkRequest(
                     .mime_type = binary.mime_type,
                 },
                 .config = config,
+                .embedding = convertOptional(inference_api.ChunkEmbeddingTarget, cfg.embedding),
+                .policy = convertOptional(inference_api.MediaChunkPolicy, cfg.policy),
+                .include_content = if (cfg.embedding != null) true else null,
+                .continuation = continuation,
+                .source_version = if (cfg.replay) |replay| replay.source_version else null,
             };
             const metadata = try httpx.json.Json.stringify(alloc, request);
             if (!framed) return .{ .metadata_or_json = metadata };
@@ -436,6 +509,9 @@ fn encodeChunkRequest(
 }
 
 fn parseChunkResponse(alloc: Allocator, response_body: []const u8) ![]RemoteChunk {
+    var tag = try std.json.parseFromSlice(struct { object: ?[]const u8 = null }, alloc, response_body, .{ .ignore_unknown_fields = true });
+    defer tag.deinit();
+    if (tag.value.object) |kind| if (std.mem.eql(u8, kind, "chunk.embedding.list")) return parseModelChunkResponse(alloc, response_body, null);
     const Response = struct {
         data: []const struct {
             id: i64,
@@ -455,8 +531,9 @@ fn parseChunkResponse(alloc: Allocator, response_body: []const u8) ![]RemoteChun
     defer parsed.deinit();
 
     var chunks = try alloc.alloc(RemoteChunk, parsed.value.data.len);
+    var initialized: usize = 0;
     errdefer {
-        for (chunks) |*chunk| chunk.deinit(alloc);
+        for (chunks[0..initialized]) |*chunk| chunk.deinit(alloc);
         alloc.free(chunks);
     }
 
@@ -488,8 +565,87 @@ fn parseChunkResponse(alloc: Allocator, response_body: []const u8) ![]RemoteChun
             out.owns_data = true;
         }
         chunks[i] = out;
+        initialized += 1;
     }
 
+    return chunks;
+}
+
+fn parseModelChunkResponse(a: Allocator, body: []const u8, replay: ?chunking_types.Replay) ![]RemoteChunk {
+    var parsed = try std.json.parseFromSlice(inference_api.ChunkEmbeddingResponse, a, body, .{ .ignore_unknown_fields = true });
+    defer parsed.deinit();
+    const response = parsed.value;
+    if (replay) |expected| {
+        if ((!std.mem.eql(u8, response.status, "complete") and !std.mem.eql(u8, response.status, "partial")) or response.gaps.len != 0 or response.data.len != 1 or response.@"error" != null or response.start_ordinal != expected.ordinal or response.covered_through_ordinal != expected.ordinal + 1 or !std.mem.eql(u8, expected.plan_id, response.plan_id) or !std.mem.eql(u8, expected.source_fingerprint, response.source_fingerprint) or !std.mem.eql(u8, expected.source_version, response.source_version)) return error.InvalidChunkReplay;
+    } else if (!std.mem.eql(u8, response.status, "complete") or response.next_continuation != null or response.gaps.len != 0 or response.start_ordinal != 0 or response.covered_through_ordinal != response.data.len) return error.IncompleteChunkCoverage;
+    if (response.source_fingerprint.len != 64 or response.plan_id.len != 64 or response.model_identity.len != 64 or response.source_version.len == 0 or response.dimensions < 0) return error.InvalidChunkerResponse;
+    var plan: [32]u8 = undefined;
+    _ = std.fmt.hexToBytes(&plan, response.plan_id) catch return error.InvalidChunkerResponse;
+    var source: [32]u8 = undefined;
+    _ = std.fmt.hexToBytes(&source, response.source_fingerprint) catch return error.InvalidChunkerResponse;
+    const chunks = try a.alloc(RemoteChunk, response.data.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (chunks[0..initialized]) |*chunk| chunk.deinit(a);
+        a.free(chunks);
+    }
+    for (response.data, chunks, 0..) |item, *chunk, i| {
+        const ordinal: u64 = try std.math.add(u64, if (replay) |expected| expected.ordinal else 0, i);
+        if (item.@"error" != null or item.descriptor.ordinal != ordinal) return error.InvalidChunkerResponse;
+        var cursor: [85]u8 = undefined;
+        if (!std.mem.eql(u8, item.descriptor.id, (inference_chunker.planning.Identity{ .plan = plan, .source = source }).cursor(ordinal, &cursor))) return error.InvalidChunkerResponse;
+        const raw = item.descriptor.coordinates;
+        var coordinates = inference_chunker.planning.Coordinates{ .kind = std.meta.stringToEnum(inference_chunker.planning.Kind, raw.kind) orelse return error.InvalidChunkerResponse };
+        inline for (.{ "start_byte", "end_byte", "page", "start_ns", "end_ns", "first_picture", "picture_count", "start_sample", "end_sample", "sample_rate", "start_tick", "end_tick", "timescale", "page_rotation", "raster_width", "raster_height" }) |name| {
+            if (@field(raw, name)) |number| @field(coordinates, name) = std.math.cast(@typeInfo(@TypeOf(@field(coordinates, name))).optional.child, number) orelse return error.InvalidChunkerResponse;
+        }
+        var owned_pictures: ?[]u64 = null;
+        defer if (owned_pictures) |pictures| a.free(pictures);
+        if (raw.picture_basis) |basis| coordinates.picture_basis = std.meta.stringToEnum(inference_chunker.planning.PictureBasis, basis) orelse return error.InvalidChunkerResponse;
+        if (raw.selected_pictures) |pictures| {
+            if (pictures.len > 32) return error.InvalidChunkerResponse;
+            const selected = try a.alloc(u64, pictures.len);
+            owned_pictures = selected;
+            for (selected, pictures) |*dest, picture| dest.* = std.math.cast(u64, picture) orelse return error.InvalidChunkerResponse;
+            coordinates.selected_pictures = selected;
+        }
+        if (raw.page_box) |box| {
+            if (box.len != 4) return error.InvalidChunkerResponse;
+            coordinates.page_box = box[0..4].*;
+        }
+        if (raw.region) |box| {
+            if (box.len != 4) return error.InvalidChunkerResponse;
+            var region: [4]u32 = undefined;
+            for (&region, box) |*dest, n| dest.* = std.math.cast(u32, n) orelse return error.InvalidChunkerResponse;
+            coordinates.region = region;
+        }
+        try coordinates.validate();
+        var policy = inference_chunker.planning.Policy{};
+        inline for (@typeInfo(inference_chunker.planning.Policy).@"struct".field_names) |name| if (@field(response.policy, name)) |n| {
+            @field(policy, name) = std.math.cast(@TypeOf(@field(policy, name)), n) orelse return error.InvalidChunkerResponse;
+        };
+        try policy.validate();
+        if (item.embedding) |vector| {
+            if (vector.len != response.dimensions) return error.InvalidChunkerResponse;
+            for (vector) |v| if (!std.math.isFinite(v)) return error.InvalidChunkerResponse;
+        }
+        chunk.* = .{ .id = std.math.cast(u32, ordinal) orelse return error.InvalidChunkerResponse, .mime_type = "" };
+        initialized += 1;
+        chunk.mime_type = try a.dupe(u8, item.mime_type);
+        chunk.owns_mime_type = true;
+        if (item.text) |text| {
+            chunk.text = try a.dupe(u8, text);
+            chunk.owns_text = true;
+        }
+        if (item.data) |data| {
+            chunk.data = try base64DecodeAlloc(a, data);
+            chunk.owns_data = true;
+        }
+        chunk.start_char = if (coordinates.start_byte) |n| std.math.cast(u32, n) else null;
+        chunk.end_char = if (coordinates.end_byte) |n| std.math.cast(u32, n) else null;
+        chunk.metadata = try (inference_chunker.types.ModelMetadata{ .descriptor = .{ .ordinal = ordinal, .coordinates = coordinates, .input_tokens = std.math.cast(usize, item.descriptor.input_tokens) orelse return error.InvalidChunkerResponse }, .inference_id = item.descriptor.id, .source_fingerprint = response.source_fingerprint, .source_version = response.source_version, .plan_id = response.plan_id, .model = response.model, .model_identity = response.model_identity, .model_revision = response.model_revision, .task_type = response.task_type, .dimensions = @intCast(response.dimensions), .policy = policy, .embedding = item.embedding }).clone(a);
+        chunk.owns_metadata = true;
+    }
     return chunks;
 }
 
@@ -876,4 +1032,28 @@ test "antfly chunker execution-only provider preserves local fallback and cancel
     var canceled = std.atomic.Value(bool).init(true);
     provider.execution.cancellation = .fromAtomic(&canceled);
     try std.testing.expectError(error.Canceled, chunkTextWithProvider(alloc, cfg, "alpha beta", provider));
+}
+
+test "model aware media transport retains vector provenance and rejects incomplete coverage" {
+    const Fixture = struct {
+        const raw =
+            \\{"object":"chunk.embedding.list","data":[{"descriptor":{"id":"1111111111111111111111111111111111111111111111111111111111111111:0","ordinal":0,"coordinates":{"kind":"video","start_ns":0,"end_ns":1000000000,"start_tick":0,"end_tick":90000,"timescale":90000},"input_tokens":144},"mime_type":"video/mp4","embedding":[0.6,0.8]}],"status":"complete","source_fingerprint":"2222222222222222222222222222222222222222222222222222222222222222","source_version":"v1","plan_id":"1111111111111111111111111111111111111111111111111111111111111111","model":"model","model_identity":"3333333333333333333333333333333333333333333333333333333333333333","model_revision":"4444444444444444444444444444444444444444444444444444444444444444","task_type":"RETRIEVAL_DOCUMENT","dimensions":2,"policy":{},"start_ordinal":0,"covered_through_ordinal":1,"gaps":[]}
+        ;
+        fn qualify(a: Allocator) !void {
+            const chunks = try parseChunkResponse(a, raw);
+            defer freeRemoteChunks(a, chunks);
+            const copy = try cloneRemoteChunks(a, chunks);
+            defer freeRemoteChunks(a, copy);
+            try std.testing.expectEqual(@as(usize, 1), copy.len);
+            const metadata = copy[0].metadata.?;
+            try std.testing.expectEqualStrings("v1", metadata.source_version);
+            try std.testing.expectEqual(@as(?u32, 90000), metadata.descriptor.coordinates.timescale);
+            try std.testing.expectEqualSlices(f32, &.{ 0.6, 0.8 }, metadata.embedding.?);
+        }
+    };
+    try Fixture.qualify(std.testing.allocator);
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Fixture.qualify, .{});
+    const partial = try std.mem.replaceOwned(u8, std.testing.allocator, Fixture.raw, "\"complete\"", "\"partial\"");
+    defer std.testing.allocator.free(partial);
+    try std.testing.expectError(error.IncompleteChunkCoverage, parseChunkResponse(std.testing.allocator, partial));
 }

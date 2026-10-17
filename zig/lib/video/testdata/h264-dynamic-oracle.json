@@ -1,0 +1,58 @@
+{
+  "cases": [
+    {
+      "name": "h264-dynamic-geometry",
+      "mp4_sha256": "a78ae2b3cf90e191f1da72aeb269ea26077454e4cbd306794cb3ef09ed258bdc",
+      "frames": [
+        {
+          "width": 64,
+          "height": 64,
+          "bit_depth": 8,
+          "chroma_format": 1,
+          "sha256": "c2c4db4a8d55e4e51a4089930f0f5cbb0ce80adad6abbe7c5a0bf7a313c140ae"
+        },
+        {
+          "width": 96,
+          "height": 96,
+          "bit_depth": 10,
+          "chroma_format": 2,
+          "sha256": "c215821b7dfd780add34ec39f2fa2cf7b80cfcf9d21483d5845e1950f2f229f8"
+        },
+        {
+          "width": 80,
+          "height": 96,
+          "bit_depth": 14,
+          "chroma_format": 3,
+          "sha256": "a1eadf15108c539b59902b7532f14caa2a9dfda9cd450eedb65411c23671c26d"
+        }
+      ]
+    },
+    {
+      "name": "h264-dynamic-pps",
+      "mp4_sha256": "012e7730331d4f44f2ac69d049f4829164d54de37e6eeedf5f88d06c1990baf2",
+      "frames": [
+        {
+          "width": 64,
+          "height": 48,
+          "bit_depth": 8,
+          "chroma_format": 1,
+          "sha256": "edd1af2de99258836c952570b79cc919a9331914471f8434926efb5f94d6d8f8"
+        },
+        {
+          "width": 64,
+          "height": 48,
+          "bit_depth": 8,
+          "chroma_format": 1,
+          "sha256": "ae268fdcf74347c7b1e4378a83d78eedf2663825ee84e31a5011f4a80325e153"
+        },
+        {
+          "width": 64,
+          "height": 48,
+          "bit_depth": 8,
+          "chroma_format": 1,
+          "sha256": "4818a0a4fd428eb7665178c7bc57d67697ca4cce592538602e0ef6748a933af3"
+        }
+      ]
+    }
+  ]
+}

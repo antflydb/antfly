@@ -1,0 +1,40 @@
+{
+  "version": 1,
+  "purpose": "Pinned reference preservation and MP4/TS equivalence, without relevance labels",
+  "documents": [
+    {
+      "id": "closed-mp4",
+      "path": "../closed.mp4",
+      "sha256": "3b5a5e12bf9831002e1f45d3d0b2ed8676632a884b526c098f15bcd18cb06efc",
+      "provenance": "Synthetic native video qualification fixture, TS uses AVC copy plus h264_mp4toannexb; independent generator at zig/lib/media/scripts/generate_ts_fixtures.py"
+    },
+    {
+      "id": "closed-ts",
+      "path": "../closed.ts",
+      "sha256": "00f54b524dc404758c1b0044fd6d3c86af9874be7836025f79764f28977bb185",
+      "provenance": "Synthetic native video qualification fixture, TS uses AVC copy plus h264_mp4toannexb; independent generator at zig/lib/media/scripts/generate_ts_fixtures.py"
+    },
+    {
+      "id": "bframes-mp4",
+      "path": "../bframes.mp4",
+      "sha256": "58de44f592e3df42aca292965394a3213b1bc7047e1269d5262652fb32a2dc18",
+      "provenance": "Synthetic native video qualification fixture, TS uses AVC copy plus h264_mp4toannexb; independent generator at zig/lib/media/scripts/generate_ts_fixtures.py"
+    },
+    {
+      "id": "bframes-ts",
+      "path": "../bframes.ts",
+      "sha256": "bdc83e969c31c267bc019d4730d47ee8cc196504e89496861a46b28982f1e941",
+      "provenance": "Synthetic native video qualification fixture, TS uses AVC copy plus h264_mp4toannexb; independent generator at zig/lib/media/scripts/generate_ts_fixtures.py"
+    }
+  ],
+  "queries": [
+    {
+      "id": "query-pattern",
+      "text": "A moving test pattern."
+    },
+    {
+      "id": "query-colour",
+      "text": "Changing colours and shapes."
+    }
+  ]
+}

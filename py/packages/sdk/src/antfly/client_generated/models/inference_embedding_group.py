@@ -18,8 +18,9 @@ T = TypeVar("T", bound="InferenceEmbeddingGroup")
 
 @_attrs_define
 class InferenceEmbeddingGroup:
-    """EmbeddingGemma 2 ordered text, image and audio parts producing one joint vector. Video is unsupported. The expanded
-    sequence including all media soft tokens must fit 8192 tokens.
+    """EmbeddingGemma 2 ordered text, image, audio and video parts producing one joint vector. Video uses video/mp4,
+    video/quicktime, video/webm or video/mp2t media/attachment parts, 1 FPS sampling, a uniform 32-frame cap and up to
+    140 soft tokens per frame. The expanded sequence must fit 8192 tokens.
 
         Attributes:
             content (list[ImageURLContentPart | MediaContentPart | TextContentPart]):
