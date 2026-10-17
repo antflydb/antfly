@@ -187,7 +187,9 @@ pub fn addMacosSdkPaths(b: *std.Build, module: *std.Build.Module, target: std.Bu
     const sdk_root = macosSdkRoot(b, target) orelse return;
     module.addSystemIncludePath(sdk_root.path(b, "usr/include"));
     module.addLibraryPath(sdk_root.path(b, "usr/lib"));
-    module.addFrameworkPath(sdk_root.path(b, "System/Library/Frameworks"));
+    // SDK headers are system headers even with an explicit older deployment
+    // target. Keep their legacy declarations out of consumers' -Werror policy.
+    module.addSystemFrameworkPath(sdk_root.path(b, "System/Library/Frameworks"));
 }
 
 fn macosSdkRoot(b: *std.Build, target: std.Build.ResolvedTarget) ?std.Build.LazyPath {

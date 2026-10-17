@@ -13,8 +13,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Request-local live allocation ceiling. The owner must reserve `limit` with
-//! process admission first and use a reclaiming backing allocator. Wrapping an
+//! Request-local live allocation ceiling. The owner must either reserve `limit`
+//! first or admit each backing allocation before growth. Use a reclaiming backing
+//! allocator (for example AdmittedAllocator for adaptive admission). Wrapping an
 //! arena would count logical frees while retaining physical memory. This owner
 //! must outlive every allocation made through it. Accounting is serialized;
 //! statistics may be read only once any allocation workers have joined.

@@ -354,6 +354,7 @@ test "Sync pool drains concurrent callers with bounded and unavailable capacity"
 }
 
 test "Sync pool completes inline while its only worker is occupied" {
+    if (comptime !supports_sync_parallelism) return error.SkipZigTest;
     var owner = SyncPool.init(1);
     defer owner.deinit();
     const io = owner.io_impl.io();

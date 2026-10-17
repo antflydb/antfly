@@ -913,6 +913,38 @@ pub const MediaContentPart = struct {
     data: []const u8,
     /// MIME type (audio/wav, image/gif, image/png, etc.).
     mime_type: []const u8,
+    sampling: ?VideoSamplingPolicy = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "type", "type", false },
+        .{ "data", "data", false },
+        .{ "mime_type", "mime_type", false },
+        .{ "sampling", "sampling", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("type");
+        try jw.write(self.type);
+        try jw.objectField("data");
+        try jw.write(self.data);
+        try jw.objectField("mime_type");
+        try jw.write(self.mime_type);
+        if (self.sampling) |value| {
+            try jw.objectField("sampling");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// Configuration for the Ollama generative AI provider.
@@ -1347,6 +1379,68 @@ pub const VertexGeneratorConfig = struct {
         }
         if (self.top_k) |value| {
             try jw.objectField("top_k");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+/// Explicit EmbeddingGemma 2 video-group sampling. Timestamp windows are half-open and relative to the first presentation picture.
+pub const VideoSamplingPolicy = struct {
+    policy: []const u8,
+    start_ns: ?i64 = null,
+    end_ns: ?i64 = null,
+    step_ns: ?i64 = null,
+    max_frames: ?i64 = null,
+    overflow: ?[]const u8 = null,
+    /// Sample the displayed picture, including VFR holds, rather than the next picture at or after the target.
+    hold: ?bool = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "policy", "policy", false },
+        .{ "start_ns", "start_ns", true },
+        .{ "end_ns", "end_ns", true },
+        .{ "step_ns", "step_ns", true },
+        .{ "max_frames", "max_frames", true },
+        .{ "overflow", "overflow", true },
+        .{ "hold", "hold", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("policy");
+        try jw.write(self.policy);
+        if (self.start_ns) |value| {
+            try jw.objectField("start_ns");
+            try jw.write(value);
+        }
+        if (self.end_ns) |value| {
+            try jw.objectField("end_ns");
+            try jw.write(value);
+        }
+        if (self.step_ns) |value| {
+            try jw.objectField("step_ns");
+            try jw.write(value);
+        }
+        if (self.max_frames) |value| {
+            try jw.objectField("max_frames");
+            try jw.write(value);
+        }
+        if (self.overflow) |value| {
+            try jw.objectField("overflow");
+            try jw.write(value);
+        }
+        if (self.hold) |value| {
+            try jw.objectField("hold");
             try jw.write(value);
         }
         try jw.endObject();

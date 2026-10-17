@@ -1455,7 +1455,7 @@ fn inferenceProviderChunkInputContext(
     request_context: ?inference.RequestContext,
 ) anyerror![]inference_chunker.Chunk {
     return switch (input) {
-        .text => try invokeInferenceProvider([]inference_chunker.Chunk, alloc, handle, .chunk_input, .{
+        .text, .source => try invokeInferenceProvider([]inference_chunker.Chunk, alloc, handle, .chunk_input, .{
             .model = model,
             .input = input,
             .config = config,

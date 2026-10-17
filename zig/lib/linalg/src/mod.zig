@@ -17,6 +17,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 pub const x86 = @import("x86.zig");
 pub const primitives = @import("primitives.zig");
+pub const prepared_gemm = @import("packed_gemm.zig");
 pub const gemm = @import("gemm_dispatch.zig");
 pub const pool = @import("pool.zig");
 pub const attention = @import("attention.zig");
@@ -421,9 +422,11 @@ pub const t5RelativePositionBucket = attention.t5RelativePositionBucket;
 pub const ropeCore = attention.ropeCore;
 pub const flashCausalAttentionHost = attention.flashCausalAttentionHost;
 pub const flashAttentionHost = attention.flashAttentionHost;
+pub const flashAttentionHostWithIo = attention.flashAttentionHostWithIo;
 pub const segmentAttentionHost = attention.segmentAttentionHost;
 pub const segmentAttentionHostWithGemm = attention.segmentAttentionHostWithGemm;
 pub const segmentAttentionHostWithGemmParallelIo = attention.segmentAttentionHostWithGemmParallelIo;
+pub const segmentAttentionHostWithGemmSerialIo = attention.segmentAttentionHostWithGemmSerialIo;
 pub const segmentTrainingAttentionForwardHost = attention.segmentTrainingAttentionForwardHost;
 pub const segmentTrainingAttentionBackwardHost = attention.segmentTrainingAttentionBackwardHost;
 pub const SegmentTrainingAttentionForward = attention.SegmentTrainingAttentionForward;
@@ -1061,5 +1064,60 @@ test "sgemmTransBF16Weights column dispatch matches the serial kernel for few ro
         sgemmTransBF16AddSlice(0, m, n, k, 1.0, a, b, want);
         sgemmTransBF16WeightsSync(m, n, k, 1.0, a, b, 0.0, got);
         try std.testing.expectEqualSlices(f32, want, got);
+    }
+}
+
+pub const segmentAttentionGroupedHostWithGemmIo = attention.segmentAttentionGroupedHostWithGemmIo;
+pub const denseAttentionHostWithGemmIo = attention.denseAttentionHostWithGemmIo;
+pub const denseAttentionPortableHostWithIo = attention.denseAttentionPortableHostWithIo;
+
+pub const segmentAttentionGroupedHostWithGemmParallelIo = attention.segmentAttentionGroupedHostWithGemmParallelIo;
+
+extern fn antfly_x86_sgemm_prepared(start: usize, end: usize, n: usize, k: usize, panel_count: usize, data: [*]f32, a: [*]const f32, c: [*]f32) callconv(.c) void;
+const PreparedCtx = struct {
+    m_start: usize = 0,
+    m_end: usize = 0,
+    panels: prepared_gemm.Panels,
+    a: []const f32,
+    c: []f32,
+    pub fn run(raw: *anyopaque) void {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        if (comptime x86.enabled) {
+            if (x86.selected() == .avx2) {
+                antfly_x86_sgemm_prepared(self.m_start, self.m_end, self.panels.n, self.panels.k, self.panels.data.len, self.panels.data.ptr, self.a.ptr, self.c.ptr);
+                return;
+            }
+        }
+        prepared_gemm.rows(self.panels, self.m_start, self.m_end, self.a, self.c);
+    }
+};
+pub fn sgemmPrepared(io: ?Io, m: usize, panels: prepared_gemm.Panels, a: []const f32, c: []f32) Cancelable!void {
+    if (m == 0) return;
+    return dispatchRows(io, PreparedCtx, .{ .panels = panels, .a = a, .c = c }, m, @as(u64, m) * panels.n * panels.k);
+}
+
+test "prepared GEMM threaded sync and Io dispatch preserve independent columns" {
+    const a = std.testing.allocator;
+    const m = 64;
+    const n = 131;
+    const k = 513;
+    const x = try a.alloc(f32, m * k);
+    defer a.free(x);
+    const w = try a.alloc(f32, n * k);
+    defer a.free(w);
+    const expected = try a.alloc(f32, m * n);
+    defer a.free(expected);
+    const actual = try a.alloc(f32, m * n);
+    defer a.free(actual);
+    for (x, 0..) |*v, i| v.* = @as(f32, @floatFromInt(i % 13)) / 13;
+    for (w, 0..) |*v, i| v.* = @as(f32, @floatFromInt(i % 17)) / 17;
+    const panels = try prepared_gemm.Panels.init(a, w, n, k);
+    defer panels.deinit(a);
+    prepared_gemm.rows(panels, 0, m, x, expected);
+    const io = std.Io.Threaded.global_single_threaded.io();
+    for ([_]?Io{ null, io }) |runtime| {
+        @memset(actual, std.math.nan(f32));
+        try sgemmPrepared(runtime, m, panels, x, actual);
+        for (expected, actual) |e, v| try std.testing.expectApproxEqAbs(e, v, 2e-5);
     }
 }

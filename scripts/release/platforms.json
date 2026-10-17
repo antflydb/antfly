@@ -90,7 +90,7 @@
       "runner": "arc-antfly-publish",
       "builder_os": "linux",
       "builder_arch": "x86_64",
-      "zig_target": "aarch64-macos",
+      "zig_target": "aarch64-macos.15.0",
       "archive_os": "Darwin",
       "archive_arch": "arm64",
       "archive_suffix": "",
@@ -103,7 +103,7 @@
       "backends": ["cpu", "metal"],
       "npm_package_dir": "cli-darwin-arm64",
       "npm_libc": null,
-      "wheel_platform": "macosx_11_0_arm64",
+      "wheel_platform": "macosx_15_0_arm64",
       "consumers": ["npm", "pypi", "homebrew", "direct-download"]
     }
   ]
