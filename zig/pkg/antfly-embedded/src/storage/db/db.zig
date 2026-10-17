@@ -8962,18 +8962,40 @@ pub const DB = struct {
     /// preparable forever: a durable applied watermark skips their replay only
     /// after checking the actual namespace, owner group and authority domain.
     pub fn applyRaftSchemaOwnerCommand(self: *DB, command: SchemaOwnerControl.Command, owner_group: u64, entry: OrderedApplyReceipt, context: @import("../../api/operation.zig").RequestContext) !void {
+        var prepared = try self.prepareCommittedRaftSchemaOwnerCommand(command, owner_group, entry, context);
+        defer if (prepared) |*value| value.deinit();
+        try self.applyPreparedRaftSchemaOwnerCommand(if (prepared) |*value| value else null, command.binding, owner_group, entry, context);
+    }
+
+    /// Run on the owner control lane, not node progress. A null preparation
+    /// means an independently verified durable duplicate, not an apply grant.
+    /// The caller must keep this exact physical owner alive until destruction.
+    pub fn prepareCommittedRaftSchemaOwnerCommand(self: *DB, command: SchemaOwnerControl.Command, owner_group: u64, entry: OrderedApplyReceipt, context: @import("../../api/operation.zig").RequestContext) !?SchemaOwnerControl.Prepared {
         try context.ensureActive();
         try command.validateFor(.raft);
-        if (try self.raftSchemaOwnerControlAlreadyApplied(command.binding, owner_group, entry)) return;
-        var prepared = self.prepareRaftSchemaOwnerControl(command, context) catch |err| {
+        if (try self.raftSchemaOwnerControlAlreadyApplied(command.binding, owner_group, entry)) return null;
+        return self.prepareRaftSchemaOwnerControl(command, context) catch |err| {
             // Another committed apply may have finished while preparation was
             // reading a predecessor. Recovery must inspect durable truth, not
             // turn that completed command into a replayable preparation error.
-            if (try self.raftSchemaOwnerControlAlreadyApplied(command.binding, owner_group, entry)) return;
+            if (try self.raftSchemaOwnerControlAlreadyApplied(command.binding, owner_group, entry)) return null;
             return err;
         };
-        defer prepared.deinit();
-        try self.applyCommittedRaftSchemaOwnerControl(&prepared, owner_group, entry);
+    }
+
+    /// No command parsing, schema compilation, independent row scan or large
+    /// prepared-buffer cleanup on this lane. Transactional durable metadata
+    /// guards remain mandatory, including for a duplicate ticket.
+    /// Cancellation callbacks are scoped to this call, never retained by work
+    /// prepared asynchronously on another invocation's stack.
+    pub fn applyPreparedRaftSchemaOwnerCommand(self: *DB, prepared: ?*SchemaOwnerControl.Prepared, binding: @import("relational_schema_owner_contract.zig").Binding, owner_group: u64, entry: OrderedApplyReceipt, context: @import("../../api/operation.zig").RequestContext) !void {
+        try context.ensureActive();
+        if (try self.raftSchemaOwnerControlAlreadyApplied(binding, owner_group, entry)) return;
+        const value = prepared orelse return error.InvalidOrderedApplyReceipt;
+        if (!std.meta.eql(value.command.binding, binding)) return error.SchemaValidationJobChanged;
+        value.context = context;
+        defer value.context = .{};
+        try self.applyCommittedRaftSchemaOwnerControl(value, owner_group, entry);
         // No fallible cancellation/deadline check after successful commit.
     }
 

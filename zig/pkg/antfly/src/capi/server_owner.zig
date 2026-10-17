@@ -4120,6 +4120,117 @@ pub fn storageOwnerRaftIndexPreparationJson(
     return .ok;
 }
 
+const RaftSchemaPreparation = struct {
+    owner_id: *anyopaque,
+    owner: *Handle,
+    owner_slot: *HandleRegistry.Slot,
+    root_generation: u64,
+    term: u64,
+    index: u64,
+    binding: @import("antfly_local_sources").storage_db_relational_schema_owner_contract.Binding,
+    prepared: ?db_mod.DB.SchemaOwnerControl.Prepared,
+    applying: std.atomic.Mutex = .unlocked,
+};
+const RaftSchemaPreparationRegistry = HandleRegistryOf(RaftSchemaPreparation);
+var raft_schema_preparations: RaftSchemaPreparationRegistry = .{};
+
+fn raftSchemaRequestContext(request: *const kernel_owner_abi.RaftSchemaOwnerApplyRequest) !@import("antfly_local_sources").api_operation.RequestContext {
+    if (request.version != kernel_owner_abi.abi_version or request.control.version != kernel_owner_abi.abi_version)
+        return error.InvalidAbiVersion;
+    const contract = @import("antfly_local_sources").storage_db_relational_schema_owner_contract;
+    if (request._reserved != 0 or request.table_name.len == 0 or request.table_name.ptr == null or
+        request.table_name.len > std.math.maxInt(usize) or request.command.ptr == null or
+        request.command.len < 48 or request.command.len > contract.Command.max_raft_wire_bytes or
+        request.term == 0 or request.index == 0 or request.control.has_execution_deadline > 1 or
+        request.control._reserved0 != 0 or !std.mem.allEqual(u8, &request.control._reserved1, 0) or
+        request.control.table_name.len != 0 or request.control.request_json.len != 0)
+        return error.InvalidArgument;
+    const context: @import("antfly_local_sources").api_operation.RequestContext = .{
+        .deadline_ns = if (request.control.has_execution_deadline != 0) request.control.execution_deadline_ns else null,
+        .cancellation = ownerQueryCancellation(&request.control),
+    };
+    try context.ensureActive();
+    return context;
+}
+
+fn prepareRaftSchemaControl(owner: ?*anyopaque, request: *const kernel_owner_abi.RaftSchemaOwnerApplyRequest) !*anyopaque {
+    const context = try raftSchemaRequestContext(request);
+    const entered = handle_registry.enter(owner) orelse return error.InvalidArgument;
+    errdefer HandleRegistry.leave(entered[1]);
+    const handle = entered[0];
+    _ = storageOwnerTableName(handle, request.table_name) orelse return error.InvalidArgument;
+    if (handle.storage_owner_schema_preparing.cmpxchgStrong(false, true, .acq_rel, .acquire) != null) return error.StorageBusy;
+    errdefer handle.storage_owner_schema_preparing.store(false, .release);
+    const command = try @import("antfly_local_sources").storage_db_relational_schema_owner_contract.Command.decodeRaft(request.command.slice());
+    var prepared = try handle.db.prepareCommittedRaftSchemaOwnerCommand(command, handle.storage_owner_group_id, .{ .term = request.term, .index = request.index }, context);
+    errdefer if (prepared) |*value| value.deinit();
+    try context.ensureActive();
+    // These callbacks borrow the prepare call's stack. Commit gets its own
+    // invocation context; neither a worker nor a cached ticket retains them.
+    if (prepared) |*value| value.context = .{};
+    const ticket = try handle.alloc.create(RaftSchemaPreparation);
+    errdefer handle.alloc.destroy(ticket);
+    ticket.* = .{ .owner_id = owner.?, .owner = handle, .owner_slot = entered[1], .root_generation = handle.storage_owner_root_generation, .term = request.term, .index = request.index, .binding = command.binding, .prepared = prepared };
+    return try raft_schema_preparations.register(ticket);
+}
+
+/// Heavy preparation and registration happen on control, never node progress.
+/// An exact owner registry pin prevents close/free until worker destruction.
+pub fn storageOwnerPrepareRaftSchemaControl(owner: ?*anyopaque, request: *const kernel_owner_abi.RaftSchemaOwnerApplyRequest, out_prepared: *?*anyopaque, out_failure: *kernel_owner_abi.FailureIdentity) callconv(.c) kernel_owner_abi.Status {
+    out_prepared.* = null;
+    out_failure.* = .{};
+    out_prepared.* = prepareRaftSchemaControl(owner, request) catch |err| {
+        out_failure.* = kernel_error_identity.failureFromError(err, .storage_owner, kernel_owner_abi.abi_version, kernel_owner_abi.RaftSchemaOwnerApplyRequest.operation);
+        return out_failure.status;
+    };
+    return .ok;
+}
+
+fn applyPreparedRaftSchemaControl(owner: ?*anyopaque, request: *const kernel_owner_abi.RaftSchemaOwnerPreparedApplyRequest) !void {
+    if (request.version != kernel_owner_abi.abi_version or request.control.version != kernel_owner_abi.abi_version) return error.InvalidAbiVersion;
+    if (request._reserved != 0 or request.term == 0 or request.index == 0 or request.control.has_execution_deadline > 1 or
+        request.control._reserved0 != 0 or !std.mem.allEqual(u8, &request.control._reserved1, 0) or
+        request.control.table_name.len != 0 or request.control.request_json.len != 0) return error.InvalidArgument;
+    const context: @import("antfly_local_sources").api_operation.RequestContext = .{
+        .deadline_ns = if (request.control.has_execution_deadline != 0) request.control.execution_deadline_ns else null,
+        .cancellation = ownerQueryCancellation(&request.control),
+    };
+    try context.ensureActive();
+    const entered = raft_schema_preparations.enter(request.prepared) orelse return error.InvalidArgument;
+    defer RaftSchemaPreparationRegistry.leave(entered[1]);
+    const ticket = entered[0];
+    if (owner != ticket.owner_id or request.term != ticket.term or request.index != ticket.index) return error.InvalidArgument;
+    const owner_entered = handle_registry.enter(owner) orelse return error.InvalidArgument;
+    defer HandleRegistry.leave(owner_entered[1]);
+    if (owner_entered[0] != ticket.owner or ticket.root_generation != ticket.owner.storage_owner_root_generation) return error.SchemaValidationJobChanged;
+    // Concurrent misuse never blocks progress behind another apply invocation.
+    if (!ticket.applying.tryLock()) return error.StorageBusy;
+    defer ticket.applying.unlock();
+    try ticket.owner.db.applyPreparedRaftSchemaOwnerCommand(if (ticket.prepared) |*value| value else null, ticket.binding, ticket.owner.storage_owner_group_id, .{ .term = request.term, .index = request.index }, context);
+    // Leave retained buffers to the control worker. No fallible post-commit
+    // acknowledgement or caller callback can turn this commit into an error.
+}
+
+pub fn storageOwnerApplyPreparedRaftSchemaControl(owner: ?*anyopaque, request: *const kernel_owner_abi.RaftSchemaOwnerPreparedApplyRequest, out_failure: *kernel_owner_abi.FailureIdentity) callconv(.c) kernel_owner_abi.Status {
+    out_failure.* = .{};
+    applyPreparedRaftSchemaControl(owner, request) catch |err| {
+        out_failure.* = kernel_error_identity.failureFromError(err, .storage_owner, kernel_owner_abi.abi_version, kernel_owner_abi.RaftSchemaOwnerPreparedApplyRequest.operation);
+        return out_failure.status;
+    };
+    return .ok;
+}
+
+pub fn storageOwnerDestroyRaftSchemaPreparation(prepared: ?*anyopaque) callconv(.c) void {
+    const closed = raft_schema_preparations.beginClose(prepared) orelse return;
+    const ticket = closed[0];
+    const slot = ticket.owner_slot;
+    if (ticket.prepared) |*value| value.deinit();
+    ticket.owner.storage_owner_schema_preparing.store(false, .release);
+    ticket.owner.alloc.destroy(ticket);
+    HandleRegistry.leave(slot);
+    raft_schema_preparations.finishClose(closed[1]);
+}
+
 /// Private applying-state-machine port. No ordinary batch parser or metadata
 /// hint may select the separate committed position accepted here.
 pub fn storageOwnerApplyRaftSchemaControl(
@@ -4134,21 +4245,8 @@ pub fn storageOwnerApplyRaftSchemaControl(
             return out.status;
         }
     };
-    if (request.version != kernel_owner_abi.abi_version or request.control.version != kernel_owner_abi.abi_version)
-        return Failure.result(error.InvalidAbiVersion, out_failure);
     const contract = @import("antfly_local_sources").storage_db_relational_schema_owner_contract;
-    if (request._reserved != 0 or request.table_name.len == 0 or request.table_name.ptr == null or
-        request.table_name.len > std.math.maxInt(usize) or request.command.ptr == null or
-        request.command.len < 48 or request.command.len > contract.Command.max_raft_wire_bytes or
-        request.term == 0 or request.index == 0 or request.control.has_execution_deadline > 1 or
-        request.control._reserved0 != 0 or !std.mem.allEqual(u8, &request.control._reserved1, 0) or
-        request.control.table_name.len != 0 or request.control.request_json.len != 0)
-        return Failure.result(error.InvalidArgument, out_failure);
-    const context: @import("antfly_local_sources").api_operation.RequestContext = .{
-        .deadline_ns = if (request.control.has_execution_deadline != 0) request.control.execution_deadline_ns else null,
-        .cancellation = ownerQueryCancellation(&request.control),
-    };
-    context.ensureActive() catch |err| return Failure.result(err, out_failure);
+    const context = raftSchemaRequestContext(request) catch |err| return Failure.result(err, out_failure);
     const handle = asHandle(owner) orelse return Failure.result(error.InvalidArgument, out_failure);
     _ = storageOwnerTableName(handle, request.table_name) orelse return Failure.result(error.InvalidArgument, out_failure);
     const command = contract.Command.decodeRaft(request.command.slice()) catch |err| return Failure.result(err, out_failure);

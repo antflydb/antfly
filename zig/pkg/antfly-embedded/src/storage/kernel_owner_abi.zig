@@ -19,7 +19,7 @@
 const failure_abi = @import("runtime_failure_abi");
 
 // Storage layouts evolve independently of the shared failure envelope.
-pub const abi_version: u32 = 95;
+pub const abi_version: u32 = 96;
 pub const Status = failure_abi.Status;
 pub const FailureBoundary = failure_abi.FailureBoundary;
 pub const FailureIdentity = failure_abi.FailureIdentity;
@@ -1263,6 +1263,37 @@ pub extern fn antfly_storage_owner_apply_raft_schema_control(
     request: *const RaftSchemaOwnerApplyRequest,
     out_failure: *FailureIdentity,
 ) callconv(.c) Status;
+
+/// Control-lane preparation owns all retained command data and pins the exact
+/// owner generation. Only one outstanding preparation per owner is admitted.
+/// Call destroy on the control lane BEFORE closing/releasing that owner. The
+/// prepare request's callbacks are borrowed only for the prepare invocation.
+pub extern fn antfly_storage_owner_prepare_raft_schema_control(
+    owner: ?*anyopaque,
+    request: *const RaftSchemaOwnerApplyRequest,
+    out_prepared: *?*anyopaque,
+    out_failure: *FailureIdentity,
+) callconv(.c) Status;
+
+pub const RaftSchemaOwnerPreparedApplyRequest = extern struct {
+    pub const operation: u32 = 4;
+    version: u32 = abi_version,
+    _reserved: u32 = 0,
+    prepared: ?*anyopaque = null,
+    /// Must match the actual committed entry used for preparation. A ticket
+    /// cannot be rebound to a different entry, owner, or physical generation.
+    term: u64 = 0,
+    index: u64 = 0,
+    control: ControlledJsonOperationRequest = .{},
+};
+pub extern fn antfly_storage_owner_apply_prepared_raft_schema_control(
+    owner: ?*anyopaque,
+    request: *const RaftSchemaOwnerPreparedApplyRequest,
+    out_failure: *FailureIdentity,
+) callconv(.c) Status;
+/// Idempotent for stale/foreign IDs. Waits for entered apply invocations;
+/// potentially large prepared-buffer destruction never runs on node progress.
+pub extern fn antfly_storage_owner_destroy_raft_schema_preparation(prepared: ?*anyopaque) callconv(.c) void;
 
 /// Read-only native schema progress. No caller-selected root, receipt position,
 /// publication flag or opaque mutation payload is accepted by this port.

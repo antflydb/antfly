@@ -41,9 +41,35 @@ test "storage owner Raft schema controls cross the checked archive and recover t
         }
         fn apply(source: *db_mod.DB, target: *client.Owner, command: contract.Command, term: u64, index: u64) !void {
             const bytes = try command.encodeRaft(std.testing.allocator);
-            defer std.testing.allocator.free(bytes);
+            var bytes_live = true;
+            defer if (bytes_live) std.testing.allocator.free(bytes);
+            const Cancellation = struct {
+                fn check(ptr: ?*anyopaque) callconv(.c) u8 {
+                    const flag: *bool = @ptrCast(@alignCast(ptr.?));
+                    return @intFromBool(flag.*);
+                }
+            };
+            var canceled = false;
+            var prepared = try target.prepareRaftSchemaOwnerControl("rows", bytes, term, index, .{ .cancellation_ctx = &canceled, .cancellation_fn = Cancellation.check });
+            defer prepared.deinit();
+            // Rejected concurrent preparation neither replaces nor leaks the
+            // existing ticket. All transport bytes may be released immediately.
+            try std.testing.expectError(error.StorageBusy, target.prepareRaftSchemaOwnerControl("rows", bytes, term, index, .{}));
+            std.testing.allocator.free(bytes);
+            bytes_live = false;
+            canceled = true; // the preparation callback must not be retained
+            var failure: abi.FailureIdentity = .{};
+            try std.testing.expectEqual(abi.Status.invalid_argument, abi.antfly_storage_owner_apply_prepared_raft_schema_control(null, &.{ .prepared = prepared.handle, .term = term, .index = index }, &failure));
+            try std.testing.expectEqual(abi.Status.invalid_argument, abi.antfly_storage_owner_apply_prepared_raft_schema_control(target.handle, &.{ .prepared = prepared.handle, .term = term, .index = index + 1 }, &failure));
+            try std.testing.expectEqual(abi.RaftSchemaOwnerPreparedApplyRequest.operation, failure.operation);
+            try std.testing.expectError(error.DeadlineExceeded, prepared.apply(.{ .execution_deadline_ns = 0 }));
             try source.applyRaftSchemaOwnerCommand(command, 72, .{ .term = term, .index = index }, .{});
-            try target.applyRaftSchemaOwnerControl("rows", bytes, term, index, .{});
+            try prepared.apply(.{});
+            try prepared.apply(.{}); // exact retry: durable marker, not a flag
+            const stale = prepared.handle;
+            prepared.deinit();
+            try std.testing.expectEqual(abi.Status.invalid_argument, abi.antfly_storage_owner_apply_prepared_raft_schema_control(target.handle, &.{ .prepared = stale, .term = term, .index = index }, &failure));
+            abi.antfly_storage_owner_destroy_raft_schema_preparation(stale);
         }
     };
     for ([_]bool{ true, false }) |cancel_only| {
@@ -98,7 +124,62 @@ test "storage owner Raft schema controls cross the checked archive and recover t
         wire[wire.len - 1] ^= 1;
         try std.testing.expectError(error.InvalidSchemaOwnerControl, peer.applyRaftSchemaOwnerControl("rows", wire, 2, 10, .{}));
         wire[wire.len - 1] ^= 1;
+        var invalid_ticket: ?*anyopaque = @ptrFromInt(1);
+        try std.testing.expectEqual(abi.Status.invalid_abi, abi.antfly_storage_owner_prepare_raft_schema_control(peer.handle, &.{ .version = abi.abi_version - 1, .command = .{ .ptr = @ptrFromInt(1), .len = 48 } }, &invalid_ticket, &failure));
+        try std.testing.expect(invalid_ticket == null);
+        try std.testing.expectEqual(abi.Status.invalid_abi, abi.antfly_storage_owner_apply_prepared_raft_schema_control(peer.handle, &.{ .version = abi.abi_version - 1, .prepared = @ptrFromInt(1) }, &failure));
+        try std.testing.expectError(error.DeadlineExceeded, peer.prepareRaftSchemaOwnerControl("rows", wire, 2, 10, .{ .execution_deadline_ns = 0 }));
+        {
+            var discarded = try peer.prepareRaftSchemaOwnerControl("rows", wire, 2, 10, .{});
+            defer discarded.deinit();
+            const foreign_path = try std.fs.path.join(a, &.{ root, "foreign" });
+            defer a.free(foreign_path);
+            var foreign_open = open;
+            foreign_open.path = .fromSlice(foreign_path);
+            foreign_open.owner_catalog_deferred_out = null;
+            var foreign_owner = try client.Owner.open(foreign_open);
+            defer foreign_owner.deinit();
+            try std.testing.expectEqual(abi.Status.invalid_argument, abi.antfly_storage_owner_apply_prepared_raft_schema_control(foreign_owner.handle, &.{ .prepared = discarded.handle, .term = 2, .index = 10 }, &failure));
+            try std.testing.expectEqual(abi.Status.invalid_argument, abi.antfly_storage_owner_apply_prepared_raft_schema_control(peer.handle, &.{ .prepared = peer.handle, .term = 2, .index = 10 }, &failure));
+            // Dropping unpublished work must release both its owner pin and
+            // its admission slot without advancing any durable state.
+        }
         try Driver.apply(&primary, &peer, begin, 2, 10);
+        {
+            // A control-lane ticket pins the provider while close drains. Use
+            // the registry's actual closing rejection as the synchronization
+            // event, not a sleep-based assertion about thread scheduling.
+            var pinned = try peer.prepareRaftSchemaOwnerControl("rows", wire, 2, 10, .{});
+            errdefer pinned.deinit();
+            const Close = struct {
+                owner: ?*anyopaque,
+                done: std.atomic.Value(bool) = .init(false),
+                fn run(self: *@This()) void {
+                    abi.antfly_storage_owner_close(self.owner);
+                    self.done.store(true, .release);
+                }
+            };
+            var closing: Close = .{ .owner = peer.handle };
+            var future = try std.testing.io.concurrent(Close.run, .{&closing});
+            peer_live = false;
+            defer {
+                pinned.deinit();
+                future.await(std.testing.io);
+            }
+            for (0..1000) |_| {
+                pinned.apply(.{}) catch |err| {
+                    if (err != error.InvalidArgument) return err;
+                    break;
+                };
+                try std.testing.io.sleep(.fromMilliseconds(1), .awake);
+            } else return error.OwnerCloseDidNotStart;
+            try std.testing.expect(!closing.done.load(.acquire));
+            pinned.deinit();
+            future.await(std.testing.io);
+            try std.testing.expect(closing.done.load(.acquire));
+        }
+        peer = try client.Owner.open(open);
+        peer_live = true;
         try std.testing.expectError(error.ConflictingOrderedApplyReceipt, peer.applyRaftSchemaOwnerControl("rows", wire, 3, 10, .{}));
         try Driver.apply(&primary, &peer, .{ .binding = binding, .action = .freeze }, 2, 11);
         peer.deinit();
@@ -122,7 +203,7 @@ test "storage owner Raft schema controls cross the checked archive and recover t
         const completed = try Driver.header(&primary);
         // Old admission is no longer preparable after cancellation. The actual
         // applied watermark, not a synthetic phase receipt, makes replay safe.
-        try peer.applyRaftSchemaOwnerControl("rows", wire, 2, 10, .{});
+        try Driver.apply(&primary, &peer, begin, 2, 10);
         var foreign = begin;
         foreign.binding.fence.namespace.range_id += 1;
         const foreign_wire = try foreign.encodeRaft(a);

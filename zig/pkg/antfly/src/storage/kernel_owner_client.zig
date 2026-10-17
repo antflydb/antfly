@@ -293,6 +293,33 @@ pub fn aggregate(request: AggregationRequest) !Response {
     return response;
 }
 
+/// Owned by a control worker and destroyed there before the borrowed Owner is
+/// closed. The provider pins the exact physical owner; apply never destroys
+/// retained buffers, reparses the command or rebinds its committed entry.
+pub const RaftSchemaPreparation = struct {
+    handle: ?*anyopaque,
+    owner: ?*anyopaque,
+    term: u64,
+    index: u64,
+
+    pub fn apply(self: *RaftSchemaPreparation, options: Owner.QueryOptions) !void {
+        var failure: abi.FailureIdentity = .{};
+        const status = abi.antfly_storage_owner_apply_prepared_raft_schema_control(self.owner, &.{
+            .prepared = self.handle,
+            .term = self.term,
+            .index = self.index,
+            .control = controlledRequest("", "", options.execution_deadline_ns, options.cancellation_ctx, options.cancellation_fn),
+        }, &failure);
+        if (status != .ok and (failure.boundary != .storage_owner or failure.operation != abi.RaftSchemaOwnerPreparedApplyRequest.operation)) return error.InvalidBoundaryFailureIdentity;
+        try acceptStorageOwnerFailure(status, failure, "prepared Raft schema owner control");
+    }
+
+    pub fn deinit(self: *RaftSchemaPreparation) void {
+        abi.antfly_storage_owner_destroy_raft_schema_preparation(self.handle);
+        self.handle = null;
+    }
+};
+
 pub const Owner = struct {
     handle: ?*anyopaque,
 
@@ -713,6 +740,24 @@ pub const Owner = struct {
         }, &failure);
         if (status != .ok and (failure.boundary != .storage_owner or failure.operation != abi.RaftSchemaOwnerApplyRequest.operation)) return error.InvalidBoundaryFailureIdentity;
         try acceptStorageOwnerFailure(status, failure, "Raft schema owner control");
+    }
+
+    /// Control lane only. Command bytes and callbacks need survive only this
+    /// call. Drain/destroy the returned ticket before closing this owner.
+    pub fn prepareRaftSchemaOwnerControl(self: *Owner, table_name: []const u8, command: []const u8, term: u64, index: u64, options: QueryOptions) !RaftSchemaPreparation {
+        var prepared: ?*anyopaque = null;
+        var failure: abi.FailureIdentity = .{};
+        const status = abi.antfly_storage_owner_prepare_raft_schema_control(self.handle, &.{
+            .table_name = .fromSlice(table_name),
+            .command = .fromSlice(command),
+            .term = term,
+            .index = index,
+            .control = controlledRequest("", "", options.execution_deadline_ns, options.cancellation_ctx, options.cancellation_fn),
+        }, &prepared, &failure);
+        errdefer abi.antfly_storage_owner_destroy_raft_schema_preparation(prepared);
+        if (status != .ok and (failure.boundary != .storage_owner or failure.operation != abi.RaftSchemaOwnerApplyRequest.operation)) return error.InvalidBoundaryFailureIdentity;
+        try acceptStorageOwnerFailure(status, failure, "Raft schema owner preparation");
+        return .{ .handle = prepared orelse return error.StorageKernelFailure, .owner = self.handle, .term = term, .index = index };
     }
 
     pub fn nativeIndexOwnerStateJson(self: *Owner, table_name: []const u8, identity_json: []const u8) !Response {

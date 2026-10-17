@@ -11778,3 +11778,71 @@ group/root/entry identity, cancellation and shutdown draining, and retry without
 fallible post-commit acknowledgement. A prepared result is not metadata
 authorization or an all-member capability barrier. No public producer,
 publication/release authority or original parity disposition is enabled here.
+
+### Opaque owner-pinned schema preparation and split committed apply
+
+Private owner ABI 96 separates preparation, committed apply and destruction.
+Preparation performs ASVR decoding, candidate/schema compilation and independent
+page replay on the caller's control lane. The provider owns every retained
+payload and clears the invocation's borrowed cancellation/deadline callbacks
+before returning a ticket. Apply supplies its own scoped context; a prior
+prepare invocation's stack or subsequently canceled token cannot be retained.
+
+Tickets use a separate generation-tagged registry, not raw provider pointers.
+One outstanding ticket per physical owner bounds local admission. Each ticket
+pins that exact owner registry slot and its root generation, binding and actual
+term/index. Apply rejects a different owner, entry, stale/foreign ticket, or
+changed generation. Enter/leave use registry atomics; concurrent apply uses
+try-lock admission rather than waiting on another invocation. Destruction and
+registry reclamation belong to the control lane, before its physical owner
+lease is released. Owner close drains the pin instead of freeing live prepared
+schema/index epochs. This ABI lifetime pin does not replace the source's lease
+or metadata authorization.
+
+The DB synchronous command port now shares the same prepare/commit split.
+Preparation may return a verified durable duplicate without compiling retired
+job inputs. Commit rechecks namespace, source authority and the actual ordered
+marker, even for that duplicate. Real effects still use the existing atomic
+schema/job/ordered-marker transaction and transactional metadata preimage guards;
+this is not a claim of allocation-free or constant-time store commit. Command
+parsing, schema compilation, independent row scanning and large retained-buffer
+destruction are excluded from the prepared apply invocation. It performs no
+fallible post-commit cancellation check.
+
+The first linked physical Debug checkpoint passes both archive/cold-reopen
+fixtures, zero skips/leaks and 76/76 build steps in
+`/private/tmp/antfly-sql-schema-prepared-owner-debug.log`. All five schema
+controls execute on a distinct physical replica through prepared tickets while
+the oracle uses the synchronous DB path. The fixture releases transport bytes
+before apply, cancels the prepare token after return, retries an expired apply
+deadline with fresh controls, rejects a second pending preparation and a
+different live owner/entry, drops uncommitted work, rejects stale/foreign ticket
+IDs, and replays old admission after cancellation without reviving the job.
+The complete owner gate additionally includes an actual concurrent-close test
+using `std.Io.concurrent`; it synchronizes on the registry's closing rejection,
+proves close remains pinned, then drains the ticket and joins close.
+
+The complete Debug owner checkpoint passes 57 tests with zero skips/leaks and
+93/93 build steps in
+`/private/tmp/antfly-sql-schema-prepared-owner-qualified-debug.log`. Review added
+cleanup for a failed test-worker launch; the final physical gate passes both
+fixtures again, zero skips/leaks and 76/76 steps in
+`/private/tmp/antfly-sql-schema-prepared-owner-final-debug.log`. The fixtures
+remain attached to the standard owner CI gate. The physical schema-control
+fixture also passes 25 consecutive Debug soak runs with zero skips/failures/
+leaks in `/private/tmp/antfly-sql-schema-prepared-owner-soak-debug.log`.
+A separate full Debug run passes 1,130 SQL tests, 47 owner-source tests and
+10 native/Raft job tests, four opt-in benchmarks skipped, zero failures/leaks
+and 103/103 build steps in
+`/private/tmp/antfly-sql-schema-prepared-source-sql-debug.log`.
+Control-catalog, source boundary, license, inventory and formatting checks pass.
+An additional 1.1 GiB of two individually inspected, unopened obsolete
+archive/object pairs was reclaimed for build headroom; generated outputs are
+rebuildable and current outputs/source/logs/other worktrees were preserved.
+The subsequent `make gc DRY_RUN=1` preview completed without deleting anything.
+
+The bounded source control queue/cache, command/root identity matching,
+cold-root preparation, worker shutdown draining, actual data-log dispatch,
+metadata plan/ACK/root adoption and coordinated publication/release remain
+required. Decoder version 24 is still unadvertised; the new ABI alone is not
+production schema activation. No original parity case is reclassified.
