@@ -101,6 +101,8 @@ class ZigValidationScopeTests(unittest.TestCase):
         ]
         base_jobs = [
             "zig-base-tests",
+            "zig-base-wasm",
+            "zig-base-lite-models",
             "zig-base",
             "e2e-base-plan",
             "e2e-base-tests",
@@ -119,6 +121,16 @@ class ZigValidationScopeTests(unittest.TestCase):
         for job in base_jobs:
             self.assertTrue(selected(job))
             self.assertFalse(selected(job, full=True))
+            self.assertFalse(selected(job, **{"needs.admission.result": "failure"}))
+            self.assertFalse(selected(job, **{"github.run_attempt": 2}))
+        self.assertFalse(
+            selected(
+                "zig-base-lite-models", **{"needs.changes.outputs.zig_tests": "false"}
+            )
+        )
+        self.assertTrue(
+            selected("zig-base-wasm", **{"needs.changes.outputs.zig_tests": "false"})
+        )
         self.assertTrue(selected("e2e-base-build", full=True))
         self.assertTrue(selected("e2e-base-low-fd"))
         self.assertTrue(selected("e2e-base-low-fd", full=True))
@@ -225,6 +237,99 @@ class ZigValidationScopeTests(unittest.TestCase):
                     self.assertEqual(
                         result.returncode == 0, driver == "success", result.stderr
                     )
+
+    def test_base_native_wasm_and_model_qualification_have_independent_owners(self):
+        workflow = (ROOT / ".github/workflows/zig-tests.yml").read_text()
+        blocks = dict(
+            re.findall(r"\n  ([\w-]+):\n(.*?)(?=\n  [\w-]+:\n|\Z)", workflow, re.DOTALL)
+        )
+        native, wasm, models = (
+            blocks[name]
+            for name in ("zig-base-tests", "zig-base-wasm", "zig-base-lite-models")
+        )
+        for block in (native, wasm, models):
+            self.assertIn("needs: [admission, changes]", block)
+            self.assertIn("runs-on: arc-antfly-heavy", block)
+            self.assertIn('ANTFLY_ZIG_MAX_RSS: "23622320128"', block)
+        self.assertIn("Run hermetic Antfly unit tests", native)
+        self.assertIn("Set up Node for generated source checks", native)
+        for name in (
+            "Build and test Apache WASM artifacts",
+            "Exercise real Lite extraction through public graph APIs",
+        ):
+            self.assertNotIn(name, native)
+        for command in (
+            "node pkg/antfly-embedded/wasm_client_test.mjs",
+            "build wasm-test inference-wasm",
+            "zig build inference-wasm -Dwebgpu=true",
+            "zig build inference-wasm -Dwasm-memory-model=wasm64",
+            "zig build wasm -Dwasm=true -j1",
+            "zig build wasm -Dwasm=true -Dwasm-memory-model=wasm64",
+            "node web/test-wasm-abi.mjs wasm32",
+            "node web/test-wasm-abi.mjs wasm64",
+        ):
+            self.assertIn(command, wasm)
+        libraries, evaluation = models.split(
+            "      - name: Exercise real Lite extraction through public graph APIs", 1
+        )
+        self.assertIn("build capi \\", libraries)
+        self.assertIn("python3 scripts/ci/prepare_lite_previous_reader.py", libraries)
+        self.assertIn("timeout-minutes: 25", evaluation)
+        self.assertIn("build capi-test", evaluation)
+        self.assertIn('--cache-dir "$ZIG_LOCAL_CACHE_DIR"', evaluation)
+        self.assertNotIn("--cache-dir ../../.zig-cache", models)
+        self.assertNotIn("--cache-dir ../../.zig-cache", blocks["zig-full-tests"])
+        self.assertIn("tests/test_graph_edge_readiness.py", evaluation)
+        self.assertIn("scripts/ci/run_lite_extraction_eval.py", evaluation)
+        self.assertIn("scripts/ci/run_lite_embedding_test.py", evaluation)
+        for block in (wasm, models):
+            self.assertIn("if: always() && steps.cache.outcome == 'success'", block)
+            self.assertIn('--release-phase "$ZIG_LOCAL_CACHE_DIR"', block)
+
+    def test_base_aggregate_requires_each_selected_qualification(self):
+        workflow = (ROOT / ".github/workflows/zig-tests.yml").read_text()
+        aggregate = workflow.split("\n  zig-base:\n", 1)[1].split("\n  zig-full:\n", 1)[
+            0
+        ]
+        self.assertIn("zig-base-wasm, zig-base-lite-models", aggregate)
+        command = textwrap.dedent(aggregate.split("run: |\n", 1)[1])
+        healthy = {
+            "CHANGES_RESULT": "success",
+            "X86_64_RESULT": "success",
+            "ARM64_CODEC_RESULT": "success",
+            "WASM_RESULT": "success",
+            "LITE_MODEL_RESULT": "success",
+            "REQUIRE_LITE_MODELS": "true",
+        }
+        cases = [({}, True)]
+        for key in (
+            "CHANGES_RESULT",
+            "X86_64_RESULT",
+            "ARM64_CODEC_RESULT",
+            "WASM_RESULT",
+            "LITE_MODEL_RESULT",
+        ):
+            for status in ("failure", "skipped", "cancelled"):
+                cases.append(({key: status}, False))
+        for status in ("success", "skipped", "failure", "cancelled"):
+            cases.append(
+                (
+                    {
+                        "REQUIRE_LITE_MODELS": "false",
+                        "LITE_MODEL_RESULT": status,
+                    },
+                    status in ("success", "skipped"),
+                )
+            )
+        for overrides, expected in cases:
+            with self.subTest(overrides=overrides):
+                result = subprocess.run(
+                    ["bash", "-c", command],
+                    env={**os.environ, **healthy, **overrides},
+                    capture_output=True,
+                    check=False,
+                )
+                self.assertEqual(result.returncode == 0, expected, result.stderr)
 
     def test_codegen_and_laya_inputs_select_zig_validation(self):
         workflow = (ROOT / ".github/workflows/zig-tests.yml").read_text()

@@ -118,6 +118,8 @@ fn producerDefinitions(hash: *Hash, alloc: std.mem.Allocator, enrichments: []con
         if (raw.len == 0) continue;
         const parsed = try std.json.parseFromSlice(std.json.Value, alloc, raw, .{});
         defer parsed.deinit();
+        // Reader envelopes fence physical representations; the logical
+        // producer identity still binds every resolver definition below.
         const rows = if (std.mem.eql(u8, family, "resolvers"))
             @import("catalog/resolver_catalog.zig").catalogRows(parsed.value) catch return error.InvalidArtifactCatalogCommand
         else
@@ -161,12 +163,27 @@ test "ordered artifact inventory semantic producer catalogs ignore order but bin
     try std.testing.expectError(error.InvalidArtifactCatalogCommand, digest(alloc, "", "[{\"name\":\"a\"},{\"name\":\"a\"}]", ""));
 }
 
-test "ordered artifact inventory semantic resolver envelopes preserve definition identity" {
+test "ordered artifact inventory semantic producer catalogs accept versioned resolver envelopes" {
     const a = std.testing.allocator;
-    const rows = "[{\"name\":\"entities\",\"config_generation\":7,\"promote\":false}]";
-    const wrapped = try std.fmt.allocPrint(a, "{{\"version\":2,\"resolvers\":{s}}}", .{rows});
-    defer a.free(wrapped);
-    try std.testing.expectEqualDeep(try digest(a, "", "", rows), try digest(a, "", "", wrapped));
-    try std.testing.expectEqualDeep(try digest(a, "", "", "[]"), try digest(a, "", "", "{\"version\":2,\"resolvers\":[]}"));
-    try std.testing.expectError(error.InvalidArtifactCatalogCommand, digest(a, "", "", "{\"version\":3,\"resolvers\":[]}"));
+    const definitions = "[{\"name\":\"resolver\",\"config_generation\":1}]";
+    const legacy = try digest(a, "", "", definitions);
+    const empty = try digest(a, "", "", "[]");
+    for ([_]u32{ 2, 3, 4 }) |version| {
+        const envelope = try @import("catalog/resolver_catalog.zig").versionedCatalog(a, definitions, version);
+        defer a.free(envelope);
+        try std.testing.expectEqualDeep(legacy, try digest(a, "", "", envelope));
+        const empty_envelope = try @import("catalog/resolver_catalog.zig").versionedCatalog(a, "[]", version);
+        defer a.free(empty_envelope);
+        try std.testing.expectEqualDeep(empty, try digest(a, "", "", empty_envelope));
+    }
+    for ([_][]const u8{
+        "{\"version\":5,\"resolvers\":[]}",
+        "{\"version\":1,\"resolvers\":[]}",
+        "{\"version\":4}",
+        "{\"version\":4,\"resolvers\":{}}",
+        "{\"version\":4,\"resolvers\":[{\"name\":\"a\"},{\"name\":\"a\"}]}",
+    }) |invalid| try std.testing.expectError(error.InvalidArtifactCatalogCommand, digest(a, "", "", invalid));
+    try std.testing.expectError(error.InvalidArtifactCatalogCommand, digest(a, "", "{\"version\":4,\"enrichments\":[]}", "[]"));
+    const changed = try digest(a, "", "", "{\"version\":4,\"resolvers\":[{\"name\":\"resolver\",\"config_generation\":2}]}");
+    try std.testing.expect(!std.mem.eql(u8, &legacy, &changed));
 }

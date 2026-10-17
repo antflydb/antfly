@@ -281,3 +281,7 @@ Compared with `../antfly/e2e`, the biggest missing areas are:
 2. Expand broader stateful retrieval-generation depth beyond pipeline-only retrieval.
 3. Broaden backup/restore coverage beyond the current local + remote matrix.
 4. Decide whether provider/auth/secrets tests belong in this portable suite or a separate integration suite with external dependencies.
+
+For standalone CLI qualification, `ANTFLY_CLI_BIN` can select a focused
+`antfly-cli` artifact while `ANTFLY_BIN` selects the server. This allows a Debug
+CLI to exercise an optimized inference server without rebuilding the model runtime.

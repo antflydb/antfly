@@ -319,19 +319,21 @@ async function main({github, context, core, mode, config, env = process.env}) {
   if (['labeled', 'unlabeled'].includes(p.action) &&
       !config.suites.some(s => s.label === p.label?.name)) return;
   if (p.action === 'edited' && !p.changes?.base) return;
-  if (p.action === 'synchronize') {
-    // Push and comment controllers can arrive out of order. A push must revoke
-    // older approvals, but not an approval issued after that push for the live
-    // snapshot. Timestamp ties and missing event timestamps remain fail closed.
-    const pushedAt = Date.parse(p.pull_request?.updated_at);
+  if (context.eventName === 'pull_request_target') {
+    // PR update and comment controllers can arrive out of order. Revoke older
+    // approvals, while retaining one issued after this event for the exact live
+    // snapshot. This includes ready-for-review/reopen events, whose delayed
+    // delivery must not cancel a newer authorized run. Timestamp ties and
+    // missing event timestamps remain fail closed.
+    const eventAt = Date.parse(p.pull_request?.updated_at);
     const check = await checkFor(pr);
-    if (Number.isFinite(pushedAt) && check) {
+    if (Number.isFinite(eventAt) && check) {
       const data = metadata(check);
       if (!data.revoked) {
         try {
           validateSnapshot(pr, data, config);
           const comment = await validateComment(data);
-          if (Date.parse(comment.created_at) > pushedAt) return;
+          if (Date.parse(comment.created_at) > eventAt) return;
         } catch (error) {
           core.notice(error.message);
         }

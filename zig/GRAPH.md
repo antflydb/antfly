@@ -1533,6 +1533,21 @@ contributions whose expiration time is at or before that time. Read filtering
 uses no cleanup grace period. Scanned expired rows still consume query work
 budgets. Document and producer visibility checks continue to apply as well.
 
+Graph expiry uses the private replay family `01 ff 54`. Resolver promotion
+state remains in `01 ff 44`; earlier writers accidentally shared that family.
+Writable opens of TTL-enabled graph indexes publish permanent minimum reader
+epoch 4 before writing the new representation. The matching versioned resolver
+envelope also fences pre-epoch readers. Read-only opens do not migrate records.
+
+TTL cleanup relocates canonical legacy expiry entries in bounded transactions
+(default 4,096 keys / 4 MiB, permitting one indivisible larger entry),
+committing the cursor with each page. It preserves
+promotion records and any newer valid expiry publication. Corrupt or ambiguous
+entries fail closed without deleting data or advancing migration progress.
+Each Lite table owns its cleanup cadence, so an error yields its slot rather
+than repeatedly blocking producer/resolver replay. Successful partial pages
+resume after the short page interval without constructing inference providers.
+
 A durable time-ordered expiration index maps `(expiration time, incarnation,
 contribution identity)` to the expected mutation revision. It is updated in the
 same authoritative mutation as the contribution. A bounded leader-side worker

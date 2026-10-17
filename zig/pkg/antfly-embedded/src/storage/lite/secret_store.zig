@@ -18,7 +18,6 @@
 const std = @import("std");
 const docstore = @import("docstore.zig");
 const native = @import("native.zig");
-const sync = @import("antfly_platform").sync;
 const contract = @import("../../common/secret_contract.zig");
 const record = @import("../../common/secret_record.zig");
 const Allocator = std.mem.Allocator;
@@ -86,7 +85,7 @@ pub const Store = struct {
             const io = self.docs.file.runtime();
             self.docs.generation_lock.lockSharedUncancelable(io);
             defer self.docs.generation_lock.unlockShared(io);
-            sync.lockYielding(&self.docs.mutex);
+            self.docs.mutex.lock();
             defer self.docs.mutex.unlock();
             const revision = try self.head();
             if (revision < options.min_revision) return error.Unavailable;
@@ -106,7 +105,7 @@ pub const Store = struct {
         const io = self.docs.file.runtime();
         self.docs.generation_lock.lockSharedUncancelable(io);
         defer self.docs.generation_lock.unlockShared(io);
-        sync.lockYielding(&self.docs.mutex);
+        self.docs.mutex.lock();
         defer self.docs.mutex.unlock();
         const revision = try self.head();
         if (revision < options.min_revision) return error.Unavailable;
@@ -143,7 +142,7 @@ pub const Store = struct {
         const io = self.docs.file.runtime();
         self.docs.generation_lock.lockSharedUncancelable(io);
         defer self.docs.generation_lock.unlockShared(io);
-        sync.lockYielding(&self.docs.mutex);
+        self.docs.mutex.lock();
         defer self.docs.mutex.unlock();
         return .{ .revision = try self.head() };
     }
@@ -165,7 +164,7 @@ pub const Store = struct {
         defer self.docs.releaseWriterSlot();
         const entry_key = self.entryKey(key);
         const previous = blk: {
-            sync.lockYielding(&self.docs.mutex);
+            self.docs.mutex.lock();
             defer self.docs.mutex.unlock();
             const revision = try self.head();
             const bytes = try self.docs.file.getCatalogRecordAlloc(self.allocator, &entry_key);
@@ -201,7 +200,7 @@ pub const Store = struct {
             .{ .key = &(self.prefix ++ "head".*), .value = &head_bytes },
         } };
         self.docs.submitMutation(&request, Request.apply) catch |err| {
-            sync.lockYielding(&self.docs.mutex);
+            self.docs.mutex.lock();
             defer self.docs.mutex.unlock();
             if (self.docs.file.checkpoint_publication_uncertain or err == error.OutcomeUnknown) {
                 self.docs.secret_store_uncertain = true;
@@ -257,7 +256,7 @@ const TestProvider = struct {
         const self: *@This() = @ptrCast(@alignCast(ptr));
         if (self.unavailable) return error.Unavailable;
         if (self.index_docs) |docs| {
-            sync.lockYielding(&docs.mutex);
+            docs.mutex.lock();
             defer docs.mutex.unlock();
             try docs.file.putIndexCatalogRecord("index/progress", "wrapped");
         }

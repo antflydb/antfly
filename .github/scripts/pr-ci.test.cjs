@@ -286,13 +286,16 @@ test('PR updates cancel old compute and mark the current head as needing approva
   assert.equal(f.checks[0].conclusion,'action_required');
 });
 
-test('delayed push events preserve newer approvals for the live snapshot', async t => {
-  for (const admitted of [false, true]) await t.test(admitted ? 'running' : 'queued', async () => {
+test('delayed PR updates preserve newer approvals for the live snapshot', async t => {
+  for (const action of ['synchronize', 'opened', 'reopened', 'ready_for_review', 'converted_to_draft', 'closed', 'labeled', 'unlabeled', 'edited'])
+  for (const admitted of [false, true]) await t.test(`${action} ${admitted ? 'running' : 'queued'}`, async () => {
     const f=fixture(); await f.call();
     if (admitted) await f.call('admit');
     f.runs.push({id:91,status:admitted ? 'in_progress' : 'queued',
       display_title:'PR CI #7 / check 1 / approval 17'});
-    f.context.eventName='pull_request_target'; f.context.payload.action='synchronize';
+    f.context.eventName='pull_request_target'; f.context.payload.action=action;
+    f.context.payload.label={name:config.suites.find(s=>s.label).label};
+    f.context.payload.changes={base:{}};
     f.context.payload.pull_request={updated_at:'2026-09-15T00:59:59Z'};
     await f.call();
     assert.deepEqual(f.cancelled,[]);
@@ -305,7 +308,7 @@ test('delayed push events preserve newer approvals for the live snapshot', async
   });
 });
 
-test('delayed push events still revoke stale or invalid approvals', async t => {
+test('delayed PR updates still revoke stale or invalid approvals', async t => {
   const cases = {
     'head changed': f => {f.pr.head.sha=BASE;},
     'base changed': f => {f.pr.base.sha=SHA;},
@@ -319,10 +322,13 @@ test('delayed push events still revoke stale or invalid approvals', async t => {
     'missing timestamp': f => {delete f.context.payload.pull_request.updated_at;},
     'invalid timestamp': f => {f.context.payload.pull_request.updated_at='invalid';},
   };
-  for (const [name,change] of Object.entries(cases)) await t.test(name,async()=>{
+  for (const action of ['synchronize', 'opened', 'reopened', 'ready_for_review', 'converted_to_draft', 'closed', 'labeled', 'unlabeled', 'edited'])
+  for (const [name,change] of Object.entries(cases)) await t.test(`${action}: ${name}`,async()=>{
     const f=fixture(); await f.call(); await f.call('admit');
     f.runs.push({id:91,status:'in_progress',display_title:'PR CI #7 / check 1 / approval 17'});
-    f.context.eventName='pull_request_target'; f.context.payload.action='synchronize';
+    f.context.eventName='pull_request_target'; f.context.payload.action=action;
+    f.context.payload.label={name:config.suites.find(s=>s.label).label};
+    f.context.payload.changes={base:{}};
     f.context.payload.pull_request={updated_at:'2026-09-15T00:59:59Z'};
     change(f); await f.call();
     assert.deepEqual(f.cancelled,[91]);

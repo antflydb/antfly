@@ -500,7 +500,7 @@ pub const Handle = struct {
     }
 
     pub fn storageStatus(self: *Handle) StorageStatus {
-        if (self.native_docstore) |store| platform_sync.lockYielding(&store.mutex);
+        if (self.native_docstore) |store| store.mutex.lock();
         defer if (self.native_docstore) |store| store.mutex.unlock();
         return switch (self.engine) {
             .native_single_file => blk: {
@@ -839,7 +839,7 @@ fn nativeVacuumReport(handle: *Handle, cancel: ?*const maintenance.CancelToken) 
 
 fn nativeStableSnapshot(handle: *Handle, dest_path: []const u8, replace: bool) !StableSnapshotReport {
     const store = handle.native_docstore.?;
-    platform_sync.lockYielding(&store.mutex);
+    store.mutex.lock();
     defer store.mutex.unlock();
     return try store.file.copyStableSnapshotToPath(dest_path, replace);
 }

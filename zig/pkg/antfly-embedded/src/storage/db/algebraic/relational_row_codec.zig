@@ -1436,7 +1436,7 @@ pub const OrdinalRowView = struct {
 
     /// Write directly in the requested output layout. Slots absent from this
     /// historical schema (or reserved for ranking metadata) stay absent NULLs.
-    pub fn projectSqlDatumsMappedAlloc(self: OrdinalRowView, alloc: Allocator, plan: OrdinalProjectionPlan, output: ?@import("../../../sql/catalog.zig").Row.TypedLayout) !DatumProjection {
+    pub fn projectSqlDatumsMappedAlloc(self: OrdinalRowView, alloc: Allocator, plan: OrdinalProjectionPlan, output: ?*const @import("../../../sql/catalog.zig").Row.TypedLayout) !DatumProjection {
         if (plan.schema_version != self.table_schema.version) return error.RelationalRowSchemaMismatch;
         const Datum = @import("../../../sql/scalar.zig").Datum;
         const width = if (output) |layout| layout.names.len else plan.ordinals.len;
