@@ -11721,3 +11721,60 @@ Actual data-log ingress/proposal capability barriers, advisory owner preparation
 durable metadata plan/ACK acceptance, root adoption, coordinated publication and
 release, and layout-preserving full-text retirement qualification remain
 required. The port is not a public producer and no parity case is reclassified.
+
+### Compact schema-control log routing and progress isolation
+
+The ABI-95 full Debug SQL/source checkpoint completed successfully: 1,130 SQL
+tests and 47 owner-source tests passed, four opt-in benchmarks skipped and
+67/67 build steps succeeded in
+`/private/tmp/antfly-sql-schema-owner-abi95-source-sql-debug.log`.
+
+ASRL v1 wraps the position-free ASVR command with bounded canonical table/root
+generation routing, lengths and checksum. Per-page entries do not repeat the
+full public schema/index descriptor. Routing strings are owned; the immutable
+command payload borrows the committed log entry. Neither decoding nor a root
+generation grants metadata permission. The actual owner and applying entry
+remain responsible for namespace/group and term/index authority.
+
+Decoder version 24 is reserved, **not advertised**: the supported writer version
+remains 23. Both raw projection and native runtime paths recognize the reserved
+binary family before legacy parsing. An unsupported control must not become an
+empty successful entry, retained normal entry, protocol advance or applied
+watermark.
+
+The paired runtime Debug gate passes all five tests with zero skips/leaks and
+91/91 build steps in
+`/private/tmp/antfly-sql-schema-control-log-runtime-debug.log`. Its physical
+implementation owns the raw projection rejection; its consumer owns the three
+codec tests and native-runtime rejection. Codec tests cover owned Unicode
+routing, maximum root generation, borrowed payload lifetime, future/truncated
+frames, checksum and rehashed-length corruption, noncanonical headers and
+allocation-failure cleanup. An initial combined invocation incorrectly asked
+the separate storage gate for consumer-only codec tests; the codec suite also
+needed the same explicit compile-time discovery anchor as `raft_batch`.
+Neither issue was bypassed with an empty-test allowance. The source boundary,
+control catalog, license, inventory and formatting checks pass; original
+dispositions remain 531 implemented / 132 rejected / 113 superseded / 810
+unresolved. About 0.73 GiB of individually inspected superseded unit-test
+executables/objects were reclaimed; these generated outputs are rebuildable.
+
+The separate storage Debug gate also passes its projection-rejection test,
+zero skips/leaks and 51/51 build steps in
+`/private/tmp/antfly-sql-schema-control-log-storage-debug.log`.
+
+Combined legacy JSON batch/exact-number, protocol-barrier and new schema-log
+regressions pass all ten tests with zero skips/leaks and 91/91 build steps in
+`/private/tmp/antfly-sql-schema-control-log-legacy-runtime-debug.log`.
+
+Production dispatch must not call the synchronous ABI-95 complete-command port
+from Raft progress. Although its preparation runs outside the database apply
+lock, schema compilation and independent page replay would still hold the
+node's progress mutex. The required continuation is an opaque preparation owned
+by the control worker and pinned to the exact physical owner lease. Preparation,
+large-buffer cleanup and cold owner opening run off progress; actual committed
+apply rechecks durable authority/preimages and joins the effect and ordered
+marker atomically. Prepared work needs bounded byte/entry admission, exact
+group/root/entry identity, cancellation and shutdown draining, and retry without
+fallible post-commit acknowledgement. A prepared result is not metadata
+authorization or an all-member capability barrier. No public producer,
+publication/release authority or original parity disposition is enabled here.

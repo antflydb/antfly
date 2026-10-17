@@ -44,6 +44,9 @@ pub const batch_protocol_version: u16 = 23;
 /// Version 23 decodes only private index admission/drain/reservation controls.
 /// It does not advertise complete index-publication lifecycle support.
 pub const batch_index_owner_control_protocol_version: u16 = 23;
+/// Reserved decoder family. Do not advertise this as batch_protocol_version
+/// until committed native dispatch and off-progress preparation are complete.
+pub const batch_schema_owner_control_protocol_version: u16 = 24;
 pub const batch_row_semantics_protocol_version: u16 = 18;
 pub const batch_artifact_catalog_protocol_version: u16 = 14;
 /// Full producer publications require a separate all-member barrier; the

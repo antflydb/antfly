@@ -2228,6 +2228,12 @@ const RaftTableApplyStateMachine = struct {
         for (committed_entries) |entry| {
             if (entry.index > last_index) last_index = entry.index;
             if (entry.index <= completed_index) continue;
+            if (entry.entry_type == .normal and @import("schema_control_log.zig").looksLikeEnvelope(entry.data)) {
+                // Decoder reservation is not native apply readiness. Until
+                // off-progress preparation and actual dispatch are enabled,
+                // never acknowledge this private family as a legacy no-op.
+                return error.UnsupportedRaftBatchProtocolVersion;
+            }
             if (entry.entry_type == .normal and data_raft_batch.looksLikeEnvelope(entry.data)) {
                 var decoded = try data_raft_batch.decode(self.alloc, entry.data);
                 defer decoded.deinit(self.alloc);
@@ -37652,6 +37658,20 @@ fn consumerTests() type {
             defer alloc.free(retry_json);
             try std.testing.expectError(error.IntentConflict, restored.replicatedBatchAtRaftEntryJson("docs", retry_json, 1, 4));
             try std.testing.expectEqualDeep(restored_cut, try restored.raftIndexOwnerObservation(alloc, "docs", identity, .{}));
+        }
+
+        test "data raft schema controls do not acknowledge unsupported native dispatch" {
+            const a = std.testing.allocator;
+            const schema = @import("schema_control_log.zig");
+            const command = try schema.testing.command().encodeRaft(a);
+            defer a.free(command);
+            const frame = try schema.encode(a, "rows", 11, command);
+            defer a.free(frame);
+            var apply = try RaftTableApplyStateMachine.init(a, "/unused-schema-control", antfly.public_api.table_catalog.emptyCatalogSource(), null);
+            defer apply.deinit();
+            try std.testing.expectError(error.UnsupportedRaftBatchProtocolVersion, RaftTableApplyStateMachine.applyReady(&apply, 72, null, &.{.{ .term = 1, .index = 1, .entry_type = .normal, .data = frame }}, &.{}));
+            try std.testing.expectEqual(@as(u64, 0), apply.appliedIndex(72));
+            try std.testing.expectEqual(@as(u64, 0), apply.retry_apply_checkpoints.get(72).?.completed_index);
         }
 
         test "data raft apply records transaction conflicts without stopping replica progress" {

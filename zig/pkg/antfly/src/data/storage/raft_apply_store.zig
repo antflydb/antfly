@@ -2394,6 +2394,20 @@ pub const RaftApplyStore = struct {
     ) !void {
         const operation_start = operations.items.len;
         var topology_guarded = false;
+        if (@import("../schema_control_log.zig").looksLikeEnvelope(data)) {
+            // Reserved binary controls cannot fall through the legacy parser
+            // as an empty successful entry, including projection-only owners.
+            var schema = try @import("../schema_control_log.zig").decode(alloc, data);
+            defer schema.deinit();
+            if (!native_source_delegate) return error.StorageKernelOwnerUnavailable;
+            // Keep the writer version unadvertised until native prepared
+            // dispatch is wired. The persisted barrier must gate this family.
+            try operations.append(alloc, .{ .require_raft_batch_protocol = .{
+                .version = @import("../schema_control_log.zig").protocol_version,
+                .owner_group_id = schema.command.binding.fence.owner_group_id,
+            } });
+            return;
+        }
         if (!data_raft_batch.looksLikeEnvelope(data)) {
             if (try parseDataOperation(alloc, data)) |operation| {
                 switch (operation) {
@@ -2585,6 +2599,33 @@ pub const RaftApplyStore = struct {
         if (topology_guarded) try operations.append(alloc, .topology_end);
     }
 };
+
+test "data raft schema controls cannot advance projection state before native decoder activation" {
+    const a = std.testing.allocator;
+    const schema = @import("../schema_control_log.zig");
+    try std.testing.expect(schema.protocol_version > @import("../../common/data_raft_protocol.zig").batch_protocol_version);
+    const command = try schema.testing.command().encodeRaft(a);
+    defer a.free(command);
+    const frame = try schema.encode(a, "rows", 11, command);
+    defer a.free(frame);
+    const entries = try raft_state_machine.encodeCommittedEntries(a, &.{.{ .term = 1, .index = 1, .entry_type = .normal, .data = frame }});
+    defer a.free(entries);
+    for ([_]bool{ false, true }) |native| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const path = try tmp.dir.realPathFileAlloc(std.testing.io, ".", a);
+        defer a.free(path);
+        var store = try RaftApplyStore.init(a, .{ .root_dir = path, .native_source_delegate = native });
+        defer store.deinit();
+        const request: raft_state_machine.ApplyBatch = .{ .group_id = 72, .commit_index = 1, .entries_bytes = entries };
+        try std.testing.expectError(if (native) error.UnsupportedBatchProtocolVersion else error.StorageKernelOwnerUnavailable, store.snapshotBuilder().applyBatch(request));
+        try std.testing.expect(try store.latestBatch(72) == null);
+        const retained = try store.appliedNormalEntries(a, 72);
+        defer a.free(retained);
+        try std.testing.expectEqual(@as(usize, 0), retained.len);
+        try std.testing.expectEqual(@as(u16, 0), try store.raftBatchProtocolVersionForRequest(72));
+    }
+}
 
 test "data raft integrity transfer refuses projection only owners and retains native protocol barrier" {
     const alloc = std.testing.allocator;
