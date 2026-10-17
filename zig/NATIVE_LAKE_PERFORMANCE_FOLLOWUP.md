@@ -5451,15 +5451,24 @@ and recognizes either lane-entry order. The real Parquet restart fixture also
 checks sparse wide/decimal/nullable projections; existing real Iceberg coverage
 exercises dictionary projections, schema evolution, partition pruning and deletes.
 
-Qualification: the full SQL gate passed 1,007 tests (three opt-in benchmarks
-skipped), all 513 native lake tests and the runtime I/O ABI gate passed with zero
+Ancestor quota diagnostics follow scheduler and spill allocator wrappers. Reusable
+pattern executions inspect local admission and their own DFA allocation-failure
+state, so an ancestor's historical quota failure cannot invalidate healthy forks
+after headroom recovers. Failed executions are still discarded and reconstructed.
+Hard overlay and transform-size diagnostics likewise inspect their local budget;
+parent cache pressure remains retryable and can use private ownership. Cancellation
+and provider errors retain their own identity even after quota pressure.
+
+Qualification: the full SQL gate passed 1,009 tests (three opt-in benchmarks
+skipped), all 515 native lake tests and the runtime I/O ABI gate passed with zero
 failures or leaks. Coverage includes retry-view pressure through direct and locked
 allocators, allocation-free dynamic filters, selected nullable/dictionary framing
 and ownership failures, exact coefficient unions, checkpoint truncation, and
-small-budget NUMERIC spill/sort execution. The archive/recent overlap fixture
+small-budget NUMERIC spill/sort execution, and WAL private fallback/headroom
+recovery. The archive/recent overlap fixture
 passed 10 consecutive focused runs. All 50 real Parquet/Iceberg E2Es passed in
-322.13 seconds against the final Debug CLI; its SHA-256 stayed unchanged across
+312.11 seconds against the final Debug CLI; its SHA-256 stayed unchanged across
 the run. Formatting, Python lint, whitespace, staged license headers and the
-Apache boundary (2,075 sources) passed. Latest fetched origin/main `ce578d9033`
+Apache boundary (2,076 sources) passed. Latest fetched origin/main `968f037c9a`
 is included. Representative archive-scale latency/RSS and live-provider retention
 qualification remain deferred.
