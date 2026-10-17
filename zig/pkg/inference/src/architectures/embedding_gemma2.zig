@@ -25,6 +25,7 @@ const model_config = @import("embedding_gemma2_config.zig");
 pub const checkpoint_revision = model_config.checkpoint_revision;
 pub const recipe_version = model_config.recipe_version;
 pub const max_tokens = model_config.max_tokens;
+pub const output_dim: usize = 768;
 pub const Config = model_config.Config;
 pub const isModel = model_config.isModel;
 pub const parseConfig = model_config.parseConfig;
@@ -109,7 +110,7 @@ fn requireWeight(allocator: std.mem.Allocator, store: anytype, name: []const u8,
 }
 
 pub fn validDimension(dim: usize) bool {
-    return dim == 768 or dim == 512 or dim == 256 or dim == 128;
+    return dim > 0 and dim <= output_dim;
 }
 
 pub fn taskPrefix(task: []const u8) ![]const u8 {
@@ -118,7 +119,9 @@ pub fn taskPrefix(task: []const u8) ![]const u8 {
         .{ .task = "RETRIEVAL_DOCUMENT", .prefix = "title: none | text: " },
         .{ .task = "QUESTION_ANSWERING", .prefix = "task: question answering | query: " },
         .{ .task = "FACT_VERIFICATION", .prefix = "task: fact checking | query: " },
+        .{ .task = "FACT_CHECKING", .prefix = "task: fact checking | query: " },
         .{ .task = "CODE_RETRIEVAL_QUERY", .prefix = "task: code retrieval | query: " },
+        .{ .task = "CODE_RETRIEVAL", .prefix = "task: code retrieval | query: " },
         .{ .task = "CLASSIFICATION", .prefix = "task: classification | query: " },
         .{ .task = "CLUSTERING", .prefix = "task: clustering | query: " },
         .{ .task = "SEMANTIC_SIMILARITY", .prefix = "task: sentence similarity | query: " },
@@ -1206,8 +1209,12 @@ test "embeddinggemma2 official task prefixes and matryoshka dimensions" {
     try std.testing.expectEqualStrings("title: none | text: ", try taskPrefix("RETRIEVAL_DOCUMENT"));
     try std.testing.expectEqualStrings("task: clustering | query: ", try taskPrefix("CLUSTERING"));
     try std.testing.expectError(error.UnsupportedEmbeddingTask, taskPrefix("unknown"));
+    try std.testing.expect(validDimension(1));
     try std.testing.expect(validDimension(128));
-    try std.testing.expect(!validDimension(384));
+    try std.testing.expect(validDimension(384));
+    try std.testing.expect(validDimension(768));
+    try std.testing.expect(!validDimension(0));
+    try std.testing.expect(!validDimension(769));
 }
 
 test "embeddinggemma2 real official checkpoint matches F32 oracle" {
@@ -1468,7 +1475,9 @@ test "embeddinggemma2 real padded batch is invariant and cancellation permits re
 test "embeddinggemma2 rejects incompatible checkpoint semantics" {
     const a = std.testing.allocator;
     const fixture = @embedFile("embedding_gemma2_config.json");
-    _ = try parseConfig(a, fixture);
+    const cfg = try parseConfig(a, fixture);
+    try std.testing.expect(cfg.resident != null);
+    try std.testing.expect(cfg.resident.?.isOfficialTextTopology());
     const parsed = try std.json.parseFromSlice(std.json.Value, a, fixture, .{});
     defer parsed.deinit();
     const tc = parsed.value.object.getPtr("text_config").?;

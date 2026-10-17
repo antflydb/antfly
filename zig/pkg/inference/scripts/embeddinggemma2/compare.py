@@ -14,7 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Small, matched F32 native/Metal versus official PyTorch CPU/MPS comparison.
+"""Matched F32 native/Metal and BF16 CUDA versus pinned PyTorch comparison.
 
 Each runtime runs in its own process, with synchronized GPU timings. Native
 timings include HTTP; PyTorch timings exclude HTTP. This is a representative
@@ -88,7 +88,7 @@ def assert_agreement(actual, expected, max_error=1e-4):
         or result["max_abs"] > max_error
         or abs(result["actual_norm"] - 1) > 1e-4
     ):
-        raise ValueError(f"F32 parity failed: {result}")
+        raise ValueError(f"embedding parity failed: {result}")
     return result
 
 
@@ -119,6 +119,10 @@ def compare_reference(actual, expected, max_error=1e-4):
     for field in ("suite_sha256", "checkpoint_receipt_sha256", "precision"):
         if actual[field] != expected[field]:
             raise ValueError(f"reference {field} differs")
+    if actual["precision"] == "bfloat16" and any(
+        result.get("pooling_precision") != "float32" for result in (actual, expected)
+    ):
+        raise ValueError("BF16 reference must declare F32 pooling")
     if expected["status"] != "pass" or set(actual["cases"]) != set(expected["cases"]):
         raise ValueError("reference is incomplete or has different cases")
     vectors = {
@@ -429,6 +433,8 @@ def native(args, suite, result):
         endpoint.bind(("127.0.0.1", 0))
         port = endpoint.getsockname()[1]
     env = dict(os.environ, ANTFLY_INFERENCE_REQUIRED_BACKEND=args.backend)
+    if args.backend == "cuda":
+        env["ANTFLY_INFERENCE_CUDA_EMBEDDING_GEMMA2_STATS"] = "1"
     log_path = args.output.with_suffix(".server.log")
     url = f"http://127.0.0.1:{port}"
     with log_path.open("w") as log:
@@ -497,7 +503,12 @@ def native(args, suite, result):
                         raise ValueError("model generation changed")
                     identity = actual_identity
                     vector = response["data"][0]["embedding"]
-                    assert_agreement(vector, case.get("oracle", vector))
+                    assert_agreement(
+                        vector,
+                        case.get("oracle", vector)
+                        if getattr(args, "precision", "float32") == "float32"
+                        else vector,
+                    )
                     if i == 0 and not result.get("first_request_seconds"):
                         result["first_request_seconds"] = elapsed
                     if i >= warmups:
@@ -591,6 +602,45 @@ def native(args, suite, result):
     if f"selected backend {args.backend} " not in text:
         raise ValueError("required backend was not confirmed by server log")
     result["server_log_sha256"] = reference.sha256(log_path)
+    if args.backend == "cuda":
+        result["cuda_routes"] = cuda_routes(text)
+        require_cuda_routes(result["cuda_routes"], getattr(args, "require_route", []))
+
+
+CUDA_ROUTES = {
+    "extended_flash": "extended_flash_launches_total",
+    "fused_vision": "fused_vision_launches_total",
+    "packed_projections": "packed_projection_launches_total",
+    "graph_replay": "embedding_graph_replays_total",
+    "batched_vision": "vision_batched_executes_total",
+    "native_vision": "native_vision_launches_total",
+    "media_batch": "media_batches_total",
+    "packed_ple": "packed_ple_groups_total",
+    "fused_backbone": "fused_backbone_launches_total",
+}
+
+
+def cuda_routes(text):
+    return {
+        route: max(
+            [int(value) for value in re.findall(rf"\b{counter}=(\d+)\b", text)] or [0]
+        )
+        for route, counter in CUDA_ROUTES.items()
+    }
+
+
+def require_cuda_routes(routes, required):
+    missing = [route for route in required if routes.get(route, 0) == 0]
+    if missing:
+        raise ValueError(f"CUDA routes were not observed: {', '.join(missing)}")
+
+
+def execution_precision(backend, requested=None):
+    expected = "bfloat16" if backend in ("cuda", "torch-cuda") else "float32"
+    precision = requested or expected
+    if precision != expected:
+        raise ValueError(f"{backend} requires {expected} for matched qualification")
+    return precision
 
 
 def torch_run(args, suite, result):
@@ -605,14 +655,45 @@ def torch_run(args, suite, result):
     torch.set_num_interop_threads(1)
     if args.backend == "mps" and not torch.backends.mps.is_available():
         raise RuntimeError("PyTorch MPS unavailable")
-    sync = torch.mps.synchronize if args.backend == "mps" else lambda: None
+    device = "cuda" if args.backend == "torch-cuda" else args.backend
+    if device == "cuda" and not torch.cuda.is_available():
+        raise RuntimeError("PyTorch CUDA unavailable")
+    if device == "cuda" and not torch.cuda.is_bf16_supported():
+        raise RuntimeError("PyTorch CUDA BF16 unavailable")
+    dtype = torch.bfloat16 if args.precision == "bfloat16" else torch.float32
+    sync = (
+        torch.cuda.synchronize
+        if device == "cuda"
+        else torch.mps.synchronize
+        if device == "mps"
+        else lambda: None
+    )
+    if device == "cuda":
+        torch.cuda.reset_peak_memory_stats()
+        result["cuda_device"] = torch.cuda.get_device_name()
+        result["cuda_runtime"] = torch.version.cuda
+
+    def to_device(encoded):
+        return {
+            k: v.to(device=device, dtype=dtype if v.is_floating_point() else v.dtype)
+            for k, v in encoded.items()
+        }
+
+    def record_cuda_memory():
+        if device == "cuda":
+            sync()
+            result["cuda_memory_bytes"] = {
+                "allocated": torch.cuda.memory_allocated(),
+                "reserved": torch.cuda.memory_reserved(),
+                "peak_allocated": torch.cuda.max_memory_allocated(),
+                "peak_reserved": torch.cuda.max_memory_reserved(),
+            }
+
     started = time.perf_counter()
     model = (
-        AutoModel.from_pretrained(
-            args.model_dir, dtype=torch.float32, local_files_only=True
-        )
+        AutoModel.from_pretrained(args.model_dir, dtype=dtype, local_files_only=True)
         .eval()
-        .to(args.backend)
+        .to(device)
     )
     sync()
     result["model_load_seconds"] = time.perf_counter() - started
@@ -634,10 +715,8 @@ def torch_run(args, suite, result):
             if len(mask) != len(ids) or not 0 < len(ids) <= 8192 or not any(mask):
                 raise ValueError("invalid prepared IDs/mask")
             return {
-                "input_ids": torch.tensor([ids], dtype=torch.long, device=args.backend),
-                "attention_mask": torch.tensor(
-                    [mask], dtype=torch.long, device=args.backend
-                ),
+                "input_ids": torch.tensor([ids], dtype=torch.long, device=device),
+                "attention_mask": torch.tensor([mask], dtype=torch.long, device=device),
             }
         if "text" in case:
             prefix = (
@@ -669,10 +748,10 @@ def torch_run(args, suite, result):
             )
         if encoded["input_ids"][0].tolist() != case["token_ids"]:
             raise ValueError("token IDs differ from matched suite")
-        return {k: v.to(args.backend) for k, v in encoded.items()}
+        return to_device(encoded)
 
     def forward(encoded, dimensions=768):
-        hidden = model(**encoded).last_hidden_state
+        hidden = model(**encoded).last_hidden_state.float()
         mask = encoded["attention_mask"].unsqueeze(-1)
         vector = torch.nn.functional.normalize(
             ((hidden * mask).sum(1) / mask.sum(1))[:, :dimensions], dim=-1
@@ -704,7 +783,12 @@ def torch_run(args, suite, result):
                 if i >= warmups:
                     samples.append(elapsed)
                     full_samples.append(time.perf_counter() - full_started)
-            assert_agreement(vector, case.get("oracle", vector))
+            # Suite oracles are F32. BF16 is gated against a separately completed
+            # matching BF16 reference below, never mislabeled as F32 parity.
+            assert_agreement(
+                vector,
+                case.get("oracle", vector) if args.precision == "float32" else vector,
+            )
             result["cases"][case["name"]] = {
                 "tokens": len(case["token_ids"]),
                 "timing": timing(samples),
@@ -735,6 +819,7 @@ def torch_run(args, suite, result):
             if args.backend == "mps":
                 result["mps_allocated_bytes"] = torch.mps.current_allocated_memory()
                 result["mps_driver_bytes"] = torch.mps.driver_allocated_memory()
+            record_cuda_memory()
             return
         vectors = []
         for text, expected in zip(
@@ -743,7 +828,7 @@ def torch_run(args, suite, result):
             encoded = tokenizer(text, return_tensors="pt")
             if encoded["input_ids"][0].tolist() != expected:
                 raise ValueError("decision token IDs differ")
-            vectors.append(forward({k: v.to(args.backend) for k, v in encoded.items()}))
+            vectors.append(forward(to_device(encoded)))
         scores = {
             label: sum(x * y for x, y in zip(vectors[0], vector))
             for label, vector in zip(suite["decision"]["criteria"], vectors[1:])
@@ -759,7 +844,7 @@ def torch_run(args, suite, result):
             sync()
             started = time.perf_counter()
             encoded = tokenizer(suite["decision"]["rendered"][0], return_tensors="pt")
-            state = forward({k: v.to(args.backend) for k, v in encoded.items()})
+            state = forward(to_device(encoded))
             current = [
                 sum(x * y for x, y in zip(state, vector)) for vector in vectors[1:]
             ]
@@ -775,11 +860,15 @@ def torch_run(args, suite, result):
         result["mps_allocated_bytes"] = torch.mps.current_allocated_memory()
         result["mps_driver_bytes"] = torch.mps.driver_allocated_memory()
 
+    record_cuda_memory()
+
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
-        "--backend", choices=["prepare", "native", "metal", "cpu", "mps"], required=True
+        "--backend",
+        choices=["prepare", "native", "metal", "cuda", "cpu", "mps", "torch-cuda"],
+        required=True,
     )
     parser.add_argument("--model-dir", type=Path, required=True)
     parser.add_argument("--artifacts-dir", type=Path)
@@ -804,6 +893,10 @@ def main():
     parser.add_argument(
         "--timing-mode", choices=["default", "encoder"], default="default"
     )
+    parser.add_argument(
+        "--require-route", action="append", choices=list(CUDA_ROUTES), default=[]
+    )
+    parser.add_argument("--precision", choices=["float32", "bfloat16"])
     parser.add_argument("--max-vector-error", type=float, default=1e-4)
     parser.add_argument("--process-memory-budget-mb", type=int, default=8192)
     args = parser.parse_args()
@@ -820,8 +913,20 @@ def main():
             parser.error("prepare requires --artifacts-dir")
         prepare(args.model_dir, args.artifacts_dir, args.output)
         return
-    if not args.suite or (args.backend in ("native", "metal") and not args.binary):
-        parser.error("runtime requires --suite and native/metal requires --binary")
+    try:
+        args.precision = execution_precision(args.backend, args.precision)
+    except ValueError as error:
+        parser.error(str(error))
+    if args.require_route and args.backend != "cuda":
+        parser.error("--require-route requires native CUDA HTTP execution")
+    if args.backend == "cuda" and args.timing_mode == "encoder":
+        parser.error(
+            "CUDA uses completed HTTP pipeline timing; encoder timing is CPU/Metal only"
+        )
+    if not args.suite or (
+        args.backend in ("native", "metal", "cuda") and not args.binary
+    ):
+        parser.error("runtime requires --suite and native/metal/cuda requires --binary")
     suite = json.loads(args.suite.read_text())
     if suite["revision"] != reference.REVISION:
         raise ValueError("suite checkpoint revision differs")
@@ -840,7 +945,11 @@ def main():
             key: value
             for key, value in os.environ.items()
             if key.startswith(
-                ("ANTFLY_EMBEDDINGGEMMA2_", "TERMITE_METAL_EMBEDDINGGEMMA2_")
+                (
+                    "ANTFLY_EMBEDDINGGEMMA2_",
+                    "TERMITE_METAL_EMBEDDINGGEMMA2_",
+                    "ANTFLY_INFERENCE_CUDA_EMBEDDING_GEMMA2_",
+                )
             )
         },
         "vm_counter_order": ["pageouts", "swapins", "swapouts"],
@@ -851,18 +960,19 @@ def main():
             args.model_dir / "embeddinggemma2_receipt.json"
         ),
         "production_qualified": False,
-        "precision": "float32",
+        "precision": args.precision,
+        "pooling_precision": "float32",
         "suite_sha256": reference.sha256(args.suite),
         "timing_scope": "prepared IDs/mask: embedding lookup, encoder, pooling, normalization and synchronized vector readback"
         if args.timing_mode == "encoder"
         else "HTTP request including serialization/tokenization and output transfer"
-        if args.backend in ("native", "metal")
+        if args.backend in ("native", "metal", "cuda")
         else "encoder, pooling and output transfer; excludes input preprocessing and HTTP",
         "cases": {},
         "before": conditions(),
     }
     try:
-        if args.backend in ("native", "metal"):
+        if args.backend in ("native", "metal", "cuda"):
             (encoder_run if args.timing_mode == "encoder" else native)(
                 args, suite, result
             )

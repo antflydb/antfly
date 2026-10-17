@@ -10511,13 +10511,13 @@ static NSString *termite_metal_shader_source(void) {
            "    float s = g >= 0.0f ? 1.0f / (1.0f + exp(-g)) : exp(g) / (1.0f + exp(g));\n"
            "    output[gid] = a * s;\n"
            "}\n"
-           "kernel void termite_gemma4_audio_dwconv_causal(device const float *input [[buffer(0)]], device const float *weight [[buffer(1)]], device float *output [[buffer(2)]], constant termite_metal_gemma4_audio_rows_params &p [[buffer(3)]], uint gid [[thread_position_in_grid]]) {\n"
+           "kernel void termite_gemma4_audio_dwconv_causal(device const float *input [[buffer(0)]], device const float *weight [[buffer(1)]], device float *output [[buffer(2)]], device const float *starts [[buffer(3)]], constant termite_metal_gemma4_audio_rows_params &p [[buffer(4)]], uint gid [[thread_position_in_grid]]) {\n"
            "    uint total = p.rows * p.dim; if (gid >= total) return;\n"
            "    uint t = gid / p.dim; uint h = gid - t * p.dim;\n"
-           "    uint left_pad = p.extra - 1u;\n"
+           "    uint left_pad = p.extra - 1u; uint start = p.reserved ? uint(starts[t]) : 0u;\n"
            "    float sum = 0.0f;\n"
            "    for (uint k = 0u; k < p.extra; ++k) {\n"
-           "        if (t + k < left_pad) continue;\n"
+           "        if (t + k < left_pad + start) continue;\n"
            "        uint src_t = t + k - left_pad;\n"
            "        sum += input[src_t * p.dim + h] * weight[k * p.dim + h];\n"
            "    }\n"
@@ -10550,8 +10550,8 @@ static NSString *termite_metal_shader_source(void) {
            "    uint head_base = head * p.head_dim;\n"
            "    uint out_base = q_idx * p.hidden + head_base;\n"
            "    for (uint d = 0u; d < p.head_dim; ++d) output[out_base + d] = 0.0f;\n"
-           "    if (valid[q_idx] == 0.0f || p.context > 64u) return;\n"
-           "    uint block_start = (q_idx / p.chunk) * p.chunk;\n"
+           "    if (((p.reserved & 2u) ? valid[q_idx] <= 0.0f : valid[q_idx] == 0.0f) || p.context > 64u) return;\n"
+           "    uint clip_start = (p.reserved & 2u) ? uint(valid[q_idx]) - 1u : 0u; uint block_start = clip_start + ((q_idx - clip_start) / p.chunk) * p.chunk;\n"
            "    uint q_off = q_idx - block_start;\n"
            "    int past = (int)p.context_left - 1;\n"
            "    float scores[64];\n"
@@ -10562,7 +10562,7 @@ static NSString *termite_metal_shader_source(void) {
            "        int rel_idx = (int)c - (int)q_off;\n"
            "        int k_idx = (int)(block_start + c) - past;\n"
            "        bool ok = rel_idx >= 0 && rel_idx < (int)p.context_left && k_idx >= 0 && k_idx < (int)p.rows;\n"
-           "        if (ok) ok = valid[k_idx] != 0.0f && k_idx <= (int)q_idx && ((int)q_idx - k_idx) <= past - int(p.reserved & 1u);\n"
+           "        if (ok) ok = ((p.reserved & 2u) ? valid[k_idx] == valid[q_idx] : valid[k_idx] != 0.0f) && k_idx <= (int)q_idx && ((int)q_idx - k_idx) <= past - int(p.reserved & 1u);\n"
            "        if (!ok) { scores[c] = p.invalid_value; continue; }\n"
            "        uint k_base = (uint)k_idx * p.hidden + head_base;\n"
            "        uint rel_base = (uint)rel_idx * p.hidden + head_base;\n"
@@ -10588,7 +10588,7 @@ static NSString *termite_metal_shader_source(void) {
            "            float prob = scores[c] / sum_exp;\n"
            "            if (prob == 0.0f) continue;\n"
            "            int k_idx = (int)(block_start + c) - past;\n"
-           "            if (k_idx < 0 || k_idx >= (int)p.rows) continue;\n"
+           "            if (k_idx < 0 || k_idx >= (int)p.rows) continue; if ((p.reserved & 2u) ? valid[k_idx] != valid[q_idx] : valid[k_idx] == 0.0f) continue; if (k_idx > (int)q_idx || (int)q_idx - k_idx > past - int(p.reserved & 1u)) continue;\n"
            "            acc += prob * v[(uint)k_idx * p.hidden + head_base + d];\n"
            "        }\n"
            "        output[out_base + d] = acc;\n"
@@ -10606,9 +10606,9 @@ static NSString *termite_metal_shader_source(void) {
            "    if (head >= p.heads || q_idx >= p.rows || tid >= p.head_dim) return;\n"
            "    uint head_base = head * p.head_dim;\n"
            "    uint out_base = q_idx * p.hidden + head_base;\n"
-           "    bool row_valid = valid[q_idx] != 0.0f && p.context <= 64u && sg_count <= 32u;\n"
+           "    bool row_valid = ((p.reserved & 2u) ? valid[q_idx] > 0.0f : valid[q_idx] != 0.0f) && p.context <= 64u && sg_count <= 32u;\n"
            "    if (!row_valid) { output[out_base + tid] = 0.0f; return; }\n"
-           "    uint block_start = (q_idx / p.chunk) * p.chunk;\n"
+           "    uint clip_start = (p.reserved & 2u) ? uint(valid[q_idx]) - 1u : 0u; uint block_start = clip_start + ((q_idx - clip_start) / p.chunk) * p.chunk;\n"
            "    uint q_off = q_idx - block_start;\n"
            "    int past = (int)p.context_left - 1;\n"
            "    float qv = q[q_idx * p.hidden + head_base + tid] * q_scales[tid];\n"
@@ -10616,7 +10616,7 @@ static NSString *termite_metal_shader_source(void) {
            "        int rel_idx = (int)c - (int)q_off;\n"
            "        int k_idx = (int)(block_start + c) - past;\n"
            "        bool ok = rel_idx >= 0 && rel_idx < (int)p.context_left && k_idx >= 0 && k_idx < (int)p.rows;\n"
-           "        if (ok) ok = valid[k_idx] != 0.0f && k_idx <= (int)q_idx && ((int)q_idx - k_idx) <= past - int(p.reserved & 1u);\n"
+           "        if (ok) ok = ((p.reserved & 2u) ? valid[k_idx] == valid[q_idx] : valid[k_idx] != 0.0f) && k_idx <= (int)q_idx && ((int)q_idx - k_idx) <= past - int(p.reserved & 1u);\n"
            "        float prod = 0.0f;\n"
            "        if (ok) {\n"
            "            uint k_base = (uint)k_idx * p.hidden + head_base;\n"
@@ -10656,7 +10656,7 @@ static NSString *termite_metal_shader_source(void) {
            "        float prob = scores[c];\n"
            "        if (prob == 0.0f) continue;\n"
            "        int k_idx = (int)(block_start + c) - past;\n"
-           "        if (k_idx < 0 || k_idx >= (int)p.rows) continue;\n"
+           "        if (k_idx < 0 || k_idx >= (int)p.rows) continue; if ((p.reserved & 2u) ? valid[k_idx] != valid[q_idx] : valid[k_idx] == 0.0f) continue; if (k_idx > (int)q_idx || (int)q_idx - k_idx > past - int(p.reserved & 1u)) continue;\n"
            "        acc += prob * v[(uint)k_idx * p.hidden + head_base + tid];\n"
            "    }\n"
            "    output[out_base + tid] = acc;\n"
@@ -54446,18 +54446,21 @@ int termite_metal_decode_runtime_gemma4_audio_dwconv_device(
     size_t dim,
     size_t kernel_size,
     void *output_handle,
-    size_t output_offset
+    size_t output_offset,
+    void *starts_handle,
+    size_t starts_offset
 ) {
     if (runtime == NULL || input_handle == NULL || weight_handle == NULL || output_handle == NULL) return -1;
     if (rows == 0 || dim == 0 || kernel_size == 0 || rows > UINT32_MAX || dim > UINT32_MAX || kernel_size > UINT32_MAX || rows * dim > UINT32_MAX) return -3;
     const size_t elems = rows * dim;
-    const termite_metal_gemma4_audio_binding bindings[3] = {
+    const termite_metal_gemma4_audio_binding bindings[4] = {
         { (__bridge id<MTLBuffer>)input_handle, input_offset, elems * sizeof(float), false },
         { (__bridge id<MTLBuffer>)weight_handle, weight_offset, kernel_size * dim * sizeof(float), false },
         { (__bridge id<MTLBuffer>)output_handle, output_offset, elems * sizeof(float), true },
+        { (__bridge id<MTLBuffer>)(starts_handle ? starts_handle : input_handle), starts_handle ? starts_offset : input_offset, rows * sizeof(float), false },
     };
-    const termite_metal_gemma4_audio_rows_params params = { (uint32_t)rows, (uint32_t)dim, (uint32_t)kernel_size, 0 };
-    return termite_metal_decode_runtime_gemma4_audio_dispatch(runtime, runtime->gemma4_audio_dwconv_pipeline, bindings, 3, &params, sizeof(params), elems, 0, 0, __func__);
+    const termite_metal_gemma4_audio_rows_params params = { (uint32_t)rows, (uint32_t)dim, (uint32_t)kernel_size, starts_handle ? 1u : 0u };
+    return termite_metal_decode_runtime_gemma4_audio_dispatch(runtime, runtime->gemma4_audio_dwconv_pipeline, bindings, 4, &params, sizeof(params), elems, 0, 0, __func__);
 }
 
 int termite_metal_decode_runtime_gemma4_audio_flatten_device(

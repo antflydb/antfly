@@ -383,3 +383,52 @@ indexes stay portable. WebM header indexes now carry packet bindings, codec
 configuration and colour metadata so VideoToolbox and Zig replay use the same
 logical selections. Apple release artifacts declare a macOS 15 deployment target;
 framework SDK availability does not imply a hardware decoder for every stream.
+
+CUDA video decoder caches retain their own shared backend scratch lease across
+request completion. Per-request media/model permits do not cover this retained
+state. Allocation is admitted before decoder creation, and eviction/destruction
+releases both the context and shared reservations. See
+[VIDEO.md](../video/VIDEO.md#cuda-decoder-cache-accounting) for the bounded surface
+envelope and NVIDIA hardware qualification requirement. Embedding identity pins
+also distinguish CUDA BF16 execution from the existing CPU/Metal F32 recipe.
+
+CUDA mixed-content preparation now shares the existing ordered/manual-marker
+parser with the host frontend while retaining image/audio projections and
+composing text/media rows on device. BF16 text lookup/scaling occurs before media
+replacement; projected rows remain unscaled. Backend handles and execution locks
+outlive prepared tensors. Packed projection and graph caches hold separate
+retained admission, with bounded storage and synchronized ownership transitions.
+See [CUDA_TUNING.md](../../pkg/inference/CUDA_TUNING.md#embeddinggemma-2-encoder-optimization-profiles)
+for optional arithmetic profiles and qualification requirements.
+
+CUDA ordered text/image/audio groups use the prepared-wave scheduler when the
+session's `MEDIA_BATCH` qualification profile is enabled. CPU preparation overlaps
+device execution; projected rows remain resident and the ordered composer keeps
+manual placeholders, Pillow image policy and reference audio resampling intact.
+Length buckets run the BF16 backbone in batches of at most four. Queue cancellation
+continues to use live cohort members and original result indexes. The profile is
+part of the embedding identity and defaults off pending NVIDIA qualification.
+Singleton CUDA mixed requests retire preprocessing admission after composition;
+image header geometry determines the initial bounds.
+
+EmbeddingGemma2 Metal audio cohorts encode bounded groups of conformer layers
+with at most one submitted group and one encoding group. The group size is
+limited by a 384-MiB activation envelope inside the existing audio reservation;
+large inputs retain synchronous single-layer execution. Matrix views detach to
+their command frame before rotation. Cancellation drains submitted work before
+layer inputs/weights leave scope, and external frame owners keep submission
+control. Diagnostics and `ANTFLY_EMBEDDINGGEMMA2_DISABLE_PIPELINED_AUDIO=1` retain
+the per-layer wait path for comparison.
+
+CUDA audio preparation derives its sample limit from the same model config for
+singleton and mixed cohorts. Header duration bounds include media wrappers;
+unknown lengths use the full token ceiling without a PCM inspection pass.
+
+
+Audio cohort projection packing is selected by a checked 64-MiB activation
+budget, including clips beyond the former 512-row threshold. Metal and CUDA
+attention and depthwise convolution process segmented cohorts directly into the
+final output allocation. Shared row metadata resets chunk alignment and causal
+taps at each clip boundary; signed validity tags distinguish invalid rows from
+out-of-clip keys even with finite mask values. Backend declines retain isolated
+per-clip execution. Metadata stays alive until all submitted groups complete.

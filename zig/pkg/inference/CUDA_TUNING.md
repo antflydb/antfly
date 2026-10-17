@@ -4,6 +4,36 @@ Gemma 4 QAT CUDA measurements must use the shared profile in
 `scripts/gemma4/gemma4_qat_cuda_tuning.sh`. The CLI benchmark and server wrapper both
 source it so production route settings stay aligned.
 
+## EmbeddingGemma 2 CUDA image residency
+
+Pure-image groups and the direct image embedding pipeline retain resized patches,
+vision activations, projected soft tokens, and packed encoder inputs on CUDA.
+Compressed image decoding and tokenization remain on CPU; decoded RGB uploads once
+per image. CUDA performs Pillow-compatible resizing and patch extraction. Only
+final vectors download (3,072 bytes per 768-dimensional FP32 vector). Grouped
+requests truncate to the requested dimensions on CUDA; the direct pipeline
+preserves its 768-dimensional return contract.
+Mixed text/media groups retain the ordered-content frontend, including manual
+placeholders, and compose text/media rows on device. Text lookup/scaling retains
+the BF16 22.625 boundary. The ordered-content handoff no longer reads back
+intermediate embeddings; transfer telemetry still exposes diagnostic or operation
+fallbacks within the towers.
+
+CUDA image cohorts default to one image to preserve the existing BF16 arithmetic.
+`ANTFLY_INFERENCE_CUDA_EMBEDDING_GEMMA2_IMAGE_BATCH=1` enables experimental cohorts
+of up to four compatible images with bounded preparation lookahead. Attention is
+isolated per image, but larger GEMMs can change final vectors; this option is not
+qualified for exact-output workloads. Metal cohort policy is unchanged. Broker
+keys include expanded token limits, so requests with different limits cannot share
+a cohort. CUDA audio coalescing remains disabled.
+
+The optional fused vision-attention path requires a discoverable
+`libcudnn.so.9` (module minimum: cuDNN 9.13). Add its directory to
+`LD_LIBRARY_PATH` when it is not installed system-wide. Plans that decline
+retain the existing fallback. For diagnostics, set
+`ANTFLY_INFERENCE_CUDA_EMBEDDING_GEMMA2_STATS=1` and inspect
+`embedding_gemma2_cudnn_stats` for `vision_executes` and `unavailable`.
+
 ## Production Defaults
 
 The tuned profile currently uses these conservative defaults:
@@ -122,10 +152,21 @@ single-row E2B GGML-Q8_1 FFN route. Its default is `off`, and qualification is
 scoped to SM89. Likewise,
 `ANTFLY_INFERENCE_CUDA_CUBLASLT_BF16_TUNING_PROFILE=sm89-prefill` is an
 experimental SM89-only BF16 prefill profile. That typed profile is fixed at 8
-algorithm candidates, 1 warmup, 3 timed iterations, and a minimum of 128 rows;
-these are part of the profile contract rather than free tuning knobs. Its
-default is `off` so normal inference never performs synchronous first-use
-algorithm timing.
+algorithm candidates, 3 warmups, 10 timed iterations, and a minimum of 32
+rows; these are part of the profile contract rather than free tuning knobs.
+Its default is `off` so normal inference uses cuBLASLt's first admissible
+heuristic and never performs synchronous first-use algorithm timing. This is
+also the repeatable retrieval path: timed selection is owned by each model
+session and can otherwise choose numerically different algorithms for models
+with identical shapes.
+
+EmbeddingGemma 2 global text attention uses the resident SM89 BF16 flash
+kernel for its exact 512-token, four-query-head, one-KV-head, 512-dimension
+geometry. This route is independent of the optional cuDNN
+policy. Other global shapes use the generic attention kernel. Sliding text
+attention may use cuDNN for supported shapes; setting
+`ANTFLY_INFERENCE_CUDA_EMBEDDING_GEMMA2_CUDNN=0`, unavailable plans, and
+workspace-budget limits retain its existing SM89 or generic fallback.
 
 Continuous batching and request-scoped graph replay are mutually exclusive.
 Set both server controls explicitly when running the batching profile:
@@ -1097,3 +1138,172 @@ Because continuous batching remains default-off, scheduled and release CI
 use an explicit `0.40` C2 speedup floor as a correctness and catastrophic-
 regression check. The benchmark's `1.5` default remains the manual promotion
 gate before enabling batching by default.
+
+
+### EmbeddingGemma2 video embeddings
+
+Linux CUDA accepts one H.264 MP4 clip per embedding input, through `inference
+embed <model-dir> --backend cuda --video <clip.mp4>` or a `video/mp4` media part:
+
+```json
+{"model":"embeddinggemma-2","input":[{"content":[{"type":"media","mime_type":"video/mp4","data":"<base64 MP4>"}]}]}
+```
+
+The checkpoint's video processor samples at 1 FPS and uniformly caps the sampled
+sequence at 32 frames. Each frame contributes up to 140 visual tokens. Image
+wrappers surround each frame's video markers, with BOS/EOS once around the clip;
+the encoder pools this complete sequence into one normalized embedding. This
+preserves temporal order and does not average independently embedded frames.
+Expanded inputs exceeding the configured token limit fail without truncation.
+
+NVDEC surfaces, RGB8 conversion, torchvision-compatible antialiased bicubic
+resize, patch projection, frame packing, and encoder activations stay on CUDA.
+The NV12 conversion uses nearest chroma, round-to-nearest RGB8, and BT.601
+(default/unspecified) or BT.709 with the declared full/limited range. This is
+an explicit decoder policy; FFmpeg/PyAV RGB24 may use different chroma filtering
+and integer rounding. The CPU handles compressed MP4 packets, timestamps,
+resize coefficients, and token IDs. Only the final embedding vector is downloaded. Selected surfaces are
+synchronized before NVDEC unmaps them. Decoder errors discard cached surfaces;
+successful clips reuse the decoder.
+
+The supported envelope is progressive 8-bit SDR H.264 MP4, at most 60 seconds,
+256 MiB, 4096 pixels per side, and 18,000 packets. HTTP/CLI request budgets can
+be narrower. Rotation, non-square pixels, HDR, interlacing, other codecs, and
+mixed text/image/audio/video groups are rejected. The existing Gemma4 generation
+sampler and still-image preprocessing are unchanged. NVDEC's `libnvcuvid.so.1`
+is required at runtime; no FFmpeg process or runtime CUDA compiler is needed.
+
+HTTP reports corrupt or truncated clips as `400 INVALID_VIDEO`, unsupported
+backends as `400 UNSUPPORTED_VIDEO_BACKEND`, and a missing NVDEC library as
+`503 VIDEO_BACKEND_UNAVAILABLE`. With `error_policy: "per_item"`, failures retain
+their input indexes and valid sibling inputs can still complete.
+
+For HTTP serving, set `ANTFLY_INFERENCE_REQUIRED_BACKEND=cuda` so ordinary
+requests use CUDA. A CUDA-specific preload alone does not force that selection.
+Configure backend and scratch budgets for the model plus video workspace.
+
+The checked-in six-second fixture at `src/testdata/video/closed.mp4` and its
+provenance record cover decoder, sampling, cancellation, and resident preprocessing
+regressions. CUDA tests also compare RGB conversion and resized patches against the
+CPU reference. Preserve those small fixtures when changing the decoder or sampler.
+
+Both Gemma4 and EmbeddingGemma2 video projectors compact into an owned device
+allocation before releasing their accumulation buffer. CUDA row slices borrow
+their source, so returning a slice here would allow subsequent token lookup to
+overwrite projected video features. A CUDA regression test overwrites the
+accumulator and checks the returned rows remain intact.
+
+Production changes to video decoding, sampling, color conversion, or token
+packing require renewed endpoint parity and recovery checks on the target GPU.
+
+## EmbeddingGemma 2 encoder optimization profiles
+
+The checked-in artifacts use NVCC `V13.2.78`; regenerate with that compiler patch
+to preserve existing kernel code generation. New inference-only kernels are
+appended to the bundle so existing kernel numbering remains stable.
+
+The session snapshots the following optional profiles at construction. Each
+arithmetic profile (including image cohorts and graph bucket padding) has a
+distinct CUDA `model_identity`; CPU/Metal and default CUDA pins remain stable.
+Changing profiles requires reloading the model and qualifying the resulting
+vectors against the matching pinned BF16 reference. These profiles default off
+pending NVIDIA hardware qualification.
+
+| Control (`ANTFLY_INFERENCE_CUDA_EMBEDDING_GEMMA2_` prefix) | Execution |
+|---|---|
+| `EXTENDED_FLASH=1` | cuDNN global/local plans when available, otherwise bundled BF16 WMMA tiles across supported sequence lengths and SM80–SM120; masks and scalar tile tails remain explicit. Portable SM75 PTX never enters an empty WMMA body. |
+| `FUSED_VISION=1` | Fused F32 rotary/Q-scaling math directly into BF16 attention inputs, BF16 SDPA output directly into projection; one final widening at the tower boundary. Declined plans retain the existing path. |
+| `PACKED_PROJECTIONS=1` | Pack immutable Q/K/V and gate/up weights once, execute one GEMM per group and split columns. Also pack immutable PLE projections into groups bounded by 16 MiB, preserving BF16 GEMM/scale/norm boundaries. |
+| `GRAPH_REPLAY=1` | Four retained arenas keyed by batch, padded sequence and mask kind, through four items and 4096 total padded rows. Each arena has a 128-MiB ceiling and retained admission. Fresh typed inputs, masks and prefix lengths are uploaded before replay; compact results are read afterward. |
+| `IMAGE_BATCH=1` | Existing image cohort opt-in also permits up to four staged video pictures. cuDNN vision plans carry the full batch dimension. |
+| `NATIVE_VISION=1` | Native batched head-64 tensor-core attention with BF16 inputs/output and online softmax. Fused rotary packing feeds attention and projection without whole-tensor F32 bridges. No score/probability arenas or cuDNN dependency. The typed BF16 implementation carries a new native-vision identity version. |
+| `MEDIA_BATCH=1` | Up to four ordered text/image/audio groups share preparation waves and length-bucketed BF16 backbone calls. CUDA Pillow resize, reference audio resampling and manual placeholder ordering remain explicit. |
+| `FUSED_BACKBONE=1` | Fuse post-attention norm/residual/pre-FFN norm, post-FFN norm/residual, PLE scale/norm, and PLE norm/residual/scalar. Explicit BF16 conversions preserve intermediate boundaries; six launches per encoder layer are removed. |
+
+Packed weights retain up to 512 MiB, and each of the four graph arenas has a
+128 MiB ceiling. Every retained allocation holds both physical context accounting
+and shared backend scratch admission until synchronized eviction or teardown.
+Admission-policy changes evict these buffers before switching controllers.
+Video and mixed-input requests reclaim optional caches once on admission denial.
+Failed admission declines packing/capture before queueing work. Model unload
+releases graphs before their backing storage and weights.
+
+Graph keys distinguish sequence buckets and unmasked, prefix-masked and arbitrary
+mask layouts. A changed attention workspace pointer or packed-weight generation
+invalidates replay. Cancellation is checked before submission and after completed
+readback; captured driver execution follows the existing supervised CUDA
+interruption contract. Capture failure cannot return stale output.
+
+The comparison harness records CUDA controls and observed route counters. Use
+`--require-route extended_flash`, `--require-route fused_vision`,
+`--require-route packed_projections`, `--require-route graph_replay`,
+`--require-route native_vision` or `--require-route media_batch` to reject a
+qualification run where the requested optimization never executed. A workload
+must exercise the route: e.g. short repeated queries for replay, media for vision,
+and medium/long sequences for extended flash. `--require-route batched_vision`
+requires actual multi-image/frame execution, not just an enabled environment flag.
+
+NVIDIA qualification must run the native attention partial-tile/batch differential tests, mixed-cohort versus
+singleton vectors and cancellation/retry, GPU split/rotary differential tests, ordered
+resident composition versus legacy BF16 boundaries (with checkpoint/media oracle
+environment paths), masked
+local/global tile-tail tests, fresh-input graph replay test, pretrained matched
+BF16 comparison, and completed-device performance/memory measurements before
+promoting any profile. Compilation and portable policy tests do not establish a
+GPU speedup or numerical parity.
+
+CUDA resize preparation retains four immutable geometry/pixel-policy plans within
+an 8 MiB coefficient ceiling. Two pinned source slots (at most 64 MiB each) wait
+only for their own H2D completion events before reuse. A cache hit builds/uploads
+no coefficients and imposes no resize completion barrier. Retained coefficient
+host/device storage and pinned sources hold shared admission leases separately
+from request peaks. Geometry eviction and teardown drain readers; admission or
+pinned-memory declines retain the synchronous uncached path. Resize hit/miss and
+transfer counters expose actual reuse.
+
+Ordered CUDA admission inspects image headers before decode, bounds text lengths
+and retained media rows, and reserves the maximum of tower and encoder peaks.
+Once preparation completes, singleton mixed/video requests retain only the actual
+sequence, host metadata and encoder workspace. Prepared cohort execution keeps
+future preparation and projected peers admitted; it does not release their peak
+while a subsequent producer wave may still need it. The final ready wave drops
+completed preparation reservations before acquiring its encoder supplement.
+
+The native BF16 vision kernel retains the existing tiled online-softmax reduction
+and BF16 output rounding. Qualification includes bitwise comparison against the
+previous F32-boundary native kernel for batched and partial-tile inputs.
+`FUSED_BACKBONE` has a distinct identity bit and an observed
+`--require-route fused_backbone` gate. Run the GPU fused-versus-unfused boundary
+test and pinned pretrained vectors/rankings before enabling it in production.
+
+CUDA singleton and cohort audio use the same model sample ceiling, reference
+resampler and expanded-token limit. WAV/FLAC duration headers bound admission
+without decoding PCM; unknown durations retain the full model token envelope.
+Decoded samples, packed features and final encoder phases remain separately
+bounded. A preparation-wave memory decline falls back through the existing
+singleton route instead of imposing a different duration limit.
+
+
+Packed-projection and graph-replay identities are versioned for grouped PLE and
+cohort graphs. Packed PLE columns feed strided fused scale/RMS directly without
+a per-layer slice allocation or copy kernel. Grouped PLE changes GEMM output geometry and requires pretrained
+vector/ranking qualification; `--require-route packed_ple` requires observed
+execution. The extended-attention identity also versions 64-row tail padding on
+all architectures carrying a bundled BF16 WMMA image. Defaults retain the existing
+qualified architecture restrictions. The CUDA attention differential test covers
+1/2/4-item batches, dense/prefix/holey masks, partial tiles and contexts through
+8192; it records synchronized exact/flash wall times. These are qualification
+measurements, not a replacement for warmed full-pipeline benchmarks.
+
+CUDA ordered-media composition uses BF16 row storage. Hard lookup rounds once;
+F32 projected media converts during row insertion, and cohorts pack directly into
+zero-padded BF16 storage. The encoder accepts either resident F32 or BF16 input,
+so existing video producers remain compatible without a padded F32 staging arena.
+
+Audio QKV packing uses a checked 64-MiB output envelope instead of a 512-row
+cutoff. CUDA named audio packing follows `PACKED_PROJECTIONS`, retains F32 outputs
+through the existing linear dispatch and shares the packed-weight admission cap. Segmented audio attention carries signed clip-start tags alongside the
+ordinary validity mask; convolution shares per-row starts. One kernel writes the
+whole cohort, with no per-clip output assembly. Invalid rows and finite mask
+probabilities preserve isolated-clip semantics. Backends that decline segmented
+execution retain the existing per-clip fallback.

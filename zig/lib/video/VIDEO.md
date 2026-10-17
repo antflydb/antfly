@@ -526,3 +526,64 @@ failure retains bounded preparation; cache reclamation cannot invalidate active
 CPU borrowers or Metal commands. These mechanisms establish reuse and bounded
 lifetimes; speed comparisons require the pinned per-case performance gate in
 [the model guide](../../../docs/guides/embeddinggemma2.md#per-case-performance-gate).
+
+### CUDA decoder cache accounting
+
+Each cached NVDEC decoder owns its admission lease independently of the request
+that created it. Sequence negotiation reserves both the context's physical device
+budget and shared backend scratch admission before driver allocation. Compatible
+clips reuse the same reservation; resize, failed creation, error cleanup, eviction
+and context teardown release it after decoder destruction. Changing admission
+controllers first evicts the old decoder under the session execution lock. Video
+requests denied admission evict their idle decoder and retry admission once.
+
+NVDEC does not report an exact allocation size. The policy reserves 64 MiB of
+opaque driver headroom plus twice the aligned NV12 payload for decode surfaces,
+one mapped output and one working surface. Width is aligned to 256 bytes and
+height to 32 rows, with at most 4096 by 4096 pixels and 32 decode surfaces. This
+is a conservative policy envelope, not measured driver memory. NVIDIA hardware
+qualification must check that envelope against completed-driver memory deltas.
+See NVIDIA's [NVDEC programming guide](https://docs.nvidia.com/video-technologies/video-codec-sdk/13.1/nvdec-video-decoder-api-prog-guide/index.html)
+for decode/output surface allocation behavior.
+
+### CUDA staged frame cohorts
+
+The EmbeddingGemma 2 NVDEC consumer converts each selected coded picture to owned
+RGB storage and records a CUDA event before resize/projection. Surface unmapping
+waits for that event, so subsequent vision work does not hold the decoder surface
+and CPU/NVDEC decoding can overlap queued vision execution. Consumer failures
+still drain all queued reads before unmapping.
+
+Repeated model samples of one coded picture share staging and vision projection;
+the projected token rows and timestamps are repeated in their original logical
+order. The default singleton route transfers its hidden tensor directly into the
+tower. The image-batch qualification profile permits bounded cohorts of four
+compatible pictures, flushes geometry changes and the final partial cohort, and
+preserves the 32-frame/model-token limits. Cleanup drains failed work and owns all
+partial staging slots. Batched cuDNN plans preserve independent attention per
+picture. Profile identity and NVIDIA qualification are documented in
+[CUDA_TUNING.md](../../pkg/inference/CUDA_TUNING.md#embeddinggemma-2-encoder-optimization-profiles).
+
+The CUDA EmbeddingGemma2 resize path caches coefficient plans by source/target
+geometry and pixel preparation policy. Model-owned plans and pinned copy staging
+remove success-path per-picture stream drains; source slots wait for H2D events,
+while NVDEC surface release retains its separate RGB-conversion fence. Retention
+is bounded and shared-admitted, with a synchronous uncached fallback on pressure.
+The `NATIVE_VISION` qualification profile runs batched native online-softmax
+attention without score/probability arenas or cuDNN. Video admission drops the
+completed media peak before the BF16 backbone, using the actual expanded length.
+These changes do not establish NVIDIA speedups without completed-device timings.
+
+The native CUDA vision tower now keeps attention inputs/output in BF16. Rotary
+packing preserves the existing F32 arithmetic and conversion boundary, while the
+native head-64 kernel stores BF16 output directly for projection. This removes
+per-layer whole-tensor F32 bridges without changing the tiled attention reduction.
+The opt-in native-vision identity is versioned for the typed BF16 implementation.
+
+
+CUDA media cohorts pack composed BF16 rows directly for the text backbone.
+Resident F32 video producers remain accepted and convert directly into the final
+BF16 encoder arena, including zero padding. Optional graph replay supports up to
+four items and 4096 padded rows, with shape-specific addresses, bounded retained
+admission and synchronized eviction. Grouped immutable PLE projections use a
+16-MiB output budget rather than retaining all 24 layers for long contexts.

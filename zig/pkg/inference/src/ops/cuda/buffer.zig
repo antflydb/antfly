@@ -75,6 +75,9 @@ pub const DeviceBuffer = struct {
         var ptr: driver_mod.CUdeviceptr = 0;
         const result = ctx.driver.fns.cuMemAlloc(&ptr, len);
         if (result != driver_mod.CUDA_SUCCESS) {
+            // Physical exhaustion (including other resident GPU runtimes)
+            // follows the same bounded retry path as our allocation quota.
+            if (result == driver_mod.CUDA_ERROR_OUT_OF_MEMORY) return error.CudaMemoryLimitExceeded;
             std.log.err("CUDA cuMemAlloc failed: bytes={d} error={s} ({s})", .{ len, ctx.driver.errorName(result), ctx.driver.errorString(result) });
             return error.CudaDriverError;
         }
@@ -131,3 +134,37 @@ pub const DeviceBuffer = struct {
         }
     }
 };
+
+test "CUDA physical OOM releases its reservation and permits a later allocation" {
+    const Mock = struct {
+        var oom: bool = true;
+
+        fn setCurrent(_: driver_mod.CUcontext) callconv(.c) driver_mod.CUresult {
+            return driver_mod.CUDA_SUCCESS;
+        }
+
+        fn alloc(ptr: *driver_mod.CUdeviceptr, _: usize) callconv(.c) driver_mod.CUresult {
+            if (oom) return driver_mod.CUDA_ERROR_OUT_OF_MEMORY;
+            ptr.* = 1;
+            return driver_mod.CUDA_SUCCESS;
+        }
+
+        fn free(_: driver_mod.CUdeviceptr) callconv(.c) driver_mod.CUresult {
+            return driver_mod.CUDA_SUCCESS;
+        }
+    };
+    var ctx: context_mod.CudaContext = undefined;
+    ctx.ctx = @ptrFromInt(1);
+    ctx.device_allocations = .{ .limit = 32 };
+    ctx.driver.fns.cuCtxSetCurrent = Mock.setCurrent;
+    ctx.driver.fns.cuMemAlloc = Mock.alloc;
+    ctx.driver.fns.cuMemFree = Mock.free;
+    Mock.oom = true;
+    try std.testing.expectError(error.CudaMemoryLimitExceeded, DeviceBuffer.alloc(&ctx, 16));
+    try std.testing.expectEqual(@as(usize, 0), ctx.device_allocations.snapshot().live);
+    Mock.oom = false;
+    var buffer = try DeviceBuffer.alloc(&ctx, 16);
+    try std.testing.expectEqual(@as(usize, 16), ctx.device_allocations.snapshot().live);
+    buffer.free(&ctx);
+    try std.testing.expectEqual(@as(usize, 0), ctx.device_allocations.snapshot().live);
+}

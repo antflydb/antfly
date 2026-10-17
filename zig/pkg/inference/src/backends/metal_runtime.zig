@@ -10386,11 +10386,12 @@ pub fn decoderRuntimeGemma4AudioGlu(self: anytype, input: MetalTensor, rows: usi
     return finishDeviceOutput(&output_device, rc);
 }
 
-pub fn decoderRuntimeGemma4AudioDepthwiseConv(self: anytype, input: MetalTensor, weight: MetalTensor, rows: usize, dim: usize, kernel_size: usize) !?MetalTensor {
+pub fn decoderRuntimeGemma4AudioDepthwiseConv(self: anytype, input: MetalTensor, weight: MetalTensor, rows: usize, dim: usize, kernel_size: usize, starts: ?MetalTensor) !?MetalTensor {
     const runtime = self.raw_decode_runtime orelse return null;
     if (termite_metal_decode_runtime_ready(runtime) == 0) return null;
     if (!input.isDevice() or !weight.isDevice() or rows == 0 or dim == 0 or kernel_size == 0) return null;
     if (input.elemCount() != rows * dim or weight.elemCount() != kernel_size * dim) return null;
+    if (starts) |metadata| if (!metadata.isDevice() or metadata.elemCount() != rows) return null;
     const shape = [_]i32{ @intCast(rows), @intCast(dim) };
     var output_device = try MetalTensor.deviceAllocate(runtime, rows * dim * @sizeOf(f32), .private, &shape);
     errdefer output_device.deinit();
@@ -10405,6 +10406,8 @@ pub fn decoderRuntimeGemma4AudioDepthwiseConv(self: anytype, input: MetalTensor,
         kernel_size,
         output_device.deviceHandle(),
         output_device.deviceByteOffset(),
+        if (starts) |metadata| metadata.deviceHandle() else null,
+        if (starts) |metadata| metadata.deviceByteOffset() else 0,
     );
     return finishDeviceOutput(&output_device, rc);
 }
@@ -23129,6 +23132,8 @@ pub extern fn termite_metal_decode_runtime_gemma4_audio_dwconv_device(
     kernel_size: usize,
     output_handle: ?*anyopaque,
     output_offset: usize,
+    starts_handle: ?*anyopaque,
+    starts_offset: usize,
 ) c_int;
 pub extern fn termite_metal_decode_runtime_gemma4_audio_flatten_device(
     runtime: ?*RawMetalDecodeRuntime,
@@ -34595,7 +34600,7 @@ test "metal gemma4 audio encoder kernels match the host references" {
         defer input.deinit();
         var w = try testDeviceTensorFromSlice(runtime, weight, &[_]i32{ @intCast(kernel_size), @intCast(hidden) });
         defer w.deinit();
-        var conv = (try decoderRuntimeGemma4AudioDepthwiseConv(&provider, input, w, rows, hidden, kernel_size)) orelse return error.UnexpectedNull;
+        var conv = (try decoderRuntimeGemma4AudioDepthwiseConv(&provider, input, w, rows, hidden, kernel_size, null)) orelse return error.UnexpectedNull;
         defer conv.deinit();
         const host = try tensorHostSlice(&conv);
         for (0..rows) |t| {

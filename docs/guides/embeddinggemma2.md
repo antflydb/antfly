@@ -1,10 +1,14 @@
 # EmbeddingGemma 2 embeddings and similarity decisions
 
 Antfly runs the open Hugging Face `google/embeddinggemma-2` safetensors checkpoint
-on native CPU and Metal. Text, images, audio, video and ordered combinations share the
-same embedding space. Video accepts qualified MP4/MOV through ordered groups.
-CUDA, ONNX, PJRT and WebGPU are excluded from this implementation. The original EmbeddingGemma, GLiNER, Laya and Jev routes retain
-their existing contracts.
+on native CPU, Metal and CUDA. Text, images, audio, video and ordered combinations
+share the model embedding space. CPU/Metal retain the qualified media and
+chunking paths described below. CUDA requires an Ampere or newer GPU and uses
+BF16 inference; its video route requires Linux NVDEC and a standalone progressive
+SDR H.264 MP4 clip of at most 60 seconds and 256 MiB. CUDA video does not accept
+mixed content, titles or explicit sampling policies. ONNX, PJRT and WebGPU are
+excluded. The original EmbeddingGemma, GLiNER, Laya and Jev routes retain their
+existing contracts.
 
 ## Checkpoint and numerical contract
 
@@ -23,16 +27,19 @@ A managed registry reference is
 
 The runtime validates the text, vision and audio geometry and weight shapes,
 tokenizer BOS/EOS and media tokens, and the pinned image/audio/video processor. It
-accepts BF16 or F32 weights, converts BF16 values exactly to F32, and uses F32
-activations and accumulation on both supported backends. Quantized and implicit
-F16 execution are rejected for this family.
+accepts BF16 or F32 weights. Native CPU and Metal convert BF16 values exactly to
+F32 and use F32 activations and accumulation. CUDA uses its model-specific BF16
+encoder contract. Quantized and implicit F16 execution are rejected for this
+family. CPU/Metal F32 qualification results below do not establish CUDA parity.
 
 The text encoder is bidirectional, including its alternating global and sliding
 attention. Mean pooling includes every active token: BOS, EOS, task prefixes and
 expanded media tokens. Padding is excluded. The result is L2 normalized. Reduced
 sizes 512, 256 and 128 truncate the 768-vector and then normalize again. The
 8192-token limit includes all expanded media tokens and wrappers; overflow fails
-instead of silently truncating input. Audio is limited to 30 seconds per part.
+instead of silently truncating input. Native CPU/Metal audio parts are limited to 30 seconds. CUDA singleton and
+cohort audio share the model sample ceiling and the expanded 8192-token limit,
+subject to the admitted decode and preparation memory budgets.
 
 Task types are `RETRIEVAL_DOCUMENT` (default), `RETRIEVAL_QUERY`,
 `QUESTION_ANSWERING`, `FACT_VERIFICATION`, `CODE_RETRIEVAL_QUERY`,
@@ -93,11 +100,16 @@ The native endpoint allows up to 64 groups, with 1–64 parts each. Existing exe
 aggregate media budgets can impose lower limits. `error_policy: "per_item"`
 returns valid groups with their original indexes and errors for invalid groups.
 
-The embedding response includes `model_identity`, a backend-independent SHA256
-identity for the exact config, weights, tokenizer, processor, SentenceTransformers
-sidecars and `embeddinggemma2-f32-mean-v1` recipe. Supply that value as request
+The embedding response includes `model_identity`, a SHA256 identity for the exact
+config, weights, tokenizer, processor, SentenceTransformers sidecars and execution
+recipe. CPU and Metal preserve the existing
+`embeddinggemma2-f32-mean-v6-webm-presentation` identity. CUDA derives a separate
+identity from that artifact identity and `embeddinggemma2-cuda-bf16-mean-v1`.
+A pinned F32 identity therefore rejects CUDA BF16 execution, including backend
+fallbacks that cross precision recipes. Supply the returned value as request
 `model_identity` to reject a mismatched generation before encoding. Loaded
-artifacts are checked for changes before and after execution.
+artifacts are checked for changes before and after execution. Identity separation
+is not evidence of numerical parity; CUDA still requires hardware qualification.
 
 The linked provider exposes `embedDenseGroupsDirectWithControl` and uses the same
 validation, media policy, model pinning and admission. CLI examples:
@@ -1065,3 +1077,58 @@ Native CPU, Metal and actually executed Linux ARM64 preserve all rankings and
 top-k sets, with maximum coordinate error below `1e-6`. This includes two
 attributed real VP9/AV1 clips. WebM duration comes from the declared Segment
 Duration when present, preserving pinned FPS sampling at rounded PTS boundaries.
+
+### CUDA BF16 qualification
+
+Use `zig/pkg/inference/scripts/embeddinggemma2/compare.py` with the same pinned
+checkpoint and prepared suite for both runs. `--backend torch-cuda` loads BF16
+weights/activations, casts floating media inputs to BF16 and pools/normalizes in
+F32. `--backend cuda --binary <cuda-binary>` runs the native HTTP pipeline and
+requires CUDA rather than allowing fallback. Both reports declare `bfloat16`;
+CPU/Metal reports remain `float32`, and comparisons reject precision mismatches.
+For example, from `zig/pkg/inference` in the pinned reference environment:
+
+```sh
+python scripts/embeddinggemma2/compare.py --backend torch-cuda \
+  --model-dir "$MODEL" --suite "$SUITE" --output torch-cuda.json
+python scripts/embeddinggemma2/compare.py --backend cuda --binary "$BINARY" \
+  --model-dir "$MODEL" --suite "$SUITE" --reference torch-cuda.json --output cuda.json
+```
+
+The CUDA reference synchronizes completed device work and records device/runtime,
+allocated/reserved memory and their peaks. HTTP timing includes serialization and
+preprocessing, so compare its scope with the reference's preprocessing-inclusive
+measurement rather than treating encoder time as end-to-end time. The existing
+strict vector, ranking and routing gates remain in force. CUDA encoder-only
+benchmark mode is rejected until its measurement contract is implemented.
+Reports remain `production_qualified: false`; executing this harness on NVIDIA
+hardware and retaining its matched results is required before asserting parity.
+
+Optional CUDA attention, projection, vision and graph profiles carry distinct
+identity pins and remain subject to matched BF16 qualification. See the repository
+`zig/pkg/inference/CUDA_TUNING.md` for profile controls, retained memory limits and
+route-evidence gates. Mixed CUDA inputs compose their ordered text/media rows on
+device; repeated video samples reuse projection while preserving logical slots.
+
+CUDA additionally offers `ANTFLY_INFERENCE_CUDA_EMBEDDING_GEMMA2_NATIVE_VISION=1`
+for native batched tiled vision attention and
+`ANTFLY_INFERENCE_CUDA_EMBEDDING_GEMMA2_MEDIA_BATCH=1` for ordered mixed-media/audio
+cohorts with preparation overlap and batched BF16 backbone execution. Both are
+session-frozen, change `model_identity`, and remain opt-in until NVIDIA vector,
+ranking and performance qualification. The comparison harness can require observed
+execution with `--require-route native_vision` and `--require-route media_batch`.
+
+`ANTFLY_INFERENCE_CUDA_EMBEDDING_GEMMA2_FUSED_BACKBONE=1` enables fused
+normalization/residual/scaling kernels with explicit BF16 rounding boundaries.
+It changes `model_identity` and remains opt-in pending NVIDIA qualification.
+The BF16 native vision implementation also versions its existing opt-in identity;
+reload and qualify models before using the resulting pin.
+
+
+CUDA `PACKED_PROJECTIONS`, `GRAPH_REPLAY` and `EXTENDED_FLASH` opt-in profiles
+carry updated identities for bounded grouped PLE, cohort replay and portable
+WMMA tail padding. Reload and qualify the new pins before use. Graph replay is
+bounded to four items, 4096 padded rows and four 128-MiB arenas; grouped PLE uses
+at most 16 MiB of output scratch. BF16 composition avoids F32 widening for hard
+tokens and batched input storage. These implementation changes do not establish
+NVIDIA speedups without hardware measurements.
