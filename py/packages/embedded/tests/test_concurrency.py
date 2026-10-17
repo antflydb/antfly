@@ -596,3 +596,26 @@ with antfly_embedded.open(sys.argv[1], no_sync=True, busy_timeout=10.0) as db:
                 if worker.poll() is None:
                     worker.terminate()
                     worker.wait(timeout=5)
+
+
+def test_sql_sessions_own_native_arrays_and_numeric_pages_across_reopen(tmp_path: Path) -> None:
+    from contextlib import closing
+    from decimal import Decimal
+
+    path = tmp_path / "native-transactions.aflite"
+    with antfly_embedded.create(path, no_sync=True, busy_timeout=5.0) as first:
+        with antfly_embedded.open(path, no_sync=True, busy_timeout=5.0) as second:
+            first.sql("CREATE TABLE items (id BIGINT PRIMARY KEY,n NUMERIC,tags TEXT[])")
+            with closing(first.sql_session()) as session:
+                session.execute("BEGIN")
+                session.execute("INSERT INTO items (id,n,tags) VALUES (1,CAST('1.25' AS NUMERIC),ARRAY['pending'])")
+                second.sql("INSERT INTO items (id,n,tags) VALUES (2,CAST('2.5' AS NUMERIC),ARRAY['committed'])")
+                rows = session.execute("SELECT id,n,tags FROM items ORDER BY id")["rows"]
+                assert [(row[0], Decimal(row[1]), row[2]["values"]) for row in rows] == [
+                    ("1", Decimal("1.25"), ["pending"]),
+                    ("2", Decimal("2.5"), ["committed"]),
+                ]
+                assert session.execute("SELECT id FROM items WHERE n>CAST('2' AS NUMERIC)")["rows"] == [["2"]]
+                assert session.execute("SELECT id FROM items WHERE tags=ARRAY['pending']")["rows"] == [["1"]]
+                session.execute("COMMIT")
+                assert len(second.sql("SELECT id,n,tags FROM items")["rows"]) == 2

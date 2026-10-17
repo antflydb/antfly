@@ -66,12 +66,16 @@ const Overlay = struct {
         errdefer arena.deinit();
         const a = arena.allocator();
         var rows: std.ArrayList(catalog.Row) = .empty;
+        var layout: ?catalog.Row.TypedLayout = null;
         while (rows.items.len < limit) {
             const native = try self.peek();
             const staged: ?catalog.Row = if (self.staged_index < self.staged.len) self.staged[self.staged_index] else null;
             const use_staged = if (staged) |row| native == null or std.mem.lessThan(u8, row.id, native.?.id) else false;
             const row = if (use_staged) staged.? else native orelse break;
-            try rows.append(a, try cloneRow(a, row));
+            if (row.typed_cells) |cells| if (layout == null) {
+                layout = try cells.layout.clone(a);
+            };
+            try rows.append(a, try row.cloneWithLayout(a, layout));
             if (use_staged) self.staged_index += 1 else self.native_index += 1;
         }
         const more = (try self.peek()) != null or self.staged_index < self.staged.len;
@@ -86,16 +90,8 @@ const Overlay = struct {
         self.alloc.destroy(self);
     }
 };
-fn cloneJson(a: std.mem.Allocator, value: Json) !Json {
-    return std.json.parseFromSliceLeaky(Json, a, try std.json.Stringify.valueAlloc(a, value, .{}), .{ .parse_numbers = false });
-}
 fn cloneRow(a: std.mem.Allocator, row: catalog.Row) !catalog.Row {
-    var result = row;
-    result.id = try a.dupe(u8, row.id);
-    result.value = try cloneJson(a, row.value);
-    result.sql_nulls = if (row.sql_nulls) |nulls| try a.dupe(bool, nulls) else null;
-    result.document = if (row.document) |document| try cloneJson(a, document) else null;
-    return result;
+    return row.cloneOwned(a);
 }
 fn matches(row: catalog.Row, conditions: []const catalog.Condition) !bool {
     for (conditions) |condition| {
@@ -108,8 +104,9 @@ fn matches(row: catalog.Row, conditions: []const catalog.Condition) !bool {
             if (cell.sql_null) return false;
             continue;
         }
-        if (cell.sql_null or condition.value == .null) return false;
-        const order = try d.sql_scalar.compare(cell.value, condition.value);
+        const operand = condition.datum();
+        if (cell.sql_null or operand.sql_null) return false;
+        const order = try d.sql_scalar.compareDatums(cell, operand);
         if (!switch (condition.op) {
             .eq => order == .eq,
             .neq => order != .eq,
@@ -131,6 +128,21 @@ pub fn open(alloc: std.mem.Allocator, native: catalog.Cursor, session: *Session,
         self.native_arena.deinit();
     }
     const a = self.arena.allocator();
+    // Normalize only projected and predicate cells; untouched wide arrays
+    // remain in the postimage envelope. Native and staged rows then share
+    // exact NUMERIC, array and SQL/JSON-null comparison semantics.
+    var names: std.ArrayList([]const u8) = .empty;
+    try names.appendSlice(a, request.fields);
+    for (request.conditions) |condition| try names.append(a, condition.column);
+    const full_projection = try d.sql_document_row.Projection.init(a, table, names.items);
+    const full_layout = try full_projection.pageLayout(a);
+    const selected_projection = try d.sql_document_row.Projection.init(a, table, request.fields);
+    const selected_layout = try selected_projection.pageLayout(a);
+    const conditions = try a.dupe(catalog.Condition, request.conditions);
+    for (conditions) |*condition| {
+        if (condition.op == .is_null or condition.op == .is_not_null or condition.datum().sql_null) continue;
+        condition.operand = try d.sql_document_row.declaredCell(a, try table.column(condition.column), condition.datum());
+    }
     const entries = try session.merged(a);
     var rows: std.ArrayList(catalog.Row) = .empty;
     for (entries) |entry| {
@@ -144,8 +156,8 @@ pub fn open(alloc: std.mem.Allocator, native: catalog.Cursor, session: *Session,
         const bytes = entry.encoded_row orelse continue;
         const value = try std.json.parseFromSliceLeaky(Json, a, bytes, .{ .parse_numbers = false, .allocate = .alloc_always });
         var object: std.json.ObjectMap = .empty;
-        const nulls = try a.alloc(bool, table.columns.len);
-        for (table.columns, nulls) |column, *sql_null| {
+        const nulls = try a.alloc(bool, full_projection.columns.len);
+        for (full_projection.columns, nulls) |column, *sql_null| {
             const raw = value.object.get(column.path) orelse .null;
             const json_null = if (table.storage_mode == .document) column.type == .json and value.object.contains(column.path) else for (mutation.json_null_fields) |field| {
                 if (std.mem.eql(u8, field, column.path)) break true;
@@ -153,8 +165,14 @@ pub fn open(alloc: std.mem.Allocator, native: catalog.Cursor, session: *Session,
             sql_null.* = raw == .null and !json_null;
             try object.put(a, column.path, raw);
         }
-        const row: catalog.Row = .{ .id = mutation.key, .value = .{ .object = object }, .version = mutation.expected_version, .sql_nulls = nulls, .expected_content_digest = mutation.expected_content_digest, .document = if (request.include_document) value else null };
-        if (!try matches(row, request.conditions)) continue;
+        const row = try full_projection.adaptBorrowed(a, full_layout, .{ .id = mutation.key, .value = .{ .object = object }, .version = mutation.expected_version, .sql_nulls = nulls, .expected_content_digest = mutation.expected_content_digest, .document = if (request.include_document) value else null });
+        if (!try matches(row, conditions)) continue;
+        if (selected_projection.has_typed_cells) {
+            var projected = try selected_projection.adaptBorrowed(a, selected_layout, row);
+            projected.id = try a.dupe(u8, projected.id);
+            try rows.append(a, projected);
+            continue;
+        }
         var projected: std.json.ObjectMap = .empty;
         const projected_nulls = try a.alloc(bool, request.fields.len);
         for (request.fields, projected_nulls) |field, *sql_null| {
