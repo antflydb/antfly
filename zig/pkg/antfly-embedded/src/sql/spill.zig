@@ -557,6 +557,53 @@ const Encoder = struct {
             try self.word(id);
         } else try self.json(value.value, 0);
     }
+    /// Frozen recursive JSON encoding directly from an admitted canonical
+    /// token stream. Counts are patched after emission; no DOM is staged.
+    fn jsonBytes(self: *Encoder, bytes: []const u8) !void {
+        var scanner = std.json.Scanner.initCompleteInput(self.scratch orelse self.a, bytes);
+        defer scanner.deinit();
+        try self.jsonTokens(&scanner, 0);
+        if (try scanner.next() != .end_of_document) return error.InvalidSqlSpill;
+    }
+    fn jsonTokens(self: *Encoder, scanner: *std.json.Scanner, depth: usize) anyerror!void {
+        if (depth > 64) return error.SqlProgramLimitExceeded;
+        const a = self.scratch orelse self.a;
+        const token = try scanner.nextAllocMax(a, .alloc_if_needed, scanner.input.len);
+        defer switch (token) {
+            .allocated_string, .allocated_number => |payload| a.free(payload),
+            else => {},
+        };
+        switch (token) {
+            .object_begin, .array_begin => {
+                const object = token == .object_begin;
+                try self.append(&.{if (object) 7 else 6});
+                const prefix = self.bytes.items.len;
+                try self.word(0);
+                var count: u64 = 0;
+                const close: std.json.TokenType = if (object) .object_end else .array_end;
+                while (try scanner.peekNextTokenType() != close) {
+                    if (object) {
+                        const key = try scanner.nextAllocMax(a, .alloc_if_needed, scanner.input.len);
+                        defer if (key == .allocated_string) a.free(key.allocated_string);
+                        try self.text(switch (key) {
+                            .string, .allocated_string => |payload| payload,
+                            else => return error.InvalidSqlSpill,
+                        });
+                    }
+                    try self.jsonTokens(scanner, depth + 1);
+                    count += 1;
+                }
+                _ = try scanner.next();
+                std.mem.writeInt(u64, self.bytes.items[prefix..][0..8], count, .little);
+            },
+            .string, .allocated_string => |payload| try self.json(.{ .string = payload }, depth),
+            .number, .allocated_number => |payload| try self.json(.{ .number_string = payload }, depth),
+            .true => try self.json(.{ .bool = true }, depth),
+            .false => try self.json(.{ .bool = false }, depth),
+            .null => try self.json(.null, depth),
+            else => return error.InvalidSqlSpill,
+        }
+    }
     fn json(self: *Encoder, value: std.json.Value, depth: usize) anyerror!void {
         if (depth > 64) return error.SqlProgramLimitExceeded;
         switch (value) {
@@ -955,6 +1002,25 @@ pub const Sequential = struct {
         for (0..batch.width()) |column| {
             if (!column_scratch.reset(.{ .retain_with_limit = 256 * 1024 })) return error.OutOfMemory;
             const column_alloc = column_scratch.allocator();
+            var encoded: [256]?[]const u8 = undefined;
+            var has_encoded = false;
+            for (begin..end, 0..) |index, lane| {
+                encoded[lane] = try batch.encodedJson(index, column);
+                has_encoded = has_encoded or encoded[lane] != null;
+            }
+            if (has_encoded) {
+                // An encoded object/array forces the same mixed-cell framing
+                // as the parsed codec; scalar/SQL-null lanes remain unchanged.
+                try encoder.append(&.{255});
+                for (begin..end, 0..) |index, lane| {
+                    if (encoded[lane]) |json| {
+                        try encoder.word(1);
+                        try encoder.append(&.{0});
+                        try encoder.jsonBytes(json);
+                    } else try encoder.cells(&.{try batch.cell(column_alloc, index, column)});
+                }
+                continue;
+            }
             const dictionary = try selected.dictionaryColumn(column_alloc, column);
             if (dictionary) |physical| if (physical != .dictionary or physical.len() != end - begin) return error.InvalidSqlSpill;
             defer if (dictionary) |physical| if (selected != .dictionary) {
@@ -4128,6 +4194,73 @@ test "SQL column batch direct append preserves frozen prefixes quotas and alloca
                 try std.testing.expectError(error.SqlProgramLimitExceeded, appendColumnarBatchVersion(a, aa, &output, batch, &.{ 9, 10 }, 0, version));
                 try std.testing.expectEqual(before, output.items.len);
             }
+        }
+    };
+    try Fixture.run(std.testing.allocator);
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Fixture.run, .{});
+}
+
+test "SQL encoded JSON batch passthrough preserves frozen versions mappings and scalar fallbacks" {
+    const Fixture = struct {
+        fn run(backing: Allocator) !void {
+            var arena = std.heap.ArenaAllocator.init(backing);
+            defer arena.deinit();
+            const a = arena.allocator();
+            const View = struct {
+                reads: usize = 0,
+                fn json(_: *anyopaque, row: usize, _: usize) !?[]const u8 {
+                    return switch (row) {
+                        0 => "{\"x\":[9007199254740993,1e-3,true,null],\"s\":\"é\\n\"}",
+                        1 => "[1,{\"a\":false}]",
+                        else => null,
+                    };
+                }
+                fn cell(raw: *anyopaque, alloc: Allocator, row: usize, column: usize) !Datum {
+                    const self: *@This() = @ptrCast(@alignCast(raw));
+                    self.reads += 1;
+                    if (try json(raw, row, column)) |bytes| return Datum.json(try std.json.parseFromSliceLeaky(std.json.Value, alloc, bytes, .{ .parse_numbers = false }));
+                    return if (row == 2) Datum{} else Datum.json(.null);
+                }
+            };
+            var view: View = .{};
+            const source: @import("execution_batch.zig").Batch = .{ .reader = .{ .ptr = &view, .read = View.cell, .read_json = View.json, .width = 1, .count = 4 } };
+            const wrapped: @import("execution_batch.zig").Batch = .{ .columns = .{ .definitions = &.{.{ .name = "j", .type = .json }}, .page = .{ .native = .{ .values = &source, .names = &.{"j"} }, .selection = &.{ 1, 0, 1, 3, 2 } } } };
+            const mapped: @import("execution_batch.zig").Batch = .{ .mapped = .{ .source = &wrapped, .ordinals = &.{0}, .types = &.{.{ .kind = .json }}, .selection = &.{ 0, 1, 2, 3, 4 } } };
+            const selected = try mapped.select(a, &.{ 0, 1, 2, 3, 4 });
+            var rows: [5]Row = undefined;
+            for (&rows, 0..) |*row, i| {
+                const cells = try a.alloc(Datum, 1);
+                cells[0] = try selected.cell(a, i, 0);
+                row.* = .{ .values = cells, .keys = &.{}, .ordinal = i };
+            }
+            for ([_]ColumnarVersion{ .v1, .v2 }) |version| {
+                view.reads = 0;
+                const actual = try encodeColumnarBatchVersionAlloc(a, selected, &.{ 0, 1, 2, 3, 4 }, 1 << 20, version);
+                try std.testing.expectEqual(@as(usize, 2), view.reads);
+                const expected = try encodeColumnarBlockVersionAlloc(a, &rows, 1 << 20, version);
+                try std.testing.expectEqualSlices(u8, expected, actual);
+            }
+            var store = @import("typed_store.zig").Store.init(backing);
+            defer store.deinit();
+            view.reads = 0;
+            try store.appendBatch(selected);
+            try std.testing.expectEqual(@as(usize, 2), view.reads);
+            const retained: @import("execution_batch.zig").Batch = .{ .retained = .{ .store = &store, .count = 5 } };
+            for (0..5) |i| {
+                const before = try selected.encodedJson(i, 0);
+                const after = try retained.encodedJson(i, 0);
+                try std.testing.expectEqual(before != null, after != null);
+                if (before) |bytes| try std.testing.expectEqualStrings(bytes, after.?);
+            }
+            for ([_]ColumnarVersion{ .v1, .v2 }) |version| {
+                const actual = try encodeColumnarBatchVersionAlloc(a, retained, &.{ 0, 1, 2, 3, 4 }, 1 << 20, version);
+                try std.testing.expectEqualSlices(u8, try encodeColumnarBlockVersionAlloc(a, &rows, 1 << 20, version), actual);
+            }
+            _ = try store.append(&.{Datum.json(.{ .integer = 7 })});
+            try std.testing.expectEqual(@as(i64, 7), (try store.cell(a, 5, 0)).value.integer);
+            try std.testing.expectEqual(std.math.Order.eq, try scalar.compareDatums(try store.cell(a, 0, 0), rows[0].values[0]));
+            const cast: @import("execution_batch.zig").Batch = .{ .mapped = .{ .source = &source, .ordinals = &.{0}, .types = &.{.{ .kind = .string }}, .selection = &.{0} } };
+            try std.testing.expect(try cast.encodedJson(0, 0) == null);
         }
     };
     try Fixture.run(std.testing.allocator);

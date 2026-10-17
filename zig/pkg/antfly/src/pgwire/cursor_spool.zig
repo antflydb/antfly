@@ -21,7 +21,7 @@ const Budget = @import("budget.zig").Budget;
 // A page owns its prepared payloads. Type tags live once per column; scalar
 // cells remain plain JSON values and native cells retain compact pointers.
 const ColumnPayload = union(enum) {
-    json: struct { values: []std.json.Value, nulls: []bool },
+    json: struct { values: []std.json.Value, nulls: []bool, encoded: []?[]const u8 },
     array: []?*const @import("antfly_local_sources").sql_array_value.Value,
     numeric: []?*const @import("antfly_local_sources").sql_numeric_value.Value,
 };
@@ -71,7 +71,7 @@ pub const Store = struct {
         }
         const index = row - page.begin;
         return switch (page.columns[column]) {
-            .json => |data| .{ .value = data.values[index], .sql_null = data.nulls[index] },
+            .json => |data| if (data.encoded.len != 0 and data.encoded[index] != null) .{ .json_bytes = data.encoded[index], .sql_null = false } else .{ .value = data.values[index], .sql_null = data.nulls[index] },
             .array => |values| if (values[index]) |value| .{ .array = value, .sql_null = false } else .{ .sql_null = true },
             .numeric => |values| if (values[index]) |value| .{ .numeric = value, .sql_null = false } else .{ .sql_null = true },
         };
@@ -103,15 +103,22 @@ pub const Store = struct {
         const sources = @import("antfly_local_sources");
         for (definitions, page.columns) |definition, *payload| {
             _ = try @import("values.zig").columnOid(definition);
-            payload.* = if (definition.type == .array) .{ .array = try a.alloc(?*const sources.sql_array_value.Value, count) } else if (definition.type == .number and definition.element_type == .numeric) .{ .numeric = try a.alloc(?*const sources.sql_numeric_value.Value, count) } else .{ .json = .{ .values = try a.alloc(std.json.Value, count), .nulls = try a.alloc(bool, count) } };
+            payload.* = if (definition.type == .array) .{ .array = try a.alloc(?*const sources.sql_array_value.Value, count) } else if (definition.type == .number and definition.element_type == .numeric) .{ .numeric = try a.alloc(?*const sources.sql_numeric_value.Value, count) } else .{ .json = .{ .values = try a.alloc(std.json.Value, count), .nulls = try a.alloc(bool, count), .encoded = if (definition.type == .json) try a.alloc(?[]const u8, count) else &.{} } };
         }
         for (0..count) |row| for (definitions, page.columns, 0..) |definition, *payload, column| {
             const value = try result.cell(a, row, column);
-            if (value.sql_null and (value.value != .null or value.array != null or value.numeric != null)) return error.InvalidResult;
+            if (value.sql_null and (value.value != .null or value.array != null or value.numeric != null or value.json_bytes != null)) return error.InvalidResult;
             switch (payload.*) {
                 .json => |data| {
                     if (value.array != null or value.numeric != null) return error.InvalidResult;
-                    data.values[row] = try clone(a, value.value, 0);
+                    if (value.json_bytes) |bytes| {
+                        if (definition.type != .json or value.value != .null) return error.InvalidResult;
+                        data.encoded[row] = try a.dupe(u8, bytes);
+                        data.values[row] = .null;
+                    } else {
+                        if (data.encoded.len != 0) data.encoded[row] = null;
+                        data.values[row] = try clone(a, value.value, 0);
+                    }
                     data.nulls[row] = value.sql_null;
                 },
                 .array => |values| {
@@ -331,4 +338,34 @@ test "pgwire cursor spool page crossings and failed append preserve published ro
     try spool.append(.{ .columns = columns, .rows = &.{&.{.{ .integer = 5 }}}, .command_tag = "SELECT" }, 10);
     try std.testing.expectEqual(@as(i64, 5), (try spool.cell(3, 0)).value.integer);
     try std.testing.expectEqual(@as(i64, 1), (try spool.cell(0, 0)).value.integer);
+}
+
+test "pgwire encoded JSONB spool owns bytes and preserves SQL and JSON nulls on every unwind" {
+    const Fixture = struct {
+        fn run(a: std.mem.Allocator) !void {
+            var budget: Budget = .{ .child = a, .limit = 1 << 20 };
+            var store = Store.init(&budget);
+            defer store.deinit();
+            var bytes: [7]u8 = "{\"x\":1}".*;
+            const Reader = struct {
+                bytes: []const u8,
+                fn read(raw: *anyopaque, _: std.mem.Allocator, row: usize, _: usize) !backend.Cell {
+                    const self: *@This() = @ptrCast(@alignCast(raw));
+                    return switch (row) {
+                        0 => .{ .json_bytes = self.bytes, .sql_null = false },
+                        1 => .{ .value = .null, .sql_null = false },
+                        else => .{ .sql_null = true },
+                    };
+                }
+            };
+            var reader: Reader = .{ .bytes = &bytes };
+            try store.append(.{ .columns = &.{.{ .name = "j", .type = .json }}, .cells = .{ .context = &reader, .count = 3, .width = 1, .read = Reader.read }, .command_tag = "SELECT" }, 3);
+            bytes[5] = '7';
+            try std.testing.expectEqualStrings("{\"x\":1}", (try store.cell(0, 0)).json_bytes.?);
+            try std.testing.expect(!(try store.cell(1, 0)).sql_null);
+            try std.testing.expect((try store.cell(2, 0)).sql_null);
+        }
+    };
+    try Fixture.run(std.testing.allocator);
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Fixture.run, .{});
 }

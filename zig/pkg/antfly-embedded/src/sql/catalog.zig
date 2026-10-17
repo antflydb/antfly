@@ -414,6 +414,13 @@ pub const ColumnPage = struct {
             for (self.selection) |index| if (index >= self.batch.rowCount()) return error.InvalidSqlBackendResponse;
         }
     }
+    pub fn encodedJson(self: ColumnPage, row: usize, name: []const u8) !?[]const u8 {
+        if (row >= self.selection.len) return error.InvalidSqlBackendResponse;
+        if (self.native) |native| {
+            for (native.names, 0..) |column, ordinal| if (std.mem.eql(u8, column, name)) return native.values.encodedJson(self.selection[row], ordinal);
+        }
+        return null;
+    }
     pub fn cell(self: ColumnPage, alloc: std.mem.Allocator, row: usize, name: []const u8) !Row.Cell {
         if (row >= self.selection.len) return error.InvalidSqlBackendResponse;
         const index = self.selection[row];

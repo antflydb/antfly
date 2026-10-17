@@ -603,7 +603,40 @@ pub fn Adapter(comptime native: type) type {
             layout: catalog.Row.TypedLayout,
             projection: dependencies.sql_document_row.Projection,
             position: usize = 0,
+            column_page: ?catalog.Page = null,
+            const NativePage = struct { page: catalog.Page, values: ?dependencies.sql_execution_batch.Batch = null };
+            fn retireColumns(self: *@This()) void {
+                if (self.column_page) |*page| page.deinit();
+                self.column_page = null;
+            }
             fn next(ptr: *anyopaque, alloc: std.mem.Allocator, limit: u32) !catalog.Page {
+                const self: *@This() = @ptrCast(@alignCast(ptr));
+                self.retireColumns();
+                return (try nextMode(false, ptr, alloc, limit)).page;
+            }
+            fn nextColumns(ptr: *anyopaque, alloc: std.mem.Allocator, limit: u32) !catalog.ColumnPage {
+                const self: *@This() = @ptrCast(@alignCast(ptr));
+                self.retireColumns();
+                _ = alloc;
+                // A column producer owns its page until its next pull. The
+                // consumer may reset its page arena before making that call.
+                const result = try nextMode(true, ptr, dependencies.sql_memory_budget.reclaimingAllocator(self.alloc), limit);
+                self.column_page = result.page;
+                errdefer self.retireColumns();
+                // Column readers borrow this page until the next cursor pull.
+                const a = self.column_page.?.owned_arena.?.allocator();
+                const values = try a.create(dependencies.sql_execution_batch.Batch);
+                values.* = result.values.?;
+                const names = try a.alloc([]const u8, values.width());
+                for (names[0..self.projection.columns.len], self.projection.columns) |*name, column| name.* = column.name;
+                // Identity is implicit in row cursors, even when Scan.fields
+                // contains only stored fields. Preserve it in native pages.
+                names[names.len - 1] = "_id";
+                const selection = try a.alloc(usize, values.len());
+                for (selection, 0..) |*index, i| index.* = i;
+                return .{ .native = .{ .values = values, .names = names }, .selection = selection, .after = result.page.after };
+            }
+            fn nextMode(comptime encoded_mode: bool, ptr: *anyopaque, alloc: std.mem.Allocator, limit: u32) !NativePage {
                 const self: *@This() = @ptrCast(@alignCast(ptr));
                 defer if (self.documents) |*documents| documents.releasePage();
                 if (limit == 0 or limit > 4096) return error.InvalidSqlLimit;
@@ -612,6 +645,8 @@ pub fn Adapter(comptime native: type) type {
                 const a = page.allocator();
                 const count = @min(self.result.hits.len - self.position, limit);
                 const rows = try a.alloc(catalog.Row, count);
+                const json_slots = if (encoded_mode) try a.alloc(?[]const u8, count * self.projection.columns.len) else &.{};
+                if (encoded_mode) @memset(json_slots, null);
                 const layout = try self.layout.clone(a);
                 const score_slot = layout.ordinals.get("score");
                 const highlight_slot = layout.ordinals.get("_highlights");
@@ -671,19 +706,42 @@ pub fn Adapter(comptime native: type) type {
                         } else if (hit.source_value) |value| .{ .value = value } else if (hit.stored_data) |data| .{ .bytes = data } else return error.InvalidSqlBackendResponse;
                         const highlights = if (highlight_slot != null) try highlightsValueLeaky(document_scratch.allocator(), hit.highlights) else null;
                         const out = &rows[produced];
-                        out.* = try self.projection.projectSearch(a, document_scratch.allocator(), layout, hit.id, source, .{ .score = if (hit.score) |score| @as(f64, score) else null, .highlights = highlights });
+                        const encoded: ?[]?[]const u8 = if (encoded_mode) json_slots[produced * self.projection.columns.len ..][0..self.projection.columns.len] else null;
+                        out.* = try self.projection.projectSearchEncoded(a, document_scratch.allocator(), layout, hit.id, source, .{ .score = if (hit.score) |score| @as(f64, score) else null, .highlights = highlights }, encoded);
                         bytes +|= out.id.len;
-                        for (try out.fieldNames()) |name| bytes +|= try dependencies.sql_operators.datumBytes(try out.cell(name));
+                        for (try out.fieldNames(), 0..) |name, column| bytes +|= if (encoded_mode and encoded.?[column] != null) encoded.?[column].?.len else try dependencies.sql_operators.datumBytes(try out.cell(name));
                         produced += 1;
                     }
                 }
                 const end = self.position + produced;
                 const after = if (end < self.result.hits.len) try std.fmt.allocPrint(a, "{d}", .{end}) else null;
                 self.position = end;
-                return .{ .rows = rows[0..produced], .after = after, .owned_arena = page };
+                const view = if (encoded_mode) blk: {
+                    const View = struct {
+                        rows: []const catalog.Row,
+                        json: []const ?[]const u8,
+                        width: usize,
+                        fn cell(raw: *anyopaque, cell_alloc: std.mem.Allocator, row: usize, column: usize) anyerror!dependencies.sql_scalar.Datum {
+                            const self_: *@This() = @ptrCast(@alignCast(raw));
+                            if (column == self_.width) return dependencies.sql_scalar.Datum.json(.{ .string = self_.rows[row].id });
+                            if (self_.json[row * self_.width + column]) |raw_json| return dependencies.sql_scalar.Datum.json(try std.json.parseFromSliceLeaky(std.json.Value, cell_alloc, raw_json, .{ .parse_numbers = false }));
+                            return self_.rows[row].typed_cells.?.values[column];
+                        }
+                        fn encoded(raw: *anyopaque, row: usize, column: usize) anyerror!?[]const u8 {
+                            const self_: *@This() = @ptrCast(@alignCast(raw));
+                            if (column == self_.width) return null;
+                            return self_.json[row * self_.width + column];
+                        }
+                    };
+                    const owner = try a.create(View);
+                    owner.* = .{ .rows = rows[0..produced], .json = json_slots, .width = self.projection.columns.len };
+                    break :blk dependencies.sql_execution_batch.Batch{ .reader = .{ .ptr = owner, .read = View.cell, .read_json = View.encoded, .count = produced, .width = self.projection.columns.len + 1 } };
+                } else null;
+                return .{ .page = .{ .rows = rows[0..produced], .after = after, .owned_arena = page }, .values = view };
             }
             fn close(ptr: *anyopaque) void {
                 const self: *@This() = @ptrCast(@alignCast(ptr));
+                self.retireColumns();
                 if (self.reader) |*reader| reader.deinit();
                 if (self.documents) |*documents| documents.deinit();
                 self.result.deinit();
@@ -739,7 +797,7 @@ pub fn Adapter(comptime native: type) type {
             // Finish allocating before moving the arena: a later allocation
             // could add a chunk that the cursor's earlier copy would not own.
             cursor.* = .{ .alloc = alloc, .arena = arena, .result = captured.result, .reader = reader, .documents = documents, .needs_document = needs_document, .source_fields = source_fields.keys(), .layout = layout, .projection = projection };
-            return .{ .ptr = cursor, .next = SearchCursor.next, .close = SearchCursor.close };
+            return .{ .ptr = cursor, .next = SearchCursor.next, .next_columns = if (reader == null) SearchCursor.nextColumns else null, .close = SearchCursor.close };
         }
 
         fn resolve(ptr: *anyopaque, alloc: std.mem.Allocator, name: ast.Name, action: catalog.Action) !catalog.Table {

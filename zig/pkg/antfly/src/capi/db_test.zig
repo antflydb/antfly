@@ -6724,6 +6724,14 @@ test "capi SQL document search projects native cells without copying unselected 
     try std.testing.expectEqualStrings("alpha", hits.output.rows[0][1].string);
     try std.testing.expectEqualStrings("9007199254740993", hits.output.rows[0][2].string);
     try std.testing.expect(!hits.output.sql_nulls.?[0][3]);
+    var native_json = try sql.compiler.compile(a, "SELECT _id,payload FROM antfly_search('rows','body:alpha')", .{});
+    defer native_json.deinit();
+    const stream = (try @import("antfly_local_sources").sql_read_stream.Stream.open(a, adapter.backend(), &native_json, &.{}, .{ .page_rows = 1 })).?;
+    defer stream.close();
+    var native_page = try stream.nextBatch(1);
+    defer native_page.deinit();
+    try std.testing.expectEqualStrings("a", (try native_page.values.cell(native_page.arena.allocator(), 0, 0)).value.string);
+    try std.testing.expectEqualStrings("{\"amount\":9007199254740993}", (try native_page.values.encodedJson(0, 1)).?);
     var metadata = try sql.compiler.compile(a, "SELECT _id,score FROM antfly_search('rows','body:alpha')", .{});
     defer metadata.deinit();
     var metadata_hits = try sql.runtime.execute(a, adapter.backend(), &metadata, &.{}, .{});
@@ -6813,7 +6821,8 @@ test "capi SQL document ranked hydration pins old primary bytes and retires each
             // Both projections use the original captured cut, after update/delete.
             const projected_before = if (file) |native_file| native_file.test_backing_read_bytes.load(.monotonic) else 0;
             const projected = try reader.lookupProjectedBatch(&.{ "a", "b" }, &.{"body"}, 256 * 1024);
-            try std.testing.expectEqual(@as(usize, 1), projected.consumed);
+            try std.testing.expectEqual(@as(usize, if (is_lite) 2 else 1), projected.consumed);
+            if (is_lite) try std.testing.expectEqualStrings("\"beta\"", projected.values[1].fields[0].value);
             try std.testing.expectEqualStrings("body", projected.values[0].fields[0].name);
             try std.testing.expectEqualStrings("\"alpha\"", projected.values[0].fields[0].value);
             const projected_reads = if (file) |native_file| native_file.test_backing_read_bytes.load(.monotonic) - projected_before else 0;
@@ -6822,6 +6831,24 @@ test "capi SQL document ranked hydration pins old primary bytes and retires each
                 try std.testing.expect(budget.peak < 256 * 1024);
                 try std.testing.expect(projected_reads < document.len / 4);
             }
+            reader.releasePage();
+            const repeated_projection = try reader.lookupProjectedBatch(&.{ "b", "a", "b" }, &.{"body"}, 256 * 1024);
+            try std.testing.expectEqualStrings("\"beta\"", repeated_projection.values[0].fields[0].value);
+            if (is_lite) {
+                try std.testing.expectEqual(@as(usize, 3), repeated_projection.consumed);
+                try std.testing.expectEqualStrings("\"alpha\"", repeated_projection.values[1].fields[0].value);
+                try std.testing.expectEqual(repeated_projection.values[0].fields.ptr, repeated_projection.values[2].fields.ptr);
+            }
+            reader.releasePage();
+            const bounded_projection = try reader.lookupProjectedBatch(&.{ "b", "a" }, &.{"body"}, 8);
+            try std.testing.expectEqual(@as(usize, 1), bounded_projection.consumed);
+            const continued_projection = try reader.lookupProjectedBatch(&.{"a"}, &.{"body"}, 8);
+            try std.testing.expectEqualStrings("\"alpha\"", continued_projection.values[0].fields[0].value);
+            reader.releasePage();
+            const absent_projection = try reader.lookupProjectedBatch(&.{ "b", "a", "b" }, &.{"not-present"}, 8);
+            try std.testing.expectEqual(@as(usize, 3), absent_projection.consumed);
+            for (absent_projection.values) |source| try std.testing.expectEqual(@as(usize, 0), source.fields.len);
+            reader.releasePage();
             const deleted_projection = try reader.lookupProjectedBatch(&.{"b"}, &.{"body"}, 256 * 1024);
             try std.testing.expectEqualStrings("\"beta\"", deleted_projection.values[0].fields[0].value);
             reader.releasePage();

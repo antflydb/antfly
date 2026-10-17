@@ -374,6 +374,14 @@ pub fn viewLeaky(a: A, expected: arrays.ElementType, bytes: []const u8, options:
 pub fn borrowLeaky(a: A, expected: arrays.ElementType, bytes: []const u8, options: Options) !arrays.Value {
     if (!@import("array_compact.zig").supported(expected)) return (try decodeLeaky(a, expected, bytes, options)).value;
     const view = try validateCanonical(a, expected, bytes, options);
+    return borrowValidatedLeaky(a, view);
+}
+
+/// Internal codec handoff: the producer owns immutable bytes and has checked
+/// every cell. External/authentication-only inputs must use borrowLeaky.
+pub fn borrowValidatedLeaky(a: A, view: layout.View) !arrays.Value {
+    if (view.validation == null) return error.InvalidSqlArrayStorage;
+    const expected = view.kind;
     const axes = try a.alloc(arrays.Dimension, view.rank);
     for (axes, 0..) |*axis, index| axis.* = try view.dimension(index);
     const owned = try a.create(layout.View);

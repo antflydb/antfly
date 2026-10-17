@@ -1111,3 +1111,103 @@ test "native projection refinements benchmark streaming selected arrays" {
         std.debug.print("STREAM_ARRAY sample={d} before_ns={d} after_ns={d} before_peak={d} after_peak={d}\n", .{ sample, before.ns, after.ns, before.peak, after.peak });
     }
 }
+
+// Per-thread CPU time excludes scheduling gaps while independent worktrees
+// build on this host. Existing wall-clock fixtures retain their original clock.
+fn cpuNow() i96 {
+    if (comptime @import("builtin").link_libc and (@import("builtin").os.tag == .macos or @import("builtin").os.tag == .linux)) {
+        var stamp: std.c.timespec = undefined;
+        if (std.c.clock_gettime(.THREAD_CPUTIME_ID, &stamp) != 0) @panic("thread CPU clock unavailable");
+        return @as(i96, stamp.sec) * std.time.ns_per_s + stamp.nsec;
+    }
+    return now();
+}
+const BuilderMeasurement = struct { ns: i96, checksum: u64 };
+fn checkedBuilderTiming(checked: bool, cells: []const Datum) !BuilderMeasurement {
+    return if (checked) checkedBuilderMode(true, cells) else checkedBuilderMode(false, cells);
+}
+fn checkedBuilderMode(comptime checked: bool, cells: []const Datum) !BuilderMeasurement {
+    var elapsed: i96 = 0;
+    var checksum: u64 = 0;
+    for (0..512) |_| {
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        var work: @import("array_value.zig").Budget = .{};
+        const started = cpuNow();
+        const Producer = if (checked) @import("array_compact.zig").CheckedBuilder else @import("array_compact.zig").Builder;
+        var builder = try Producer.init(arena.allocator(), .int64, &.{.{ .length = @intCast(cells.len) }}, cells.len, cells.len, 0, .{});
+        for (cells) |cell| {
+            if (checked) try builder.appendChecked(cell, .int64, .{}, &work) else {
+                _ = try @import("array_value.zig").Value.initWithBudget(.int64, &.{.{ .length = 1 }}, &.{cell}, .{}, &work);
+                try builder.append(cell);
+            }
+        }
+        const result = try builder.finish(arena.allocator(), .{});
+        elapsed += cpuNow() - started;
+        checksum +%= std.hash.Wyhash.hash(0, result.stored.?.bytes);
+    }
+    return .{ .ns = elapsed, .checksum = checksum };
+}
+test "native projection refinements benchmark checked builders" {
+    const a = std.testing.allocator;
+    const cells = try a.alloc(Datum, 8192);
+    defer a.free(cells);
+    for (cells, 0..) |*cell, i| cell.* = Datum.json(.{ .integer = 9007199254740993 + @as(i64, @intCast(i)) });
+    _ = try checkedBuilderTiming(false, cells);
+    _ = try checkedBuilderTiming(true, cells);
+    for (0..5) |sample| {
+        const first = try checkedBuilderTiming(sample % 2 != 0, cells);
+        const second = try checkedBuilderTiming(sample % 2 == 0, cells);
+        const before = if (sample % 2 == 0) first else second;
+        const after = if (sample % 2 == 0) second else first;
+        try std.testing.expectEqual(before.checksum, after.checksum);
+        std.debug.print("CHECKED_BUILDER sample={d} before_cpu_ns={d} after_cpu_ns={d} elements=8192 repetitions=512\n", .{ sample, before.ns, after.ns });
+    }
+}
+fn encodedJsonTiming(encoded: bool, projection: @import("document_row.zig").Projection, layout_: @import("catalog.zig").Row.TypedLayout, input: []const u8) !struct { ns: i96, peak: usize, checksum: u64 } {
+    const wire_bytes = try std.testing.allocator.alloc(u8, input.len * 2 + 1);
+    defer std.testing.allocator.free(wire_bytes);
+    var elapsed: i96 = 0;
+    var peak: usize = 0;
+    var checksum: u64 = 0;
+    for (0..8) |_| {
+        var budget: @import("memory_budget.zig") = .{ .backing = std.testing.allocator, .limit = 256 << 20 };
+        var arena = std.heap.ArenaAllocator.init(budget.allocator());
+        defer arena.deinit();
+        var slots: [1]?[]const u8 = undefined;
+        const started = cpuNow();
+        const row = try projection.projectSearchEncoded(arena.allocator(), arena.allocator(), layout_, "key", .{ .fields = &.{.{ .name = "payload", .value = input }} }, .{}, if (encoded) &slots else null);
+        var wire: std.Io.Writer = .fixed(wire_bytes);
+        try wire.writeByte(1); // PostgreSQL binary JSONB version.
+        if (encoded) try wire.writeAll(slots[0].?) else try std.json.Stringify.value((try row.cell("payload")).value, .{}, &wire);
+        elapsed += cpuNow() - started;
+        peak = @max(peak, budget.peak);
+        checksum +%= std.hash.Wyhash.hash(0, wire.buffered());
+    }
+    return .{ .ns = elapsed, .peak = peak, .checksum = checksum };
+}
+test "native projection refinements benchmark encoded JSON" {
+    const a = std.testing.allocator;
+    var input: std.Io.Writer.Allocating = .init(a);
+    defer input.deinit();
+    try input.writer.writeByte('[');
+    for (0..4096) |i| {
+        if (i != 0) try input.writer.writeByte(',');
+        try input.writer.writeAll("{\"x\":9007199254740993,\"s\":\"abcdefghijklmnopqrstuvwxyz\\n\",\"nested\":[true,null,1e-3]}");
+    }
+    try input.writer.writeByte(']');
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const projection = try @import("document_row.zig").Projection.initSearch(arena.allocator(), .{ .id = 1, .physical_name = "rows", .schema_version = 1, .columns = &.{.{ .name = "payload", .path = "payload", .type = .json }} }, &.{"payload"});
+    const layout_ = try @import("catalog.zig").Row.TypedLayout.init(arena.allocator(), &.{"payload"});
+    _ = try encodedJsonTiming(false, projection, layout_, input.written());
+    _ = try encodedJsonTiming(true, projection, layout_, input.written());
+    for (0..5) |sample| {
+        const first = try encodedJsonTiming(sample % 2 != 0, projection, layout_, input.written());
+        const second = try encodedJsonTiming(sample % 2 == 0, projection, layout_, input.written());
+        const before = if (sample % 2 == 0) first else second;
+        const after = if (sample % 2 == 0) second else first;
+        try std.testing.expectEqual(before.checksum, after.checksum);
+        std.debug.print("ENCODED_JSON projection_and_wire=true sample={d} before_cpu_ns={d} after_cpu_ns={d} before_peak={d} after_peak={d} input_bytes={d} repetitions=8\n", .{ sample, before.ns, after.ns, before.peak, after.peak, input.written().len });
+    }
+}

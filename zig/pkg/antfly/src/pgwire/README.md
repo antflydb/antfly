@@ -302,7 +302,8 @@ Ranked document SQL prepares a literal root-member routing directory once per
 cursor. It copies selected payloads into final native cells and supplies score
 and highlights separately. Parsed hits are never cloned wholesale. Raw stored
 hits receive complete syntax and duplicate-key validation, including unselected
-subtrees, while only selected members acquire a temporary DOM. Eligible plain
+subtrees. Scalars, homogeneous arrays, and encoded JSONB columns avoid a selected
+subtree DOM; ordinary JSON cell consumers materialize only when needed. Eligible plain
 ranked searches capture primary storage and schema under the same apply fence
 as ranking, retain IDs/scores, and read source bytes only as pages demand them.
 Sorted, deduplicated hydration uses up to 64 keys and a 256 KiB soft source-byte
@@ -325,17 +326,39 @@ field offsets. Native range batches resolve the document once, sort ranges, and
 restore caller order after coalescing nearby fields. Each read span is at most
 256 KiB, except an isolated oversized field; retained padding across a document
 is capped at 256 KiB. Overlapping and duplicate requests share span bytes.
+Projected windows batch up to 64 directory reads, deduplicate document IDs, and
+sort body requests while restoring ranked order. Lite shares one document-index
+traversal across the window. Admission uses the range planner's exact retained
+span lengths, including gaps; non-range fallbacks charge the full body length.
+Directory input is independently bounded by 64 × 32 KiB. A single oversized row
+is isolated, and mixed/missing directories resume through the full-body path.
 Selected fields feed native SQL cells directly, without rebuilding a JSON object.
 Selecting at least half the source bytes keeps the full-body path.
 
 Root-validation workspaces use reclaimable scratch beneath SQL quotas. Completed
 sibling objects release their tables instead of accumulating in a document arena.
 Scalar fields decode directly from tokens. Fixed-width array envelopes count null
-flags, then validate and emit values in one pass. Text arrays size their payload
+flags, then validate and emit values in one pass. Checked builders derive
+immutable validation summaries from existing format counters, then check shape/header metadata
+without rescanning completed cell payloads. Unchecked builders and externally
+supplied frames retain full canonical validation. Text arrays size their payload
 before writing canonical storage;
 NUMERIC and JSONB arrays retain only their native payloads and final cell vector.
 The parsed-envelope codec remains the admission and byte-compatibility oracle,
 including lower bounds, exact numbers, NULL flags, wire size, and logical work.
+
+Native JSONB passthrough is an optional column capability, alongside the ordinary
+parsed cell accessor. Document sources normalize selected object/array tokens to
+canonical bytes under the same depth and exact-number rules. Encoded accessors
+promise the same cell value obtained with lossless (`parse_numbers=false`)
+parsing; producers with other JSON representations retain ordinary cells. Projection mappings,
+selections, retained SQL pages, and pgwire cursor stores preserve those bytes and
+copy only at ownership boundaries. Byte accounting uses the retained payload
+without triggering a parse. Text pgwire results emit the bytes directly; binary
+JSONB adds its existing version byte. SQL expressions and other scalar consumers
+use the normal cell accessor, which parses on demand. SQL NULL and JSON null
+remain distinct. The frozen v1/v2 mixed-cell encoder can emit the same recursive
+JSON records directly from canonical tokens without staging a DOM.
 
 An ordinary leader-gated authority backfill publishes directories for older roots
 in bounded, resumable pages. Manual owners can advance the same bounded entry

@@ -190,11 +190,17 @@ const Column = struct {
         encoded: std.ArrayList(std.json.Value),
     };
     values: Values = .unknown,
+    json_bytes: ?*std.ArrayList(?[]const u8) = null,
     nulls: std.ArrayList(u64) = .empty,
     patterns: std.ArrayList(?*scalar.PatternSet) = .empty,
     arrays: std.ArrayList(?*const @import("array_value.zig").Value) = .empty,
     numerics: std.ArrayList(?*const @import("numeric_value.zig").Value) = .empty,
     fn deinit(self: *Column, a: A) void {
+        if (self.json_bytes) |bytes| {
+            bytes.deinit(a);
+            a.destroy(bytes);
+        }
+
         switch (self.values) {
             .unknown => {},
             inline else => |*values| values.deinit(a),
@@ -209,7 +215,7 @@ const Column = struct {
     }
     fn cell(self: Column, a: A, row: usize) !Datum {
         if (self.isNull(row)) return .{};
-        _ = a;
+        if (self.json_bytes) |bytes| if (bytes.items[row]) |json| return Datum.json(try std.json.parseFromSliceLeaky(std.json.Value, a, json, .{ .parse_numbers = false }));
         const value: std.json.Value = switch (self.values) {
             .unknown => return error.InvalidSqlBackendResponse,
             .integers => |v| .{ .integer = v.get(row) },
@@ -222,7 +228,7 @@ const Column = struct {
         return .{ .value = value, .sql_null = false, .patterns = if (self.patterns.items.len == 0) null else self.patterns.items[row], .array = if (self.arrays.items.len == 0) null else self.arrays.items[row], .numeric = if (self.numerics.items.len == 0) null else self.numerics.items[row] };
     }
     fn appendDictionary(self: *Column, a: A, owned: A, begin: usize, batch: @import("execution_batch.zig").Batch) !bool {
-        if (batch != .dictionary or self.patterns.items.len != 0 or self.arrays.items.len != 0 or self.numerics.items.len != 0) return false;
+        if (self.json_bytes != null or batch != .dictionary or self.patterns.items.len != 0 or self.arrays.items.len != 0 or self.numerics.items.len != 0) return false;
         const source = batch.dictionary;
         for (source.indices) |id| if (id >= source.values.len) return error.InvalidSqlBackendResponse;
         const remap = try a.alloc(u32, source.values.len);
@@ -347,7 +353,19 @@ const Column = struct {
         }
         return true;
     }
+    fn appendJson(self: *Column, a: A, owned: A, scratch: A, row: usize, bytes: []const u8) !void {
+        if (self.json_bytes == null) {
+            const values = try a.create(std.ArrayList(?[]const u8));
+            values.* = .empty;
+            self.json_bytes = values;
+            try values.resize(a, row);
+            @memset(values.items, null);
+        }
+        try self.append(a, owned, scratch, row, Datum.json(.null));
+        self.json_bytes.?.items[row] = try owned.dupe(u8, bytes);
+    }
     fn append(self: *Column, a: A, owned: A, scratch: A, row: usize, value: Datum) !void {
+        if (self.json_bytes) |bytes| try bytes.append(a, null);
         if (self.numerics.items.len != 0 or value.numeric != null) {
             if (self.numerics.items.len == 0) {
                 try self.numerics.resize(a, row);
@@ -546,6 +564,10 @@ pub const Store = struct {
             _ = scratch.reset(.free_all);
             for (0..batch.len()) |index| {
                 _ = scratch.reset(.retain_capacity);
+                if (try batch.encodedJson(index, ordinal)) |bytes| {
+                    try column.appendJson(self.a, self.arena.allocator(), scratch.allocator(), self.len + index, bytes);
+                    continue;
+                }
                 const value = try batch.cell(scratch.allocator(), index, ordinal);
                 try column.append(self.a, self.arena.allocator(), scratch.allocator(), self.len + index, value);
             }
@@ -591,6 +613,15 @@ pub const Store = struct {
         errdefer a.free(result);
         for (result, 0..) |*value, column| value.* = try self.cell(a, index, column);
         return result;
+    }
+    pub fn encodedJson(self: *const Store, index: usize, column: usize) !?[]const u8 {
+        if (self.failed or index >= self.len or column >= self.columns.len) return error.InvalidSqlBackendResponse;
+        const values = self.columns[column].json_bytes orelse return null;
+        return values.items[index];
+    }
+    pub fn cellBytes(self: *const Store, a: A, index: usize, column: usize) !usize {
+        if (try self.encodedJson(index, column)) |bytes| return bytes.len;
+        return @import("operators.zig").datumBytes(try self.cell(a, index, column));
     }
     pub fn cell(self: *const Store, a: A, index: usize, column: usize) !Datum {
         if (self.failed or index >= self.len or column >= self.columns.len) return error.InvalidSqlBackendResponse;

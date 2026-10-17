@@ -164,6 +164,14 @@ pub fn encodeColumnInto(a: std.mem.Allocator, writer: *std.Io.Writer, column: Co
 /// Native pages retain typed arrays and numerics through the wire boundary.
 pub fn encodeCellInto(a: std.mem.Allocator, writer: *std.Io.Writer, column: Column, format: u16, cell: @import("backend.zig").Cell, wire_bytes: usize) !void {
     if (cell.sql_null or format > 1) return error.InvalidResult;
+    if (cell.json_bytes) |json| {
+        if (column.type != .json or cell.value != .null or cell.array != null or cell.numeric != null) return error.InvalidResult;
+        const prefix: usize = @intFromBool(format == 1);
+        if (json.len > wire_bytes -| prefix or prefix > wire_bytes) return error.ProgramLimitExceeded;
+        if (format == 1) try writer.writeByte(1);
+        try writer.writeAll(json);
+        return;
+    }
     if (cell.array == null and cell.numeric == null) return encodeColumnInto(a, writer, column, format, cell.value, wire_bytes);
     _ = try columnOid(column);
     if (cell.value != .null or (cell.array != null and cell.numeric != null)) return error.InvalidResult;
@@ -873,4 +881,26 @@ test "pgwire native scalar float parameters roundtrip through typed frames in te
         const binary_cell = try decodeNative(arena.allocator(), type_oid, 1, output.written());
         try std.testing.expectEqual(std.math.Order.eq, try src.sql_scalar.compareDatums(frame.values[0], binary_cell));
     };
+}
+
+test "pgwire encoded JSONB cells preserve text binary quotas and writer failures without allocations" {
+    const input = "{\"x\":[9007199254740993,true,null],\"s\":\"é\\n\"}";
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const parsed = try std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), input, .{ .parse_numbers = false });
+    var none = std.heap.FixedBufferAllocator.init(&.{});
+    const column: Column = .{ .name = "j", .type = .json };
+    for ([_]u16{ 0, 1 }) |format| {
+        var expected_bytes: [256]u8 = undefined;
+        var expected: std.Io.Writer = .fixed(&expected_bytes);
+        try encodeColumnInto(arena.allocator(), &expected, column, format, parsed, 256);
+        var actual_bytes: [256]u8 = undefined;
+        var actual: std.Io.Writer = .fixed(&actual_bytes);
+        try encodeCellInto(none.allocator(), &actual, column, format, .{ .json_bytes = input, .sql_null = false }, 256);
+        try std.testing.expectEqualSlices(u8, expected.buffered(), actual.buffered());
+        var denied: std.Io.Writer = .fixed(&.{});
+        try std.testing.expectError(error.ProgramLimitExceeded, encodeCellInto(none.allocator(), &denied, column, format, .{ .json_bytes = input, .sql_null = false }, actual.end - 1));
+        try std.testing.expectEqual(@as(usize, 0), denied.end);
+        try std.testing.expectError(error.WriteFailed, encodeCellInto(none.allocator(), &denied, column, format, .{ .json_bytes = input, .sql_null = false }, 256));
+    }
 }

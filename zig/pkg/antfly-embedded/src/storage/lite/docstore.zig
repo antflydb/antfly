@@ -3246,6 +3246,23 @@ pub const Txn = struct {
             return self.scratch.allocator();
         }
 
+        pub fn getRangesMany(self: *@This(), requests: []const @import("../value_ranges.zig").Request) !void {
+            if (requests.len > 64) return error.InvalidBatch;
+            const a = self.resultAllocator();
+            var translated: [64]@import("../value_ranges.zig").Request = undefined;
+            var initialized: usize = 0;
+            defer if (self.parent.prefix.len != 0) for (translated[0..initialized]) |request| a.free(request.key);
+            var overlay = false;
+            for (requests, 0..) |request, i| {
+                const key = if (self.parent.prefix.len == 0) request.key else try std.mem.concat(a, u8, &.{ self.parent.prefix, request.key });
+                translated[i] = .{ .key = key, .ranges = request.ranges, .output = request.output };
+                initialized += 1;
+                overlay = overlay or self.parent.pending_tree.getEntryFor(key).node != null;
+            }
+            if (overlay) {
+                for (requests) |request| try self.getRanges(request.key, request.ranges, request.output);
+            } else try (try self.parent.readFile()).readDocumentRangesBatchAlloc(a, self.parent.checkpoint, translated[0..requests.len]);
+        }
         pub fn getRanges(self: *@This(), key: []const u8, ranges: []const @import("../value_ranges.zig").Range, output: [][]const u8) !void {
             const a = self.resultAllocator();
             const full = if (self.parent.prefix.len == 0) key else try std.mem.concat(a, u8, &.{ self.parent.prefix, key });

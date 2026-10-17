@@ -6405,6 +6405,29 @@ pub const NativeFile = struct {
         if (ranges.len != output.len or ranges.len > @import("../value_ranges.zig").maximum_ranges) return error.InvalidBatch;
         if (ranges.len == 0) return;
         const page = (try self.lookupDocumentIndexPage(checkpoint, key)) orelse return error.NotFound;
+        return self.readDocumentRangesAtPage(allocator, checkpoint, key, page, ranges, output);
+    }
+    pub fn readDocumentRangesBatchAlloc(self: *NativeFile, allocator: Allocator, checkpoint: CheckpointSlot, requests: []const @import("../value_ranges.zig").Request) !void {
+        if (requests.len > 64) return error.InvalidBatch;
+        if (requests.len == 0) return;
+        var keys: [64][]const u8 = undefined;
+        for (requests, 0..) |request, i| {
+            if (request.ranges.len != request.output.len or request.ranges.len > @import("../value_ranges.zig").maximum_ranges) return error.InvalidBatch;
+            keys[i] = request.key;
+            if (i != 0 and std.mem.order(u8, keys[i - 1], keys[i]) == .gt) return error.InvalidBatch;
+        }
+        const temporary = @import("antfly_platform").allocator.reclaimingScratch(allocator);
+        var state: DocumentBatchReadState = .{};
+        state.prepare(self);
+        defer state.deinit();
+        const references = try self.resolveBatchReferences(temporary, checkpoint, keys[0..requests.len], "", &state.path);
+        defer temporary.free(references);
+        for (requests, references) |request, page| {
+            if (page == 0) return error.NotFound;
+            try self.readDocumentRangesAtPage(allocator, checkpoint, request.key, page, request.ranges, request.output);
+        }
+    }
+    fn readDocumentRangesAtPage(self: *NativeFile, allocator: Allocator, checkpoint: CheckpointSlot, key: []const u8, page: u64, ranges: []const @import("../value_ranges.zig").Range, output: [][]const u8) !void {
         var record: ValuePageReader = undefined;
         record.init();
         defer record.deinit(self);
@@ -18446,5 +18469,46 @@ test "lite native projected range cohorts bound IO preserve order and old checkp
             try reader.readDocumentRangesAlloc(arena.allocator(), checkpoint, key, &separated, &parts);
             for (separated, parts) |range, value| try std.testing.expectEqualSlices(u8, bytes[@intCast(range.offset)..][0..range.length], value);
         }
+    }
+}
+
+test "lite native projected document batches share index traversal and preserve captured ranges" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "projected-documents.aflite");
+    defer a.free(path);
+    const payload = try a.alloc(u8, 32768);
+    defer a.free(payload);
+    for (payload, 0..) |*byte, i| byte.* = @intCast(i % 251);
+    for ([_]bool{ false, true }) |indexed| {
+        var file = try NativeFile.createWithIo(a, std.testing.io, path, .{ .indexed_reclamation = indexed, .no_sync = true });
+        defer file.close();
+        var keys: [32][12]u8 = undefined;
+        var mutations: [32]DocumentMutation = undefined;
+        for (&keys, &mutations, 0..) |*key, *mutation, i| mutation.* = .{ .key = try std.fmt.bufPrint(key, "document-{d:0>3}", .{i}), .value = payload };
+        try file.putDocumentBatch(&mutations);
+        var reader = try NativeFile.openWithIo(a, std.testing.io, path, .{ .read_only = true });
+        defer reader.close();
+        reader.page_cache_enabled.store(false, .monotonic);
+        const checkpoint = reader.activeCheckpoint();
+        try file.putDocument(mutations[0].key, "replacement");
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        const ranges = [_]@import("../value_ranges.zig").Range{ .{ .offset = 4, .length = 7 }, .{ .offset = 4100, .length = 9 } };
+        var parts: [32][2][]const u8 = undefined;
+        var requests: [32]@import("../value_ranges.zig").Request = undefined;
+        for (&requests, mutations, &parts) |*request, mutation, *output| request.* = .{ .key = mutation.key, .ranges = &ranges, .output = output };
+        const before = reader.test_backing_read_bytes.load(.monotonic);
+        for (requests) |request| try reader.readDocumentRangesAlloc(arena.allocator(), checkpoint, request.key, request.ranges, request.output);
+        const scalar_bytes = reader.test_backing_read_bytes.load(.monotonic) - before;
+        const batch_before = reader.test_backing_read_bytes.load(.monotonic);
+        try reader.readDocumentRangesBatchAlloc(arena.allocator(), checkpoint, &requests);
+        const batch_bytes = reader.test_backing_read_bytes.load(.monotonic) - batch_before;
+        for (parts) |output| for (ranges, output) |range, value| try std.testing.expectEqualSlices(u8, payload[@intCast(range.offset)..][0..range.length], value);
+        try std.testing.expect(batch_bytes < scalar_bytes);
+        std.debug.print("PROJECTED_DOCUMENT_BATCH indexed={any} scalar_backing={d} batch_backing={d} documents=32\n", .{ indexed, scalar_bytes, batch_bytes });
+        const reversed = [_]@import("../value_ranges.zig").Request{ requests[1], requests[0] };
+        try std.testing.expectError(error.InvalidBatch, reader.readDocumentRangesBatchAlloc(arena.allocator(), checkpoint, &reversed));
     }
 }

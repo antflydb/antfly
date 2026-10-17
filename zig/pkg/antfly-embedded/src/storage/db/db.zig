@@ -3042,6 +3042,13 @@ const DocumentPrimaryReadWindow = struct {
         if (physical.len > 64 or output.len != physical.len) return error.InvalidBatch;
         self.retire();
         self.scope = try txn.openReadScope(self.arena.allocator());
+        try readMany(&self.scope.?, physical, output);
+        for (output) |value| if (value) |raw| {
+            self.bytes +|= raw.len;
+        };
+    }
+    fn readMany(scope: *@import("../backend_erased.zig").ReadScope, physical: []const []const u8, output: []?[]const u8) !void {
+        if (physical.len > 64 or output.len != physical.len) return error.InvalidBatch;
         const Entry = struct {
             key: []const u8,
             row: usize,
@@ -3063,10 +3070,7 @@ const DocumentPrimaryReadWindow = struct {
             }
             entry.value_index = count - 1;
         }
-        try self.scope.?.getManySorted(keys[0..count], values[0..count]);
-        for (values[0..count]) |value| if (value) |raw| {
-            self.bytes +|= raw.len;
-        };
+        try scope.getManySorted(keys[0..count], values[0..count]);
         for (entries[0..physical.len]) |entry| output[entry.row] = values[entry.value_index];
     }
 
@@ -40239,11 +40243,7 @@ pub const DB = struct {
                 return .{ .values = self.sources[0..1], .consumed = 1 };
             }
             try self.prepare(documents);
-            if (fields.len != 0) if (try self.projectCurrent(fields)) |raw| {
-                self.sources[0] = .{ .fields = raw };
-                self.next_cached += 1;
-                return .{ .values = self.sources[0..1], .consumed = 1 };
-            };
+            if (fields.len != 0) if (try self.projectBatch(documents.len, fields, max_bytes)) |projected| return projected;
             // A declined projection must not retain its metadata/range buffers
             // beside the full body. The proof cache has a separate owner.
             self.window.retire();
@@ -40276,54 +40276,108 @@ pub const DB = struct {
             self.repair_requested = true;
             self.db.document_authority_backfill_requested.store(true, .release);
         }
-        fn projectCurrent(self: *@This(), fields: []const []const u8) !?[]const @import("../document_projection.zig").FieldValue {
+        fn projectBatch(self: *@This(), maximum: usize, fields: []const []const u8, max_bytes: usize) !?ProjectedBatch {
             const projection = @import("../document_projection.zig");
             const revision = @import("../document_mutation_revision.zig");
-            const proof = self.proofs[self.next_cached] orelse {
-                self.requestRepair();
-                return null;
-            };
-            if (proof.bytes < projection.minimum_bytes) return null;
-            const physical = self.keys[self.next_cached];
+            const ranges_mod = @import("../value_ranges.zig");
+            const available = @min(maximum, self.cached - self.next_cached);
+            const limit = @min(max_bytes, DocumentPrimaryReadWindow.max_bytes);
             const a = self.window.arena.allocator();
             self.window.scope = try self.read.openReadScope(a);
             const scope = &self.window.scope.?;
-            const raw = scope.get(&projection.keyForRevision(revision.keyForPhysical(physical).?)) catch |err| {
-                if (err == error.NotFound) {
+            // Directory metadata is separately bounded by 64 * 32 KiB. Only
+            // projected payload cohorts enter the caller's soft byte window.
+            var directory_keys: [64]projection.Key = undefined;
+            var keys: [64][]const u8 = undefined;
+            var directories: [64]?[]const u8 = @splat(null);
+            var candidates: usize = 0;
+            for (0..available) |i| {
+                const proof = self.proofs[self.next_cached + i] orelse {
                     self.requestRepair();
-                    return null;
-                }
-                return err;
-            };
-            const directory = (try projection.Directory.open(a, raw, proof)) orelse {
-                if (!try projection.isCurrent(a, raw, proof)) self.requestRepair();
-                return null;
-            };
-            var selected_bytes: u64 = 0;
-            for (fields) |name| {
-                if (directory.find(name)) |field| selected_bytes +|= field.length;
+                    break;
+                };
+                if (proof.bytes < projection.minimum_bytes) break;
+                directory_keys[i] = projection.keyForRevision(revision.keyForPhysical(self.keys[self.next_cached + i]).?);
+                keys[i] = &directory_keys[i];
+                candidates += 1;
             }
-            if (selected_bytes >= proof.bytes / 2) return null;
-            const output = try a.alloc(projection.FieldValue, fields.len);
-            var ranges: [512]@import("../value_ranges.zig").Range = undefined;
-            var values: [512][]const u8 = undefined;
-            var expected: [512][32]u8 = undefined;
+            if (candidates == 0) return null;
+            try DocumentPrimaryReadWindow.readMany(scope, keys[0..candidates], directories[0..candidates]);
+            const Prepared = struct { fields: []projection.FieldValue, ranges: []ranges_mod.Range, values: [][]const u8, hashes: [][32]u8, duplicate: bool = false };
+            var prepared: [64]Prepared = undefined;
+            var requests: [64]ranges_mod.Request = undefined;
+            var request_count: usize = 0;
             var count: usize = 0;
-            for (fields) |name| if (directory.find(name)) |field| {
-                if (count == ranges.len) return error.InvalidBatch;
-                ranges[count] = .{ .offset = field.offset, .length = std.math.cast(usize, field.length) orelse return error.InvalidDocumentContentAuthority };
-                expected[count] = field.digest;
-                output[count] = .{ .name = field.name, .value = undefined };
-                count += 1;
-            };
-            try scope.getRanges(physical, ranges[0..count], values[0..count]);
-            for (values[0..count], expected[0..count], output[0..count]) |value, hash, *field| {
-                var digest: [32]u8 = undefined;
-                std.crypto.hash.sha2.Sha256.hash(value, &digest, .{});
-                if (!std.mem.eql(u8, &digest, &hash)) return error.InvalidDocumentContentAuthority;
-                field.value = value;
+            var retained: usize = 0;
+            while (count < candidates) : (count += 1) {
+                const physical = self.keys[self.next_cached + count];
+                const duplicate = for (0..count) |prior| {
+                    if (std.mem.eql(u8, physical, self.keys[self.next_cached + prior])) break prior;
+                } else null;
+                if (duplicate) |prior| {
+                    prepared[count] = prepared[prior];
+                    prepared[count].duplicate = true;
+                    continue;
+                }
+                const proof = self.proofs[self.next_cached + count].?;
+                const raw = directories[count] orelse {
+                    self.requestRepair();
+                    break;
+                };
+                const directory = (try projection.Directory.open(a, raw, proof)) orelse {
+                    if (!try projection.isCurrent(a, raw, proof)) self.requestRepair();
+                    break;
+                };
+                var selected_bytes: u64 = 0;
+                var selected_count: usize = 0;
+                for (fields) |name| if (directory.find(name)) |field| {
+                    selected_bytes +|= field.length;
+                    selected_count += 1;
+                };
+                if (selected_bytes >= proof.bytes / 2 or selected_count > ranges_mod.maximum_ranges) break;
+                const ranges = try a.alloc(ranges_mod.Range, selected_count);
+                var slot: usize = 0;
+                for (fields) |name| if (directory.find(name)) |field| {
+                    ranges[slot] = .{ .offset = field.offset, .length = std.math.cast(usize, field.length) orelse return error.InvalidDocumentContentAuthority };
+                    slot += 1;
+                };
+                const cost = if (scope.supportsRange()) try ranges_mod.retainedBytes(std.math.cast(usize, proof.bytes) orelse return error.InvalidDocumentContentAuthority, ranges) else if (selected_count == 0) 0 else proof.bytes;
+                if (count != 0 and cost > limit -| retained) break;
+                retained +|= std.math.cast(usize, cost) orelse return error.InvalidDocumentContentAuthority;
+                const output = try a.alloc(projection.FieldValue, selected_count);
+                const values = try a.alloc([]const u8, selected_count);
+                const hashes = try a.alloc([32]u8, selected_count);
+                slot = 0;
+                for (fields) |name| if (directory.find(name)) |field| {
+                    output[slot] = .{ .name = field.name, .value = undefined };
+                    hashes[slot] = field.digest;
+                    slot += 1;
+                };
+                prepared[count] = .{ .fields = output, .ranges = ranges, .values = values, .hashes = hashes };
+                if (selected_count != 0) {
+                    requests[request_count] = .{ .key = physical, .ranges = ranges, .output = values };
+                    request_count += 1;
+                }
             }
-            return output[0..count];
+            if (count == 0) return null;
+            std.mem.sort(ranges_mod.Request, requests[0..request_count], {}, struct {
+                fn less(_: void, left: ranges_mod.Request, right: ranges_mod.Request) bool {
+                    return std.mem.order(u8, left.key, right.key) == .lt;
+                }
+            }.less);
+            scope.getRangesMany(requests[0..request_count]) catch |err| return if (err == error.NotFound) error.StorageReadTemporarilyUnavailable else err;
+            for (prepared[0..count], self.sources[0..count]) |item, *source| {
+                if (!item.duplicate) for (item.values, item.hashes, item.fields) |value, hash, *field| {
+                    var digest: [32]u8 = undefined;
+                    std.crypto.hash.sha2.Sha256.hash(value, &digest, .{});
+                    if (!std.mem.eql(u8, &digest, &hash)) return error.InvalidDocumentContentAuthority;
+                    field.value = value;
+                };
+                source.* = .{ .fields = item.fields };
+            }
+            self.window.bytes = retained;
+            self.next_cached += count;
+            return .{ .values = self.sources[0..count], .consumed = count };
         }
 
         pub fn lookup(self: *@This(), key: []const u8) ![]const u8 {

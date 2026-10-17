@@ -584,6 +584,10 @@ const OwnedRead = struct {
         page: Pull.BatchPage,
         fn cell(raw: *anyopaque, alloc: std.mem.Allocator, row: usize, column: usize) anyerror!wire.Cell {
             const self: *@This() = @ptrCast(@alignCast(raw));
+            if (try self.page.values.encodedJson(row, column)) |bytes| {
+                if (self.page.columns[column].type != .json) return error.InvalidSqlBackendResponse;
+                return .{ .json_bytes = bytes, .sql_null = false };
+            }
             const value = try self.page.values.cell(alloc, row, column);
             if (value.array) |array| {
                 const definition = self.page.columns[column];

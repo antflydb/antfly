@@ -267,6 +267,16 @@ pub const Projection = struct {
     /// hits validate every subtree/duplicate key while materializing selected
     /// root members only. Metadata overrides never mutate or copy the hit tree.
     pub fn projectSearch(self: Projection, alloc: std.mem.Allocator, scratch: std.mem.Allocator, layout: catalog.Row.TypedLayout, id: []const u8, source: SearchSource, metadata: SearchMetadata) !catalog.Row {
+        return self.projectSearchEncoded(alloc, scratch, layout, id, source, metadata, null);
+    }
+    /// Optional canonical JSON columns. Placeholder cells are private to the
+    /// native reader; ordinary cell access must parse that column on demand.
+    pub fn projectSearchEncoded(self: Projection, alloc: std.mem.Allocator, scratch: std.mem.Allocator, layout: catalog.Row.TypedLayout, id: []const u8, source: SearchSource, metadata: SearchMetadata, encoded: ?[]?[]const u8) !catalog.Row {
+        if (encoded) |slots| {
+            if (slots.len != self.columns.len) return error.InvalidSqlBackendResponse;
+            @memset(slots, null);
+        }
+
         if (layout.names.len != self.columns.len or self.next_source.len != self.columns.len) return error.InvalidSqlBackendResponse;
         const cells = try alloc.alloc(catalog.Row.Cell, self.columns.len);
         @memset(cells, .{});
@@ -278,6 +288,7 @@ pub const Projection = struct {
             scratch: std.mem.Allocator,
             cells: []catalog.Row.Cell,
             presence: []bool,
+            encoded: ?[]?[]const u8,
             fn put(target: *@This(), name: []const u8, value: Json) !void {
                 var slot = target.projection.source_slots.get(name) orelse return;
                 while (slot != std.math.maxInt(usize)) {
@@ -304,6 +315,20 @@ pub const Projection = struct {
                     }
                     break :blk true;
                 };
+                if (homogeneous and column.type == .json and target.encoded != null and std.mem.indexOfScalar(u8, "{[", std.mem.trim(u8, bytes, " \t\r\n")[0]) != null) {
+                    // The root scanner (or digest-bound directory) already
+                    // admitted this subtree, including duplicate keys. The raw
+                    // codec normalizes tokens without building a DOM.
+                    const owned = try @import("json_bytes.zig").fromValidated(target.alloc, target.scratch, bytes);
+                    var slot = first;
+                    while (slot != std.math.maxInt(usize)) {
+                        target.encoded.?[slot] = owned;
+                        target.cells[slot] = catalog.Row.Cell.json(.null);
+                        target.presence[slot] = true;
+                        slot = target.projection.next_source[slot];
+                    }
+                    return;
+                }
                 if (homogeneous and column.type == .array and !std.mem.eql(u8, std.mem.trim(u8, bytes, " \t\r\n"), "null")) {
                     const decoded = try @import("array_wire.zig").decodeBytesLeakyMeasured(target.alloc, column.element_type orelse return error.InvalidSqlBackendResponse, bytes, .{});
                     const value = try target.alloc.create(@import("array_value.zig").Value);
@@ -346,7 +371,7 @@ pub const Projection = struct {
                 try target.put(name, parsed.value);
             }
         };
-        var sink: Sink = .{ .projection = self, .alloc = alloc, .scratch = scratch, .cells = cells, .presence = presence };
+        var sink: Sink = .{ .projection = self, .alloc = alloc, .scratch = scratch, .cells = cells, .presence = presence, .encoded = encoded };
         switch (source) {
             // A revision-bound directory already validated the complete root;
             // range digests bind these selected fields to that immutable cut.
@@ -867,4 +892,27 @@ test "SQL projected range planner coalesces bounded spans and restores order" {
     for (requested, output) |range, value| try std.testing.expectEqualSlices(u8, source.bytes[@intCast(range.offset)..][0..range.length], value);
     try std.testing.expectEqual(output[0].ptr, output[2].ptr);
     try std.testing.expectError(error.EndOfStream, ranges.read(source.bytes.len, &.{.{ .offset = source.bytes.len, .length = 1 }}, output[0..1], &source));
+}
+
+test "SQL document encoded JSON projection preserves exact cells aliases depth and strict validation" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const table: catalog.Table = .{ .id = 1, .physical_name = "rows", .schema_version = 1, .columns = &.{ .{ .name = "j", .path = "payload", .type = .json }, .{ .name = "alias", .path = "payload", .type = .json }, .{ .name = "n", .path = "n", .type = .json } } };
+    const projection = try Projection.initSearch(a, table, &.{ "j", "alias", "n" });
+    const layout = try catalog.Row.TypedLayout.init(a, &.{ "j", "alias", "n" });
+    var encoded: [3]?[]const u8 = undefined;
+    const input = "{\"payload\": { \"x\": [9007199254740993,1e-3,\"\\u00e9\"], \"n\":null },\"n\":null}";
+    const result = try projection.projectSearchEncoded(a, a, layout, "key", .{ .bytes = input }, .{}, &encoded);
+    const legacy = try projection.projectSearch(a, a, layout, "key", .{ .bytes = input }, .{});
+    try std.testing.expectEqual(encoded[0].?.ptr, encoded[1].?.ptr);
+    try std.testing.expect(encoded[2] == null and !(try result.cell("n")).sql_null);
+    const expected = try std.json.Stringify.valueAlloc(a, (try legacy.cell("j")).value, .{});
+    try std.testing.expectEqualStrings(expected, encoded[0].?);
+    try std.testing.expectError(error.DuplicateField, projection.projectSearchEncoded(a, a, layout, "key", .{ .bytes = "{\"payload\":{\"x\":1,\"x\":2}}" }, .{}, &encoded));
+    const deep = try a.alloc(u8, 133);
+    @memset(deep[0..66], '[');
+    deep[66] = '0';
+    @memset(deep[67..], ']');
+    try std.testing.expectError(error.SqlProgramLimitExceeded, @import("json_bytes.zig").fromValidated(a, a, deep));
 }

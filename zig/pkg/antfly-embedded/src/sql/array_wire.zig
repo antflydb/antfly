@@ -456,7 +456,7 @@ fn decodeBytesImpl(a: A, kind: arrays.ElementType, input: []const u8, options: O
     var bytes: usize = @sizeOf(arrays.Value) + rank * @sizeOf(arrays.Dimension);
     if (bytes > options.values.bytes) return options.limit();
     const fixed = @import("array_compact.zig").supported(kind) and kind != .text;
-    var fixed_builder: @import("array_compact.zig").Builder = undefined;
+    var fixed_builder: @import("array_compact.zig").CheckedBuilder = undefined;
     if (fixed) {
         var flags = try RawArray.init(scratch, envelope.nulls orelse return error.InvalidSqlArrayShape);
         defer flags.deinit();
@@ -468,7 +468,7 @@ fn decodeBytesImpl(a: A, kind: arrays.ElementType, input: []const u8, options: O
             if (!try nullFlag(raw)) present += 1;
         }
         if (seen != count) return error.InvalidSqlArrayShape;
-        fixed_builder = try @import("array_compact.zig").Builder.init(a, kind, dimensions[0..rank], count, present, 0, options.values);
+        fixed_builder = try @import("array_compact.zig").CheckedBuilder.init(a, kind, dimensions[0..rank], count, present, 0, options.values);
     }
     var counter_buffer: [4096]u8 = undefined;
     var counter: std.Io.Writer.Discarding = .init(&counter_buffer);
@@ -508,10 +508,9 @@ fn decodeBytesImpl(a: A, kind: arrays.ElementType, input: []const u8, options: O
                     else => {},
                 };
                 const cell = try readElement(kind, value, flag);
-                _ = try arrays.Value.initWithBudget(kind, &.{.{ .length = 1 }}, &.{cell}, options.values, &work);
+                if (fixed) try fixed_builder.appendChecked(cell, kind, options.values, &work) else _ = try arrays.Value.initWithBudget(kind, &.{.{ .length = 1 }}, &.{cell}, options.values, &work);
                 bytes = std.math.add(usize, bytes, try operators.datumBytes(cell)) catch return options.limit();
                 if (!flag and kind == .text) text_bytes += cell.value.string.len;
-                if (fixed) try fixed_builder.append(cell);
             }
             if (!flag) non_null += 1;
             if (bytes > options.values.bytes) return options.limit();
