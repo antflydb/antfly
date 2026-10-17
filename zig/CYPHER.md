@@ -1349,6 +1349,16 @@ therefore do not force those consumers back into route enumeration. Mixing in a
 bag-sensitive COUNT/SUM/AVG requests exact weights through every scan adapter,
 including authenticated owner cursors; unsupported consumers keep ordinary rows.
 
+SQL global aggregates whose arguments depend on different endpoints can negotiate
+at most two dependency-specific weighted passes. Each page explicitly identifies
+its active aggregate slots; SQL evaluates only those arguments and FILTERs and
+updates the existing typed SQL accumulators. Each pass includes the shared WHERE
+and its own FILTER dependencies. Both passes retain one cursor, immutable read cut,
+authority checks, adjacency cache and cumulative work/memory quotas. Unsupported
+or coupled dependencies decline negotiation and preserve ordinary execution.
+Private tagged continuations keep partial pulls within one pass; they do not
+change the public graph continuation contract.
+
 Read phases share a bounded, quota-accounted cache of raw adjacency pages across
 anchors. Cache keys include mapping, direction, identity and continuation; each
 capture still applies its own property residuals and uniqueness proof. Admission
@@ -1388,6 +1398,16 @@ projections, filters and UNWIND, including alias shadowing and lexical locals.
 UNWIND preserves the incoming weight for each emitted list item. Intermediate
 DISTINCT deduplicates the projected keys globally and resets each surviving
 weight to one, so subsequent SUM/AVG need no exact upstream multiplicity.
+Before proving endpoint dependencies, a backwards, scope-aware liveness pass
+removes unused WITH bindings only when evaluating them is provably total: literals,
+variable reads and nullable node property reads. Dead arithmetic, function calls
+and parameter reads remain observable, preserving evaluation errors. DISTINCT
+keys remain live even when a later projection discards them. Lexical free-variable
+analysis visits each expression directly rather than rescanning it per alias.
+OPTIONAL MATCH uses the same compressed ALL-path bags and tracks whether each
+input actually matched before its downstream filters. An unmatched input emits
+one null-extended row; downstream filtering never creates a replacement row.
+This match marker is independent of saturated multiplicities and aggregate passes.
 Wildcard DISTINCT includes every binding in its dependency proof; observing
 an interior node or route retains exact production. Ordering, pagination,
 aggregation, writes and non-repeatable expressions remain pipeline barriers.

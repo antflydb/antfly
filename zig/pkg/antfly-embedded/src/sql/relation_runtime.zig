@@ -2114,6 +2114,7 @@ fn Engine(comptime Context: type) type {
             opened: bool = false,
             pending_failure: ?anyerror = null,
             weighted: bool = false,
+            partitioned: bool = false,
 
             fn iface(self: *Adapter) catalog.Backend {
                 return .{ .regex_execution = self.engine.context.backend.regex_execution, .scalar_control = self.engine.context.backend.scalar_control, .execution_io = self.engine.context.backend.execution_io, .spill_manager = self.engine.context.spill, .ptr = self, .decision_provider = self.engine.context.backend.decision_provider, .pinned_statement_snapshot = true, .vtable = &.{ .resolve = resolve, .scan = scan, .open_scan = open, .mutate = mutate, .checkpoint = Adapter.checkpoint, .aggregate_partials = openAggregatePartials } };
@@ -2189,6 +2190,27 @@ fn Engine(comptime Context: type) type {
                 self.weighted = if (cursor.enable_weights) |enable| try enable(cursor.ptr, multiplicity) else false;
                 return self.weighted;
             }
+            fn enableAggregateWeights(ptr: *anyopaque, requests: []const catalog.AggregateWeight) !bool {
+                const self: *Adapter = @ptrCast(@alignCast(ptr));
+                if (self.ordinal != 0 or self.pending_failure != null or self.iterator.pages != 0 or self.iterator.apply_mode or self.iterator.recursive_id != null or self.iterator.node.operation != .scan) return false;
+                const source = self.iterator.node.operation.scan;
+                const cursor = self.engine.cursors[source.index];
+                const enable = cursor.enable_aggregate_weights orelse return false;
+                const a = self.engine.context.arena;
+                const mapped = try a.alloc(catalog.AggregateWeight, requests.len);
+                for (requests, mapped) |request, *out| {
+                    const fields = try a.alloc([]const u8, request.fields.len);
+                    for (request.fields, fields) |field, *name| {
+                        name.* = for (self.iterator.node.columns, source.source_columns) |column, physical| {
+                            if (std.mem.eql(u8, field, column.internal)) break physical;
+                        } else return false;
+                    }
+                    out.* = .{ .fields = fields, .multiplicity = request.multiplicity };
+                }
+                self.partitioned = try enable(cursor.ptr, mapped);
+                self.weighted = self.partitioned;
+                return self.partitioned;
+            }
             fn nextWeighted(self: *Adapter, a: Allocator, limit: u32) !catalog.Page {
                 const scan_source = self.iterator.node.operation.scan;
                 const cursor = self.engine.cursors[scan_source.index];
@@ -2214,7 +2236,7 @@ fn Engine(comptime Context: type) type {
                     self.ordinal += 1;
                     out.* = try catalog.Row.fromDatums(a, try std.fmt.allocPrint(a, "{d}", .{self.ordinal}), layout, values);
                 }
-                return .{ .rows = rows, .multiplicities = try a.dupe(u64, weights), .after = if (page.after) |after| try a.dupe(u8, after) else null };
+                return .{ .rows = rows, .multiplicities = try a.dupe(u64, weights), .aggregate_slots = if (page.aggregate_slots) |slots| if (self.partitioned) try a.dupe(usize, slots) else return error.InvalidSqlBackendResponse else if (self.partitioned) return error.InvalidSqlBackendResponse else null, .after = if (page.after) |after| try a.dupe(u8, after) else null };
             }
             fn countRows(ptr: *anyopaque) !?u64 {
                 const self: *Adapter = @ptrCast(@alignCast(ptr));
@@ -2230,7 +2252,7 @@ fn Engine(comptime Context: type) type {
                 const self: *Adapter = @ptrCast(@alignCast(ptr));
                 if (self.opened) return error.InvalidSqlBackendResponse;
                 self.opened = true;
-                return .{ .ptr = self, .next = next, .next_columns = if (hasPatterns(self.iterator.node, 0)) null else nextColumns, .count_rows = countRows, .enable_weights = enableWeights, .close = close };
+                return .{ .ptr = self, .next = next, .next_columns = if (hasPatterns(self.iterator.node, 0)) null else nextColumns, .count_rows = countRows, .enable_weights = enableWeights, .enable_aggregate_weights = enableAggregateWeights, .close = close };
             }
             fn close(_: *anyopaque) void {}
             fn next(ptr: *anyopaque, alloc: Allocator, limit: u32) !catalog.Page {
@@ -2322,6 +2344,10 @@ fn Source(comptime Context: type) type {
             const self: *Self = @ptrCast(@alignCast(raw));
             return Engine(Context).Adapter.enableWeights(&self.adapter, multiplicity);
         }
+        fn enableAggregateWeights(raw: *anyopaque, requests: []const catalog.AggregateWeight) !bool {
+            const self: *Self = @ptrCast(@alignCast(raw));
+            return Engine(Context).Adapter.enableAggregateWeights(&self.adapter, requests);
+        }
         fn countRows(raw: *anyopaque) !?u64 {
             const self: *Self = @ptrCast(@alignCast(raw));
             return Engine(Context).Adapter.countRows(&self.adapter);
@@ -2335,7 +2361,7 @@ fn Source(comptime Context: type) type {
 
 pub fn openCursor(context: anytype) !catalog.Cursor {
     const owner = try Source(@TypeOf(context)).create(context);
-    return .{ .ptr = owner, .next = @TypeOf(owner.*).next, .next_columns = if (Engine(@TypeOf(context)).Adapter.hasPatterns(owner.iterator.?.node, 0)) null else @TypeOf(owner.*).nextColumns, .count_rows = @TypeOf(owner.*).countRows, .enable_weights = @TypeOf(owner.*).enableWeights, .close = @TypeOf(owner.*).closeCursor };
+    return .{ .ptr = owner, .next = @TypeOf(owner.*).next, .next_columns = if (Engine(@TypeOf(context)).Adapter.hasPatterns(owner.iterator.?.node, 0)) null else @TypeOf(owner.*).nextColumns, .count_rows = @TypeOf(owner.*).countRows, .enable_weights = @TypeOf(owner.*).enableWeights, .enable_aggregate_weights = @TypeOf(owner.*).enableAggregateWeights, .close = @TypeOf(owner.*).closeCursor };
 }
 
 pub fn execute(context: anytype) anyerror!@import("runtime.zig").Output {

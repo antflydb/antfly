@@ -1425,6 +1425,8 @@ pub const Adapter = struct {
                 .set_dynamic_filter = if (child.set_dynamic_filter != null) setDynamicFilter else null,
                 .wants_exact_filter = if (child.wants_exact_filter != null) wantsExactFilter else null,
                 .count_rows = if (child.count_rows != null) countRows else null,
+                .enable_weights = if (child.enable_weights != null) enableWeights else null,
+                .enable_aggregate_weights = if (child.enable_aggregate_weights != null) enableAggregateWeights else null,
                 // Cursor's contract keeps children inside their parent's lifetime.
                 // The statement therefore pins their shared source until close.
                 .split_scan = if (child.split_scan != null) splitScan else null,
@@ -1439,6 +1441,16 @@ pub const Adapter = struct {
             const self: *@This() = @ptrCast(@alignCast(raw));
             const child = self.statement.cursors[0];
             return child.count_rows.?(child.ptr);
+        }
+        fn enableWeights(raw: *anyopaque, multiplicity: catalog.Multiplicity) !bool {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const child = self.statement.cursors[0];
+            return child.enable_weights.?(child.ptr, multiplicity);
+        }
+        fn enableAggregateWeights(raw: *anyopaque, requests: []const catalog.AggregateWeight) !bool {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const child = self.statement.cursors[0];
+            return child.enable_aggregate_weights.?(child.ptr, requests);
         }
         fn splitScan(raw: *anyopaque, alloc: std.mem.Allocator, maximum: usize) !?[]catalog.Cursor {
             const self: *@This() = @ptrCast(@alignCast(raw));
@@ -1673,6 +1685,16 @@ pub const Adapter = struct {
             try self.validate(arena.allocator());
             return enabled;
         }
+        fn enableAggregateWeights(ptr: *anyopaque, requests: []const catalog.AggregateWeight) !bool {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            const enable = self.child.enable_aggregate_weights orelse return false;
+            var arena = std.heap.ArenaAllocator.init(self.a);
+            defer arena.deinit();
+            try self.validate(arena.allocator());
+            const enabled = try enable(self.child.ptr, requests);
+            try self.validate(arena.allocator());
+            return enabled;
+        }
         fn countRows(ptr: *anyopaque) !?u64 {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             const count_rows = self.child.count_rows orelse return null;
@@ -1848,7 +1870,7 @@ pub const Adapter = struct {
             errdefer child.close(child.ptr);
             const wrapper = try a.create(GraphStatementCursor);
             wrapper.* = .{ .a = a, .adapter = self, .table = request.table, .child = child, .owner = owner };
-            out.* = .{ .ptr = wrapper, .next = GraphStatementCursor.next, .close = GraphStatementCursor.close, .count_rows = if (child.count_rows != null) GraphStatementCursor.countRows else null, .enable_weights = if (child.enable_weights != null) GraphStatementCursor.enableWeights else null };
+            out.* = .{ .ptr = wrapper, .next = GraphStatementCursor.next, .close = GraphStatementCursor.close, .count_rows = if (child.count_rows != null) GraphStatementCursor.countRows else null, .enable_weights = if (child.enable_weights != null) GraphStatementCursor.enableWeights else null, .enable_aggregate_weights = if (child.enable_aggregate_weights != null) GraphStatementCursor.enableAggregateWeights else null };
             owner.opened += 1;
         }
         // All allocations through the local arena must finish before its

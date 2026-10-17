@@ -33,12 +33,16 @@ fn addWeightedRow(context: anytype, bound: *const binding.Bound, grouped: anytyp
 }
 
 fn addCells(context: anytype, bound: *const binding.Bound, grouped: anytype, alloc: std.mem.Allocator, cells: []const Datum, weight: u64) !void {
+    return addCellsMasked(context, bound, grouped, alloc, cells, weight, null);
+}
+fn addCellsMasked(context: anytype, bound: *const binding.Bound, grouped: anytype, alloc: std.mem.Allocator, cells: []const Datum, weight: u64, active: ?[]const usize) !void {
     if (!try bound.input.matchesWithLimits(alloc, cells, context.parameters, context.backend.decision_provider, @import("decision_eval.zig").limitsFor(context.backend))) return;
     const values = try alloc.alloc(Datum, bound.group_count);
     for (bound.input.projections[0..bound.group_count], values) |program, *value| value.* = try context.evaluate(alloc, program.?, cells);
     const inputs = try alloc.alloc(Datum, bound.inputs.len);
-    for (bound.inputs, bound.filters, inputs) |index, filter, *value| {
+    for (bound.inputs, bound.filters, inputs, 0..) |index, filter, *value, aggregate_index| {
         value.* = .{};
+        if (active) |slots| if (std.mem.indexOfScalar(usize, slots, aggregate_index) == null) continue;
         if (filter) |slot| {
             const test_value = try context.evaluate(alloc, bound.input.projections[slot].?, cells);
             if (test_value.sql_null) continue;
@@ -371,6 +375,28 @@ fn multiplicity(bound: *const binding.Bound) catalog.Multiplicity {
     return .presence;
 }
 
+fn aggregateRequests(a: std.mem.Allocator, bound: *const binding.Bound, table: catalog.Table, conditions: []const catalog.Condition) ![]const catalog.AggregateWeight {
+    const requests = try a.alloc(catalog.AggregateWeight, bound.specs.len);
+    for (bound.specs, bound.inputs, bound.filters, requests) |spec, input, filter, *request| {
+        var fields: std.StringHashMapUnmanaged(void) = .empty;
+        for (conditions) |condition| try fields.put(a, condition.column, {});
+        const programs = [_]?scalar.Program{
+            bound.input.predicate,
+            if (input) |slot| bound.input.projections[slot] else null,
+            if (filter) |slot| bound.input.projections[slot] else null,
+        };
+        for (programs) |optional| if (optional) |program| for (program.required_columns) |ordinal| {
+            try fields.put(a, (try table.column(bound.input.columns[ordinal].name)).path, {});
+        };
+        var names: std.ArrayList([]const u8) = .empty;
+        var keys = fields.keyIterator();
+        while (keys.next()) |key| try names.append(a, key.*);
+        const presence = spec.distinct or spec.kind == .min or spec.kind == .max or spec.kind == .bool_and or spec.kind == .bool_or;
+        request.* = .{ .fields = names.items, .multiplicity = if (presence) .presence else .exact };
+    }
+    return requests;
+}
+
 pub fn execute(context: anytype, statement: ast.Select) !@import("runtime.zig").Output {
     const bound = context.binding.aggregate orelse return error.InvalidSqlBackendResponse;
     if (context.invocation_constants.len != bound.constant_count) return error.InvalidSqlBackendResponse;
@@ -417,8 +443,10 @@ pub fn execute(context: anytype, statement: ast.Select) !@import("runtime.zig").
             try grouped.addGlobalCount(count);
             aggregate_loaded = true;
         };
-        const weighted = !aggregate_loaded and !predicates.empty and !external and supportsWeights(bound) and
-            try scan.weights(context, table, .{ .fields = fields[0..field_count], .primary_key = predicates.primary_key, .conditions = predicates.terms.items, .limit = context.limits.page_rows }, multiplicity(bound));
+        const can_weight = !aggregate_loaded and !predicates.empty and !external and supportsWeights(bound);
+        const partitioned = can_weight and bound.group_count == 0 and bound.specs.len > 1 and
+            try scan.aggregateWeights(context, table, .{ .fields = fields[0..field_count], .primary_key = predicates.primary_key, .conditions = predicates.terms.items, .limit = context.limits.page_rows }, try aggregateRequests(context.arena, bound, table, predicates.terms.items));
+        const weighted = partitioned or (can_weight and try scan.weights(context, table, .{ .fields = fields[0..field_count], .primary_key = predicates.primary_key, .conditions = predicates.terms.items, .limit = context.limits.page_rows }, multiplicity(bound)));
         const parallel = !weighted and bound.ordered.len == 0 and !external and !predicates.empty and !aggregate_loaded and try @import("parallel_aggregate.zig").execute(context, bound, grouped, &scan, table, .{ .fields = fields[0..field_count], .primary_key = predicates.primary_key, .conditions = predicates.terms.items, .limit = context.limits.executionRows() });
         while (!predicates.empty and !aggregate_loaded and !parallel) {
             try context.checkpoint();
@@ -443,6 +471,12 @@ pub fn execute(context: anytype, statement: ast.Select) !@import("runtime.zig").
             defer page.deinit();
             if (page.rows.len > context.limits.page_rows) return error.InvalidSqlBackendResponse;
             if (page.multiplicities) |weights| if (!weighted or weights.len != page.rows.len) return error.InvalidSqlBackendResponse;
+            if (page.aggregate_slots) |slots| {
+                if (!partitioned or slots.len == 0 or page.multiplicities == null) return error.InvalidSqlBackendResponse;
+                for (slots, 0..) |slot, i| {
+                    if (slot >= bound.specs.len or std.mem.indexOfScalar(usize, slots[0..i], slot) != null) return error.InvalidSqlBackendResponse;
+                }
+            } else if (partitioned) return error.InvalidSqlBackendResponse;
             if (visited + page.rows.len > context.limits.scan_rows) return error.SqlProgramLimitExceeded;
             if (external) {
                 visited += page.rows.len;
@@ -459,7 +493,8 @@ pub fn execute(context: anytype, statement: ast.Select) !@import("runtime.zig").
                 try context.checkpoint();
                 visited += 1;
                 if (visited > context.limits.scan_rows) return error.SqlProgramLimitExceeded;
-                try addWeightedRow(context, bound, &collector, arena.allocator(), row, if (page.multiplicities) |weights| weights[row_index] else 1);
+                const cells = try bound.input.cells(arena.allocator(), row);
+                try addCellsMasked(context, bound, &collector, arena.allocator(), cells, if (page.multiplicities) |weights| weights[row_index] else 1, page.aggregate_slots);
             }
             const next = page.after orelse break;
             if (!scan.retained(context)) return error.SqlStatementSnapshotRequired;

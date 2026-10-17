@@ -21,6 +21,7 @@ import subprocess
 import sys
 import time
 import uuid
+from math import comb
 from pathlib import Path
 
 import conftest
@@ -418,6 +419,49 @@ def test_authenticated_cypher_property_plans_and_sql_overlays(monkeypatch):
         )
         assert weighted_sql["rows"] == [["497250", "6", "17", "138"]], weighted_sql
         assert time.monotonic() - start < 10
+        mixed_statement = (
+            f"SELECT sum(q.s),sum(q.e),count(*),avg(q.s),avg(q.e) "
+            f"FROM GRAPH_TABLE({hops} MATCH {path} "
+            "COLUMNS(a.score AS s,b.score AS e)) q"
+        )
+        root_sum = sum(i * comb(17 - i, 6) for i in range(12))
+        mixed_sql = call("/sql", {"statement": mixed_statement})
+        assert mixed_sql["rows"][0][:3] == [str(root_sum), "497250", "31824"], mixed_sql
+        # Exercise the same negotiated cursor behind the pgwire authority guard.
+        pgwire = subprocess.run(
+            [
+                "/opt/homebrew/opt/postgresql@18/bin/psql",
+                f"host=127.0.0.1 port={server.pgwire_port} user=admin dbname=default sslmode=disable",
+                "-X",
+                "-At",
+                "-v",
+                "ON_ERROR_STOP=1",
+            ],
+            input=mixed_statement + ";",
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=45,
+            env={**os.environ, "PGPASSWORD": AUTH_BOOTSTRAP_PASSWORD},
+        )
+        assert pgwire.returncode == 0, pgwire.stderr
+        assert pgwire.stdout.strip().split("|")[:3] == [
+            str(root_sum),
+            "497250",
+            "31824",
+        ]
+        optional = call(
+            f"/graphs/{hops}/query",
+            {
+                "query": "OPTIONAL MATCH (a:H)-[:R*6..6]->(b:H) RETURN count(*),sum(b.score),min(b.score)",
+                "limits": {"explored_edges": 153, "intermediate_states": 20000},
+            },
+        )
+        assert [cell["value"] for cell in optional["rows"][0]] == [
+            "31824",
+            "497250",
+            "6",
+        ], optional
         start = time.monotonic()
         computed_sql = call(
             "/sql",
@@ -452,6 +496,8 @@ def test_authenticated_cypher_property_plans_and_sql_overlays(monkeypatch):
         )
         for tail, expected in (
             ("WITH b RETURN count(*),sum(b.score)", ["31824", "497250"]),
+            ("WITH a,b RETURN count(*),sum(b.score)", ["31824", "497250"]),
+            ("WITH a.id AS dead,b RETURN count(*),sum(b.score)", ["31824", "497250"]),
             ("WITH b.score AS score RETURN count(*),sum(score)", ["31824", "497250"]),
             ("WITH DISTINCT b RETURN count(*),sum(b.score)", ["12", "138"]),
             (

@@ -120,6 +120,62 @@ pub const NodeCursor = struct {
     pending: std.ArrayList(struct { row: Row, weight: u64 }) = .empty,
     pending_position: usize = 0,
     last_weights: std.ArrayList(u64) = .empty,
+    pub const WeightPlan = struct { path: ast.Path, projection: ast.Projection, multiplicity: Multiplicity };
+    /// Plan a projected endpoint bag without advancing or rebinding the read
+    /// cut. Plans and their AST storage belong to this cursor.
+    pub fn planWeightFields(self: *NodeCursor, fields: []const []const u8, multiplicity: Multiplicity) !?WeightPlan {
+        if (self.started or self.done or self.exact_count != null) return null;
+        const operation = self.query.clauses[0].operation.match;
+        if (operation.paths.len != 1 or self.interior_anchors[0] != 0) return null;
+        const path = operation.paths[0];
+        if (path.edges.len == 0 or path.execution_prefix) return null;
+        if (path.edges.len == 1 and path.edges[0].min_hops == 1 and path.edges[0].max_hops == 1) return null;
+        var projection = self.query.clauses[1].operation.project.value;
+        var items: std.ArrayList(ast.Item) = .empty;
+        for (projection.items) |item| {
+            const name = item.alias orelse try self.engine.expressionName(item.expression);
+            for (fields) |field| if (std.mem.eql(u8, name, field)) {
+                try items.append(self.engine.a, item);
+                break;
+            };
+        }
+        if (items.items.len != fields.len) return null;
+        if (items.items.len == 0) {
+            const one = try self.engine.a.create(ast.Expr);
+            one.* = .{ .span = .{}, .value = .{ .literal = .{ .integer = 1 } } };
+            try items.append(self.engine.a, .{ .expression = one, .alias = "_antfly_weight" });
+        }
+        projection.items = items.items;
+        try self.engine.state();
+        const planned = try self.engine.reductionPath(path, &.{}, operation, projection, &.{});
+        if (!try self.engine.batchEligible(planned, &.{}, operation, projection, &.{})) return null;
+        return .{ .path = planned, .projection = projection, .multiplicity = multiplicity };
+    }
+    /// Serial aggregate passes share every quota, backend capability and raw
+    /// adjacency page. Exhaust the preceding pass before changing its shape.
+    pub fn startWeightPlan(self: *NodeCursor, plan: WeightPlan) !void {
+        if (self.started and !self.done) return error.CypherInvalidBackendPage;
+        if (self.frames.items.len != 0) return error.CypherInvalidBackendPage;
+        if (self.weighted_seeds) |*seeds| if (seeds.arena) |*arena| arena.deinit();
+        self.weighted_seeds = null;
+        self.fallback_seed = null;
+        _ = self.weighted_arena.reset(.retain_capacity);
+        self.pending = .empty;
+        self.pending_position = 0;
+        self.last_weights = .empty;
+        self.started = false;
+        self.done = false;
+        const clauses = try self.engine.a.dupe(ast.Clause, self.query.clauses);
+        clauses[0].operation.match.paths = try self.engine.a.dupe(ast.Path, &.{plan.path});
+        clauses[1].operation.project.value = plan.projection;
+        self.query.clauses = clauses;
+        const columns = try self.engine.a.alloc([]const u8, plan.projection.items.len);
+        for (plan.projection.items, columns) |item, *name| name.* = item.alias orelse try self.engine.expressionName(item.expression);
+        self.columns = columns;
+        self.weighted = true;
+        self.multiplicity = plan.multiplicity;
+        self.weighted_seeds = .{ .path = plan.path, .input = .{ .row = &.{} }, .mode = clauses[0].operation.match.mode, .budget = .{ .backing = self.budget.allocator(), .limit = @min(8 << 20, self.engine.limits.memory_bytes / 16) } };
+    }
     /// Negotiate endpoint bags before the first pull. Route-observing queries
     /// retain the ordinary cursor; every declined per-anchor proof does too.
     pub fn enableWeights(self: *NodeCursor, multiplicity: Multiplicity) !bool {
@@ -1135,16 +1191,14 @@ const Engine = struct {
         matched: *usize,
         distinct: []DistinctRows,
         distinct_goal: ?usize = null,
-        accepted: usize = 0,
+        had_match: bool = false,
         weight: u64 = 1,
         active_calls: ?[]const bool = null,
         record_rows: bool = true,
         fn add(fold: *@This(), engine: *Engine, initial: Row) anyerror!void {
             const weight = std.math.cast(usize, fold.weight) orelse std.math.maxInt(usize);
-            if (fold.record_rows) {
-                fold.accepted +|= weight;
-                fold.stage_counts[0] +|= weight;
-            }
+            fold.had_match = true;
+            if (fold.record_rows) fold.stage_counts[0] +|= weight;
             return fold.expand(engine, initial, 0);
         }
         fn expand(fold: *@This(), engine: *Engine, row: Row, index: usize) anyerror!void {
@@ -1219,6 +1273,129 @@ const Engine = struct {
             return 128;
         }
     };
+    const Names = std.StringHashMapUnmanaged(void);
+    fn retainReferences(self: *Engine, names: *Names, candidates: Row, expression: *const ast.Expr) !void {
+        const Visitor = struct {
+            engine: *Engine,
+            names: *Names,
+            candidates: Row,
+            pub fn reference(visitor: @This(), name: []const u8) !void {
+                try chargeWork(visitor.engine, 1);
+                try visitor.names.put(visitor.engine.a, name, {});
+            }
+            pub fn pattern(visitor: @This()) !void {
+                for (visitor.candidates) |entry| try visitor.reference(entry.name);
+            }
+        };
+        try @import("expressions.zig").visitFree(expression, Visitor{ .engine = self, .names = names, .candidates = candidates });
+    }
+    fn discardable(expression: *const ast.Expr, node_shape: Row) bool {
+        return switch (expression.value) {
+            .literal, .variable => true,
+            .property => |p| p.base.value == .variable and blk: {
+                const node = lookup(node_shape, p.base.value.variable) orelse break :blk false;
+                break :blk node.boolean;
+            },
+            else => false,
+        };
+    }
+    /// Backward liveness may discard only total, side-effect-free reads. Keep
+    /// expressions which could raise an error, even when their result is dead.
+    /// DISTINCT retains all of its keys. Forward node lineage proves that a
+    /// nullable entity property read is total without guessing scalar types.
+    fn pruneMiddle(self: *Engine, input: []const Row, operation: ast.Match, middle: []const ast.Clause, projection: ast.Projection) ![]const ast.Clause {
+        if (middle.len == 0) return middle;
+        var shape: Row = &.{};
+        if (input.len != 0) for (input[0]) |entry| {
+            shape = try self.replace(shape, entry.name, .{ .boolean = false });
+        };
+        for (operation.paths) |path| {
+            for (path.nodes) |node| if (node.alias) |alias| {
+                shape = try self.replace(shape, alias, .{ .boolean = true });
+            };
+            for (path.edges) |edge| if (edge.alias) |alias| {
+                shape = try self.replace(shape, alias, .{ .boolean = false });
+            };
+            if (path.alias) |alias| {
+                shape = try self.replace(shape, alias, .{ .boolean = false });
+            }
+        }
+        var candidates = shape;
+        const shapes = try self.a.alloc(Row, middle.len);
+        for (middle, 0..) |clause, i| {
+            shapes[i] = shape;
+            switch (clause.operation) {
+                .project => |p| {
+                    if (p.value.order.len != 0 or p.value.skip != null or p.value.limit != null) return middle;
+                    var next: Row = if (p.value.wildcard) shape else &.{};
+                    for (p.value.items) |item| {
+                        if (aggregates(item.expression) or @import("expressions.zig").containsPattern(item.expression)) return middle;
+                        const name = item.alias orelse try self.expressionName(item.expression);
+                        const is_node = item.expression.value == .variable and (lookup(shape, item.expression.value.variable) orelse v.Value{ .boolean = false }).boolean;
+                        next = try self.replace(next, name, .{ .boolean = is_node });
+                        candidates = try self.replace(candidates, name, .{ .boolean = false });
+                    }
+                    shape = next;
+                },
+                .unwind => |u| {
+                    shape = try self.replace(shape, u.alias, .{ .boolean = false });
+                    candidates = try self.replace(candidates, u.alias, .{ .boolean = false });
+                },
+                else => return middle,
+            }
+        }
+        var live: Names = .empty;
+        if (projection.wildcard) for (shape) |entry| {
+            try live.put(self.a, entry.name, {});
+        };
+        for (projection.items) |item| try self.retainReferences(&live, candidates, item.expression);
+        for (projection.order) |order| try self.retainReferences(&live, candidates, order.expression);
+        if (projection.predicate) |predicate| try self.retainReferences(&live, candidates, predicate);
+        const output = try self.a.dupe(ast.Clause, middle);
+        var index = middle.len;
+        while (index != 0) {
+            index -= 1;
+            switch (middle[index].operation) {
+                .unwind => |u| {
+                    _ = live.remove(u.alias);
+                    try self.retainReferences(&live, candidates, u.expression);
+                },
+                .project => |p| {
+                    if (p.value.predicate) |predicate| try self.retainReferences(&live, candidates, predicate);
+                    var kept: std.ArrayList(ast.Item) = .empty;
+                    var previous: Names = if (p.value.wildcard) try live.clone(self.a) else .empty;
+                    if (p.value.distinct and p.value.wildcard) for (shapes[index]) |entry| {
+                        try previous.put(self.a, entry.name, {});
+                    };
+                    for (p.value.items) |item| {
+                        const name = item.alias orelse try self.expressionName(item.expression);
+                        _ = previous.remove(name);
+                        if (p.value.distinct or live.contains(name) or !discardable(item.expression, shapes[index])) {
+                            try kept.append(self.a, item);
+                        }
+                    }
+                    // Predicate aliases resolve to projected expressions; other
+                    // names retain access to the source scope.
+                    if (p.value.predicate) |predicate| {
+                        var references: Names = .empty;
+                        try self.retainReferences(&references, candidates, predicate);
+                        var keys = references.keyIterator();
+                        while (keys.next()) |name| {
+                            const projected = for (p.value.items) |item| {
+                                if (std.mem.eql(u8, item.alias orelse try self.expressionName(item.expression), name.*)) break true;
+                            } else false;
+                            if (!projected) try previous.put(self.a, name.*, {});
+                        }
+                    }
+                    for (kept.items) |item| try self.retainReferences(&previous, candidates, item.expression);
+                    output[index].operation.project.value.items = kept.items;
+                    live = previous;
+                },
+                else => unreachable,
+            }
+        }
+        return output;
+    }
     const ReductionPass = struct { projection: ast.Projection, active_calls: ?[]const bool = null };
     /// Partition independent aggregate calls by their efficient orientation.
     /// Every pass consumes the same immutable bag; the original expressions
@@ -1257,10 +1434,10 @@ const Engine = struct {
         for (passes, items, active) |*pass, group, mask| pass.* = .{ .projection = .{ .items = group.items }, .active_calls = mask };
         return passes;
     }
-    fn streamMatchProjection(self: *Engine, input: []const Row, operation: ast.Match, projection: ast.Projection, middle: []const ast.Clause, match_span: ast.Span, projection_span: ast.Span) anyerror!?[]const Row {
+    fn streamMatchProjection(self: *Engine, input: []const Row, operation: ast.Match, projection: ast.Projection, original_middle: []const ast.Clause, match_span: ast.Span, projection_span: ast.Span) anyerror!?[]const Row {
         // The row pipeline nests only within the statement's stack allowance.
         // Longer clause sequences retain the iterative general executor.
-        if (middle.len > self.limits.recursion_depth -| self.recursion) return null;
+        if (original_middle.len > self.limits.recursion_depth -| self.recursion) return null;
         if (operation.paths.len == 0) return null;
         if (operation.paths.len > 1) for (operation.paths) |candidate| if (candidate.selector != .all) return null;
         const path = operation.paths[0];
@@ -1273,6 +1450,7 @@ const Engine = struct {
                 if (@import("expressions.zig").containsPattern(entry.value)) return null;
             };
         }
+        const middle = try self.pruneMiddle(input, operation, original_middle, projection);
         var grouped = projection.distinct;
         for (projection.items) |item| {
             grouped = grouped or aggregates(item.expression);
@@ -1326,7 +1504,7 @@ const Engine = struct {
             for (calls.items) |expression| if (expression.value.call.distinct or !expression.value.call.star or !std.ascii.eqlIgnoreCase(expression.value.call.name, "count")) break :blk false;
             break :blk true;
         };
-        const count_endpoints = !count_shortest and !operation.optional and operation.paths.len == 1 and path.selector == .all and grouped and blk: {
+        const count_endpoints = !count_shortest and operation.paths.len == 1 and path.selector == .all and grouped and blk: {
             // Unordered DISTINCT with a row goal can finish after one route.
             // Preserve that demand rather than capturing the whole closure.
             if (calls.items.len == 0 and projection.order.len == 0 and projection.predicate == null and projection.limit != null) break :blk false;
@@ -1444,7 +1622,7 @@ const Engine = struct {
                 const scope = EvalScope.enter(self, scratch.allocator());
                 defer scope.leave(self);
                 var ignored: std.ArrayList(MatchState) = .empty;
-                const accepted_before = fold.accepted;
+                fold.had_match = false;
                 var count_paths: u64 = 0;
                 self.shortest_count = if (count_shortest) &count_paths else null;
                 const planned_path = if (count_shortest or count_endpoints) try self.reductionPath(path, row, operation, pass.projection, middle) else path;
@@ -1460,7 +1638,7 @@ const Engine = struct {
                     else => return err,
                 };
                 try batch.flush(self, &ignored);
-                if (operation.optional and fold.accepted == accepted_before) {
+                if (operation.optional and !fold.had_match) {
                     var extended = row;
                     for (self.match_aliases) |alias| if (lookup(extended, alias) == null) {
                         extended = (try self.bind(extended, alias, .null)).?;

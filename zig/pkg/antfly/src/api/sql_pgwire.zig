@@ -1283,6 +1283,20 @@ const GuardedCatalog = struct {
             try self.checkAuthority();
             return self.inner.count_rows.?(self.inner.ptr);
         }
+        fn enableWeights(raw: *anyopaque, multiplicity: catalog.Multiplicity) !bool {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try self.checkAuthority();
+            const enabled = try self.inner.enable_weights.?(self.inner.ptr, multiplicity);
+            try self.checkAuthority();
+            return enabled;
+        }
+        fn enableAggregateWeights(raw: *anyopaque, requests: []const catalog.AggregateWeight) !bool {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try self.checkAuthority();
+            const enabled = try self.inner.enable_aggregate_weights.?(self.inner.ptr, requests);
+            try self.checkAuthority();
+            return enabled;
+        }
         fn wantsExactFilter(raw: *anyopaque, columns: []const @import("antfly_local_sources").sql_dynamic_filter.Column) !bool {
             const self: *@This() = @ptrCast(@alignCast(raw));
             try self.guard.checkRead(self.table);
@@ -1331,6 +1345,8 @@ const GuardedCatalog = struct {
                 .close = release,
                 .next_columns = if (self.inner.next_columns != null) nextColumns else null,
                 .count_rows = if (self.inner.count_rows != null) countRows else null,
+                .enable_weights = if (self.inner.enable_weights != null) enableWeights else null,
+                .enable_aggregate_weights = if (self.inner.enable_aggregate_weights != null) enableAggregateWeights else null,
                 .set_dynamic_filter = if (self.inner.set_dynamic_filter != null) setDynamicFilter else null,
                 .wants_exact_filter = if (self.inner.wants_exact_filter != null) wantsExactFilter else null,
                 .split_scan = if (self.inner.split_scan != null) splitScan else null,

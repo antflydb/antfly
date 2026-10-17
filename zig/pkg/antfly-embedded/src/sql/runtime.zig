@@ -302,6 +302,11 @@ pub const Context = struct {
             if (self.cursor) |cursor| if (cursor.enable_weights) |enable| return enable(cursor.ptr, multiplicity);
             return false;
         }
+        pub fn aggregateWeights(self: *ScanState, context: Context, table: catalog.Table, request: catalog.Scan, aggregates: []const catalog.AggregateWeight) !bool {
+            try self.open(context, table, request);
+            if (self.cursor) |cursor| if (cursor.enable_aggregate_weights) |enable| return enable(cursor.ptr, aggregates);
+            return false;
+        }
         pub fn columns(self: *ScanState, context: Context, alloc: std.mem.Allocator, table: catalog.Table, request: catalog.Scan) !?catalog.ColumnPage {
             try self.open(context, table, request);
             if (self.cursor) |cursor| if (cursor.next_columns) |next| return try next(cursor.ptr, alloc, request.limit);

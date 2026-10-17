@@ -1440,6 +1440,14 @@ def test_presence_reductions_do_not_enumerate_or_require_exact_path_counts(graph
         assert [[cell.get("value") for cell in row] for row in result["rows"]] == [values]
         assert result["stats"]["explored_edges"] == 254
         assert result["stats"]["intermediate_states"] < 5000
+    optional = db.cypher_json(
+        "g",
+        {
+            "query": "OPTIONAL MATCH (s:D {id:'start'})-[:R*64..64]->(b:D) RETURN min(b.score),count(DISTINCT b)",
+            "limits": {"intermediate_states": 10000, "explored_edges": 300},
+        },
+    )
+    assert [cell.get("value") for cell in optional["rows"][0]] == ["64", "2"]
     early = db.cypher_json(
         "g",
         {
@@ -1519,6 +1527,22 @@ def test_pure_endpoint_expressions_keep_compressed_bags(graph_db):
             },
         )
         assert [cell["value"] for cell in result["rows"][0]] == [str(value) for value in expected]
+    for predicate, expected in (
+        ("", [paths, paths, total, 6]),
+        (" WHERE false", [1, 0, 0, None]),
+    ):
+        optional = db.cypher_json(
+            "g",
+            {
+                "query": "OPTIONAL MATCH (a:D)-[:R*6..6]->(b:D)"
+                + predicate
+                + " RETURN count(*),count(b),sum(b.score),min(b.score)",
+                "limits": {"intermediate_states": 10000, "explored_edges": 120},
+            },
+        )
+        assert [cell.get("value") for cell in optional["rows"][0]] == [
+            str(value) if value is not None else None for value in expected
+        ]
     distinct = db.cypher_json(
         "g",
         {
@@ -1538,6 +1562,40 @@ def test_pure_endpoint_expressions_keep_compressed_bags(graph_db):
     )
     assert result["rows"] == [["6"]]
     assert time.monotonic() - start < 5
+    mixed_relation = f"GRAPH_TABLE(g MATCH {path} COLUMNS(a.score AS s,b.score AS e)) q"
+    start_total = sum(i * comb(size - i - 1, 6) for i in range(size - 6))
+    mixed = db.sql(
+        "SELECT sum(q.s),sum(q.e),count(*),sum(DISTINCT q.s),sum(DISTINCT q.e),"
+        "sum(q.s) FILTER (WHERE q.s%2=0),sum(q.e) FILTER (WHERE q.e%2=1) FROM " + mixed_relation
+    )
+    assert mixed["rows"] == [
+        [
+            str(start_total),
+            str(total),
+            str(paths),
+            str(sum(range(size - 6))),
+            str(sum(range(6, size))),
+            str(sum(i * comb(size - i - 1, 6) for i in range(size - 6) if i % 2 == 0)),
+            str(sum(i * comb(i, 6) for i in range(6, size) if i % 2 == 1)),
+        ]
+    ]
+    lazy = db.sql("SELECT sum(q.s),sum(q.e),sum(1/(q.s-q.s)) FILTER (WHERE q.s<0) FROM " + mixed_relation)
+    assert lazy["rows"] == [[str(start_total), str(total), None]]
+    factor = 10**20
+    exact = db.sql(
+        f"SELECT sum(CAST(q.s AS NUMERIC)*{factor}),sum(CAST(q.e AS NUMERIC)*{factor}) FROM {mixed_relation}"
+    )
+    assert exact["rows"] == [[str(start_total * factor), str(total * factor)]]
+    # A cross-endpoint predicate keeps its exact coupled scan rather than
+    # accepting incompatible independent passes.
+    assert db.sql(f"SELECT sum(q.s),sum(q.e) FROM {mixed_relation} WHERE q.s<q.e")["rows"] == [
+        [str(start_total), str(total)]
+    ]
+
+    # An empty relation exhausts both negotiated passes, retaining the SQL
+    # global group and its NULL sums / zero count.
+    db.cypher_json("g", {"query": "MATCH ()-[r:R]->() DELETE r"})
+    assert db.sql(f"SELECT sum(q.s),sum(q.e),count(*) FROM {mixed_relation}")["rows"] == [[None, None, "0"]]
 
 
 def test_multi_anchor_reductions_share_work_across_bounded_batches(graph_db):
@@ -1573,6 +1631,15 @@ def test_multi_anchor_reductions_share_work_across_bounded_batches(graph_db):
         },
     )
     assert root_sum["rows"] == [[{"type": "integer", "value": str(sum(i * (size - i - 1) for i in range(size)))}]]
+    for middle in ("WITH a,b", "WITH a.id AS dead,b", "WITH a AS saved,b WITH saved AS dead,b"):
+        live = db.cypher_json(
+            "g",
+            {
+                "query": "MATCH (a:D)-[:R*1..]->(b:D) " + middle + " RETURN sum(b.score)",
+                "limits": {"intermediate_states": 100000, "explored_edges": size - 1},
+            },
+        )
+        assert live["rows"] == [[{"type": "integer", "value": str(sum(i * i for i in range(size)))}]]
     start_sum = sum(i * (size - i - 1) for i in range(size))
     end_sum = sum(i * i for i in range(size))
     for projection, expected in (
@@ -1644,6 +1711,30 @@ def test_sql_weighted_reductions_batch_starting_nodes(graph_db):
         # Reorient start-only COLUMNS too; the SQL cursor still owns one read cut.
         result = db.sql(f"SELECT sum(q.score) FROM GRAPH_TABLE(g MATCH {path} COLUMNS(a.score AS score)) q")
         assert result["rows"] == [[str(sum(range(size - hops)))]]
+        # Two 100-hop passes exceed the shared million-state allowance; keep
+        # that single-endpoint coverage while qualifying mixed bags at 60 hops.
+        if hops == 100:
+            continue
+        mixed_relation = (
+            f"GRAPH_TABLE(g MATCH {path} COLUMNS(a.score AS s,b.score AS e,a.missing AS sm,b.missing AS em)) q"
+        )
+        mixed = db.sql(
+            "SELECT sum(q.s),sum(q.e),count(*),avg(q.s),avg(q.e),sum(CAST(q.sm AS BIGINT)),count(q.em) FROM "
+            + mixed_relation
+        )
+        assert mixed["rows"] == [
+            [
+                str(sum(range(size - hops))),
+                total,
+                str(size - hops),
+                pytest.approx((size - hops - 1) / 2, rel=1e-14),
+                pytest.approx((hops + size - 1) / 2, rel=1e-14),
+                None,
+                "0",
+            ]
+        ]
+        empty = db.sql(f"SELECT sum(q.s),sum(q.e),count(*) FROM {mixed_relation} WHERE false")
+        assert empty["rows"] == [[None, None, "0"]]
 
 
 def test_sql_weighted_seed_batches_resume_cyclic_routes(graph_db):

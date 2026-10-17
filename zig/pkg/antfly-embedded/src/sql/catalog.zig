@@ -392,6 +392,9 @@ pub const Page = struct {
     /// Optional bag weights, negotiated by aggregate consumers before pulling.
     /// Ordinary SQL rows carry no per-row storage overhead.
     multiplicities: ?[]const u64 = null,
+    /// Only after enable_aggregate_weights: this page contributes to these
+    /// reducer slots, not to an ordinary logical SQL row stream.
+    aggregate_slots: ?[]const usize = null,
     owned_arena: ?std.heap.ArenaAllocator = null,
     storage_page: ?@import("../storage/relational_read_view.zig").View.Page = null,
     /// Exclusive native continuation; null proves exhaustion. Implementations
@@ -467,6 +470,7 @@ pub const ColumnPage = struct {
 
 /// Owned statement read view. Opening pins data, not just routing metadata.
 /// Page values belong to the next() allocator; the cursor lives until close().
+pub const AggregateWeight = struct { fields: []const []const u8, multiplicity: Multiplicity };
 pub const Cursor = struct {
     /// True only when this cursor preserves every requested Scan.order key.
     order_satisfied: bool = false,
@@ -498,6 +502,11 @@ pub const Cursor = struct {
     /// Before the first pull, negotiate exact bags or duplicate-insensitive
     /// presence contributions. Other consumers receive ordinary logical rows.
     enable_weights: ?*const fn (*anyopaque, Multiplicity) anyerror!bool = null,
+    /// Global aggregate consumers may negotiate serial dependency partitions
+    /// before the first pull. A successful provider shares the read cut and
+    /// work/memory quotas across all passes; each page identifies reducer slots.
+    /// Other consumers must never receive partitioned pages.
+    enable_aggregate_weights: ?*const fn (*anyopaque, []const AggregateWeight) anyerror!bool = null,
 };
 
 pub const StatementScan = struct { table: Table, request: Scan };

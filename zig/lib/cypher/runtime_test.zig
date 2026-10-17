@@ -1943,6 +1943,63 @@ test "DISTINCT ordering resolves projected expressions without exposing discarde
     }
 }
 
+test "optional compressed bags preserve per-input null extension and dead binding effects" {
+    const Dag = struct {
+        fn expand(ptr: *anyopaque, a: std.mem.Allocator, mapping: catalog.Relationship, identity: v.Identity, direction: c.ast.Direction, after: ?[]const u8, limit: usize) !b.Page(*const v.Relationship) {
+            const page = try Fixture.expand(ptr, a, mapping, identity, direction, after, limit);
+            var out: std.ArrayList(*const v.Relationship) = .empty;
+            for (page.items) |edge| if (!std.mem.eql(u8, edge.identity.key, "ba")) try out.append(a, edge);
+            return .{ .items = out.items };
+        }
+    };
+    for ([_]bool{ false, true }) |dag| for ([_][]const u8{
+        "OPTIONAL MATCH (a:Document)-[:CITES*0..3]->(b:Document)",
+        "OPTIONAL MATCH (a:Document)-[:CITES*1..3]->(b:Document)",
+        "OPTIONAL MATCH (a:Document)-[:CITES*2..3]->(b:Document)",
+        "MATCH (a:Document) OPTIONAL MATCH (a)-[:CITES*2..3]->(b:Document)",
+        "OPTIONAL MATCH (a:Document)-[:CITES*1..3]->(b:Document) WHERE false",
+        "OPTIONAL MATCH (a:Document {id:'absent'})-[:CITES*1..3]->(b:Document)",
+    }) |prefix| for ([_][]const u8{
+        "RETURN count(*),count(a),count(b),sum(a.rank),sum(b.rank),avg(b.rank),min(b.rank)",
+        "WITH a,b RETURN count(*),sum(b.rank),min(b.rank)",
+        "WITH a.rank AS dead,b RETURN count(*),sum(b.rank)",
+        "WITH DISTINCT a,b RETURN count(*),sum(b.rank)",
+        "WITH b AS a WITH a AS dead,a.rank AS score RETURN count(*),sum(score)",
+        "WITH a,b WHERE b.rank>1 RETURN count(*),sum(b.rank)",
+    }) |tail| {
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+        var diagnostic: c.Diagnostic = .{};
+        var compiled = try c.compile(a, try std.fmt.allocPrint(a, "{s} {s}", .{ prefix, tail }), .{}, &diagnostic);
+        defer compiled.deinit();
+        var exact = try c.compile(a, try std.fmt.allocPrint(a, "{s} WITH * ORDER BY a.rank,b.rank {s}", .{ prefix, tail }), .{}, &diagnostic);
+        defer exact.deinit();
+        var fixture: Fixture = .{};
+        var callbacks = fixture.backend().vtable.*;
+        if (dag) callbacks.expand = Dag.expand;
+        const backend: b.Backend = .{ .ptr = &fixture, .vtable = &callbacks };
+        var result = try runtime.execute(a, backend, graph, &compiled, &.{}, .{});
+        defer result.deinit();
+        var expected = try runtime.execute(a, backend, graph, &exact, &.{}, .{});
+        defer expected.deinit();
+        try std.testing.expectEqual(expected.rows.len, result.rows.len);
+        for (expected.rows, result.rows) |er, ar| for (er, ar) |ev, av| {
+            if (ev == .number) try std.testing.expectApproxEqAbs(ev.number, av.number, 1e-12) else try std.testing.expectEqualStrings(try std.json.Stringify.valueAlloc(a, ev, .{}), try std.json.Stringify.valueAlloc(a, av, .{}));
+        };
+    };
+    for ([_][]const u8{
+        "MATCH (a:Document)-[:CITES*0..2]->(b:Document) WITH a,1/0 AS dead,b RETURN sum(b.rank)",
+        "OPTIONAL MATCH (a:Document)-[:CITES*0..2]->(b:Document) WHERE false WITH 1/0 AS dead,b RETURN sum(b.rank)",
+    }) |text| {
+        var diagnostic: c.Diagnostic = .{};
+        var compiled = try c.compile(std.testing.allocator, text, .{}, &diagnostic);
+        defer compiled.deinit();
+        var fixture: Fixture = .{};
+        try std.testing.expectError(error.CypherDivisionByZero, runtime.execute(std.testing.allocator, fixture.backend(), graph, &compiled, &.{}, .{}));
+    }
+}
+
 test "zero aggregate demand skips partition planning and graph work" {
     var diagnostic: c.Diagnostic = .{};
     var compiled = try c.compile(std.testing.allocator, "MATCH (a:Document)-[:CITES*1..]->(b:Document) RETURN sum(a.rank),sum(b.rank) LIMIT 0", .{}, &diagnostic);

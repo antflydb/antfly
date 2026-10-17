@@ -299,6 +299,66 @@ fn allLocal(items: []const *const ast.Expr, context: anytype, locals: ?*const Lo
     for (items) |item| if (!rowLocalScoped(item, context, locals)) return false;
     return true;
 }
+/// Visit free variables in one lexical walk. Pattern consumers decide how to
+/// handle the wider binding scope rather than guessing subquery dependencies.
+pub fn visitFree(expression: *const ast.Expr, context: anytype) anyerror!void {
+    return visitFreeScoped(expression, context, null);
+}
+fn visitFreeScoped(expression: *const ast.Expr, context: anytype, locals: ?*const Local) anyerror!void {
+    switch (expression.value) {
+        .variable => |name| {
+            var local = locals;
+            while (local) |binding| : (local = binding.parent) if (std.mem.eql(u8, binding.name, name)) return;
+            try context.reference(name);
+        },
+        .exists, .pattern_comprehension => try context.pattern(),
+        .comprehension => |c| {
+            try visitFreeScoped(c.input, context, locals);
+            const local: Local = .{ .name = c.alias, .parent = locals };
+            try visitFreeChildren(c.predicate, context, &local);
+            try visitFreeChildren(c.projection, context, &local);
+        },
+        .list_predicate => |c| {
+            try visitFreeScoped(c.input, context, locals);
+            const local: Local = .{ .name = c.alias, .parent = locals };
+            try visitFreeScoped(c.predicate, context, &local);
+        },
+        .reduce => |r| {
+            try visitFreeScoped(r.initial, context, locals);
+            try visitFreeScoped(r.input, context, locals);
+            const accumulator: Local = .{ .name = r.accumulator, .parent = locals };
+            const local: Local = .{ .name = r.alias, .parent = &accumulator };
+            try visitFreeScoped(r.projection, context, &local);
+        },
+        .map_projection => |p| {
+            try visitFreeScoped(p.base, context, locals);
+            for (p.items) |item| switch (item) {
+                .entry => |entry| try visitFreeScoped(entry.value, context, locals),
+                .variable => |name| {
+                    const variable: ast.Expr = .{ .span = .{}, .value = .{ .variable = name } };
+                    try visitFreeScoped(&variable, context, locals);
+                },
+                .property, .all => {},
+            };
+        },
+        else => try visitFreeChildren(expression.value, context, locals),
+    }
+}
+fn visitFreeChildren(value: anytype, context: anytype, locals: ?*const Local) anyerror!void {
+    switch (@typeInfo(@TypeOf(value))) {
+        .pointer => |p| {
+            if (p.size == .one and p.child == ast.Expr) return visitFreeScoped(value, context, locals);
+            if (p.size == .slice and p.child != u8) for (value) |child| try visitFreeChildren(child, context, locals);
+        },
+        .@"struct" => |s| inline for (s.field_names) |name| try visitFreeChildren(@field(value, name), context, locals),
+        .@"union" => switch (value) {
+            inline else => |child| try visitFreeChildren(child, context, locals),
+        },
+        .optional => if (value) |child| try visitFreeChildren(child, context, locals),
+        else => {},
+    }
+}
+
 fn references(expr: *const ast.Expr, name: []const u8) bool {
     return switch (expr.value) {
         .literal, .parameter => false,

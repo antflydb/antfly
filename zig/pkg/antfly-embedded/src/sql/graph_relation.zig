@@ -308,6 +308,9 @@ pub const Cursor = struct {
     resume_position: usize = 0,
     optimized: bool = true,
     empty: bool = false,
+    weight_passes: []const WeightPass = &.{},
+    weight_pass: usize = 0,
+    const WeightPass = struct { plan: cypher.runtime.NodeCursor.WeightPlan, slots: []const usize };
     pub fn open(a: A, binding: Binding, backend: cypher.backend.Backend, parameters: []const cypher.value.Entry, request: catalog.Scan, limits: cypher.runtime.Limits) !catalog.Cursor {
         const self = try a.create(Cursor);
         errdefer a.destroy(self);
@@ -343,7 +346,38 @@ pub const Cursor = struct {
         copied.primary_key = if (request.primary_key) |key| try owned.dupe(u8, key) else null;
         if ((empty and resume_position != 0) or (result != null and resume_position > result.?.rows.len)) return error.InvalidSqlBackendResponse;
         self.* = .{ .a = a, .arena = arena, .result = result, .stream = stream, .request = copied, .position = if (stream != null) 0 else resume_position, .resume_position = resume_position, .optimized = optimized, .empty = empty };
-        return .{ .ptr = self, .next = next, .close = close, .count_rows = countRows, .enable_weights = enableWeights, .estimated_rows = if (empty) 0 else if (result) |value| value.rows.len else null };
+        return .{ .ptr = self, .next = next, .close = close, .count_rows = countRows, .enable_weights = enableWeights, .enable_aggregate_weights = enableAggregateWeights, .estimated_rows = if (empty) 0 else if (result) |value| value.rows.len else null };
+    }
+    fn enableAggregateWeights(ptr: *anyopaque, requests: []const catalog.AggregateWeight) !bool {
+        const self: *Cursor = @ptrCast(@alignCast(ptr));
+        if (self.position != 0 or self.resume_position != 0 or self.request.primary_key != null or self.request.graph_source_ordinals or self.weight_passes.len != 0) return false;
+        if (requests.len < 2 or requests.len > 256) return false;
+        for (self.request.fields) |field| if (std.mem.eql(u8, field, "_id")) return false;
+        for (self.request.conditions) |condition| if (std.mem.eql(u8, condition.column, "_id")) return false;
+        const stream = self.stream orelse return false;
+        const a = self.arena.allocator();
+        var fields: [2]std.StringHashMapUnmanaged(void) = .{ .empty, .empty };
+        var slots: [2]std.ArrayList(usize) = .{ .empty, .empty };
+        var multiplicities: [2]cypher.runtime.Multiplicity = .{ .presence, .presence };
+        for (requests, 0..) |request, i| {
+            const multiplicity: cypher.runtime.Multiplicity = if (request.multiplicity == .exact) .exact else .presence;
+            const plan = (try stream.planWeightFields(request.fields, multiplicity)) orelse return false;
+            const direction: usize = @intFromBool(plan.path.execution_reversed);
+            try slots[direction].append(a, i);
+            for (request.fields) |field| try fields[direction].put(a, field, {});
+            if (multiplicity == .exact) multiplicities[direction] = .exact;
+        }
+        if (slots[0].items.len == 0 or slots[1].items.len == 0) return false;
+        const passes = try a.alloc(WeightPass, 2);
+        for (passes, 0..) |*pass, i| {
+            var names: std.ArrayList([]const u8) = .empty;
+            var keys = fields[i].keyIterator();
+            while (keys.next()) |name| try names.append(a, name.*);
+            pass.* = .{ .plan = (try stream.planWeightFields(names.items, multiplicities[i])) orelse return false, .slots = slots[i].items };
+        }
+        try stream.startWeightPlan(passes[0].plan);
+        self.weight_passes = passes;
+        return true;
     }
     fn enableWeights(ptr: *anyopaque, multiplicity: catalog.Multiplicity) !bool {
         const self: *Cursor = @ptrCast(@alignCast(ptr));
@@ -355,6 +389,7 @@ pub const Cursor = struct {
     }
     fn countRows(ptr: *anyopaque) anyerror!?u64 {
         const self: *Cursor = @ptrCast(@alignCast(ptr));
+        if (self.weight_passes.len != 0) return null;
         if (self.empty) return 0;
         // Storage hints are supersets of SQL truth. Leave any SQL residual to
         // its consumer rather than counting hinted candidates as exact rows.
@@ -365,6 +400,10 @@ pub const Cursor = struct {
     fn next(ptr: *anyopaque, a: A, limit: u32) !catalog.Page {
         const self: *Cursor = @ptrCast(@alignCast(ptr));
         if (limit == 0 or limit > 4096) return error.InvalidSqlParameters;
+        if (self.weight_passes.len != 0 and self.stream.?.done and self.weight_pass + 1 < self.weight_passes.len) {
+            self.weight_pass += 1;
+            try self.stream.?.startWeightPlan(self.weight_passes[self.weight_pass].plan);
+        }
         var arena = std.heap.ArenaAllocator.init(a);
         errdefer arena.deinit();
         const owned = arena.allocator();
@@ -439,8 +478,8 @@ pub const Cursor = struct {
                 if (self.stream) |stream| if (stream.weighted) try weights.append(owned, stream.last_weights.items[row_index]);
             }
         }
-        const more = if (self.empty) false else if (self.stream) |stream| !stream.done else self.position < self.result.?.rows.len;
-        return .{ .rows = try output.toOwnedSlice(owned), .multiplicities = if (self.stream != null and self.stream.?.weighted) try weights.toOwnedSlice(owned) else null, .owned_arena = arena, .after = if (more) try std.fmt.allocPrint(owned, "{s}{d}", .{ if (self.optimized) "g:" else "", self.position }) else null };
+        const more = if (self.weight_passes.len != 0) !self.stream.?.done or self.weight_pass + 1 < self.weight_passes.len else if (self.empty) false else if (self.stream) |stream| !stream.done else self.position < self.result.?.rows.len;
+        return .{ .rows = try output.toOwnedSlice(owned), .multiplicities = if (self.stream != null and self.stream.?.weighted) try weights.toOwnedSlice(owned) else null, .aggregate_slots = if (self.weight_passes.len != 0) try owned.dupe(usize, self.weight_passes[self.weight_pass].slots) else null, .owned_arena = arena, .after = if (!more) null else if (self.weight_passes.len != 0) try std.fmt.allocPrint(owned, "ag:{d}:{d}", .{ self.weight_pass, self.position }) else try std.fmt.allocPrint(owned, "{s}{d}", .{ if (self.optimized) "g:" else "", self.position }) };
     }
 
     fn close(ptr: *anyopaque) void {
@@ -451,6 +490,78 @@ pub const Cursor = struct {
         self.a.destroy(self);
     }
 };
+
+test "SQL GRAPH_TABLE dependency partitions share quotas and resume narrow pages" {
+    const F = struct {
+        const nodes = [_]cypher.value.Node{
+            .{ .identity = .{ .table = "docs", .key = "a" }, .labels = &.{"D"}, .properties = &.{.{ .name = "rank", .value = .{ .integer = 1 } }} },
+            .{ .identity = .{ .table = "docs", .key = "b" }, .labels = &.{"D"}, .properties = &.{.{ .name = "rank", .value = .{ .integer = 2 } }} },
+            .{ .identity = .{ .table = "docs", .key = "c" }, .labels = &.{"D"}, .properties = &.{.{ .name = "rank", .value = .{ .integer = 3 } }} },
+        };
+        const edges = [_]cypher.value.Relationship{
+            .{ .identity = .{ .table = "docs", .key = "ab1" }, .index = "links", .type = "R", .source = nodes[0].identity, .target = nodes[1].identity },
+            .{ .identity = .{ .table = "docs", .key = "ab2" }, .index = "links", .type = "R", .source = nodes[0].identity, .target = nodes[1].identity },
+            .{ .identity = .{ .table = "docs", .key = "bc" }, .index = "links", .type = "R", .source = nodes[1].identity, .target = nodes[2].identity },
+        };
+        fn bind(_: *anyopaque, _: A, _: cypher.catalog.Graph) !void {}
+        fn checkpoint(_: *anyopaque) !void {}
+        fn scan(_: *anyopaque, a: A, _: []const u8, after: ?[]const u8, limit: usize) !cypher.backend.Page(*const cypher.value.Node) {
+            const start = if (after) |s| try std.fmt.parseUnsigned(usize, s, 10) else 0;
+            const end = @min(nodes.len, start + limit);
+            const out = try a.alloc(*const cypher.value.Node, end - start);
+            for (out, start..) |*node, i| node.* = &nodes[i];
+            return .{ .items = out, .next = if (end < nodes.len) try std.fmt.allocPrint(a, "{d}", .{end}) else null };
+        }
+        fn get(_: *anyopaque, _: A, id: cypher.value.Identity) !?*const cypher.value.Node {
+            for (&nodes) |*node| if (node.identity.eql(id)) return node;
+            return null;
+        }
+        fn expand(_: *anyopaque, a: A, _: cypher.catalog.Relationship, id: cypher.value.Identity, d: cypher.ast.Direction, after: ?[]const u8, limit: usize) !cypher.backend.Page(*const cypher.value.Relationship) {
+            var selected: std.ArrayList(*const cypher.value.Relationship) = .empty;
+            for (&edges) |*edge| if ((d != .in and edge.source.eql(id)) or (d != .out and edge.target.eql(id))) try selected.append(a, edge);
+            const start = if (after) |s| try std.fmt.parseUnsigned(usize, s, 10) else 0;
+            const end = @min(selected.items.len, start + limit);
+            return .{ .items = selected.items[start..end], .next = if (end < selected.items.len) try std.fmt.allocPrint(a, "{d}", .{end}) else null };
+        }
+    };
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var diagnostic: cypher.compiler.Diagnostic = .{};
+    const compiled = try cypher.compiler.compileInto(a, "MATCH (a:D)-[:R*0..3]->(b:D) RETURN a.rank AS start_score,b.rank AS end_score", .{}, &diagnostic);
+    const binding: Binding = .{ .definition = .{ .name = .{ .table = "g" }, .query = compiled.query, .parameters = compiled.parameters }, .graph = .{ .name = "g", .incarnation = 1, .revision = 1, .labels = &.{.{ .name = "D", .table = "docs", .table_id = 7 }}, .relationships = &.{.{ .name = "R", .index = "links", .source_label = "D", .target_label = "D", .stored_type = "R" }} }, .catalog_json = "{}", .dependencies = &.{} };
+    var marker: u8 = 0;
+    const backend: cypher.backend.Backend = .{ .ptr = &marker, .vtable = &.{ .bind = F.bind, .checkpoint = F.checkpoint, .scan = F.scan, .get = F.get, .expand = F.expand } };
+    for ([_]bool{ false, true }) |bounded| {
+        const cursor = try Cursor.open(std.testing.allocator, binding, backend, &.{}, .{ .fields = &.{ "start_score", "end_score" }, .limit = 1 }, .{ .scanned_anchors = if (bounded) 3 else 6 });
+        defer cursor.close(cursor.ptr);
+        try std.testing.expect(try cursor.enable_aggregate_weights.?(cursor.ptr, &.{
+            .{ .fields = &.{"start_score"}, .multiplicity = .exact },
+            .{ .fields = &.{"end_score"}, .multiplicity = .exact },
+        }));
+        var totals = [_]i64{ 0, 0 };
+        var failed = false;
+        while (true) {
+            const page = cursor.next(cursor.ptr, std.testing.allocator, 1) catch |err| {
+                if (!bounded) return err;
+                try std.testing.expectEqual(error.CypherAnchorBudgetExceeded, err);
+                failed = true;
+                break;
+            };
+            defer page.deinit();
+            try std.testing.expectEqual(@as(usize, 1), page.aggregate_slots.?.len);
+            const slot = page.aggregate_slots.?[0];
+            for (page.rows, page.multiplicities.?) |row, weight| {
+                const value = try row.cell(if (slot == 0) "start_score" else "end_score");
+                const inactive = try row.cell(if (slot == 0) "end_score" else "start_score");
+                try std.testing.expect(inactive.sql_null);
+                totals[slot] += value.value.integer * @as(i64, @intCast(weight));
+            }
+            if (page.after == null) break;
+        }
+        if (bounded) try std.testing.expect(failed) else try std.testing.expectEqualSlices(i64, &.{ 12, 19 }, &totals);
+    }
+}
 
 test "SQL GRAPH_TABLE derives columns and exposes typed rows from shared graph IR" {
     const Fixture = struct {
