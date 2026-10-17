@@ -336,7 +336,10 @@ pub const Effect = union(enum) {
             .release => |value| try value.validate(),
             .cancel_release => |value| try value.validate(),
             .release_gc => |value| try value.validate(),
-            .build => |value| try value.validate(),
+            .build => |value| {
+                try value.validate();
+                if (value.binding.authority != .native) return error.InvalidControlReceiptPosition;
+            },
             .cancel_intent => |value| try value.validate(),
             .cancel_cleanup, .cancel_complete => |value| {
                 _ = try value.encode();
@@ -650,7 +653,7 @@ pub const BuildOutcome = struct {
     pub fn validateFor(self: BuildOutcome, command: pages.Page.PrivateCommand) !void {
         try command.validate();
         try self.position.validate();
-        if (!std.mem.eql(u8, &try self.binding.encode(), &try command.binding.encode()) or
+        if (command.binding.authority != .native or !std.mem.eql(u8, &try self.binding.encode(), &try command.binding.encode()) or
             !std.mem.eql(u8, &self.page_digest, &try command.digest()) or
             !self.position.namespace.eql(command.binding.fence.namespace) or
             self.replication_pending != (self.error_name != null)) return error.InvalidPrivateIndexNativeReceipt;
@@ -1514,14 +1517,25 @@ pub const PreparedBuild = struct {
     }
     pub fn prepareControlled(alloc: Allocator, io: ?std.Io, core: anytype, table_name: []const u8, reservation: *const Prepared, budget: pages.Budget, context: RequestContext) !?PreparedBuild {
         try context.ensureActive();
+        try reservation.command.validate();
         if (reservation.command.effect != .reserved) return error.PrivateIndexOwnerJobChanged;
         const artifacts = if (reservation.artifacts) |*value| value else return error.InvalidPrivateIndexOwnerJob;
-        var binding = reservation.command.binding;
+        return prepareCandidate(alloc, io, core, table_name, reservation.command.binding, artifacts, budget, context);
+    }
+    pub fn prepareRaft(alloc: Allocator, io: ?std.Io, core: anytype, table_name: []const u8, reservation: *const @import("relational_index_raft_control.zig").Prepared, budget: pages.Budget, request_context: RequestContext) !?PreparedBuild {
+        try request_context.ensureActive();
+        try reservation.command.validate();
+        if (reservation.command.effect != .reserved or reservation.command.binding.authority != .raft) return error.PrivateIndexOwnerJobChanged;
+        const artifacts = if (reservation.artifacts) |*value| value else return error.InvalidPrivateIndexOwnerJob;
+        return prepareCandidate(alloc, io, core, table_name, reservation.command.binding, artifacts, budget, request_context);
+    }
+    fn prepareCandidate(alloc: Allocator, io: ?std.Io, core: anytype, table_name: []const u8, original: jobs.Binding, artifacts: *const Artifacts, budget: pages.Budget, request_context: RequestContext) !?PreparedBuild {
+        var binding = original;
         binding.phase = .reserved;
-        var page = (try pages.Page.preparePrivateClaims(alloc, io, core, binding, &artifacts.addition, budget, context, .{ .scope = .{ .table_name = table_name, .generation = artifacts.unique.generation, .schema_version = binding.physical_candidate.schema_version, .tuple_fingerprint = artifacts.unique.tuple.fingerprint, .nulls_not_distinct = artifacts.unique.nulls_not_distinct }, .tuple = artifacts.unique.tuple })) orelse return null;
+        var page = (try pages.Page.preparePrivateClaims(alloc, io, core, binding, &artifacts.addition, budget, request_context, .{ .scope = .{ .table_name = table_name, .generation = artifacts.unique.generation, .schema_version = binding.physical_candidate.schema_version, .tuple_fingerprint = artifacts.unique.tuple.fingerprint, .nulls_not_distinct = artifacts.unique.nulls_not_distinct }, .tuple = artifacts.unique.tuple })) orelse return null;
         errdefer page.deinit();
         var result = try init(alloc, page);
-        result.context = context;
+        result.context = request_context;
         return result;
     }
     pub fn replayPrepared(alloc: Allocator, core: anytype, command: pages.Page.PrivateCommand) !PreparedBuild {
@@ -1533,7 +1547,7 @@ pub const PreparedBuild = struct {
         try jobs.requireReserved(&read, command.binding);
         var manifest = try inputs.Prepared.load(alloc, &read, command.binding.inputs_digest);
         defer manifest.deinit();
-        var artifacts = try Artifacts.init(alloc, view, &read, manifest.bytes, .native);
+        var artifacts = try Artifacts.init(alloc, view, &read, manifest.bytes, if (command.binding.authority == .native) .native else .raft);
         defer artifacts.deinit();
         if (!std.mem.eql(u8, &artifacts.unique.generation, &command.source.generation) or
             !std.mem.eql(u8, &artifacts.unique.tuple.fingerprint, &command.source.tuple_fingerprint) or
@@ -1577,17 +1591,23 @@ pub const PreparedBuild = struct {
         const bytes = raw[0..checkpoint_len].*;
         if (!std.mem.eql(u8, bytes[8..40], &hash(&try binding.encode()))) return null;
         const position = try @import("receipt_position.zig").Position.decode(bytes[104..137]);
-        if (position != .native) return error.InvalidControlReceiptPosition;
         try position.requireNamespace(binding.fence.namespace);
-        const state = try source_authority.require(txn, .native, @import("online_source_contract.zig").namespaceBytes(binding.fence.namespace));
-        if (position.native.sequence > state.sequence) return error.InvalidControlReceiptPosition;
+        if ((position == .native) != (binding.authority == .native)) return error.InvalidControlReceiptPosition;
+        const state = try source_authority.require(txn, if (binding.authority == .native) .native else .raft, @import("online_source_contract.zig").namespaceBytes(binding.fence.namespace));
+        switch (position) {
+            .native => |value| if (value.sequence > state.sequence) return error.InvalidControlReceiptPosition,
+            .raft => |value| {
+                const applied = (try @import("apply_receipts.zig").readOrderedApplyReceiptTxn(txn)) orelse return error.InvalidControlReceiptPosition;
+                if (value.index > applied.index or value.term > applied.term or (value.index == applied.index and value.term != applied.term)) return error.InvalidControlReceiptPosition;
+            },
+        }
         const progress = try txn.get(&pages.progressKey(binding.index));
         if (!std.mem.eql(u8, bytes[72..104], &hash(progress))) return error.InvalidRelationalIndexProgress;
         return bytes;
     }
     pub fn verifyRecovery(txn: anytype, binding: jobs.Binding) !void {
         const bytes = try checkpoint(txn, binding);
-        try private_claims.SourceStream.verifyRecovery(txn, binding, if (bytes) |value| (try @import("receipt_position.zig").Position.decode(value[104..137])).native else null, if (bytes) |value| value[72..104].* else null, if (bytes) |value| value[144..176].* else null);
+        try private_claims.SourceStream.verifyRecoveryOrdered(txn, binding, if (bytes) |value| try @import("receipt_position.zig").Position.decode(value[104..137]) else null, if (bytes) |value| value[72..104].* else null, if (bytes) |value| value[144..176].* else null);
     }
     /// Pin the physical checkpoint and the complete bounded header chain in
     /// the same snapshot before exposing source bytes to a delivery worker.
@@ -1614,39 +1634,54 @@ pub const PreparedBuild = struct {
         return .{ .binding = binding, .state = if (progress.state == .ready) .ready else .failed, .failure = progress.failure, .rows_scanned = progress.rows_scanned, .progress_digest = bytes[72..104].*, .position = position, .claim_batches_pending = source.pending(), .claim_bytes_pending = source.pending_bytes };
     }
     pub fn stage(self: *PreparedBuild, core: anytype, txn: anytype, replay: ?Native) !BuildOutcome {
+        if (self.command.binding.authority != .native) return error.InvalidControlReceiptPosition;
+        const outcome = try self.stageOrdered(core, txn, if (replay) |value| .{ .native = value } else null);
+        return .{ .binding = self.command.binding, .page_digest = self.command_digest, .position = outcome.position.native, .duplicate = outcome.duplicate };
+    }
+    /// Trusted committed-entry execution only. No request supplies a cut and
+    /// no native sequence is advanced for a replicated physical page.
+    pub fn stageRaft(self: *PreparedBuild, core: anytype, txn: anytype, owner_group: u64, entry: @import("apply_receipts.zig").OrderedApplyReceipt) !void {
+        if (self.command.binding.authority != .raft or owner_group == 0 or owner_group != self.command.binding.fence.owner_group_id) return error.PrivateIndexOwnerJobChanged;
+        const prior = try @import("apply_receipts.zig").readOrderedApplyReceiptTxn(txn);
+        if (try @import("apply_receipts.zig").orderedApplyDisposition(prior, entry) != .apply) return error.InvalidControlReceiptPosition;
+        if (prior) |value| if (entry.index <= value.index or entry.term < value.term) return error.InvalidControlReceiptPosition;
+        _ = try self.stageOrdered(core, txn, .{ .raft = .{ .term = entry.term, .index = entry.index } });
+    }
+    fn stageOrdered(self: *PreparedBuild, core: anytype, txn: anytype, replay: ?@import("receipt_position.zig").Position) !struct { position: @import("receipt_position.zig").Position, duplicate: bool } {
         try self.context.ensureActive();
         const binding = self.command.binding;
         try jobs.requireReserved(txn, binding);
         if (try checkpoint(txn, binding)) |bytes| {
             if (std.mem.eql(u8, bytes[40..72], &self.command_digest)) {
                 if (!std.mem.eql(u8, bytes[72..104], &self.progress_digest)) return error.InvalidRelationalIndexProgress;
-                const position = (try @import("receipt_position.zig").Position.decode(bytes[104..137])).native;
-                _ = try private_claims.SourceStream.requireLatest(txn, binding, self.command.source, position, self.progress_digest, bytes[144..176].*);
-                if (replay) |expected| if (!std.meta.eql(position, expected)) return error.InvalidControlReceiptPosition;
-                return .{ .binding = binding, .page_digest = self.command_digest, .position = position, .duplicate = true };
+                const position = try @import("receipt_position.zig").Position.decode(bytes[104..137]);
+                _ = try private_claims.SourceStream.requireLatestOrdered(txn, binding, self.command.source, position, self.progress_digest, bytes[144..176].*);
+                if (replay) |expected| if (binding.authority == .native and !std.meta.eql(position, expected)) return error.InvalidControlReceiptPosition;
+                return .{ .position = position, .duplicate = true };
             }
         }
         var manager = try core.initTxnManager();
         defer manager.deinit();
         try self.page.stage(core, &manager, txn);
-        const position: Native = .{ .namespace = self.namespace(), .sequence = try source_authority.advance(txn, @import("online_source_contract.zig").namespaceBytes(self.namespace()), if (replay) |value| value.sequence else null) };
-        try self.claim_batch.stage(txn, binding, position);
+        const position: @import("receipt_position.zig").Position = if (binding.authority == .raft) replay orelse return error.InvalidControlReceiptPosition else .{ .native = .{ .namespace = self.namespace(), .sequence = try source_authority.advance(txn, @import("online_source_contract.zig").namespaceBytes(self.namespace()), if (replay) |value| value.native.sequence else null) } };
+        try self.claim_batch.stageOrdered(txn, binding, position);
         var bytes: [checkpoint_len]u8 = @splat(0);
         @memcpy(bytes[0..8], "AIBP\x02\x00\x00\x00");
         @memcpy(bytes[8..40], &hash(&try binding.encode()));
         @memcpy(bytes[40..72], &self.command_digest);
         @memcpy(bytes[72..104], &self.progress_digest);
-        @memcpy(bytes[104..137], &try (@import("receipt_position.zig").Position{ .native = position }).encode());
+        @memcpy(bytes[104..137], &try position.encode());
         @memcpy(bytes[144..176], self.claim_batch.header[288..320]);
         @memcpy(bytes[176..208], &hash(bytes[0..176]));
         try txn.put(checkpoint_key, &bytes);
-        return .{ .binding = binding, .page_digest = self.command_digest, .position = position, .duplicate = false };
+        return .{ .position = position, .duplicate = false };
     }
     pub fn hasPublicationReceipt(_: *const PreparedBuild) bool {
         return false;
     }
     pub fn populateReceipt(_: *const PreparedBuild, _: anytype, _: *BuildOutcome) !void {}
     pub fn preparePayload(self: *PreparedBuild) !void {
+        if (self.command.binding.authority != .native) return error.InvalidControlReceiptPosition;
         try prepareNativePayload(self, "build", self.command, pages.Page.PrivateCommand.max_wire_bytes);
     }
     pub fn finalizePayload(self: *PreparedBuild, position: Native) ![]const u8 {

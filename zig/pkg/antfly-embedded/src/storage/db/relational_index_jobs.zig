@@ -352,7 +352,7 @@ pub const Page = struct {
         pub fn validate(self: PrivateCommand) !void {
             _ = try self.binding.encode();
             try self.source.validate();
-            if (self.binding.authority != .native or self.binding.phase != .reserved or
+            if (self.binding.phase != .reserved or
                 self.source.schema_version != self.binding.physical_candidate.schema_version or
                 self.next.id.mapKey() != self.binding.index.mapKey() or self.next.phase != .primary or
                 self.candidates.len > @import("relational_index_private_claims.zig").max_claims or self.records_examined > 4096 or

@@ -1866,6 +1866,113 @@ test "relational index system Raft owner controls commit authentic phase cuts at
         try db.core.store.putBatch(&.{.{ .key = &cut_key, .value = saved }}, &.{});
         try std.testing.expectEqualDeep(reserved, (try db.raftIndexOwnerReceipt(11, binding, .reserved)).?);
     }
+    // Reuse the physical builder: a replicated page must commit its exact
+    // progress and claim-source batch at the SAME actual Raft cut. Preparing
+    // or aborting a page must leave all three absent.
+    const build = @import("relational_index_owner_control.zig").PreparedBuild;
+    const source = @import("relational_index_private_claims.zig").SourceStream;
+    const pages = @import("relational_index_jobs.zig");
+    var first = (try build.prepareRaft(alloc, null, db.core, "usage_records", &retry, .{ .records = 1, .time_ns = std.time.ns_per_s }, .{})).?;
+    defer first.deinit();
+    try std.testing.expectEqual(@as(usize, 1), first.page.records_examined);
+    try std.testing.expectEqual(pages.State.building, first.command.next.state);
+    try std.testing.expectError(error.InvalidControlReceiptPosition, (@import("relational_index_owner_control.zig").Effect{ .build = first.command }).validate());
+    const ReplayAllocation = struct {
+        fn run(a: std.mem.Allocator, database: *db_mod.DB, command: pages.Page.PrivateCommand) !void {
+            var prepared = try build.replayPrepared(a, database.core, command);
+            defer prepared.deinit();
+        }
+    };
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(alloc, ReplayAllocation.run, .{ &db, first.command });
+    try std.testing.expectError(error.PrivateIndexOwnerJobChanged, db.applyCommittedRaftIndexBuild(&first, 99, .{ .term = 4, .index = 50 }));
+    {
+        var aborted = try build.replayPrepared(alloc, db.core, first.command);
+        defer aborted.deinit();
+        var txn = try db.core.store.beginWriteTxn();
+        defer txn.abort();
+        try aborted.stageRaft(db.core, &txn, 11, .{ .term = 4, .index = 50 });
+        try std.testing.expectEqual(@as(u64, 50), (try source.load(&txn, reserved_binding)).?.last_sequence);
+    }
+    {
+        var read = try db.core.store.beginReadTxn();
+        defer read.abort();
+        try std.testing.expectError(error.NotFound, read.get(build.checkpoint_key));
+        try std.testing.expectError(error.NotFound, read.get(source.head_key));
+        try std.testing.expectError(error.NotFound, read.get(&pages.progressKey(binding.index)));
+        try std.testing.expectEqual(@as(u64, 40), (try receipts.readOrderedApplyReceiptTxn(&read)).?.index);
+    }
+    // Follower replay owns canonical page data, never reruns the leader's
+    // time-limited scan. A later retry retains the first effect position.
+    var replayed_page = try build.replayPrepared(alloc, db.core, first.command);
+    defer replayed_page.deinit();
+    try db.applyCommittedRaftIndexBuild(&replayed_page, 11, .{ .term = 4, .index = 50 });
+    try db.applyCommittedRaftIndexBuild(&replayed_page, 11, .{ .term = 4, .index = 50 });
+    try std.testing.expectError(error.ConflictingOrderedApplyReceipt, db.applyCommittedRaftIndexBuild(&replayed_page, 11, .{ .term = 5, .index = 50 }));
+    db.close();
+    db_live = false;
+    db = try db_mod.DB.open(alloc, directory.path(), options);
+    db_live = true;
+    var retried = try build.replayPrepared(alloc, db.core, first.command);
+    defer retried.deinit();
+    try db.applyCommittedRaftIndexBuild(&retried, 11, .{ .term = 5, .index = 55 });
+    {
+        var read = try db.core.store.beginReadTxn();
+        defer read.abort();
+        try build.verifyRecovery(&read, reserved_binding);
+        var batch = (try build.peekClaimSource(alloc, &read, reserved_binding)).?;
+        defer batch.deinit();
+        const cut = try batch.header.orderedPosition();
+        try std.testing.expectEqualDeep(@import("receipt_position.zig").Position{ .raft = .{ .term = 4, .index = 50 } }, cut);
+        try std.testing.expectError(error.InvalidControlReceiptPosition, batch.header.position());
+        try std.testing.expectEqual(@as(usize, 1), batch.rows().len);
+        try std.testing.expectEqualStrings("a", batch.rows()[0].key);
+        const head = (try source.load(&read, reserved_binding)).?;
+        try std.testing.expectEqual(@as(u64, 1), head.emitted);
+        try std.testing.expectEqual(@as(u64, 50), head.last_sequence);
+        try std.testing.expectEqual(@as(u64, 0), (try @import("../source_authority.zig").load(&read)).?.sequence);
+        const physical = @import("relational_index_records.zig");
+        var reverse: std.ArrayList(u8) = .empty;
+        defer reverse.deinit(alloc);
+        try physical.appendReverseKey(alloc, &reverse, binding.index, "a");
+        const tuple = try physical.reverseTuple(reverse.items, try read.get(reverse.items));
+        try std.testing.expectEqualSlices(u8, first.command.candidates[0].tuple.?, tuple);
+    }
+    {
+        const checkpoint_bytes = try db.core.store.get(alloc, build.checkpoint_key);
+        defer alloc.free(checkpoint_bytes);
+        var corrupt: [build.checkpoint_len]u8 = checkpoint_bytes[0..build.checkpoint_len].*;
+        @memcpy(corrupt[104..137], &try (@import("receipt_position.zig").Position{ .native = .{ .namespace = binding.fence.namespace, .sequence = 50 } }).encode());
+        @memcpy(corrupt[176..208], &@import("relational_index_inputs.zig").digest(corrupt[0..176]));
+        try db.core.store.putBatch(&.{.{ .key = build.checkpoint_key, .value = &corrupt }}, &.{});
+        {
+            var read = try db.core.store.beginReadTxn();
+            defer read.abort();
+            try std.testing.expectError(error.InvalidControlReceiptPosition, build.verifyRecovery(&read, reserved_binding));
+        }
+        try db.core.store.putBatch(&.{.{ .key = build.checkpoint_key, .value = checkpoint_bytes }}, &.{});
+    }
+    var last = (try build.prepareRaft(alloc, null, db.core, "usage_records", &retry, .{ .records = 1, .time_ns = std.time.ns_per_s }, .{})).?;
+    defer last.deinit();
+    try std.testing.expectEqual(@as(usize, 0), last.page.records_examined);
+    try std.testing.expectEqual(pages.State.ready, last.command.next.state);
+    try std.testing.expectError(error.InvalidControlReceiptPosition, db.applyCommittedRaftIndexBuild(&last, 11, .{ .term = 4, .index = 60 }));
+    try db.applyCommittedRaftIndexBuild(&last, 11, .{ .term = 5, .index = 60 });
+    db.close();
+    db_live = false;
+    db = try db_mod.DB.open(alloc, directory.path(), options);
+    db_live = true;
+    {
+        var read = try db.core.store.beginReadTxn();
+        defer read.abort();
+        try build.verifyRecovery(&read, reserved_binding);
+        const head = (try source.load(&read, reserved_binding)).?;
+        try std.testing.expectEqual(source.State.ready, head.state);
+        try std.testing.expectEqual(@as(u64, 2), head.emitted);
+        try std.testing.expectEqual(@as(u64, 1), head.emitted_rows);
+        try std.testing.expectEqual(@as(u64, 60), head.last_sequence);
+        // Physical completion alone grants neither uniqueness nor publication.
+        try std.testing.expectEqualDeep(reserved_binding, (try jobs.load(&read)).?);
+    }
     try @import("antfly_server_test_sources").local_test_sources.storage_relational_index_raft_apply.run(admission.command);
 }
 

@@ -1,7 +1,7 @@
 # SQL catalog lifecycle and original-case qualification
 
 Status: draft follow-up PR #1061 to merged PR #1048, merged with `origin/main`
-at `2de3e3780c` (2026-10-17). Earlier implementation and
+at `1b4b255aae` (2026-10-17). Earlier implementation and
 qualification checkpoints are retained below with their exact scope.
 This is an implementation and qualification backlog, not
 a completion claim. PostgreSQL is the SQL standard and independent test oracle.
@@ -19,6 +19,29 @@ are unresolved family pools, not promises that one implementation closes them.
 | 3 | Read and query | 113 | Faithful typed fixtures, binding/correlation, endpoint results and diagnostics |
 | 4 | Document writes | 62 | Document-specific schema/index profiles, complete postimages and integrity admission |
 | 5 | Historically unsupported writes | 92 | Individual PostgreSQL contract review, implementations or proven required rejections |
+
+## Replicated index execution: current boundary
+
+The mounted distributed UNIQUE-index gate still rejects CREATE with `501`:
+replicated publication is not fully activated. Admission stays guarded and no
+original cases receive credit for storage-only work. Next delivery must cross
+the public owner/coordinator boundary, not merely add more protocol contracts.
+
+The existing bounded physical builder now supports trusted committed Raft apply
+using the same page, progress CAS and claim-source queue as standalone execution.
+Page records, progress, source batch and the ordered apply watermark commit in
+one store transaction. Raft term/index remain explicit on disk; retries retain
+the original effect position without advancing the standalone clock. Preparation
+reuses the compiled reservation outside apply exclusion, and follower replay
+uses the selected page rather than repeating a time-limited scan. Cold recovery
+verifies the checkpoint against the durable apply watermark and bounded source
+header chain. This does not yet wire replicated claim delivery, validation,
+installation, cancellation or publication release through the public receiver.
+
+Verification: `zig build antfly-relational-index-system-test -Doptimize=Debug -j1`
+passes 288 storage tests and one server test, with no skips or leaks. The Raft
+regression covers aborted apply, exact replay, retry cuts, physical membership,
+wrong-authority corruption, allocation failures and two cold reopens.
 
 ## Document conflict delivery (2026-10-17)
 

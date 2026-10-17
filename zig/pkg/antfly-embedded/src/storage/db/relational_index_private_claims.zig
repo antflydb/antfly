@@ -25,6 +25,7 @@ pub const prefix = jobs.key ++ ":claim-inventory:";
 pub const registration_prefix = jobs.key ++ ":claim-registration:";
 const authority = @import("../source_authority.zig");
 const Native = @import("receipt_position.zig").Native;
+const Position = @import("receipt_position.zig").Position;
 pub const max_claims = 128;
 pub const delivery = @import("relational_index_claim_delivery.zig");
 
@@ -360,7 +361,7 @@ pub const SourceStream = struct {
                 std.mem.readInt(u64, raw[104..112], .little) != ordinal or ordinal == 0 or
                 !std.mem.eql(u8, raw[288..320], &hash(raw[0..288]))) return error.InvalidPrivateIndexClaimInventory;
             const cut_position = try @import("receipt_position.zig").Position.decode(raw[112..145]);
-            if (cut_position != .native) return error.InvalidPrivateIndexClaimInventory;
+            if ((cut_position == .native) != (binding.authority == .native)) return error.InvalidPrivateIndexClaimInventory;
             try cut_position.requireNamespace(binding.fence.namespace);
             const name_len = std.mem.readInt(u32, raw[92..96], .little);
             const count = std.mem.readInt(u32, raw[96..100], .little);
@@ -372,7 +373,12 @@ pub const SourceStream = struct {
             return .{ .bytes = raw[0..header_len].* };
         }
         pub fn position(self: Header) !Native {
-            return (try @import("receipt_position.zig").Position.decode(self.bytes[112..145])).native;
+            const cut = try self.orderedPosition();
+            if (cut != .native) return error.InvalidControlReceiptPosition;
+            return cut.native;
+        }
+        pub fn orderedPosition(self: Header) !Position {
+            return Position.decode(self.bytes[112..145]);
         }
         pub fn progressDigest(self: Header) integrity.Digest {
             return self.bytes[152..184].*;
@@ -445,21 +451,31 @@ pub const SourceStream = struct {
         /// Stage with the physical page, progress, native cut and mirror outbox.
         /// Capacity rejection aborts that whole transaction, never just claims.
         pub fn stage(self: *PreparedSource, txn: anytype, binding: jobs.Binding, position: Native) !void {
+            return self.stageOrdered(txn, binding, .{ .native = position });
+        }
+        /// The caller commits this batch with its physical page and actual
+        /// authority watermark. Raft indexes remain Raft positions on disk.
+        pub fn stageOrdered(self: *PreparedSource, txn: anytype, binding: jobs.Binding, position: Position) !void {
+            const sequence = try orderedSequence(binding, position);
             const allocation = try requireRegistered(txn, binding);
             if (!std.mem.eql(u8, &allocation.generation, &self.scope.generation)) return error.InvalidPrivateIndexClaimInventory;
             var head = (try load(txn, binding)) orelse Head{ .binding_digest = try bindingDigest(binding), .scope_digest = try self.scope.digest() };
-            if (!std.mem.eql(u8, &head.scope_digest, &try self.scope.digest()) or head.state != .building or position.sequence <= head.last_sequence) return error.PrivateIndexOwnerJobChanged;
+            if (!std.mem.eql(u8, &head.scope_digest, &try self.scope.digest()) or head.state != .building or sequence <= head.last_sequence) return error.PrivateIndexOwnerJobChanged;
+            if (head.emitted != 0 and binding.authority == .raft) {
+                const previous = try Header.decode((try optional(txn, &key(binding.id, head.emitted, false))) orelse return error.InvalidPrivateIndexClaimInventory, binding, head.emitted);
+                if ((try previous.orderedPosition()).raft.term > position.raft.term) return error.InvalidControlReceiptPosition;
+            }
             const bytes: u64 = self.payload.len + header_len + 2 * @sizeOf(Key);
             if (head.emitted - head.consumed >= max_pending or head.pending_bytes + bytes > max_pending_bytes) return error.PrivateIndexClaimBacklogFull;
             head.emitted = try std.math.add(u64, head.emitted, 1);
             std.mem.writeInt(u64, self.header[104..112], head.emitted, .little);
-            @memcpy(self.header[112..145], &try (@import("receipt_position.zig").Position{ .native = position }).encode());
+            @memcpy(self.header[112..145], &try position.encode());
             @memcpy(self.header[256..288], &head.last_digest);
             @memcpy(self.header[288..320], &hash(self.header[0..288]));
             const header = try Header.decode(&self.header, binding, head.emitted);
             head.pending_bytes += bytes;
             head.emitted_rows = try std.math.add(u64, head.emitted_rows, std.mem.readInt(u32, self.header[96..100], .little));
-            head.last_sequence = position.sequence;
+            head.last_sequence = sequence;
             head.last_digest = header.digest();
             head.progress_digest = self.header[152..184].*;
             head.state = @fromBackingInt(@intCast(self.header[184]));
@@ -470,13 +486,27 @@ pub const SourceStream = struct {
     };
 
     pub fn requireLatest(txn: anytype, binding: jobs.Binding, source: Scope, position: Native, progress_digest: integrity.Digest, batch_digest: integrity.Digest) !Head {
+        return requireLatestOrdered(txn, binding, source, .{ .native = position }, progress_digest, batch_digest);
+    }
+
+    fn orderedSequence(binding: jobs.Binding, position: Position) !u64 {
+        try position.requireNamespace(binding.fence.namespace);
+        if ((position == .native) != (binding.authority == .native)) return error.InvalidControlReceiptPosition;
+        return switch (position) {
+            .native => |value| value.sequence,
+            .raft => |value| value.index,
+        };
+    }
+
+    pub fn requireLatestOrdered(txn: anytype, binding: jobs.Binding, source: Scope, position: Position, progress_digest: integrity.Digest, batch_digest: integrity.Digest) !Head {
+        const sequence = try orderedSequence(binding, position);
         const head = (try load(txn, binding)) orelse return error.InvalidPrivateIndexClaimInventory;
-        if (!std.mem.eql(u8, &head.last_digest, &batch_digest) or !std.mem.eql(u8, &head.scope_digest, &try source.digest()) or head.last_sequence != position.sequence or
+        if (!std.mem.eql(u8, &head.last_digest, &batch_digest) or !std.mem.eql(u8, &head.scope_digest, &try source.digest()) or head.last_sequence != sequence or
             !std.mem.eql(u8, &head.progress_digest, &progress_digest)) return error.InvalidPrivateIndexClaimInventory;
         if (head.pending() != 0) {
             const raw = (try optional(txn, &key(binding.id, head.emitted, false))) orelse return error.InvalidPrivateIndexClaimInventory;
             const header = try Header.decode(raw, binding, head.emitted);
-            if (!std.meta.eql(try header.position(), position) or
+            if (!std.meta.eql(try header.orderedPosition(), position) or
                 !std.mem.eql(u8, header.bytes[40..72], &head.scope_digest) or
                 !std.mem.eql(u8, header.bytes[152..184], &head.progress_digest) or header.bytes[184] != @backingInt(head.state) or
                 !std.mem.eql(u8, &header.digest(), &head.last_digest) or !std.mem.eql(u8, header.bytes[72..88], &source.generation) or
@@ -488,31 +518,38 @@ pub const SourceStream = struct {
     /// Metadata-only bounded recovery; payload integrity is checked on peek.
     /// Pending debt prevents publication even if a payload needs root recovery.
     pub fn verifyRecovery(txn: anytype, binding: jobs.Binding, expected: ?Native, progress_digest: ?integrity.Digest, batch_digest: ?integrity.Digest) !void {
+        return verifyRecoveryOrdered(txn, binding, if (expected) |value| .{ .native = value } else null, progress_digest, batch_digest);
+    }
+
+    pub fn verifyRecoveryOrdered(txn: anytype, binding: jobs.Binding, expected: ?Position, progress_digest: ?integrity.Digest, batch_digest: ?integrity.Digest) !void {
         const head = (try load(txn, binding)) orelse {
             if (expected != null) return error.InvalidPrivateIndexClaimInventory;
             return;
         };
         const cut = expected orelse return error.InvalidPrivateIndexClaimInventory;
         const allocation = try requireRegistered(txn, binding);
-        if (cut.sequence != head.last_sequence or progress_digest == null or batch_digest == null or
+        if (try orderedSequence(binding, cut) != head.last_sequence or progress_digest == null or batch_digest == null or
             !std.mem.eql(u8, &head.last_digest, &batch_digest.?) or !std.mem.eql(u8, &head.progress_digest, &progress_digest.?)) return error.InvalidPrivateIndexClaimInventory;
         var previous = head.consumed_digest;
         var previous_sequence = head.consumed_sequence;
+        var previous_term: u64 = 0;
         var bytes: u64 = 0;
         var rows: u64 = 0;
         for (0..@intCast(head.pending())) |i| {
             const ordinal = head.consumed + i + 1;
             const raw = (try optional(txn, &key(binding.id, ordinal, false))) orelse return error.InvalidPrivateIndexClaimInventory;
             const header = try Header.decode(raw, binding, ordinal);
-            const position = try header.position();
+            const position = try header.orderedPosition();
+            const sequence = try orderedSequence(binding, position);
             if (!std.mem.eql(u8, header.bytes[40..72], &head.scope_digest) or
                 !std.mem.eql(u8, header.bytes[72..88], &allocation.generation) or
-                !std.mem.eql(u8, header.bytes[256..288], &previous) or position.sequence <= previous_sequence or
+                !std.mem.eql(u8, header.bytes[256..288], &previous) or sequence <= previous_sequence or position.term() < previous_term or
                 (ordinal != head.emitted and header.bytes[184] != @backingInt(State.building)) or
                 (ordinal == head.emitted and (!std.meta.eql(position, cut) or
                     !std.mem.eql(u8, header.bytes[152..184], &head.progress_digest) or header.bytes[184] != @backingInt(head.state)))) return error.InvalidPrivateIndexClaimInventory;
             previous = header.digest();
-            previous_sequence = position.sequence;
+            previous_sequence = sequence;
+            previous_term = position.term();
             bytes += header.storedBytes();
             rows += std.mem.readInt(u32, header.bytes[96..100], .little);
         }

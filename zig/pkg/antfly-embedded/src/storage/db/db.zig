@@ -8406,6 +8406,15 @@ pub const DB = struct {
     /// state machine, not decoded from the command. Effects and the replay
     /// watermark commit together; preparation never runs under apply exclusion.
     pub fn applyCommittedRaftIndexOwnerControl(self: *DB, prepared: *RaftIndexOwnerControl.Prepared, owner_group: u64, entry: OrderedApplyReceipt) !void {
+        return self.applyCommittedRaftIndexEffect(prepared, owner_group, entry);
+    }
+
+    pub fn applyCommittedRaftIndexBuild(self: *DB, prepared: *@import("relational_index_owner_control.zig").PreparedBuild, owner_group: u64, entry: OrderedApplyReceipt) !void {
+        if (prepared.command.binding.authority != .raft) return error.InvalidControlReceiptPosition;
+        return self.applyCommittedRaftIndexEffect(prepared, owner_group, entry);
+    }
+
+    fn applyCommittedRaftIndexEffect(self: *DB, prepared: anytype, owner_group: u64, entry: OrderedApplyReceipt) !void {
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
         if (self.local_execution.restore_staging_required.load(.acquire)) return error.RestoreStagingScopeChanged;
         try prepared.command.validate();
@@ -8430,7 +8439,9 @@ pub const DB = struct {
             txn.abort();
             return;
         }
-        _ = try prepared.stage(self.core, &txn, owner_group, entry);
+        if (comptime @hasDecl(@typeInfo(@TypeOf(prepared)).pointer.child, "stageRaft")) {
+            try prepared.stageRaft(self.core, &txn, owner_group, entry);
+        } else _ = try prepared.stage(self.core, &txn, owner_group, entry);
         var marker_bytes: [ordered_apply_receipt_value_len]u8 = undefined;
         const marker_write = orderedApplyReceiptWrite(entry, &marker_bytes);
         try txn.put(marker_write.key, marker_write.value);
@@ -64447,7 +64458,7 @@ test "relational rows snapshot automatically binds expression prefixes without b
     const alloc = std.testing.allocator;
     var directory = try TestDirectory.init("relational-expression-auto-prefix");
     defer directory.cleanup();
-    var db = try DB.open(alloc, directory.path(), .{ .start_optional_runtimes = false, .primary_backend = .{ .lsm = .{ .flush_threshold = 2 } } });
+    var db = try DB.open(alloc, directory.path(), .{ .start_optional_runtimes = false, .start_index_workers = false, .primary_backend = .{ .lsm = .{ .flush_threshold = 2 } } });
     defer db.close();
     const properties =
         \\"document_schemas":{"row":{"schema":{"type":"object","properties":{"tenant":{"type":"integer"},"email":{"type":"keyword"},"active":{"type":"boolean"}},"additionalProperties":false}}}
@@ -64481,15 +64492,28 @@ test "relational rows snapshot automatically binds expression prefixes without b
         .{ .column = "active", .op = .eq, .value = .{ .boolean = true } },
     } };
     const Check = struct {
+        fn drain(reader: *RelationalRows.Reader) !usize {
+            var count: usize = 0;
+            // Page completion is not query completion. Force both matching
+            // and filtered one-record pages instead of depending on how much
+            // work fits inside a default wall-clock slice on this machine.
+            for (0..8) |_| {
+                var page = try reader.nextTypedPage(std.testing.allocator, null, .{ .rows = 1, .records = 1 });
+                defer page.deinit();
+                try std.testing.expect(page.rows.len <= 1);
+                count += page.rows.len;
+                if (!page.more) return count;
+                try std.testing.expect(page.records_examined != 0);
+            }
+            return error.TestUnexpectedResult;
+        }
         fn fallback(database: *DB, input: RelationalRows.Request, count: usize) !void {
             var reader = try database.beginRelationalRows(std.testing.allocator, input);
             defer reader.deinit();
             try std.testing.expect(reader.index == null);
-            var page = try reader.nextTypedPage(std.testing.allocator, null, .{});
-            defer page.deinit();
             // Hints do not own logical filtering. The caller must retain its
             // expression residual when this correct primary fallback is used.
-            try std.testing.expectEqual(count, page.rows.len);
+            try std.testing.expectEqual(count, try drain(&reader));
         }
         fn broadPrefix(database: *DB, input: RelationalRows.Request) !void {
             var reader = try database.beginRelationalRows(std.testing.allocator, input);
@@ -64497,9 +64521,7 @@ test "relational rows snapshot automatically binds expression prefixes without b
             // A nonmatching second key must not discard a useful first-key
             // prefix, nor narrow that prefix using an unproven expression.
             try std.testing.expectEqualStrings("mixed", reader.index.?.name);
-            var page = try reader.nextTypedPage(std.testing.allocator, null, .{});
-            defer page.deinit();
-            try std.testing.expectEqual(@as(usize, 2), page.rows.len);
+            try std.testing.expectEqual(@as(usize, 2), try drain(&reader));
         }
     };
     try Check.fallback(&db, request, 2);
