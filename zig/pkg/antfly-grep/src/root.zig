@@ -15,6 +15,7 @@
 
 const std = @import("std");
 pub const interrupt = @import("interrupt.zig");
+pub const concurrency = @import("concurrency.zig");
 pub const setup = @import("setup.zig");
 pub const tooling = @import("tooling.zig");
 pub const Options = @import("options.zig").Options;
@@ -2188,6 +2189,7 @@ test "line offsets preserve CRLF and unterminated final lines" {
     try std.testing.expectEqual(@as(usize, 0), empty.len);
 }
 test {
+    _ = @import("concurrency.zig");
     _ = @import("options.zig");
     _ = @import("matcher.zig");
     _ = @import("discovery.zig");

@@ -68,6 +68,7 @@ def main():
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--count", action="store_true")
     mode.add_argument("--files-with-matches", action="store_true")
+    parser.add_argument("--search-zip", action="store_true")
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
     if (
@@ -97,6 +98,7 @@ def main():
     command = [
         str(binary),
         *(["-P"] if args.engine == "pcre2" else []),
+        *(["-z"] if args.search_zip else []),
         "-l" if args.files_with_matches else "-c" if args.count else "-o",
         "--color=never",
         "-e",
@@ -138,7 +140,7 @@ def main():
             process.kill()
             process.wait()
     report.update(
-        complete=process.returncode == 0 and sampler_exit == 0 and stacks.exists(),
+        complete=process.returncode in (0, 1) and sampler_exit == 0 and stacks.exists(),
         exit=process.returncode,
         elapsed_seconds=time.monotonic() - start,
         sampler_exit=sampler_exit,

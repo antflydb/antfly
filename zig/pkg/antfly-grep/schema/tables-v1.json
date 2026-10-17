@@ -53,6 +53,29 @@
           "document_field": {
             "type": "string",
             "default": "grep"
+          },
+          "candidate_index": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "version",
+              "field"
+            ],
+            "properties": {
+              "version": {
+                "const": 1
+              },
+              "field": {
+                "type": "string",
+                "minLength": 1
+              },
+              "version_field": {
+                "type": "string",
+                "minLength": 1,
+                "default": "grep_trigrams_version"
+              }
+            },
+            "description": "Complete raw-content byte trigrams encoded as lowercase hex keyword terms; atomic with the source revision. Opt-in acceleration only."
           }
         }
       }

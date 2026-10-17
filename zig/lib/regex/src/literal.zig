@@ -252,7 +252,7 @@ pub fn find(text: []const u8, needle: []const u8, offset: usize, insensitive: bo
             while (left < needle.len and right < text.len) {
                 const x = unicode.decode(needle, left, true);
                 const y = unicode.decode(text, right, true);
-                if (unicode.fold(x.cp) != unicode.fold(y.cp)) break;
+                if (x.cp != y.cp and unicode.fold(x.cp) != unicode.fold(y.cp)) break;
                 left += x.len;
                 right += y.len;
             }

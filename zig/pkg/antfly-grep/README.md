@@ -675,3 +675,95 @@ add **107,363 executions** across regex, parsers and dictionaries. Windows x86_6
 cross-compilation passes; runtime validation remains scoped to macOS/Linux.
 The validation report records source and executable hashes. Decision checks use
 local fixtures.
+
+
+## Release qualification and indexed acceleration
+
+Build a versioned standalone release with the native toolchain, then package it:
+
+```sh
+zig build -Dgrep-only=true -Doptimize=ReleaseFast -Dstrip=true -Dantfly-version=VERSION grep
+python3 ../scripts/packaging/package_grep_release.py --binary zig-out/bin/antfly-grep --output zig-out/antfly-grep.tar.gz
+```
+
+The archive includes the executable, its SHA-256 manifest, Apache license,
+third-party notices, all four shell completion files, a man page, connection and
+document schemas, and compatibility documentation. Server archives also carry
+these grep assets. Cross-target archives copy generated tooling without executing
+the target binary. CLI regression tests compare every generated asset with the
+current CLI output. Regenerate `generated/` using `--generate` after flag changes.
+The server E2E artifact includes grep so real-server tests use the same checkout.
+
+[`zig/e2e/antfly/test_grep_indexed.py`](../../e2e/antfly/test_grep_indexed.py) covers real native-server
+pagination, large source-region lists, concurrent updates, one-second cursor
+expiry with retained partial output, authentication and key revocation. Run it
+with `ANTFLY_BIN` and `ANTFLY_GREP_BIN` pointing at the desired native builds.
+
+Optional indexed acceleration uses an explicitly configured, revision-atomic
+raw-byte trigram index. For example:
+
+```json
+{"name":"sources","candidate_index":{"version":1,"field":"grep_trigrams","version_field":"grep_trigrams_version"}}
+```
+
+The producer must index **every overlapping three-byte window of the exact stored
+UTF-8 content** as a six-character lowercase hexadecimal keyword term. No analyzer
+stemming, normalization, or truncation is permitted. Deduplicating terms is safe.
+Write the term array, content, source metadata and revision atomically; set the
+keyword certificate field to `raw-byte-trigrams-v1` only after generating the
+complete array. Empty and short content has an empty term array. The certificate
+is an ingestion guarantee, not a user-supplied relevance score. Without a
+certificate, documents remain candidates, allowing online incremental backfills.
+Do not certify partial or stale term arrays.
+
+The CLI selects at most eight necessary grams for a single case-sensitive literal,
+combines them with any user filter, and verifies all returned content with the
+shared matcher. Missing certificates use the exact-scan fallback. Queries needing
+nonmatching files, inverted selection, passthrough, zero counts, full JSON/statistics,
+or decision evaluation bypass candidate filtering. Case-insensitive, short and
+multiple-pattern searches currently fall back too. Existing tables without
+`candidate_index` keep the original exact scan. Approximate semantic retrieval is
+not substituted for an exact grep query.
+
+Automatic local workers respect Linux scheduler affinity and hierarchical cgroup
+v2 CPU quotas; explicit `-j` remains authoritative. Storage-sensitive defaults
+retain the measured caps. Use benchmark worker sweeps on the deployment's actual
+storage rather than assuming one cap is optimal everywhere.
+
+`bench/compare.py` accepts `--threads N`, Linux `--cpus N`, and
+`--cache-mode cold-advice`. Cold advice fsyncs each corpus file and calls
+`POSIX_FADV_DONTNEED` before each measured child. It does not drop global caches,
+and storage/controller caches can remain warm; it is best-effort eviction, not a
+physical cold-storage guarantee. Extended cases include dense output, capture
+replacement, Unicode output and preprocessing; `--codecs` adds decompression.
+The admitted native Linux qualification CI records paired runs, CPU, RSS,
+first-result latency, output hashes and a 5,000-case differential campaign,
+including worker sweeps and a one-CPU/cold-advice configuration. CI evidence is
+available only after the job has actually completed on that platform.
+
+`tests/relevance-repository.json` pins labeled production-source snapshots in
+addition to the small synthetic relevance corpus. Run `bench/evaluate.py` with
+that manifest and `--fixture` for deterministic pipeline checks. It records
+requests and provider-reported tokens; optional `--input-usd-per-million` and
+`--output-usd-per-million` calculate cost when usage is available. Unknown usage
+remains unknown. Fixture precision/recall does not establish live-model quality.
+Provider evaluation remains opt-in, with an explicit endpoint/model and request
+budget. No provider pricing or credentials are embedded in the corpus.
+
+Linux memory measurements use separate GNU `time` runs outside elapsed/CPU timing.
+Install `/usr/bin/time` to collect target RSS; without it, Linux RSS is reported as
+unavailable. Direct `wait4` can include the benchmark parent's inherited pre-exec
+high-water mark, so those values are deliberately omitted. A regression holds
+96 MiB in the parent and verifies that a small target does not inherit that peak.
+Cold-advice eviction is repeated before the independent memory runs too.
+
+Timing reports retain every trial and flag relative median absolute deviation
+above 20% as high variance. Treat such timings as inconclusive for small speedups;
+the Linux VM can share CPU and storage with other host workloads. No slow trials
+are removed. Dedicated admitted CI remains the next source of independent x86-64
+Linux measurements. Source and executable identities remain attached to results.
+
+GNU `time` reports the command's accounted RSS maximum, including waited
+children by maximum rather than sum. Codec/preprocessor comparisons therefore
+do not establish concurrent process-tree peak memory; external rg helper
+processes can overlap. Single-process cases avoid that ambiguity.

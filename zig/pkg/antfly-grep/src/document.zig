@@ -56,10 +56,11 @@ pub const Document = struct {
         if (field(value, "metadata")) |metadata| if (metadata != .object) return error.InvalidDocumentMetadata;
         if (field(value, "regions")) |regions| {
             if (regions != .array) return error.InvalidDocumentRegions;
+            const line_count = std.mem.count(u8, content, "\n") + 1;
             for (regions.array.items) |region| {
                 const start = integer(field(region, "start_line")) orelse return error.InvalidDocumentRegions;
                 const end = integer(field(region, "end_line")) orelse return error.InvalidDocumentRegions;
-                if (start < 1 or end < start or end > std.mem.count(u8, content, "\n") + 1) return error.InvalidDocumentRegions;
+                if (start < 1 or end < start or end > line_count) return error.InvalidDocumentRegions;
             }
         }
         return .{ .path = path, .content = content, .modified_at = integer(field(value, "modified_at")), .created_at = integer(field(value, "created_at")), .accessed_at = integer(field(value, "accessed_at")), .provenance = .{ .backend = .antfly, .uri = uri, .table = table, .document_id = id, .revision = revision, .indexed_at = indexed_at, .observed_at = now, .snapshot = snapshot, .freshness = .indexed, .metadata = field(value, "metadata"), .source_regions = field(value, "regions") } };

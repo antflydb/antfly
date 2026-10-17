@@ -1,0 +1,628 @@
+.TH ANTFLY-GREP 1
+.SH NAME
+antfly-grep \- native exact and decision source search
+.SH SYNOPSIS
+.nf
+Usage: antfly-grep [OPTIONS] PATTERN [PATH ...]
+       antfly-grep --ask QUESTION --model MODEL [OPTIONS] [PATH ...]
+
+Native local-file grep and decision-based source search. No index required.
+With no paths, search piped stdin, otherwise recursively search '.'.
+Use '-' for stdin; '--' ends option parsing.
+
+  -e, --regexp PATTERN       Repeat for OR patterns; restrict --ask regions
+  -F, --fixed-strings        Literal matching
+  -i, --ignore-case          Unicode case-insensitive matching
+  -w, --word-regexp          Unicode word boundaries
+  -x, --line-regexp          Match whole lines
+  -v, --invert-match         Select nonmatching lines/decision regions
+  -n, --line-number          Show line numbers
+      --no-line-number       Omit line numbers
+  -l, --files-with-matches   Print matching paths only
+  -c, --count                Print selected line counts per file
+  -q, --quiet                Exit after a matching file, without output
+  -A/-B/-C N                After/before/both context lines
+  -m, --max-count N          Maximum selected lines per file
+  -g, --glob GLOB            Include glob; prefix '!' to exclude (repeatable)
+      --files               List discovered files without searching
+      --hidden              Include hidden files
+      --no-ignore           Disable ignore/exclude files
+  -a, --text                 Search files containing NUL bytes
+      --max-file-size N      File/stdin byte ceiling (default unlimited)
+      --json                JSON Lines events
+
+  -o, --only-matching        Print each matching span
+  -r, --replace TEXT         Capture replacement ($1, ${name})
+  -U, --multiline            Match across lines
+  -S, --smart-case           Infer case sensitivity from pattern
+  -j, --threads N            Concurrent file scans/decision requests
+  -L, --follow               Follow discovered symlinks
+  -t/-T TYPE                 Include/exclude file types (--type-list)
+      --color WHEN          auto, always, never
+      --count-matches       Count occurrences rather than lines
+      --sort path           Deterministic path order
+      --stats               Report search statistics
+  -P, --pcre2                Native bounded PCRE-style matching
+      --engine ENGINE       default, pcre2, auto
+  -z, --search-zip           Native streaming compressed-file search
+      --dictionary PATH     Brotli/LZ4/Zstandard external dictionary
+      --table-config PATH  Versioned Antfly table connection JSON
+      --table NAME         Select a configured table (repeatable)
+      --table-filter JSON  Server-side structured filter
+      --max-index-documents N  Exact scan document budget (default 100000)
+      --max-pending-output N  Ranked output memory cap (default 64MiB)
+      --dictionary-format FORMAT  auto/raw/brotli/brotli-google
+      --max-dictionary-size SIZE  Dictionary payload cap (default 64M)
+      --max-decompression-window SIZE  Codec history cap (default 64M)
+  -E, --encoding NAME        BOM detection/transcoding (auto, none, label)
+      --pre PROGRAM         Explicit file preprocessor
+      --generate KIND       Man page or shell completion
+      --debug / --trace      Search/discovery diagnostics
+
+      --ask QUESTION        Judge source regions using Antfly decisions
+      --backend local       In-process native libantfly inference
+      --library PATH        Native inference shared library
+      --models-dir PATH     Local model directory
+      --cache-ttl SECONDS  Score cache lifetime (86400; 0 bypasses)
+      --no-cache            Bypass persistent decision score cache
+      --no-refine           Retain accepted declaration/block regions
+      --no-rank             Emit source order instead of score ranking
+      --triage              Enable model-based directory pruning
+      --max-requests N      Decision request budget (default 1000)
+      --model MODEL         Decision model (or ANTFLY_GREP_MODEL)
+      --endpoint URL        Full URL (or ANTFLY_GREP_ENDPOINT)
+                            Default: http://127.0.0.1:8090/decisions
+      --threshold P         Predicate cutoff [0,1] (default 0.5)
+      --chunk-lines N       Maximum target lines per region (default 80)
+      --unit line|block     'line' sets chunk-lines=1
+      --context-lines N     Model-only context (default 8)
+      --batch-size N        Inputs per request, 1..128 (default 8)
+      --max-regions N       Evaluation budget; exhaustion exits 2
+      --timeout-ms N        Request deadline (default 60000)
+                            Bearer token: ANTFLY_GREP_TOKEN environment
+  -I, --no-filename          Omit filename prefixes
+  -h, --help                 Show help
+      --version             Show version
+
+Exit: 0 matches, 1 no matches, 2 errors/incomplete search.
+ask QUERY uses jevgrep-style option meanings: -n result files, -T file
+threshold, -t region threshold, -f policy, -b broad, -q suppress progress.
+auth, doctor, skill, files, and cache clear provide setup and inspection.
+Line and region probabilities have distinct scopes in semantic output.
+
+.fi
+.SH OPTIONS
+.TP
+.B --after-context
+See antfly-grep --help and the package README for semantics.
+.TP
+.B --agent
+See antfly-grep --help and the package README for semantics.
+.TP
+.B --ask
+See antfly-grep --help and the package README for semantics.
+.TP
+.B --auto-hybrid-regex
+See antfly-grep --help and the package README for semantics.
+.TP
+.B --backend
+See antfly-grep --help and the package README for semantics.
+.TP
+.B --base-url
+See antfly-grep --help and the package README for semantics.
+.TP
+.B --batch-size
+See antfly-grep --help and the package README for semantics.
+.TP
+.B --before-context
+See antfly-grep --help and the package README for semantics.
+.TP
+.B --binary
+See antfly-grep --help and the package README for semantics.
+.TP
+.B --block-buffered
+See antfly-grep --help and the package README for semantics.
+.TP
+.B --broad
+See antfly-grep --help and the package README for semantics.
+.TP
+.B --byte-offset
+See antfly-grep --help and the package README for semantics.
+.TP
+.B --cache-dir
+See antfly-grep --help and the package README for semantics.
+.TP
+.B --cache-ttl
+See antfly-grep --help and the package README for semantics.
+.TP
+.B --case-sensitive
+See antfly-grep --help and the package README for semantics.
+.TP
+.B --chunk-lines
+See antfly-grep --help and the package README for semantics.
+.TP
+.B --color
+See antfly-grep --help and the package README for semantics.
+.TP
+.B --colors
+See antfly-grep --help and the package README for semantics.
+.TP
+.B --column
+See antfly-grep --help and the package README for semantics.
+.TP
+.B --concurrency
+See antfly-grep --help and the package README for semantics.
+.TP
+.B --context
+See antfly-grep --help and the package README for semantics.
+.TP
+.B --context-lines
+See antfly-grep --help and the package README for semantics.
+.TP
+.B --context-separator
+See antfly-grep --help and the package README for semantics.
+.TP
+.B --count
+See antfly-grep --help and the package README for semantics.
+.TP
+.B --count-matches
+See antfly-grep --help and the package README for semantics.
+.TP
+.B --crlf
+See antfly-grep --help and the package README for semantics.
+.TP
+.B --debug
+See antfly-grep --help and the package README for semantics.
+.TP
+.B --dfa-size-limit
+See antfly-grep --help and the package README for semantics.
+.TP
+.B --dictionary
+See antfly-grep --help and the package README for semantics.
+.TP
+.B --dictionary-format
+See antfly-grep --help and the package README for semantics.
+.TP
+.B --encoding
+See antfly-grep --help and the package README for semantics.
+.TP
+.B --endpoint
+See antfly-grep --help and the package README for semantics.
+.TP
+.B --engine
+See antfly-grep --help and the package README for semantics.
+.TP
+.B --exclude
+See antfly-grep --help and the package README for semantics.
+.TP
+.B --field-context-separator
+See antfly-grep --help and the package README for semantics.
+.TP
+.B --field-match-separator
+See antfly-grep --help and the package README for semantics.
+.TP
+.B --file
+See antfly-grep --help and the package README for semantics.
+.TP
+.B --file-threshold
+See antfly-grep --help and the package README for semantics.
+.TP
+.B --files
+See antfly-grep --help and the package README for semantics.
+.TP
+.B --files-with-matches
+See antfly-grep --help and the package README for semantics.
+.TP
+.B --files-without-match
+See antfly-grep --help and the package README for semantics.
+.TP
+.B --filter
+See antfly-grep --help and the package README for semantics.
+.TP
+.B --fixed-strings
+See antfly-grep --help and the package README for semantics.
+.TP
+.B --follow
+See antfly-grep --help and the package README for semantics.
+.TP
+.B --generate
+See antfly-grep --help and the package README for semantics.
+.TP
+.B --glob
+See antfly-grep --help and the package README for semantics.
+.TP
+.B --glob-case-insensitive
+See antfly-grep --help and the package README for semantics.
+.TP
+.B --global
+See antfly-grep --help and the package README for semantics.
+.TP
+.B --heading
+See antfly-grep --help and the package README for semantics.
+.TP
+.B --help
+See antfly-grep --help and the package README for semantics.
+.TP
+.B --hidden
+See antfly-grep --help and the package README for semantics.
+.TP
+.B --hostname-bin
+See antfly-grep --help and the package README for semantics.
+.TP
+.B --hyperlink-format
+See antfly-grep --help and the package README for semantics.
+.TP
+.B --iglob
+See antfly-grep --help and the package README for semantics.
+.TP
+.B --ignore
+See antfly-grep --help and the package README for semantics.
+.TP
+.B --ignore-case
+See antfly-grep --help and the package README for semantics.
+.TP
+.B --ignore-dot
+See antfly-grep --help and the package README for semantics.
+.TP
+.B --ignore-exclude
+See antfly-grep --help and the package README for semantics.
+.TP
+.B --ignore-file
+See antfly-grep --help and the package README for semantics.
+.TP
+.B --ignore-file-case-insensitive
+See antfly-grep --help and the package README for semantics.
+.TP
+.B --ignore-files
+See antfly-grep --help and the package README for semantics.
+.TP
+.B --ignore-global
+See antfly-grep --help and the package README for semantics.
+.TP
+.B --ignore-parent
+See antfly-grep --help and the package README for semantics.
+.TP
+.B --ignore-vcs
+See antfly-grep --help and the package README for semantics.
+.TP
+.B --include-dependencies
+See antfly-grep --help and the package README for semantics.
+.TP
+.B --include-sensitive
+See antfly-grep --help and the package README for semantics.
+.TP
+.B --include-zero
+See antfly-grep --help and the package README for semantics.
+.TP
+.B --invert-match
+See antfly-grep --help and the package README for semantics.
+.TP
+.B --json
+See antfly-grep --help and the package README for semantics.
+.TP
+.B --library
+See antfly-grep --help and the package README for semantics.
+.TP
+.B --line-buffered
+See antfly-grep --help and the package README for semantics.
+.TP
+.B --line-number
+See antfly-grep --help and the package README for semantics.
+.TP
+.B --line-regexp
+See antfly-grep --help and the package README for semantics.
+.TP
+.B --max-columns
+See antfly-grep --help and the package README for semantics.
+.TP
+.B --max-columns-preview
+See antfly-grep --help and the package README for semantics.
+.TP
+.B --max-count
+See antfly-grep --help and the package README for semantics.
+.TP
+.B --max-decompression-window
+See antfly-grep --help and the package README for semantics.
+.TP
+.B --max-depth
+See antfly-grep --help and the package README for semantics.
+.TP
+.B --max-dictionary-size
+See antfly-grep --help and the package README for semantics.
+.TP
+.B --max-file-size
+See antfly-grep --help and the package README for semantics.
+.TP
+.B --max-files
+See antfly-grep --help and the package README for semantics.
+.TP
+.B --max-filesize
+See antfly-grep --help and the package README for semantics.
+.TP
+.B --max-index-documents
+See antfly-grep --help and the package README for semantics.
+.TP
+.B --max-output-bytes
+See antfly-grep --help and the package README for semantics.
+.TP
+.B --max-pending-output
+See antfly-grep --help and the package README for semantics.
+.TP
+.B --max-regions
+See antfly-grep --help and the package README for semantics.
+.TP
+.B --max-requests
+See antfly-grep --help and the package README for semantics.
+.TP
+.B --max-result-files
+See antfly-grep --help and the package README for semantics.
+.TP
+.B --max-source-bytes
+See antfly-grep --help and the package README for semantics.
+.TP
+.B --messages
+See antfly-grep --help and the package README for semantics.
+.TP
+.B --mmap
+See antfly-grep --help and the package README for semantics.
+.TP
+.B --model
+See antfly-grep --help and the package README for semantics.
+.TP
+.B --models-dir
+See antfly-grep --help and the package README for semantics.
+.TP
+.B --multiline
+See antfly-grep --help and the package README for semantics.
+.TP
+.B --multiline-dotall
+See antfly-grep --help and the package README for semantics.
+.TP
+.B --no-cache
+See antfly-grep --help and the package README for semantics.
+.TP
+.B --no-config
+See antfly-grep --help and the package README for semantics.
+.TP
+.B --no-context-separator
+See antfly-grep --help and the package README for semantics.
+.TP
+.B --no-filename
+See antfly-grep --help and the package README for semantics.
+.TP
+.B --no-follow
+See antfly-grep --help and the package README for semantics.
+.TP
+.B --no-heading
+See antfly-grep --help and the package README for semantics.
+.TP
+.B --no-hidden
+See antfly-grep --help and the package README for semantics.
+.TP
+.B --no-ignore
+See antfly-grep --help and the package README for semantics.
+.TP
+.B --no-ignore-case
+See antfly-grep --help and the package README for semantics.
+.TP
+.B --no-ignore-dot
+See antfly-grep --help and the package README for semantics.
+.TP
+.B --no-ignore-exclude
+See antfly-grep --help and the package README for semantics.
+.TP
+.B --no-ignore-files
+See antfly-grep --help and the package README for semantics.
+.TP
+.B --no-ignore-global
+See antfly-grep --help and the package README for semantics.
+.TP
+.B --no-ignore-messages
+See antfly-grep --help and the package README for semantics.
+.TP
+.B --no-ignore-parent
+See antfly-grep --help and the package README for semantics.
+.TP
+.B --no-ignore-vcs
+See antfly-grep --help and the package README for semantics.
+.TP
+.B --no-line-number
+See antfly-grep --help and the package README for semantics.
+.TP
+.B --no-messages
+See antfly-grep --help and the package README for semantics.
+.TP
+.B --no-mmap
+See antfly-grep --help and the package README for semantics.
+.TP
+.B --no-pcre2
+See antfly-grep --help and the package README for semantics.
+.TP
+.B --no-pcre2-unicode
+See antfly-grep --help and the package README for semantics.
+.TP
+.B --no-pre
+See antfly-grep --help and the package README for semantics.
+.TP
+.B --no-rank
+See antfly-grep --help and the package README for semantics.
+.TP
+.B --no-refine
+See antfly-grep --help and the package README for semantics.
+.TP
+.B --no-require-git
+See antfly-grep --help and the package README for semantics.
+.TP
+.B --no-search-zip
+See antfly-grep --help and the package README for semantics.
+.TP
+.B --no-sort-files
+See antfly-grep --help and the package README for semantics.
+.TP
+.B --no-unicode
+See antfly-grep --help and the package README for semantics.
+.TP
+.B --not
+See antfly-grep --help and the package README for semantics.
+.TP
+.B --null
+See antfly-grep --help and the package README for semantics.
+.TP
+.B --null-data
+See antfly-grep --help and the package README for semantics.
+.TP
+.B --one-file-system
+See antfly-grep --help and the package README for semantics.
+.TP
+.B --only
+See antfly-grep --help and the package README for semantics.
+.TP
+.B --only-matching
+See antfly-grep --help and the package README for semantics.
+.TP
+.B --passthru
+See antfly-grep --help and the package README for semantics.
+.TP
+.B --path-separator
+See antfly-grep --help and the package README for semantics.
+.TP
+.B --pcre2
+See antfly-grep --help and the package README for semantics.
+.TP
+.B --pcre2-match-limit
+See antfly-grep --help and the package README for semantics.
+.TP
+.B --pcre2-unicode
+See antfly-grep --help and the package README for semantics.
+.TP
+.B --pcre2-version
+See antfly-grep --help and the package README for semantics.
+.TP
+.B --pre
+See antfly-grep --help and the package README for semantics.
+.TP
+.B --pre-glob
+See antfly-grep --help and the package README for semantics.
+.TP
+.B --pretty
+See antfly-grep --help and the package README for semantics.
+.TP
+.B --provider
+See antfly-grep --help and the package README for semantics.
+.TP
+.B --query
+See antfly-grep --help and the package README for semantics.
+.TP
+.B --quiet
+See antfly-grep --help and the package README for semantics.
+.TP
+.B --refine
+See antfly-grep --help and the package README for semantics.
+.TP
+.B --regex-size-limit
+See antfly-grep --help and the package README for semantics.
+.TP
+.B --regexp
+See antfly-grep --help and the package README for semantics.
+.TP
+.B --replace
+See antfly-grep --help and the package README for semantics.
+.TP
+.B --require-git
+See antfly-grep --help and the package README for semantics.
+.TP
+.B --retries
+See antfly-grep --help and the package README for semantics.
+.TP
+.B --search-zip
+See antfly-grep --help and the package README for semantics.
+.TP
+.B --smart-case
+See antfly-grep --help and the package README for semantics.
+.TP
+.B --sort
+See antfly-grep --help and the package README for semantics.
+.TP
+.B --sort-files
+See antfly-grep --help and the package README for semantics.
+.TP
+.B --sortr
+See antfly-grep --help and the package README for semantics.
+.TP
+.B --stats
+See antfly-grep --help and the package README for semantics.
+.TP
+.B --stdin
+See antfly-grep --help and the package README for semantics.
+.TP
+.B --stop-on-nonmatch
+See antfly-grep --help and the package README for semantics.
+.TP
+.B --table
+See antfly-grep --help and the package README for semantics.
+.TP
+.B --table-config
+See antfly-grep --help and the package README for semantics.
+.TP
+.B --table-filter
+See antfly-grep --help and the package README for semantics.
+.TP
+.B --text
+See antfly-grep --help and the package README for semantics.
+.TP
+.B --threads
+See antfly-grep --help and the package README for semantics.
+.TP
+.B --threshold
+See antfly-grep --help and the package README for semantics.
+.TP
+.B --timeout-ms
+See antfly-grep --help and the package README for semantics.
+.TP
+.B --trace
+See antfly-grep --help and the package README for semantics.
+.TP
+.B --triage
+See antfly-grep --help and the package README for semantics.
+.TP
+.B --trim
+See antfly-grep --help and the package README for semantics.
+.TP
+.B --type
+See antfly-grep --help and the package README for semantics.
+.TP
+.B --type-add
+See antfly-grep --help and the package README for semantics.
+.TP
+.B --type-clear
+See antfly-grep --help and the package README for semantics.
+.TP
+.B --type-list
+See antfly-grep --help and the package README for semantics.
+.TP
+.B --type-not
+See antfly-grep --help and the package README for semantics.
+.TP
+.B --unicode
+See antfly-grep --help and the package README for semantics.
+.TP
+.B --unit
+See antfly-grep --help and the package README for semantics.
+.TP
+.B --unrestricted
+See antfly-grep --help and the package README for semantics.
+.TP
+.B --version
+See antfly-grep --help and the package README for semantics.
+.TP
+.B --vimgrep
+See antfly-grep --help and the package README for semantics.
+.TP
+.B --with-filename
+See antfly-grep --help and the package README for semantics.
+.TP
+.B --word-regexp
+See antfly-grep --help and the package README for semantics.
+.TP
+.B --yes
+See antfly-grep --help and the package README for semantics.

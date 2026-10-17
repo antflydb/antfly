@@ -19,7 +19,8 @@ const httpx = @import("httpx");
 const document = @import("document.zig");
 const Limits = @import("budget.zig").Limits;
 const A = std.mem.Allocator;
-pub const Table = struct { name: []const u8, alias: ?[]const u8 = null, document_field: []const u8 = "grep" };
+pub const CandidateIndex = struct { version: u32, field: []const u8, version_field: []const u8 = "grep_trigrams_version" };
+pub const Table = struct { name: []const u8, alias: ?[]const u8 = null, document_field: []const u8 = "grep", candidate_index: ?CandidateIndex = null };
 pub const Config = struct {
     version: u32,
     endpoint: []const u8,
@@ -39,6 +40,7 @@ pub fn run(search: anytype) !void {
     try @import("providers.zig").validateCustom(config.endpoint);
     for (config.tables, 0..) |table, i| {
         if (table.name.len == 0 or table.document_field.len == 0 or std.mem.eql(u8, table.name, ".") or std.mem.eql(u8, table.name, "..") or std.mem.indexOfScalar(u8, table.name, 0) != null) return error.InvalidTableConfig;
+        if (table.candidate_index) |index| if (index.version != 1 or index.field.len == 0 or index.version_field.len == 0 or std.mem.indexOfScalar(u8, index.field, 0) != null or std.mem.indexOfScalar(u8, index.version_field, 0) != null) return error.InvalidCandidateIndex;
         if (table.alias) |alias| if (alias.len == 0) return error.InvalidTableConfig;
         for (config.tables[0..i]) |prior| if (std.mem.eql(u8, prior.alias orelse prior.name, table.alias orelse table.name)) return error.DuplicateTableAlias;
     }
@@ -96,8 +98,9 @@ fn scan(search: anytype, http: *httpx.Client, config: Config, table: Table, coun
         var page = std.heap.ArenaAllocator.init(memory.allocator());
         defer page.deinit();
         const a = page.allocator();
-        const filter: ?std.json.Value = if (search.options.table_filter) |raw| (try std.json.parseFromSlice(std.json.Value, a, raw, .{ .allocate = .alloc_always })).value else null;
-        const body = try std.json.Stringify.valueAlloc(a, .{ .query = .{ .match_all = .{} }, .filter_query = filter, .fields = [_][]const u8{table.document_field}, .limit = page_size, .search_after = cursor, .remote_snapshot = snapshot, .timeout_ms = search.options.timeout_ms }, .{ .emit_null_optional_fields = false });
+        const user_filter: ?std.json.Value = if (search.options.table_filter) |raw| (try std.json.parseFromSlice(std.json.Value, a, raw, .{ .allocate = .alloc_always })).value else null;
+        const filter = try candidateFilter(a, search, table, user_filter);
+        const body = try std.json.Stringify.valueAlloc(a, .{ .query = .{ .match_all = .{} }, .filter_query = filter, .fields = [_][]const u8{table.document_field}, .order_by = .{.{ .field = "_id", .desc = false }}, .limit = page_size, .search_after = cursor, .remote_snapshot = snapshot, .timeout_ms = search.options.timeout_ms }, .{ .emit_null_optional_fields = false });
         const auth = if (search.options.table_token) |token| try std.fmt.allocPrint(a, "Bearer {s}", .{token}) else null;
         const headers: ?[]const [2][]const u8 = if (auth) |value| &.{.{ "Authorization", value }} else null;
         var attempt: usize = 0;
@@ -142,6 +145,10 @@ fn scan(search: anytype, http: *httpx.Client, config: Config, table: Table, coun
         if (responses != .array or responses.array.items.len != 1) return error.InvalidIndexResponse;
         const result = responses.array.items[0];
         const status = document.integer(document.field(result, "status")) orelse return error.InvalidIndexResponse;
+        // The public multi-query envelope may carry a per-table failure in an
+        // HTTP 200 response. Preserve the same diagnostics as HTTP failures.
+        if (status == 401 or status == 403) return error.IndexAuthorizationFailed;
+        if (status == 409) return error.IndexSnapshotExpired;
         if (status < 200 or status >= 300 or document.field(result, "error") != null and document.field(result, "error").? != .null) return error.IndexQueryFailed;
         const current_snapshot = try document.string(result, "remote_snapshot");
         if (current_snapshot.len == 0 or (snapshot != null and !std.mem.eql(u8, snapshot.?, current_snapshot))) return error.IndexSnapshotChanged;
@@ -195,4 +202,36 @@ fn backoff(search: anytype, attempt: usize, requested: u64) !void {
         try std.Io.sleep(search.io, .fromMilliseconds(@intCast(delay)), .awake);
         remaining -= delay;
     }
+}
+
+/// v1 indexes contain every overlapping raw-content byte trigram as six lowercase
+/// hexadecimal keyword bytes. Sample at most eight mandatory grams. Candidate
+/// filtering can admit false positives; the original matcher verifies content.
+fn candidateFilter(a: A, search: anytype, table: Table, user_filter: ?std.json.Value) !?std.json.Value {
+    const index = table.candidate_index orelse return user_filter;
+    const o = search.options;
+    if (o.ask != null or o.files or o.invert or o.files_without_match or o.include_zero or o.passthru or o.json or o.stats) return user_filter;
+    const literal = search.matcher.requiredLiteral() orelse return user_filter;
+    var grams: std.ArrayList(std.json.Value) = .empty;
+    const certificate_bytes = try std.json.Stringify.valueAlloc(a, .{ .term = "raw-byte-trigrams-v1", .field = index.version_field }, .{});
+    const certificate = (try std.json.parseFromSlice(std.json.Value, a, certificate_bytes, .{ .allocate = .alloc_always })).value;
+    try grams.append(a, certificate);
+    const n = @min(@as(usize, 8), literal.len - 2);
+    for (0..n) |i| {
+        const position = if (n == 1) 0 else i * (literal.len - 3) / (n - 1);
+        const gram = std.fmt.bytesToHex(literal[position..][0..3].*, .lower);
+        const encoded = try std.json.Stringify.valueAlloc(a, .{ .term = gram[0..], .field = index.field }, .{});
+        const term = try std.json.parseFromSlice(std.json.Value, a, encoded, .{ .allocate = .alloc_always });
+        try grams.append(a, term.value);
+    }
+    // Documents without a completeness certificate must remain candidates.
+    // This permits incremental backfills without dropping legacy revisions.
+    const candidates_bytes = try std.json.Stringify.valueAlloc(a, .{ .disjuncts = .{
+        .{ .conjuncts = grams.items },
+        .{ .must_not = .{ .disjuncts = .{certificate} } },
+    } }, .{});
+    const candidates = (try std.json.parseFromSlice(std.json.Value, a, candidates_bytes, .{ .allocate = .alloc_always })).value;
+    if (user_filter == null) return candidates;
+    const encoded = try std.json.Stringify.valueAlloc(a, .{ .conjuncts = .{ user_filter.?, candidates } }, .{});
+    return (try std.json.parseFromSlice(std.json.Value, a, encoded, .{ .allocate = .alloc_always })).value;
 }

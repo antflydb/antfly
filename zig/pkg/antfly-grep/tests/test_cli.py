@@ -71,6 +71,11 @@ class DecisionHandler(BaseHTTPRequestHandler):
         self.server.index_requests.append(
             (self.path, self.headers.get("Authorization"), body)
         )
+        if body.get("order_by") != [{"field": "_id", "desc": False}]:
+            self.send_response(400)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
         mode = self.server.index_mode
         if mode == "retry" and len(self.server.index_requests) == 1:
             self.send_response(429)
@@ -90,6 +95,23 @@ class DecisionHandler(BaseHTTPRequestHandler):
             return
         after = (body.get("search_after") or [""])[0]
         docs = [doc for doc in self.server.index_documents if doc["_id"] > after]
+
+        def candidate_matches(query, doc):
+            if not query:
+                return True
+            if "disjuncts" in query:
+                return any(candidate_matches(q, doc) for q in query["disjuncts"])
+            if "must_not" in query:
+                return not candidate_matches(query["must_not"], doc)
+            if query.get("field") == "grep_trigrams_version":
+                return doc["_source"].get("grep_trigrams_version") == query["term"]
+            if "conjuncts" in query:
+                return all(candidate_matches(q, doc) for q in query["conjuncts"])
+            if query.get("field") == "grep_trigrams":
+                return query["term"] in doc["_source"]["grep_trigrams"]
+            return True
+
+        docs = [doc for doc in docs if candidate_matches(body.get("filter_query"), doc)]
         hits = docs[: body["limit"]]
         if mode == "cursor" and after:
             hits = self.server.index_documents[:1]
@@ -98,7 +120,15 @@ class DecisionHandler(BaseHTTPRequestHandler):
             {
                 "responses": [
                     {
-                        "status": 200,
+                        "status": (
+                            409
+                            if mode == "embedded-expired"
+                            else 403
+                            if mode == "embedded-denied"
+                            else 200
+                        )
+                        if after
+                        else 200,
                         "took": 1,
                         "remote_snapshot": snapshot,
                         "hits": {"hits": hits},
@@ -225,6 +255,12 @@ class CliTests(unittest.TestCase):
             {"_id": str(i), "_sort": [str(i)], "_score": 0, "_source": {"grep": doc}}
             for i, doc in enumerate(documents)
         ]
+        for row in self.server.index_documents:
+            content = row["_source"]["grep"]["content"].encode()
+            row["_source"]["grep_trigrams_version"] = "raw-byte-trigrams-v1"
+            row["_source"]["grep_trigrams"] = sorted(
+                {content[i : i + 3].hex() for i in range(len(content) - 2)}
+            )
         config = {
             "version": 1,
             "endpoint": f"http://127.0.0.1:{self.server.server_port}/api/v1",
@@ -286,6 +322,64 @@ class CliTests(unittest.TestCase):
             self.assertEqual(local_match[field], matches[0][field])
         self.assertEqual(local_match["source"]["backend"], "local")
 
+    def test_indexed_conservative_candidates_preserve_exact_results(self):
+        documents = [
+            self.indexed_doc("a.py", "TARGET xyz\n"),
+            self.indexed_doc("b.py", "irrelevant\n"),
+            self.indexed_doc("c.py", "TAR GET xyz\n"),
+        ]
+        args = ["-F", "TARGET"]
+        baseline = self.raw_cli(
+            "--table-config", self.table_config(documents), *args
+        ).stdout
+        config = self.table_config(
+            documents,
+            tables=[
+                {
+                    "name": "source files",
+                    "candidate_index": {"version": 1, "field": "grep_trigrams"},
+                }
+            ],
+        )
+        self.server.index_requests = []
+        result = self.raw_cli("--table-config", config, *args)
+        self.assertEqual(result.stdout, baseline)
+        self.assertEqual(len(self.server.index_requests), 2)
+        filters = self.server.index_requests[0][2]["filter_query"]["disjuncts"][0][
+            "conjuncts"
+        ][1:]
+        self.assertTrue(all(term["field"] == "grep_trigrams" for term in filters))
+        self.server.index_documents[1]["_source"].pop("grep_trigrams_version")
+        self.server.index_requests = []
+        self.assertEqual(self.raw_cli("--table-config", config, *args).stdout, baseline)
+        self.assertEqual(len(self.server.index_requests), 3)
+        for flags in (
+            ["--files"],
+            ["-F", "-v", "TARGET"],
+            ["-F", "--files-without-match", "TARGET"],
+            ["-F", "--include-zero", "-c", "TARGET"],
+            ["-Fi", "TARGET"],
+            ["-F", "-e", "TARGET", "-e", "irrelevant"],
+            ["-F", "TA"],
+            ["--json", "-F", "TARGET"],
+            ["--stats", "-F", "TARGET"],
+        ):
+            self.server.index_requests = []
+            self.raw_cli("--table-config", config, *flags)
+            self.assertNotIn("filter_query", self.server.index_requests[0][2], flags)
+        self.server.index_requests = []
+        self.raw_cli(
+            "--table-config",
+            config,
+            "--table-filter",
+            '{"term":"active","field":"state"}',
+            *args,
+        )
+        self.assertEqual(
+            self.server.index_requests[0][2]["filter_query"]["conjuncts"][0],
+            {"term": "active", "field": "state"},
+        )
+
     def test_indexed_globs_types_permissions_and_server_filter(self):
         denied = self.indexed_doc("secret.py")
         denied["permissions"] = {"public": False, "readers": ["alice"]}
@@ -314,6 +408,8 @@ class CliTests(unittest.TestCase):
     def test_indexed_failures_budgets_and_retry_preserve_partial_results(self):
         for mode, message in [
             ("expired", "IndexSnapshotExpired"),
+            ("embedded-expired", "IndexSnapshotExpired"),
+            ("embedded-denied", "IndexAuthorizationFailed"),
             ("changed", "IndexSnapshotChanged"),
             ("cursor", "InvalidIndexCursor"),
         ]:
@@ -1550,6 +1646,28 @@ class CliTests(unittest.TestCase):
         ]
         self.assertFalse(any(id.startswith("region-") for id in ids))
 
+    def test_pinned_pcre_empty_utf_platform_contract(self):
+        self.write("pinned-utf.txt", "éΣ\naéa\n")
+        count = b"10\n" if sys.platform.startswith("linux") else b"7\n"
+        self.assertEqual(
+            self.raw_cli("-P", "--count-matches", "", "pinned-utf.txt").stdout, count
+        )
+        self.assertEqual(
+            self.raw_cli(
+                "--engine=auto", "--count-matches", "(?=)", "pinned-utf.txt"
+            ).stdout,
+            count,
+        )
+        self.assertEqual(
+            self.raw_cli(
+                "-P", "--no-pcre2-unicode", "--count-matches", "", "pinned-utf.txt"
+            ).stdout,
+            b"10\n",
+        )
+        self.assertEqual(
+            self.raw_cli("--count-matches", "", "pinned-utf.txt").stdout, b"10\n"
+        )
+
     @unittest.skipUnless(shutil.which("rg"), "optional empty UTF match oracle")
     def test_empty_matches_respect_each_engines_utf_mode(self):
         self.write("utf", "éΣ\naéa\n")
@@ -2630,6 +2748,21 @@ class CliTests(unittest.TestCase):
                     "--files", "--sort=path", ".", code=expected.returncode
                 )
                 self.assertEqual(actual.stdout, expected.stdout)
+
+    def test_packaged_tooling_matches_cli(self):
+        generated = Path(__file__).resolve().parents[1] / "generated"
+        for name, kind in [
+            ("antfly-grep.bash", "complete-bash"),
+            ("antfly-grep.zsh", "complete-zsh"),
+            ("antfly-grep.fish", "complete-fish"),
+            ("antfly-grep.ps1", "complete-powershell"),
+            ("antfly-grep.1", "man"),
+        ]:
+            self.assertEqual(
+                self.run_cli("--generate", kind).stdout,
+                (generated / name).read_bytes(),
+                name,
+            )
 
     def test_help_and_version(self):
         self.assertIn(b"--ask", self.run_cli("--help").stdout)

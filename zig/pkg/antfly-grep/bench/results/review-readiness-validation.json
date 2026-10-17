@@ -1,0 +1,158 @@
+{
+  "version": 1,
+  "recorded_at": "2026-10-17T03:40:05.816525+00:00",
+  "implementation": "native Zig; product adds no C or Rust build dependencies",
+  "source_sha256": {
+    "scripts/check_apache_boundary.py": "e5838c94b9dfe6eb4543d61ac1a36ce708bd891e7fbf030a6a570a3b0cc44174",
+    "scripts/packaging/build_zig_release_archive.sh": "91ba2d76efcc7c96b203cd1e4a7722ffdb25b5601b0ceedfcf46caf65bec9d34",
+    "scripts/packaging/package_grep_release.py": "0a5de2b99d59b389b98d091768178026bbe5ee24b0d66cf140ec3a2463213df4",
+    "zig/e2e/antfly/test_grep_indexed.py": "68cc782fc99b631e134a84f5f9e14a8344130baeaaf1f114b41787354d491364",
+    "zig/lib/regex/src/literal.zig": "b49bfa4b70173533342862f67310e69bf8d17338ea9128f2da355bf9d7f77365",
+    "zig/pkg/antfly-grep/bench/compare.py": "2c58cd45e20f0a10363e1295522fc01a9555b86cb97fb5f2fc2a99f265db46f0",
+    "zig/pkg/antfly-grep/bench/evaluate.py": "dadda6265f58175bd08f8c67d215214b737ce7dd68d2b4a7fdb0d79d40ccc30c",
+    "zig/pkg/antfly-grep/bench/sample_cli.py": "433ad5f7aa4b1ddf93e7dd17ddb5d8c8145d95b9c8813b18ac9d7bfd076480a4",
+    "zig/pkg/antfly-grep/build.zig": "6e3d3c969d9b358965e0e4d739267542036e3eee73aa8b4de6b6892ccd69a892",
+    "zig/pkg/antfly-grep/src/budget.zig": "18c74ee9b3c918b7ea1a75b9355ab006c217a097a2d7b744aac6aa9b9573a0c0",
+    "zig/pkg/antfly-grep/src/codec_stream.zig": "fb9183b943e0d10866c72c5905e9fd4ebc441977f0b61be62fd39f8968d2cf20",
+    "zig/pkg/antfly-grep/src/compression.zig": "3f09460e617e977e9449a67589e0fc2221d5b3067bc436f2627239d2deeb5422",
+    "zig/pkg/antfly-grep/src/concurrency.zig": "b85274a948d733dbea6d457010eac81ed708ce59dc0fda7b383660da5e3a640a",
+    "zig/pkg/antfly-grep/src/decision.zig": "d2ddc2106f0f0581d999f57a91e94bd6f3b687e3b3d926420eb6a6ad364f8572",
+    "zig/pkg/antfly-grep/src/discovery.zig": "ebf7044928ee6fcbfb25212b49ca88e6a4d7f4d27148e78d6c4c2ed43422cfa5",
+    "zig/pkg/antfly-grep/src/document.zig": "6a5b5ecdd25c713d857fe65186458dfc100cd5cb2da0f35d90a3bf5752d7bc47",
+    "zig/pkg/antfly-grep/src/evidence.zig": "092a79ea0290902d73a8c0fe3bbd6af9ec244ba36d515f7535ffd1e82c2bfda5",
+    "zig/pkg/antfly-grep/src/external_dictionary.zig": "8bfba886a4bbbcc4dba4ee143adde99358f8692844a8f806c80522882e4f0047",
+    "zig/pkg/antfly-grep/src/filesystem.zig": "3ef2da9133a4cceae55287c5ca53681595352a5613f232ded8793e73e326343a",
+    "zig/pkg/antfly-grep/src/filetypes.zig": "20b562e88bf967518f97a20d7bdb27ccf24f7f8c4707481f16a09ebfeb0c8c88",
+    "zig/pkg/antfly-grep/src/http_date.zig": "8389e3fb2aedc54cb7a8f235e29d28cefd3d3a86137e67748f9555ce0bbf57ea",
+    "zig/pkg/antfly-grep/src/indexed.zig": "67151332d76f883ef4bbf474d63ca50d6930d9b119d1f64ba0858682ca81a0a1",
+    "zig/pkg/antfly-grep/src/interrupt.zig": "2b9352c36fc129315588ef7d3310d6e4138753997b2802c4146991fb422d3743",
+    "zig/pkg/antfly-grep/src/local_decider.zig": "89579925b666c3cb90ef8ab61d56d7c694cec2deeeff226d43ba269585efa52d",
+    "zig/pkg/antfly-grep/src/main.zig": "7854b3bdeb23fce85ad8f29791c8a4d5dc811ce9236eefd8f3e065793687325e",
+    "zig/pkg/antfly-grep/src/matcher.zig": "4410f0c21cdd01321859627b81451cf173306911c6b240acc4bd78b51fc30956",
+    "zig/pkg/antfly-grep/src/native_library.zig": "2d7f89fbca9980b75c5944dd85ca0c722a72e4ca1bde1c8b33bbbeab97a72d2d",
+    "zig/pkg/antfly-grep/src/options.zig": "b80b88a38b56a2d83d628dcb4efbd0597d57c328be197ddaa0e0241c5c60ddd7",
+    "zig/pkg/antfly-grep/src/pcre2.zig": "4b69b3cdcc237b4618ce9c728fbd6cc6da2b0cd5c2992631ceeecf354ff11368",
+    "zig/pkg/antfly-grep/src/providers.zig": "0d3ea9bda270af65131c19da11d7d8b5a923ba89105d3b9a797c61087ae74992",
+    "zig/pkg/antfly-grep/src/regions.zig": "da17958e3bc12ff521dc27e160ea034e7b8a88921a4dd942232a7e20937ba007",
+    "zig/pkg/antfly-grep/src/root.zig": "b98f0b5f70fe53d7aefce631aa690fcd663416ca368874477248d3b9f3854fe5",
+    "zig/pkg/antfly-grep/src/setup.zig": "7033192fb3dd5b8485e37746ac9be4a9652fc143679301530b60b5895521611a",
+    "zig/pkg/antfly-grep/src/snapshot.zig": "ad2dd3361e99e0337b52306afdacbb3fad170156b386ced1a2e301453ac5f746",
+    "zig/pkg/antfly-grep/src/source.zig": "97f3b0ce15aa226710981c5a01454d1ee961d76d79aaa41a960dc1732c26213f",
+    "zig/pkg/antfly-grep/src/stream_encoding.zig": "ecfb327c4624fab32e229f47fbe6dd141a544489d353a278bb684a5ea20bc645",
+    "zig/pkg/antfly-grep/src/style.zig": "75ac315b883d3493b60fc01de7284e1ca0843f611c892bdbc70f90a24bff4f01",
+    "zig/pkg/antfly-grep/src/terminal.zig": "9e67e71a46c405ec8b220131592c561da1ed5de5036a6de2868d006a5d7778e3",
+    "zig/pkg/antfly-grep/src/tooling.zig": "51608dd53dea13bb4814137a2d3abbccffe30628939d5b29357b80d6075d02c0",
+    "zig/pkg/antfly-grep/tests/test_benchmark_tools.py": "a3e4fd90950570998a55cbc4ab9250f112d6e3dd00fe757ac455275e8799e999",
+    "zig/pkg/antfly-grep/tests/test_cli.py": "3b31b77abfbe4d1346605cffe1c1f9c8020dadfb6521db22410bcd7140dd35d8"
+  },
+  "macos": {
+    "platform": "macOS-27.0.1-arm64-arm-64bit",
+    "binary_sha256": "572f676df58259fa4bc3320d016f9b46b14f473a52693049affc1eb3ac72e199",
+    "cli_tests": 121,
+    "cli_skips": 2,
+    "native_units_and_hardening": "passed",
+    "differential_cases": 5000,
+    "failures": 0,
+    "timeouts": 0,
+    "log_sha256": "492932467535ff69234717d03fcf1eff4bc1fdd4dfca66c6667f0b232605074b"
+  },
+  "linux_arm64": {
+    "execution": "Native ARM64 instructions in a Linux VM hosted on ARM64 macOS; virtualized, not instruction-emulated",
+    "binary_sha256": "ea9ed778cffdd9405eaff2aca65c994eb12255133c021b7f1d864ad4a758689a",
+    "stripped": true,
+    "binary_bytes": 6492688,
+    "cli_suite_cases": 120,
+    "cli_suite_skips": 1,
+    "additional_pinned_utf_contract_cases": 1,
+    "differential_cases": 5000,
+    "failures": 0,
+    "timeouts": 0,
+    "cgroup_unit_tests": 3,
+    "actual_1_5_cpu_quota_auto_workers": 2,
+    "memory_regressions": 1,
+    "cli_log_sha256": "e4d9545efeaf1c55fb4637022ee45c60b15d80ff82f6ddeb75a3e70892f5cfe1",
+    "utf_log_sha256": "e2ab428e9f659c5d0c5914b4fcb1c3fce5ed30bb67011cf1b4038666f2743cff",
+    "memory_log_sha256": "69277c314aa1c796a0fe1a90989c01924313e4a506729a83d71b6b844cf84e3f"
+  },
+  "real_server": {
+    "tests": 5,
+    "passed": 5,
+    "server_binary_sha256": "d816bebc093b3c881163a0fcf0af1d9c5396215e93fe0bde39b30cf6710a36e0",
+    "grep_binary_sha256": "572f676df58259fa4bc3320d016f9b46b14f473a52693049affc1eb3ac72e199",
+    "server_artifact": "Pre-existing native server, pinned into this worktree cache before the run; this follow-up does not modify server implementation.",
+    "coverage": [
+      "multi-page explicit ID ordering",
+      "large document with 5000 source regions",
+      "private source permissions",
+      "snapshot retention across concurrent mutation",
+      "actual one-second cursor expiry with partial results",
+      "server authentication and API-key revocation",
+      "certified trigram candidates and legacy fallback"
+    ],
+    "log_sha256": "1753904c3d14c851c60e76e754628a23e3d130fc5a31507c68cc987601510957"
+  },
+  "packaging": {
+    "standalone_native_archives": "assembled for macOS and ARM64 Linux",
+    "server_archive_assembly": "fixture-tested with real licenses and grep assets",
+    "reproducible_archive_test": "passed",
+    "generated_tooling_cli_drift_check": "passed",
+    "headers": "passed",
+    "apache_boundary": "passed"
+  },
+  "benchmarks": {
+    "reports": {
+      "linux-arm64-review-differential.json": "11c8950cde14eb60942aff759a5d2e9c636056d2bdda04a08570f086f3fbe8c7",
+      "linux-arm64-review-local-storage-workers-1.json": "b01718eed6f07a15eb2281c6f7cd5e746b089a3e17ad7bf342f7076718397e46",
+      "linux-arm64-review-local-storage-workers-2.json": "e0a40e9af578b2a30f5009fd5503545baffb5c1960661c29e99ba07ec5db0daf",
+      "linux-arm64-review-local-storage-workers-4.json": "7a1f853d230b19c89af70141d04d2ec1b69e7166aa162d4a8f9e363b30171531",
+      "linux-arm64-review-local-storage-workers-8.json": "ae087d0c4f50d80139c225b92d95b8b0770b55dc3e1075cec76b53e3f9446f03",
+      "linux-arm64-review-one-cpu-cold-advice.json": "7f50d48a6934bd13e568e4ecdd225c734e1a747a6ce98ce46b392472dc0230b0",
+      "linux-arm64-review-one-cpu-warm.json": "9ad2126741011ddae9f115bf527aa40facfc448e813ac683c65d48dd4be45667",
+      "linux-arm64-review-warm.json": "095267d23b5c6d4033205c2533b79d213355c853187b8224bb33508ba9e746b6",
+      "linux-arm64-review-workers-1.json": "d468ed5d32da10b207696430b6eb1144c72a67875fe76218cb5cd38de2668b4a",
+      "linux-arm64-review-workers-2.json": "a2f1b6ca0fc44ffc75e87529be0f36409b80c5f95bf2cc7ccecbd840a41d3002",
+      "linux-arm64-review-workers-4.json": "104db4b56a61dd79d0e7290962fdd637f055ba8fe2489552e9b3b61cf1fc7aea",
+      "linux-arm64-review-workers-8.json": "18eaa1535a2195636de44d2e08933e2681e5f76151851d188b3a4c18b92ba7bc",
+      "macos-arm64-review-bzip2-profile.json": "3e72932a064162154e19c8180339a8a99d12446b931ce113ff70a122adc08f2c",
+      "macos-arm64-review-differential.json": "4c7b4db419e3de95ee44b38ca2a09edaea4af199ecaeeab40855563ea1e40f67",
+      "macos-arm64-review-final.json": "17a4380ed38e144faa5f50e8184b65a3091440bdd4368fd0e2e67a4f9a9c854e",
+      "macos-arm64-review-unicode.json": "e1065f0b8ee59f5ca51f3ffe0bec00912ab9e22388e60206e63db9466ae0ade9",
+      "review-repository-relevance-fixture.json": "a59f33e14f10ccfcf6b5027fed8b51e8dc355a2eb16b2cc613b237465900096d"
+    },
+    "all_output_and_exit_digests": "matched pinned rg within each paired case",
+    "storage": [
+      "host-shared SDK mount",
+      "container-local SDK copy",
+      "container-local generated files"
+    ],
+    "cache": [
+      "warm",
+      "best-effort Linux POSIX_FADV_DONTNEED advice"
+    ],
+    "cpu": [
+      "automatic workers",
+      "one-CPU affinity with explicit single worker",
+      "workers 1/2/4/8"
+    ],
+    "memory": "Separate GNU time command maxima on Linux; no simultaneous process-tree peak claim",
+    "timing_limit": "Shared host contention is present; high-variance timings are flagged and all samples retained. No general Linux speedup claim.",
+    "new_jit_paths": 0,
+    "jit_reason": "No new JIT path justified; measured bzip2 stacks concentrate in decoding, while Unicode literal folding improved without JIT changes."
+  },
+  "provider_validation": {
+    "mode": "fixtures only, as requested",
+    "labeled_corpora": [
+      "synthetic snippets",
+      "pinned production-source snapshots"
+    ],
+    "live_model_quality": "not established; opt-in endpoint/model runs remain available"
+  },
+  "independent_x86_64_ci": {
+    "status": "pending human approval under the repository CI controller",
+    "new_qualification_job": "wired in .github/workflows/zig-tests.yml; trusted reusable workflow adoption still applies"
+  },
+  "limits": [
+    "Finite differential and fuzz evidence does not establish exhaustive ripgrep/PCRE2/JIT parity.",
+    "No new Windows runtime verification; Windows remains deprioritized."
+  ]
+}

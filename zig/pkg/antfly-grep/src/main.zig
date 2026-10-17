@@ -213,7 +213,7 @@ fn run(init: std.process.Init) !u8 {
     o.temporary_dir = init.environ_map.get("TMPDIR") orelse init.environ_map.get("TMP") orelse init.environ_map.get("TEMP");
     if (o.jobs == 0) {
         o.jobs_auto = true;
-        o.jobs = if (o.jev_mode) 32 else @min(12, std.Thread.getCpuCount() catch 4);
+        o.jobs = if (o.jev_mode) 32 else @min(12, grep.concurrency.cpuCount(persistent, init.io));
     }
     if (o.cache_dir == null) {
         if (init.environ_map.get("XDG_CACHE_HOME")) |dir| o.cache_dir = try std.fs.path.join(persistent, &.{ dir, "antfly-grep", "decisions" }) else if (init.environ_map.get("HOME")) |dir| o.cache_dir = try std.fs.path.join(persistent, &.{ dir, ".cache", "antfly-grep", "decisions" });
@@ -273,7 +273,7 @@ fn run(init: std.process.Init) !u8 {
         return 0;
     }
     if (o.version) {
-        try std.Io.File.stdout().writeStreamingAll(init.io, "antfly-grep 0.1.0\nZig " ++ @import("builtin").zig_version_string ++ " " ++ @tagName(@import("builtin").mode) ++ "\nnative regex, PCRE-style VM/JIT, streaming compression, encoding\ntarget " ++ @tagName(@import("builtin").cpu.arch) ++ "-" ++ @tagName(@import("builtin").os.tag) ++ "-" ++ @tagName(@import("builtin").abi) ++ " " ++ @tagName(@import("builtin").link_mode) ++ "\n");
+        try std.Io.File.stdout().writeStreamingAll(init.io, "antfly-grep " ++ @import("grep_build_options").version ++ "\nZig " ++ @import("builtin").zig_version_string ++ " " ++ @tagName(@import("builtin").mode) ++ "\nnative regex, PCRE-style VM/JIT, streaming compression, encoding\ntarget " ++ @tagName(@import("builtin").cpu.arch) ++ "-" ++ @tagName(@import("builtin").os.tag) ++ "-" ++ @tagName(@import("builtin").abi) ++ " " ++ @tagName(@import("builtin").link_mode) ++ "\n");
         return 0;
     }
     for (o.globs.items) |raw| {

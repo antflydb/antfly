@@ -72,7 +72,15 @@ def main():
     parser.add_argument("--output", type=Path)
     parser.add_argument("--min-recall", type=float, default=0.0)
     parser.add_argument("--min-precision", type=float, default=0.0)
+    parser.add_argument("--input-usd-per-million", type=float)
+    parser.add_argument("--output-usd-per-million", type=float)
+    parser.add_argument("--max-requests", type=int, default=10000)
     args = parser.parse_args()
+    for price in (args.input_usd_per_million, args.output_usd_per_million):
+        if price is not None and (not math.isfinite(price) or price < 0):
+            parser.error("token prices must be finite and nonnegative")
+    if args.max_requests < 1:
+        parser.error("--max-requests must be positive")
     if not args.fixture and (not args.endpoint or not args.model):
         parser.error("select --fixture or explicitly provide --endpoint and --model")
     corpus = json.loads(args.manifest.read_text())
@@ -149,6 +157,11 @@ def main():
         "model": "fixture" if args.fixture else args.model,
         "ranking": "CLI file order, then source-line order",
         "token_accounting": "Provider-reported CLI counters; zero may mean omitted usage. Fixture replies omit token usage.",
+        "source_snapshots": corpus.get("sources", {}),
+        "token_prices_usd_per_million": {
+            "input": args.input_usd_per_million,
+            "output": args.output_usd_per_million,
+        },
         "questions": [],
     }
     try:
@@ -181,6 +194,8 @@ def main():
                         "--broad",
                         "--no-cache",
                         "--no-config",
+                        "--max-requests",
+                        str(args.max_requests),
                         "--concurrency",
                         "1",
                         *corpus["documents"],
@@ -222,6 +237,17 @@ def main():
                     "input_tokens": summary["input_tokens"],
                     "output_tokens": summary["output_tokens"],
                 }
+                row["estimated_cost_usd"] = (
+                    (
+                        row["input_tokens"] * args.input_usd_per_million
+                        + row["output_tokens"] * args.output_usd_per_million
+                    )
+                    / 1_000_000
+                    if args.input_usd_per_million is not None
+                    and args.output_usd_per_million is not None
+                    and row["input_tokens"] + row["output_tokens"] > 0
+                    else None
+                )
                 report["questions"].append(row)
     finally:
         if server:

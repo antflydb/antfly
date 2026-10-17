@@ -43,7 +43,10 @@ def measure(argv, cwd, env):
     if hasattr(os, "wait4"):
         _, status, usage = os.wait4(proc.pid, 0)
         proc.returncode = os.waitstatus_to_exitcode(status)
-        rss = usage.ru_maxrss / (1024 if platform.system() == "Darwin" else 1)
+        # Linux can retain the forking benchmark parent's pre-exec high-water
+        # RSS. Measure target memory through a small GNU time supervisor in
+        # separate runs rather than reporting that inherited floor.
+        rss = usage.ru_maxrss / 1024 if platform.system() == "Darwin" else None
         counters = {
             "user_seconds": usage.ru_utime,
             "system_seconds": usage.ru_stime,
@@ -66,6 +69,49 @@ def measure(argv, cwd, env):
         "load_average": load,
         **counters,
     }
+
+
+def timing_quality(samples):
+    median = statistics.median(samples)
+    relative_mad = (
+        statistics.median(abs(value - median) for value in samples) / median
+        if median
+        else 0
+    )
+    return {
+        "relative_median_absolute_deviation": relative_mad,
+        "high_variance": relative_mad > 0.2,
+        "high_variance_threshold": 0.2,
+        "minimum_seconds": min(samples),
+        "maximum_seconds": max(samples),
+    }
+
+
+def linux_time():
+    if platform.system() != "Linux":
+        return None
+    path = Path("/usr/bin/time")
+    if not path.is_file():
+        return None
+    result = subprocess.run([str(path), "--version"], capture_output=True, check=False)
+    return str(path) if b"GNU" in result.stdout else None
+
+
+def target_rss(argv, cwd, env, supervisor):
+    """GNU time forks after exec, separating target RSS from the Python parent."""
+    with tempfile.TemporaryDirectory(prefix="antfly-grep-rss-") as directory:
+        metrics = Path(directory) / "rss"
+        result = subprocess.run(
+            [supervisor, "-q", "-f", "%M", "-o", str(metrics), "--", *argv],
+            cwd=cwd,
+            env=env,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+        if result.returncode not in (0, 1):
+            raise RuntimeError(result.stderr.decode(errors="replace"))
+        return int(metrics.read_text().strip())
 
 
 def first_result(argv, cwd, env):
@@ -114,6 +160,12 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("binary", type=Path)
     parser.add_argument("--mib", type=int, default=32)
+    parser.add_argument(
+        "--rss-rounds",
+        type=int,
+        default=3,
+        help="Separate Linux GNU time memory runs, outside elapsed/CPU timing",
+    )
     parser.add_argument("--rounds", type=int, default=3)
     parser.add_argument("--output", type=Path)
     parser.add_argument(
@@ -130,6 +182,25 @@ def main():
     )
     parser.add_argument("--quiet", action="store_true")
     parser.add_argument(
+        "--execution-environment",
+        default="unspecified",
+        help="Record native/virtualized/emulated execution provenance",
+    )
+    parser.add_argument(
+        "--threads", type=int, help="Explicit scan workers for both binaries"
+    )
+    parser.add_argument(
+        "--cpus",
+        type=int,
+        help="Restrict the benchmark and children to N allowed Linux CPUs",
+    )
+    parser.add_argument(
+        "--cache-mode",
+        choices=("warm", "cold-advice"),
+        default="warm",
+        help="cold-advice fsyncs and advises eviction of each corpus file before each measured child; Linux only, no global cache dropping",
+    )
+    parser.add_argument(
         "--case", action="append", help="measure only this named case (repeatable)"
     )
     parser.add_argument(
@@ -138,8 +209,19 @@ def main():
         help="also measure streamed gzip/bzip2/XZ input",
     )
     args = parser.parse_args()
-    if args.mib < 1 or args.rounds < 1:
+    if args.mib < 1 or args.rounds < 1 or args.rss_rounds < 0:
         parser.error("--mib and --rounds must be positive")
+    if args.threads is not None and args.threads < 1:
+        parser.error("--threads must be positive")
+    if args.cpus is not None:
+        if not hasattr(os, "sched_setaffinity") or args.cpus < 1:
+            parser.error("--cpus requires Linux affinity and a positive count")
+        allowed = sorted(os.sched_getaffinity(0))
+        if args.cpus > len(allowed):
+            parser.error("--cpus exceeds allowed affinity")
+        os.sched_setaffinity(0, allowed[: args.cpus])
+    if args.cache_mode == "cold-advice" and not hasattr(os, "posix_fadvise"):
+        parser.error("cold-advice requires Linux posix_fadvise")
     binaries = {"antfly-grep": str(args.binary.resolve())}
     if shutil.which("rg"):
         binaries["ripgrep"] = shutil.which("rg")
@@ -150,10 +232,23 @@ def main():
         for k, v in os.environ.items()
         if not k.startswith(("RIPGREP_", "ANTFLY_GREP_"))
     }
+    supervisor = linux_time()
     result = {
+        "memory_measurement": "Darwin wait4; Linux separate GNU time command-maximum runs, including waited descendants by maximum rather than sum. This is not concurrent process-tree RSS. Linux RSS is unavailable without GNU time; inherited Python-parent high-water marks are not reported.",
+        "linux_memory_supervisor": supervisor,
+        "rss_rounds": args.rss_rounds,
         "platform": platform.platform(),
+        "execution_environment": args.execution_environment,
         "architecture": platform.machine(),
         "cpu_count": os.cpu_count(),
+        "cpu_affinity": sorted(os.sched_getaffinity(0))
+        if hasattr(os, "sched_getaffinity")
+        else None,
+        "threads": args.threads,
+        "cache_mode": args.cache_mode,
+        "cache_limitations": "Eviction advice is best effort; storage/controller caches remain. Not a global cold-cache claim."
+        if args.cache_mode == "cold-advice"
+        else "Warm-cache runs include an explicit warmup.",
         "measurement": "elapsed and first-result latency use separate paired rounds with alternating binary order; correctness outside timing",
         "load_average": list(os.getloadavg()) if hasattr(os, "getloadavg") else None,
         "mib": args.mib,
@@ -208,10 +303,18 @@ def main():
             "mmap-literal": ["--mmap", "-F", "unfindable-literal", "large.log"],
         }
         repository_bytes = 0
+        repository_paths = []
         if args.repository:
             repository = args.repository.resolve()
             listing = subprocess.run(
-                [binaries["antfly-grep"], "--files", "--sort", "path", str(repository)],
+                [
+                    binaries["antfly-grep"],
+                    "--files",
+                    "--null",
+                    "--sort",
+                    "path",
+                    str(repository),
+                ],
                 cwd=root,
                 env=env,
                 capture_output=True,
@@ -221,8 +324,9 @@ def main():
                 raise RuntimeError(listing.stderr.decode(errors="replace"))
             corpus_hash = hashlib.sha256()
             file_count = 0
-            for path in listing.stdout.splitlines():
+            for path in filter(None, listing.stdout.split(b"\0")):
                 source_path = Path(os.fsdecode(path))
+                repository_paths.append(source_path)
                 data = source_path.read_bytes()
                 repository_bytes += len(data)
                 corpus_hash.update(
@@ -271,6 +375,15 @@ def main():
                 (root / name).write_bytes(row * max(1, len(block) // len(row)))
             cases.update(
                 {
+                    "dense-output": ["-o", "request", "large.log"],
+                    "replacement-output": [
+                        "-P",
+                        "-r",
+                        "$2:$1",
+                        r"id=(123)(456)",
+                        "large.log",
+                    ],
+                    "unicode-casefold-output": ["-i", "été", "unicode.log"],
                     "pcre-repeat": ["-Pc", "a+z", "repeat.log"],
                     "pcre-captures": [
                         "-Pc",
@@ -299,12 +412,51 @@ def main():
                     path,
                 ]
                 expanded_sizes[path] = len(source)
+        import sys
+
+        identity = root / "identity-preprocessor.py"
+        identity.write_text(
+            "#!"
+            + sys.executable
+            + "\nimport shutil,sys\nwith open(sys.argv[1], 'rb') as source: shutil.copyfileobj(source,sys.stdout.buffer)\n"
+        )
+        identity.chmod(0o755)
+        if args.extended:
+            cases["preprocessor"] = [
+                "--pre",
+                str(identity),
+                "ERROR[a-zA-Z0-9]+",
+                "large.log",
+            ]
         if args.case:
             missing = set(args.case) - cases.keys()
             if missing:
                 parser.error("unknown or disabled cases: " + ", ".join(sorted(missing)))
             cases = {name: cases[name] for name in args.case}
         for case, flags in cases.items():
+            if args.threads is not None:
+                flags = ["-j", str(args.threads), *flags]
+            corpus = (
+                args.repository.resolve()
+                if case.startswith("repository-")
+                else root / flags[-1]
+            )
+            paths = (
+                repository_paths
+                if case.startswith("repository-")
+                else sorted(p for p in corpus.rglob("*") if p.is_file())
+                if corpus.is_dir()
+                else [corpus]
+            )
+
+            def prepare():
+                if args.cache_mode != "cold-advice":
+                    return
+                for path in paths:
+                    with path.open("rb") as source:
+                        os.fsync(source.fileno())
+                        os.posix_fadvise(source.fileno(), 0, 0, os.POSIX_FADV_DONTNEED)
+
             result["cases"][case] = {}
             source_bytes = (
                 repository_bytes
@@ -339,12 +491,14 @@ def main():
             random.Random(case).shuffle(order)
             for iteration in range(args.rounds):
                 for name in order if iteration % 2 == 0 else reversed(order):
+                    prepare()
                     runs_by_binary[name].append(
                         measure([binaries[name], "--color=never", *flags], root, env)
                     )
             first_by_binary = {name: [] for name in binaries}
             for iteration in range(args.rounds):
                 for name in order if iteration % 2 == 0 else reversed(order):
+                    prepare()
                     first_by_binary[name].append(
                         first_result(
                             [binaries[name], "--color=never", *flags], root, env
@@ -353,6 +507,17 @@ def main():
             for name, runs in runs_by_binary.items():
                 seconds = statistics.median(r["seconds"] for r in runs)
                 rss = [r["peak_rss_kib"] for r in runs if r["peak_rss_kib"] is not None]
+                if supervisor:
+                    for _ in range(args.rss_rounds):
+                        prepare()
+                        rss.append(
+                            target_rss(
+                                [binaries[name], "--color=never", *flags],
+                                root,
+                                env,
+                                supervisor,
+                            )
+                        )
                 cpu = [
                     r["user_seconds"] + r["system_seconds"]
                     for r in runs
@@ -366,10 +531,12 @@ def main():
                     ),
                     "first_result_runs": first_runs,
                     "seconds": seconds,
+                    "timing_quality": timing_quality([r["seconds"] for r in runs]),
                     "cpu_seconds": statistics.median(cpu) if cpu else None,
                     "output": outputs[name],
                     "mib_per_second": source_bytes / (1024 * 1024) / seconds,
                     "peak_rss_kib": max(rss) if rss else None,
+                    "rss_runs_kib": rss,
                     "runs": runs,
                 }
     rendered = json.dumps(result, indent=2) + "\n"

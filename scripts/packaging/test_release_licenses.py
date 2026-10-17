@@ -36,6 +36,7 @@ class ReleaseLicenseTests(unittest.TestCase):
                 "scripts/packaging/build_zig_release_archive.sh",
                 "scripts/packaging/create_reproducible_tar.py",
                 "scripts/packaging/render_libantfly_pkgconfig.py",
+                "scripts/packaging/package_grep_release.py",
                 "zig/pkg/antfly-embedded/libantfly.pc.in",
                 "scripts/packaging/lite-release-README.md",
                 "scripts/packaging/embedded-release-README.md",
@@ -53,6 +54,7 @@ class ReleaseLicenseTests(unittest.TestCase):
                 destination = root / name
                 destination.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copyfile(ROOT / name, destination)
+            shutil.copytree(ROOT / "zig/pkg/antfly-grep", root / "zig/pkg/antfly-grep")
             shutil.copytree(
                 ROOT / "LICENSES/third-party", root / "LICENSES/third-party"
             )
@@ -67,6 +69,7 @@ class ReleaseLicenseTests(unittest.TestCase):
                 "inference = Path.cwd().name == 'inference'\n"
                 "library = 'lib/libantfly.dylib' if '-Dtarget=aarch64-macos' in args else 'lib/libantfly.so'\n"
                 "names = ('bin/antfly-inference',) if inference else (('bin/antfly-lite',) if 'lite' in args else ('bin/antfly',)) + (library, 'include/antfly.h')\n"
+                "if 'grep' in args: names += ('bin/antfly-grep',)\n"
                 "for name in names:\n"
                 "    path = prefix / name\n"
                 "    path.parent.mkdir(parents=True, exist_ok=True)\n"
@@ -83,8 +86,8 @@ class ReleaseLicenseTests(unittest.TestCase):
                 ("embedded", "aarch64-macos", ["lite"], "LICENSES/Apache-2.0.txt"),
                 ("lite", "aarch64-macos", ["lite"], "LICENSES/Apache-2.0.txt"),
                 ("inference", "aarch64-macos", [], "LICENSES/Apache-2.0.txt"),
-                ("server", "aarch64-macos", ["antfly", "capi"], "LICENSE"),
-                ("server", "aarch64-linux-musl", ["antfly", "capi"], "LICENSE"),
+                ("server", "aarch64-macos", ["antfly", "capi", "grep"], "LICENSE"),
+                ("server", "aarch64-linux-musl", ["antfly", "capi", "grep"], "LICENSE"),
             ):
                 with self.subTest(product=product, target=target):
                     subprocess.run(
@@ -119,7 +122,11 @@ class ReleaseLicenseTests(unittest.TestCase):
                     args = json.loads((build_dir / "build-args.json").read_text())
                     self.assertEqual(
                         steps,
-                        [arg for arg in args if arg in ("lite", "antfly", "capi")],
+                        [
+                            arg
+                            for arg in args
+                            if arg in ("lite", "antfly", "capi", "grep")
+                        ],
                     )
                     self.assertEqual(
                         product == "server", "-Dapple-providers=false" in args

@@ -13,9 +13,11 @@
         "tests/local_fixtures.json",
         "tests/pcre2_dialect_fixtures.json",
         "tests/generated_fixtures.json",
-        "tests/differential.py"
+        "tests/differential.py",
+        "bench/results/macos-arm64-review-differential.json",
+        "bench/results/linux-arm64-review-differential.json"
       ],
-      "limits": "Pinned goldens plus seeded grammar-based exploration with bounded reduction of flags, patterns and subjects. Generated Linux x86 cases replay fully there; portable ASCII inputs replay elsewhere because upstream empty UTF matching differs by platform. Complete upstream dialect/JIT parity is not claimed."
+      "limits": "Pinned goldens plus seeded grammar-based exploration with bounded reduction of flags, patterns and subjects. Generated Linux x86 cases replay fully there; portable ASCII inputs replay elsewhere because upstream empty UTF matching differs by platform. Complete upstream dialect/JIT parity is not claimed. Linux ARM64 and x86-64 PCRE empty-UTF output advances bytes; the pinned macOS ARM64 PCRE output advances codepoints. An oracle-independent CLI regression preserves that contract."
     },
     {
       "area": "Discovery, binary input, encoding, JSON/statistics",
@@ -38,9 +40,11 @@
       "status": "fixture pipeline + opt-in provider evaluation",
       "evidence": [
         "tests/relevance.json",
-        "bench/evaluate.py"
+        "bench/evaluate.py",
+        "tests/relevance-repository.json",
+        "bench/results/review-repository-relevance-fixture.json"
       ],
-      "limits": "Fixture precision/recall/nDCG test plumbing and independent-line discovery, not model quality."
+      "limits": "Labeled pinned production-source and synthetic fixture evaluations verify pipeline precision/recall and independent-line discovery, not live-model quality. Request/token/cost accounting supports explicit provider evaluations."
     },
     {
       "area": "Decision budgets, cache, retries and cancellation",
@@ -52,13 +56,14 @@
     },
     {
       "area": "Antfly indexed tables",
-      "status": "fixture tested exact scan",
+      "status": "native-server and fixture tested exact scan",
       "evidence": [
         "schema/document-v1.json",
         "schema/tables-v1.json",
-        "tests/test_cli.py"
+        "tests/test_cli.py",
+        "../../e2e/antfly/test_grep_indexed.py"
       ],
-      "limits": "Snapshot-bound ID cursors are required. Exact scans are bounded by request/document/source/output budgets. No connector ingestion or direct remote-file downloads."
+      "limits": "Explicit ID ordering from page one; native-server pagination, concurrent writes, actual cursor expiry, large region lists, API-key revocation and opt-in certified-trigram candidates with legacy fallback. Snapshot-bound cursors and request/document/source/output budgets remain required. No connector ingestion or direct remote-file downloads."
     },
     {
       "area": "Unified local/indexed results",
@@ -90,9 +95,16 @@
         "bench/results/macos-arm64-file-worker-tuning.json",
         "bench/results/macos-arm64-search-speedups-large.json",
         "bench/results/macos-arm64-search-speedups-go-sdk.json",
-        "bench/results/macos-arm64-search-speedups-ts-sdk.json"
+        "bench/results/macos-arm64-search-speedups-ts-sdk.json",
+        "bench/results/macos-arm64-review-final.json",
+        "bench/results/macos-arm64-review-unicode.json",
+        "bench/results/linux-arm64-review-warm.json",
+        "bench/results/linux-arm64-review-one-cpu-cold-advice.json",
+        "bench/results/linux-arm64-review-local-storage-workers-2.json",
+        "bench/results/macos-arm64-review-bzip2-profile.json",
+        "tests/test_benchmark_tools.py"
       ],
-      "limits": "Tracks startup, first stdout byte, elapsed/CPU, RSS and throughput on large files, generated small files and native Zig/Go/TypeScript repositories. VM dispatch and native CLI CPU-stack profiles guide JIT work; VM/JIT checksums must agree. Host, corpus/binary hashes and per-run results are recorded; no general ripgrep performance parity claim."
+      "limits": "Paired elapsed/CPU/first-result measurements retain all trials and flag high variance. Native-instruction ARM64 Linux VM tests include cold advice, CPU affinity and worker sweeps on host-shared and container-local filesystems. Linux RSS uses separate GNU time command-maximum runs, not concurrent process-tree peak. Contended VM timings do not establish general Linux performance parity. Independent x86-64 hardware qualification remains admission-gated in CI; JIT growth requires a demonstrated bottleneck and equivalence evidence."
     },
     {
       "area": "Malformed-input hardening and VM/JIT equivalence",
@@ -103,7 +115,8 @@
         "bench/results/macos-arm64-hardening.json",
         "bench/results/macos-arm64-search-speedups-hardening.json",
         "bench/results/linux-x86_64-search-speedups-differential.json",
-        "bench/results/search-speedups-validation.json"
+        "bench/results/search-speedups-validation.json",
+        "bench/results/review-readiness-validation.json"
       ],
       "limits": "ReleaseSafe regex, Python/Go/Rust/JS/TS parser and dictionary targets have allocation/input/work bounds and leak checks; VM/JIT comparisons include spans, captures, marks, errors and steps. Finite campaigns are evidence, not a proof of safety for arbitrary input."
     }

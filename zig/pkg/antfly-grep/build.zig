@@ -46,6 +46,10 @@ pub fn add(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.lang.O
     b.step("grep-profile", "Build in-process VM/JIT profiling utility").dependOn(&b.addInstallArtifact(profile, .{}).step);
     const main = b.createModule(.{ .root_source_file = b.path("pkg/antfly-grep/src/main.zig"), .target = target, .optimize = optimize });
     main.addImport("antfly-grep", lib);
+    const version = b.addOptions();
+    version.addOption([]const u8, "version", b.option([]const u8, "antfly-version", "Release version") orelse "0.1.0-dev");
+    main.addImport("grep_build_options", version.createModule());
+    main.strip = b.option(bool, "strip", "Strip grep debug information for release archives") orelse false;
     main.link_libc = true;
     lib.link_libc = true;
     const exe = b.addExecutable(.{ .name = "antfly-grep", .root_module = main });
@@ -109,6 +113,9 @@ pub fn add(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.lang.O
     const differential_tools = b.addSystemCommand(&.{"python3"});
     differential_tools.addFileArg(b.path("pkg/antfly-grep/tests/test_differential_tools.py"));
     test_step.dependOn(&differential_tools.step);
+    const benchmark_tools = b.addSystemCommand(&.{"python3"});
+    benchmark_tools.addFileArg(b.path("pkg/antfly-grep/tests/test_benchmark_tools.py"));
+    test_step.dependOn(&benchmark_tools.step);
     const compatibility = b.addSystemCommand(&.{"python3"});
     compatibility.addFileArg(b.path("pkg/antfly-grep/tests/check_compatibility.py"));
     compatibility.addArg("--check");

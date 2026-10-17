@@ -238,12 +238,11 @@ pub const Matcher = struct {
             if (found) |match| if (best == null or match.span.start < best.?.span.start or (match.span.start == best.?.span.start and item.order < best_order)) {
                 best = .{ .span = match.span, .captures = match.captures, .names = item.pattern.names };
                 best_order = item.order;
-                // ripgrep 15.2 / PCRE2 10.45 JIT on Linux x86_64 permits
-                // intermediate byte offsets for empty UTF matches. Verified ARM64
-                // references advance codepoints. Keep this output compatibility
-                // separate from VM decoding and native JIT execution.
-                const target = @import("builtin");
-                self.advance_utf8 = item.pattern.pattern.flags.unicode and !(target.os.tag == .linux and target.cpu.arch == .x86_64);
+                // The pinned Linux x86_64 and ARM64 PCRE2 references permit
+                // byte-wise empty UTF advancement; the macOS ARM64 reference
+                // advances codepoints. This output policy is separate from
+                // decoding and native JIT execution.
+                self.advance_utf8 = item.pattern.pattern.flags.unicode and @import("builtin").os.tag != .linux;
             };
         }
         return best;
@@ -266,6 +265,14 @@ pub const Matcher = struct {
         if (self.program.direct.items.len != 1 or self.program.regular.items.len != 0 or self.program.advanced.items.len != 0) return false;
         const item = self.program.direct.items[0];
         return !item.insensitive and !regex.literal.mayContainOrByte(text, item.bytes, 0);
+    }
+    /// A necessary raw byte substring, never an approximation of relevance.
+    /// Broader pattern sets can add proven literals here without changing the
+    /// indexed candidate contract.
+    pub fn requiredLiteral(self: *const Matcher) ?[]const u8 {
+        if (!self.isLiteralSearch() or self.program.direct.items.len != 1) return null;
+        const bytes = self.program.direct.items[0].bytes;
+        return if (bytes.len >= 3) bytes else null;
     }
     pub fn isLiteralSearch(self: *const Matcher) bool {
         if (self.program.direct.items.len == 0 or self.program.regular.items.len != 0 or self.program.advanced.items.len != 0) return false;
