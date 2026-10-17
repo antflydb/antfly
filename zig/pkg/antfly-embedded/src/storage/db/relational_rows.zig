@@ -670,12 +670,12 @@ pub const Reader = struct {
 
     /// Cache belongs to the caller's page, never to this cursor. Older source
     /// schemas may have a different field subset/order and get a new layout.
-    pub fn lookupSqlRowWithLayout(self: *Reader, alloc: Allocator, document: []const u8, shared: *?@import("../../sql/catalog.zig").Row.TypedLayout) !?Row {
+    pub fn lookupSqlRowWithLayout(self: *Reader, alloc: Allocator, document: []const u8, shared: *?*const @import("../../sql/catalog.zig").Row.TypedLayout) !?Row {
         if (comptime storage_engine.enabled) return @import("antfly_source_root").antfly_sources.storage_engine.call("relationalReaderLookupTypedRow", .{ self, alloc, document, true, shared });
         return self.lookupRowFormat(alloc, document, true, shared);
     }
 
-    fn cachedSqlLayout(alloc: Allocator, row: codec.OrdinalRowView, projection: codec.OrdinalProjectionPlan, shared: ?*?@import("../../sql/catalog.zig").Row.TypedLayout) !@import("../../sql/catalog.zig").Row.TypedLayout {
+    fn cachedSqlLayout(alloc: Allocator, row: codec.OrdinalRowView, projection: codec.OrdinalProjectionPlan, shared: ?*?*const @import("../../sql/catalog.zig").Row.TypedLayout) !*const @import("../../sql/catalog.zig").Row.TypedLayout {
         if (shared) |cache| if (cache.*) |layout| {
             var same = layout.names.len == projection.ordinals.len;
             if (same) for (layout.names, projection.ordinals) |name, ordinal| {
@@ -691,7 +691,7 @@ pub const Reader = struct {
         return layout;
     }
 
-    fn sqlLayout(alloc: Allocator, row: codec.OrdinalRowView, projection: codec.OrdinalProjectionPlan) !@import("../../sql/catalog.zig").Row.TypedLayout {
+    fn sqlLayout(alloc: Allocator, row: codec.OrdinalRowView, projection: codec.OrdinalProjectionPlan) !*const @import("../../sql/catalog.zig").Row.TypedLayout {
         const names = try alloc.alloc([]const u8, projection.ordinals.len);
         for (projection.ordinals, names) |ordinal, *name| name.* = try alloc.dupe(u8, row.table_schema.relational_columns[ordinal].name);
         return @import("../../sql/catalog.zig").Row.TypedLayout.init(alloc, names);
@@ -702,7 +702,7 @@ pub const Reader = struct {
     /// Bounded ranked microbatch. Sorted physical lookups share source probes;
     /// rows are decoded in ranking order and stop at the delivery byte target.
     /// Returned payloads own their bytes independently of the temporary batch.
-    pub fn lookupSqlBatch(self: *Reader, alloc: Allocator, documents: []const []const u8, layout: @import("../../sql/catalog.zig").Row.TypedLayout, max_bytes: usize) !Hydrated {
+    pub fn lookupSqlBatch(self: *Reader, alloc: Allocator, documents: []const []const u8, layout: *const @import("../../sql/catalog.zig").Row.TypedLayout, max_bytes: usize) !Hydrated {
         if (comptime storage_engine.enabled) return @import("antfly_source_root").antfly_sources.storage_engine.call("relationalReaderLookupSqlBatch", .{ self, alloc, documents, layout, max_bytes });
         if (self.index != null or documents.len == 0 or documents.len > 64 or max_bytes == 0) return error.InvalidRelationalRowsRequest;
         if (self.row_policy_lease) |*lease| try lease.checkAt(@intCast(@divFloor(time.realtimeNs(), std.time.ns_per_s)));
@@ -778,7 +778,7 @@ pub const Reader = struct {
         }
     }
 
-    fn lookupRowFormat(self: *Reader, alloc: Allocator, document: []const u8, native_cells: bool, shared: ?*?@import("../../sql/catalog.zig").Row.TypedLayout) !?Row {
+    fn lookupRowFormat(self: *Reader, alloc: Allocator, document: []const u8, native_cells: bool, shared: ?*?*const @import("../../sql/catalog.zig").Row.TypedLayout) !?Row {
         if (self.index != null) return error.InvalidRelationalRowsRequest;
         if (self.row_policy_lease) |*lease| try lease.checkAt(@intCast(@divFloor(time.realtimeNs(), std.time.ns_per_s)));
         var scratch = std.heap.ArenaAllocator.init(self.alloc);
@@ -793,7 +793,7 @@ pub const Reader = struct {
         return self.hydratePrimary(alloc, temporary, document, raw, native_cells, shared, null);
     }
 
-    fn hydratePrimary(self: *Reader, alloc: Allocator, temporary: Allocator, document: []const u8, raw: []const u8, native_cells: bool, shared: ?*?@import("../../sql/catalog.zig").Row.TypedLayout, output: ?@import("../../sql/catalog.zig").Row.TypedLayout) !?Row {
+    fn hydratePrimary(self: *Reader, alloc: Allocator, temporary: Allocator, document: []const u8, raw: []const u8, native_cells: bool, shared: ?*?*const @import("../../sql/catalog.zig").Row.TypedLayout, output: ?*const @import("../../sql/catalog.zig").Row.TypedLayout) !?Row {
         const row = try self.rowView(raw);
         if (self.active.visibilityTtlDurationNs() != 0 and row.writeTimestampNs() != 0 and
             ttl.isExpired(row.writeTimestampNs(), self.active.visibilityTtlDurationNs(), self.now_ns)) return null;
@@ -849,7 +849,7 @@ pub const Reader = struct {
         }
         const page = arena.allocator();
         var output = std.ArrayList(Row).empty;
-        var native_layout: ?@import("../../sql/catalog.zig").Row.TypedLayout = null;
+        var native_layout: ?*const @import("../../sql/catalog.zig").Row.TypedLayout = null;
         var predicate_scratch = std.ArrayList(u8).empty;
         defer predicate_scratch.deinit(alloc);
         var continuation = std.ArrayList(u8).empty;

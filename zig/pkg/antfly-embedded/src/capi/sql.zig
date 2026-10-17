@@ -597,7 +597,7 @@ pub fn Adapter(comptime native: type) type {
             arena: std.heap.ArenaAllocator,
             result: types.SearchResult,
             reader: ?DB.RelationalRows.Reader,
-            layout: catalog.Row.TypedLayout,
+            layout: *const catalog.Row.TypedLayout,
             projection: dependencies.sql_document_row.Projection,
             position: usize = 0,
             fn next(ptr: *anyopaque, alloc: std.mem.Allocator, limit: u32) !catalog.Page {
