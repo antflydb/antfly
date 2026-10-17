@@ -4675,7 +4675,8 @@ test "GLiNER Decide listing falls back to tokenizer JSON marker IDs" {
     try tmp.dir.writeFile(io, .{ .sub_path = "tokenizer.json", .data = "{\"added_tokens\":[{\"id\":50368,\"content\":\"[SEP_STRUCT]\"},{\"id\":50369,\"content\":\"[SEP_TEXT]\"},{\"id\":50370,\"content\":\"[P]\"},{\"id\":50371,\"content\":\"[C]\"},{\"id\":50372,\"content\":\"[E]\"},{\"id\":50373,\"content\":\"[R]\"},{\"id\":50374,\"content\":\"[L]\"}]}" });
     const path = try tmp.dir.realPathFileAlloc(io, ".", a);
     defer a.free(path);
-    try std.testing.expect(!hasGlinerPathHint(path));
+    // Parent checkout/worktree names may legitimately contain "gliner".
+    try std.testing.expect(!hasGlinerPathHint(tmp.sub_path[0..]));
     var listing = try loadListingFromDir(a, path);
     defer listing.deinit();
     try std.testing.expectEqual(GlinerClassificationHead.label_marker_mlp, listing.gliner_classification_head);

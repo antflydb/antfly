@@ -64,9 +64,9 @@ Historical validation reports retain the original paths and measurements;
 """
     if name.endswith("1B"):
         note += """This exact Q8 bundle currently serves typed Decide and classification on
-Native CPU and Metal: one request item, one prepared sequence, at most
-198 prepared tokens including schema. FP32's 64-sequence / 1024-token proof
-does not qualify Q8 at those sizes. Entity and relation extraction are not
+Native CPU and Metal: one request item, at most 64 prepared sequences and
+1024 prepared tokens per sequence including schema. Q8 has its own independent
+upstream, Native, Metal, and HTTP capacity evidence. Entity and relation extraction are not
 advertised: the pinned upstream FP32 span heads produce empty results in
 the retained extraction investigation. Long-document graph extraction and
 ModernBERT fine-tuning remain unsupported for this artifact. See

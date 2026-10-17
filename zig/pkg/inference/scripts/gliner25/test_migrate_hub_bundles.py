@@ -45,7 +45,7 @@ class MigrationTests(unittest.TestCase):
             )
             self.assertNotIn("tasks", descriptor)
             if name.endswith("1B"):
-                self.assertIn(b"198 prepared tokens", result["README.md"])
+                self.assertIn(b"1024 prepared tokens per sequence", result["README.md"])
                 self.assertIn(b"empty results", result["README.md"])
             else:
                 self.assertIn(b"exporter strips", result["README.md"])

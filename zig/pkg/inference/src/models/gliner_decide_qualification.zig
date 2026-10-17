@@ -171,14 +171,12 @@ pub const RequestLimits = struct {
     sequence_tokens: usize = 198,
 };
 
-/// Precision-specific admission: the FP32 extraction/context proof cannot be
-/// borrowed by the separately pinned Q8 encoder/head bundle.
+/// The two immutable precision variants share the measured request geometry.
+/// Their numerical and serving evidence remain independently captured.
 pub fn requestLimits(identity: Identity) !?RequestLimits {
     const variant = try require(identity);
     if (variant != .decide_1b) return null;
-    if (identity.weight_companion == null)
-        return .{ .prepared_sequences = 64, .sequence_tokens = 1024 };
-    return .{};
+    return .{ .prepared_sequences = 64, .sequence_tokens = 1024 };
 }
 
 pub fn supportsSpanExtraction(identity: Identity) bool {
@@ -271,8 +269,11 @@ test "GLiNER Decide 1B qualification binds exact loaded identity" {
     try std.testing.expectEqual(QualifiedVariant.decide_1b, try require(identity));
     const quantized = identity;
     try std.testing.expect(!supportsSpanExtraction(identity));
-    try requireRequestIdentity(identity, .metal, 1, 1, 198);
-    try std.testing.expectError(error.UnsupportedGlinerDecisionGeometry, requireRequestIdentity(identity, .metal, 1, 1, 199));
+    try requireRequestIdentity(identity, .metal, 1, 64, 1024);
+    try requireRequestIdentity(identity, .native, 1, 64, 1024);
+    try std.testing.expectError(error.UnsupportedGlinerDecisionGeometry, requireRequestIdentity(identity, .metal, 1, 1, 1025));
+    try std.testing.expectError(error.UnsupportedGlinerDecisionGeometry, requireRequestIdentity(identity, .metal, 1, 65, 700));
+    try std.testing.expectError(error.UnsupportedGlinerDecisionGeometry, requireRequestIdentity(identity, .native, 2, 1, 700));
 
     identity.weight_companion = null;
     try std.testing.expectError(error.UnsupportedGlinerDecisionArtifact, require(identity));

@@ -14,7 +14,7 @@ an encoder, head, tokenizer, or converter.
 | --- | --- | --- |
 | multi-v1 | native, Metal | measured single-window entity, classification, structure, and relation profiles |
 | multi-Decide | native, Metal | the multilingual boundary profiles, plus typed Decide |
-| Decide-1B | native, Metal | typed classification/Decide and entity/relation extraction; one item, at most 64 prepared sequences of at most 1024 tokens each (Q8 bundle: one sequence, 198 tokens, no extraction) |
+| Decide-1B | native, Metal | typed classification/Decide; one item, at most 64 prepared sequences of at most 1024 tokens each, independently measured for FP32 and Q8; FP32 also has diagnostic span execution, with extraction capabilities withheld |
 
 The multilingual checkpoints have the same 334-tensor schema and the same
 16 MB Unigram tokenizer, but different learned weights. They share boundary
@@ -193,8 +193,9 @@ capabilities.
 The public 1B decision contract is separate from the encoder's saved position
 budget. For the exact pinned FP32 artifact it permits native or Metal, one
 request item, at most 64 prepared sequences, and at most 1024 prepared tokens
-per sequence. The separately pinned Q8 encoder/head bundle keeps one prepared
-sequence and at most 198 tokens; it cannot borrow the FP32 proof. These limits
+per sequence. The separately pinned Q8 encoder/head bundle has independent
+Native and physical Metal pipeline and HTTP measurements at the same bounds;
+it does not borrow the FP32 proof. These limits
 are `requestLimits` in `src/models/gliner_decide_qualification.zig`, enforced
 by `requireRequestIdentity` and applied to the span planner in
 `src/server/server.zig`. The planner rejects larger requests without
@@ -413,7 +414,7 @@ layout:
 
 | Repository | Immutable layout revision | Current typed Decide contract |
 | --- | --- | --- |
-| [`antflydb/GLiNER2.5-Decide-1B`](https://huggingface.co/antflydb/GLiNER2.5-Decide-1B) | `98ce73668cea4b940299396920671ec0a8abc57f` | Native/Metal, one item, one sequence, 198 complete prompt tokens |
+| [`antflydb/GLiNER2.5-Decide-1B`](https://huggingface.co/antflydb/GLiNER2.5-Decide-1B) | `98ce73668cea4b940299396920671ec0a8abc57f` | Native/Metal, one item, 64 sequences, 1024 complete prompt tokens per sequence |
 | [`antflydb/GLiNER2.5-Decide`](https://huggingface.co/antflydb/GLiNER2.5-Decide) | `358ae4b1263cedb79faf9e8b7984c3b4e5586874` | Not qualified; the DeBERTa Q8 exporter strips `decide` |
 
 The previous `gliner2.5-decide-1B-gguf` and `gliner2.5-decide-gguf` URLs redirect
@@ -445,8 +446,9 @@ controls concurrent independent requests, rather than combining several states
 into a model request. It need not be set to one for the 1B item limit; use one
 when serial admission is desirable on a memory-constrained host.
 
-Issue #1083 remains open for independently measured Q8 context expansion,
-non-empty upstream extraction evaluation, and ModernBERT span fine-tuning.
+Issue #1083 remains open for useful entity/relation extraction from a trained
+artifact. Q8 context expansion is independently measured; the pinned upstream
+weights still return empty extraction.
 The existing DeBERTa GLiNER trainer and the Laya trainer do not qualify a
 Decide-1B adapter. A future trainer must bind the exact encoder/head geometry,
 replay labeled decision and extraction holdouts, materialize a versioned bundle,
@@ -464,12 +466,15 @@ sweep was 0.02295 Native and 0.02270 Metal, below the predefined 0.05 probe
 tolerance. The 1024-token case alone differed by 0.001661 Native and 0.001581
 Metal. These timings describe a shared host, not a latency qualification.
 
-This is diagnostic evidence, not expanded serving qualification. It excludes
-HTTP/typed presentation, admission, schema splitting into 64 sequences, a
-natural-language long-context holdout, and non-empty extraction. The public Q8
-contract therefore remains one sequence of 198 tokens. Promotion requires
-those missing serving and calibration checks; FP32 evidence cannot substitute
-for Q8 measurements.
+Those original probes are superseded for classification capacity by the
+[capacity campaign](../../testdata/gliner25/family/decide_1b/q8_capacity/README.md): 31 complete
+in-budget prompts on Native and physical Metal, independent upstream token
+IDs/logits/distributions, natural-language 665–748-token contexts, exact
+1024-token acceptance, and real HTTP execution of 64 windows. The public Q8
+classification ceiling is now one item and 64 prepared sequences of at most
+1024 tokens each. Larger requests are rejected without truncation. This does
+not qualify entity/relation extraction or prove application-level decision
+quality; the campaign retains gold-model misses separately from parity.
 
 Reproduce the capture with `benchmark-cases.json` and `validation.json` from
 the immutable bundle revision recorded in the receipt:
