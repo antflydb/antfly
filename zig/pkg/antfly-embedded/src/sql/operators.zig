@@ -1249,6 +1249,37 @@ pub const Grouped = struct {
         return .{ .rows = rows, .representatives = representatives.items, .needed = needed };
     }
     pub fn addEncodedColumnsIdentified(self: *Grouped, keys: []const @import("execution_batch.zig").Batch, inputs: []const @import("execution_batch.zig").Batch, count: usize, identity: ?InputIdentity) !void {
+        if (try self.addEncodedWindow(keys, inputs, count, identity)) return;
+        const Batch = @import("execution_batch.zig").Batch;
+        var scratch = std.heap.ArenaAllocator.init(self.backing);
+        defer scratch.deinit();
+        var begin: usize = 0;
+        var length = @max(@as(usize, 1), count / 2);
+        while (begin < count) {
+            _ = scratch.reset(.free_all);
+            const a = scratch.allocator();
+            length = @min(length, count - begin);
+            const selection = try a.alloc(usize, length);
+            for (selection, begin..) |*row, i| row.* = i;
+            const key_parts = try a.alloc(Batch, keys.len);
+            const input_parts = try a.alloc(Batch, inputs.len);
+            for (keys, key_parts) |*column, *part| part.* = try column.select(a, selection);
+            for (inputs, input_parts) |*column, *part| part.* = try column.select(a, selection);
+            const ids: ?InputIdentity = if (identity) |value| .{ .ordinals = value.ordinals[begin..][0..length], .hashes = value.hashes[begin..][0..length] } else null;
+            if (try self.addEncodedWindow(key_parts, input_parts, length, ids)) {
+                begin += length;
+                length *|= 2;
+            } else length = @max(@as(usize, 1), length / 2);
+        }
+    }
+    /// Atomic admission probe for a native reducer page. False consumes no
+    /// rows or retained groups, allowing an owning spill reader to switch modes.
+    pub fn tryAddEncodedColumns(self: *Grouped, keys: []const @import("execution_batch.zig").Batch, inputs: []const @import("execution_batch.zig").Batch, count: usize, identity: InputIdentity) !bool {
+        if (count < 2 or keys.len == 0 or self.external != null) return false;
+        for (self.specs) |spec| if (spec.distinct or spec.kind == .pattern_set or spec.input_element == .numeric) return false;
+        return self.addEncodedWindow(keys, inputs, count, identity);
+    }
+    fn addEncodedWindow(self: *Grouped, keys: []const @import("execution_batch.zig").Batch, inputs: []const @import("execution_batch.zig").Batch, count: usize, identity: ?InputIdentity) !bool {
         const previous_ordinal = self.source_ordinal;
         defer self.source_ordinal = previous_ordinal;
         if (identity) |ids| {
@@ -1258,7 +1289,7 @@ pub const Grouped = struct {
         if (self.failed or self.finished or inputs.len != self.specs.len or keys.len > 256 or (self.key_count != null and self.key_count.? != keys.len)) return error.InvalidSqlBackendResponse;
         for (keys) |column| if (column.len() != count or column.width() != 1) return error.InvalidSqlBackendResponse;
         for (inputs) |column| if (column.len() != count or column.width() != 1) return error.InvalidSqlBackendResponse;
-        if (count == 0) return;
+        if (count == 0) return true;
         self.key_count = keys.len;
         var scratch = std.heap.ArenaAllocator.init(self.backing);
         defer scratch.deinit();
@@ -1279,7 +1310,7 @@ pub const Grouped = struct {
 
         // Spilling keeps the same physical validation contract as retaining;
         // supplied identity hashes do not bypass selected-lane validation.
-        if (try self.spillEncodedColumns(keys, inputs, count, identity)) return;
+        if (try self.spillEncodedColumns(keys, inputs, count, identity)) return true;
 
         // A global reducer retains one group, independently of batch length.
         // Admit its state once and use bounded scratch windows. Variable-width
@@ -1342,15 +1373,28 @@ pub const Grouped = struct {
                     }
                 }
                 self.rows_seen = std.math.add(u64, self.rows_seen, count) catch return error.SqlNumericOutOfRange;
-                return;
+                return true;
             }
         }
-        var fast = self.external == null;
+        var fast = self.external == null and count > 1;
         for (self.specs) |spec| if (spec.distinct or spec.kind == .pattern_set or spec.input_element == .numeric) {
             fast = false;
         };
-        const hashes = if (fast) (if (identity) |ids_| ids_.hashes else try @import("batch_hash.zig").encodedColumnsWithPhysical(a, keys, physical_keys, count, true)) else null;
-        const census = if (hashes) |values| try self.encodedGroups(a, keys, physical_keys, count, values) else null;
+        // Optional census workspace is independently reclaimable. A declined
+        // window returns before any retained mutation; retries never pin an
+        // ancestor's hashes, representatives or selections.
+        var census_budget: MemoryBudget = .{ .backing = self.backing, .limit = @min(2 * 1024 * 1024, (MemoryBudget.headroom(self.backing) orelse 4 * 1024 * 1024) / 2) };
+        var census_arena = std.heap.ArenaAllocator.init(census_budget.allocator());
+        defer census_arena.deinit();
+        const ca = census_arena.allocator();
+        const hashes = if (fast) (if (identity) |ids_| ids_.hashes else @import("batch_hash.zig").encodedColumnsWithPhysical(ca, keys, physical_keys, count, true) catch |err| {
+            if (err == error.OutOfMemory and census_budget.isExhausted() and count > 1) return false;
+            return err;
+        }) else null;
+        const census = if (hashes) |values| self.encodedGroups(ca, keys, physical_keys, count, values) catch |err| {
+            if (err == error.OutOfMemory and census_budget.isExhausted() and count > 1) return false;
+            return err;
+        } else null;
         var needed = if (census) |groups_| groups_.needed else std.math.maxInt(usize);
         if (census) |groups_| {
             // Variable-width winners can grow once per distinct group. Reserve
@@ -1407,20 +1451,7 @@ pub const Grouped = struct {
             for (self.specs) |spec| if (spec.distinct or spec.kind == .pattern_set or spec.input_element == .numeric) {
                 typed = false;
             };
-            if (typed and count > 1) {
-                const selected = try a.alloc(usize, count);
-                for (selected, 0..) |*row, i| row.* = i;
-                const key_parts = try a.alloc(@import("execution_batch.zig").Batch, keys.len);
-                const input_parts = try a.alloc(@import("execution_batch.zig").Batch, inputs.len);
-                const middle = count / 2;
-                for ([_][2]usize{ .{ 0, middle }, .{ middle, count } }) |range| {
-                    for (keys, key_parts) |*column, *part| part.* = try column.select(a, selected[range[0]..range[1]]);
-                    for (inputs, input_parts) |*column, *part| part.* = try column.select(a, selected[range[0]..range[1]]);
-                    const ids_: ?InputIdentity = if (identity) |ids_| .{ .ordinals = ids_.ordinals[range[0]..range[1]], .hashes = ids_.hashes[range[0]..range[1]] } else null;
-                    try self.addEncodedColumnsIdentified(key_parts, input_parts, range[1] - range[0], ids_);
-                }
-                return;
-            }
+            if (typed and count > 1) return false;
             for (0..count) |index| {
                 if (self.external != null and self.external.?.partitioned) {
                     const selected = try a.alloc(usize, count - index);
@@ -1430,14 +1461,14 @@ pub const Grouped = struct {
                     for (keys, key_parts) |*column, *part| part.* = try column.select(a, selected);
                     for (inputs, input_parts) |*column, *part| part.* = try column.select(a, selected);
                     const ids_: ?InputIdentity = if (identity) |ids_| .{ .ordinals = ids_.ordinals[index..], .hashes = ids_.hashes[index..] } else null;
-                    if (try self.spillEncodedColumns(key_parts, input_parts, selected.len, ids_)) return;
+                    if (try self.spillEncodedColumns(key_parts, input_parts, selected.len, ids_)) return true;
                 }
                 for (keys, physical_keys, row_keys) |column, native, *cell| cell.* = if (native) |view| try view.cell(index) else try column.cell(a, index, 0);
                 for (inputs, row_inputs) |column, *cell| cell.* = try column.cell(a, index, 0);
                 if (identity) |ids| self.source_ordinal = ids.ordinals[index];
                 try self.add(row_keys, row_inputs);
             }
-            return;
+            return true;
         }
         const ids = try a.alloc(usize, count);
         self.key_count = keys.len;
@@ -1450,7 +1481,7 @@ pub const Grouped = struct {
                 try column.updateEncoded(self.budget.allocator(), ids, values);
             }
             self.rows_seen = std.math.add(u64, self.rows_seen, count) catch return error.SqlNumericOutOfRange;
-            return;
+            return true;
         }
         const groups_ = census.?;
         for (groups_.representatives) |*representative| {
@@ -1464,6 +1495,7 @@ pub const Grouped = struct {
             if (native) |physical| if (try column.updatePhysical(self.budget.allocator(), ids, physical)) continue;
             try column.updateEncoded(self.budget.allocator(), ids, values);
         }
+        return true;
     }
 
     fn spillEncodedColumns(self: *Grouped, keys: []const @import("execution_batch.zig").Batch, inputs: []const @import("execution_batch.zig").Batch, count: usize, identity: ?InputIdentity) !bool {
@@ -3231,6 +3263,7 @@ fn encodedPartitionScenario(a: Allocator, count: usize) !void {
     defer group.deinit();
     group.key_count = 1;
     try group.startSpill();
+    group.external.?.parallel = false;
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
     const alloc = arena.allocator();
@@ -3255,6 +3288,7 @@ fn encodedPartitionScenario(a: Allocator, count: usize) !void {
         }
     }
     try std.testing.expectEqual(@as(usize, 2), seen);
+    try std.testing.expect(group.external.?.native_reduced_rows != 0);
 }
 test "SQL encoded partition spill preserves native input blocks null keys and ordinals" {
     try encodedPartitionScenario(std.testing.allocator, 1024);
@@ -3320,4 +3354,47 @@ test "SQL encoded spill validates physical inputs before writing scalar blocks" 
     try std.testing.expectError(error.InvalidSqlBackendResponse, group.addEncodedColumnsIdentified(&.{key}, &.{input}, 1, .{ .hashes = &.{0}, .ordinals = &.{0} }));
     try std.testing.expectEqual(@as(u64, 0), group.rows_seen);
     try std.testing.expectEqual(@as(u64, 0), manager.written_bytes);
+}
+
+test "SQL encoded admission reclaims declined census under shared pressure" {
+    const Hook = struct {
+        fn check(_: *anyopaque) !void {}
+    };
+    const Batch = @import("execution_batch.zig").Batch;
+    const base = std.testing.allocator;
+    var values: [64]Datum = undefined;
+    var indices: [64]u32 = undefined;
+    for (&values, &indices, 0..) |*value, *index, i| {
+        value.* = Datum.json(.{ .integer = @intCast(i) });
+        index.* = @intCast(i);
+    }
+    const keys: Batch = .{ .dictionary = .{ .values = &values, .indices = &indices } };
+    const hashes = try @import("batch_hash.zig").encodedColumns(base, &.{keys}, values.len, true);
+    defer base.free(hashes);
+    var ordinals: [64]u64 = undefined;
+    for (&ordinals, 0..) |*ordinal, i| ordinal.* = i;
+    for ([_]usize{ 800, 850, 875, 900, 925, 950, 975, 985 }) |kib| {
+        for ([_]bool{ true, false }) |batch| for ([_]bool{ false, true }) |wrapped| {
+            var quota: MemoryBudget = .{ .backing = base, .limit = 1024 * 1024 };
+            const a = quota.allocator();
+            const reservation = try a.alloc(u8, kib * 1024);
+            defer a.free(reservation);
+            var raw: u8 = 0;
+            var manager: @import("spill.zig").Manager = .{ .alloc = a, .io = std.testing.io, .context = &raw, .checkpoint = Hook.check, .async_writes = false, .compression = .none };
+            defer manager.deinit();
+            var locked: @import("parallel_scheduler.zig").LockedAllocator = .{ .backing = a };
+            const group = try Grouped.create(if (wrapped) locked.allocator() else a, &.{.{ .kind = .count }}, .{ .bytes = 64 * 1024, .spill = &manager });
+            defer group.deinit();
+            const outcome: ?anyerror = blk: {
+                if (batch) {
+                    group.addEncodedColumnsIdentified(&.{keys}, &.{keys}, values.len, .{ .hashes = hashes, .ordinals = &ordinals }) catch |err| break :blk err;
+                } else {
+                    for (values) |value| group.add(&.{value}, &.{value}) catch |err| break :blk err;
+                }
+                break :blk null;
+            };
+            try std.testing.expect(outcome == null);
+            try std.testing.expectEqual(@as(u64, values.len), group.rows_seen);
+        };
+    }
 }

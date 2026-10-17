@@ -283,6 +283,10 @@ def test_real_iceberg_snapshots_schema_ids_partitions_deletes_and_restart(tmp_pa
                 "SELECT COUNT(*), SUM(id) FROM ice_events WHERE region = 'west'"
             ) == [["3", "9"]]
             assert sql(
+                "SELECT id, title FROM ice_events WHERE id >= 3 AND id < 6 "
+                "AND region = 'west' ORDER BY id"
+            ) == [["3", None], ["5", "five"]]
+            assert sql(
                 "SELECT region, SUM(id) FILTER (WHERE region='west'), "
                 "COUNT(*) FILTER (WHERE region='east') FROM ice_events "
                 "GROUP BY region ORDER BY region"

@@ -1405,14 +1405,14 @@ pub const Stream = struct {
         return total;
     }
     pub fn deleteMask(self: Stream, a: Allocator, batch: types.ColumnBatch, selected: []bool) !void {
-        for (batch.row_refs, selected) |ref, *keep| if (keep.* and self.isDeleted(ref)) {
-            keep.* = false;
-        };
+        for (selected, 0..) |*keep, index| {
+            if (keep.* and self.isDeleted(batch.rowRef(index))) keep.* = false;
+        }
         if (self.source.prepared_deletes) |prepared|
             try prepared.maskPositions(a, self.discovered.?.inventory.files[0], batch, selected, self.position_starts);
     }
     pub fn isDeletedBatch(self: Stream, a: Allocator, batch: types.ColumnBatch, index: usize) !bool {
-        if (self.isDeleted(batch.row_refs[index])) return true;
+        if (self.isDeleted(batch.rowRef(index))) return true;
         if (self.source.prepared_deletes) |prepared|
             return prepared.matchesPositions(a, self.discovered.?.inventory.files[0], batch, index, self.position_starts);
         return false;

@@ -981,7 +981,8 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
             const rows = input.provider().open_with_cancellation_fn.?(input.provider().ptr, a, binding, cancellation) catch |err| return buildFailure(err, "open_rows", file_ordinal, segments.items.len);
             defer rows.deinit(a);
             while (rows.next(a) catch |err| return buildFailure(err, "read_rows", file_ordinal, segments.items.len)) |batch| {
-                for (batch.row_refs, 0..) |ref, row| {
+                for (0..batch.rowCount()) |row| {
+                    const ref = batch.rowRef(row);
                     try provider.context.ensureActive();
                     try cancellation.check();
                     const page: local.sql_catalog.ColumnPage = .{ .batch = batch, .selection = &.{row} };

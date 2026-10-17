@@ -37,7 +37,8 @@ pub fn buildFragmentFromBatchAlloc(
     var builder = try row_fragment.Builder.init(alloc, options.schema_fingerprint);
     errdefer builder.deinit();
 
-    for (batch.row_refs, 0..) |row_ref, ordinal| {
+    for (0..batch.rowCount()) |ordinal| {
+        const row_ref = batch.rowRef(ordinal);
         const key = try rowRefKeyAlloc(alloc, row_ref);
         defer alloc.free(key);
         try builder.appendRowWithOrdinal(key, ordinal);

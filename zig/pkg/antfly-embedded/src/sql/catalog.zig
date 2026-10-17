@@ -426,7 +426,7 @@ pub const ColumnPage = struct {
             return .{ .value = .null, .sql_null = true };
         }
         if (index >= self.batch.rowCount()) return error.InvalidSqlBackendResponse;
-        if (std.mem.eql(u8, name, "_id")) return .{ .value = .{ .string = try @import("../storage/rowsource/identity.zig").allocId(alloc, self.batch.row_refs[index]) }, .sql_null = false };
+        if (std.mem.eql(u8, name, "_id")) return .{ .value = .{ .string = try @import("../storage/rowsource/identity.zig").allocId(alloc, self.batch.rowRef(index)) }, .sql_null = false };
         const column = self.batch.findColumn(name) orelse return .{ .value = .null, .sql_null = true };
         if (column.nulls.isNull(index)) return .{ .value = .null, .sql_null = true };
         const value: std.json.Value = switch (column.values) {

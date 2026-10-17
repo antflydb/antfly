@@ -159,6 +159,7 @@ pub fn estimateBatchBytes(batch: rowsource.ColumnBatch) usize {
     total = addOrMax(total, batch.snapshot.snapshot_id.len);
     total = addOrMax(total, std.math.mul(usize, batch.row_refs.len, @sizeOf(rowsource.RowRef)) catch return std.math.maxInt(usize));
     total = addOrMax(total, std.math.mul(usize, batch.columns.len, @sizeOf(rowsource.ColumnVector)) catch return std.math.maxInt(usize));
+    if (batch.external_span) |span| total = addOrMax(total, span.first.file_id.len);
     for (batch.row_refs) |row_ref| {
         const ref_bytes = switch (row_ref) {
             .relational_key => |key| key.len,

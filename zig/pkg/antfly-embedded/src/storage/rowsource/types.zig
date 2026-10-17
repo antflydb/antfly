@@ -233,15 +233,44 @@ pub fn validateColumns(columns: []const ColumnVector, row_count: usize) !void {
 
 pub const ColumnBatch = struct {
     snapshot: SnapshotRef,
-    row_refs: []const RowRef,
+    /// Explicit identities remain available for arbitrary/noncontiguous input.
+    row_refs: []const RowRef = &.{},
+    /// A scan shares immutable source identity and synthesizes only requested
+    /// row references. This is borrowed with the same lifetime as column data.
+    external_span: ?struct { first: ExternalRowRef, count: usize } = null,
     columns: []const ColumnVector,
 
     pub fn rowCount(self: ColumnBatch) usize {
-        return self.row_refs.len;
+        return if (self.external_span) |span| span.count else self.row_refs.len;
     }
 
     pub fn validate(self: ColumnBatch) !void {
-        try validateColumns(self.columns, self.row_refs.len);
+        if (self.external_span) |span| {
+            if (self.row_refs.len != 0 or span.first.source_id.len == 0 or span.first.snapshot_id.len == 0 or span.first.file_id.len == 0 or
+                !std.mem.eql(u8, span.first.source_id, self.snapshot.table_id) or !std.mem.eql(u8, span.first.snapshot_id, self.snapshot.snapshot_id)) return error.InvalidExternalRowSource;
+            if (span.count != 0) _ = std.math.add(u64, span.first.row_ordinal, span.count - 1) catch return error.InvalidExternalRowSource;
+        }
+        try validateColumns(self.columns, self.rowCount());
+    }
+
+    pub fn rowRef(self: ColumnBatch, index: usize) RowRef {
+        std.debug.assert(index < self.rowCount());
+        if (self.external_span) |span| {
+            var ref = span.first;
+            ref.row_ordinal += index;
+            return .{ .external = ref };
+        }
+        return self.row_refs[index];
+    }
+    pub fn identitySlice(self: ColumnBatch, begin: usize, end: usize, columns: []const ColumnVector) !ColumnBatch {
+        if (begin > end or end > self.rowCount()) return error.RowSourceColumnLengthMismatch;
+        var result = self;
+        result.columns = columns;
+        if (self.external_span) |span| {
+            result.external_span = .{ .first = span.first, .count = end - begin };
+            if (begin != end) result.external_span.?.first.row_ordinal = std.math.add(u64, span.first.row_ordinal, begin) catch return error.InvalidExternalRowSource;
+        } else result.row_refs = self.row_refs[begin..end];
+        return result;
     }
 
     pub fn findColumn(self: ColumnBatch, name: []const u8) ?ColumnVector {
@@ -322,4 +351,26 @@ test "row source validates batches returned by adapters" {
     const batch = (try source.next(std.testing.allocator)).?;
     try std.testing.expectEqual(@as(usize, 1), batch.rowCount());
     try std.testing.expect((try source.next(std.testing.allocator)) == null);
+}
+
+test "external lake compact identity spans preserve coordinates slices and validation" {
+    const first: ExternalRowRef = .{ .source_id = "source", .snapshot_id = "snapshot", .file_id = "file", .row_group_ordinal = 7, .row_ordinal = 99 };
+    const batch: ColumnBatch = .{ .snapshot = .{ .table_id = "source", .snapshot_id = "snapshot" }, .external_span = .{ .first = first, .count = 4096 }, .columns = &.{} };
+    try batch.validate();
+    try std.testing.expectEqual(@as(usize, 0), batch.row_refs.len);
+    try std.testing.expectEqual(@as(usize, 4096), batch.rowCount());
+    const sliced = try batch.identitySlice(17, 31, &.{});
+    try sliced.validate();
+    for (0..sliced.rowCount()) |index| try std.testing.expectEqualDeep(batch.rowRef(index + 17), sliced.rowRef(index));
+    const explicit: ColumnBatch = .{ .snapshot = batch.snapshot, .row_refs = &.{ batch.rowRef(4), batch.rowRef(7) }, .columns = &.{} };
+    try std.testing.expectEqualDeep(explicit.rowRef(1), (try explicit.identitySlice(1, 2, &.{})).rowRef(0));
+    var bad = batch;
+    bad.row_refs = explicit.row_refs;
+    try std.testing.expectError(error.InvalidExternalRowSource, bad.validate());
+    bad = batch;
+    bad.external_span.?.first.row_ordinal = std.math.maxInt(u64);
+    try std.testing.expectError(error.InvalidExternalRowSource, bad.validate());
+    bad = batch;
+    bad.snapshot.snapshot_id = "other";
+    try std.testing.expectError(error.InvalidExternalRowSource, bad.validate());
 }

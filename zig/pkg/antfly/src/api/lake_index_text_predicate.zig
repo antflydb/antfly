@@ -1277,12 +1277,12 @@ fn PredicateResolver(comptime Set: type) type {
                 if (mask) |matches| try evaluateColumns(page_arena.allocator(), input, page, matches, null);
                 for (page.selection, 0..) |position, row| {
                     if (mask) |matches| {
-                        if (matches[row]) try self.addMatch(a, result, &bitmap_cache, page.batch.row_refs[position]);
+                        if (matches[row]) try self.addMatch(a, result, &bitmap_cache, page.batch.rowRef(position));
                         continue;
                     }
                     _ = row_arena.reset(.retain_capacity);
                     const ra = row_arena.allocator();
-                    const ref = page.batch.row_refs[position];
+                    const ref = page.batch.rowRef(position);
                     const id = try local.storage_rowsource_identity.allocId(ra, ref);
                     var doc: std.json.Value = .{ .object = .empty };
                     try doc.object.put(ra, "_id", .{ .string = id });

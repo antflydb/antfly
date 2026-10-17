@@ -407,7 +407,7 @@ pub fn scanRowsAlloc(
         for (0..batch.rowCount()) |row_idx| {
             rows_examined = std.math.add(u64, rows_examined, 1) catch return error.LakeRowsScanBudgetExceeded;
             if (rows_examined > request.limits.max_rows_examined) return error.LakeRowsScanBudgetExceeded;
-            if (rowIsDeletedLookup(deleted_lookup, request.deleted_row_filter, batch.row_refs[row_idx])) continue;
+            if (rowIsDeletedLookup(deleted_lookup, request.deleted_row_filter, batch.rowRef(row_idx))) continue;
             if (request.predicate) |predicate| {
                 if (!try predicateMatches(predicate, predicate_column.?, row_idx)) continue;
             }
@@ -723,7 +723,8 @@ fn hydrateRowsInternalAlloc(
             batch.findColumn(value.column) orelse return error.RowSourceColumnNotFound
         else
             null;
-        for (batch.row_refs, 0..) |row_ref, row_idx| {
+        for (0..batch.rowCount()) |row_idx| {
+            const row_ref = batch.rowRef(row_idx);
             rows_examined = std.math.add(u64, rows_examined, 1) catch return error.LakeRowsHydrationBudgetExceeded;
             if (rows_examined > limits.max_rows_examined) return error.LakeRowsHydrationBudgetExceeded;
             if (rowIsDeletedLookup(deleted_lookup, deleted_row_filter, row_ref)) continue;
@@ -1046,7 +1047,7 @@ fn resultFromSourceAlloc(
         }
 
         for (0..batch.rowCount()) |row_idx| {
-            if (rowIsDeletedLookup(deleted_lookup, request.deleted_row_filter, batch.row_refs[row_idx])) continue;
+            if (rowIsDeletedLookup(deleted_lookup, request.deleted_row_filter, batch.rowRef(row_idx))) continue;
             if (group_column.nulls.isNull(row_idx)) continue;
             const key = try group_column.bytesAt(row_idx);
             if (key.len == 0) continue;
@@ -1115,7 +1116,7 @@ fn expressionResultFromSourceAlloc(
             }
         }
         for (0..batch.rowCount()) |row_idx| {
-            if (rowIsDeletedLookup(deleted_lookup, request.deleted_row_filter, batch.row_refs[row_idx])) continue;
+            if (rowIsDeletedLookup(deleted_lookup, request.deleted_row_filter, batch.rowRef(row_idx))) continue;
             for (accumulators, value_columns) |*accumulator, value_column| {
                 const next_value = (try rowAggregateValue(accumulator.spec.op, value_column, row_idx)) orelse continue;
                 if (!accumulator.initialized) {
@@ -1181,7 +1182,7 @@ fn projectRowAlloc(
     row_idx: usize,
     projected_columns: []const []const u8,
 ) !ProjectedRow {
-    const row_ref = try source_binding.cloneRowRefAlloc(alloc, batch.row_refs[row_idx]);
+    const row_ref = try source_binding.cloneRowRefAlloc(alloc, batch.rowRef(row_idx));
     errdefer source_binding.freeOwnedRowRef(alloc, row_ref);
     const cells = try alloc.alloc(ProjectedCell, projected_columns.len);
     errdefer alloc.free(cells);
@@ -1216,7 +1217,7 @@ fn projectedRowAllocatedBytes(
         @sizeOf(ProjectedRow),
         std.math.mul(usize, projected_columns.len, @sizeOf(ProjectedCell)) catch return std.math.maxInt(usize),
     ) catch return std.math.maxInt(usize);
-    total = std.math.add(usize, total, rowRefPayloadBytes(batch.row_refs[row_idx])) catch return std.math.maxInt(usize);
+    total = std.math.add(usize, total, rowRefPayloadBytes(batch.rowRef(row_idx))) catch return std.math.maxInt(usize);
     for (projected_columns) |name| {
         const column = batch.findColumn(name) orelse return error.RowSourceColumnNotFound;
         total = std.math.add(usize, total, name.len) catch return std.math.maxInt(usize);

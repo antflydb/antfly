@@ -52,6 +52,7 @@ test {
     _ = @import("antfly_local_sources").sql_aggregate_state;
     _ = @import("antfly_local_sources").sql_aggregate_materialization;
     _ = @import("antfly_local_sources").sql_vector_eval;
+    _ = @import("antfly_local_sources").sql_lake_predicate_kernel;
     _ = @import("antfly_local_sources").sql_parallel_scheduler;
     _ = @import("antfly_local_sources").sql_parallel_aggregate;
     _ = @import("antfly_local_sources").sql_partition_join;

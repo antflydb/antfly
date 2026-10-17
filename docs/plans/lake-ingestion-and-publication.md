@@ -1642,3 +1642,40 @@ outputs and unused-expression pruning. Zig/Python formatting, Python lint,
 whitespace, licenses and the Apache product boundary (2,073 sources) passed.
 Current `origin/main` `ce578d9033` is included. Archive-scale latency/RSS
 benchmarks and live-provider retention qualification remain deferred.
+
+
+### Native scan identities, exact predicate masks and spill reduction
+
+Contiguous Parquet/Iceberg batches carry a shared external identity span.
+The batch count and on-demand row-reference accessor preserve snapshot, file,
+row-group and physical ordinal authority without a reference allocation per
+row. Explicit identities remain available for arbitrary inputs. Slicing, delete
+masks, hydration, pagination, replay and index builders consume the same accessor;
+retained builds clone the shared identity once and preserve the compact span.
+
+Residual scan predicates dispatch once per native column. Dense integer/float
+comparisons use SIMD lanes; selected dictionary entries use a fixed bounded memo.
+SQL NULL, excluded lanes and signed timestamp boundaries remain exact. NUMERIC,
+wide datetime bounds, mixed integer/float comparisons, nonfinite coercion and
+complex values retain the established scalar boundary. Literal coercion stays
+lazy when no nonnull selected lane needs it. Embedded pruning remains advisory.
+
+Native spill ingestion sizes and encodes selected primitive/dictionary columns
+without Datum row reconstruction, using the existing portable block format.
+Compatible raw partition blocks feed typed grouped state atomically; partial AGS
+checkpoints, specialized exact state and sorted skew fallback retain their
+existing representations and order. No borrowed block survives its owning read.
+Declined group censuses use independently bounded workspace and iterative
+reclaim-before-retry windows. Singleton fallback needs no census. Ordinary SQL
+row/cardinality errors share one prefix-delivery classification; cancellation,
+resource and integrity errors remain immediate failures.
+
+Qualification: the full SQL gate passed 997 tests (three opt-in benchmarks
+skipped); native lake integration passed 509 tests and the runtime I/O ABI gate
+passed, with zero failures or leaks. All 50 real Parquet/Iceberg E2Es passed
+against the final Debug CLI in 635.73 seconds, including filtered compact identity
+stability across cold restarts. Focused allocation-failure, scalar-predicate
+parity, mixed spill validation and direct/wrapped allocator pressure checks passed.
+Formatting, Python lint, license headers and the Apache boundary (2,074 sources)
+passed. Latest fetched origin/main `ce578d9033` is included. Representative
+archive-scale latency/RSS and live-provider retention qualification remain deferred.

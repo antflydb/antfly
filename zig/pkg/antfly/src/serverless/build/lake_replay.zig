@@ -104,11 +104,21 @@ const OwnedBatch = struct {
         const snapshot_id = try alloc.dupe(u8, batch.snapshot.snapshot_id);
         errdefer alloc.free(snapshot_id);
 
+        try batch.validate();
+        const span: @FieldType(rowsource.ColumnBatch, "external_span") = if (batch.external_span) |value| blk: {
+            var copy = value;
+            copy.first.source_id = table_id;
+            copy.first.snapshot_id = snapshot_id;
+            copy.first.file_id = try alloc.dupe(u8, value.first.file_id);
+            break :blk copy;
+        } else null;
+        errdefer if (span) |value| alloc.free(value.first.file_id);
         const row_refs = try alloc.alloc(rowsource.RowRef, batch.row_refs.len);
         errdefer alloc.free(row_refs);
         var initialized_refs: usize = 0;
         errdefer for (row_refs[0..initialized_refs]) |*row_ref| source_binding.freeOwnedRowRef(alloc, row_ref.*);
-        for (batch.row_refs, row_refs) |row_ref, *out| {
+        for (row_refs, 0..) |*out, row_index| {
+            const row_ref = batch.rowRef(row_index);
             out.* = try source_binding.cloneRowRefAlloc(alloc, row_ref);
             initialized_refs += 1;
         }
@@ -125,6 +135,7 @@ const OwnedBatch = struct {
         const owned = OwnedBatch{ .batch = .{
             .snapshot = .{ .table_id = table_id, .snapshot_id = snapshot_id, .generation = batch.snapshot.generation },
             .row_refs = row_refs,
+            .external_span = span,
             .columns = columns,
         } };
         try owned.batch.validate();
@@ -134,6 +145,7 @@ const OwnedBatch = struct {
     pub fn deinit(self: *OwnedBatch, alloc: Allocator) void {
         alloc.free(@constCast(self.batch.snapshot.table_id));
         alloc.free(@constCast(self.batch.snapshot.snapshot_id));
+        if (self.batch.external_span) |span| alloc.free(span.first.file_id);
         for (self.batch.row_refs) |row_ref| source_binding.freeOwnedRowRef(alloc, row_ref);
         alloc.free(@constCast(self.batch.row_refs));
         for (self.batch.columns) |column| freeColumn(alloc, column);
@@ -287,4 +299,18 @@ test "bounded replay scans a source once and supports independent cursors" {
         }
     };
     try @import("antfly_platform").allocator.checkAllAllocationFailures(alloc, AllocationRunner.run, .{batches[0..]});
+}
+
+fn compactReplayScenario(a: Allocator) !void {
+    const input: rowsource.ColumnBatch = .{ .snapshot = .{ .table_id = "source", .snapshot_id = "snapshot" }, .external_span = .{ .first = .{ .source_id = "source", .snapshot_id = "snapshot", .file_id = "file", .row_group_ordinal = 3, .row_ordinal = 7 }, .count = 4096 }, .columns = &.{} };
+    var owned = try OwnedBatch.cloneAlloc(a, input);
+    defer owned.deinit(a);
+    try std.testing.expectEqual(@as(usize, 0), owned.batch.row_refs.len);
+    try std.testing.expectEqualDeep(input.rowRef(4095), owned.batch.rowRef(4095));
+    try std.testing.expect(owned.batch.external_span.?.first.file_id.ptr != input.external_span.?.first.file_id.ptr);
+    try std.testing.expect(@import("lake_build_limits.zig").estimateBatchBytes(owned.batch) < 1024);
+}
+test "external lake compact replay owns shared identity once and unwinds failures" {
+    try compactReplayScenario(std.testing.allocator);
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, compactReplayScenario, .{});
 }

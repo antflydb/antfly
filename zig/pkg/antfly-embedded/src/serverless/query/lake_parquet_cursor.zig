@@ -572,9 +572,8 @@ pub const Cursor = struct {
     }
     fn batch(self: *Cursor, count: usize, required_only: bool) !types.ColumnBatch {
         const a = self.output.allocator();
-        const refs = try a.alloc(types.RowRef, count);
         const binding = @import("../external_source/rowsource_bridge.zig").bindingFromValidatedInventory(self.inventory);
-        for (refs, 0..) |*ref, index| ref.* = try @import("../../storage/rowsource/external.zig").makeRowRef(binding, self.file.file_id, self.group.ordinal, self.position + index);
+        const first = try @import("../../storage/rowsource/external.zig").makeRowRef(binding, self.file.file_id, self.group.ordinal, self.position);
         var vectors: std.ArrayList(types.ColumnVector) = .empty;
         for (self.columns) |*column| {
             if (required_only and !column.required) continue;
@@ -589,7 +588,7 @@ pub const Cursor = struct {
             if (decoded.nulls.bytes.len != 0) vector.nulls.bytes = decoded.nulls.bytes[begin..][0..count];
             try vectors.append(a, vector);
         }
-        return .{ .snapshot = binding.snapshot(), .row_refs = refs, .columns = vectors.items };
+        return .{ .snapshot = binding.snapshot(), .external_span = .{ .first = first.external, .count = count }, .columns = vectors.items };
     }
     pub fn next(self: *Cursor) !?types.ColumnBatch {
         while (self.position < self.group.row_count) {

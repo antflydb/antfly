@@ -295,7 +295,7 @@ const Owner = struct {
     fn selectionMask(self: *Owner, batch: @import("../storage/rowsource/types.zig").ColumnBatch) ![]const bool {
         const count = batch.rowCount();
         if (count == 0) return &.{};
-        const ref = batch.row_refs[0].external;
+        const ref = batch.rowRef(0).external;
         if (std.mem.eql(u8, self.mask_file, ref.file_id) and self.mask_group == ref.row_group_ordinal and ref.row_ordinal >= self.mask_first) {
             const start = std.math.cast(usize, ref.row_ordinal - self.mask_first) orelse return error.InvalidSqlBackendResponse;
             if (start <= self.selection_mask.len and count <= self.selection_mask.len - start) return self.selection_mask[start..][0..count];
@@ -306,7 +306,8 @@ const Owner = struct {
         const a = self.mask_arena.allocator();
         const selected = try a.alloc(bool, count);
         @memset(selected, true);
-        if (self.stream.selection) |selection| for (batch.row_refs, selected) |row_ref, *keep| {
+        if (self.stream.selection) |selection| for (selected, 0..) |*keep, row_index| {
+            const row_ref = batch.rowRef(row_index);
             const r = row_ref.external;
             keep.* = selection.contains(self.stream.active_file, r.row_group_ordinal, r.row_ordinal);
         };
@@ -320,6 +321,7 @@ const Owner = struct {
         view.columns = vectors;
         // Column-major predicates, with dictionary entries evaluated once.
         for (self.conditions) |condition| {
+            if (try @import("lake_predicate_kernel.zig").apply(a, view, self.table, condition, selected)) continue;
             const physical = view.findColumn(condition.column);
             var dictionary: std.AutoHashMapUnmanaged(u32, bool) = .empty;
             defer dictionary.deinit(a);
@@ -339,7 +341,7 @@ const Owner = struct {
         if (self.dynamic) |filter| try filter.applyBatch(a, view, selected);
         if (self.after != null or self.before != null or self.primary_key != null) for (selected, 0..) |*keep, index| {
             if (!keep.*) continue;
-            const id = try @import("../storage/rowsource/identity.zig").allocId(a, batch.row_refs[index]);
+            const id = try @import("../storage/rowsource/identity.zig").allocId(a, batch.rowRef(index));
             if (self.after) |after| if (std.mem.order(u8, id, after) != .gt) {
                 keep.* = false;
             };
@@ -462,7 +464,7 @@ const Owner = struct {
                 alloc.free(vectors);
                 continue;
             }
-            last_id = try @import("../storage/rowsource/identity.zig").allocId(alloc, batch.row_refs[selected[count - 1]]);
+            last_id = try @import("../storage/rowsource/identity.zig").allocId(alloc, batch.rowRef(selected[count - 1]));
             const end = self.position == batch.rowCount() and (self.stream.page_cursor == null or self.stream.page_cursor.?.position == self.stream.page_cursor.?.group.row_count) and self.stream.file_index == self.stream.files.len and self.stream.group_index == self.stream.discovered.?.row_group_plan.row_groups.len and !try self.stream.enumeratedHasMore();
             return .{ .batch = view, .retain_columns = .{ .ptr = self, .retain_fn = retainColumns }, .selection = selected[0..count], .after = if (end or self.primary_key != null) null else last_id };
         }
@@ -485,7 +487,7 @@ const Owner = struct {
                 try object.put(a, column.name, value);
                 flag.* = cell.sql_null;
             }
-            row.* = .{ .id = try @import("../storage/rowsource/identity.zig").allocId(a, page.batch.row_refs[page.selection[i]]), .version = 0, .value = .{ .object = object }, .sql_nulls = nulls };
+            row.* = .{ .id = try @import("../storage/rowsource/identity.zig").allocId(a, page.batch.rowRef(page.selection[i])), .version = 0, .value = .{ .object = object }, .sql_nulls = nulls };
         }
         _ = self;
         return .{ .rows = output, .owned_arena = arena, .after = page.after };
@@ -1383,7 +1385,7 @@ test "lake SQL Parquet page cursor preserves row ordinals and bounds decoded row
             const page = try cursor.next_columns.?(cursor.ptr, scratch.allocator(), 17);
             for (0..page.selection.len) |index| {
                 try std.testing.expectEqual(@as(i64, @intCast(count)), (try page.cell(scratch.allocator(), index, "amount")).value.integer);
-                try std.testing.expectEqual(@as(u64, @intCast(count)), page.batch.row_refs[page.selection[index]].external.row_ordinal);
+                try std.testing.expectEqual(@as(u64, @intCast(count)), page.batch.rowRef(page.selection[index]).external.row_ordinal);
                 count += 1;
             }
             if (page.after == null) break;

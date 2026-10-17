@@ -884,6 +884,20 @@ pub const Sequential = struct {
     pub fn appendBatch(self: *Sequential, values: @import("execution_batch.zig").Batch, keys: @import("execution_batch.zig").Batch, ordinals: []const u64) !void {
         if (values.len() != keys.len() or values.len() != ordinals.len) return error.InvalidSqlSpill;
         try self.flush();
+        var physical_arena = std.heap.ArenaAllocator.init(self.file.manager.allocator());
+        defer physical_arena.deinit();
+        const pa = physical_arena.allocator();
+        const Physical = @import("execution_batch.zig").PhysicalColumn;
+        const physical_values = try pa.alloc(?Physical, values.width());
+        const physical_keys = try pa.alloc(?Physical, keys.width());
+        for (physical_values, 0..) |*view, column| {
+            view.* = try values.physicalColumn(pa, column);
+            if (view.*) |native| try native.validate();
+        }
+        for (physical_keys, 0..) |*view, column| {
+            view.* = try keys.physicalColumn(pa, column);
+            if (view.*) |native| try native.validate();
+        }
         var begin: usize = 0;
         while (begin < values.len()) {
             try self.file.manager.check();
@@ -894,8 +908,8 @@ pub const Sequential = struct {
             var estimated: usize = 24;
             while (end < values.len() and end - begin < 256) {
                 var cost: usize = 8;
-                for (0..values.width()) |column| cost +|= try operators.datumBytes(try values.cell(a, end, column));
-                for (0..keys.width()) |column| cost +|= try operators.datumBytes(try keys.cell(a, end, column));
+                for (physical_values, 0..) |view, column| cost +|= if (view) |native| try native.bytes(end) else try operators.datumBytes(try values.cell(a, end, column));
+                for (physical_keys, 0..) |view, column| cost +|= if (view) |native| try native.bytes(end) else try operators.datumBytes(try keys.cell(a, end, column));
                 if (end != begin and cost > self.block_bytes -| estimated) break;
                 estimated +|= cost;
                 end += 1;
@@ -906,14 +920,14 @@ pub const Sequential = struct {
             try encoder.word(values.width());
             try encoder.word(keys.width());
             for (ordinals[begin..end]) |ordinal| try encoder.word(ordinal);
-            try encodeBatchColumns(&encoder, values, begin, end);
-            try encodeBatchColumns(&encoder, keys, begin, end);
+            try encodeBatchColumns(&encoder, values, physical_values, begin, end);
+            try encodeBatchColumns(&encoder, keys, physical_keys, begin, end);
             try self.writeEncoded(bytes.items);
             self.size += end - begin;
             begin = end;
         }
     }
-    fn encodeBatchColumns(encoder: *Encoder, batch: @import("execution_batch.zig").Batch, begin: usize, end: usize) !void {
+    fn encodeBatchColumns(encoder: *Encoder, batch: @import("execution_batch.zig").Batch, physical_columns: []const ?@import("execution_batch.zig").PhysicalColumn, begin: usize, end: usize) !void {
         // One bounded column of borrowed cells feeds the shared physical codec.
         // Dictionary choice, SQL NULL and JSON null retain exactly one format.
         var cells: [256]Datum = undefined;
@@ -922,6 +936,12 @@ pub const Sequential = struct {
         for (positions[0 .. end - begin], begin..) |*position, index| position.* = index;
         const selected = try batch.select(encoder.a, positions[0 .. end - begin]);
         for (0..batch.width()) |column| {
+            if (physical_columns[column]) |view| {
+                var native = view;
+                native.selection = view.selection[begin..end];
+                try encodeNativeColumn(encoder, native);
+                continue;
+            }
             const dictionary = try selected.dictionaryColumn(encoder.a, column);
             defer if (dictionary) |physical| {
                 encoder.a.free(physical.dictionary.values);
@@ -933,6 +953,80 @@ pub const Sequential = struct {
                 rows[lane] = .{ .values = cells[lane..][0..1], .keys = &.{}, .ordinal = 0 };
             }
             try encodeColumns(encoder, rows[0 .. end - begin], false);
+        }
+    }
+    fn nativeBytes(comptime T: type, value: T) usize {
+        return if (T == []const u8) 8 +| value.len else if (T == bool) 1 else 8;
+    }
+    fn nativeWord(encoder: *Encoder, comptime T: type, value: T) !void {
+        if (T == []const u8) return encoder.text(value);
+        if (T == bool) return encoder.append(&.{@intFromBool(value)});
+        return encoder.word(@bitCast(value));
+    }
+    fn nativeEqual(comptime T: type, left: T, right: T) bool {
+        if (T == []const u8) return std.mem.eql(u8, left, right);
+        if (T == f64) return @as(u64, @bitCast(left)) == @as(u64, @bitCast(right));
+        return left == right;
+    }
+    fn encodeNativeValues(encoder: *Encoder, comptime T: type, view: @import("execution_batch.zig").PhysicalColumn, values: []const T, dictionary_indices: ?[]const u32, kind_: u8) !void {
+        var entries: [256]T = undefined;
+        var indices: [256]u16 = undefined;
+        var slots: [512]u16 = @splat(std.math.maxInt(u16));
+        var unique: usize = 0;
+        var present: usize = 0;
+        var expanded: usize = 0;
+        var compact: usize = 0;
+        for (view.selection, 0..) |row, lane| {
+            if (view.vector.nulls.isNull(row)) continue;
+            const value = values[if (dictionary_indices) |ids| ids[row] else row];
+            const hash = if (T == []const u8) std.hash.Wyhash.hash(0, value) else std.hash.Wyhash.hash(0, std.mem.asBytes(&value));
+            var slot: usize = @intCast(hash & 511);
+            while (slots[slot] != std.math.maxInt(u16) and !nativeEqual(T, entries[slots[slot]], value)) slot = (slot + 1) & 511;
+            if (slots[slot] == std.math.maxInt(u16)) {
+                slots[slot] = @intCast(unique);
+                entries[unique] = value;
+                unique += 1;
+                compact +|= nativeBytes(T, value);
+            }
+            indices[lane] = slots[slot];
+            expanded +|= nativeBytes(T, value);
+            present += 1;
+        }
+        const encoded_dictionary = present != 0 and compact +| present *| 2 +| 9 < expanded;
+        try encoder.append(&.{if (encoded_dictionary) 6 else kind_});
+        for (0..(view.selection.len + 3) / 4) |group| {
+            var flags: u8 = 0;
+            for (0..4) |lane| {
+                const index = group * 4 + lane;
+                if (index >= view.selection.len) break;
+                if (view.vector.nulls.isNull(view.selection[index])) flags |= @as(u8, 1) << @as(u3, @intCast(lane * 2));
+            }
+            try encoder.append(&.{flags});
+        }
+        if (encoded_dictionary) {
+            try encoder.append(&.{kind_});
+            try encoder.word(unique);
+            for (entries[0..unique]) |value| try nativeWord(encoder, T, value);
+            for (view.selection, 0..) |row, lane| if (!view.vector.nulls.isNull(row)) {
+                var bytes: [2]u8 = undefined;
+                std.mem.writeInt(u16, &bytes, indices[lane], .little);
+                try encoder.append(&bytes);
+            };
+        } else for (view.selection) |row| if (!view.vector.nulls.isNull(row)) {
+            try nativeWord(encoder, T, values[if (dictionary_indices) |ids| ids[row] else row]);
+        };
+    }
+    fn encodeNativeColumn(encoder: *Encoder, view: @import("execution_batch.zig").PhysicalColumn) !void {
+        if (view.selection.len > 256) return error.InvalidSqlSpill;
+        switch (view.vector.values) {
+            .i64 => |v| try encodeNativeValues(encoder, i64, view, v, null, 2),
+            .f64 => |v| try encodeNativeValues(encoder, f64, view, v, null, 3),
+            .bool => |v| try encodeNativeValues(encoder, bool, view, v, null, 1),
+            .bytes => |v| try encodeNativeValues(encoder, []const u8, view, v, null, 5),
+            .dictionary_i64 => |v| try encodeNativeValues(encoder, i64, view, v.values, v.indices, 2),
+            .dictionary_f64 => |v| try encodeNativeValues(encoder, f64, view, v.values, v.indices, 3),
+            .dictionary_bytes => |v| try encodeNativeValues(encoder, []const u8, view, v.values, v.indices, 5),
+            else => return error.InvalidSqlSpill,
         }
     }
     fn tag(value: Datum) u8 {
@@ -1422,16 +1516,16 @@ pub const Sequential = struct {
                     const columns = if (view.keys) encoded.keys else encoded.values;
                     if (column >= columns.len) return error.InvalidSqlSpill;
                     const stored = columns[column];
-                    for (0..encoded.count()) |row_index| {
-                        const flag = (stored.flags[row_index / 4] >> @as(u3, @intCast(row_index % 4 * 2))) & 3;
-                        if (flag > 1) return null;
-                    }
                     const wire_tag = switch (stored.values) {
                         .fixed => |v| v.kind,
                         .dictionary => |v| v.kind,
                         .texts => |v| if (v.decimal) return null else @as(u8, 5),
                         else => return null,
                     };
+                    for (0..encoded.count()) |row_index| {
+                        const flag = (stored.flags[row_index / 4] >> @as(u3, @intCast(row_index % 4 * 2))) & 3;
+                        if (flag > 1) return null;
+                    }
                     const kind_: @import("../storage/rowsource/types.zig").ColumnKind = switch (wire_tag) {
                         1 => .bool,
                         2 => .i64,
@@ -3803,4 +3897,53 @@ test "SQL compact columnar arrays reject truncation and unwind allocation failur
         }
     };
     try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Probe.run, .{});
+}
+
+fn physicalSpillScenario(a: Allocator) !void {
+    const Batch = @import("execution_batch.zig").Batch;
+    const Reader = struct {
+        fn check(_: *anyopaque) !void {}
+        fn read(_: *anyopaque, _: Allocator, _: usize, _: usize) !Datum {
+            return error.UnexpectedScalarCell;
+        }
+        fn physical(_: *anyopaque, _: Allocator, column: usize) !?@import("execution_batch.zig").PhysicalColumn {
+            const types = @import("../storage/rowsource/types.zig");
+            const vector: types.ColumnVector = switch (column) {
+                0 => .{ .name = "n", .values = .{ .dictionary_i64 = .{ .values = &.{ 9007199254740993, -7 }, .indices = &.{ 0, 99, 1, 0 } } }, .nulls = .{ .bytes = &.{ 0, 1, 0, 0 } } },
+                1 => .{ .name = "f", .values = .{ .f64 = &.{ -0.0, 0, std.math.nan(f64), std.math.inf(f64) } } },
+                else => .{ .name = "s", .values = .{ .dictionary_bytes = .{ .values = &.{ "alpha", "beta" }, .indices = &.{ 0, 1, 0, 1 } } } },
+            };
+            return .{ .vector = vector, .selection = &.{ 3, 0, 1, 2, 3, 0, 1, 2 }, .kind = switch (column) {
+                0 => .integer,
+                1 => .number,
+                else => .string,
+            }, .element = if (column == 1) .float64 else null };
+        }
+    };
+    var raw: u8 = 0;
+    var manager: Manager = .{ .alloc = a, .io = std.testing.io, .context = &raw, .checkpoint = Reader.check, .async_writes = false, .compression = .none };
+    defer manager.deinit();
+    var file = try Sequential.init(&manager, 4096);
+    defer file.close();
+    const values: Batch = .{ .reader = .{ .ptr = &raw, .read = Reader.read, .read_physical = Reader.physical, .count = 8, .width = 3 } };
+    const keys: Batch = .{ .vectors = .{ .values = &.{}, .count = 8 } };
+    try file.appendBatch(values, keys, &.{ 100, 103, 106, 109, 112, 115, 118, 121 });
+    var input = try file.readInputBlock(0);
+    defer input.deinit();
+    const block = input.view();
+    try std.testing.expectEqual(@as(usize, 8), block.count());
+    for (0..3) |column| {
+        const source = (try Reader.physical(&raw, a, column)).?;
+        for (0..8) |row| {
+            const expected = try source.cell(row);
+            const actual = try block.cell(row, column);
+            try std.testing.expectEqual(expected.sql_null, actual.sql_null);
+            if (column == 1) try std.testing.expectEqual(@as(u64, @bitCast(expected.value.float)), @as(u64, @bitCast(actual.value.float))) else try std.testing.expectEqualDeep(expected, actual);
+            try std.testing.expectEqual(@as(u64, 100 + row * 3), block.ordinal(row));
+        }
+    }
+}
+test "SQL spill physical kernels encode selected dictionaries without scalar cells" {
+    try physicalSpillScenario(std.testing.allocator);
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, physicalSpillScenario, .{});
 }

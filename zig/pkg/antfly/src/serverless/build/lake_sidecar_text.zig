@@ -235,14 +235,14 @@ fn appendBatchText(
             for (0..column.rowCount()) |row| {
                 if (column.nulls.isNull(row)) continue;
                 const value = try column.bytesAt(row);
-                posting_count = std.math.add(usize, posting_count, try appendDocument(alloc, docs, term_map, batch.row_refs[row], value)) catch
+                posting_count = std.math.add(usize, posting_count, try appendDocument(alloc, docs, term_map, batch.rowRef(row), value)) catch
                     return error.LakeSidecarBuildBudgetExceeded;
             }
         },
         .json => |values| {
             for (values, 0..) |value, row| {
                 if (column.nulls.isNull(row)) continue;
-                posting_count = std.math.add(usize, posting_count, try appendDocument(alloc, docs, term_map, batch.row_refs[row], value)) catch
+                posting_count = std.math.add(usize, posting_count, try appendDocument(alloc, docs, term_map, batch.rowRef(row), value)) catch
                     return error.LakeSidecarBuildBudgetExceeded;
             }
         },

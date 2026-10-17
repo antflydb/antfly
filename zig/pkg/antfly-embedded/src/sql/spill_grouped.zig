@@ -78,6 +78,7 @@ pub const Grouped = struct {
     local: ?*operators.Grouped = null,
     fallback: ?*Grouped = null,
     bytes: usize,
+    native_reduced_rows: usize = 0,
     parallel: bool = true,
     reductions: [8]?*Reduction = @splat(null),
     next_lane: usize = 0,
@@ -376,6 +377,39 @@ pub const Grouped = struct {
         }
         return false;
     }
+    fn reduceNativeBlock(self: *Grouped, block: *spill.Sequential.OwnedBlock, ordinal_base: u64) !bool {
+        if (self.fallback != null or block.count() < 2 or block.count() > 256 or block.width() != self.specs.len + 1) return false;
+        for (self.specs) |spec| if (spec.distinct or spec.kind == .pattern_set or spec.input_element == .numeric) return false;
+        for (0..block.count()) |row| {
+            const marker = try block.cell(row, 0);
+            if (marker.sql_null or marker.value != .bool) return error.InvalidSqlSpill;
+            if (marker.value.bool) return false;
+        }
+        var scratch = std.heap.ArenaAllocator.init(self.a);
+        defer scratch.deinit();
+        const a = scratch.allocator();
+        const Batch = @import("execution_batch.zig").Batch;
+        const values = try a.create(Batch);
+        values.* = try block.batch(a, false);
+        const key_values = try a.create(Batch);
+        key_values.* = try block.batch(a, true);
+        const keys = try a.alloc(Batch, block.keyWidth());
+        const inputs = try a.alloc(Batch, self.specs.len);
+        for (keys, 0..) |*column, i| column.* = try key_values.project(a, i);
+        for (inputs, self.specs, 0..) |*column, spec, i| {
+            column.* = try values.project(a, i + 1);
+            if (spec.kind == .sum or spec.kind == .avg) {
+                const native = (try column.physicalColumn(a, 0)) orelse return false;
+                if (native.kind != .integer) return false;
+            }
+        }
+        const hashes = try @import("batch_hash.zig").encodedColumns(a, keys, block.count(), true);
+        var ordinals: [256]u64 = undefined;
+        for (ordinals[0..block.count()], 0..) |*ordinal, row| ordinal.* = try std.math.add(u64, ordinal_base, block.ordinal(row));
+        const admitted = try self.local.?.tryAddEncodedColumns(keys, inputs, block.count(), .{ .hashes = hashes, .ordinals = ordinals[0..block.count()] });
+        if (admitted) self.native_reduced_rows += block.count();
+        return admitted;
+    }
     fn loadFile(self: *Grouped, file: *spill.Sequential, ordinal_base: u64) !void {
         try file.seal();
         var offset: u64 = 0;
@@ -384,6 +418,10 @@ pub const Grouped = struct {
             var input = try file.readInputBlock(offset);
             defer input.deinit();
             const block = input.view();
+            if (try self.reduceNativeBlock(block, ordinal_base)) {
+                offset += block.count();
+                continue;
+            }
             var values_storage: [1024]Datum = undefined;
             var keys_storage: [256]Datum = undefined;
             const values = values_storage[0..block.width()];

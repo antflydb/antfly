@@ -157,7 +157,8 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
             const pa = page_arena.allocator();
             var writes: std.ArrayList(local.sparse_sparse.SparseWrite) = .empty;
             var unit_records: std.StringHashMapUnmanaged([]const u8) = .empty;
-            for (batch.row_refs, 0..) |ref, ordinal| {
+            for (0..batch.rowCount()) |ordinal| {
+                const ref = batch.rowRef(ordinal);
                 try cancellation.check();
                 try provider.context.ensureActive();
                 const page: local.sql_catalog.ColumnPage = .{ .batch = batch, .selection = &.{ordinal} };

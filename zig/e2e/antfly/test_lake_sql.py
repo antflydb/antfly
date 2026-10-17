@@ -5559,6 +5559,7 @@ def test_published_parquet_skewed_files_share_row_groups_and_stream_in_order(tmp
         expected = list(range(total))
         divisible = [i for i in expected if i % 3 == 0]
         first_order = None
+        first_ids = None
         for _ in range(2):
             server.restart()
             with (
@@ -5593,6 +5594,27 @@ def test_published_parquet_skewed_files_share_row_groups_and_stream_in_order(tmp
                     "statement": "SELECT SUM(amount), COUNT(*) FROM skew_scan WHERE amount % 3 = 0"
                 },
             )["rows"] == [[str(sum(divisible)), str(len(divisible))]]
+            bounded = [value for value in expected if 4000 <= value < 7000]
+            assert call(
+                "POST",
+                "/sql",
+                {
+                    "statement": "SELECT COUNT(*), SUM(amount) FROM skew_scan WHERE amount >= 4000 AND amount < 7000"
+                },
+            )["rows"] == [[str(len(bounded)), str(sum(bounded))]]
+            identities = call(
+                "POST",
+                "/sql",
+                {
+                    "statement": "SELECT _id, amount FROM skew_scan WHERE amount >= 4000 AND amount < 7000 ORDER BY amount LIMIT 3"
+                },
+            )["rows"]
+            assert [int(row[1]) for row in identities] == bounded[:3]
+            assert len({row[0] for row in identities}) == 3
+            if first_ids is None:
+                first_ids = identities
+            else:
+                assert identities == first_ids
             # Mixed FILTER cohorts retain native computed vectors and evaluate
             # invalid expressions only for lanes that survive their filter.
             filtered = call(

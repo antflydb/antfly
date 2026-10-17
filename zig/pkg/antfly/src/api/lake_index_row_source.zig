@@ -249,7 +249,7 @@ fn slice(columns: []rows.ColumnVector, batch: rows.ColumnBatch, begin: usize, en
             inline else => |values, tag| @unionInit(rows.ColumnValues, @tagName(tag), values[begin..end]),
         };
     }
-    return .{ .snapshot = batch.snapshot, .row_refs = batch.row_refs[begin..end], .columns = columns };
+    return batch.identitySlice(begin, end, columns);
 }
 
 test "external lake native index input preserves dictionary ids and nulls across filtered runs" {

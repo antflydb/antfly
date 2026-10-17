@@ -875,7 +875,7 @@ fn appendEqualityDeleteRowRefsAlloc(
                 const key = try lake_iceberg_deletes.equalityKeyFromBatchRowAlloc(alloc, batch, row_idx, equality_columns);
                 defer alloc.free(key);
                 const file_indexes = delete_keys.get(key) orelse continue;
-                const stable_ref = try rebindRowRefToInventory(request.data_inventory, batch.row_refs[row_idx]);
+                const stable_ref = try rebindRowRefToInventory(request.data_inventory, batch.rowRef(row_idx));
                 for (file_indexes.items) |delete_idx| {
                     if (!try equalityDeleteAppliesToRowRef(
                         request.data_inventory,

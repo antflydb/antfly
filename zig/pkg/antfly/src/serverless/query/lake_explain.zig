@@ -287,8 +287,12 @@ fn countIntersectedCandidateRefs(
 ) !u64 {
     const first = try firstUsableCandidateSet(descriptor, sidecars, desired, policy, candidate_sets) orelse return 0;
     var total: u64 = 0;
-    for (first.row_refs, 0..) |row_ref, row_idx| {
-        if (containsRowRef(first.row_refs[0..row_idx], row_ref)) continue;
+    for (0..first.rowCount()) |row_idx| {
+        const row_ref = first.rowRef(row_idx);
+        const duplicate = for (0..row_idx) |prior| {
+            if (containsRowRef(&.{first.rowRef(prior)}, row_ref)) break true;
+        } else false;
+        if (duplicate) continue;
         if (!try rowRefInEveryUsableCandidateSet(descriptor, sidecars, desired, policy, candidate_sets, row_ref)) continue;
         total += 1;
     }

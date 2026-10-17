@@ -335,7 +335,8 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
                         errdefer selected.deinit();
                         try condition_batches.append(a, selected);
                     };
-                    for (batch.row_refs, 0..) |ref, row| {
+                    for (0..batch.rowCount()) |row| {
+                        const ref = batch.rowRef(row);
                         if (row % 128 == 0) {
                             try cancellation.check();
                             try provider.context.ensureActive();

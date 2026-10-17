@@ -4935,7 +4935,7 @@ test "parquet row group batch assembles decoded i64 columns with external row re
     try std.testing.expectEqual(@as(usize, 3), owned.batch.rowCount());
     try std.testing.expectEqualStrings("amount", owned.batch.columns[0].name);
     try std.testing.expectEqualSlices(i64, &[_]i64{ 10, 20, 30 }, owned.batch.columns[0].values.i64);
-    const first_ref = owned.batch.row_refs[0].external;
+    const first_ref = owned.batch.rowRef(0).external;
     try std.testing.expectEqualStrings("events", first_ref.source_id);
     try std.testing.expectEqualStrings("sha256:objects", first_ref.snapshot_id);
     try std.testing.expectEqualStrings("part-a.parquet", first_ref.file_id);
@@ -4993,7 +4993,7 @@ test "parquet row group batch assembles optional i64 columns with null bitmap" {
     try std.testing.expect(!owned.batch.columns[0].nulls.isNull(0));
     try std.testing.expect(owned.batch.columns[0].nulls.isNull(1));
     try std.testing.expect(!owned.batch.columns[0].nulls.isNull(2));
-    const null_ref = owned.batch.row_refs[1].external;
+    const null_ref = owned.batch.rowRef(1).external;
     try std.testing.expectEqualStrings("part-a.parquet", null_ref.file_id);
     try std.testing.expectEqual(@as(u64, 1), null_ref.row_ordinal);
 }
@@ -5046,7 +5046,7 @@ test "parquet row group batch assembles dictionary i64 columns" {
     try std.testing.expectEqual(@as(usize, 4), owned.batch.rowCount());
     try std.testing.expectEqualSlices(i64, &[_]i64{ 11, 22, 11, 33 }, owned.batch.columns[0].values.i64);
     try std.testing.expectEqual(@as(usize, 0), owned.batch.columns[0].nulls.bytes.len);
-    const row_ref = owned.batch.row_refs[3].external;
+    const row_ref = owned.batch.rowRef(3).external;
     try std.testing.expectEqualStrings("part-a.parquet", row_ref.file_id);
     try std.testing.expectEqual(@as(u64, 3), row_ref.row_ordinal);
 }
@@ -9841,7 +9841,7 @@ test "parquet page cursor reuses decoded dictionaries aligns nullable columns an
             try std.testing.expect(reader.prefetch_bytes <= bytes.items.len);
         }
         for (0..batch.rowCount()) |index| {
-            try std.testing.expectEqual(@as(u64, position), batch.row_refs[index].external.row_ordinal);
+            try std.testing.expectEqual(@as(u64, position), batch.rowRef(index).external.row_ordinal);
             try std.testing.expectEqual(@as(i64, if (position % 3 == 0) 10 else 20), try batch.columns[0].integerAt(index));
             try std.testing.expectEqualStrings(if ((position / 8) % 2 == 0) "alpha" else "beta", batch.columns[1].values.dictionary_bytes.at(index));
             try std.testing.expectEqual(position % 3 == 1, batch.columns[2].nulls.bytes[index] != 0);
@@ -10233,7 +10233,7 @@ test "lake persistent cache recovery preserves priority when capacity shrinks" {
     }
 }
 
-test "parquet wide large pages retain columns without duplicate row identities" {
+test "external lake compact Parquet wide pages retain columns without duplicate row identities" {
     const a = std.testing.allocator;
     const row_count = 145186;
     const values = try a.alloc(i64, row_count);
@@ -10286,7 +10286,10 @@ test "parquet wide large pages retain columns without duplicate row identities" 
         while (try cursor.next()) |batch| {
             try batch.validate();
             try std.testing.expect(batch.rowCount() <= 4096);
-            for (batch.row_refs, 0..) |ref, index| {
+            try std.testing.expect(batch.external_span != null);
+            try std.testing.expectEqual(@as(usize, 0), batch.row_refs.len);
+            for (0..batch.rowCount()) |index| {
+                const ref = batch.rowRef(index);
                 try std.testing.expectEqual(@as(u64, position + index), ref.external.row_ordinal);
                 for (batch.columns) |column| try std.testing.expectEqual(@as(i64, @intCast(position + index)), try column.integerAt(index));
             }

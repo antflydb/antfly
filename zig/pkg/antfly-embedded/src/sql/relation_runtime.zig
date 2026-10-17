@@ -1337,8 +1337,7 @@ fn Engine(comptime Context: type) type {
 
             fn batchProgram(self: *Iterator, a: Allocator, context: @TypeOf(self.engine.context), program: *const scalar.Program, batch: @import("execution_batch.zig").Batch, errors: []?anyerror) ![]const Datum {
                 const vector = @import("vector_eval.zig").evaluateBatch(a, program, batch, context.parameters) catch |err| switch (err) {
-                    error.SqlDivisionByZero, error.SqlNumericOutOfRange, error.SqlTypeMismatch, error.InvalidSqlDateTime, error.SqlCardinalityViolation => null,
-                    else => return err,
+                    else => if (@import("errors.zig").isRowEvaluationError(err)) null else return err,
                 };
                 if (vector) |values| return values;
                 const values = try a.alloc(Datum, batch.len());
@@ -1505,8 +1504,7 @@ fn Engine(comptime Context: type) type {
                     }
                     bound.mapped.selection = selected.items;
                     const encoded = self.queryEncodedColumns(self.projection_arena.allocator(), context, query, &bound, input, selected.items) catch |err| switch (err) {
-                        error.SqlDivisionByZero, error.SqlNumericOutOfRange, error.SqlTypeMismatch, error.InvalidSqlDateTime, error.SqlCardinalityViolation => null,
-                        else => return err,
+                        else => if (@import("errors.zig").isRowEvaluationError(err)) null else return err,
                     };
                     if (encoded) |output| {
                         if (selected.items.len == self.query_remaining) upstream_error = null;
@@ -2463,4 +2461,23 @@ test "SQL derived demand reaches physical scan planning before opening readers" 
     try std.testing.expectEqual(@as(usize, 1), scans.len);
     try std.testing.expectEqual(@as(usize, 1), scans[0].request.fields.len);
     try std.testing.expectEqualStrings("n", scans[0].request.fields[0]);
+}
+
+test "SQL derived projection errors preserve valid prefixes before invalid text casts" {
+    const a = std.testing.allocator;
+    var backend: SetTestBackend = .{};
+    var compiled = try @import("compiler.zig").compile(a, "SELECT v FROM (SELECT x::BIGINT AS v FROM (VALUES('1'),('bad')) t(x)) d", .{});
+    defer compiled.deinit();
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const bound = try @import("describe.zig").bind(alloc, backend.backend(), &compiled, &.{});
+    const context: @import("runtime.zig").Context = .{ .alloc = a, .arena = alloc, .backend = backend.backend(), .binding = bound, .parameters = &.{}, .limits = .{} };
+    const cursor = try openCursor(context);
+    defer cursor.close(cursor.ptr);
+    const next = cursor.next_columns.?;
+    const page = try next(cursor.ptr, alloc, 2);
+    try std.testing.expectEqual(@as(usize, 1), page.selection.len);
+    try std.testing.expectEqual(@as(i64, 1), (try page.native.?.values.cell(alloc, 0, 0)).value.integer);
+    try std.testing.expectError(error.SqlInvalidTextRepresentation, next(cursor.ptr, alloc, 2));
 }

@@ -316,7 +316,7 @@ pub const Prepared = struct {
         return self.matchesPositions(a, file, batch, index, &.{});
     }
     pub fn matchesPositions(self: *Prepared, a: A, file: @import("../external_source/types.zig").FileEntry, batch: types.ColumnBatch, index: usize, starts: []const u64) !bool {
-        const ref = batch.row_refs[index];
+        const ref = batch.rowRef(index);
         const info = self.files.getPtr(file.file_id) orelse return error.ExternalSourceFileNotFound;
         if (self.positions.count() != 0) {
             const ordinal = try std.math.add(u64, ref.external.row_ordinal, try positionPrefix(file, ref.external.row_group_ordinal, starts));
@@ -343,7 +343,8 @@ pub const Prepared = struct {
         if (self.positions.count() != 0) {
             var group: ?u32 = null;
             var prefix: u64 = 0;
-            for (batch.row_refs, selected) |ref, *keep| {
+            for (selected, 0..) |*keep, row_index| {
+                const ref = batch.rowRef(row_index);
                 if (!keep.*) continue;
                 if (group != ref.external.row_group_ordinal) {
                     prefix = try positionPrefix(file, ref.external.row_group_ordinal, starts);
