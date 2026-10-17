@@ -42045,12 +42045,13 @@ fn consumerTests() type {
 
         test "raft index owner observation crosses the compiled storage boundary" {
             const a = std.testing.allocator;
-            const contract = @import("antfly_local_sources").storage_db_relational_index_raft_contract;
+            const local = @import("antfly_local_sources");
+            const contract = local.storage_db_relational_index_raft_contract;
             var directory = try @import("antfly_local_sources").common_test_directory.TestDirectory.init("compiled-raft-index-observer");
             defer directory.cleanup();
             const identity: contract.Identity = .{ .id = @splat(1), .plan_digest = @splat(2), .owner_digest = @splat(3), .ordinal = 0, .namespace = .{ .table_id = 101, .shard_id = 11, .range_id = 12 }, .owner_group_id = 11 };
             const schema_json =
-                \\{"version":1,"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"integer"}},"additionalProperties":false}}}}
+                \\{"version":1,"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"integer"},"email":{"type":"string"}},"additionalProperties":false}}}}
             ;
             // Empty relational tables still have a metadata-authoritative
             // schema/catalog. A raw unprovisioned directory has no durable
@@ -42062,6 +42063,34 @@ fn consumerTests() type {
             try std.testing.expect(result.binding == null and result.applied == null and result.fenced == null and result.reserved == null);
             try std.testing.expectError(error.InvalidArgument, owner.raftIndexOwnerObservation(a, "other", identity, .{}));
             try std.testing.expectError(error.DeadlineExceeded, owner.raftIndexOwnerObservation(a, "items", identity, .{ .execution_deadline_ns = 0 }));
+            const after_json =
+                \\{"version":2,"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"integer"},"email":{"type":"string"}},"additionalProperties":false}}},"relational_indexes":[{"name":"email_idx","keys":[{"column":"email"}]}],"unique_constraints":[{"name":"email_idx","origin":"index","columns":["email"]}]}
+            ;
+            // Synthetic metadata inputs qualify the real compiled preparation
+            // boundary, not coordinator authorization or consensus admission.
+            var schema = try local.schema_mod.parseValidatedTableSchema(a, schema_json);
+            defer schema.deinit(a);
+            var prior = try local.schema_relational_declarations.compileCatalog(a, schema, 101, null);
+            defer prior.deinit();
+            var candidate = try @import("../metadata/relational_index_candidate.zig").Candidate.prepare(a, 101, schema_json, after_json, prior.value, "email_idx");
+            defer candidate.deinit();
+            const header: contract.Admission = .{ .id = identity.id, .plan_digest = identity.plan_digest, .owner_digest = identity.owner_digest, .ordinal = identity.ordinal, .fence = .{ .role = .index_build, .transition_id = 7, .attempt = 1, .owner_group_id = 11, .peer_group_id = 11, .namespace = identity.namespace, .catalog_digest = local.storage_db_relational_index_inputs.digest(prior.value) }, .candidate_digest = local.storage_db_relational_index_inputs.digest(candidate.next.value), .reservation_digest = local.storage_db_relational_index_inputs.digest(candidate.reservation.value) };
+            const prepared = try owner.raftIndexOwnerAdmissionPreparation(a, "items", header, candidate.inputs.bytes, .{});
+            try prepared.validate(header, local.storage_db_relational_index_inputs.digest(candidate.inputs.bytes));
+            const unchanged = try owner.raftIndexOwnerObservation(a, "items", identity, .{});
+            try std.testing.expectEqualDeep(result, unchanged);
+            try std.testing.expectError(error.InvalidArgument, owner.raftIndexOwnerAdmissionPreparation(a, "other", header, candidate.inputs.bytes, .{}));
+            try std.testing.expectError(error.DeadlineExceeded, owner.raftIndexOwnerAdmissionPreparation(a, "items", header, candidate.inputs.bytes, .{ .execution_deadline_ns = 0 }));
+            try std.testing.expectError(error.InvalidPrivateIndexInputs, owner.raftIndexOwnerAdmissionPreparation(a, "items", header, "invalid", .{}));
+            var foreign = header;
+            foreign.fence.owner_group_id = 12;
+            try std.testing.expectError(error.PrivateIndexOwnerJobChanged, owner.raftIndexOwnerAdmissionPreparation(a, "items", foreign, candidate.inputs.bytes, .{}));
+            foreign = header;
+            foreign.fence.namespace.range_id += 1;
+            try std.testing.expectError(error.IdentityNamespaceMismatch, owner.raftIndexOwnerAdmissionPreparation(a, "items", foreign, candidate.inputs.bytes, .{}));
+            foreign = header;
+            foreign.candidate_digest[0] ^= 1;
+            try std.testing.expectError(error.InvalidIndexPublicationCandidate, owner.raftIndexOwnerAdmissionPreparation(a, "items", foreign, candidate.inputs.bytes, .{}));
         }
 
         test "raft index owner controls require their decoder but cannot bypass metadata admission" {

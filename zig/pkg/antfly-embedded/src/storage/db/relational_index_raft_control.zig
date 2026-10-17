@@ -36,6 +36,7 @@ pub const Effect = contract.Effect;
 pub const Command = contract.Command;
 pub const Identity = contract.Identity;
 pub const Observation = contract.Observation;
+pub const AdmissionPreparation = contract.AdmissionPreparation;
 pub const validateBatchRequest = contract.validateBatchRequest;
 pub const Admission = @import("relational_index_cancellation_intent.zig").Intent;
 pub const prefix = jobs.key ++ ":raft:";
@@ -208,6 +209,31 @@ fn stageCut(txn: anytype, binding: jobs.Binding, effect: Effect, entry: Entry) !
     return .{ .entry = entry, .evidence = proof };
 }
 
+/// Owns the single candidate compilation without constructing transport bytes.
+/// Read-only callers return just the binding; proposal callers encode the
+/// manifest once, and committed apply independently checks the preimage.
+pub const PreparedAdmission = struct {
+    binding: jobs.Binding,
+    artifacts: preparation.PreparedCandidate,
+
+    pub fn init(a: A, before: registry.SchemaView, txn: anytype, header: Admission, manifest: []const u8) !PreparedAdmission {
+        try header.validate();
+        const actual = (try @import("doc_identity.zig").loadNamespaceTxn(txn)) orelse return error.IdentityNamespaceMismatch;
+        if (!actual.eql(header.fence.namespace)) return error.IdentityNamespaceMismatch;
+        var artifacts = try preparation.PreparedCandidate.init(a, before, txn, manifest, .raft);
+        errdefer artifacts.deinit();
+        if (!std.mem.eql(u8, &hash(artifacts.candidate.next.value), &header.candidate_digest) or
+            !std.mem.eql(u8, &hash(artifacts.candidate.reservation.value), &header.reservation_digest)) return error.InvalidIndexPublicationCandidate;
+        const binding = try jobs.prepare(header.id, header.plan_digest, header.owner_digest, header.ordinal, header.fence, .raft, &artifacts.candidate, &artifacts.addition);
+        return .{ .binding = binding, .artifacts = artifacts };
+    }
+
+    pub fn deinit(self: *PreparedAdmission) void {
+        self.artifacts.deinit();
+        self.* = undefined;
+    }
+};
+
 pub const Prepared = struct {
     alloc: A,
     command: Command,
@@ -219,15 +245,11 @@ pub const Prepared = struct {
         self.* = undefined;
     }
     pub fn admission(a: A, before: registry.SchemaView, txn: anytype, header: Admission, manifest: []const u8) !Prepared {
-        try header.validate();
-        var artifacts = try preparation.PreparedCandidate.init(a, before, txn, manifest, .raft);
-        errdefer artifacts.deinit();
-        if (!std.mem.eql(u8, &hash(artifacts.candidate.next.value), &header.candidate_digest) or
-            !std.mem.eql(u8, &hash(artifacts.candidate.reservation.value), &header.reservation_digest)) return error.InvalidIndexPublicationCandidate;
-        const binding = try jobs.prepare(header.id, header.plan_digest, header.owner_digest, header.ordinal, header.fence, .raft, &artifacts.candidate, &artifacts.addition);
+        var prepared = try PreparedAdmission.init(a, before, txn, header, manifest);
+        errdefer prepared.deinit();
         const b64 = try a.alloc(u8, std.base64.standard.Encoder.calcSize(manifest.len));
         _ = std.base64.standard.Encoder.encode(b64, manifest);
-        return .{ .alloc = a, .command = .{ .effect = .admitted, .binding = binding, .inputs_b64 = b64 }, .artifacts = artifacts };
+        return .{ .alloc = a, .command = .{ .effect = .admitted, .binding = prepared.binding, .inputs_b64 = b64 }, .artifacts = prepared.artifacts };
     }
     pub fn control(a: A, before: registry.SchemaView, txn: anytype, command: Command) !Prepared {
         try command.validate();

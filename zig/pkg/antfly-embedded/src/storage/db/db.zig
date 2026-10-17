@@ -8087,6 +8087,21 @@ pub const DB = struct {
 
     pub const RaftIndexOwnerControl = @import("relational_index_raft_control.zig");
 
+    /// Advisory local compilation, not admission. The actual owner scope is
+    /// independent of metadata input; no transport copy/base64 or write txn.
+    pub fn raftIndexOwnerAdmissionPreparation(self: *DB, owner_group: u64, header: RaftIndexOwnerControl.Admission, manifest: []const u8) !RaftIndexOwnerControl.AdmissionPreparation {
+        try self.requireRaftIndexOwnerIdentity(owner_group, .{ .id = header.id, .plan_digest = header.plan_digest, .owner_digest = header.owner_digest, .ordinal = header.ordinal, .namespace = header.fence.namespace, .owner_group_id = header.fence.owner_group_id });
+        var view = self.core.acquireSchemaView() orelse return error.RelationalTableRequired;
+        defer view.release();
+        var txn = try self.core.store.beginReadTxn();
+        defer txn.abort();
+        var prepared = try RaftIndexOwnerControl.PreparedAdmission.init(self.alloc, view, &txn, header, manifest);
+        defer prepared.deinit();
+        const result: RaftIndexOwnerControl.AdmissionPreparation = .{ .format_version = 1, .binding = prepared.binding };
+        try result.validate(header, @import("relational_index_inputs.zig").digest(manifest));
+        return result;
+    }
+
     pub fn prepareRaftIndexOwnerAdmission(self: *DB, header: RaftIndexOwnerControl.Admission, manifest: []const u8) !RaftIndexOwnerControl.Prepared {
         var view = self.core.acquireSchemaView() orelse return error.RelationalTableRequired;
         defer view.release();

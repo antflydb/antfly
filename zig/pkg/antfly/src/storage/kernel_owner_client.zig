@@ -652,6 +652,33 @@ pub const Owner = struct {
         return parsed.value;
     }
 
+    /// Advisory physical binding, not a reservation, receipt or permission.
+    pub fn raftIndexOwnerAdmissionPreparation(self: *Owner, alloc: std.mem.Allocator, table_name: []const u8, admission: @import("antfly_local_sources").storage_db_relational_index_raft_contract.Admission, manifest: []const u8, options: QueryOptions) !@import("antfly_local_sources").storage_db_relational_index_raft_contract.AdmissionPreparation {
+        const contract = @import("antfly_local_sources").storage_db_relational_index_raft_contract;
+        const limits = contract.AdmissionPreparation;
+        try admission.validate();
+        if (manifest.len == 0 or manifest.len > limits.max_manifest_bytes) return error.InvalidPrivateIndexInputs;
+        const encoded = try std.json.Stringify.valueAlloc(alloc, admission, .{});
+        defer alloc.free(encoded);
+        if (encoded.len > limits.max_header_json_bytes) return error.InvalidArgument;
+        var response: Response = .{};
+        defer response.deinit();
+        var failure: abi.FailureIdentity = .{};
+        const status = abi.antfly_storage_owner_raft_index_preparation_json(self.handle, &.{
+            .table_name = .fromSlice(table_name),
+            .admission_json = .fromSlice(encoded),
+            .manifest = .fromSlice(manifest),
+            .control = controlledRequest("", "", options.execution_deadline_ns, options.cancellation_ctx, options.cancellation_fn),
+        }, &response.buffer, &failure);
+        if (status != .ok and (failure.boundary != .storage_owner or failure.operation != abi.RaftIndexOwnerPreparationRequest.operation)) return error.InvalidBoundaryFailureIdentity;
+        try acceptStorageOwnerFailure(status, failure, "Raft index owner preparation");
+        if (response.bytes().len == 0 or response.bytes().len > limits.max_json_bytes) return error.InvalidPrivateIndexOwnerJob;
+        var parsed = try std.json.parseFromSlice(contract.AdmissionPreparation, alloc, response.bytes(), .{ .ignore_unknown_fields = false });
+        defer parsed.deinit();
+        try parsed.value.validate(admission, @import("antfly_local_sources").storage_db_relational_index_inputs.digest(manifest));
+        return parsed.value;
+    }
+
     pub fn nativeIndexOwnerStateJson(self: *Owner, table_name: []const u8, identity_json: []const u8) !Response {
         var response: Response = .{};
         try statusToError(abi.antfly_storage_owner_native_index_control_json(self.handle, &.{

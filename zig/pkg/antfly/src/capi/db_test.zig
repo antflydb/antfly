@@ -1413,8 +1413,78 @@ test "storage owner Raft index observations preserve coherent cuts and reject ca
     bad.identity_json = .fromSlice(caller_position);
     try Read.reject(id, bad, "InvalidArgument");
     try std.testing.expect(try handle.db.orderedApplyReceipt() == null);
+    const header_json = try std.json.Stringify.valueAlloc(a, header, .{});
+    defer a.free(header_json);
+    const prepare_request: kernel_owner_abi.RaftIndexOwnerPreparationRequest = .{ .table_name = .fromSlice("items"), .admission_json = .fromSlice(header_json), .manifest = .fromSlice(candidate.inputs.bytes) };
+    const Prepare = struct {
+        fn call(owner: ?*anyopaque, req: kernel_owner_abi.RaftIndexOwnerPreparationRequest, expected: contract.Admission, digest: [32]u8) !contract.AdmissionPreparation {
+            var response: kernel_owner_abi.OwnedBytes = .{};
+            var failure: kernel_owner_abi.FailureIdentity = .{};
+            const status = server_api.storageOwnerRaftIndexPreparationJson(owner, &req, &response, &failure);
+            defer freeRawBuffer(response.ptr, response.len);
+            try std.testing.expectEqual(kernel_owner_abi.Status.ok, status);
+            try kernel_error_identity.validateFailureEnvelope(status, &failure, kernel_owner_abi.abi_version);
+            try std.testing.expect(response.len <= contract.AdmissionPreparation.max_json_bytes);
+            var parsed = try std.json.parseFromSlice(contract.AdmissionPreparation, std.testing.allocator, response.slice(), .{ .ignore_unknown_fields = false });
+            defer parsed.deinit();
+            try parsed.value.validate(expected, digest);
+            return parsed.value;
+        }
+        fn reject(owner: ?*anyopaque, req: kernel_owner_abi.RaftIndexOwnerPreparationRequest, name: []const u8) !void {
+            var response: kernel_owner_abi.OwnedBytes = .{};
+            var failure: kernel_owner_abi.FailureIdentity = .{};
+            const status = server_api.storageOwnerRaftIndexPreparationJson(owner, &req, &response, &failure);
+            defer freeRawBuffer(response.ptr, response.len);
+            try std.testing.expect(status != .ok);
+            try kernel_error_identity.validateFailureEnvelope(status, &failure, kernel_owner_abi.abi_version);
+            try std.testing.expectEqualStrings(name, failure.errorName());
+            try std.testing.expectEqual(kernel_owner_abi.RaftIndexOwnerPreparationRequest.operation, failure.operation);
+            try std.testing.expect(response.ptr == null and response.len == 0);
+        }
+    };
+    const manifest_digest = local.storage_db_relational_index_inputs.digest(candidate.inputs.bytes);
+    const preparation = try Prepare.call(id, prepare_request, header, manifest_digest);
+    var bad_prepare = prepare_request;
+    bad_prepare.version = 0;
+    bad_prepare.manifest = .{ .ptr = @ptrFromInt(1), .len = std.math.maxInt(u64) };
+    try Prepare.reject(null, bad_prepare, "InvalidAbiVersion");
+    bad_prepare = prepare_request;
+    bad_prepare.manifest = .{ .ptr = @ptrFromInt(1), .len = contract.AdmissionPreparation.max_manifest_bytes + 1 };
+    try Prepare.reject(id, bad_prepare, "InvalidArgument");
+    bad_prepare = prepare_request;
+    bad_prepare.admission_json = .{ .ptr = @ptrFromInt(1), .len = contract.AdmissionPreparation.max_header_json_bytes + 1 };
+    try Prepare.reject(id, bad_prepare, "InvalidArgument");
+    bad_prepare = prepare_request;
+    bad_prepare.table_name = .fromSlice("other");
+    try Prepare.reject(id, bad_prepare, "InvalidArgument");
+    bad_prepare = prepare_request;
+    bad_prepare.control = .{ .has_execution_deadline = 1, .execution_deadline_ns = 0 };
+    try Prepare.reject(id, bad_prepare, "DeadlineExceeded");
+    for ([_]usize{ 1, 2, 3 }) |at| {
+        var cancel: Cancel = .{ .at = at };
+        bad_prepare = prepare_request;
+        bad_prepare.control.cancellation_ctx = &cancel;
+        bad_prepare.control.cancellation_fn = Cancel.check;
+        try Prepare.reject(id, bad_prepare, "Canceled");
+    }
+    bad_prepare = prepare_request;
+    bad_prepare.manifest = .fromSlice("invalid");
+    try Prepare.reject(id, bad_prepare, "InvalidPrivateIndexInputs");
+    const smuggled = try std.fmt.allocPrint(a, "{s},\"index\":42}}", .{header_json[0 .. header_json.len - 1]});
+    defer a.free(smuggled);
+    bad_prepare = prepare_request;
+    bad_prepare.admission_json = .fromSlice(smuggled);
+    try Prepare.reject(id, bad_prepare, "InvalidArgument");
+    var altered_preparation = preparation;
+    altered_preparation.binding.authority = .native;
+    try std.testing.expectError(error.PrivateIndexOwnerJobChanged, altered_preparation.validate(header, manifest_digest));
+    try std.testing.expectError(error.InvalidPrivateIndexInputs, preparation.validate(header, @splat(1)));
+    try std.testing.expect(try handle.db.orderedApplyReceipt() == null);
+    const still_empty = try Read.run(id, request, identity);
+    try std.testing.expect(still_empty.binding == null and still_empty.applied == null);
     var admission = try handle.db.prepareRaftIndexOwnerAdmission(header, candidate.inputs.bytes);
     defer admission.deinit();
+    try std.testing.expectEqualDeep(admission.command.binding, preparation.binding);
     try handle.db.applyCommittedRaftIndexOwnerControl(&admission, 11, .{ .term = 1, .index = 1 });
     const admitted = try Read.run(id, request, identity);
     try std.testing.expectEqualDeep(admission.command.binding, admitted.binding.?);

@@ -24,6 +24,25 @@ pub const Admission = @import("relational_index_cancellation_intent.zig").Intent
 const publication = @import("relational_index_publication_progress.zig");
 const positions = @import("receipt_position.zig");
 
+/// Advisory compilation result, not a reservation or metadata permission.
+/// Only the actual storage owner chooses the physical binding. Committed apply
+/// must still revalidate its complete catalog/schema preimage.
+pub const AdmissionPreparation = struct {
+    pub const max_header_json_bytes = 8 * 1024;
+    pub const max_json_bytes = 16 * 1024;
+    pub const max_manifest_bytes = inputs.max_bytes;
+    format_version: u16,
+    binding: jobs.Binding,
+
+    pub fn validate(self: AdmissionPreparation, expected: Admission, manifest_digest: [32]u8) !void {
+        try expected.validate();
+        _ = try self.binding.encode();
+        if (self.format_version != 1 or self.binding.authority != .raft or self.binding.phase != .fencing or
+            !expected.eql(Admission.fromBinding(self.binding))) return error.PrivateIndexOwnerJobChanged;
+        if (!std.mem.eql(u8, &self.binding.inputs_digest, &manifest_digest)) return error.InvalidPrivateIndexInputs;
+    }
+};
+
 /// Deterministic integrity binding, not authentication or proof of commit.
 /// Storage separately verifies the retained cut and durable apply watermark.
 pub fn effectEvidence(binding: jobs.Binding, effect: Effect, position: positions.Position) ![32]u8 {

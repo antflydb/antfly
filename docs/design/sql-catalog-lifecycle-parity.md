@@ -10535,7 +10535,8 @@ The separately compiled-provider test exercises typed reads on a provisioned emp
 table, wrong-table/deadline failures and the unchanged generic proposal guard.
 These are storage/ABI contracts, not network consensus or complete SQL qualification.
 
-The preparation bridge and authenticated receiver remain unfinished. They must
+At this observation checkpoint the preparation bridge and authenticated receiver
+remained unfinished; the following checkpoint implements preparation. They must
 obtain the physical allocation from the actual owner, pin/recheck leader and root
 scope, independently fetch metadata permission and propose through the durable
 all-member capability barrier. Full source/build/claims/install/cancel/standby
@@ -10558,3 +10559,57 @@ Licensing, the 2,068-source Apache boundary, generated control catalog and immut
 original inventory audits pass. Three verified inactive worktree-local test-cache
 entries (about 2.2 GiB) were removed for build headroom; they are rebuildable. Source,
 test logs and user data were preserved.
+
+### Owner-selected Raft admission preparation across the compiled boundary
+
+Read-only admission preparation now accepts the immutable metadata admission
+header and raw bounded manifest and returns only a versioned physical binding.
+The actual handle supplies table/group scope; the owner checks its durable
+namespace and source authority. The shared `PreparedAdmission` owns the single
+candidate compilation and is reused by both advisory preparation and committed
+command preparation. Only the latter constructs base64 transport bytes. No
+physical index ID, committed position, signature or verification flag is accepted
+from the coordinator by the preparation ABI.
+
+Preparation is advisory, not a reservation or promise that apply will succeed.
+Catalog/schema CAS and the durable metadata/leader/capability checks remain
+mandatory at proposal/apply. The bridge does not admit a job, change a watermark,
+advance the native clock or open the generic proposal guard. Its response is
+bounded to 16 KiB before serialization; admission JSON is bounded to 8 KiB and
+the raw manifest to the existing immutable-input limit before dereferencing.
+Cancellation/deadline checks bracket compilation and serialization; cancellation
+during compilation prevents returning a result but does not yet interrupt each
+individual compiler phase. The client validates exact admission identity,
+authority, phase and manifest digest and preserves the typed failure envelope.
+
+Tests compare the returned binding to actual command preparation, check unchanged
+job/watermark state, cancellation, malformed/oversized inputs, wrong owner scope,
+and rejection of caller physical fields. Allocation-failure coverage and a
+same-snapshot allocator comparison exercise the shared preparation path: removing
+transport encoding must save exactly its base64 allocation, with balanced frees.
+The compiled consumer/provider test uses actual immutable schema inputs and real
+exports, not stubs. These are owner/ABI contracts with supplied metadata inputs,
+not distributed authorization or original SQL-case qualification.
+
+Authenticated reception/proposal, all-member lifecycle capabilities, source and
+target claim processing, installation/cancellation/standby support and distributed
+fault qualification remain unfinished. Original inventory dispositions remain
+531 implemented / 132 rejected / 113 superseded / 810 unresolved.
+
+Debug ABI validation passes seven tests, 52/52 steps, no skips/failures/leaks in
+`/private/tmp/antfly-sql-raft-index-preparation-capi-debug.log`. The separately
+compiled consumer/provider gate passes two tests, 91/91 steps, no
+skips/failures/leaks in
+`/private/tmp/antfly-sql-raft-index-preparation-compiled-debug.log`.
+The first full system run passed 273 tests but exposed allocator-dependent
+resize/remap behavior in the new exact allocation comparison, with zero leaks.
+Both measured paths now disable resize/remap symmetrically, preserving the exact
+savings assertion. The final full suite passes 274 tests plus its snapshot
+companion, 51/51 steps, no skips/failures/leaks in
+`/private/tmp/antfly-sql-raft-index-preparation-system-final-debug.log`.
+For the 770-byte fixture manifest, advisory preparation allocates 87,437 bytes
+versus 88,465 for transport preparation: exactly the 1,028-byte base64 allocation
+is avoided. Both paths free all measured bytes. This is an allocation comparison,
+not a throughput benchmark; no throughput gain is claimed. Final source-boundary,
+control-catalog, licensing, formatting and immutable-inventory checks pass. Cache
+GC was previewed only; this checkpoint removed no artifacts or user data.

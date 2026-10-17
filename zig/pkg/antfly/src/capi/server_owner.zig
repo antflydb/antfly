@@ -4079,6 +4079,46 @@ pub fn storageOwnerRaftIndexObservationJson(
     return .ok;
 }
 
+/// Advisory compilation against the actual owner, never a catalog mutation.
+/// Raw inputs stay borrowed across the synchronous call; output is binding-only.
+pub fn storageOwnerRaftIndexPreparationJson(
+    owner: ?*anyopaque,
+    request: *const kernel_owner_abi.RaftIndexOwnerPreparationRequest,
+    out_response: *kernel_owner_abi.OwnedBytes,
+    out_failure: *kernel_owner_abi.FailureIdentity,
+) callconv(.c) kernel_owner_abi.Status {
+    out_response.* = .{};
+    out_failure.* = .{};
+    const Failure = struct {
+        fn result(err: anyerror, out: *kernel_owner_abi.FailureIdentity) kernel_owner_abi.Status {
+            out.* = kernel_error_identity.failureFromError(err, .storage_owner, kernel_owner_abi.abi_version, kernel_owner_abi.RaftIndexOwnerPreparationRequest.operation);
+            return out.status;
+        }
+    };
+    if (request.version != kernel_owner_abi.abi_version or request.control.version != kernel_owner_abi.abi_version) return Failure.result(error.InvalidAbiVersion, out_failure);
+    const contract = @import("antfly_local_sources").storage_db_relational_index_raft_contract;
+    const limits = contract.AdmissionPreparation;
+    if (request.admission_json.ptr == null or request.admission_json.len == 0 or request.admission_json.len > limits.max_header_json_bytes or
+        request.manifest.ptr == null or request.manifest.len == 0 or request.manifest.len > limits.max_manifest_bytes or
+        request.control.has_execution_deadline > 1 or request.control._reserved0 != 0 or !std.mem.allEqual(u8, &request.control._reserved1, 0) or
+        request.control.table_name.len != 0 or request.control.request_json.len != 0) return Failure.result(error.InvalidArgument, out_failure);
+    const context: @import("antfly_local_sources").api_operation.RequestContext = .{ .deadline_ns = if (request.control.has_execution_deadline != 0) request.control.execution_deadline_ns else null, .cancellation = ownerQueryCancellation(&request.control) };
+    context.ensureActive() catch |err| return Failure.result(err, out_failure);
+    const handle = asHandle(owner) orelse return Failure.result(error.InvalidArgument, out_failure);
+    _ = storageOwnerTableName(handle, request.table_name) orelse return Failure.result(error.InvalidArgument, out_failure);
+    var parsed = std.json.parseFromSlice(contract.Admission, handle.alloc, request.admission_json.slice(), .{ .ignore_unknown_fields = false }) catch |err|
+        return Failure.result(if (err == error.OutOfMemory) err else error.InvalidArgument, out_failure);
+    defer parsed.deinit();
+    const result = handle.db.raftIndexOwnerAdmissionPreparation(handle.storage_owner_group_id, parsed.value, request.manifest.slice()) catch |err| return Failure.result(err, out_failure);
+    context.ensureActive() catch |err| return Failure.result(err, out_failure);
+    var response = BoundedOwnerJsonResponse(limits.max_json_bytes).init() catch |err| return Failure.result(err, out_failure);
+    defer response.deinit();
+    const used = response.encode(result) catch |err| return Failure.result(err, out_failure);
+    context.ensureActive() catch |err| return Failure.result(err, out_failure);
+    out_response.* = response.detach(used);
+    return .ok;
+}
+
 /// No ordinary-batch decoding or caller-selected replay position enters this
 /// boundary. Metadata permission is independently checked by the server worker;
 /// durable local job/catalog checks remain authoritative for each storage effect.

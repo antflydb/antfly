@@ -75,6 +75,9 @@ test "relational index system Raft owner controls commit authentic phase cuts at
     var admission = try db.prepareRaftIndexOwnerAdmission(header, candidate.inputs.bytes);
     defer admission.deinit();
     const binding = admission.command.binding;
+    const preparation = try db.raftIndexOwnerAdmissionPreparation(11, header, candidate.inputs.bytes);
+    try std.testing.expectEqualDeep(binding, preparation.binding);
+    try std.testing.expectError(error.PrivateIndexOwnerJobChanged, db.raftIndexOwnerAdmissionPreparation(99, header, candidate.inputs.bytes));
     const identity: raft.Identity = .{ .id = binding.id, .plan_digest = binding.plan_digest, .owner_digest = binding.owner_digest, .ordinal = binding.ordinal, .namespace = binding.fence.namespace, .owner_group_id = binding.fence.owner_group_id };
     try std.testing.expect(try db.raftIndexOwnerState(11, identity) == null);
     try std.testing.expectError(error.PrivateIndexOwnerJobChanged, db.raftIndexOwnerState(99, identity));
@@ -181,6 +184,50 @@ test "relational index system Raft owner controls commit authentic phase cuts at
         }
     };
     try @import("antfly_platform").allocator.checkAllAllocationFailures(alloc, PrepareFaults.run, .{ &db, admission.command });
+    const AdmissionFaults = struct {
+        fn run(a: std.mem.Allocator, database: *db_mod.DB, intent: raft.Admission, manifest: []const u8, expected: jobs.Binding) !void {
+            var vtable = a.vtable.*;
+            vtable.resize = std.mem.Allocator.noResize;
+            vtable.remap = std.mem.Allocator.noRemap;
+            const deterministic: std.mem.Allocator = .{ .ptr = a.ptr, .vtable = &vtable };
+            var view = database.core.acquireSchemaView().?;
+            defer view.release();
+            var read = try database.core.store.beginReadTxn();
+            defer read.abort();
+            var prepared = try raft.PreparedAdmission.init(deterministic, view, &read, intent, manifest);
+            defer prepared.deinit();
+            try std.testing.expectEqualDeep(expected, prepared.binding);
+            try std.testing.expect(try jobs.load(&read) == null);
+        }
+    };
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(alloc, AdmissionFaults.run, .{ &db, header, candidate.inputs.bytes, binding });
+    {
+        // Measure the same compiler against the same immutable snapshot. The
+        // advisory bridge eliminates exactly the base64 transport allocation,
+        // rather than hiding a second manifest encoding behind its API.
+        var counters: [2]std.testing.FailingAllocator = .{ .init(alloc, .{}), .init(alloc, .{}) };
+        var vtables = .{ counters[0].allocator().vtable.*, counters[1].allocator().vtable.* };
+        inline for (0..2) |i| {
+            vtables[i].resize = std.mem.Allocator.noResize;
+            vtables[i].remap = std.mem.Allocator.noRemap;
+        }
+        const measured: [2]std.mem.Allocator = .{
+            .{ .ptr = &counters[0], .vtable = &vtables[0] },
+            .{ .ptr = &counters[1], .vtable = &vtables[1] },
+        };
+        var view = db.core.acquireSchemaView().?;
+        defer view.release();
+        var read = try db.core.store.beginReadTxn();
+        defer read.abort();
+        var advisory = try raft.PreparedAdmission.init(measured[0], view, &read, header, candidate.inputs.bytes);
+        advisory.deinit();
+        var transport = try raft.Prepared.admission(measured[1], view, &read, header, candidate.inputs.bytes);
+        const transport_bytes = transport.command.inputs_b64.?.len;
+        transport.deinit();
+        try std.testing.expectEqual(counters[0].allocated_bytes + transport_bytes, counters[1].allocated_bytes);
+        for (counters) |counter| try std.testing.expectEqual(counter.allocated_bytes, counter.freed_bytes);
+        std.debug.print("Raft admission preparation: manifest_bytes={d} transport_allocation_saved={d} advisory_allocated={d} transport_allocated={d}\n", .{ candidate.inputs.bytes.len, transport_bytes, counters[0].allocated_bytes, counters[1].allocated_bytes });
+    }
     {
         var barrier: @import("antfly_runtime_abi").mutation_barrier.MutationBarrier = .{};
         var publisher: TestNativeIndexPublisher = .{ .barrier = &barrier };

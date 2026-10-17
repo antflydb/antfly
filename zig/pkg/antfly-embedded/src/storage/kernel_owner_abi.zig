@@ -1210,6 +1210,24 @@ pub extern fn antfly_storage_owner_raft_index_observation_json(
 /// authenticates the coordinator and obtains a fresh metadata owner decision.
 /// Admission supplies raw immutable inputs; physical IDs are chosen locally.
 pub const NativeIndexOwnerOperation = enum(u32) { admit = 1, fence = 2, reserve = 3, inspect = 4, receipt = 5, cancel_intent = 6, cancel_cleanup = 7, cancel_gc_page = 8, cancel_admit = 9, cancel_fence = 10, cancel_reserve = 11, cancel_inspect = 12, cancel_claim_gc_page = 13, claims = 14, build = 15, source = 16, consume = 17, install = 18, release = 19, cancel_complete = 20, cancel_release = 21, _ };
+
+/// Read-only preparation; accepts raw bounded immutable inputs, not physical
+/// IDs or caller positions. The result neither reserves nor admits a job.
+pub const RaftIndexOwnerPreparationRequest = extern struct {
+    pub const operation: u32 = 2;
+    version: u32 = abi_version,
+    table_name: BorrowedBytes = .{},
+    admission_json: BorrowedBytes = .{},
+    manifest: BorrowedBytes = .{},
+    control: ControlledJsonOperationRequest = .{},
+};
+
+pub extern fn antfly_storage_owner_raft_index_preparation_json(
+    owner: ?*anyopaque,
+    request: *const RaftIndexOwnerPreparationRequest,
+    out_response: *OwnedBytes,
+    out_failure: *FailureIdentity,
+) callconv(.c) Status;
 pub const NativeIndexOwnerControlRequest = extern struct {
     version: u32 = abi_version,
     operation: NativeIndexOwnerOperation,
