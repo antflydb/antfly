@@ -716,6 +716,20 @@ pub const HashJoin = struct {
             };
         }
     }
+    fn evictPayload(raw: *anyopaque) bool {
+        const self: *HashJoin = @ptrCast(@alignCast(raw));
+        // Build-side dedup entries are colder than decoded probe pages.
+        if (self.disk_values) |payloads| if (payloads.evictOne()) return true;
+        for (0..self.disk_payloads.len) |step| {
+            const entry = &self.disk_payloads[(self.next_payload + step) % self.disk_payloads.len];
+            if (entry.*) |cached| {
+                cached.block.release();
+                entry.* = null;
+                return true;
+            }
+        }
+        return false;
+    }
     fn diskBlock(self: *HashJoin, offset: u64) !*@import("spill.zig").Sequential.OwnedBlock {
         self.trimPayloadCache(offset);
         for (self.disk_payloads) |entry| if (entry) |cached| {
@@ -724,10 +738,8 @@ pub const HashJoin = struct {
         // Retain at most four small pages (64 KiB including lazy caches), or one
         // oversized page. Output leases may pin evicted blocks independently.
         const payloads = self.disk_values orelse return error.InvalidSqlSpill;
-        if (@import("memory_budget.zig").headroom(payloads.file.manager.alloc)) |available| {
-            if (available < payloads.file.manager.max_record_bytes *| 3 +| 64 * 1024) self.clearPayloadCache();
-        }
-        const block = try payloads.read(offset);
+        var pressure: @import("spill.zig").CachePressure = .{ .manager = payloads.file.manager, .context = self, .evict = evictPayload };
+        const block = try payloads.readWithPressure(offset, &pressure);
         const bytes = block.retainedBytes();
         var live: usize = bytes;
         for (self.disk_payloads) |entry| if (entry) |cached| {
@@ -3313,7 +3325,10 @@ test "SQL native spill pages share leased payloads pack distinct lanes and retai
                 try std.testing.expectEqual(count, seen);
             }
             if (repeated or !scalar_input) try std.testing.expectEqual(@as(usize, 1), join.payload_reads);
-            if (repeated) try std.testing.expect(join.disk_values.?.file.size < 9000);
+            if (repeated) {
+                try std.testing.expect(join.disk_values.?.file.size < 9000);
+                try std.testing.expectEqual(@as(usize, 1), join.disk_values.?.encoded_pages);
+            }
             if (measure) std.debug.print("SHARED_SPILL rows={d} repeated={} scalar={} payload_bytes={d} payload_reads={d}\n", .{ count, repeated, scalar_input, join.disk_values.?.file.size, join.payload_reads });
             // Force eviction; the accepted output lease must still own its page.
             for (0..6) |index| {
@@ -3412,4 +3427,72 @@ test "SQL native payload cache eviction includes lazy JSON memory and preserves 
     for (join.disk_payloads) |entry| if (entry) |cached| try std.testing.expect(cached.offset != match.native.?.offset);
     // Eviction drops only the cache reference, leaving accepted output intact.
     try std.testing.expectEqual(@as(i64, 2047), (try block.cell(0, 0)).value.array.items[2047].integer);
+}
+
+test "SQL native payload read cache uses actual allocations under statement sized record ceilings" {
+    const Fixture = struct {
+        fn check(_: *anyopaque) !void {}
+        fn run(a: Allocator, quota: usize, compressed: bool, pressure: bool, measure: bool) !void {
+            const spill = @import("spill.zig");
+            const Budget = @import("memory_budget.zig");
+            var budget: Budget = .{ .backing = a, .limit = quota };
+            defer std.debug.assert(budget.live == 0);
+            var dummy: u8 = 0;
+            var manager: spill.Manager = .{ .alloc = budget.allocator(), .io = std.testing.io, .context = &dummy, .checkpoint = check, .max_record_bytes = quota, .compression = if (compressed) .snappy else .none, .async_writes = false };
+            defer manager.deinit();
+            const join = try HashJoin.create(a, .{ .bytes = 8192, .spill = &manager });
+            var live = true;
+            defer if (live) join.deinit();
+            try join.startSpill();
+            var body: [8192]u8 = @splat('x');
+            const key = Datum.json(.{ .integer = 1 });
+            try join.add(&.{Datum.json(.{ .string = &body })}, &.{key});
+            body[0] = 'y';
+            try join.add(&.{Datum.json(.{ .string = &body })}, &.{key});
+            for (0..2) |_| {
+                var probe = try join.probe(&.{key});
+                var count: usize = 0;
+                while (try probe.next()) |match| {
+                    const block = try match.native.?.block();
+                    try std.testing.expectEqual(@as(u8, if (count == 0) 'y' else 'x'), (try block.cell(0, 0)).value.string[0]);
+                    count += 1;
+                }
+                try std.testing.expectEqual(@as(usize, 2), count);
+            }
+            try std.testing.expectEqual(@as(usize, 2), join.payload_reads);
+            if (measure) std.debug.print("SPILL_READ_QUOTA compressed={} quota={d} reads={d} peak={d}\n", .{ compressed, quota, join.payload_reads, budget.peak });
+            if (pressure) {
+                // Pin an output page, then force admission to drop cache refs.
+                const first = join.disk_payloads[0].?.block;
+                first.retain();
+                defer first.release();
+                const first_offset = join.disk_payloads[0].?.offset;
+                const second_offset = join.disk_payloads[1].?.offset;
+                while (join.disk_values.?.evictOne()) {}
+                const incoming = first.retainedBytes();
+                join.clearPayloadCache();
+                const available = Budget.headroom(manager.alloc).?;
+                const ballast = try manager.allocator().alloc(u8, available - incoming * 2);
+                defer manager.allocator().free(ballast);
+                // Both pinned and cached pages fit, but a third decoded page
+                // requires eviction of the unpinned cache entry.
+                _ = try join.diskBlock(second_offset);
+                _ = try join.diskBlock(first_offset);
+                var cached_pages: usize = 0;
+                for (join.disk_payloads) |entry| if (entry != null) {
+                    cached_pages += 1;
+                };
+                try std.testing.expectEqual(@as(usize, 1), cached_pages);
+                try std.testing.expect(!budget.isExhausted());
+                join.deinit();
+                live = false;
+                try std.testing.expectEqual(@as(u8, 'y'), (try first.cell(0, 0)).value.string[0]);
+            }
+        }
+    };
+    for ([_]bool{ false, true }) |compressed| {
+        for ([_]usize{ 2 * 1024 * 1024, 32 * 1024 * 1024 }) |quota|
+            try Fixture.run(std.testing.allocator, quota, compressed, true, true);
+        try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Fixture.run, .{ @as(usize, 2 * 1024 * 1024), compressed, false, false });
+    }
 }

@@ -1118,26 +1118,119 @@ fn decodeColumnarBlockManaged(a: Allocator, cache_backing: ?Allocator, bytes: []
     return .{ .values = values, .keys = keys, .ordinals = ordinals, .json_owner = decoder.json_owner };
 }
 
+/// A synchronous allocation scope that gives optional cache entries back before
+/// forwarding actual growth to the statement allocator. No failed-allocation
+/// retry and no callback under the parent budget/manager mutex. This descriptor
+/// must never escape: retained arenas switch back to manager.allocator().
+pub const CachePressure = struct {
+    manager: *Manager,
+    context: *anyopaque,
+    evict: *const fn (*anyopaque) bool,
+    pub fn prepare(self: *CachePressure, growth: usize) void {
+        while (@import("memory_budget.zig").headroom(self.manager.alloc)) |available| {
+            if (growth <= available or !self.evict(self.context)) break;
+        }
+    }
+    pub fn allocator(self: *CachePressure) Allocator {
+        return .{ .ptr = self, .vtable = &.{ .alloc = allocate, .resize = resize, .remap = remap, .free = free } };
+    }
+    fn allocate(raw: *anyopaque, len: usize, alignment: std.mem.Alignment, ra: usize) ?[*]u8 {
+        const self: *CachePressure = @ptrCast(@alignCast(raw));
+        self.prepare(len);
+        return self.manager.allocator().rawAlloc(len, alignment, ra);
+    }
+    fn resize(raw: *anyopaque, bytes: []u8, alignment: std.mem.Alignment, len: usize, ra: usize) bool {
+        const self: *CachePressure = @ptrCast(@alignCast(raw));
+        self.prepare(len -| bytes.len);
+        return self.manager.allocator().rawResize(bytes, alignment, len, ra);
+    }
+    fn remap(raw: *anyopaque, bytes: []u8, alignment: std.mem.Alignment, len: usize, ra: usize) ?[*]u8 {
+        const self: *CachePressure = @ptrCast(@alignCast(raw));
+        self.prepare(len -| bytes.len);
+        return self.manager.allocator().rawRemap(bytes, alignment, len, ra);
+    }
+    fn free(raw: *anyopaque, bytes: []u8, alignment: std.mem.Alignment, ra: usize) void {
+        const self: *CachePressure = @ptrCast(@alignCast(raw));
+        self.manager.allocator().rawFree(bytes, alignment, ra);
+    }
+};
+
 /// Random-access native payloads for hash chains. The chain's separate small
 /// key record owns the link/matched flag; failed key comparisons never read
 /// this file. Offsets are physical, so reverse chains do not replay prefixes.
 pub const JoinPayloads = struct {
     // Exact, canonical page bytes own their keys. Cache metadata and bytes are
     // bounded independently of relation cardinality, with no borrowed keys.
-    const Cached = struct { bytes: []u8, offset: u64, hash: u64 };
+    const Cached = struct {
+        bytes: []u8,
+        offset: u64,
+        hash: u64,
+        // Scalar descriptors own no producer pointers: strings borrow bytes.
+        scalar: []Datum = &.{},
+        scalar_hash: u64 = 0,
+    };
     pub const page_bytes = 16 * 1024;
     pub const page_rows = 64;
     file: File,
     recent: [4]?Cached = @splat(null),
     next_recent: usize = 0,
+    encoded_pages: usize = 0,
     pub fn init(manager: *Manager) !JoinPayloads {
         var file = try manager.create();
         file.buffer_bytes = @min(4096, manager.buffer_bytes);
         return .{ .file = file };
     }
     pub fn close(self: *JoinPayloads) void {
-        for (self.recent) |entry| if (entry) |cached| self.file.manager.allocator().free(cached.bytes);
+        for (&self.recent) |*entry| self.drop(entry);
         self.file.close();
+    }
+    fn drop(self: *JoinPayloads, entry: *?Cached) void {
+        if (entry.*) |cached| {
+            self.file.manager.allocator().free(cached.scalar);
+            self.file.manager.allocator().free(cached.bytes);
+        }
+        entry.* = null;
+    }
+    fn evict(raw: *anyopaque) bool {
+        const self: *JoinPayloads = @ptrCast(@alignCast(raw));
+        return self.evictOne();
+    }
+    pub fn evictOne(self: *JoinPayloads) bool {
+        for (0..self.recent.len) |step| {
+            const entry = &self.recent[(self.next_recent + step) % self.recent.len];
+            if (entry.* != null) {
+                self.drop(entry);
+                return true;
+            }
+        }
+        return false;
+    }
+    // Only direct scalar rows opt in. Encoded JSON/arrays/patterns retain the
+    // manager-aware codec and its validation. Hashing never grants equality:
+    // compare exact types, NULL flags and float bits before reusing an offset.
+    fn scalarHash(values: []const Datum) ?u64 {
+        if (values.len == 0 or values.len > 16) return null;
+        var hash = std.hash.Wyhash.init(values.len);
+        for (values) |value| {
+            if (Sequential.tag(value) == 255) return null;
+            const tag: u8 = if (value.sql_null) 128 else Sequential.tag(value);
+            hash.update(&.{tag});
+            if (tag != 0 and tag != 128) {
+                const physical = Sequential.physicalHash(value);
+                hash.update(std.mem.asBytes(&physical));
+            }
+        }
+        return hash.final();
+    }
+    fn scalarEqual(a: []const Datum, b: []const Datum) bool {
+        if (a.len != b.len) return false;
+        for (a, b) |x, y| {
+            if (x.sql_null != y.sql_null) return false;
+            if (x.sql_null) continue;
+            if (x.value == .null and y.value == .null) continue;
+            if (!Sequential.physicalEqual(x, y)) return false;
+        }
+        return true;
     }
     /// Ordinals belong to the separate key chain. Canonical zero ordinals let
     /// identical payload pages share storage even across producer leases.
@@ -1145,20 +1238,25 @@ pub const JoinPayloads = struct {
         if (values.len() == 0 or values.len() > page_rows) return error.InvalidSqlSpill;
         const manager = self.file.manager;
         try manager.check();
-        var arena = std.heap.ArenaAllocator.init(manager.allocator());
+        const scalar_values: []const Datum = if (values == .rows and values.len() == 1) values.rows[0] else &.{};
+        const scalar_hash = scalarHash(scalar_values);
+        if (scalar_hash) |key| for (self.recent) |entry| {
+            if (entry) |cached| if (cached.bytes.len <= manager.max_record_bytes and cached.scalar_hash == key and scalarEqual(cached.scalar, scalar_values)) return cached.offset;
+        };
+        var pressure: CachePressure = .{ .manager = manager, .context = self, .evict = evict };
+        var arena = std.heap.ArenaAllocator.init(pressure.allocator());
         defer arena.deinit();
         var output: std.ArrayList(u8) = .empty;
         const temporary = @import("memory_budget.zig").reclaimingAllocator(arena.allocator());
         defer output.deinit(temporary);
         const ordinals: [page_rows]u64 = @splat(0);
         try appendColumnarBatchVersionMode(temporary, temporary, &output, values, ordinals[0..values.len()], manager.max_record_bytes, .v2, manager);
+        self.encoded_pages += 1;
         const wire = output.items;
         const hash = std.hash.Wyhash.hash(0, wire);
         for (self.recent) |entry| if (entry) |cached| {
             if (cached.hash == hash and std.mem.eql(u8, cached.bytes, wire)) return cached.offset;
         };
-        const remembered = if (wire.len <= page_bytes) try manager.allocator().dupe(u8, wire) else null;
-        errdefer if (remembered) |bytes| manager.allocator().free(bytes);
         const compressed = if (self.file.manager.compression == .snappy and wire.len >= 1024) try snappy.encode(arena.allocator(), wire) else null;
         const use_compressed = compressed != null and compressed.?.len + 32 < wire.len;
         const stored = if (use_compressed) compressed.? else wire;
@@ -1167,25 +1265,52 @@ pub const JoinPayloads = struct {
         std.mem.writeInt(u64, header[0..8], stored.len, .little);
         std.mem.writeInt(u64, header[8..16], hash, .little);
         const offset = self.file.size;
+        if (self.file.write_buffer.len == 0) pressure.prepare(@max(1, self.file.buffer_bytes orelse manager.buffer_bytes));
         try self.file.writeRaw(offset, &header);
         try self.file.writeRaw(offset + header.len, stored);
         self.file.manager.increment("compressed_records", @intFromBool(use_compressed));
-        if (remembered) |bytes| {
-            if (self.recent[self.next_recent]) |old| manager.allocator().free(old.bytes);
-            self.recent[self.next_recent] = .{ .bytes = bytes, .offset = offset, .hash = hash };
+        // Cache publication is optional and occurs after required I/O. Evict
+        // the replaced entry before admission, and never poison the statement
+        // budget by probing a known policy denial with an allocation.
+        self.drop(&self.recent[self.next_recent]);
+        const key_bytes = if (scalar_hash != null) scalar_values.len * @sizeOf(Datum) else 0;
+        const available = @import("memory_budget.zig").headroom(manager.alloc);
+        if (wire.len + key_bytes <= page_bytes and (available == null or wire.len + key_bytes <= available.?)) {
+            const bytes = try manager.allocator().dupe(u8, wire);
+            errdefer manager.allocator().free(bytes);
+            const cells = try manager.allocator().alloc(Datum, if (scalar_hash != null) scalar_values.len else 0);
+            errdefer manager.allocator().free(cells);
+            if (cells.len != 0) {
+                // Only primitive, one-row pages reach this decoder. Metadata
+                // lives on the stack; retained string slices borrow bytes.
+                var scratch: [8192]u8 = undefined;
+                var fixed = std.heap.FixedBufferAllocator.init(&scratch);
+                const block = try decodeColumnarBlockManaged(fixed.allocator(), null, bytes, manager.max_record_bytes, .forwarding, manager);
+                for (cells, 0..) |*cell, col| cell.* = try block.cell(0, col);
+            }
+            self.recent[self.next_recent] = .{ .bytes = bytes, .offset = offset, .hash = hash, .scalar = cells, .scalar_hash = scalar_hash orelse 0 };
             self.next_recent = (self.next_recent + 1) % self.recent.len;
         }
         return offset;
     }
     pub fn read(self: *JoinPayloads, offset: u64) !*Sequential.OwnedBlock {
+        var pressure: CachePressure = .{ .manager = self.file.manager, .context = self, .evict = evict };
+        return self.readWithPressure(offset, &pressure);
+    }
+    pub fn readWithPressure(self: *JoinPayloads, offset: u64, pressure: ?*CachePressure) !*Sequential.OwnedBlock {
+        if (pressure) |scope| if (self.file.read_buffer.len == 0) scope.prepare(@max(1, self.file.buffer_bytes orelse self.file.manager.buffer_bytes));
         var header: [17]u8 = undefined;
         try self.file.readRaw(offset, &header);
         const length = std.mem.readInt(u64, header[0..8], .little);
         if (header[16] > 1 or length > self.file.manager.max_record_bytes or length > self.file.size -| (offset + header.len)) return error.InvalidSqlSpill;
-        const a = self.file.manager.allocator();
+        const stable = self.file.manager.allocator();
+        const a = if (pressure) |scope| scope.allocator() else stable;
         const owner = try a.create(Sequential.OwnedBlock);
-        owner.* = .{ .a = a, .arena = .init(a) };
+        owner.* = .{ .a = stable, .arena = .init(a) };
         errdefer owner.release();
+        // Published blocks and lazy JSON owners may outlive the hash join and
+        // this stack scope. Frees/growth use the identical stable backing.
+        defer owner.arena.child_allocator = stable;
         const wire = if (header[16] == 1) blk: {
             // Compressed input is decode scratch, not retained page storage.
             const encoded = try a.alloc(u8, @intCast(length));
@@ -1203,7 +1328,7 @@ pub const JoinPayloads = struct {
             break :blk encoded;
         };
         if (std.hash.Wyhash.hash(0, wire) != std.mem.readInt(u64, header[8..16], .little)) return error.InvalidSqlSpill;
-        owner.encoded = try decodeColumnarBlockManaged(owner.arena.allocator(), a, wire, self.file.manager.max_record_bytes, .forwarding, self.file.manager);
+        owner.encoded = try decodeColumnarBlockManaged(owner.arena.allocator(), stable, wire, self.file.manager.max_record_bytes, .forwarding, self.file.manager);
         if (owner.count() == 0 or owner.count() > page_rows) return error.InvalidSqlSpill;
         return owner;
     }
@@ -5276,4 +5401,79 @@ test "SQL native payload pages enforce statement array limits on write and read"
     try std.testing.expectEqual(@as(usize, 32), (try block.cell(0, 0)).array.?.cardinality());
     manager.array_limits.elements = 16;
     try std.testing.expectError(error.InvalidSqlSpill, file.read(offset));
+}
+
+test "SQL native payload write cache yields to required allocations without exhausting statement quotas" {
+    const Fixture = struct {
+        fn check(_: *anyopaque) !void {}
+        fn run(a: Allocator, compressed: bool, measure: bool) !void {
+            var budget: @import("memory_budget.zig") = .{ .backing = a, .limit = 64 * 1024 };
+            defer std.debug.assert(budget.live == 0);
+            var dummy: u8 = 0;
+            var manager: Manager = .{ .alloc = budget.allocator(), .io = std.testing.io, .context = &dummy, .checkpoint = check, .compression = if (compressed) .snappy else .none, .async_writes = false };
+            defer manager.deinit();
+            var payloads = try JoinPayloads.init(&manager);
+            defer payloads.close();
+            var body: [12000]u8 = @splat('x');
+            var offsets: [10]u64 = undefined;
+            for (&offsets, 0..) |*offset, index| {
+                body[0] = @intCast('a' + index);
+                offset.* = try payloads.appendBatch(.{ .rows = &.{&.{Datum.json(.{ .string = &body })}} });
+            }
+            @memset(&body, 'z');
+            for (offsets, 0..) |offset, index| {
+                const block = try payloads.read(offset);
+                defer block.release();
+                const value = try block.cell(0, 0);
+                try std.testing.expectEqual(@as(usize, 12000), value.value.string.len);
+                try std.testing.expectEqual(@as(u8, @intCast('a' + index)), value.value.string[0]);
+            }
+            try std.testing.expect(!budget.isExhausted());
+            if (measure) std.debug.print("SPILL_WRITE_QUOTA compressed={} rows=10 limit={d} peak={d} encoded_pages={d}\n", .{ compressed, budget.limit, budget.peak, payloads.encoded_pages });
+        }
+    };
+    for ([_]bool{ false, true }) |compressed| {
+        try Fixture.run(std.testing.allocator, compressed, true);
+        try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Fixture.run, .{ compressed, false });
+    }
+}
+
+test "SQL native scalar payload reuse precedes serialization and preserves exact representations" {
+    const Hook = struct {
+        fn check(_: *anyopaque) !void {}
+    };
+    var dummy: u8 = 0;
+    var manager: Manager = .{ .alloc = std.testing.allocator, .io = std.testing.io, .context = &dummy, .checkpoint = Hook.check, .compression = .none, .async_writes = false };
+    defer manager.deinit();
+    var payloads = try JoinPayloads.init(&manager);
+    defer payloads.close();
+    var body: [8192]u8 = @splat('x');
+    const values = [_]Datum{ Datum.json(.{ .string = &body }), Datum.json(.{ .float = 0.0 }), Datum.json(.null), .{} };
+    const offset = try payloads.appendBatch(.{ .rows = &.{&values} });
+    for (0..63) |_| try std.testing.expectEqual(offset, try payloads.appendBatch(.{ .rows = &.{&values} }));
+    try std.testing.expectEqual(@as(usize, 1), payloads.encoded_pages);
+    const record_limit = manager.max_record_bytes;
+    manager.max_record_bytes = 100;
+    try std.testing.expectError(error.SqlProgramLimitExceeded, payloads.appendBatch(.{ .rows = &.{&values} }));
+    manager.max_record_bytes = record_limit;
+    body[0] = 'y';
+    const different = try payloads.appendBatch(.{ .rows = &.{&values} });
+    try std.testing.expect(different != offset);
+    body[0] = 'x';
+    try std.testing.expectEqual(offset, try payloads.appendBatch(.{ .rows = &.{&values} }));
+    var changed = values;
+    changed[1] = Datum.json(.{ .float = -0.0 });
+    try std.testing.expect(offset != try payloads.appendBatch(.{ .rows = &.{&changed} }));
+    changed = values;
+    changed[2] = .{};
+    try std.testing.expect(offset != try payloads.appendBatch(.{ .rows = &.{&changed} }));
+    // A matching fingerprint never substitutes for the owned exact key.
+    changed = values;
+    changed[0] = Datum.json(.{ .number_string = &body });
+    payloads.recent[0].?.scalar_hash = JoinPayloads.scalarHash(&changed).?;
+    try std.testing.expect(offset != try payloads.appendBatch(.{ .rows = &.{&changed} }));
+    const block = try payloads.read(offset);
+    defer block.release();
+    try std.testing.expectEqual(@as(u8, 'x'), (try block.cell(0, 0)).value.string[0]);
+    std.debug.print("SPILL_SCALAR_REUSE repeated_rows=64 encoded_pages=1\n", .{});
 }
