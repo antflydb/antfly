@@ -336,7 +336,7 @@ pub const Candidates = struct {
         var source_rows: std.ArrayList(usize) = .empty;
         var keys: std.StringHashMapUnmanaged(void) = .empty;
         var retained: usize = 0;
-        var old_layout: ?catalog.Row.TypedLayout = null;
+        var old_layout: ?*const catalog.Row.TypedLayout = null;
         if (self.returning) {
             var names: std.ArrayList([]const u8) = .empty;
             for (self.target.columns, self.field_ordinals) |field, ordinal| {

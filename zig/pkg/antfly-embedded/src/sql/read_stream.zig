@@ -1257,6 +1257,12 @@ pub const Stream = struct {
                 }
                 return .{ .dictionary = .{ .values = values, .indices = source.dictionary.indices } };
             }
+            fn frozen(raw: *anyopaque, index: usize, ordinal: usize) anyerror!?@import("execution_batch.zig").FrozenJson {
+                const projection_: *@This() = @ptrCast(@alignCast(raw));
+                if (projection_.stream.context.binding.columns[ordinal].type != .json) return null;
+                if (projection_.projections[ordinal]) |values| return values.frozenJson(index, 0);
+                return projection_.page.frozenJson(index, projection_.stream.fields[ordinal]);
+            }
             fn json(raw: *anyopaque, index: usize, ordinal: usize) anyerror!?[]const u8 {
                 const projection_: *@This() = @ptrCast(@alignCast(raw));
                 if (projection_.stream.context.binding.columns[ordinal].type != .json) return null;
@@ -1282,7 +1288,7 @@ pub const Stream = struct {
         // complete batch is published only after all typed columns succeed.
         if (self.one_scan_page) try pending.reserveRecords(selection.items.len);
         const before = pending.len();
-        try pending.values.appendBatch(.{ .reader = .{ .ptr = &projection, .read = Projection.cell, .read_dictionary = Projection.dictionary, .read_json = Projection.json, .count = selection.items.len, .width = self.fields.len } });
+        try pending.values.appendBatch(.{ .reader = .{ .ptr = &projection, .read = Projection.cell, .read_dictionary = Projection.dictionary, .read_json = Projection.json, .read_frozen = Projection.frozen, .count = selection.items.len, .width = self.fields.len } });
         if (self.one_scan_page) for (positions.items, failures) |position, failure| pending.record(position, failure);
         for (before..pending.len()) |row| for (0..self.fields.len) |column| {
             output_bytes +|= try pending.values.cellBytes(a, row, column);

@@ -209,7 +209,7 @@ pub const Projection = struct {
 
     /// The returned directory belongs to the page, not this scan/cursor. Bind
     /// once per page, and reuse across every row regardless of array length.
-    pub fn pageLayout(self: Projection, alloc: std.mem.Allocator) !?catalog.Row.TypedLayout {
+    pub fn pageLayout(self: Projection, alloc: std.mem.Allocator) !?*const catalog.Row.TypedLayout {
         if (!self.has_typed_cells) return null;
         const names = try alloc.alloc([]const u8, self.columns.len);
         for (self.columns, names) |column, *name| name.* = try alloc.dupe(u8, column.name);
@@ -219,7 +219,7 @@ pub const Projection = struct {
     /// Adapt an already parsed native projection. Metadata is page-owned and
     /// payloads borrow that same page's pinned JSON tree. No JSON reparsing or
     /// nested JSONB/string cloning occurs. Legacy scalar-only pages stay cheap.
-    pub fn adaptBorrowed(self: Projection, alloc: std.mem.Allocator, layout: ?catalog.Row.TypedLayout, row: catalog.Row) !catalog.Row {
+    pub fn adaptBorrowed(self: Projection, alloc: std.mem.Allocator, layout: ?*const catalog.Row.TypedLayout, row: catalog.Row) !catalog.Row {
         if (!self.has_typed_cells) return row;
         if (row.typed_cells) |native| {
             var direct = native.layout.names.len == self.columns.len;
@@ -228,7 +228,7 @@ pub const Projection = struct {
                     direct = false;
                     break;
                 }
-                if (column.type == .json and try row.encodedJson(name) != null) continue;
+                if (column.type == .json and (try row.frozenJson(name) != null or try row.encodedJson(name) != null)) continue;
                 const cell = try row.cell(name);
                 if (cell.sql_null and !column.nullable) return error.InvalidSqlBackendResponse;
                 if (!cell.sql_null and ((column.type == .array and cell.array == null) or
@@ -267,12 +267,12 @@ pub const Projection = struct {
     /// Copy only selected payloads into their final native cells. Raw stored
     /// hits validate every subtree/duplicate key while materializing selected
     /// root members only. Metadata overrides never mutate or copy the hit tree.
-    pub fn projectSearch(self: Projection, alloc: std.mem.Allocator, scratch: std.mem.Allocator, layout: catalog.Row.TypedLayout, id: []const u8, source: SearchSource, metadata: SearchMetadata) !catalog.Row {
+    pub fn projectSearch(self: Projection, alloc: std.mem.Allocator, scratch: std.mem.Allocator, layout: *const catalog.Row.TypedLayout, id: []const u8, source: SearchSource, metadata: SearchMetadata) !catalog.Row {
         return self.projectSearchEncoded(alloc, scratch, layout, id, source, metadata, null);
     }
     /// Optional canonical JSON columns. Placeholder cells are private to the
     /// native reader; ordinary cell access must parse that column on demand.
-    pub fn projectSearchEncoded(self: Projection, alloc: std.mem.Allocator, scratch: std.mem.Allocator, layout: catalog.Row.TypedLayout, id: []const u8, source: SearchSource, metadata: SearchMetadata, encoded: ?[]?[]const u8) !catalog.Row {
+    pub fn projectSearchEncoded(self: Projection, alloc: std.mem.Allocator, scratch: std.mem.Allocator, layout: *const catalog.Row.TypedLayout, id: []const u8, source: SearchSource, metadata: SearchMetadata, encoded: ?[]?[]const u8) !catalog.Row {
         if (encoded) |slots| {
             if (slots.len != self.columns.len) return error.InvalidSqlBackendResponse;
             @memset(slots, null);

@@ -324,7 +324,10 @@ pub const Join = struct {
                 const costs = if (build_side) &self.build_cost else &self.probe_cost;
                 if (costs[partition] == 0) costs[partition] = @import("typed_store.zig").columnMetadataBytes(batch.width() + keys[index].len) *| 2;
                 costs[partition] +|= 128;
-                for (0..batch.width()) |column| costs[partition] +|= (try @import("typed_store.zig").retainedCellBytes(try batch.cell(a, index, column))) *| 2;
+                for (0..batch.width()) |column| {
+                    const cost = if (try batch.frozenJson(index, column)) |value| 64 +| value.bytes.len else if (try batch.encodedJson(index, column)) |text| 64 +| text.len else try @import("typed_store.zig").retainedCellBytes(try batch.cell(a, index, column));
+                    costs[partition] +|= cost *| 2;
+                }
                 for (keys[index]) |value| costs[partition] +|= (try @import("typed_store.zig").retainedCellBytes(value)) *| 2;
             }
             for (counts[0..self.partitions], 0..) |count, partition| {

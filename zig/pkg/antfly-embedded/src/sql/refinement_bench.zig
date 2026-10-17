@@ -822,7 +822,7 @@ const ProjectionStats = struct { ns: i96, peak: usize, allocations: usize, check
 const ProjectionCase = enum { document, columns, array, array_copy, array_wire, replay, replay_batch };
 const ProjectionFixture = struct {
     projection: @import("document_row.zig").Projection,
-    layout: @import("catalog.zig").Row.TypedLayout,
+    layout: *const @import("catalog.zig").Row.TypedLayout,
     root: std.json.Value,
     array: @import("array_value.zig").Value,
     output: []u8,
@@ -1164,7 +1164,7 @@ test "native projection refinements benchmark checked builders" {
         std.debug.print("CHECKED_BUILDER sample={d} before_cpu_ns={d} after_cpu_ns={d} elements=8192 repetitions=512\n", .{ sample, before.ns, after.ns });
     }
 }
-fn encodedJsonTiming(encoded: bool, projection: @import("document_row.zig").Projection, layout_: @import("catalog.zig").Row.TypedLayout, input: []const u8) !struct { ns: i96, peak: usize, checksum: u64 } {
+fn encodedJsonTiming(encoded: bool, projection: @import("document_row.zig").Projection, layout_: *const @import("catalog.zig").Row.TypedLayout, input: []const u8) !struct { ns: i96, peak: usize, checksum: u64 } {
     const wire_bytes = try std.testing.allocator.alloc(u8, input.len * 2 + 1);
     defer std.testing.allocator.free(wire_bytes);
     var elapsed: i96 = 0;

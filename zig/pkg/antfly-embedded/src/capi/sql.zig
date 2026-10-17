@@ -600,7 +600,7 @@ pub fn Adapter(comptime native: type) type {
             documents: ?DB.DocumentRows,
             needs_document: bool,
             source_fields: []const []const u8,
-            layout: catalog.Row.TypedLayout,
+            layout: *const catalog.Row.TypedLayout,
             projection: dependencies.sql_document_row.Projection,
             position: usize = 0,
             column_page: ?catalog.Page = null,

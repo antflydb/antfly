@@ -598,6 +598,14 @@ pub const HashJoin = struct {
         pub fn materializeKeys(self: Match, alloc: Allocator) ![]const Datum {
             return if (self.owner) |owner| owner.key_columns.row(alloc, self.index) else self.keys;
         }
+        /// Keep build payloads encoded when transferring into another operator.
+        pub fn valuesBatch(self: Match, alloc: Allocator) !@import("execution_batch.zig").Batch {
+            if (self.owner) |owner| if (owner.entries.items[self.index].width == owner.value_columns.columns.len)
+                return .{ .retained = .{ .store = &owner.value_columns, .begin = self.index, .count = 1 } };
+            const rows = try alloc.alloc([]const Datum, 1);
+            rows[0] = try self.materializeValues(alloc);
+            return .{ .rows = rows };
+        }
         pub fn materializeValues(self: Match, alloc: Allocator) ![]const Datum {
             if (self.owner) |owner| return owner.value_columns.rowWidth(alloc, self.index, owner.entries.items[self.index].width);
             const result = try alloc.dupe(Datum, self.values);
@@ -751,7 +759,7 @@ pub const HashJoin = struct {
         defer scratch.deinit();
         for (0..batch.width()) |column| for (0..batch.len()) |index| {
             _ = scratch.reset(.retain_capacity);
-            needed +|= (try datumBytes(try batch.cell(scratch.allocator(), index, column))) *| 4;
+            needed +|= (try batch.cellBytes(scratch.allocator(), index, column)) *| 4;
         };
         for (keys) |row| {
             if (row.len > 256 or (self.key_count != null and row.len != self.key_count.?)) return error.InvalidSqlBackendResponse;
@@ -2644,4 +2652,38 @@ test "external lake SQL identified group columns separate source ordinals from i
         }
         try std.testing.expectEqual(@as(usize, 2), count);
     }
+}
+
+test "SQL encoded JSON hash join admission and repeated matches reuse retained payloads" {
+    const Fixture = struct {
+        fn run(a: Allocator) !void {
+            const Probe = struct {
+                fn json(_: *anyopaque, _: usize, _: usize) !?[]const u8 {
+                    return "{\"x\":[1,2,3]}";
+                }
+                fn cell(_: *anyopaque, _: Allocator, _: usize, _: usize) !Datum {
+                    return error.UnexpectedScalarMaterialization;
+                }
+            };
+            var raw: u8 = 0;
+            var scratch = std.heap.ArenaAllocator.init(a);
+            defer scratch.deinit();
+            const alloc = scratch.allocator();
+            const join = try HashJoin.create(a, .{ .bytes = 1 << 20 });
+            defer join.deinit();
+            try join.addBatch(alloc, .{ .reader = .{ .ptr = &raw, .read = Probe.cell, .read_json = Probe.json, .count = 1, .width = 1 } }, &.{&.{Datum.json(.{ .integer = 7 })}});
+            var first_tree: ?[*]std.json.Value = null;
+            for (0..16) |_| {
+                var probe = try join.probe(&.{Datum.json(.{ .integer = 7 })});
+                const match = (try probe.next()).?;
+                const batch = try match.valuesBatch(alloc);
+                try std.testing.expectEqualStrings("{\"x\":[1,2,3]}", (try batch.encodedJson(0, 0)).?);
+                const values = try match.materializeValues(alloc);
+                const tree = values[0].value.object.values().ptr;
+                if (first_tree) |prior| try std.testing.expect(prior == tree) else first_tree = tree;
+            }
+        }
+    };
+    try Fixture.run(std.testing.allocator);
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Fixture.run, .{});
 }

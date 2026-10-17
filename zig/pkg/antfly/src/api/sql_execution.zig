@@ -856,6 +856,11 @@ pub const Adapter = struct {
                     const view_: *@This() = @ptrCast(@alignCast(raw));
                     return view_.rows[row].cell(if (column == view_.columns.len) "_id" else view_.columns[column].name);
                 }
+                fn frozen(raw: *anyopaque, row: usize, column: usize) !?@import("antfly_local_sources").sql_execution_batch.FrozenJson {
+                    const view_: *@This() = @ptrCast(@alignCast(raw));
+                    if (column == view_.columns.len or view_.columns[column].type != .json) return null;
+                    return view_.rows[row].frozenJson(view_.columns[column].name);
+                }
                 fn json(raw: *anyopaque, row: usize, column: usize) !?[]const u8 {
                     const view_: *@This() = @ptrCast(@alignCast(raw));
                     if (column == view_.columns.len or view_.columns[column].type != .json) return null;
@@ -865,7 +870,7 @@ pub const Adapter = struct {
             const reader = try a.create(Reader);
             reader.* = .{ .rows = self.column_page.?.rows, .columns = self.projection.columns };
             const values = try a.create(@import("antfly_local_sources").sql_execution_batch.Batch);
-            values.* = .{ .reader = .{ .ptr = reader, .read = Reader.cell, .read_json = Reader.json, .count = reader.rows.len, .width = reader.columns.len + 1 } };
+            values.* = .{ .reader = .{ .ptr = reader, .read = Reader.cell, .read_json = Reader.json, .read_frozen = Reader.frozen, .count = reader.rows.len, .width = reader.columns.len + 1 } };
             const names = try a.alloc([]const u8, values.width());
             for (self.projection.columns, names[0..self.projection.columns.len]) |column, *name| name.* = column.name;
             names[names.len - 1] = "_id";

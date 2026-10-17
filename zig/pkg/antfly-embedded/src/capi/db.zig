@@ -5391,8 +5391,11 @@ pub fn antfly_db_stats_json(
 }
 
 pub fn dbStatsJsonAlloc(handle: *Handle) ![]u8 {
-    const stats = try handle.database().*.stats(handle.alloc);
+    var stats = try handle.database().*.stats(handle.alloc);
     defer db_mod.types.freeDBStats(handle.alloc, stats);
+
+    const context = handle.lite_connection_context orelse if (handle.parent_handle) |parent| parent.lite_connection_context else null;
+    if (context) |connection| connection.owner.overlayTtlStats(handle.database(), &stats.ttl_cleanup);
 
     const indexes = try dbIndexStatsProjectionAlloc(handle.alloc, stats);
     defer if (indexes.len > 0) handle.alloc.free(indexes);

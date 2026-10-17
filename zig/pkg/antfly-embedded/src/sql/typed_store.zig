@@ -179,6 +179,91 @@ fn Numeric(comptime T: type) type {
         }
     };
 }
+// Shared per retained store, with stable addresses for managed JSON arrays.
+// Cached trees have a strict aggregate cap; large/cold values decode into the
+// consumer's scratch instead. Failed speculative caches release all capacity.
+const JsonCache = struct {
+    const limit = 512 * 1024;
+    budget: @import("memory_budget.zig"),
+    text_arena: std.heap.ArenaAllocator,
+    entries: ?*Entry = null,
+    mutex: std.atomic.Mutex = .unlocked,
+    const Entry = struct { arena: std.heap.ArenaAllocator, datum: Datum, next: ?*Entry };
+    fn deinit(self: *JsonCache) void {
+        while (self.entries) |entry| {
+            self.entries = entry.next;
+            entry.arena.deinit();
+            self.budget.allocator().destroy(entry);
+        }
+        self.text_arena.deinit();
+    }
+    fn lock(self: *JsonCache) void {
+        while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
+    }
+    fn materialize(self: *JsonCache, payload: *JsonPayload, a: A) !Datum {
+        self.lock();
+        const entry = blk: {
+            defer self.mutex.unlock();
+            if (!payload.attempted) {
+                payload.cached = try self.cache(payload.*);
+                payload.attempted = true;
+            }
+            break :blk payload.cached;
+        };
+        if (entry) |cached| return cached.datum;
+        return payload.decode(a);
+    }
+    fn encoded(self: *JsonCache, payload: *JsonPayload) !?[]const u8 {
+        self.lock();
+        defer self.mutex.unlock();
+        if (payload.text) |text| return text;
+        const frozen = payload.frozen orelse return null;
+        if (!frozen.lossless_text) return null;
+        payload.text = try @import("spill.zig").frozenJsonText(self.text_arena.allocator(), frozen);
+        return payload.text;
+    }
+    fn cache(self: *JsonCache, payload: JsonPayload) !?*Entry {
+        // Avoid speculative decoding for a value that cannot plausibly fit.
+        const bytes = if (payload.frozen) |v| v.bytes else payload.text.?;
+        if (bytes.len > self.budget.limit -| self.budget.live) return null;
+        // A cache is optional within the operator's admission too. Bound its
+        // speculative allocations by remaining known parent capacity so an
+        // operator quota miss falls back to the consumer's scratch region.
+        const ceiling = self.budget.limit;
+        if (@import("memory_budget.zig").headroom(self.budget.backing)) |available|
+            self.budget.limit = @min(ceiling, self.budget.live +| available);
+        defer self.budget.limit = ceiling;
+        self.budget.exhausted = false;
+        const entry = self.budget.allocator().create(Entry) catch |err| {
+            if (self.budget.exhausted) return null;
+            return err;
+        };
+        entry.* = .{ .arena = .init(self.budget.allocator()), .datum = .{}, .next = null };
+        var keep = false;
+        defer if (!keep) {
+            entry.arena.deinit();
+            self.budget.allocator().destroy(entry);
+        };
+        entry.datum = payload.decode(entry.arena.allocator()) catch |err| {
+            if (err == error.OutOfMemory and self.budget.exhausted) return null;
+            return err;
+        };
+        entry.next = self.entries;
+        self.entries = entry;
+        keep = true;
+        return entry;
+    }
+};
+const JsonPayload = struct {
+    text: ?[]const u8 = null,
+    frozen: ?@import("execution_batch.zig").FrozenJson = null,
+    cached: ?*JsonCache.Entry = null,
+    attempted: bool = false,
+    fn decode(self: JsonPayload, a: A) !Datum {
+        if (self.frozen) |value| return @import("spill.zig").materializeFrozenJson(a, value);
+        return Datum.json(try std.json.parseFromSliceLeaky(std.json.Value, a, self.text.?, .{ .parse_numbers = false }));
+    }
+};
 const Column = struct {
     const Values = union(enum) {
         unknown,
@@ -190,7 +275,8 @@ const Column = struct {
         encoded: std.ArrayList(std.json.Value),
     };
     values: Values = .unknown,
-    json_bytes: ?*std.ArrayList(?[]const u8) = null,
+    json_bytes: ?*std.ArrayList(?JsonPayload) = null,
+    json_cache: ?*JsonCache = null,
     nulls: std.ArrayList(u64) = .empty,
     patterns: std.ArrayList(?*scalar.PatternSet) = .empty,
     arrays: std.ArrayList(?*const @import("array_value.zig").Value) = .empty,
@@ -215,7 +301,9 @@ const Column = struct {
     }
     fn cell(self: Column, a: A, row: usize) !Datum {
         if (self.isNull(row)) return .{};
-        if (self.json_bytes) |bytes| if (bytes.items[row]) |json| return Datum.json(try std.json.parseFromSliceLeaky(std.json.Value, a, json, .{ .parse_numbers = false }));
+        if (self.json_bytes) |bytes| if (bytes.items[row]) |*json| {
+            return self.json_cache.?.materialize(json, a);
+        };
         const value: std.json.Value = switch (self.values) {
             .unknown => return error.InvalidSqlBackendResponse,
             .integers => |v| .{ .integer = v.get(row) },
@@ -353,16 +441,22 @@ const Column = struct {
         }
         return true;
     }
-    fn appendJson(self: *Column, a: A, owned: A, scratch: A, row: usize, bytes: []const u8) !void {
+    fn appendJson(self: *Column, a: A, owned: A, scratch: A, row: usize, payload: JsonPayload) !void {
         if (self.json_bytes == null) {
-            const values = try a.create(std.ArrayList(?[]const u8));
+            const values = try a.create(std.ArrayList(?JsonPayload));
             values.* = .empty;
             self.json_bytes = values;
             try values.resize(a, row);
             @memset(values.items, null);
         }
         try self.append(a, owned, scratch, row, Datum.json(.null));
-        self.json_bytes.?.items[row] = try owned.dupe(u8, bytes);
+        var retained = payload;
+        if (payload.text) |text| retained.text = try owned.dupe(u8, text);
+        if (payload.frozen) |value| {
+            retained.frozen = value;
+            retained.frozen.?.bytes = try owned.dupe(u8, value.bytes);
+        }
+        self.json_bytes.?.items[row] = retained;
     }
     fn append(self: *Column, a: A, owned: A, scratch: A, row: usize, value: Datum) !void {
         if (self.json_bytes) |bytes| try bytes.append(a, null);
@@ -454,6 +548,7 @@ pub const Store = struct {
     len: usize = 0,
     initialized: bool = false,
     failed: bool = false,
+    json_cache: ?*JsonCache = null,
     pub fn init(a: A) Store {
         return .{ .a = a, .arena = .init(a) };
     }
@@ -461,6 +556,18 @@ pub const Store = struct {
         for (self.columns) |*column| column.deinit(self.a);
         self.a.free(self.columns);
         self.arena.deinit();
+        if (self.json_cache) |cache| {
+            cache.deinit();
+            self.a.destroy(cache);
+        }
+    }
+    fn jsonCache(self: *Store) !*JsonCache {
+        if (self.json_cache == null) {
+            const cache = try self.a.create(JsonCache);
+            cache.* = .{ .budget = .{ .backing = @import("memory_budget.zig").reclaimingAllocator(self.a), .limit = JsonCache.limit }, .text_arena = .init(self.a) };
+            self.json_cache = cache;
+        }
+        return self.json_cache.?;
     }
     /// Conservative admission estimate that recognizes already retained
     /// dictionary bytes. Capacity growth is still enforced by the allocator.
@@ -564,8 +671,14 @@ pub const Store = struct {
             _ = scratch.reset(.free_all);
             for (0..batch.len()) |index| {
                 _ = scratch.reset(.retain_capacity);
+                if (try batch.frozenJson(index, ordinal)) |frozen| {
+                    column.json_cache = try self.jsonCache();
+                    try column.appendJson(self.a, self.arena.allocator(), scratch.allocator(), self.len + index, .{ .frozen = frozen });
+                    continue;
+                }
                 if (try batch.encodedJson(index, ordinal)) |bytes| {
-                    try column.appendJson(self.a, self.arena.allocator(), scratch.allocator(), self.len + index, bytes);
+                    column.json_cache = try self.jsonCache();
+                    try column.appendJson(self.a, self.arena.allocator(), scratch.allocator(), self.len + index, .{ .text = bytes });
                     continue;
                 }
                 const value = try batch.cell(scratch.allocator(), index, ordinal);
@@ -617,9 +730,17 @@ pub const Store = struct {
     pub fn encodedJson(self: *const Store, index: usize, column: usize) !?[]const u8 {
         if (self.failed or index >= self.len or column >= self.columns.len) return error.InvalidSqlBackendResponse;
         const values = self.columns[column].json_bytes orelse return null;
-        return values.items[index];
+        const payload = if (values.items[index]) |*payload| payload else return null;
+        return self.json_cache.?.encoded(payload);
+    }
+    pub fn frozenJson(self: *const Store, index: usize, column: usize) !?@import("execution_batch.zig").FrozenJson {
+        if (self.failed or index >= self.len or column >= self.columns.len) return error.InvalidSqlBackendResponse;
+        const values = self.columns[column].json_bytes orelse return null;
+        const payload = values.items[index] orelse return null;
+        return payload.frozen;
     }
     pub fn cellBytes(self: *const Store, a: A, index: usize, column: usize) !usize {
+        if (try self.frozenJson(index, column)) |value| return value.bytes.len;
         if (try self.encodedJson(index, column)) |bytes| return bytes.len;
         return @import("operators.zig").datumBytes(try self.cell(a, index, column));
     }
@@ -858,4 +979,88 @@ fn dictionaryHandoffScenario(a: A) !void {
 test "SQL dictionary handoff remaps referenced entries preserves NULL prefixes and unwinds failures" {
     try dictionaryHandoffScenario(std.testing.allocator);
     try std.testing.checkAllAllocationFailures(std.testing.allocator, dictionaryHandoffScenario, .{});
+}
+
+test "SQL encoded JSON bounded cache reuses scalar trees and releases failed attempts" {
+    const Fixture = struct {
+        fn run(a: A) !void {
+            const Probe = struct {
+                fn json(_: *anyopaque, _: usize, _: usize) !?[]const u8 {
+                    return "{\"x\":[1,2,3],\"s\":\"value\"}";
+                }
+                fn cell(_: *anyopaque, _: A, _: usize, _: usize) !Datum {
+                    return error.UnexpectedScalarMaterialization;
+                }
+            };
+            var raw: u8 = 0;
+            var store = Store.init(a);
+            defer store.deinit();
+            try store.appendBatch(.{ .reader = .{ .ptr = &raw, .read = Probe.cell, .read_json = Probe.json, .count = 3, .width = 1 } });
+            var scratch = std.heap.ArenaAllocator.init(a);
+            defer scratch.deinit();
+            const first = try store.cell(scratch.allocator(), 0, 0);
+            const live = store.json_cache.?.budget.live;
+            _ = scratch.reset(.free_all);
+            for (0..16) |_| {
+                const again = try store.cell(scratch.allocator(), 0, 0);
+                try std.testing.expect(first.value.object.values().ptr == again.value.object.values().ptr);
+                try std.testing.expectEqual(live, store.json_cache.?.budget.live);
+            }
+            // Policy exhaustion is an optimization miss, while a genuine
+            // backing allocator failure must still propagate to the caller.
+            store.json_cache.?.budget.limit = live + @sizeOf(JsonCache.Entry) + 32;
+            const second = try store.cell(scratch.allocator(), 1, 0);
+            try std.testing.expectEqualStrings("1", second.value.object.get("x").?.array.items[0].number_string);
+            try std.testing.expectEqual(live, store.json_cache.?.budget.live);
+            try std.testing.expect(store.columns[0].json_bytes.?.items[1].?.cached == null);
+            try std.testing.expect(store.columns[0].json_bytes.?.items[1].?.attempted);
+            var parent: @import("memory_budget.zig") = .{ .backing = a, .limit = 0 };
+            const original = store.json_cache.?.budget.backing;
+            store.json_cache.?.budget.backing = parent.allocator();
+            defer store.json_cache.?.budget.backing = original;
+            store.json_cache.?.budget.limit = JsonCache.limit;
+            _ = try store.cell(scratch.allocator(), 2, 0);
+            try std.testing.expect(!parent.exhausted);
+            try std.testing.expectEqual(@as(usize, 0), parent.live);
+            try std.testing.expectEqual(live, store.json_cache.?.budget.live);
+        }
+    };
+    try Fixture.run(std.testing.allocator);
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Fixture.run, .{});
+}
+
+test "native projection refinements benchmark repeated retained JSON scalar reads" {
+    var source = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer source.deinit();
+    var input: std.Io.Writer.Allocating = .init(source.allocator());
+    try input.writer.writeByte('[');
+    for (0..if (@import("builtin").mode == .debug) @as(usize, 512) else 1024) |i| {
+        if (i != 0) try input.writer.writeByte(',');
+        try input.writer.writeAll("{\"x\":1,\"s\":\"nested value\"}");
+    }
+    try input.writer.writeByte(']');
+    const Probe = struct {
+        bytes: []const u8,
+        fn json(raw: *anyopaque, _: usize, _: usize) !?[]const u8 {
+            return @as(*@This(), @ptrCast(@alignCast(raw))).bytes;
+        }
+        fn cell(_: *anyopaque, _: A, _: usize, _: usize) !Datum {
+            return error.UnexpectedScalarMaterialization;
+        }
+    };
+    var probe: Probe = .{ .bytes = input.written() };
+    var store = Store.init(std.testing.allocator);
+    defer store.deinit();
+    try store.appendBatch(.{ .reader = .{ .ptr = &probe, .read = Probe.cell, .read_json = Probe.json, .count = 1, .width = 1 } });
+    var baseline: @import("memory_budget.zig") = .{ .backing = std.testing.allocator, .limit = 128 << 20 };
+    var prior = std.heap.ArenaAllocator.init(baseline.allocator());
+    defer prior.deinit();
+    for (0..16) |_| _ = try std.json.parseFromSliceLeaky(std.json.Value, prior.allocator(), probe.bytes, .{ .parse_numbers = false });
+    var budget: @import("memory_budget.zig") = .{ .backing = std.testing.allocator, .limit = 128 << 20 };
+    var results = std.heap.ArenaAllocator.init(budget.allocator());
+    defer results.deinit();
+    for (0..16) |_| _ = try store.cell(results.allocator(), 0, 0);
+    try std.testing.expect(store.json_cache.?.budget.live <= JsonCache.limit);
+    try std.testing.expect(store.json_cache.?.budget.peak + budget.peak < baseline.peak);
+    std.debug.print("RETAINED_JSON_CACHE before_peak={d} after_scratch_peak={d} cache_peak={d} wire={d} reads=16\n", .{ baseline.peak, budget.peak, store.json_cache.?.budget.peak, probe.bytes.len });
 }

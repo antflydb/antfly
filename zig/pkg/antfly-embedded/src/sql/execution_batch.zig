@@ -19,13 +19,16 @@
 const std = @import("std");
 const scalar = @import("scalar.zig");
 const A = std.mem.Allocator;
+/// Validated frozen JSON tokens, distinct from canonical JSON text. V1 tags
+/// preserve exact scalar representations. Bytes borrow the producer lease.
+pub const FrozenJson = struct { version: enum { v1 } = .v1, bytes: []const u8, lossless_text: bool };
 pub const Batch = union(enum) {
     /// One expression over page-local dictionary entries, including a NULL lane.
     dictionary: struct { values: []const scalar.Datum, indices: []const u32 },
     /// Stable retained columns; ownership belongs to the enclosing lease.
     retained: struct { store: *const @import("typed_store.zig").Store, begin: usize = 0, count: usize },
     /// Operator-specific column access without constructing a row matrix.
-    reader: struct { ptr: *anyopaque, read: *const fn (*anyopaque, A, usize, usize) anyerror!scalar.Datum, read_dictionary: ?*const fn (*anyopaque, A, usize) anyerror!?Batch = null, read_json: ?*const fn (*anyopaque, usize, usize) anyerror!?[]const u8 = null, read_identity: ?*const fn (*anyopaque, usize, usize) anyerror!?u64 = null, count: usize, width: usize },
+    reader: struct { ptr: *anyopaque, read: *const fn (*anyopaque, A, usize, usize) anyerror!scalar.Datum, read_dictionary: ?*const fn (*anyopaque, A, usize) anyerror!?Batch = null, read_frozen: ?*const fn (*anyopaque, usize, usize) anyerror!?FrozenJson = null, read_json: ?*const fn (*anyopaque, usize, usize) anyerror!?[]const u8 = null, read_identity: ?*const fn (*anyopaque, usize, usize) anyerror!?u64 = null, count: usize, width: usize },
     columns: struct { page: @import("catalog.zig").ColumnPage, definitions: []const scalar.Column },
     rows: []const []const scalar.Datum,
     vectors: struct { values: []const []const scalar.Datum, count: usize },
@@ -64,8 +67,19 @@ pub const Batch = union(enum) {
             else => null,
         };
     }
+    pub fn frozenJson(self: Batch, row_index: usize, column: usize) anyerror!?FrozenJson {
+        if (row_index >= self.len() or column >= self.width()) return error.InvalidSqlBackendResponse;
+        return switch (self) {
+            .retained => |v| v.store.frozenJson(v.begin + row_index, column),
+            .reader => |v| if (v.read_frozen) |read| read(v.ptr, row_index, column) else null,
+            .mapped => |v| if (column < v.types.len and v.types[column].kind == .json and v.ordinals[column] != std.math.maxInt(usize)) v.source.frozenJson(v.selection[row_index], v.ordinals[column]) else null,
+            .columns => |v| if (v.definitions[column].type == .json) v.page.frozenJson(row_index, v.definitions[column].name) else null,
+            else => null,
+        };
+    }
     /// Size admission must not force an encoded JSON column into a DOM.
     pub fn cellBytes(self: Batch, a: A, row_index: usize, column: usize) !usize {
+        if (try self.frozenJson(row_index, column)) |value| return value.bytes.len;
         if (try self.encodedJson(row_index, column)) |bytes| return bytes.len;
         return @import("operators.zig").datumBytes(try self.cell(a, row_index, column));
     }
@@ -84,6 +98,10 @@ pub const Batch = union(enum) {
                 const view: *@This() = @ptrCast(@alignCast(raw));
                 return view.source.encodedJson(row_index, view.column);
             }
+            fn frozen(raw: *anyopaque, row_index: usize, _: usize) !?FrozenJson {
+                const view: *@This() = @ptrCast(@alignCast(raw));
+                return view.source.frozenJson(row_index, view.column);
+            }
             fn identity(raw: *anyopaque, row_index: usize, _: usize) !?u64 {
                 const view: *@This() = @ptrCast(@alignCast(raw));
                 return view.source.dictionaryIdentity(row_index, view.column);
@@ -91,7 +109,7 @@ pub const Batch = union(enum) {
         };
         const view = try a.create(View);
         view.* = .{ .source = self, .column = column };
-        return .{ .reader = .{ .ptr = view, .read = View.read, .read_identity = View.identity, .read_json = View.json, .count = self.len(), .width = 1 } };
+        return .{ .reader = .{ .ptr = view, .read = View.read, .read_identity = View.identity, .read_json = View.json, .read_frozen = View.frozen, .count = self.len(), .width = 1 } };
     }
     /// Optional physical representation, with the same cells and row order.
     /// Producers decline when normalization or effects require scalar access.
@@ -189,6 +207,10 @@ pub const Batch = union(enum) {
                 const view: *@This() = @ptrCast(@alignCast(raw));
                 return view.source.encodedJson(view.selection[row_index], column);
             }
+            fn frozen(raw: *anyopaque, row_index: usize, column: usize) !?FrozenJson {
+                const view: *@This() = @ptrCast(@alignCast(raw));
+                return view.source.frozenJson(view.selection[row_index], column);
+            }
             fn identity(raw: *anyopaque, row_index: usize, column: usize) !?u64 {
                 const view: *@This() = @ptrCast(@alignCast(raw));
                 return view.source.dictionaryIdentity(view.selection[row_index], column);
@@ -197,7 +219,7 @@ pub const Batch = union(enum) {
         for (selection) |index| if (index >= self.len()) return error.InvalidSqlBackendResponse;
         const view = try a.create(View);
         view.* = .{ .source = self, .selection = selection };
-        return .{ .reader = .{ .ptr = view, .count = selection.len, .width = self.width(), .read = View.read, .read_dictionary = View.dictionary, .read_identity = View.identity, .read_json = View.json } };
+        return .{ .reader = .{ .ptr = view, .count = selection.len, .width = self.width(), .read = View.read, .read_dictionary = View.dictionary, .read_identity = View.identity, .read_json = View.json, .read_frozen = View.frozen } };
     }
     pub fn cell(self: Batch, a: A, index: usize, column: usize) anyerror!scalar.Datum {
         if (index >= self.len() or column >= self.width()) return error.InvalidSqlBackendResponse;

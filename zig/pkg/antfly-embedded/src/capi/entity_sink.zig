@@ -1695,6 +1695,9 @@ fn testNativeTextQueryConcurrentCommit(change_config: bool) !void {
         try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_sql_json(writer, .fromSlice(request), &sql_output));
         api.antfly_buffer_free(&sql_output);
     }
+    // Complete setup publications before installing a producer on the pinned
+    // reader root; background setup work must not replace that test double.
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_run_until_idle(writer));
     var readonly = options;
     readonly.open_mode = h.capi.open_mode_readonly;
     var reader: ?*anyopaque = null;
@@ -1706,12 +1709,16 @@ fn testNativeTextQueryConcurrentCommit(change_config: bool) !void {
     api.antfly_buffer_free(&sql_output);
     defer _ = sql_cursor.antfly_db_sql_close_cursor(reader, cursor);
     var state: State = .{};
-    const setup = api.enterHandle(reader, .read).?;
-    const snapshot = setup.handle;
-    snapshot.query_producer = try @import("../asset_producer_runtime.zig").Runtime.createOwned(snapshot.alloc, snapshot.database().backend_runtime.io().?, .{
-        .antfly_provider = managed.AntflyProvider{ .ptr = &state, .owns_invocation_admission = true, .embed_dense_texts = State.embedDense, .embed_sparse_texts = State.embedSparse, .extract = State.extract },
-    });
-    setup.leave();
+    const snapshot = blk: {
+        const setup = api.enterHandle(reader, .read).?;
+        defer setup.leave();
+        try std.testing.expectEqual(@as(?h.capi.ErrorCode, null), setup.entry_error);
+        const snapshot = setup.handle;
+        snapshot.query_producer = try @import("../asset_producer_runtime.zig").Runtime.createOwned(snapshot.alloc, snapshot.database().backend_runtime.io().?, .{
+            .antfly_provider = managed.AntflyProvider{ .ptr = &state, .owns_invocation_admission = true, .embed_dense_texts = State.embedDense, .embed_sparse_texts = State.embedSparse, .extract = State.extract },
+        });
+        break :blk snapshot;
+    };
     var first: Query = .{ .id = reader };
     var second: Query = .{ .id = reader };
     const first_thread = try std.Thread.spawn(.{ .stack_size = 8 * 1024 * 1024 }, Query.run, .{&first});
@@ -1728,29 +1735,33 @@ fn testNativeTextQueryConcurrentCommit(change_config: bool) !void {
     // A bounded wait fails instead of deadlocking if extraction retains the path lock.
     try state.committed.waitTimeout(h.handleLockIo(), .{ .duration = .{ .raw = .fromSeconds(10), .clock = .awake } });
     try std.testing.expectEqual(h.capi.ErrorCode.ok, write.code);
-    const refreshed = api.enterHandle(reader, .read).?;
-    try std.testing.expect(refreshed.handle != snapshot);
-    try std.testing.expectEqual(@as(usize, 2), snapshot.query_borrows);
-    try std.testing.expect(snapshot.query_producer != null);
-    refreshed.leave();
+    {
+        const refreshed = api.enterHandle(reader, .read).?;
+        defer refreshed.leave();
+        try std.testing.expect(refreshed.handle != snapshot);
+        try std.testing.expectEqual(@as(usize, 2), snapshot.query_borrows);
+        try std.testing.expect(snapshot.query_producer != null);
+    }
     state.release.set(h.handleLockIo());
     try first.done.waitTimeout(h.handleLockIo(), .{ .duration = .{ .raw = .fromSeconds(10), .clock = .awake } });
     try second.done.waitTimeout(h.handleLockIo(), .{ .duration = .{ .raw = .fromSeconds(10), .clock = .awake } });
     try std.testing.expectEqual(if (change_config) h.capi.ErrorCode.busy else h.capi.ErrorCode.ok, first.code);
     try std.testing.expectEqual(if (change_config) h.capi.ErrorCode.busy else h.capi.ErrorCode.ok, second.code);
-    const pinned = api.enterHandle(reader, .read).?;
-    // resumeQuery collected while this registry was attached to the new root.
-    // The cursor must still pin the original root after both queries finish.
-    try std.testing.expectEqual(@as(usize, 1), pinned.connection.?.owner.retired.items.len);
-    try std.testing.expect(pinned.connection.?.owner.retired.items[0] == snapshot);
-    pinned.leave();
+    {
+        const pinned = api.enterHandle(reader, .read).?;
+        defer pinned.leave();
+        // resumeQuery collected while this registry was attached to the new root.
+        // The cursor must still pin the original root after both queries finish.
+        try std.testing.expectEqual(@as(usize, 1), pinned.connection.?.owner.retired.items.len);
+        try std.testing.expect(pinned.connection.?.owner.retired.items[0] == snapshot);
+    }
     try std.testing.expectEqual(h.capi.ErrorCode.ok, sql_cursor.antfly_db_sql_fetch_cursor_json(reader, cursor, 10, &sql_output));
     try std.testing.expect(std.mem.indexOf(u8, sql_output.ptr.?[0..sql_output.len], "7") != null);
     api.antfly_buffer_free(&sql_output);
     try std.testing.expectEqual(h.capi.ErrorCode.ok, sql_cursor.antfly_db_sql_close_cursor(reader, cursor));
     const finished = api.enterHandle(reader, .read).?;
+    defer finished.leave();
     try std.testing.expectEqual(@as(usize, 0), finished.connection.?.owner.retired.items.len);
-    finished.leave();
 }
 
 test "capi inline resolver ownership migrates legacy declarations and preserves independent definitions" {

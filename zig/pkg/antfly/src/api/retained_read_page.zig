@@ -188,6 +188,12 @@ fn encodeBounded(comptime direct: bool, alloc: A, output_budget: *sources.sql_me
                     if (!try plan.present(self.names, self.column + ordinal)) return null;
                     return plan.input.sqlRow().encodedJson(self.names[self.column + ordinal]);
                 }
+                fn frozen(raw: *anyopaque, row: usize, ordinal: usize) !?sources.sql_execution_batch.FrozenJson {
+                    const self: *@This() = @ptrCast(@alignCast(raw));
+                    const plan = self.plans[row];
+                    if (!try plan.present(self.names, self.column + ordinal)) return null;
+                    return plan.input.sqlRow().frozenJson(self.names[self.column + ordinal]);
+                }
                 fn dictionary(raw: *anyopaque, scratch_alloc: A, ordinal: usize) !?sources.sql_execution_batch.Batch {
                     const self: *@This() = @ptrCast(@alignCast(raw));
                     if (self.plans.len == 0 or (try self.plans[0].dictionaryKey(self.names, self.column + ordinal)) == null) return null;
@@ -215,7 +221,7 @@ fn encodeBounded(comptime direct: bool, alloc: A, output_budget: *sources.sql_me
             var columns: Columns = .{ .plans = plans[first..][0..count], .names = names.keys(), .column = column };
             var ordinals: [256]u64 = undefined;
             for (ordinals[0..count], first..) |*ordinal, index| ordinal.* = index;
-            const batch: sources.sql_execution_batch.Batch = .{ .reader = .{ .ptr = &columns, .read = Columns.cell, .read_dictionary = Columns.dictionary, .read_json = Columns.json, .count = count, .width = width } };
+            const batch: sources.sql_execution_batch.Batch = .{ .reader = .{ .ptr = &columns, .read = Columns.cell, .read_dictionary = Columns.dictionary, .read_json = Columns.json, .read_frozen = Columns.frozen, .count = count, .width = width } };
             if (direct) {
                 var response = out.toArrayList();
                 defer out = .fromArrayList(output_budget.allocator(), &response);

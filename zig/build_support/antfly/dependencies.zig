@@ -358,6 +358,7 @@ pub fn create(b: *std.Build, comptime asking_build_zig: type) ?Shared {
     });
     @import("../embedded/source_owner.zig").attach(pgwire_test_mod);
     pgwire_test_mod.addImport("sql_parser", sql_parser_mod);
+    pgwire_test_mod.addImport("antfly_platform", platform_mod);
     // This intentionally remains a storage-independent test root. Every
     // pgwire-owned test has the pgwire prefix; without a compile filter Zig
     // also discovers transitive storage tests through the SQL binder and

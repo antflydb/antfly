@@ -2033,7 +2033,7 @@ fn Engine(comptime Context: type) type {
                                     var index: usize = 0;
                                     while (try self.hash_join.?.unmatched(&index)) |match| {
                                         _ = transfer.reset(.retain_capacity);
-                                        try owner.add(true, try match.materializeValues(transfer.allocator()), try match.materializeKeys(transfer.allocator()), @intCast(match.index));
+                                        try owner.addBatch(true, try match.valuesBatch(transfer.allocator()), &.{try match.materializeKeys(transfer.allocator())}, 0);
                                     }
                                     self.hash_join.?.deinit();
                                     self.hash_join = null;
