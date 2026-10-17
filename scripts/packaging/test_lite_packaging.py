@@ -255,6 +255,50 @@ class LitePackagingTests(unittest.TestCase):
             snapshot.verify(sealed, "1.2.3", commit)
             manifest_path = sealed / "lite-snapshot.json"
             manifest = json.loads(manifest_path.read_text())
+            self.assertEqual(manifest["schema_version"], 2)
+            self.assertEqual(
+                set(manifest["wheel_platforms"]),
+                {platform.wheel_platform for platform in package.PACKAGE_PLATFORMS},
+            )
+            with mock.patch.object(
+                snapshot,
+                "source_wheel_platforms",
+                return_value=["a changed future policy"],
+            ):
+                snapshot.verify(sealed, "1.2.3", commit)
+            legacy = root / "legacy-snapshot"
+            shutil.copytree(sealed, legacy)
+            legacy_manifest = json.loads(manifest_path.read_text())
+            legacy_manifest["schema_version"] = 1
+            legacy_manifest.pop("wheel_platforms")
+            for item in legacy_manifest["artifacts"]:
+                if "macosx_" not in item["name"]:
+                    continue
+                original = legacy / item["name"]
+                old_tag = item["name"].split("py3-none-", 1)[1].removesuffix(".whl")
+                item["name"] = item["name"].replace(old_tag, "macosx_11_0_arm64")
+                destination = legacy / item["name"]
+                with (
+                    zipfile.ZipFile(original) as source,
+                    zipfile.ZipFile(destination, "w") as wheel,
+                ):
+                    for name in source.namelist():
+                        content = source.read(name)
+                        if name.endswith(".dist-info/WHEEL"):
+                            content = content.replace(
+                                old_tag.encode(), b"macosx_11_0_arm64"
+                            )
+                        wheel.writestr(name, content)
+                original.unlink()
+                item["size"] = destination.stat().st_size
+                item["sha256"] = snapshot.sha256(destination)
+            (legacy / "lite-snapshot.json").write_text(json.dumps(legacy_manifest))
+            snapshot.verify(legacy, "1.2.3", commit)
+            bad_platforms = {**manifest, "wheel_platforms": ["../escape", "x", "y"]}
+            manifest_path.write_text(json.dumps(bad_platforms))
+            with self.assertRaisesRegex(ValueError, "wheel platform set differs"):
+                snapshot.verify(sealed, "1.2.3", commit)
+            manifest_path.write_text(json.dumps(manifest))
             manifest["artifacts"].append(manifest["artifacts"][0])
             manifest_path.write_text(json.dumps(manifest))
             with self.assertRaisesRegex(ValueError, "artifact set differs"):

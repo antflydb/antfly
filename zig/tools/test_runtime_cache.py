@@ -1198,7 +1198,14 @@ class RuntimeCacheTest(unittest.TestCase):
         contents = project.read_text()
         attachment = 'default_test_step.dependOn(&b.top_level_steps.get("test-finetune-unit").?.step);'
         self.assertIn(attachment, contents)
-        project.write_text(contents.replace(attachment, "_ = default_test_step;"))
+        # Keep this graph mutation compilable even when other suites also
+        # reference the default step. A discard becomes a Zig compile error
+        # once another owner uses it, hiding the intended ownership failure.
+        project.write_text(
+            contents.replace(
+                attachment, "std.mem.doNotOptimizeAway(default_test_step);"
+            )
+        )
         failure = self.build("cache-finetune-standalone", succeeds=False)
         self.assertIn(
             "standalone gate must reach shared finetuning owner once", failure

@@ -347,7 +347,7 @@ test "external lake native warming recovers empty malformed oversized and invali
 test "external lake native warming canceled persistence preserves last complete state" {
     const a = std.testing.allocator;
     const io = std.testing.io;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/.warming.json", .{tmp.sub_path});
     defer a.free(path);
