@@ -95,7 +95,7 @@ fn inputLiteral(alloc: std.mem.Allocator, result: scalar.Type, value: scalar.Dat
     if (kind == .array) return json(alloc, .{
         .op = "literal",
         .type = "sql_array",
-        .sql_type = @tagName(identity.?),
+        .sql_type = @tagName(identity orelse return error.SqlTypeMismatch),
         .value = if (value.sql_null) Json.null else try @import("array_wire.zig").toJsonLeaky(alloc, value.array.?.*, .{}),
     });
     if (value.numeric) |number| {
@@ -109,7 +109,10 @@ fn inputLiteral(alloc: std.mem.Allocator, result: scalar.Type, value: scalar.Dat
         .json_null = !value.sql_null and value.value == .null,
     });
     if (value.value == .float and !std.math.isFinite(value.value.float)) return error.UnsupportedSqlShape;
-    if (kind == .integer or kind == .number) return json(alloc, .{ .op = "literal", .type = nativeType(kind, identity), .sql_type = @tagName(identity.?), .value = value.value });
+    // Untyped numeric constants have a logical domain but no explicit builtin
+    // identity. Match the ordinary literal lowering path instead of asserting
+    // that constant folding supplied a subtype it never owned.
+    if ((kind == .integer or kind == .number) and identity != null) return json(alloc, .{ .op = "literal", .type = nativeType(kind, identity), .sql_type = @tagName(identity.?), .value = value.value });
     return json(alloc, .{ .op = "literal", .type = nativeType(kind, identity), .value = value.value });
 }
 
@@ -1096,6 +1099,21 @@ test "SQL durable JSON lowering preserves JSON null through immutable COALESCE a
         const actual = try plan.evaluate(owned, &.{});
         try std.testing.expect(actual == .json and actual.json.value == .null);
     }
+}
+
+test "SQL folded schema literals preserve optional builtin identities" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const plain = try inputLiteral(a, .{ .kind = .integer }, .{ .value = .{ .integer = 1 }, .sql_null = false });
+    try std.testing.expectEqualStrings("integer", plain.object.get("type").?.string);
+    try std.testing.expect(plain.object.get("sql_type") == null);
+    const typed = try inputLiteral(a, .{ .kind = .integer, .element_type = .int32 }, .{ .value = .{ .integer = 1 }, .sql_null = false });
+    try std.testing.expectEqualStrings("int32", typed.object.get("sql_type").?.string);
+    const number = try inputLiteral(a, .{ .kind = .number }, .{ .value = .{ .float = 1.5 }, .sql_null = false });
+    try std.testing.expectEqualStrings("number", number.object.get("type").?.string);
+    try std.testing.expect(number.object.get("sql_type") == null);
+    try std.testing.expectError(error.SqlTypeMismatch, inputLiteral(a, .{ .kind = .array }, .{}));
 }
 
 test "SQL schema expressions bind nullable catalog shapes and cold typed arrays" {
