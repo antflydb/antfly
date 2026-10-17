@@ -4123,6 +4123,38 @@ pub fn storageOwnerRaftIndexPreparationJson(
 /// No ordinary-batch decoding or caller-selected replay position enters this
 /// boundary. Metadata permission is independently checked by the server worker;
 /// durable local job/catalog checks remain authoritative for each storage effect.
+pub fn storageOwnerNativeSchemaObservationJson(
+    owner: ?*anyopaque,
+    request: *const kernel_owner_abi.NativeSchemaOwnerObservationRequest,
+    out_response: *kernel_owner_abi.OwnedBytes,
+) callconv(.c) kernel_owner_abi.Status {
+    out_response.* = .{};
+    if (request.version != kernel_owner_abi.abi_version) return .invalid_abi;
+    if (request.table_name.len == 0 or request.table_name.ptr == null or
+        request.control.version != kernel_owner_abi.abi_version or request.control.has_execution_deadline > 1 or
+        request.control._reserved0 != 0 or !std.mem.allEqual(u8, &request.control._reserved1, 0) or
+        request.control.table_name.len != 0 or request.control.request_json.len != 0 or
+        request.binding_json.len == 0 or request.binding_json.ptr == null or request.binding_json.len > 8192)
+        return .invalid_argument;
+    const context: @import("antfly_local_sources").api_operation.RequestContext = .{
+        .deadline_ns = if (request.control.has_execution_deadline != 0) request.control.execution_deadline_ns else null,
+        .cancellation = ownerQueryCancellation(&request.control),
+    };
+    context.ensureActive() catch |err| return storageOwnerStatusFromError(err);
+    const handle = asHandle(owner) orelse return .invalid_argument;
+    _ = storageOwnerTableName(handle, request.table_name) orelse return .invalid_argument;
+    const job = @import("antfly_local_sources").storage_db_relational_nullability_job;
+    var scratch: [64 * 1024]u8 = undefined;
+    var fixed = std.heap.FixedBufferAllocator.init(&scratch);
+    const binding = std.json.parseFromSliceLeaky(job.Binding, fixed.allocator(), request.binding_json.slice(), .{ .ignore_unknown_fields = false }) catch return .invalid_argument;
+    binding.validate() catch return .invalid_argument;
+    if (binding.fence.owner_group_id != handle.storage_owner_group_id) return .invalid_argument;
+    const result = handle.db.observeNativeSchemaOwner(binding, context) catch |err| return storageOwnerStatusFromError(err);
+    var response = BoundedOwnerJsonResponse(db_mod.DB.NativeSchemaOwnerControl.Observation.max_wire_bytes).init() catch |err| return storageOwnerStatusFromError(err);
+    defer response.deinit();
+    return response.finish(result, out_response);
+}
+
 pub fn storageOwnerNativeIndexControlJson(
     owner: ?*anyopaque,
     request: *const kernel_owner_abi.NativeIndexOwnerControlRequest,

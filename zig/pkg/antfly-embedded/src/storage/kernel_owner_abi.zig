@@ -19,7 +19,7 @@
 const failure_abi = @import("runtime_failure_abi");
 
 // Storage layouts evolve independently of the shared failure envelope.
-pub const abi_version: u32 = 93;
+pub const abi_version: u32 = 94;
 pub const Status = failure_abi.Status;
 pub const FailureBoundary = failure_abi.FailureBoundary;
 pub const FailureIdentity = failure_abi.FailureIdentity;
@@ -1243,6 +1243,20 @@ pub const NativeIndexOwnerControlRequest = extern struct {
 pub extern fn antfly_storage_owner_native_index_control_json(
     owner: ?*anyopaque,
     request: *const NativeIndexOwnerControlRequest,
+    out_response: *OwnedBytes,
+) callconv(.c) Status;
+
+/// Read-only native schema progress. No caller-selected root, receipt position,
+/// publication flag or opaque mutation payload is accepted by this port.
+pub const NativeSchemaOwnerObservationRequest = extern struct {
+    version: u32 = abi_version,
+    table_name: BorrowedBytes = .{},
+    binding_json: BorrowedBytes = .{},
+    control: ControlledJsonOperationRequest = .{},
+};
+pub extern fn antfly_storage_owner_native_schema_observation_json(
+    owner: ?*anyopaque,
+    request: *const NativeSchemaOwnerObservationRequest,
     out_response: *OwnedBytes,
 ) callconv(.c) Status;
 

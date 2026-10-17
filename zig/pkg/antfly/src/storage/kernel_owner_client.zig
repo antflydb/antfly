@@ -679,6 +679,27 @@ pub const Owner = struct {
         return parsed.value;
     }
 
+    pub fn nativeSchemaOwnerObservation(self: *Owner, table_name: []const u8, binding: @import("antfly_local_sources").storage_db_relational_nullability_job.Binding, options: QueryOptions) !@import("antfly_local_sources").storage_db_relational_schema_owner_control.Observation {
+        try binding.validate();
+        var buffer: [8192]u8 = undefined;
+        var writer = std.Io.Writer.fixed(&buffer);
+        try std.json.Stringify.value(binding, .{}, &writer);
+        var response: Response = .{};
+        defer response.deinit();
+        try statusToError(abi.antfly_storage_owner_native_schema_observation_json(self.handle, &.{
+            .table_name = .fromSlice(table_name),
+            .binding_json = .fromSlice(writer.buffered()),
+            .control = controlledRequest("", "", options.execution_deadline_ns, options.cancellation_ctx, options.cancellation_fn),
+        }, &response.buffer));
+        const Observation = @import("antfly_local_sources").storage_db_relational_schema_owner_control.Observation;
+        if (response.bytes().len == 0 or response.bytes().len > Observation.max_wire_bytes) return error.SchemaValidationJobChanged;
+        var scratch: [128 * 1024]u8 = undefined;
+        var fixed = std.heap.FixedBufferAllocator.init(&scratch);
+        const result = try std.json.parseFromSliceLeaky(Observation, fixed.allocator(), response.bytes(), .{ .ignore_unknown_fields = false });
+        try result.validateFor(binding);
+        return result;
+    }
+
     pub fn nativeIndexOwnerStateJson(self: *Owner, table_name: []const u8, identity_json: []const u8) !Response {
         var response: Response = .{};
         try statusToError(abi.antfly_storage_owner_native_index_control_json(self.handle, &.{

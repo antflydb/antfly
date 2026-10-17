@@ -1265,6 +1265,70 @@ const TestWalOptions = struct {
     }
 };
 
+test "opaque schema owner observation preserves native root scope without creating a job" {
+    const alloc = std.testing.allocator;
+    const job = @import("antfly_local_sources").storage_db_relational_nullability_job;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmp.dir.realPathFileAlloc(std.testing.io, ".", alloc);
+    defer alloc.free(path);
+    var context: client.Context = .{};
+    try context.ensure();
+    defer context.deinit();
+    var owner = try client.Owner.open(.{
+        .context = context.handle,
+        .path = .fromSlice(path),
+        .table_name = .fromSlice("rows"),
+        .group_id = 72,
+        .has_identity_namespace = 1,
+        .identity_table_id = 7,
+        .identity_shard_id = 172,
+        .identity_range_id = 272,
+        .online_source_authority = 2,
+    });
+    defer owner.deinit();
+    const binding: job.Binding = .{
+        .id = @splat(1),
+        .plan_digest = @splat(2),
+        .owner = @splat(3),
+        .fence = .{ .transition_id = 4, .attempt = 1, .admission_epoch = 1, .owner_group_id = 72, .peer_group_id = 72, .namespace = .{ .table_id = 7, .shard_id = 172, .range_id = 272 }, .catalog_digest = @splat(5), .role = .schema_validation },
+        .authority = .native,
+        .before_version = 1,
+        .after_version = 2,
+        .columns = 1,
+        .before_schema = @splat(6),
+        .after_schema = @splat(7),
+        .before_public = @splat(8),
+        .after_public = @splat(9),
+        .after_catalog = @splat(10),
+        .physical_catalog = @splat(11),
+        .inputs = @splat(12),
+        .projection_identity = @splat(13),
+    };
+    const first = try owner.nativeSchemaOwnerObservation("rows", binding, .{});
+    try std.testing.expect(first.header == null and !first.replication_pending);
+    try std.testing.expectEqual(@as(u64, 0), first.sequence);
+    try std.testing.expect(first.physical_root_incarnation != 0);
+    const second = try owner.nativeSchemaOwnerObservation("rows", binding, .{});
+    try std.testing.expectEqualDeep(first, second);
+    var foreign = binding;
+    foreign.fence.namespace.range_id += 1;
+    try std.testing.expectError(error.IdentityNamespaceMismatch, owner.nativeSchemaOwnerObservation("rows", foreign, .{}));
+    try std.testing.expectError(error.DeadlineExceeded, owner.nativeSchemaOwnerObservation("rows", binding, .{ .execution_deadline_ns = 0 }));
+    const json = try std.json.Stringify.valueAlloc(alloc, binding, .{});
+    defer alloc.free(json);
+    var output: abi.OwnedBytes = .{};
+    try std.testing.expectEqual(abi.Status.invalid_abi, abi.antfly_storage_owner_native_schema_observation_json(owner.handle, &.{ .version = abi.abi_version - 1 }, &output));
+    try std.testing.expect(output.ptr == null);
+    try std.testing.expectEqual(abi.Status.invalid_argument, abi.antfly_storage_owner_native_schema_observation_json(owner.handle, &.{ .table_name = .{ .len = 4 }, .binding_json = .fromSlice(json) }, &output));
+    try std.testing.expectEqual(abi.Status.invalid_argument, abi.antfly_storage_owner_native_schema_observation_json(owner.handle, &.{ .table_name = .fromSlice("rows"), .binding_json = .fromSlice(json), .control = .{ ._reserved0 = 1 } }, &output));
+    const unknown = try std.fmt.allocPrint(alloc, "{{\"unexpected\":true,{s}", .{json[1..]});
+    defer alloc.free(unknown);
+    try std.testing.expectEqual(abi.Status.invalid_argument, abi.antfly_storage_owner_native_schema_observation_json(owner.handle, &.{ .table_name = .fromSlice("rows"), .binding_json = .fromSlice(unknown) }, &output));
+    try std.testing.expect(output.ptr == null);
+    try std.testing.expectEqualDeep(first, try owner.nativeSchemaOwnerObservation("rows", binding, .{}));
+}
+
 test "opaque WAL preserves durable operations and exact failure identity" {
     const root = "/tmp/antfly-storage-kernel-wal-owner";
     const path = root ++ "/wal";

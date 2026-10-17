@@ -273,7 +273,7 @@ pub const Header = struct {
     failure_column: ?u16 = null,
     installation: ?Installation = null,
 
-    fn validate(self: Header) !void {
+    pub fn validate(self: Header) !void {
         try self.binding.validate();
         inline for (.{ "cursor_digest", "chain", "last_effect" }) |field|
             if (std.mem.allEqual(u8, &@field(self, field), 0)) return error.InvalidSchemaValidationJob;

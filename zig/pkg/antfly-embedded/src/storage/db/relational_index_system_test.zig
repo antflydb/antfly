@@ -821,6 +821,14 @@ test "relational index system nullability job native metadata journal preserves 
         try std.testing.expect(admitted.replication_pending and !admitted.duplicate);
         try std.testing.expectEqualStrings("InjectedSchemaJournalUnavailable", admitted.error_name.?);
         try std.testing.expectEqual(@as(u64, 1), journal.lastLsn());
+        primary_db.local_execution.durable_replication_outbox_maybe.store(false, .release);
+        primary_db.async_context.primary_replication_outbox_pending.store(false, .release);
+        const pending_observation = try primary_db.observeNativeSchemaOwner(binding, .{});
+        try pending_observation.validateFor(binding);
+        try std.testing.expect(pending_observation.replication_pending);
+        try std.testing.expectEqual(primary_db.root_incarnation, pending_observation.physical_root_incarnation);
+        try std.testing.expectEqualDeep(admitted.header.?, pending_observation.header.?);
+        try std.testing.expectEqual(@as(u64, 1), journal.lastLsn());
         const original_cut = admitted.position;
         primary_db.close();
         primary_live = false;
@@ -917,6 +925,45 @@ test "relational index system nullability job native metadata journal preserves 
             try std.testing.expectEqual(end_lsn, journal.lastLsn());
             try std.testing.expectError(error.SchemaValidationPublicationRequired, Driver.command(&primary_db, .{ .binding = binding, .action = .cancel }));
             try std.testing.expectEqual(@as(u32, 2), peer_db.core.schema.?.version);
+            const AllocationProbe = struct {
+                parent: std.mem.Allocator,
+                database: *db_mod.DB,
+                checks: usize = 0,
+                blocked: usize = 0,
+                fn check(raw: *anyopaque) *@This() {
+                    const self: *@This() = @ptrCast(@alignCast(raw));
+                    self.checks += 1;
+                    if (self.database.core.tryLockApplyExclusive()) self.database.core.unlockApply() else self.blocked += 1;
+                    return self;
+                }
+                fn allocate(raw: *anyopaque, len: usize, alignment: std.mem.Alignment, return_address: usize) ?[*]u8 {
+                    return check(raw).parent.rawAlloc(len, alignment, return_address);
+                }
+                fn resizeMemory(raw: *anyopaque, memory: []u8, alignment: std.mem.Alignment, len: usize, return_address: usize) bool {
+                    return check(raw).parent.rawResize(memory, alignment, len, return_address);
+                }
+                fn remapMemory(raw: *anyopaque, memory: []u8, alignment: std.mem.Alignment, len: usize, return_address: usize) ?[*]u8 {
+                    return check(raw).parent.rawRemap(memory, alignment, len, return_address);
+                }
+                fn freeMemory(raw: *anyopaque, memory: []u8, alignment: std.mem.Alignment, return_address: usize) void {
+                    const self: *@This() = @ptrCast(@alignCast(raw));
+                    self.parent.rawFree(memory, alignment, return_address);
+                }
+                fn allocator(self: *@This()) std.mem.Allocator {
+                    return .{ .ptr = self, .vtable = &.{ .alloc = allocate, .resize = resizeMemory, .remap = remapMemory, .free = freeMemory } };
+                }
+            };
+            var probe: AllocationProbe = .{ .parent = primary_db.alloc, .database = &primary_db };
+            const installed_observation = blk: {
+                const prior_allocator = primary_db.alloc;
+                primary_db.alloc = probe.allocator();
+                defer primary_db.alloc = prior_allocator;
+                break :blk try primary_db.observeNativeSchemaOwner(binding, .{});
+            };
+            try std.testing.expectEqualDeep(installed.header.?, installed_observation.header.?);
+            try std.testing.expect(probe.checks > 0);
+            try std.testing.expectEqual(@as(usize, 0), probe.blocked);
+            try std.testing.expectEqual(end_lsn, journal.lastLsn());
         }
         try std.testing.expectEqualDeep(try F.current(&primary_db), try F.current(&peer_db));
         try std.testing.expectEqual(try F.clock(&primary_db), try F.clock(&peer_db));
@@ -983,6 +1030,60 @@ test "relational index system nullability job publisher admission uses the actua
     _ = try journal.append(.{ .kind = .checkpoint, .payload_codec = .binary, .payload = body });
     try std.testing.expectEqual(@as(u64, 1), journal.lastLsn());
     try std.testing.expectError(error.WalRecordTooLarge, journal.log.wal.admitAppendBytes(std.math.maxInt(usize)));
+}
+
+test "relational index system nullability job observation binds physical root debt and native authority without mutation" {
+    const F = NullabilityJobFixture;
+    var directory = try @import("../../common/test_directory.zig").TestDirectory.init("schema-owner-observation");
+    defer directory.cleanup();
+    var database = try db_mod.DB.open(alloc, directory.path(), F.options);
+    defer database.close();
+    try database.setSchemaJson(alloc, F.before);
+    var candidate = try F.candidate(&database);
+    defer candidate.deinit();
+    const binding = try F.binding(&database, &candidate, 62);
+    const before = try database.observeNativeSchemaOwner(binding, .{});
+    try before.validateFor(binding);
+    try std.testing.expect(before.header == null and !before.replication_pending);
+    try std.testing.expectEqual(@as(u64, 0), before.sequence);
+    try std.testing.expectEqual(database.root_incarnation, before.physical_root_incarnation);
+    _ = try F.apply(&database, &candidate, binding, .begin);
+    const admitted = try database.observeNativeSchemaOwner(binding, .{});
+    try std.testing.expectEqual(F.job.Phase.fencing, admitted.header.?.phase);
+    try std.testing.expectEqual(try F.clock(&database), admitted.sequence);
+    const decoded = blk: {
+        const encoded = try std.json.Stringify.valueAlloc(alloc, admitted, .{});
+        defer alloc.free(encoded);
+        var parsed = try std.json.parseFromSlice(@TypeOf(admitted), alloc, encoded, .{});
+        defer parsed.deinit();
+        break :blk parsed.value;
+    };
+    try decoded.validateFor(binding);
+    try std.testing.expectEqualDeep(admitted, decoded);
+    var changed = binding;
+    changed.plan_digest[0] ^= 1;
+    try std.testing.expectError(error.SchemaValidationJobChanged, database.observeNativeSchemaOwner(changed, .{}));
+    changed = binding;
+    changed.fence.namespace.range_id += 1;
+    try std.testing.expectError(error.IdentityNamespaceMismatch, database.observeNativeSchemaOwner(changed, .{}));
+    changed = binding;
+    changed.authority = .raft;
+    try std.testing.expectError(error.InvalidControlReceiptPosition, database.observeNativeSchemaOwner(changed, .{}));
+    try std.testing.expectError(error.DeadlineExceeded, database.observeNativeSchemaOwner(binding, .{ .deadline_ns = 0 }));
+    var canceled = std.atomic.Value(bool).init(true);
+    try std.testing.expectError(error.Canceled, database.observeNativeSchemaOwner(binding, .{ .cancellation = @import("../../api/operation.zig").CancellationToken.fromAtomic(&canceled) }));
+    try std.testing.expectEqual(admitted.sequence, try F.clock(&database));
+    var forged = admitted;
+    forged.sequence = 0;
+    try std.testing.expectError(error.SchemaValidationJobChanged, forged.validateFor(binding));
+    forged = admitted;
+    forged.physical_root_incarnation = 0;
+    try std.testing.expectError(error.SchemaValidationJobChanged, forged.validateFor(binding));
+    const marker = @import("../internal_keys.zig").ordered_document_applied_entry_key;
+    // The storage participant itself refuses a Raft marker in this native
+    // domain; do not bypass that earlier authority guard to set up a fixture.
+    try std.testing.expectError(error.OnlineSourceScopeChanged, database.core.store.put(&marker, ""));
+    try std.testing.expectEqualDeep(admitted, try database.observeNativeSchemaOwner(binding, .{}));
 }
 
 const NullabilityScanFixture = struct {

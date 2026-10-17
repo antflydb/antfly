@@ -11375,3 +11375,78 @@ control-catalog, Apache-boundary, license and inventory audits pass. About
 2.5 GiB of specifically inspected inactive earlier test binaries/objects were
 reclaimed for these builds; no broad cache or repository cleanup ran. A final
 full Debug SQL gate for the admission changes is tracked separately.
+
+The final admission SQL gate passes 896 portable and 234 native tests, with
+only four existing opt-in benchmarks skipped and 21/21 build steps, in
+`/private/tmp/antfly-sql-native-owner-admission-full-debug.log`.
+
+### Physical-root-pinned native schema observations
+
+The validation owner now exposes independently read facts rather than asking
+a future signer to trust a mutation response or reconstruct a root from later
+routing. One immutable read supplies the exact job header, durable native
+clock and actual outbox debt. The configured namespace and durable native
+authority must match; an ordered/Raft root is never relabeled native. An empty
+clock is reported as zero with no header, not invented as a receipt position.
+Installed progress additionally verifies its durable successor and matching
+resident schema/index generation. A supplied binding is a lookup identity,
+not admission: absence does not validate that candidate or authorize mutation.
+
+The store snapshot and immutable resident views are pinned together under
+apply-shared. Expensive installed-input verification runs after releasing that
+lock, with the pins retained; no schema-sized compilation is required to hold
+up a writer's exclusive admission. Observation never flushes an outbox or
+creates another source cut. It detects debt even when both volatile hints are
+false. Failure, cancellation and malformed requests cannot turn an observation
+into an append, owner receipt or publication grant.
+
+Private kernel ABI 94 carries only a bounded binding and operation controls
+into this read-only port, and returns a bounded, fully owned fixed-field
+observation. Unknown JSON fields, invalid pointers/reserved controls, stale
+ABIs, foreign owner groups/namespaces and deadlines are checked. The serving
+adapter returns that observation together with the generation from the same
+leased physical owner. Index and schema operations share the physical lease
+helper without pretending a schema job is an index identity. Cold reopen and
+native-versus-Raft scope tests use the actual compiled owner boundary.
+
+Failure ABI 66 declares schema-job corruption, identity conflict, missing job
+and runtime-recovery identities. They must not collapse into an unexplained
+`StorageKernelFailure`. The semantic registry's tests are attached to the
+existing storage-owner gate, not an uninvoked new validation target.
+
+These observations are not signatures, root enrollment/adoption, metadata
+permission, cohort capability checks, publication acceptance or fence release.
+Those distributed activation requirements remain unfinished, the public
+producer stays guarded, topology protocol stays 54 and no original case is
+reclassified. Final pinned/off-lock regression evidence is tracked separately.
+
+The final combined Debug gate passes nine native schema-job tests, one linked
+observation ABI test and three provisioned-owner adapter tests, zero skips or
+leaks, plus the semantic failure registry checks, with 103/103 build steps in
+`/private/tmp/antfly-sql-native-schema-observation-offlock-debug.log`.
+An allocation probe in a real installed/journaled job repeatedly acquires
+apply-exclusive during verification allocations: all probes succeed, and
+observation preserves the installed header, native cut and journal LSN. This
+proves the lock boundary; it is not a measured query-latency speedup. Filled
+observations survive destruction of their JSON/parser buffers. Existing native
+index permission, recovery and cold reopen coverage passes with the shared
+physical-lease helper.
+
+The initial fixture attempted to inject a Raft marker through the ordinary
+native store, which correctly rejected it before observation. The corrected
+test retains that guard and proves no state change; a separately provisioned
+real Raft owner proves native observation rejection. A private structural
+header validator was made public for checked wire validation; it grants no
+commit authority. Earlier final links failed with `NoSpaceLeft`; an incomplete
+cached executable also failed spawning and was confirmed to have an invalid
+Mach-O signature. A combined intermediate attempt exited nonzero with no
+usable log during that disk-pressure interval. None is counted as a pass; the
+fresh final combined run above is authoritative and has no test exclusions.
+
+Formatting, compilation ownership, Apache boundary (2,072 sources), license
+and inventory audits pass. Totals remain 531 implemented / 132 rejected /
+113 superseded / 810 unresolved. About 6 GiB of explicitly inspected obsolete
+ABI archives and earlier test outputs were removed for build headroom; source,
+logs, current verified outputs and other worktrees were retained. All removed
+files are regenerable build artifacts; no broad cache/repository cleanup ran.
+The full Debug SQL gate for this observation checkpoint is tracked separately.

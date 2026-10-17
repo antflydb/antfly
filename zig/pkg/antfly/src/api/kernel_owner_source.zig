@@ -93,6 +93,7 @@ test "native index owner adapter rejects cancellation deadline and foreign group
         try std.testing.expectError(expected, source.raftIndexOwnerObservationAtRoot(std.testing.allocator, 7, "rows", identity, context));
         try std.testing.expectError(expected, source.raftIndexOwnerPreparationAtRoot(std.testing.allocator, 7, "rows", undefined, "manifest", context));
         try std.testing.expectError(expected, source.nativeIndexOwnerState(std.testing.allocator, 7, "rows", identity, context));
+        try std.testing.expectError(expected, source.nativeSchemaOwnerObservationAtRoot(7, "rows", undefined, context));
         try std.testing.expectError(expected, source.readNativeIndexClaimSourceAtRoot(std.testing.allocator, 7, "rows", identity, context));
         try std.testing.expectError(expected, source.nativeIndexOwnerReceipt(std.testing.allocator, 7, "rows", .{ .identity = identity, .effect = .fenced }, context));
         try std.testing.expectError(expected, source.nativeIndexOwnerReceiptAtRoot(std.testing.allocator, 7, "rows", .{ .identity = identity, .effect = .fenced }, context));
@@ -3621,6 +3622,19 @@ pub const ProvisionedKernelOwnerSource = struct {
         try context.ensureActive();
         try identity.validate();
         if (identity.owner_group_id != group_id) return error.PrivateIndexOwnerJobChanged;
+        return self.acquireBoundOwner(group_id, table_name, identity.namespace, context);
+    }
+
+    /// Physical scope is shared across private control families; a schema job
+    /// must not impersonate an index identity just to pin its real owner.
+    fn acquireBoundOwner(
+        self: *ProvisionedKernelOwnerSource,
+        group_id: u64,
+        table_name: []const u8,
+        namespace: @import("antfly_local_sources").storage_db_doc_identity.Namespace,
+        context: request_operation.RequestContext,
+    ) !Lease {
+        try context.ensureActive();
         const normalized = try platformDeadlineContext(context);
         var lease = try self.acquireWithControls(group_id, table_name, .{
             .allow_deferred_catalog = true,
@@ -3628,12 +3642,37 @@ pub const ProvisionedKernelOwnerSource = struct {
             .cancellation = normalized.cancellation,
         });
         errdefer lease.deinit();
-        if (lease.entry.identity.table_id != identity.namespace.table_id or
-            lease.entry.identity.shard_id != identity.namespace.shard_id or
-            lease.entry.identity.range_id != identity.namespace.range_id)
+        if (lease.entry.identity.table_id != namespace.table_id or
+            lease.entry.identity.shard_id != namespace.shard_id or
+            lease.entry.identity.range_id != namespace.range_id)
             return error.IdentityNamespaceMismatch;
         try context.ensureActive();
         return lease;
+    }
+
+    pub const RootedNativeSchemaOwnerObservation = struct {
+        root_generation: u64,
+        observation: @import("antfly_local_sources").storage_db_relational_schema_owner_control.Observation,
+    };
+
+    /// Facts and generation come from the same applying lease. The receiver
+    /// still independently obtains metadata permission, enrollment and current
+    /// native ownership; this observation is not a signed publication receipt.
+    pub fn nativeSchemaOwnerObservationAtRoot(self: *ProvisionedKernelOwnerSource, group_id: u64, table_name: []const u8, binding: @import("antfly_local_sources").storage_db_relational_nullability_job.Binding, context: request_operation.RequestContext) !RootedNativeSchemaOwnerObservation {
+        try context.ensureActive();
+        try binding.validate();
+        if (binding.authority != .native or binding.fence.owner_group_id != group_id) return error.SchemaValidationJobChanged;
+        var lease = try self.acquireBoundOwner(group_id, table_name, binding.fence.namespace, context);
+        defer lease.deinit();
+        const normalized = try platformDeadlineContext(context);
+        var cancellation = normalized.cancellation;
+        const result = try lease.owner().nativeSchemaOwnerObservation(table_name, binding, .{
+            .execution_deadline_ns = normalized.deadline_ns,
+            .cancellation_ctx = &cancellation,
+            .cancellation_fn = cancellationTokenRequested,
+        });
+        try context.ensureActive();
+        return .{ .root_generation = lease.entry.generation, .observation = result };
     }
 
     pub const RootedRaftIndexOwnerObservation = struct {

@@ -78,6 +78,25 @@ test "native index owner adapter inspects cold native ownership and rejects fore
         .namespace = .{ .table_id = 101, .shard_id = 7501, .range_id = 7501 },
         .owner_group_id = 7501,
     };
+    const schema_binding: local.storage_db_relational_nullability_job.Binding = .{
+        .id = @splat(1),
+        .plan_digest = @splat(2),
+        .owner = @splat(3),
+        .fence = .{ .transition_id = 4, .attempt = 1, .admission_epoch = 1, .owner_group_id = 7501, .peer_group_id = 7501, .namespace = identity.namespace, .catalog_digest = @splat(5), .role = .schema_validation },
+        .authority = .native,
+        .before_version = 1,
+        .after_version = 2,
+        .columns = 1,
+        .before_schema = @splat(6),
+        .after_schema = @splat(7),
+        .before_public = @splat(8),
+        .after_public = @splat(9),
+        .after_catalog = @splat(10),
+        .physical_catalog = @splat(11),
+        .inputs = @splat(12),
+        .projection_identity = @splat(13),
+    };
+    var physical_root: u128 = 0;
     // Repeat from a fully closed source: neither the decoded status nor the
     // native mode proof may depend on a retained process-local job or lease.
     for (0..2) |_| {
@@ -94,6 +113,15 @@ test "native index owner adapter inspects cold native ownership and rejects fore
         defer rooted.deinit();
         try std.testing.expect(rooted.outcome.value == null);
         try std.testing.expectEqual(table_reads.backend_current_root_generation, rooted.root_generation);
+        const schema = try owners.nativeSchemaOwnerObservationAtRoot(7501, "items", schema_binding, .{});
+        try schema.observation.validateFor(schema_binding);
+        try std.testing.expect(schema.observation.header == null and !schema.observation.replication_pending);
+        try std.testing.expectEqual(table_reads.backend_current_root_generation, schema.root_generation);
+        if (physical_root != 0) try std.testing.expectEqual(physical_root, schema.observation.physical_root_incarnation);
+        physical_root = schema.observation.physical_root_incarnation;
+        var foreign_schema = schema_binding;
+        foreign_schema.fence.namespace.range_id += 1;
+        try std.testing.expectError(error.IdentityNamespaceMismatch, owners.nativeSchemaOwnerObservationAtRoot(7501, "items", foreign_schema, .{}));
         try std.testing.expectError(error.OnlineSourceScopeChanged, owners.raftIndexOwnerObservationAtRoot(alloc, 7501, "items", identity, .{}));
         var foreign = identity;
         foreign.namespace.range_id += 1;
@@ -110,6 +138,7 @@ test "native index owner adapter inspects cold native ownership and rejects fore
     var raft_owners = kernel_owner_source.ProvisionedKernelOwnerSource.init(alloc, raft_root, catalog.source(), read_gate.alreadyReadSafeBarrier());
     defer raft_owners.deinit();
     const empty = try raft_owners.raftIndexOwnerObservationAtRoot(alloc, 7501, "items", identity, .{});
+    try std.testing.expectError(error.OnlineSourceScopeChanged, raft_owners.nativeSchemaOwnerObservationAtRoot(7501, "items", schema_binding, .{}));
     try std.testing.expect(empty.observation.binding == null and empty.observation.applied == null);
     try std.testing.expectEqual(table_reads.backend_current_root_generation, empty.root_generation);
     const before_json = (try Catalog.snapshot(&catalog)).tables[0].schema_json;

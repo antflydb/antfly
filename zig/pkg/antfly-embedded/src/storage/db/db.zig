@@ -8843,6 +8843,43 @@ pub const DB = struct {
     /// under apply-exclusive, together with the transport marker and outbox.
     pub const NativeSchemaOwnerControl = @import("relational_schema_owner_control.zig");
 
+    /// Read one actual owner cut without manufacturing publication permission
+    /// or performing recovery. Debt is checked in the same immutable snapshot
+    /// as the header; installed progress additionally requires its live runtime.
+    pub fn observeNativeSchemaOwner(self: *DB, binding: @import("relational_nullability_job.zig").Binding, context: @import("../../api/operation.zig").RequestContext) !NativeSchemaOwnerControl.Observation {
+        try context.ensureActive();
+        try binding.validate();
+        if (binding.authority != .native) return error.InvalidControlReceiptPosition;
+        if (!binding.fence.namespace.eql(self.core.identity_namespace)) return error.IdentityNamespaceMismatch;
+        try self.enforceNativeOwnerReadAuthority();
+        self.core.lockApplyShared();
+        var apply_shared = true;
+        defer if (apply_shared) self.core.unlockApplyShared();
+        var txn = try self.core.store.beginReadTxn();
+        defer txn.abort();
+        var resident = NativeSchemaOwnerControl.Resident.pin(self.core);
+        defer resident.deinit();
+        const physical_root_incarnation = self.root_incarnation;
+        self.core.unlockApplyShared();
+        apply_shared = false;
+        const source = try @import("../source_authority.zig").require(&txn, .native, @import("online_source_contract.zig").namespaceBytes(binding.fence.namespace));
+        const header = if (try @import("relational_nullability_job.zig").load(&txn) != null)
+            try @import("relational_nullability_job.zig").observe(self.alloc, &txn, binding)
+        else
+            null;
+        if (header) |value| if (value.phase == .installed) try resident.require(value);
+        const result: NativeSchemaOwnerControl.Observation = .{
+            .binding = binding,
+            .physical_root_incarnation = physical_root_incarnation,
+            .sequence = source.sequence,
+            .header = header,
+            .replication_pending = try durable_outbox_store.hasPendingTxn(&txn),
+        };
+        try result.validateFor(binding);
+        try context.ensureActive();
+        return result;
+    }
+
     /// Trusted owner adapter, not ordinary RPC/batch admission. The receiving
     /// service authenticates metadata/root/cohort and capability authority.
     pub fn prepareNativeSchemaOwnerControl(self: *DB, command: NativeSchemaOwnerControl.Command, context: @import("../../api/operation.zig").RequestContext) !NativeSchemaOwnerControl.Prepared {

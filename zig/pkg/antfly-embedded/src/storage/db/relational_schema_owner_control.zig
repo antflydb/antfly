@@ -156,6 +156,28 @@ pub const Outcome = struct {
     error_name: ?[]const u8 = null,
 };
 
+/// Independently read local facts, never a signed receipt or metadata grant.
+/// Zero is an observed empty native clock, not a fabricated receipt position.
+pub const Observation = struct {
+    pub const max_wire_bytes = 32 * 1024;
+    binding: job.Binding,
+    physical_root_incarnation: u128,
+    sequence: u64,
+    header: ?job.Header,
+    replication_pending: bool,
+
+    pub fn validateFor(self: @This(), binding: job.Binding) !void {
+        try binding.validate();
+        if (binding.authority != .native or self.physical_root_incarnation == 0 or
+            !std.meta.eql(self.binding, binding)) return error.SchemaValidationJobChanged;
+        if (self.header) |header| {
+            try header.validate();
+            if (!std.meta.eql(header.binding, binding) or header.updated != .native or
+                header.updated.native.sequence > self.sequence) return error.SchemaValidationJobChanged;
+        }
+    }
+};
+
 pub const Prepared = struct {
     pub const ApplyOutcome = Outcome;
     pub const metadata_control = true;
@@ -335,13 +357,31 @@ fn duplicate(command: Command, header: job.Header) !?Native {
     };
     return if (position) |value| if (value == .native) value.native else error.InvalidControlReceiptPosition else null;
 }
-fn requireResident(core: *core_mod.DBCore, header: job.Header) !void {
-    var view = core.acquireSchemaView() orelse return error.SchemaValidationRuntimeRecoveryRequired;
-    defer view.release();
-    if (view.version() != header.binding.after_version) return error.SchemaValidationRuntimeRecoveryRequired;
-    var indexes = core.relational_indexes.acquire();
-    defer if (indexes) |*value| value.deinit();
-    const physical_hash = if (indexes) |value| job.hash(&value.head.encode()) else job.hash("");
-    if (!equal(physical_hash, header.installation.?.physical_catalog) or
-        (indexes != null and indexes.?.plan.schemaView().epoch != view.epoch)) return error.SchemaValidationRuntimeRecoveryRequired;
+/// Capture beside the immutable store read under apply-shared, then verify
+/// expensive durable inputs off-lock. Pins survive later runtime publication.
+pub const Resident = struct {
+    view: ?@import("schema_registry.zig").SchemaView,
+    indexes: ?@import("relational_index_catalog.zig").WriteSnapshot,
+
+    pub fn pin(core: *core_mod.DBCore) @This() {
+        return .{ .view = core.acquireSchemaView(), .indexes = core.relational_indexes.acquire() };
+    }
+    pub fn deinit(self: *@This()) void {
+        if (self.indexes) |*value| value.deinit();
+        if (self.view) |*value| value.release();
+        self.* = undefined;
+    }
+    pub fn require(self: @This(), header: job.Header) !void {
+        if (header.phase != .installed or header.installation == null) return error.SchemaValidationRuntimeRecoveryRequired;
+        const view = self.view orelse return error.SchemaValidationRuntimeRecoveryRequired;
+        if (view.version() != header.binding.after_version) return error.SchemaValidationRuntimeRecoveryRequired;
+        const physical_hash = if (self.indexes) |value| job.hash(&value.head.encode()) else job.hash("");
+        if (!equal(physical_hash, header.installation.?.physical_catalog) or
+            (self.indexes != null and self.indexes.?.plan.schemaView().epoch != view.epoch)) return error.SchemaValidationRuntimeRecoveryRequired;
+    }
+};
+pub fn requireResident(core: *core_mod.DBCore, header: job.Header) !void {
+    var resident = Resident.pin(core);
+    defer resident.deinit();
+    try resident.require(header);
 }

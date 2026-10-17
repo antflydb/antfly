@@ -47,6 +47,10 @@ const mappings = [_]Mapping{
     .{ .status = .private_index_job_required, .err = error.PrivateIndexJobRequired },
     .{ .status = .private_index_owner_job_changed, .err = error.PrivateIndexOwnerJobChanged },
     .{ .status = .private_index_root_recovery_required, .err = error.PrivateIndexRootRecoveryRequired },
+    .{ .status = .invalid_schema_validation_job, .err = error.InvalidSchemaValidationJob },
+    .{ .status = .schema_validation_job_changed, .err = error.SchemaValidationJobChanged },
+    .{ .status = .schema_validation_job_required, .err = error.SchemaValidationJobRequired },
+    .{ .status = .schema_validation_runtime_recovery_required, .err = error.SchemaValidationRuntimeRecoveryRequired },
     .{ .status = .invalid_relational_index_budget, .err = error.InvalidRelationalIndexBudget },
     .{ .status = .private_index_claim_backlog_full, .err = error.PrivateIndexClaimBacklogFull },
     .{ .status = .private_index_publication_canceled, .err = error.PrivateIndexPublicationCanceled },
@@ -1104,6 +1108,21 @@ test "committed visibility outcomes survive the storage owner boundary" {
         error.EnrichmentWorkerFailed,
         error.CommitVisibilityNotSatisfied,
         error.CommitPropagationIncomplete,
+    }) |err| {
+        const failure = failureFromError(err, .storage_owner, abi.abi_version, 1);
+        try std.testing.expect(failure.status != .internal);
+        try validateFailureEnvelope(failure.status, &failure, abi.abi_version);
+        try std.testing.expectError(err, statusToError(failure.status));
+        try std.testing.expectEqualStrings(@errorName(err), failure.errorName());
+    }
+}
+
+test "schema owner observation preserves exact conflict and runtime recovery failures" {
+    for ([_]anyerror{
+        error.InvalidSchemaValidationJob,
+        error.SchemaValidationJobChanged,
+        error.SchemaValidationJobRequired,
+        error.SchemaValidationRuntimeRecoveryRequired,
     }) |err| {
         const failure = failureFromError(err, .storage_owner, abi.abi_version, 1);
         try std.testing.expect(failure.status != .internal);
