@@ -360,12 +360,12 @@ pub const Cursor = struct {
         var slots: [2]std.ArrayList(usize) = .{ .empty, .empty };
         var multiplicities: [2]cypher.runtime.Multiplicity = .{ .presence, .presence };
         for (requests, 0..) |request, i| {
-            const multiplicity: cypher.runtime.Multiplicity = if (request.multiplicity == .exact) .exact else .presence;
+            const multiplicity = request.multiplicity;
             const plan = (try stream.planWeightFields(request.fields, multiplicity)) orelse return false;
             const direction: usize = @intFromBool(plan.path.execution_reversed);
             try slots[direction].append(a, i);
             for (request.fields) |field| try fields[direction].put(a, field, {});
-            if (multiplicity == .exact) multiplicities[direction] = .exact;
+            if (multiplicity == .exact or (multiplicity == .capped and multiplicities[direction] == .presence)) multiplicities[direction] = multiplicity;
         }
         const pass_count: usize = @as(usize, @intFromBool(slots[0].items.len != 0)) + @as(usize, @intFromBool(slots[1].items.len != 0));
         const passes = try a.alloc(WeightPass, pass_count);

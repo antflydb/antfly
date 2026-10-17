@@ -1675,7 +1675,7 @@ test "presence cursors retain saturated endpoints while exact cursors keep the r
             return .{ .items = page.items[offset..end], .next = if (end < page.items.len) try std.fmt.allocPrint(a, "{d}", .{end}) else null };
         }
     };
-    for ([_]runtime.Multiplicity{ .exact, .presence }) |multiplicity| {
+    for ([_]runtime.Multiplicity{ .exact, .presence, .capped }) |multiplicity| {
         var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
         defer arena.deinit();
         const a = arena.allocator();
@@ -1695,7 +1695,7 @@ test "presence cursors retain saturated endpoints while exact cursors keep the r
             while (!cursor.done) {
                 const rows = try cursor.next(a, 128);
                 for (rows, cursor.last_weights.items) |row, weight| {
-                    try std.testing.expectEqual(@as(u64, 1), weight);
+                    if (multiplicity == .presence) try std.testing.expectEqual(@as(u64, 1), weight) else try std.testing.expect(weight > 0 and weight <= @as(u64, std.math.maxInt(i64)) + 1);
                     seen[@intCast(row[0].value.integer - 1)] = true;
                 }
             }
@@ -2378,4 +2378,116 @@ test "consumer orientation preserves anchors with unknown relative populations" 
     var result = try runtime.execute(std.testing.allocator, .{ .ptr = &fixture, .vtable = &callbacks }, graph, &compiled, &.{}, .{});
     defer result.deinit();
     try std.testing.expectEqual(@as(i64, 1), result.rows[0][0].integer);
+}
+
+test "branch factorization preserves parallel edges cyclic histories and leaf constraints" {
+    const Dag = struct {
+        fn expand(ptr: *anyopaque, a: std.mem.Allocator, mapping: catalog.Relationship, identity: v.Identity, direction: c.ast.Direction, after: ?[]const u8, limit: usize) !b.Page(*const v.Relationship) {
+            const page = try Fixture.expand(ptr, a, mapping, identity, direction, after, limit);
+            var out: std.ArrayList(*const v.Relationship) = .empty;
+            for (page.items) |edge| if (!std.mem.eql(u8, edge.identity.key, "ba")) try out.append(a, edge);
+            return .{ .items = out.items };
+        }
+    };
+    for ([_]bool{ false, true }) |dag| for ([_][]const u8{ "", "REPEATABLE ELEMENTS " }) |mode| for ([_][]const u8{
+        "(a:Document)-[:CITES*1..2]->(m:Document),(m)-[:CITES*1..2]->(b:Document),(m)-[:CITES]->(c:Document)",
+        "(a:Document)-[:CITES]->(m:Document)-[:CITES]->(b:Document),(a)-[:CITES]->(c:Document)",
+        "(a:Document)-[:CITES*1..2]->(m:Document),(m)-[:CITES*1..2]->(b:Document),(a)-[:CITES {weight:2}]->(c:Document {rank:2})",
+        "(a:Document)-[:CITES*1..2]->(m:Document),(m)-[:CITES*1..2]->(b:Document),(a)-[:CITES]->(c:Document),(a)-[:CITES]->(d:Document)",
+        "(b:Document)<-[:CITES*1..2]-(m:Document),(m)<-[:CITES*1..2]-(a:Document),(m)<-[:CITES]-(c:Document)",
+    }) |pattern| for ([_][]const u8{
+        "RETURN count(*),sum(b.rank),min(a.rank)",
+        "RETURN b.rank,count(*) ORDER BY b.rank",
+        "RETURN count(DISTINCT b),sum(DISTINCT b.rank)",
+        "RETURN count(*),sum(c.rank)",
+    }) |tail| {
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+        var diagnostic: c.Diagnostic = .{};
+        var compiled = try c.compile(a, try std.fmt.allocPrint(a, "MATCH {s}{s} {s}", .{ mode, pattern, tail }), .{}, &diagnostic);
+        defer compiled.deinit();
+        var exact = try c.compile(a, try std.fmt.allocPrint(a, "MATCH {s}{s} WITH * ORDER BY a.rank SKIP 0 {s}", .{ mode, pattern, tail }), .{}, &diagnostic);
+        defer exact.deinit();
+        var fixture: Fixture = .{};
+        var callbacks = fixture.backend().vtable.*;
+        if (dag) callbacks.expand = Dag.expand;
+        const backend: b.Backend = .{ .ptr = &fixture, .vtable = &callbacks };
+        var result = try runtime.execute(a, backend, graph, &compiled, &.{}, .{});
+        defer result.deinit();
+        var expected = try runtime.execute(a, backend, graph, &exact, &.{}, .{});
+        defer expected.deinit();
+        try std.testing.expectEqualStrings(try std.json.Stringify.valueAlloc(a, expected.rows, .{}), try std.json.Stringify.valueAlloc(a, result.rows, .{}));
+    };
+}
+
+test "connected SQL cursor bags preserve original MATCH histories" {
+    const Paged = struct {
+        fn expand(ptr: *anyopaque, a: std.mem.Allocator, mapping: catalog.Relationship, identity: v.Identity, direction: c.ast.Direction, after: ?[]const u8, limit: usize) !b.Page(*const v.Relationship) {
+            const page = try Fixture.expand(ptr, a, mapping, identity, direction, null, 128);
+            const first = if (after) |text| try std.fmt.parseUnsigned(usize, text, 10) else 0;
+            const end = @min(page.items.len, first + limit);
+            return .{ .items = page.items[first..end], .next = if (end < page.items.len) try std.fmt.allocPrint(a, "{d}", .{end}) else null };
+        }
+    };
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    for ([_][]const u8{
+        "MATCH (a:Document)-[:CITES*1..2]->(m:Document),(m)-[:CITES*1..2]->(b:Document)",
+        "MATCH (m:Document)-[:CITES*1..2]->(b:Document),(a:Document)-[:CITES*1..2]->(m)",
+    }) |prefix| {
+        var diagnostic: c.Diagnostic = .{};
+        var compiled = try c.compile(a, try std.fmt.allocPrint(a, "{s} RETURN b.rank AS rank", .{prefix}), .{}, &diagnostic);
+        defer compiled.deinit();
+        var exact = try c.compile(a, try std.fmt.allocPrint(a, "{s} WITH * ORDER BY a.rank SKIP 0 RETURN b.rank AS rank", .{prefix}), .{}, &diagnostic);
+        defer exact.deinit();
+        var fixture: Fixture = .{};
+        var expected = try runtime.execute(a, fixture.backend(), graph, &exact, &.{}, .{});
+        defer expected.deinit();
+        var counts = [_]u64{ 0, 0, 0 };
+        for (expected.rows) |row| counts[@intCast(row[0].integer - 1)] += 1;
+        var callbacks = fixture.backend().vtable.*;
+        callbacks.expand = Paged.expand;
+        const clauses = try a.dupe(c.ast.Clause, compiled.query.clauses);
+        clauses[0].operation.match.mode = .node_simple;
+        var simple_query = compiled.query;
+        simple_query.clauses = clauses;
+        const simple = (try runtime.NodeCursor.open(std.testing.allocator, .{ .ptr = &fixture, .vtable = &callbacks }, graph, simple_query, &.{}, .{})).?;
+        defer simple.close();
+        try std.testing.expect(!try simple.enableWeights(.exact));
+        const shallow = (try runtime.NodeCursor.open(std.testing.allocator, .{ .ptr = &fixture, .vtable = &callbacks }, graph, compiled.query, &.{}, .{ .path_depth = 2 })).?;
+        defer shallow.close();
+        try std.testing.expect(!try shallow.enableWeights(.exact));
+        const cursor = (try runtime.NodeCursor.open(std.testing.allocator, .{ .ptr = &fixture, .vtable = &callbacks }, graph, compiled.query, &.{}, .{})).?;
+        defer cursor.close();
+        try std.testing.expect(try cursor.enableWeights(.exact));
+        var actual = [_]u64{ 0, 0, 0 };
+        while (!cursor.done) {
+            var page = std.heap.ArenaAllocator.init(std.testing.allocator);
+            defer page.deinit();
+            const rows = try cursor.next(page.allocator(), 1);
+            for (rows, cursor.last_weights.items) |row, weight| actual[@intCast(row[0].value.integer - 1)] += weight;
+        }
+        try std.testing.expectEqualSlices(u64, &counts, &actual);
+    }
+}
+
+test "branch factorization preserves externally bound relationship aliases" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var diagnostic: c.Diagnostic = .{};
+    const prefix = "MATCH (x:Document)-[r:CITES]->(y:Document) WITH r MATCH REPEATABLE ELEMENTS (a:Document)-[:CITES*1..2]->(m:Document),(m)-[:CITES*1..2]->(b:Document),(a)-[r:CITES]->(c:Document)";
+    var compiled = try c.compile(a, prefix ++ " RETURN count(*),sum(b.rank)", .{}, &diagnostic);
+    defer compiled.deinit();
+    var exact = try c.compile(a, prefix ++ " WITH * ORDER BY a.rank SKIP 0 RETURN count(*),sum(b.rank)", .{}, &diagnostic);
+    defer exact.deinit();
+    var fixture: Fixture = .{};
+    var actual = try runtime.execute(a, fixture.backend(), graph, &compiled, &.{}, .{});
+    defer actual.deinit();
+    var expected = try runtime.execute(a, fixture.backend(), graph, &exact, &.{}, .{});
+    defer expected.deinit();
+    try std.testing.expectEqualStrings(try std.json.Stringify.valueAlloc(a, expected.rows, .{}), try std.json.Stringify.valueAlloc(a, actual.rows, .{}));
 }

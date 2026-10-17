@@ -1483,6 +1483,10 @@ def test_presence_reductions_do_not_enumerate_or_require_exact_path_counts(graph
         },
     )
     assert [cell["value"] for cell in window["rows"][0]] == ["25", "1600"]
+    top_relation = f"GRAPH_TABLE(g MATCH {sql_pattern} WHERE a.id='start' COLUMNS(b.score AS score)) q"
+    for source in (top_relation, top_relation + " CROSS JOIN (SELECT 1 AS k UNION ALL SELECT 2 AS k) d"):
+        assert db.sql(f"SELECT q.score FROM {source} ORDER BY q.score DESC LIMIT 5 OFFSET 1000")["rows"] == [["64"]] * 5
+
     # Mixing a presence-only reducer with COUNT requires exact bags. Keep this
     # case below saturation, with more paths than could ever be enumerated.
     relation = relation.replace("-[r62 IS R]->(m62 IS D)-[r63 IS R]->(b IS D)", "")
@@ -1558,6 +1562,18 @@ def test_pure_endpoint_expressions_keep_compressed_bags(graph_db):
             },
         )
         assert [cell["value"] for cell in component["rows"][0]] == [str(paths), str(total)]
+    branch_paths = sum(comb(m, 3) * comb(size - m - 1, 3) * (size - m - 2) for m in range(3, size - 3))
+    branch_total = sum(
+        comb(m, 3) * comb(b - m - 1, 2) * b * (size - m - 2) for m in range(3, size - 3) for b in range(m + 3, size)
+    )
+    branch = db.cypher_json(
+        "g",
+        {
+            "query": "MATCH (a:D)-[:R*3..3]->(m:D),(m)-[:R*3..3]->(b:D),(m)-[:R]->(c:D) RETURN count(*),sum(b.score)",
+            "limits": {"intermediate_states": 20000, "explored_edges": 120},
+        },
+    )
+    assert [cell["value"] for cell in branch["rows"][0]] == [str(branch_paths), str(branch_total)]
     for predicate, expected in (
         ("", [paths, paths, total, 6]),
         (" WHERE false", [1, 0, 0, None]),
@@ -1673,6 +1689,33 @@ def test_pure_endpoint_expressions_keep_compressed_bags(graph_db):
     ):
         with pytest.raises(SQLStateError, match="22012"):
             db.sql(statement)
+
+    split = (
+        "(a IS D)-[r0 IS R]->(u0 IS D)-[r1 IS R]->(u1 IS D)-[r2 IS R]->(m IS D),"
+        + "(m)-[r3 IS R]->(v0 IS D)-[r4 IS R]->(v1 IS D)-[r5 IS R]->(b IS D)"
+    )
+    for statement, expected in (
+        (f"SELECT sum(q.score) FROM GRAPH_TABLE(g MATCH {split} COLUMNS(b.score AS score)) q", [[str(total)]]),
+        (f"SELECT q.e FROM {mixed_relation} ORDER BY q.e DESC LIMIT 5 OFFSET 100", [[str(size - 1)]] * 5),
+        (f"SELECT q.e FROM {mixed_relation} ORDER BY q.e LIMIT 3 OFFSET {paths - 3}", [[str(size - 1)]] * 3),
+        (
+            f"SELECT sum(d.e) FROM (SELECT q.e FROM {mixed_relation} ORDER BY q.e DESC LIMIT 5 OFFSET 100) d",
+            [[str(5 * (size - 1))]],
+        ),
+        (
+            f"SELECT sum(q.e*d.x),count(*) FROM {mixed_relation} CROSS JOIN (SELECT 2 AS x UNION ALL SELECT 3 AS x) d",
+            [[str(5 * total), str(2 * paths)]],
+        ),
+        (
+            f"SELECT sum(q.e),count(*) FROM (SELECT 2 AS x UNION ALL SELECT 3 AS x) d CROSS JOIN {mixed_relation}",
+            [[str(2 * total), str(2 * paths)]],
+        ),
+    ):
+        started = time.monotonic()
+        assert db.sql(statement)["rows"] == expected
+        assert time.monotonic() - started < 5
+    with pytest.raises(SQLStateError, match="22012"):
+        db.sql(f"SELECT q.e FROM {mixed_relation} ORDER BY 1/(q.e-q.e) LIMIT 5")
 
     # An empty relation exhausts both negotiated passes, retaining the SQL
     # global group and its NULL sums / zero count.

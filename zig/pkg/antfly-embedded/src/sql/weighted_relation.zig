@@ -29,7 +29,7 @@ pub const Plan = struct {
         scan,
         ordinary,
         union_all: struct { left: *Plan, right: *Plan },
-        cross: struct { child: *Plan, singleton: *const binding.Node, graph_left: bool },
+        cross: struct { child: *Plan, singleton: *const binding.Node, graph_left: bool, factor_only: bool },
     };
     source: *const binding.Node,
     terminal: Terminal = .scan,
@@ -39,7 +39,16 @@ pub const Plan = struct {
     width: usize,
 
     pub fn init(a: A, root: *const binding.Node, requests: []const catalog.AggregateWeight) anyerror!?Plan {
-        return initDepth(a, root, requests, 0);
+        // Adapters may negotiate with a temporary request descriptor. The
+        // operator tree retains it across pulls, so own both descriptors and
+        // field vectors before returning to the caller.
+        const owned = try a.alloc(catalog.AggregateWeight, requests.len);
+        for (requests, owned) |request, *out| {
+            const fields = try a.alloc([]const u8, request.fields.len);
+            for (request.fields, fields) |field, *name| name.* = try a.dupe(u8, field);
+            out.* = .{ .fields = fields, .multiplicity = request.multiplicity };
+        }
+        return initDepth(a, root, owned, 0);
     }
     fn initDepth(a: A, root: *const binding.Node, requests: []const catalog.AggregateWeight, depth: usize) anyerror!?Plan {
         if (depth >= 64 or requests.len == 0) return null;
@@ -113,9 +122,13 @@ pub const Plan = struct {
             },
             .join => |join| blk: {
                 if ((join.kind != .inner and join.kind != .cross) or join.condition != null or join.correlation or join.membership != null) return null;
-                const graph_left = singleton(join.right, 0);
-                const graph = if (graph_left) join.left else if (singleton(join.left, 0)) join.right else return null;
+                const graph_left = boundedRepeatable(join.right, 0) != null;
+                const graph = if (graph_left) join.left else if (boundedRepeatable(join.left, 0) != null) join.right else return null;
                 const single = if (graph_left) join.right else join.left;
+                var factor_only = true;
+                for (mapped) |request| for (request.fields) |field| if (columnIndex(single, field) != null) {
+                    factor_only = false;
+                };
                 const input = try a.alloc(catalog.AggregateWeight, mapped.len);
                 for (mapped, input) |request, *out| {
                     var fields: Names = .empty;
@@ -124,7 +137,7 @@ pub const Plan = struct {
                 }
                 const nested = try child(a, graph, input, depth + stages.items.len + 1);
                 width += nested.width + single.columns.len;
-                break :blk .{ .cross = .{ .child = nested, .singleton = single, .graph_left = graph_left } };
+                break :blk .{ .cross = .{ .child = nested, .singleton = single, .graph_left = graph_left, .factor_only = factor_only } };
             },
             else => return null,
         };
@@ -155,20 +168,34 @@ pub const Plan = struct {
         }
         return result;
     }
-    // A singleton subtree may filter its row away, but cannot multiply it.
-    // Its normal SQL iterator still evaluates all expressions and errors.
-    fn singleton(node: *const binding.Node, depth: usize) bool {
-        if (depth >= 64) return false;
-        return switch (node.operation) {
-            .singleton => true,
+    /// Finite, repeatable side relations can be captured once under the
+    /// statement memory budget. Never consume a scan to guess cardinality.
+    fn boundedRepeatable(node: *const binding.Node, depth: usize) ?usize {
+        if (depth >= 64) return null;
+        const bound: usize = switch (node.operation) {
+            .singleton => 1,
+            .literal_rows => |rows| rows.len,
             .query => |q| blk: {
-                if (q.binding.aggregate != null or q.binding.window != null or q.constant_refs.len != 0) break :blk false;
-                if (q.binding.scalars.predicate) |p| if (!p.repeatable()) break :blk false;
-                for (q.binding.scalars.projections) |p| if (p) |program| if (!program.repeatable()) break :blk false;
-                break :blk singleton(q.source, depth + 1);
+                if (q.binding.aggregate != null or q.binding.window != null or q.constant_refs.len != 0) return null;
+                if (q.binding.scalars.predicate) |p| if (!p.repeatable()) return null;
+                for (q.binding.scalars.projections) |p| if (p) |program| if (!program.repeatable()) return null;
+                for (q.binding.scalars.orders) |p| if (p) |program| if (!program.repeatable()) return null;
+                break :blk boundedRepeatable(q.source, depth + 1) orelse return null;
             },
-            else => false,
+            .set => |set| blk: {
+                if (set.kind != .@"union" or !set.all) return null;
+                const left = boundedRepeatable(set.left, depth + 1) orelse return null;
+                const right = boundedRepeatable(set.right, depth + 1) orelse return null;
+                break :blk std.math.add(usize, left, right) catch return null;
+            },
+            .values => |arms| blk: {
+                var total: usize = 0;
+                for (arms) |arm| total = std.math.add(usize, total, boundedRepeatable(arm, depth + 1) orelse return null) catch return null;
+                break :blk total;
+            },
+            else => return null,
         };
+        return if (bound <= 4096) bound else null;
     }
     fn totalOrderProgram(program: scalar.Program) bool {
         const root = program.instructions[program.root];

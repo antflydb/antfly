@@ -794,6 +794,16 @@ pub const Context = struct {
             for (self.binding.order_keys, orders) |key, *order| order.* = .{ .descending = key.descending, .nulls_first = key.nulls_first };
             top_k = try operators.TopK.initWithSpill(self.alloc, offset + limit + @intFromBool(statement.limit == null), orders, self.limits.retained_bytes, self.spill);
         }
+        // Sorting is a bag consumer when every evaluated expression is
+        // repeatable. The graph cursor proves that requested columns form an
+        // endpoint-local tuple; SQL retains its own coercions and sort keys.
+        const weight_safe = top_k != null and blk: {
+            if (self.binding.scalars.predicate) |p| if (!p.repeatable()) break :blk false;
+            for (self.binding.scalars.projections) |p| if (p) |program| if (!program.repeatable()) break :blk false;
+            for (self.binding.scalars.orders) |p| if (p) |program| if (!program.repeatable()) break :blk false;
+            break :blk true;
+        };
+        const weighted_top = weight_safe and try scan_state.weights(self, table_def, scan_request, .capped);
         const deferred = try self.arena.alloc(bool, fields.items.len);
         @memset(deferred, false);
         if (top_k != null) for (self.binding.scalars.projections, 0..) |optional, index| {
@@ -843,7 +853,7 @@ pub const Context = struct {
             request.limit = @intCast(wanted);
             const page = try scan_state.page(self, page_arena.allocator(), table_def, request);
             defer page.deinit();
-            if (page.rows.len > wanted) return error.InvalidSqlBackendResponse;
+            if (page.rows.len > wanted or (weighted_top and (page.multiplicities == null or page.multiplicities.?.len != page.rows.len))) return error.InvalidSqlBackendResponse;
             if (page.rows.len > self.limits.scan_rows -| visited) return error.SqlProgramLimitExceeded;
             var first: usize = 0;
             while (first < page.rows.len) {
@@ -912,7 +922,8 @@ pub const Context = struct {
                                 break :blk try describe.coerceDatum(scratch, cell, column.type, column.element_type);
                             },
                         };
-                        try operator.add(.{ .values = values, .keys = keys, .ordinal = visited });
+                        const candidate: operators.Row = .{ .values = values, .keys = keys, .ordinal = visited };
+                        if (weighted_top) try operator.addWeighted(candidate, page.multiplicities.?[first + row_index]) else try operator.add(candidate);
                         continue;
                     }
                     if (scanned <= offset) continue;
@@ -962,6 +973,23 @@ pub const Context = struct {
             after = owned_next;
         }
         if (top_k) |*operator| {
+            if (weighted_top) {
+                if (self.sink) |sink| {
+                    try operator.drainWeighted(self.alloc, offset, limit, statement.limit == null, sink);
+                } else {
+                    for (try operator.finishWeightedPage(self.arena, offset, limit, statement.limit == null)) |row| {
+                        const cells = try self.arena.alloc(Json, row.values.len);
+                        const nulls = try self.arena.alloc(bool, row.values.len);
+                        for (row.values, cells, nulls, columns) |datum, *cell, *flag, column| {
+                            cell.* = try self.outputDatum(datum, column.type, column.element_type);
+                            flag.* = datum.sql_null;
+                        }
+                        try rows.append(self.arena, cells);
+                        try null_rows.append(self.arena, nulls);
+                    }
+                }
+                return .{ .columns = columns, .rows = rows.items, .sql_nulls = null_rows.items, .command_tag = "SELECT" };
+            }
             if (self.sink != null and !defer_projection) return self.emitTop(operator, offset, limit, statement.limit == null);
             const ordered = try operator.finishPage(self.arena, offset, limit + @intFromBool(statement.limit == null));
             const remaining = ordered.len;

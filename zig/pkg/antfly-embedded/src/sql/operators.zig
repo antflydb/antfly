@@ -243,6 +243,60 @@ pub const TopK = struct {
             try self.external.?.add(row);
         };
     }
+    /// A bag contribution occupies one heap/spill record. The private typed
+    /// count travels through the ordinary sort codec; only the requested output
+    /// window is expanded, so large offsets never allocate duplicate rows.
+    pub fn addWeighted(self: *TopK, input: Row, weight: u64) !void {
+        if (weight == 0 or self.capacity == 0) return;
+        const values = try self.alloc.alloc(Datum, input.values.len + 1);
+        defer self.alloc.free(values);
+        @memcpy(values[0..input.values.len], input.values);
+        values[input.values.len] = Datum.json(.{ .integer = @intCast(@min(weight, self.capacity)) });
+        var row = input;
+        row.values = values;
+        try self.add(row);
+    }
+    pub fn drainWeighted(self: *TopK, alloc: Allocator, offset: usize, limit: usize, implicit: bool, sink: anytype) !void {
+        const Window = struct {
+            remaining: usize,
+            emitted: usize = 0,
+            limit: usize,
+            implicit: bool,
+            sink: @TypeOf(sink),
+            fn append(raw: *anyopaque, values: []const Datum) anyerror!void {
+                const state: *@This() = @ptrCast(@alignCast(raw));
+                if (values.len == 0) return error.InvalidSqlBackendResponse;
+                const count = values[values.len - 1];
+                if (count.sql_null or count.value != .integer or count.value.integer <= 0) return error.InvalidSqlBackendResponse;
+                var weight: usize = @intCast(count.value.integer);
+                const skip = @min(state.remaining, weight);
+                state.remaining -= skip;
+                weight -= skip;
+                if (state.implicit and weight > state.limit - state.emitted) return error.SqlResultTooLarge;
+                for (0..@min(weight, state.limit - state.emitted)) |_| {
+                    try state.sink.append(state.sink.ptr, values[0 .. values.len - 1]);
+                    state.emitted += 1;
+                }
+            }
+        };
+        var window: Window = .{ .remaining = offset, .limit = limit, .implicit = implicit, .sink = sink };
+        try self.drain(alloc, 0, self.capacity, false, .{ .ptr = &window, .append = Window.append });
+    }
+    pub fn finishWeightedPage(self: *TopK, alloc: Allocator, offset: usize, limit: usize, implicit: bool) ![]const Row {
+        const Page = struct {
+            a: Allocator,
+            rows: std.ArrayList(Row) = .empty,
+            fn append(raw: *anyopaque, values: []const Datum) anyerror!void {
+                const state: *@This() = @ptrCast(@alignCast(raw));
+                const owned = try state.a.alloc(Datum, values.len);
+                for (values, owned) |value, *out| out.* = try cloneDatum(state.a, value);
+                try state.rows.append(state.a, .{ .values = owned, .keys = &.{}, .ordinal = 0 });
+            }
+        };
+        var page: Page = .{ .a = alloc };
+        try self.drainWeighted(alloc, offset, limit, implicit, .{ .ptr = &page, .append = Page.append });
+        return page.rows.toOwnedSlice(alloc);
+    }
     fn addInMemory(self: *TopK, row: Row) !void {
         if (self.finished) return error.InvalidSqlBackendResponse;
         if (row.keys.len != self.orders.len) return error.InvalidSqlBackendResponse;
@@ -2734,4 +2788,37 @@ test "SQL weighted bags preserve exact numeric states DISTINCT NULLs and spill" 
             }
         }
     }
+}
+
+test "SQL weighted TopK clips bags after large offsets in memory and spill" {
+    const Harness = struct {
+        fn checkpoint(_: *anyopaque) !void {}
+        fn run(a: Allocator, disk: bool) !void {
+            var dummy: u8 = 0;
+            var manager: @import("spill.zig").Manager = .{ .alloc = a, .io = std.testing.io, .context = &dummy, .checkpoint = checkpoint };
+            defer manager.deinit();
+            var top = try TopK.initWithSpill(a, 1_000_003, &.{.{ .descending = true, .nulls_first = false }}, 32 * 1024, if (disk) &manager else null);
+            defer top.deinit();
+            const five = Datum.json(.{ .integer = 5 });
+            const eight = Datum.json(.{ .integer = 8 });
+            const null_value: Datum = .{};
+            try top.addWeighted(.{ .values = &.{five}, .keys = &.{five}, .ordinal = 0 }, 1_000_000_000);
+            try top.addWeighted(.{ .values = &.{eight}, .keys = &.{eight}, .ordinal = 1 }, 7);
+            try top.addWeighted(.{ .values = &.{null_value}, .keys = &.{null_value}, .ordinal = 2 }, 2);
+            try std.testing.expect(top.count <= 3);
+            var arena = std.heap.ArenaAllocator.init(a);
+            defer arena.deinit();
+            const rows = try top.finishWeightedPage(arena.allocator(), 1_000_000, 3, false);
+            try std.testing.expectEqual(@as(usize, 3), rows.len);
+            for (rows) |row| {
+                try std.testing.expectEqual(@as(usize, 1), row.values.len);
+                try std.testing.expect(!row.values[0].sql_null);
+                try std.testing.expectEqual(@as(i64, 5), row.values[0].value.integer);
+            }
+            try std.testing.expectEqual(disk, top.external != null);
+        }
+    };
+    try Harness.run(std.testing.allocator, true);
+    try Harness.run(std.testing.allocator, false);
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Harness.run, .{false});
 }

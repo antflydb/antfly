@@ -499,8 +499,10 @@ pub const Cursor = struct {
     /// Exact snapshot count; null means the retained cursor must be scanned.
     /// Providers may use metadata only after accounting for filters/deletes.
     count_rows: ?*const fn (*anyopaque) anyerror!?u64 = null,
-    /// Before the first pull, negotiate exact bags or duplicate-insensitive
-    /// presence contributions. Other consumers receive ordinary logical rows.
+    /// Before the first pull, negotiate exact bags, duplicate-insensitive
+    /// presence, or capped lower bounds for finite windows. Capped counts must
+    /// never be consumed as exact numeric aggregate multiplicities. Other
+    /// consumers receive ordinary logical rows.
     enable_weights: ?*const fn (*anyopaque, Multiplicity) anyerror!bool = null,
     /// Global aggregate consumers may negotiate serial dependency partitions
     /// before the first pull. A successful provider shares the read cut and

@@ -204,6 +204,7 @@ test "SQL weighted relational operators retain bags and unwind failed negotiatio
     const Fixture = struct {
         const This = @This();
         fn checkpoint(_: *anyopaque) !void {}
+        saturated: bool = false,
         opened: usize = 0,
         closed: usize = 0,
         const table: catalog.Table = .{ .id = 1, .physical_name = "docs", .schema_version = 1, .columns = &.{.{ .name = "v", .path = "v", .type = .integer, .element_type = .int64, .nullable = false }} };
@@ -234,7 +235,7 @@ test "SQL weighted relational operators retain bags and unwind failed negotiatio
                     const cells = try a.alloc(Datum, 1);
                     cells[0] = Datum.json(.{ .integer = 2 });
                     row.* = try catalog.Row.fromDatums(a, "row", try catalog.Row.TypedLayout.init(a, &.{"v"}), cells);
-                    weight.* = if (self.weighted) 100 else 1;
+                    weight.* = if (self.weighted) (if (self.owner.saturated) @as(u64, std.math.maxInt(i64)) + 1 else 100) else 1;
                 }
                 self.position += wanted;
                 return .{ .rows = rows, .multiplicities = if (self.weighted) weights else null, .after = if (self.position < count) "next" else null };
@@ -286,6 +287,9 @@ test "SQL weighted relational operators retain bags and unwind failed negotiatio
                 .{ .sql = "SELECT sum(d.v),count(*) FROM (SELECT v FROM docs UNION ALL SELECT CAST(3 AS BIGINT) AS v) d", .sum = "203", .count = "101" },
                 .{ .sql = "SELECT sum(d.v*x.k),count(*) FROM docs d CROSS JOIN (SELECT 3 AS k) x", .sum = "600", .count = "100" },
                 .{ .sql = "SELECT sum(d.v*x.k),count(*) FROM (SELECT 3 AS k) x CROSS JOIN docs d", .sum = "600", .count = "100" },
+                .{ .sql = "SELECT sum(d.v*x.k),count(*) FROM docs d CROSS JOIN (SELECT 3 AS k UNION ALL SELECT 4 AS k) x", .sum = "1400", .count = "200" },
+                .{ .sql = "SELECT sum(d.v),count(*) FROM (SELECT 3 AS k UNION ALL SELECT 4 AS k) x CROSS JOIN docs d", .sum = "400", .count = "200" },
+                .{ .sql = "SELECT sum(d.v),count(*) FROM (SELECT v FROM docs ORDER BY v DESC LIMIT 3 OFFSET 5) d", .sum = "6", .count = "3" },
             }) |case| {
                 var compiled = try @import("compiler.zig").compile(a, case.sql, .{});
                 defer compiled.deinit();
@@ -293,6 +297,15 @@ test "SQL weighted relational operators retain bags and unwind failed negotiatio
                 defer result.deinit();
                 try std.testing.expectEqualStrings(case.sum, result.output.rows[0][0].string);
                 try std.testing.expectEqualStrings(case.count, result.output.rows[0][1].string);
+            }
+            self.saturated = true;
+            {
+                var compiled = try @import("compiler.zig").compile(a, "SELECT d.v FROM docs d CROSS JOIN (SELECT 1 AS k UNION ALL SELECT 2 AS k) x ORDER BY d.v DESC LIMIT 3 OFFSET 5", .{});
+                defer compiled.deinit();
+                var result = try @import("runtime.zig").execute(a, backend, &compiled, &.{}, .{ .page_rows = 1, .scan_rows = 10 });
+                defer result.deinit();
+                try std.testing.expectEqual(@as(usize, 3), result.output.rows.len);
+                for (result.output.rows) |row| try std.testing.expectEqualStrings("2", row[0].string);
             }
             try std.testing.expectEqual(self.opened, self.closed);
         }
@@ -2216,7 +2229,11 @@ fn Engine(comptime Context: type) type {
             ordinary: ?*Iterator = null,
             fallback: bool = false,
             singleton_iterator: ?*Iterator = null,
-            singleton_values: ?[]const Datum = null,
+            singleton_values: []const []const Datum = &.{},
+            cross_arena: ?std.heap.ArenaAllocator = null,
+            cross_page: ?catalog.Page = null,
+            cross_row: usize = 0,
+            cross_side: usize = 0,
             singleton_ready: bool = false,
             tagged: bool = false,
             compressed: bool = false,
@@ -2239,7 +2256,10 @@ fn Engine(comptime Context: type) type {
                         const exact = for (plan.physical) |request| {
                             if (request.multiplicity == .exact) break true;
                         } else false;
-                        const weighted = self.tagged or if (cursor.enable_weights) |enable| try enable(cursor.ptr, if (exact) .exact else .presence) else false;
+                        const capped = for (plan.physical) |request| {
+                            if (request.multiplicity == .capped) break true;
+                        } else false;
+                        const weighted = self.tagged or if (cursor.enable_weights) |enable| try enable(cursor.ptr, if (exact) .exact else if (capped) .capped else .presence) else false;
                         self.compressed = weighted;
                         if (!weighted) self.fallback = true;
                     },
@@ -2264,6 +2284,8 @@ fn Engine(comptime Context: type) type {
                 if (self.right) |child| child.deinit();
                 if (self.ordinary) |iterator| iterator.deinit();
                 if (self.singleton_iterator) |iterator| iterator.deinit();
+                if (self.cross_page) |*page| page.deinit();
+                if (self.cross_arena) |*arena| arena.deinit();
             }
             fn ownValues(self: *WeightedReader, values: []const Datum) ![]const Datum {
                 const a = self.engine.context.arena;
@@ -2355,23 +2377,57 @@ fn Engine(comptime Context: type) type {
                     .cross => |join| {
                         if (!self.singleton_ready) {
                             self.singleton_ready = true;
-                            // One immutable typed row, independent of child page lifetimes.
-                            self.singleton_values = if (try self.singleton_iterator.?.next(self.engine.context.arena)) |values| try self.ownValues(values) else null;
+                            var side: std.ArrayList([]const Datum) = .empty;
+                            while (try self.singleton_iterator.?.next(self.engine.context.arena)) |values| {
+                                try self.engine.context.checkpoint();
+                                if (side.items.len == 4096) return error.InvalidSqlBackendResponse;
+                                try side.append(self.engine.context.arena, try self.ownValues(values));
+                            }
+                            self.singleton_values = side.items;
                         }
-                        const single = self.singleton_values orelse return .{ .rows = &.{}, .multiplicities = &.{}, .aggregate_slots = self.slots };
-                        var page = try self.left.?.next(a, limit);
-                        defer page.deinit();
-                        const rows = try a.alloc(catalog.Row, page.rows.len);
-                        for (page.rows, rows) |input, *output| {
+                        if (self.singleton_values.len == 0) return .{ .rows = &.{}, .multiplicities = &.{}, .aggregate_slots = self.slots };
+                        if (self.cross_page == null) {
+                            if (self.cross_arena == null) self.cross_arena = std.heap.ArenaAllocator.init(self.engine.context.alloc);
+                            _ = self.cross_arena.?.reset(.retain_capacity);
+                            self.cross_page = try self.left.?.next(self.cross_arena.?.allocator(), limit);
+                            self.cross_row = 0;
+                            self.cross_side = 0;
+                        }
+                        const page = &self.cross_page.?;
+                        var rows: std.ArrayList(catalog.Row) = .empty;
+                        var weights: std.ArrayList(u64) = .empty;
+                        while (self.cross_row < page.rows.len and rows.items.len < limit) {
+                            try self.engine.context.checkpoint();
+                            const input = page.rows[self.cross_row];
+                            const single = self.singleton_values[self.cross_side];
                             const values = try a.alloc(Datum, self.plan.source.columns.len);
                             for (self.plan.source.columns, values) |column, *value| {
-                                value.* = for (join.singleton.columns, single) |source, cell| {
-                                    if (std.mem.eql(u8, source.internal, column.internal)) break cell;
+                                const cell = for (join.singleton.columns, single) |source, item| {
+                                    if (std.mem.eql(u8, source.internal, column.internal)) break item;
                                 } else try input.cell(column.internal);
+                                value.* = try operators.cloneDatum(a, cell);
                             }
-                            output.* = try row(a, self.plan.source.columns, values);
+                            try rows.append(a, try row(a, self.plan.source.columns, values));
+                            const weight = page.multiplicities.?[self.cross_row];
+                            const capped = for (self.plan.requests) |request| {
+                                if (request.multiplicity == .exact) break false;
+                            } else true;
+                            const multiplied = if (!join.factor_only) weight else if (capped) @min(@as(u64, std.math.maxInt(i64)) + 1, weight *| self.singleton_values.len) else std.math.mul(u64, weight, self.singleton_values.len) catch return error.SqlNumericOutOfRange;
+                            try weights.append(a, multiplied);
+                            self.cross_side += if (join.factor_only) self.singleton_values.len else @as(usize, 1);
+                            if (self.cross_side == self.singleton_values.len) {
+                                self.cross_side = 0;
+                                self.cross_row += 1;
+                            }
                         }
-                        return .{ .rows = rows, .multiplicities = try a.dupe(u64, page.multiplicities.?), .aggregate_slots = try a.dupe(usize, page.aggregate_slots.?), .after = if (page.after == null) null else "cross" };
+                        const slots = try a.dupe(usize, page.aggregate_slots.?);
+                        const exhausted = self.cross_row == page.rows.len;
+                        const done = exhausted and page.after == null;
+                        if (exhausted) {
+                            page.deinit();
+                            self.cross_page = null;
+                        }
+                        return .{ .rows = rows.items, .multiplicities = weights.items, .aggregate_slots = slots, .after = if (done) null else "cross" };
                     },
                 }
             }

@@ -447,7 +447,10 @@ def test_authenticated_cypher_property_plans_and_sql_overlays(monkeypatch):
                 "-v",
                 "ON_ERROR_STOP=1",
             ],
-            input=mixed_statement + ";",
+            input=mixed_statement
+            + ";"
+            + f"SELECT q.score FROM GRAPH_TABLE({hops} MATCH {path} COLUMNS(b.score AS score)) q "
+            + "ORDER BY q.score DESC LIMIT 5 OFFSET 100;",
             check=False,
             capture_output=True,
             text=True,
@@ -460,6 +463,7 @@ def test_authenticated_cypher_property_plans_and_sql_overlays(monkeypatch):
             "1989000",
             "63648",
         ]
+        assert pgwire.stdout.strip().splitlines()[1:] == ["17"] * 5, pgwire.stdout
         distinct_float = call(
             "/sql",
             {
@@ -506,6 +510,50 @@ def test_authenticated_cypher_property_plans_and_sql_overlays(monkeypatch):
                 "31824",
                 "497250",
             ], reduced
+        branch_paths = sum(
+            comb(m, 3) * comb(17 - m, 3) * (16 - m) for m in range(3, 15)
+        )
+        branch_sum = sum(
+            comb(m, 3) * comb(b - m - 1, 2) * b * (16 - m)
+            for m in range(3, 15)
+            for b in range(m + 3, 18)
+        )
+        branched = call(
+            f"/graphs/{hops}/query",
+            {
+                "query": "MATCH (a:H)-[:R*3..3]->(m:H),(m)-[:R*3..3]->(b:H),(m)-[:R]->(c:H) RETURN count(*),sum(b.score)",
+                "limits": {"explored_edges": 153, "intermediate_states": 30000},
+            },
+        )
+        assert [cell["value"] for cell in branched["rows"][0]] == [
+            str(branch_paths),
+            str(branch_sum),
+        ], branched
+        split_path = (
+            "(a IS H)-[r0 IS R]->(u0 IS H)-[r1 IS R]->(u1 IS H)-[r2 IS R]->(m IS H),"
+            "(m)-[r3 IS R]->(v0 IS H)-[r4 IS R]->(v1 IS H)-[r5 IS R]->(b IS H)"
+        )
+        relation = f"GRAPH_TABLE({hops} MATCH {path} COLUMNS(b.score AS score)) q"
+        for statement, expected in (
+            (
+                f"SELECT sum(q.score) FROM GRAPH_TABLE({hops} MATCH {split_path} COLUMNS(b.score AS score)) q",
+                [["497250"]],
+            ),
+            (
+                f"SELECT q.score FROM {relation} ORDER BY q.score DESC LIMIT 5 OFFSET 100",
+                [["17"]] * 5,
+            ),
+            (
+                f"SELECT sum(d.score) FROM (SELECT q.score FROM {relation} ORDER BY q.score DESC LIMIT 5 OFFSET 100) d",
+                [["85"]],
+            ),
+            (
+                f"SELECT sum(q.score),count(*) FROM {relation} CROSS JOIN (SELECT 1 AS k UNION ALL SELECT 2 AS k) d",
+                [["994500", "63648"]],
+            ),
+        ):
+            compressed_sql = call("/sql", {"statement": statement})
+            assert compressed_sql["rows"] == expected, compressed_sql
         selective_range = call(
             f"/graphs/{hops}/query",
             {
@@ -791,6 +839,16 @@ def test_authenticated_cypher_property_plans_and_sql_overlays(monkeypatch):
             },
         )
         assert presence_sql["rows"] == [["64", "64", "1"]], presence_sql
+        saturated_top = call(
+            "/sql",
+            {
+                "statement": f"SELECT q.score FROM GRAPH_TABLE({hops} MATCH {presence_path} "
+                "WHERE a.id='presence_start' COLUMNS(b.score AS score)) q "
+                "CROSS JOIN (SELECT 1 AS k UNION ALL SELECT 2 AS k) d "
+                "ORDER BY q.score DESC LIMIT 5 OFFSET 1000"
+            },
+        )
+        assert saturated_top["rows"] == [["64"]] * 5, saturated_top
         script = (
             Path(__file__).resolve().parents[2]
             / "scripts"

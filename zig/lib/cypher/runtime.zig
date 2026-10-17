@@ -28,7 +28,9 @@ pub const max_response_bytes: usize = 32 << 20;
 pub const Limits = struct { memory_bytes: usize = 64 << 20, scanned_anchors: usize = 1_000_000, explored_edges: usize = 1_000_000, intermediate_states: usize = 1_000_000, path_depth: usize = 1024, recursion_depth: usize = 64 };
 /// A presence consumer is insensitive to duplicates of an identical source row.
 /// It receives unit contributions, including when exact path counts overflow.
-pub const Multiplicity = enum { exact, presence };
+/// Capped consumers use counts up to maxInt(i64)+1 as a lower bound for
+/// finite output windows. They must never treat that sentinel as an exact SUM.
+pub const Multiplicity = enum { exact, presence, capped };
 pub const Stats = struct { scanned_anchors: usize = 0, explored_edges: usize = 0, intermediate_states: usize = 0, mutations: usize = 0, search_calls: usize = 0, search_candidates: usize = 0, search_approximate: bool = false, memory_bytes: usize = 0 };
 pub const Stage = struct { operation: []const u8, span: ast.Span, input_rows: usize, output_rows: usize };
 pub const Result = struct {
@@ -125,9 +127,10 @@ pub const NodeCursor = struct {
     /// cut. Plans and their AST storage belong to this cursor.
     pub fn planWeightFields(self: *NodeCursor, fields: []const []const u8, multiplicity: Multiplicity) !?WeightPlan {
         if (self.started or self.done or self.exact_count != null) return null;
-        const operation = self.query.clauses[0].operation.match;
-        if (operation.paths.len != 1 or self.interior_anchors[0] != 0) return null;
-        const path = operation.paths[0];
+        const operation = self.original_match;
+        if (!self.componentCursorSafe(operation)) return null;
+        if (operation.paths.len == 1 and self.interior_anchors[0] != 0) return null;
+        const path = (try self.engine.linearComponent(operation.paths)) orelse return null;
         if (path.edges.len == 0 or path.execution_prefix) return null;
         if (path.edges.len == 1 and path.edges[0].min_hops == 1 and path.edges[0].max_hops == 1) return null;
         var projection = self.query.clauses[1].operation.project.value;
@@ -151,6 +154,20 @@ pub const NodeCursor = struct {
         if (!try self.engine.batchEligible(planned, &.{}, operation, projection, &.{})) return null;
         return .{ .path = planned, .projection = projection, .multiplicity = multiplicity };
     }
+    // Ordinary pull fallback traverses the accepted normalized path. Admit
+    // only MATCH-wide relationship histories whose depth bound remains valid
+    // after concatenation. Per-path node uniqueness and unbounded composite
+    // depth retain the original multi-pattern cursor.
+    fn componentCursorSafe(self: *NodeCursor, operation: ast.Match) bool {
+        if (operation.paths.len == 1) return true;
+        if (operation.mode == .node_simple) return false;
+        var maximum: usize = 0;
+        for (operation.paths) |path| for (path.edges) |edge| {
+            maximum = std.math.add(usize, maximum, edge.max_hops orelse return false) catch return false;
+            if (maximum > self.engine.limits.path_depth) return false;
+        };
+        return true;
+    }
     /// Serial aggregate passes share every quota, backend capability and raw
     /// adjacency page. Exhaust the preceding pass before changing its shape.
     pub fn startWeightPlan(self: *NodeCursor, plan: WeightPlan) !void {
@@ -166,7 +183,9 @@ pub const NodeCursor = struct {
         self.started = false;
         self.done = false;
         const clauses = try self.engine.a.dupe(ast.Clause, self.query.clauses);
+        clauses[0].operation.match = self.original_match;
         clauses[0].operation.match.paths = try self.engine.a.dupe(ast.Path, &.{plan.path});
+        self.interior_anchors = try self.engine.a.dupe(usize, &.{0});
         clauses[1].operation.project.value = plan.projection;
         self.query.clauses = clauses;
         const columns = try self.engine.a.alloc([]const u8, plan.projection.items.len);
@@ -181,9 +200,10 @@ pub const NodeCursor = struct {
     /// retain the ordinary cursor; every declined per-anchor proof does too.
     pub fn enableWeights(self: *NodeCursor, multiplicity: Multiplicity) !bool {
         if (self.started or self.done or self.exact_count != null) return false;
-        const operation = self.query.clauses[0].operation.match;
-        if (operation.paths.len != 1 or self.interior_anchors[0] != 0) return false;
-        const path = operation.paths[0];
+        const operation = self.original_match;
+        if (!self.componentCursorSafe(operation)) return false;
+        if (operation.paths.len == 1 and self.interior_anchors[0] != 0) return false;
+        const path = (try self.engine.linearComponent(operation.paths)) orelse return false;
         if (path.edges.len == 0 or path.execution_prefix) return false;
         if (path.edges.len == 1 and path.edges[0].min_hops == 1 and path.edges[0].max_hops == 1) return false;
         if (operation.predicate) |predicate| if (!Engine.endpointExpression(predicate, path, &.{})) return false;
@@ -194,7 +214,9 @@ pub const NodeCursor = struct {
         for (path.edges) |edge| for (edge.properties) |entry| if (self.engine.constant(entry.value, &.{}) == null) return false;
         const planned = try self.engine.reductionPath(path, &.{}, operation, projection, &.{});
         const clauses = try self.engine.a.dupe(ast.Clause, self.query.clauses);
+        clauses[0].operation.match = self.original_match;
         clauses[0].operation.match.paths = try self.engine.a.dupe(ast.Path, &.{planned});
+        self.interior_anchors = try self.engine.a.dupe(usize, &.{0});
         self.query.clauses = clauses;
         if (try self.engine.batchEligible(planned, &.{}, operation, projection, &.{})) {
             const predicates = try self.engine.batchPredicates(planned, &.{}, operation.predicate);
@@ -924,6 +946,7 @@ const Engine = struct {
     shortest_count: ?*u64 = null,
     count_endpoints: bool = false,
     component_proof: bool = false,
+    component_leaves: []const ComponentLeaf = &.{},
     weighted_sink: ?struct { ptr: *anyopaque, emit: *const fn (*anyopaque, Row, u64) anyerror!void, multiplicity: Multiplicity } = null,
     lower_graph: ?*LowerGraph = null,
     anchor_batch: ?*AnchorBatch = null,
@@ -1872,22 +1895,13 @@ const Engine = struct {
         @memcpy(edges[left.edges.len..], right.edges);
         return .{ .span = left.span, .alias = null, .nodes = nodes, .edges = edges };
     }
-    /// Plan a connected linear component once. Cross-clause fusion is only
-    /// committed after the compressed producer proves uniqueness; a declined
-    /// proof resumes the original clauses, which reset trail history separately.
-    fn tryComponent(self: *Engine, input: []const Row, clauses: []const ast.Clause) anyerror!?ComponentResult {
-        if (!self.read_only or self.component_proof or clauses.len < 2 or clauses[0].operation != .match) return null;
-        var operation = clauses[0].operation.match;
+    /// Canonical path planning shared by native folds and SQL pull cursors.
+    /// Keep the original MATCH untouched until a weighted plan is accepted.
+    fn linearComponent(self: *Engine, patterns: []const ast.Path) !?ast.Path {
+        if (patterns.len == 0) return null;
+        if (patterns.len == 1) return patterns[0];
         var paths: std.ArrayList(ast.Path) = .empty;
-        var match_count: usize = 0;
-        while (match_count < clauses.len and clauses[match_count].operation == .match) : (match_count += 1) {
-            const step = clauses[match_count].operation.match;
-            if (step.mode != operation.mode or (match_count != 0 and (step.optional or operation.optional))) return null;
-            if (match_count != 0 and operation.predicate != null) return null;
-            operation.predicate = step.predicate;
-            try paths.appendSlice(self.a, step.paths);
-        }
-        if (paths.items.len < 2) return null;
+        try paths.appendSlice(self.a, patterns);
         for (paths.items) |path| if (path.alias != null or path.selector != .all or path.execution_prefix or path.execution_reversed) return null;
         var path = paths.orderedRemove(0);
         while (paths.items.len != 0) {
@@ -1904,6 +1918,80 @@ const Engine = struct {
             }
             if (!found) return null;
         }
+        return path;
+    }
+    const ComponentLeaf = struct { pivot: usize, node: ast.Node, edge: ast.Edge };
+    fn aliasUses(patterns: []const ast.Path, alias: []const u8) usize {
+        var leaf_count: usize = 0;
+        for (patterns) |path| for (path.nodes) |node| if (node.alias) |name| {
+            leaf_count += @intFromBool(std.mem.eql(u8, alias, name));
+        };
+        return leaf_count;
+    }
+    /// Eliminate unobserved one-edge leaves from a directed linear core.
+    /// Acyclicity later proves that a leaf can conflict only with the core's
+    /// adjacent outgoing edge. Local matching counts all distinct leaf-edge
+    /// assignments instead of retaining complete trunk histories.
+    fn branchComponent(self: *Engine, patterns: []const ast.Path, leaves: *std.ArrayList(ComponentLeaf)) !?ast.Path {
+        var core: std.ArrayList(ast.Path) = .empty;
+        var branches: std.ArrayList(ast.Path) = .empty;
+        for (patterns) |pattern| {
+            if (pattern.alias != null or pattern.selector != .all or pattern.execution_prefix or pattern.execution_reversed) return null;
+            if (pattern.alias == null and pattern.selector == .all and pattern.edges.len == 1 and pattern.edges[0].min_hops == 1 and pattern.edges[0].max_hops == 1) {
+                if (pattern.nodes[1].alias) |alias| if (aliasUses(patterns, alias) == 1 and pattern.nodes[0].alias != null and aliasUses(patterns, pattern.nodes[0].alias.?) > 1) {
+                    try branches.append(self.a, pattern);
+                    continue;
+                };
+                if (pattern.nodes[0].alias) |alias| if (aliasUses(patterns, alias) == 1 and pattern.nodes[1].alias != null and aliasUses(patterns, pattern.nodes[1].alias.?) > 1) {
+                    try branches.append(self.a, try self.reverseComponent(pattern));
+                    continue;
+                };
+            }
+            try core.append(self.a, pattern);
+        }
+        if (branches.items.len == 0 or branches.items.len > @min(16, self.limits.recursion_depth)) return null;
+        var path = (try self.linearComponent(core.items)) orelse return null;
+        if (path.edges.len == 0) return null;
+        const direction = path.edges[0].direction;
+        if (direction == .both) return null;
+        for (path.edges) |edge| if (edge.direction != direction or edge.min_hops == 0) return null;
+        const nodes = try self.a.dupe(ast.Node, path.nodes);
+        for (branches.items) |branch| {
+            if (branch.edges[0].direction != direction) return null;
+            const pivot = for (nodes, 0..) |node, index| {
+                if (node.alias) |alias| if (std.mem.eql(u8, alias, branch.nodes[0].alias.?)) break index;
+            } else return null;
+            const combined = (try self.joinComponent(.{ .span = .{}, .alias = null, .nodes = &.{nodes[pivot]}, .edges = &.{} }, .{ .span = .{}, .alias = null, .nodes = &.{branch.nodes[0]}, .edges = &.{} })).?;
+            nodes[pivot] = combined.nodes[0];
+            try leaves.append(self.a, .{ .pivot = pivot, .node = branch.nodes[1], .edge = branch.edges[0] });
+        }
+        path.nodes = nodes;
+        return path;
+    }
+    /// Plan a connected linear component once. Cross-clause fusion is only
+    /// committed after the compressed producer proves uniqueness; a declined
+    /// proof resumes the original clauses, which reset trail history separately.
+    fn tryComponent(self: *Engine, input: []const Row, clauses: []const ast.Clause) anyerror!?ComponentResult {
+        if (!self.read_only or self.component_proof or clauses.len < 2 or clauses[0].operation != .match) return null;
+        var operation = clauses[0].operation.match;
+        var paths: std.ArrayList(ast.Path) = .empty;
+        var match_count: usize = 0;
+        while (match_count < clauses.len and clauses[match_count].operation == .match) : (match_count += 1) {
+            const step = clauses[match_count].operation.match;
+            if (step.mode != operation.mode or (match_count != 0 and (step.optional or operation.optional))) return null;
+            if (match_count != 0 and operation.predicate != null) return null;
+            operation.predicate = step.predicate;
+            try paths.appendSlice(self.a, step.paths);
+        }
+        if (paths.items.len < 2) return null;
+        var leaves: std.ArrayList(ComponentLeaf) = .empty;
+        const path = (try self.linearComponent(paths.items)) orelse blk: {
+            if (match_count != 1 or operation.mode == .node_simple) return null;
+            break :blk (try self.branchComponent(paths.items, &leaves)) orelse return null;
+        };
+        if (leaves.items.len != 0) for (clauses[match_count..]) |clause| {
+            if (clause.operation == .project and clause.operation.project.value.wildcard) return null;
+        };
         if (path.edges.len == 0 or (path.edges.len == 1 and path.edges[0].min_hops == 1 and path.edges[0].max_hops == 1)) return null;
         operation.paths = try self.a.dupe(ast.Path, &.{path});
         for (clauses[match_count..], match_count..) |clause, index| {
@@ -1914,8 +2002,11 @@ const Engine = struct {
             for (projection.items) |item| reduction = reduction or aggregates(item.expression);
             if (!clause.operation.project.final and !reduction and projection.limit == null) continue;
             const previous = self.component_proof;
+            const previous_leaves = self.component_leaves;
             self.component_proof = true;
+            self.component_leaves = leaves.items;
             defer self.component_proof = previous;
+            defer self.component_leaves = previous_leaves;
             const result = self.streamMatchProjection(input, operation, projection, clauses[match_count..index], clauses[0].span, clause.span) catch |err| switch (err) {
                 error.CypherComponentDeclined => return null,
                 else => return err,
@@ -2795,10 +2886,18 @@ const Engine = struct {
             if (edge.max_hops) |bound| maximum = std.math.add(usize, maximum, bound) catch return false;
         }
         if (maximum > self.limits.path_depth) return false;
+        for (self.component_leaves) |leaf| {
+            if (leaf.edge.alias) |alias| {
+                if (lookup(input.row, alias) != null or names.contains(alias)) return error.CypherComponentDeclined;
+                try names.put(self.a, alias, {});
+            }
+            for (leaf.node.properties) |entry| if (self.constant(entry.value, input.row) == null) return error.CypherComponentDeclined;
+            for (leaf.edge.properties) |entry| if (self.constant(entry.value, input.row) == null) return error.CypherComponentDeclined;
+        }
         // Each product transition retains its own constant property residual.
         const capture_edge = domains.items[0];
         const capture_path: ast.Path = .{ .span = path.span, .alias = null, .nodes = &.{ path.nodes[0], path.nodes[path.nodes.len - 1] }, .edges = &.{capture_edge} };
-        var graph: LowerGraph = .{ .input = input, .path = capture_path, .domains = domains.items, .qualified = true };
+        var graph: LowerGraph = .{ .input = input, .path = capture_path, .domains = domains.items, .qualified = true, .mode = mode };
         for (starts) |start| {
             const entry = try graph.positions.getOrPut(self.a, start.identity);
             if (!entry.found_existing) {
@@ -2879,7 +2978,7 @@ const Engine = struct {
                 // destination admission while transferring weights directly,
                 // without scanning/copying an extra frontier per pattern edge.
                 try chargeWork(self, next.capacity());
-                try self.advanceLowerTarget(&graph, domain, edge, &current, &next, path.nodes[edge_index + 1]);
+                try self.advanceLowerTarget(&graph, domain, edge, &current, &next, path.nodes[edge_index + 1], edge_index);
                 std.mem.swap(Counts, &current, &next);
                 continue;
             }
@@ -2897,7 +2996,7 @@ const Engine = struct {
                 var mandatory: usize = 0;
                 while (mandatory < edge.min_hops and current.count() != 0) : (mandatory += 1) {
                     try chargeWork(self, @as(usize, current.capacity()) + next.capacity());
-                    try self.advanceLower(&graph, domain, edge, &current, &next);
+                    try self.advanceLower(&graph, domain, edge, &current, &next, if (mandatory == 0) edge_index else null);
                     std.mem.swap(Counts, &current, &next);
                 }
                 const reached = try self.a.alloc(u64, graph.nodes.items.len);
@@ -2941,10 +3040,14 @@ const Engine = struct {
                     }
                 }
                 if (hop == upper) break;
-                try self.advanceLower(&graph, domain, edge, &current, &next);
+                try self.advanceLower(&graph, domain, edge, &current, &next, if (hop == 0) edge_index else null);
                 std.mem.swap(Counts, &current, &next);
             }
             std.mem.swap(Counts, &current, &endpoints);
+        }
+        if (self.component_leaves.len != 0) {
+            var final = current.iterator();
+            while (final.next()) |endpoint| endpoint.value_ptr.* = multiplyPathWays(endpoint.value_ptr.*, try self.branchWays(&graph, endpoint.key_ptr.*, path.nodes.len - 1, null, mode));
         }
         // Saturated counts prove COUNT overflow but are not numeric weights.
         // Never approximate SUM/AVG with the overflow sentinel.
@@ -2987,6 +3090,7 @@ const Engine = struct {
         var counts = current.iterator();
         while (counts.next()) |endpoint| {
             const ways = endpoint.value_ptr.*;
+            if (ways == 0) continue;
             if (self.shortest_count) |count_paths| {
                 count_paths.* = try addPathCount(count_paths.*, ways);
             } else {
@@ -3006,10 +3110,80 @@ const Engine = struct {
         }
         return true;
     }
-    fn advanceLower(self: *Engine, graph: *LowerGraph, domain: usize, edge: ast.Edge, current: *std.AutoHashMapUnmanaged(usize, u64), next: *std.AutoHashMapUnmanaged(usize, u64)) !void {
-        return self.advanceLowerTarget(graph, domain, edge, current, next, null);
+    fn sameRelationship(left: *const v.Relationship, right: *const v.Relationship) bool {
+        return left.identity.eql(right.identity) and std.mem.eql(u8, left.index, right.index);
     }
-    fn advanceLowerTarget(self: *Engine, graph: *LowerGraph, domain: usize, edge: ast.Edge, current: *std.AutoHashMapUnmanaged(usize, u64), next: *std.AutoHashMapUnmanaged(usize, u64), target: ?ast.Node) !void {
+    fn multiplyPathWays(left: u64, right: u64) u64 {
+        return @min(@as(u64, std.math.maxInt(i64)) + 1, left *| right);
+    }
+    fn branchWays(self: *Engine, graph: *LowerGraph, position: usize, pivot: usize, excluded: ?*const v.Relationship, mode: ast.PathMode) anyerror!u64 {
+        var leaf_count: usize = 0;
+        for (self.component_leaves) |leaf| leaf_count += @intFromBool(leaf.pivot == pivot);
+        if (leaf_count == 0) return 1;
+        const key: BranchKey = .{ .node = position, .pivot = pivot };
+        const choices = graph.branch_choices.get(key) orelse blk: {
+            const sets = try self.a.alloc([]const *const v.Relationship, leaf_count);
+            var slot: usize = 0;
+            const node = graph.nodes.items[position].node;
+            for (self.component_leaves) |leaf| {
+                if (leaf.pivot != pivot) continue;
+                var candidates: std.ArrayList(*const v.Relationship) = .empty;
+                for (self.graph.relationships, 0..) |mapping, mapping_index| {
+                    const selected = leaf.edge.types.len == 0 or for (leaf.edge.types) |name| {
+                        if (std.mem.eql(u8, name, mapping.name)) break true;
+                    } else false;
+                    if (!selected or !try self.graph.admits(node, if (leaf.edge.direction == .out) mapping.source_label else mapping.target_label, &self.values)) continue;
+                    var after: ?[]const u8 = null;
+                    while (true) {
+                        const page = try self.lowerPage(mapping_index, node.identity, leaf.edge.direction, after);
+                        try self.prefetchEndpoints(page.items, node.identity, leaf.edge.direction == .out, leaf.edge.direction == .in);
+                        for (page.items) |relationship| {
+                            try self.state();
+                            if (!std.mem.eql(u8, relationship.index, mapping.index) or !std.mem.eql(u8, relationship.type, mapping.name)) return error.CypherInvalidBackendRelationship;
+                            const identity = if (leaf.edge.direction == .out and relationship.source.eql(node.identity)) relationship.target else if (leaf.edge.direction == .in and relationship.target.eql(node.identity)) relationship.source else continue;
+                            const target = (try self.getNode(identity)) orelse continue;
+                            if (!try self.graph.admits(target, if (leaf.edge.direction == .out) mapping.target_label else mapping.source_label, &self.values) or !try self.nodeMatches(target, leaf.node) or !boundNodeMatches(target, leaf.node, graph.input.row)) continue;
+                            if (!try self.constantProperties(.{ .node = target }, leaf.node.properties, graph.input.row) or !try self.constantProperties(.{ .relationship = relationship }, leaf.edge.properties, graph.input.row)) continue;
+                            const duplicate = for (candidates.items) |other| {
+                                if (sameRelationship(other, relationship)) break true;
+                            } else false;
+                            if (!duplicate) try candidates.append(self.a, relationship);
+                        }
+                        const next = page.next orelse break;
+                        if (after) |previous| if (std.mem.eql(u8, previous, next)) return error.CypherInvalidBackendCursor;
+                        after = next;
+                    }
+                }
+                sets[slot] = candidates.items;
+                slot += 1;
+            }
+            try graph.branch_choices.put(self.a, key, sets);
+            break :blk sets;
+        };
+        var used: [16]*const v.Relationship = undefined;
+        return self.branchAssignments(choices, 0, &used, if (mode == .repeatable) null else excluded, mode == .repeatable);
+    }
+    fn branchAssignments(self: *Engine, choices: []const []const *const v.Relationship, depth: usize, used: *[16]*const v.Relationship, excluded: ?*const v.Relationship, repeatable: bool) anyerror!u64 {
+        if (depth == choices.len) return 1;
+        var ways: u64 = 0;
+        for (choices[depth]) |relationship| {
+            try self.state();
+            if (excluded) |edge| if (sameRelationship(edge, relationship)) continue;
+            if (!repeatable) {
+                const duplicate = for (used[0..depth]) |edge| {
+                    if (sameRelationship(edge, relationship)) break true;
+                } else false;
+                if (duplicate) continue;
+            }
+            used[depth] = relationship;
+            ways = mergePathWays(ways, try self.branchAssignments(choices, depth + 1, used, excluded, repeatable));
+        }
+        return ways;
+    }
+    fn advanceLower(self: *Engine, graph: *LowerGraph, domain: usize, edge: ast.Edge, current: *std.AutoHashMapUnmanaged(usize, u64), next: *std.AutoHashMapUnmanaged(usize, u64), source: ?usize) !void {
+        return self.advanceLowerTarget(graph, domain, edge, current, next, null, source);
+    }
+    fn advanceLowerTarget(self: *Engine, graph: *LowerGraph, domain: usize, edge: ast.Edge, current: *std.AutoHashMapUnmanaged(usize, u64), next: *std.AutoHashMapUnmanaged(usize, u64), target: ?ast.Node, source: ?usize) !void {
         next.clearRetainingCapacity();
         var candidates = current.iterator();
         while (candidates.next()) |candidate| {
@@ -3039,7 +3213,8 @@ const Engine = struct {
                         !try self.constantProperties(.{ .node = reached }, pattern.properties, graph.input.row)) continue;
                 }
                 const entry = try next.getOrPut(self.a, arc.target);
-                entry.value_ptr.* = mergePathWays(if (entry.found_existing) entry.value_ptr.* else 0, ways);
+                const weight = if (source) |pivot| multiplyPathWays(ways, try self.branchWays(graph, index, pivot, relationship, graph.mode)) else ways;
+                entry.value_ptr.* = mergePathWays(if (entry.found_existing) entry.value_ptr.* else 0, weight);
             }
         }
     }
@@ -3187,6 +3362,7 @@ const Engine = struct {
         }
     };
     fn reductionPath(self: *Engine, path: ast.Path, row: Row, operation: ast.Match, projection: ast.Projection, middle: []const ast.Clause) !ast.Path {
+        if (self.component_leaves.len != 0) return path;
         if (path.selector != .all or path.edges.len == 0 or path.execution_prefix or try self.batchEligible(path, row, operation, projection, middle)) return path;
         // Without cardinality estimates, equal filter scores do not prove a
         // different table or label population costs the same to scan. Only
@@ -3312,6 +3488,7 @@ const Engine = struct {
     const LowerArc = struct { target: usize, relationship: *const v.Relationship, mapping: usize, eligible: bool = false };
     const LowerRange = struct { first: usize, last: usize };
     const LowerNode = struct { node: *const v.Node, depth: usize, arcs: std.ArrayList(LowerArc) = .empty, loaded: bool = false, domains: std.AutoHashMapUnmanaged(usize, LowerRange) = .empty };
+    const BranchKey = struct { node: usize, pivot: usize };
     const LowerGraph = struct {
         nodes: std.ArrayList(LowerNode) = .empty,
         positions: std.HashMapUnmanaged(v.Identity, usize, v.Identity.Context, std.hash_map.default_max_load_percentage) = .empty,
@@ -3319,6 +3496,8 @@ const Engine = struct {
         path: ast.Path,
         domains: []const ast.Edge = &.{},
         qualified: bool = false,
+        mode: ast.PathMode = .relationship_simple,
+        branch_choices: std.AutoHashMapUnmanaged(BranchKey, []const []const *const v.Relationship) = .empty,
         probing: bool = false,
         probe_matches: bool = false,
         first_only: bool = false,

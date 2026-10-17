@@ -1367,18 +1367,30 @@ computations run in their assigned pass, and unused computations that could fail
 retain their error dependencies. Projected rows carry explicit aligned weights
 and active aggregate slots through filtering and pagination. A bounded operator
 tree concatenates UNION ALL contributions and carries them through cross joins
-with a proven at-most-one-row, repeatable subtree. Each unsupported child retains
+with a proven finite, repeatable side relation (at most 4,096 rows). The normal
+SQL iterator captures that side once under the statement memory budget, including
+its errors and empty inputs. Unobserved side columns permit direct multiplication
+of contribution weights; observed columns use a paged Cartesian product with one
+retained graph page. Each unsupported child retains
 ordinary production with unit weights, so negotiation never requires advancing a
 producer or rolling back another child's capability. A tree with no weighted
 producer declines negotiation and retains the ordinary columnar execution path.
 Positional set coercions,
-NULLs and DISTINCT state stay in the typed SQL machinery. Singleton expressions
-run through their normal iterator, including errors and empty inputs. Pure direct
+NULLs and DISTINCT state stay in the typed SQL machinery. Pure direct
 sort keys can be omitted when no pagination observes their order and the consumer
 has negotiated duplicate/order-insensitive typed reduction. Other joins, set
 operators, materialized relations, windows, ordered/error-producing sort keys and
 cardinality-changing stages retain ordinary production. No aggregate expression
 is algebraically rewritten.
+
+SQL top-N negotiates endpoint bags only for repeatable predicates, projections
+and order programs. The typed heap and spill codec retain one record per
+contribution, with a private count clipped to the maximum observable window.
+Only the final LIMIT window expands into output rows; OFFSET skips whole bags.
+NULL ordering, typed comparisons, expression errors and positional coercions
+remain SQL operations. A separate capped-count capability admits saturated graph
+counts as lower bounds for finite windows, including through UNION ALL and
+bounded side joins. Exact SUM/AVG and COUNT consumers never receive those bounds.
 
 Read phases share a bounded, quota-accounted cache of raw adjacency pages across
 anchors. Cache keys include mapping, direction, identity and continuation; each
@@ -1434,6 +1446,16 @@ compression, including reversed pattern order and adjacent read-only MATCH
 clauses. The compressed producer must prove uniqueness for the complete
 component before using merged histories. A declined proof returns to the original
 clauses, preserving their independent relationship/node uniqueness scopes.
+SQL pull cursors share the same linear component normalization before weight
+negotiation, retaining the original MATCH for ordinary execution. Directed cores
+with unobserved one-edge leaves also admit local factorization: each junction
+counts eligible leaf-edge assignments while excluding its adjacent trunk edge
+under relationship-simple semantics. Cached local choices avoid carrying full
+route histories; parallel edges remain separate identities. The core uniqueness
+proof must still pass before any contribution is emitted. Node-simple paths,
+observed leaf bindings, mixed directions and unproven cyclic trails retain exact
+execution. Repeatable walks permit reuse explicitly. Leaf matching shares work,
+authority, adjacency, property and memory limits with the statement.
 Intermediate bindings observed by the consumer, optional clause boundaries,
 early predicates and path-sensitive constraints retain ordinary execution.
 Single-hop bound-pair plans keep their direct seek instead of discovering a
@@ -1547,8 +1569,10 @@ point reads/writes with a one-anchor ceiling, shared-label counts, bounded-memor
 terminal operators, SQL graph composition, shortest paths on a dense acyclic
 graph, and lazy incident-edge deletion. Weighted regression cases include
 indexed and unindexed root/endpoint predicates, computed derived-table and CTE
-projections, SQL ordering/UNION ALL/singleton joins, selective indexed ranges,
-connected multi-pattern and multi-clause components, independent 100-hop SQL
+projections, SQL ordering/UNION ALL/bounded side joins, saturated SQL top-N windows,
+selective indexed ranges,
+connected multi-pattern and multi-clause components, factorized branches,
+independent 100-hop SQL
 endpoint reductions, floating DISTINCT SUM/AVG, and finite ordered windows over saturated path bags. Core oracles compare
 compressed execution with exact cyclic and acyclic trails, including OPTIONAL
 null extension, partial bag pagination, eager Boolean errors, pattern-property
