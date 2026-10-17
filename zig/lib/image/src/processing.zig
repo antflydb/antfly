@@ -14,6 +14,7 @@
 // limitations under the License.
 
 const std = @import("std");
+pub const work_control = @import("work_control.zig");
 
 pub const Resample = enum(u32) {
     nearest = 0,
@@ -642,7 +643,7 @@ fn sampleBicubic(
     return std.math.clamp(accum, 0.0, 255.0);
 }
 
-const BicubicAxis = struct {
+pub const BicubicAxis = struct {
     allocator: std.mem.Allocator,
     starts: []usize,
     offsets: []usize,
@@ -659,7 +660,7 @@ const BicubicAxis = struct {
 /// Build Pillow-compatible antialiased bicubic coefficients. Downsampling
 /// widens the cubic support by the reduction factor and renormalizes the
 /// surviving in-bounds taps instead of clamping out-of-bounds samples.
-fn buildPillowBicubicAxis(
+pub fn buildPillowBicubicAxis(
     allocator: std.mem.Allocator,
     source_size: usize,
     target_size: usize,

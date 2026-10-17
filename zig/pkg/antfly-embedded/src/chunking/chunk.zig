@@ -33,8 +33,10 @@ pub const Chunk = struct {
     speaker_index: ?u8 = null,
     frame_index: ?u32 = null,
     frame_delay_ms: ?u32 = null,
+    metadata: ?*@import("inference_chunker").types.ModelMetadata = null,
 
     pub fn deinit(self: *Chunk, alloc: Allocator) void {
+        if (self.metadata) |metadata| metadata.deinit(alloc);
         if (self.text) |text| alloc.free(text);
         if (self.data) |data| alloc.free(data);
         if (self.owns_mime_type) alloc.free(@constCast(self.mime_type));
@@ -129,6 +131,15 @@ pub fn appendArtifactFieldsWithProvenance(
     if (chunk.frame_index) |value| try obj.put(alloc, try alloc.dupe(u8, "_frame_index"), .{ .integer = value });
     if (chunk.frame_delay_ms) |value| try obj.put(alloc, try alloc.dupe(u8, "_frame_delay_ms"), .{ .integer = value });
     try appendProvenanceFields(alloc, obj, source_field, chunk, provenance);
+    if (chunk.metadata) |metadata| {
+        // Keep vectors in the embedding artifact family. This recipe is enough
+        // to navigate or reconstruct the source chunk without duplicated media.
+        const encoded = try std.json.Stringify.valueAlloc(alloc, .{ .descriptor = metadata.descriptor, .inference_id = metadata.inference_id, .source_fingerprint = metadata.source_fingerprint, .source_version = metadata.source_version, .plan_id = metadata.plan_id, .model = metadata.model, .model_identity = metadata.model_identity, .model_revision = metadata.model_revision, .task_type = metadata.task_type, .dimensions = metadata.dimensions, .policy = metadata.policy }, .{});
+        defer alloc.free(encoded);
+        var parsed = try std.json.parseFromSlice(std.json.Value, alloc, encoded, .{ .allocate = .alloc_always });
+        defer parsed.deinit();
+        try putClonedJsonValue(alloc, obj, "_chunk", parsed.value);
+    }
 
     if (!include_payload) return;
 
@@ -487,4 +498,82 @@ fn freeJsonValue(alloc: Allocator, value: std.json.Value) void {
         },
         else => {},
     }
+}
+
+fn cloneJsonValue(a: Allocator, value: std.json.Value) Allocator.Error!std.json.Value {
+    return switch (value) {
+        .string => |text| .{ .string = try a.dupe(u8, text) },
+        .array => |array| blk: {
+            var copy = std.json.Array.init(a);
+            errdefer freeJsonValue(a, .{ .array = copy });
+            for (array.items) |item| {
+                const owned = try cloneJsonValue(a, item);
+                errdefer freeJsonValue(a, owned);
+                try copy.append(owned);
+            }
+            break :blk .{ .array = copy };
+        },
+        .object => |object| blk: {
+            var copy = std.json.ObjectMap.empty;
+            errdefer freeJsonValue(a, .{ .object = copy });
+            var it = object.iterator();
+            while (it.next()) |item| try putClonedJsonValue(a, &copy, item.key_ptr.*, item.value_ptr.*);
+            break :blk .{ .object = copy };
+        },
+        else => value,
+    };
+}
+
+fn putClonedJsonValue(a: Allocator, obj: *std.json.ObjectMap, key: []const u8, value: std.json.Value) !void {
+    const owned_key = try a.dupe(u8, key);
+    errdefer a.free(owned_key);
+    const owned_value = try cloneJsonValue(a, value);
+    errdefer freeJsonValue(a, owned_value);
+    try obj.put(a, owned_key, owned_value);
+}
+
+/// An owned typed replay recipe; payload ownership stays in the source artifact.
+pub fn modelMetadataAlloc(a: Allocator, payload: []const u8) !?*@import("inference_chunker").types.ModelMetadata {
+    var parsed = try std.json.parseFromSlice(std.json.Value, a, payload, .{});
+    defer parsed.deinit();
+    if (parsed.value != .object) return null;
+    const raw = parsed.value.object.get("_chunk") orelse return null;
+    var metadata = try std.json.parseFromValue(@import("inference_chunker").types.ModelMetadata, a, raw, .{ .ignore_unknown_fields = true });
+    defer metadata.deinit();
+    return try metadata.value.clone(a);
+}
+
+/// A pure-computation key: it carries no publication or source-read authority.
+pub fn modelMemoKey(a: Allocator, metadata: @import("inference_chunker").types.ModelMetadata) ![32]u8 {
+    var recipe = metadata;
+    recipe.embedding = null;
+    const bytes = try std.json.Stringify.valueAlloc(a, recipe, .{ .emit_null_optional_fields = false });
+    defer a.free(bytes);
+    var hash = std.crypto.hash.sha2.Sha256.init(.{});
+    hash.update("antfly-model-chunk-vector-v1");
+    hash.update(bytes);
+    return hash.finalResult();
+}
+
+test "model chunk artifact retains reconstruction coordinates independently of vectors" {
+    const a = std.testing.allocator;
+    const M = @import("inference_chunker").types.ModelMetadata;
+    const metadata = M{ .descriptor = .{ .ordinal = 3, .coordinates = .{ .kind = .video, .start_ns = 30_000_000_000, .end_ns = 60_000_000_000, .selected_pictures = &.{ 900, 930 }, .picture_basis = .logical }, .input_tokens = 282 }, .inference_id = "plan:3", .source_fingerprint = "immutable-source", .source_version = "v1", .plan_id = "plan", .model = "model", .model_identity = "weights-v1", .model_revision = "recipe-v1", .task_type = "RETRIEVAL_DOCUMENT", .dimensions = 2, .policy = .{}, .embedding = &.{ 0.6, 0.8 } };
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    var object: std.json.ObjectMap = .empty;
+    var chunk = Chunk{ .chunk_id = 3, .mime_type = "video/mp4", .metadata = try metadata.clone(a) };
+    defer chunk.deinit(a);
+    try appendArtifactFields(arena.allocator(), &object, "body", chunk, false);
+    const encoded = try std.json.Stringify.valueAlloc(a, std.json.Value{ .object = object }, .{});
+    defer a.free(encoded);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "embedding") == null);
+    const replay = (try modelMetadataAlloc(a, encoded)).?;
+    defer replay.deinit(a);
+    try std.testing.expectEqualSlices(u64, &.{ 900, 930 }, replay.descriptor.coordinates.selected_pictures.?);
+    try std.testing.expectEqual(@as(?[]const f32, null), replay.embedding);
+    try std.testing.expectEqualSlices(u8, &try modelMemoKey(a, metadata), &try modelMemoKey(a, replay.*));
+    var changed = replay.*;
+    changed.model_identity = "weights-v2";
+    try std.testing.expect(!std.mem.eql(u8, &try modelMemoKey(a, replay.*), &try modelMemoKey(a, changed)));
 }

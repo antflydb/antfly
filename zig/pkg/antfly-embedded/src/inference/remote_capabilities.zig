@@ -790,6 +790,7 @@ const ExactWireCapabilities = struct {
     prompt_policy: work.PromptPolicy,
     borrowed_attachments: bool,
     framed_attachments: bool,
+    model_aware_chunking_v1: bool = false,
     numeric_responses_v1: bool,
     rerank_documents_v1: bool,
     image_transform: ?work.ImageTransform = null,
@@ -948,6 +949,10 @@ fn parseExactWireCapabilities(object: std.json.ObjectMap, version: usize) !Exact
         if (value != .bool) return error.InvalidInferenceCapabilities;
         break :blk value.bool;
     } else false;
+    const model_aware_chunking_v1 = if (object.get("model_aware_chunking_v1")) |value| blk: {
+        if (value != .bool) return error.InvalidInferenceCapabilities;
+        break :blk value.bool;
+    } else false;
     const numeric_responses_v1 = if (object.get("numeric_responses_v1")) |value| blk: {
         if (value != .bool) return error.InvalidInferenceCapabilities;
         break :blk value.bool;
@@ -970,6 +975,7 @@ fn parseExactWireCapabilities(object: std.json.ObjectMap, version: usize) !Exact
         .prompt_policy = prompt_policy,
         .borrowed_attachments = borrowed_value.bool,
         .framed_attachments = framed_attachments,
+        .model_aware_chunking_v1 = model_aware_chunking_v1,
         .numeric_responses_v1 = numeric_responses_v1,
         .rerank_documents_v1 = rerank_documents_v1,
         .image_transform = try parseImageTransform(object),
@@ -1051,6 +1057,7 @@ pub fn parseModelCapabilities(
         // even if a misconfigured upstream publishes its local ABI fact.
         .borrowed_attachments = false,
         .framed_attachments = if (exact) |value| value.framed_attachments else false,
+        .model_aware_chunking_v1 = if (exact) |value| value.model_aware_chunking_v1 else false,
         .numeric_responses_v1 = if (exact) |value| value.numeric_responses_v1 else false,
         .rerank_documents_v1 = if (exact) |value| value.rerank_documents_v1 else false,
     };
@@ -1059,6 +1066,12 @@ pub fn parseModelCapabilities(
             if (value == .string) try result.batch.applyManifestCapability(value.string);
         }
     };
+    if (info.object.get("model_revision")) |revision| {
+        if (revision != .string or revision.string.len != 64) return error.InvalidInferenceCapabilities;
+        var digest: [32]u8 = undefined;
+        _ = std.fmt.hexToBytes(&digest, revision.string) catch return error.InvalidInferenceCapabilities;
+        result.model_revision = digest;
+    }
     result.batch.preferred_items = @min(result.batch.preferred_items, result.batch.max_items);
     try result.validate();
     return result;
@@ -1688,4 +1701,13 @@ pub fn testCapabilityInvalidationFencesCompletedFlight() !void {
 
 test "capability invalidation poisons a completed discovery flight" {
     try testCapabilityInvalidationFencesCompletedFlight();
+}
+
+test "model aware media remote capability pins the resolved embedding generation" {
+    const payload = "{\"embedders\":{\"model\":{\"inputs\":[\"image\"],\"model_revision\":\"1111111111111111111111111111111111111111111111111111111111111111\"}}}";
+    const capabilities = (try parseModelCapabilities(std.testing.allocator, payload, "model", .embed)).?;
+    try std.testing.expectEqualSlices(u8, &@as([32]u8, @splat(0x11)), &capabilities.model_revision.?);
+    const malformed = try std.mem.replaceOwned(u8, std.testing.allocator, payload, "1111111111111111111111111111111111111111111111111111111111111111", "not-a-revision");
+    defer std.testing.allocator.free(malformed);
+    try std.testing.expectError(error.InvalidInferenceCapabilities, parseModelCapabilities(std.testing.allocator, malformed, "model", .embed));
 }

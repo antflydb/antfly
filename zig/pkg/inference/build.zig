@@ -248,6 +248,7 @@ pub fn build(b: *std.Build) void {
         .b = b,
         .target = target,
         .optimize = optimize,
+        .strip = strip,
         .paths = runtime_config.paths,
         .backend = runtime_config.backend,
         .graph = runtime_graph,
@@ -1069,6 +1070,14 @@ pub fn build(b: *std.Build) void {
     embeddinggemma2_bench.root_module.link_libc = true;
     const install_embeddinggemma2_bench = b.addInstallArtifact(embeddinggemma2_bench, .{});
     b.step("build-embeddinggemma2-bench", "Build the prepared-text encoder benchmark without running it").dependOn(&install_embeddinggemma2_bench.step);
+    const live_bench = b.addExecutable(.{ .name = "antfly-embeddinggemma2-live", .root_module = b.createModule(.{ .root_source_file = b.path("src/bench/embeddinggemma2_live.zig"), .target = target, .optimize = optimize }) });
+    live_bench.root_module.addImport("build_options", build_options_mod);
+    live_bench.root_module.addImport("inference_internal", inference_internal_mod);
+    live_bench.root_module.addImport("antfly_media", inference_internal_mod.import_table.get("antfly_media").?);
+    live_bench.root_module.addImport("antfly_video", inference_internal_mod.import_table.get("antfly_video").?);
+    runtime_graph.identities.addImports(live_bench.root_module);
+    live_bench.root_module.link_libc = true;
+    b.step("build-embeddinggemma2-live", "Build pretrained live adapter/complete-clip parity qualification").dependOn(&b.addInstallArtifact(live_bench, .{}).step);
     const run_embeddinggemma2_bench = b.addRunArtifact(embeddinggemma2_bench);
     run_embeddinggemma2_bench.addPassthruArgs();
     b.step("bench-embeddinggemma2", "Run the synchronized prepared-text encoder benchmark").dependOn(&run_embeddinggemma2_bench.step);
@@ -1111,24 +1120,7 @@ pub fn build(b: *std.Build) void {
         b.step("build-pdf-ocr-comparison", "Build Gemma4 versus Apple Vision corpus benchmark").dependOn(&b.addInstallArtifact(pdf_ocr_bench, .{}).step);
     }
 
-    // Standalone PDF benchmark shares image/hash identity with inference.
-    // Font data belongs only to this tool, not the production inference graph.
-    const pdf_fonts_files = b.addWriteFiles();
-    _ = pdf_fonts_files.addCopyFile(b.path(b.fmt("{s}/lib/pdf/fonts/roboto/Roboto-Regular.ttf", .{shared_lib_root})), "lib/pdf/fonts/roboto/Roboto-Regular.ttf");
-    _ = pdf_fonts_files.addCopyFile(b.path(b.fmt("{s}/lib/pdf/fonts/roboto/Roboto-Bold.ttf", .{shared_lib_root})), "lib/pdf/fonts/roboto/Roboto-Bold.ttf");
-    const pdf_fonts = b.createModule(.{ .root_source_file = pdf_fonts_files.addCopyFile(b.path(b.fmt("{s}/pdf_standard_fonts.zig", .{shared_lib_root})), "pdf_standard_fonts.zig"), .target = target, .optimize = optimize });
-    const pdf_font = b.createModule(.{ .root_source_file = b.path(b.fmt("{s}/lib/font/src/mod.zig", .{shared_lib_root})), .target = target, .optimize = optimize });
-    const pdf_module = b.createModule(.{ .root_source_file = b.path(b.fmt("{s}/lib/pdf/src/mod.zig", .{shared_lib_root})), .target = target, .optimize = optimize });
-    pdf_module.addImport("antfly_image", antfly_image_mod);
-    pdf_module.addImport("antfly_hash", antfly_image_mod.import_table.get("antfly_hash").?);
-    pdf_module.addImport("antfly_font", pdf_font);
-    pdf_module.addImport("pdf_standard_fonts", pdf_fonts);
-    pdf_module.addImport("antfly_platform", configured_platform_mod);
-    if (target.result.os.tag == .macos) {
-        addMacosSdkPaths(b, pdf_module, target);
-        pdf_module.linkFramework("CoreFoundation", .{});
-        pdf_module.linkFramework("CoreGraphics", .{});
-    }
+    const pdf_module = inference_internal_mod.import_table.get("antfly_pdf").?;
     const gemma4_pdf_bench = b.addExecutable(.{ .name = "antfly-gemma4-pdf-bench", .root_module = b.createModule(.{ .root_source_file = b.path("src/bench/gemma4_pdf.zig"), .target = target, .optimize = optimize }) });
     gemma4_pdf_bench.root_module.addImport("build_options", build_options_mod);
     gemma4_pdf_bench.root_module.addImport("inference_internal", inference_internal_mod);
@@ -1601,6 +1593,44 @@ pub fn build(b: *std.Build) void {
     // Tests
     const suite = workflows_tests.create(workflow_ctx);
     const tests = suite.tests;
+    b.step("test-embeddinggemma2", "Run the filtered inference suite for EmbeddingGemma 2 qualification").dependOn(&suite.run_tests.step);
+    b.step("install-embeddinggemma2-tests", "Install the filtered EmbeddingGemma2 suite for execution on another host").dependOn(&b.addInstallArtifact(tests, .{ .dest_sub_path = "embeddinggemma2-tests" }).step);
+    const video_model_root = b.createModule(.{ .root_source_file = b.path("src/inference_internal.zig"), .target = target, .optimize = optimize });
+    var video_imports = inference_internal_mod.import_table.iterator();
+    while (video_imports.next()) |entry| video_model_root.addImport(entry.key_ptr.*, entry.value_ptr.*);
+    video_model_root.addImport("inference_internal", video_model_root);
+    runtime_build.configureRuntimeLinks(b, video_model_root, target, runtime_config.backend, runtime_config.paths);
+    video_model_root.link_libc = runtime_config.backend.link_libc;
+    const video_model_tests = b.addTest(.{ .root_module = video_model_root, .filters = &.{ "embeddinggemma2 video", "embeddinggemma2 Metal video", "embeddinggemma2 model VFR", "metal native embeddinggemma2 BF16 and F32 shared" } });
+    b.step("check-video-model", "Compile video model qualification for cross-platform checks").dependOn(&video_model_tests.step);
+    b.step("install-video-model-tests", "Install native video model policy/lifetime tests for another host").dependOn(&b.addInstallArtifact(video_model_tests, .{ .dest_sub_path = "video-model-tests" }).step);
+    const media_chunk_tests = b.addTest(.{ .root_module = video_model_root, .filters = &.{"model aware media"} });
+    const media_chunk_step = b.step("test-media-chunking", "Qualify model-aware chunk coverage, source coordinates and cancellation");
+    media_chunk_step.dependOn(&b.addRunArtifact(media_chunk_tests).step);
+    const chunk_audio_root = b.createModule(.{ .root_source_file = b.path(b.fmt("{s}/lib/audio/audio_module_test_root.zig", .{shared_lib_root})), .target = target, .optimize = optimize });
+    @import("antfly_media").support.attach(b, chunk_audio_root, b.path(b.fmt("{s}/lib/media", .{shared_lib_root})));
+    chunk_audio_root.link_libc = link_libc;
+    const chunk_audio_tests = b.addTest(.{ .root_module = chunk_audio_root, .filters = &.{ "bounded audio cancellation", "streaming audio" } });
+    const run_chunk_audio_tests = b.addRunArtifact(chunk_audio_tests);
+    media_chunk_step.dependOn(&run_chunk_audio_tests.step);
+    b.step("test-audio-streaming", "Qualify bounded audio block visitors, clocks and cancellation").dependOn(&run_chunk_audio_tests.step);
+    const chunk_planning_tests = b.addTest(.{ .root_module = b.createModule(.{ .root_source_file = b.path(b.fmt("{s}/lib/chunker/src/planning.zig", .{shared_lib_root})), .target = target, .optimize = optimize }) });
+    media_chunk_step.dependOn(&b.addRunArtifact(chunk_planning_tests).step);
+    const chunk_sampling_root = b.createModule(.{ .root_source_file = b.path(b.fmt("{s}/lib/video/src/sampling.zig", .{shared_lib_root})), .target = target, .optimize = optimize });
+    chunk_sampling_root.addImport("antfly_media", inference_audio_mod.import_table.get("antfly_media").?);
+    const chunk_sampling_tests = b.addTest(.{ .root_module = chunk_sampling_root });
+    media_chunk_step.dependOn(&b.addRunArtifact(chunk_sampling_tests).step);
+    b.step("check-media-chunking", "Compile model-aware media qualification").dependOn(&media_chunk_tests.step);
+    const install_media_chunks = b.step("install-media-chunking-tests", "Install portable model-aware media qualification");
+    install_media_chunks.dependOn(&b.addInstallArtifact(media_chunk_tests, .{ .dest_sub_path = "media-chunking-tests" }).step);
+    install_media_chunks.dependOn(&b.addInstallArtifact(chunk_audio_tests, .{ .dest_sub_path = "media-chunk-audio-tests" }).step);
+    install_media_chunks.dependOn(&b.addInstallArtifact(chunk_planning_tests, .{ .dest_sub_path = "media-chunk-planning-tests" }).step);
+    install_media_chunks.dependOn(&b.addInstallArtifact(chunk_sampling_tests, .{ .dest_sub_path = "media-chunk-sampling-tests" }).step);
+    const run_video_model_tests = b.addRunArtifact(video_model_tests);
+    // Device availability and producer/consumer lifetimes must be checked on
+    // each qualification run, even when the executable itself is cached.
+    run_video_model_tests.has_side_effects = true;
+    b.step("test-video-model", "Qualify video processor, token layout and native/Metal buffer lifetime without checkpoint weights").dependOn(&run_video_model_tests.step);
     const run_cli_tests = suite.run_cli_tests;
 
     const bge_m3_e2e_bench_tests = bge_benchmark.tests;
@@ -1785,6 +1815,15 @@ pub fn build(b: *std.Build) void {
     const run_linalg_tests = b.addRunArtifact(linalg_tests);
     const linalg_test_step = b.step("test-linalg", "Run linalg tests");
     linalg_test_step.dependOn(&run_linalg_tests.step);
+    b.step("install-linalg-tests", "Install portable linalg qualification for another host").dependOn(&b.addInstallArtifact(linalg_tests, .{ .dest_sub_path = "linalg-tests" }).step);
+    inline for (.{ .{ "attention", "attention_benchmark.zig" }, .{ "transb", "transb_benchmark.zig" }, .{ "prepared", "prepared_benchmark.zig" } }) |entry| {
+        const benchmark = b.addExecutable(.{ .name = "antfly-linalg-" ++ entry[0], .root_module = b.createModule(.{ .root_source_file = b.path(b.fmt("{s}/lib/linalg/{s}", .{ shared_lib_root, entry[1] })), .target = target, .optimize = optimize }) });
+        runtime_build.addX86Kernels(b, benchmark.root_module, b.path(b.pathJoin(&.{ shared_lib_root, "lib/linalg" })), target, optimize);
+        b.step("build-linalg-" ++ entry[0], "Build portable linalg " ++ entry[0] ++ " qualification").dependOn(&b.addInstallArtifact(benchmark, .{}).step);
+        const run = b.addRunArtifact(benchmark);
+        run.has_side_effects = true;
+        b.step("bench-linalg-" ++ entry[0], "Measure portable linalg " ++ entry[0] ++ " kernels").dependOn(&run.step);
+    }
 
     // Tokenizer-only tests
     const tok_tests = b.addTest(.{
@@ -1813,6 +1852,11 @@ pub fn build(b: *std.Build) void {
     tok_test_step.dependOn(&run_tok_tests.step);
     tok_test_step.dependOn(&run_hf_tok_tests.step);
 
+    @import("antfly_media").support.addTests(b, b.path(b.fmt("{s}/lib/media", .{shared_lib_root})), target, optimize);
+    @import("antfly_video").support.addTests(b, b.path(b.fmt("{s}/lib/video", .{shared_lib_root})), target, optimize);
+    default_test_step.dependOn(&b.top_level_steps.get("test-media").?.step);
+    default_test_step.dependOn(&b.top_level_steps.get("test-video").?.step);
+
     const audio_tests = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path(b.fmt("{s}/lib/audio/audio_test_root.zig", .{shared_lib_root})),
@@ -1834,6 +1878,7 @@ pub fn build(b: *std.Build) void {
             .optimize = .safe,
         }),
     });
+    @import("antfly_media").support.attach(b, audio_open_corpus.root_module, b.path(b.fmt("{s}/lib/media", .{shared_lib_root})));
     audio_open_corpus.root_module.link_libc = true;
     const run_audio_open_corpus = b.addRunArtifact(audio_open_corpus);
     run_audio_open_corpus.addPassthruArgs();
@@ -1848,6 +1893,7 @@ pub fn build(b: *std.Build) void {
             .optimize = .fast,
         }),
     });
+    @import("antfly_media").support.attach(b, audio_xiph_corpora_e2e.root_module, b.path(b.fmt("{s}/lib/media", .{shared_lib_root})));
     audio_xiph_corpora_e2e.root_module.link_libc = true;
     const audio_xiph_corpora_e2e_step = b.step("audio-xiph-corpora-e2e", "Build the lib/audio upstream Xiph corpora e2e runner");
     audio_xiph_corpora_e2e_step.dependOn(&audio_xiph_corpora_e2e.step);
@@ -1873,6 +1919,7 @@ pub fn build(b: *std.Build) void {
             .optimize = .fast,
         }),
     });
+    @import("antfly_media").support.attach(b, audio_misc_corpora_e2e.root_module, b.path(b.fmt("{s}/lib/media", .{shared_lib_root})));
     audio_misc_corpora_e2e.root_module.link_libc = true;
     const audio_misc_corpora_e2e_step = b.step("audio-misc-corpora-e2e", "Build the lib/audio external MP3/AAC/MP4 corpora e2e runner");
     audio_misc_corpora_e2e_step.dependOn(&audio_misc_corpora_e2e.step);
@@ -2131,8 +2178,11 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
         }),
     });
+    @import("antfly_media").support.attach(b, audio_module_tests_all.root_module, b.path(b.fmt("{s}/lib/media", .{shared_lib_root})));
     audio_module_tests_all.root_module.link_libc = true;
-    audio_module_test_step.dependOn(&b.addRunArtifact(audio_module_tests_all).step);
+    const run_audio_codecs = b.addRunArtifact(audio_module_tests_all);
+    audio_module_test_step.dependOn(&run_audio_codecs.step);
+    b.step("test-audio-codecs", "Run the complete shared audio codec suite").dependOn(&run_audio_codecs.step);
 
     for (audio_module_test_filters, 0..) |filter, filter_index| {
         const audio_module_tests = b.addTest(.{
@@ -2144,6 +2194,7 @@ pub fn build(b: *std.Build) void {
             }),
             .filters = &.{filter},
         });
+        @import("antfly_media").support.attach(b, audio_module_tests.root_module, b.path(b.fmt("{s}/lib/media", .{shared_lib_root})));
         audio_module_tests.root_module.link_libc = true;
         const run_audio_module_tests = b.addRunArtifact(audio_module_tests);
         audio_module_test_step.dependOn(&run_audio_module_tests.step);

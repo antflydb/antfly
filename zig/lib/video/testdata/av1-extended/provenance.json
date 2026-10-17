@@ -1,0 +1,755 @@
+{
+  "aom_version": "3.13.1",
+  "aom_commit": "d772e334cc724105040382a977ebb10dfd393293",
+  "source_url": "https://aomedia.googlesource.com/aom/+/refs/tags/v3.13.1",
+  "tool_sha256": {
+    "aomenc": "af4601fa652c2b25e5622e511b96e40b2e69f7556e773cd1d6cbd6fa5170151b",
+    "aomdec": "0926e34a44a0b7e14ca15933c7aaff1b7503ce1d5c3d472bbe0241dfa29f4d7f",
+    "ffmpeg": "c08f5692a92f78fb885771459b0a6777ef9a292bbe76a60903824ba2a0eb5257",
+    "svc_encoder": "3c69c564c4abfbb11494b283cd03c0c68133cf41633ff06a20bebb189e2be9d9"
+  },
+  "recipes": [
+    {
+      "name": "av1-c0-8",
+      "source": [
+        "/opt/homebrew/bin/ffmpeg",
+        "-v",
+        "error",
+        "-f",
+        "lavfi",
+        "-i",
+        "testsrc=size=127x95:rate=6",
+        "-frames:v",
+        "12",
+        "-pix_fmt",
+        "yuv420p",
+        "-f",
+        "rawvideo",
+        "-y",
+        "/var/folders/4d/kpjq2k9s0290tgwy5n3rwxxr0000gn/T/antfly-av1-extended-anlnifpv/av1-c0-8.yuv"
+      ],
+      "encode": [
+        "/private/tmp/antfly-vpcodecs/aom-3.13.1-build/aomenc",
+        "--ivf",
+        "--passes=1",
+        "--cpu-used=6",
+        "--threads=1",
+        "--lag-in-frames=4",
+        "--limit=12",
+        "--width=127",
+        "--height=95",
+        "--fps=6/1",
+        "--profile=0",
+        "--input-chroma-subsampling-x=1",
+        "--input-chroma-subsampling-y=1",
+        "--bit-depth=8",
+        "--input-bit-depth=8",
+        "--i420",
+        "--end-usage=q",
+        "--cq-level=30",
+        "--kf-max-dist=6",
+        "--monochrome",
+        "-o",
+        "zig/lib/video/testdata/av1-extended/av1-c0-8.ivf",
+        "/var/folders/4d/kpjq2k9s0290tgwy5n3rwxxr0000gn/T/antfly-av1-extended-anlnifpv/av1-c0-8.yuv"
+      ],
+      "decode": [
+        "/private/tmp/antfly-vpcodecs/aom-3.13.1-build/aomdec",
+        "--rawvideo",
+        "--output-bit-depth=8",
+        "-o",
+        "/var/folders/4d/kpjq2k9s0290tgwy5n3rwxxr0000gn/T/antfly-av1-extended-anlnifpv/av1-c0-8-decoded.yuv",
+        "zig/lib/video/testdata/av1-extended/av1-c0-8.ivf"
+      ]
+    },
+    {
+      "name": "av1-c0-12",
+      "source": [
+        "/opt/homebrew/bin/ffmpeg",
+        "-v",
+        "error",
+        "-f",
+        "lavfi",
+        "-i",
+        "testsrc=size=127x95:rate=6",
+        "-frames:v",
+        "12",
+        "-pix_fmt",
+        "yuv420p12le",
+        "-f",
+        "rawvideo",
+        "-y",
+        "/var/folders/4d/kpjq2k9s0290tgwy5n3rwxxr0000gn/T/antfly-av1-extended-anlnifpv/av1-c0-12.yuv"
+      ],
+      "encode": [
+        "/private/tmp/antfly-vpcodecs/aom-3.13.1-build/aomenc",
+        "--ivf",
+        "--passes=1",
+        "--cpu-used=6",
+        "--threads=1",
+        "--lag-in-frames=4",
+        "--limit=12",
+        "--width=127",
+        "--height=95",
+        "--fps=6/1",
+        "--profile=2",
+        "--input-chroma-subsampling-x=1",
+        "--input-chroma-subsampling-y=1",
+        "--bit-depth=12",
+        "--input-bit-depth=12",
+        "--i420",
+        "--end-usage=q",
+        "--cq-level=30",
+        "--kf-max-dist=6",
+        "--monochrome",
+        "-o",
+        "zig/lib/video/testdata/av1-extended/av1-c0-12.ivf",
+        "/var/folders/4d/kpjq2k9s0290tgwy5n3rwxxr0000gn/T/antfly-av1-extended-anlnifpv/av1-c0-12.yuv"
+      ],
+      "decode": [
+        "/private/tmp/antfly-vpcodecs/aom-3.13.1-build/aomdec",
+        "--rawvideo",
+        "--output-bit-depth=12",
+        "-o",
+        "/var/folders/4d/kpjq2k9s0290tgwy5n3rwxxr0000gn/T/antfly-av1-extended-anlnifpv/av1-c0-12-decoded.yuv",
+        "zig/lib/video/testdata/av1-extended/av1-c0-12.ivf"
+      ]
+    },
+    {
+      "name": "av1-c1-12",
+      "source": [
+        "/opt/homebrew/bin/ffmpeg",
+        "-v",
+        "error",
+        "-f",
+        "lavfi",
+        "-i",
+        "testsrc=size=127x95:rate=6",
+        "-frames:v",
+        "12",
+        "-pix_fmt",
+        "yuv420p12le",
+        "-f",
+        "rawvideo",
+        "-y",
+        "/var/folders/4d/kpjq2k9s0290tgwy5n3rwxxr0000gn/T/antfly-av1-extended-anlnifpv/av1-c1-12.yuv"
+      ],
+      "encode": [
+        "/private/tmp/antfly-vpcodecs/aom-3.13.1-build/aomenc",
+        "--ivf",
+        "--passes=1",
+        "--cpu-used=6",
+        "--threads=1",
+        "--lag-in-frames=4",
+        "--limit=12",
+        "--width=127",
+        "--height=95",
+        "--fps=6/1",
+        "--profile=2",
+        "--input-chroma-subsampling-x=1",
+        "--input-chroma-subsampling-y=1",
+        "--bit-depth=12",
+        "--input-bit-depth=12",
+        "--i420",
+        "--end-usage=q",
+        "--cq-level=30",
+        "--kf-max-dist=6",
+        "-o",
+        "zig/lib/video/testdata/av1-extended/av1-c1-12.ivf",
+        "/var/folders/4d/kpjq2k9s0290tgwy5n3rwxxr0000gn/T/antfly-av1-extended-anlnifpv/av1-c1-12.yuv"
+      ],
+      "decode": [
+        "/private/tmp/antfly-vpcodecs/aom-3.13.1-build/aomdec",
+        "--rawvideo",
+        "--output-bit-depth=12",
+        "-o",
+        "/var/folders/4d/kpjq2k9s0290tgwy5n3rwxxr0000gn/T/antfly-av1-extended-anlnifpv/av1-c1-12-decoded.yuv",
+        "zig/lib/video/testdata/av1-extended/av1-c1-12.ivf"
+      ]
+    },
+    {
+      "name": "av1-c2-8",
+      "source": [
+        "/opt/homebrew/bin/ffmpeg",
+        "-v",
+        "error",
+        "-f",
+        "lavfi",
+        "-i",
+        "testsrc=size=127x95:rate=6",
+        "-frames:v",
+        "12",
+        "-pix_fmt",
+        "yuv422p",
+        "-f",
+        "rawvideo",
+        "-y",
+        "/var/folders/4d/kpjq2k9s0290tgwy5n3rwxxr0000gn/T/antfly-av1-extended-anlnifpv/av1-c2-8.yuv"
+      ],
+      "encode": [
+        "/private/tmp/antfly-vpcodecs/aom-3.13.1-build/aomenc",
+        "--ivf",
+        "--passes=1",
+        "--cpu-used=6",
+        "--threads=1",
+        "--lag-in-frames=4",
+        "--limit=12",
+        "--width=127",
+        "--height=95",
+        "--fps=6/1",
+        "--profile=2",
+        "--input-chroma-subsampling-x=1",
+        "--input-chroma-subsampling-y=0",
+        "--bit-depth=8",
+        "--input-bit-depth=8",
+        "--i422",
+        "--end-usage=q",
+        "--cq-level=30",
+        "--kf-max-dist=6",
+        "-o",
+        "zig/lib/video/testdata/av1-extended/av1-c2-8.ivf",
+        "/var/folders/4d/kpjq2k9s0290tgwy5n3rwxxr0000gn/T/antfly-av1-extended-anlnifpv/av1-c2-8.yuv"
+      ],
+      "decode": [
+        "/private/tmp/antfly-vpcodecs/aom-3.13.1-build/aomdec",
+        "--rawvideo",
+        "--output-bit-depth=8",
+        "-o",
+        "/var/folders/4d/kpjq2k9s0290tgwy5n3rwxxr0000gn/T/antfly-av1-extended-anlnifpv/av1-c2-8-decoded.yuv",
+        "zig/lib/video/testdata/av1-extended/av1-c2-8.ivf"
+      ]
+    },
+    {
+      "name": "av1-c2-10",
+      "source": [
+        "/opt/homebrew/bin/ffmpeg",
+        "-v",
+        "error",
+        "-f",
+        "lavfi",
+        "-i",
+        "testsrc=size=127x95:rate=6",
+        "-frames:v",
+        "12",
+        "-pix_fmt",
+        "yuv422p10le",
+        "-f",
+        "rawvideo",
+        "-y",
+        "/var/folders/4d/kpjq2k9s0290tgwy5n3rwxxr0000gn/T/antfly-av1-extended-anlnifpv/av1-c2-10.yuv"
+      ],
+      "encode": [
+        "/private/tmp/antfly-vpcodecs/aom-3.13.1-build/aomenc",
+        "--ivf",
+        "--passes=1",
+        "--cpu-used=6",
+        "--threads=1",
+        "--lag-in-frames=4",
+        "--limit=12",
+        "--width=127",
+        "--height=95",
+        "--fps=6/1",
+        "--profile=2",
+        "--input-chroma-subsampling-x=1",
+        "--input-chroma-subsampling-y=0",
+        "--bit-depth=10",
+        "--input-bit-depth=10",
+        "--i422",
+        "--end-usage=q",
+        "--cq-level=30",
+        "--kf-max-dist=6",
+        "-o",
+        "zig/lib/video/testdata/av1-extended/av1-c2-10.ivf",
+        "/var/folders/4d/kpjq2k9s0290tgwy5n3rwxxr0000gn/T/antfly-av1-extended-anlnifpv/av1-c2-10.yuv"
+      ],
+      "decode": [
+        "/private/tmp/antfly-vpcodecs/aom-3.13.1-build/aomdec",
+        "--rawvideo",
+        "--output-bit-depth=10",
+        "-o",
+        "/var/folders/4d/kpjq2k9s0290tgwy5n3rwxxr0000gn/T/antfly-av1-extended-anlnifpv/av1-c2-10-decoded.yuv",
+        "zig/lib/video/testdata/av1-extended/av1-c2-10.ivf"
+      ]
+    },
+    {
+      "name": "av1-c2-12",
+      "source": [
+        "/opt/homebrew/bin/ffmpeg",
+        "-v",
+        "error",
+        "-f",
+        "lavfi",
+        "-i",
+        "testsrc=size=127x95:rate=6",
+        "-frames:v",
+        "12",
+        "-pix_fmt",
+        "yuv422p12le",
+        "-f",
+        "rawvideo",
+        "-y",
+        "/var/folders/4d/kpjq2k9s0290tgwy5n3rwxxr0000gn/T/antfly-av1-extended-anlnifpv/av1-c2-12.yuv"
+      ],
+      "encode": [
+        "/private/tmp/antfly-vpcodecs/aom-3.13.1-build/aomenc",
+        "--ivf",
+        "--passes=1",
+        "--cpu-used=6",
+        "--threads=1",
+        "--lag-in-frames=4",
+        "--limit=12",
+        "--width=127",
+        "--height=95",
+        "--fps=6/1",
+        "--profile=0",
+        "--input-chroma-subsampling-x=1",
+        "--input-chroma-subsampling-y=0",
+        "--bit-depth=12",
+        "--input-bit-depth=12",
+        "--i422",
+        "--end-usage=q",
+        "--cq-level=30",
+        "--kf-max-dist=6",
+        "-o",
+        "zig/lib/video/testdata/av1-extended/av1-c2-12.ivf",
+        "/var/folders/4d/kpjq2k9s0290tgwy5n3rwxxr0000gn/T/antfly-av1-extended-anlnifpv/av1-c2-12.yuv"
+      ],
+      "decode": [
+        "/private/tmp/antfly-vpcodecs/aom-3.13.1-build/aomdec",
+        "--rawvideo",
+        "--output-bit-depth=12",
+        "-o",
+        "/var/folders/4d/kpjq2k9s0290tgwy5n3rwxxr0000gn/T/antfly-av1-extended-anlnifpv/av1-c2-12-decoded.yuv",
+        "zig/lib/video/testdata/av1-extended/av1-c2-12.ivf"
+      ]
+    },
+    {
+      "name": "av1-c3-8",
+      "source": [
+        "/opt/homebrew/bin/ffmpeg",
+        "-v",
+        "error",
+        "-f",
+        "lavfi",
+        "-i",
+        "testsrc=size=127x95:rate=6",
+        "-frames:v",
+        "12",
+        "-pix_fmt",
+        "yuv444p",
+        "-f",
+        "rawvideo",
+        "-y",
+        "/var/folders/4d/kpjq2k9s0290tgwy5n3rwxxr0000gn/T/antfly-av1-extended-anlnifpv/av1-c3-8.yuv"
+      ],
+      "encode": [
+        "/private/tmp/antfly-vpcodecs/aom-3.13.1-build/aomenc",
+        "--ivf",
+        "--passes=1",
+        "--cpu-used=6",
+        "--threads=1",
+        "--lag-in-frames=4",
+        "--limit=12",
+        "--width=127",
+        "--height=95",
+        "--fps=6/1",
+        "--profile=1",
+        "--input-chroma-subsampling-x=0",
+        "--input-chroma-subsampling-y=0",
+        "--bit-depth=8",
+        "--input-bit-depth=8",
+        "--i444",
+        "--end-usage=q",
+        "--cq-level=30",
+        "--kf-max-dist=6",
+        "-o",
+        "zig/lib/video/testdata/av1-extended/av1-c3-8.ivf",
+        "/var/folders/4d/kpjq2k9s0290tgwy5n3rwxxr0000gn/T/antfly-av1-extended-anlnifpv/av1-c3-8.yuv"
+      ],
+      "decode": [
+        "/private/tmp/antfly-vpcodecs/aom-3.13.1-build/aomdec",
+        "--rawvideo",
+        "--output-bit-depth=8",
+        "-o",
+        "/var/folders/4d/kpjq2k9s0290tgwy5n3rwxxr0000gn/T/antfly-av1-extended-anlnifpv/av1-c3-8-decoded.yuv",
+        "zig/lib/video/testdata/av1-extended/av1-c3-8.ivf"
+      ]
+    },
+    {
+      "name": "av1-c3-10",
+      "source": [
+        "/opt/homebrew/bin/ffmpeg",
+        "-v",
+        "error",
+        "-f",
+        "lavfi",
+        "-i",
+        "testsrc=size=127x95:rate=6",
+        "-frames:v",
+        "12",
+        "-pix_fmt",
+        "yuv444p10le",
+        "-f",
+        "rawvideo",
+        "-y",
+        "/var/folders/4d/kpjq2k9s0290tgwy5n3rwxxr0000gn/T/antfly-av1-extended-anlnifpv/av1-c3-10.yuv"
+      ],
+      "encode": [
+        "/private/tmp/antfly-vpcodecs/aom-3.13.1-build/aomenc",
+        "--ivf",
+        "--passes=1",
+        "--cpu-used=6",
+        "--threads=1",
+        "--lag-in-frames=4",
+        "--limit=12",
+        "--width=127",
+        "--height=95",
+        "--fps=6/1",
+        "--profile=1",
+        "--input-chroma-subsampling-x=0",
+        "--input-chroma-subsampling-y=0",
+        "--bit-depth=10",
+        "--input-bit-depth=10",
+        "--i444",
+        "--end-usage=q",
+        "--cq-level=30",
+        "--kf-max-dist=6",
+        "-o",
+        "zig/lib/video/testdata/av1-extended/av1-c3-10.ivf",
+        "/var/folders/4d/kpjq2k9s0290tgwy5n3rwxxr0000gn/T/antfly-av1-extended-anlnifpv/av1-c3-10.yuv"
+      ],
+      "decode": [
+        "/private/tmp/antfly-vpcodecs/aom-3.13.1-build/aomdec",
+        "--rawvideo",
+        "--output-bit-depth=10",
+        "-o",
+        "/var/folders/4d/kpjq2k9s0290tgwy5n3rwxxr0000gn/T/antfly-av1-extended-anlnifpv/av1-c3-10-decoded.yuv",
+        "zig/lib/video/testdata/av1-extended/av1-c3-10.ivf"
+      ]
+    },
+    {
+      "name": "av1-c3-12",
+      "source": [
+        "/opt/homebrew/bin/ffmpeg",
+        "-v",
+        "error",
+        "-f",
+        "lavfi",
+        "-i",
+        "testsrc=size=127x95:rate=6",
+        "-frames:v",
+        "12",
+        "-pix_fmt",
+        "yuv444p12le",
+        "-f",
+        "rawvideo",
+        "-y",
+        "/var/folders/4d/kpjq2k9s0290tgwy5n3rwxxr0000gn/T/antfly-av1-extended-anlnifpv/av1-c3-12.yuv"
+      ],
+      "encode": [
+        "/private/tmp/antfly-vpcodecs/aom-3.13.1-build/aomenc",
+        "--ivf",
+        "--passes=1",
+        "--cpu-used=6",
+        "--threads=1",
+        "--lag-in-frames=4",
+        "--limit=12",
+        "--width=127",
+        "--height=95",
+        "--fps=6/1",
+        "--profile=0",
+        "--input-chroma-subsampling-x=0",
+        "--input-chroma-subsampling-y=0",
+        "--bit-depth=12",
+        "--input-bit-depth=12",
+        "--i444",
+        "--end-usage=q",
+        "--cq-level=30",
+        "--kf-max-dist=6",
+        "-o",
+        "zig/lib/video/testdata/av1-extended/av1-c3-12.ivf",
+        "/var/folders/4d/kpjq2k9s0290tgwy5n3rwxxr0000gn/T/antfly-av1-extended-anlnifpv/av1-c3-12.yuv"
+      ],
+      "decode": [
+        "/private/tmp/antfly-vpcodecs/aom-3.13.1-build/aomdec",
+        "--rawvideo",
+        "--output-bit-depth=12",
+        "-o",
+        "/var/folders/4d/kpjq2k9s0290tgwy5n3rwxxr0000gn/T/antfly-av1-extended-anlnifpv/av1-c3-12-decoded.yuv",
+        "zig/lib/video/testdata/av1-extended/av1-c3-12.ivf"
+      ]
+    },
+    {
+      "name": "av1-annex-b",
+      "source": [
+        "/opt/homebrew/bin/ffmpeg",
+        "-v",
+        "error",
+        "-f",
+        "lavfi",
+        "-i",
+        "testsrc=size=127x95:rate=6",
+        "-frames:v",
+        "12",
+        "-pix_fmt",
+        "yuv420p",
+        "-f",
+        "rawvideo",
+        "-y",
+        "/var/folders/4d/kpjq2k9s0290tgwy5n3rwxxr0000gn/T/antfly-av1-extended-anlnifpv/av1-annex-b.yuv"
+      ],
+      "encode": [
+        "/private/tmp/antfly-vpcodecs/aom-3.13.1-build/aomenc",
+        "--ivf",
+        "--passes=1",
+        "--cpu-used=6",
+        "--threads=1",
+        "--lag-in-frames=4",
+        "--limit=12",
+        "--width=127",
+        "--height=95",
+        "--fps=6/1",
+        "--profile=0",
+        "--input-chroma-subsampling-x=1",
+        "--input-chroma-subsampling-y=1",
+        "--bit-depth=8",
+        "--input-bit-depth=8",
+        "--i420",
+        "--end-usage=q",
+        "--cq-level=30",
+        "--kf-max-dist=6",
+        "--annexb=1",
+        "-o",
+        "zig/lib/video/testdata/av1-extended/av1-annex-b.ivf",
+        "/var/folders/4d/kpjq2k9s0290tgwy5n3rwxxr0000gn/T/antfly-av1-extended-anlnifpv/av1-annex-b.yuv"
+      ],
+      "decode": [
+        "/private/tmp/antfly-vpcodecs/aom-3.13.1-build/aomdec",
+        "--rawvideo",
+        "--output-bit-depth=8",
+        "-o",
+        "/var/folders/4d/kpjq2k9s0290tgwy5n3rwxxr0000gn/T/antfly-av1-extended-anlnifpv/av1-annex-b-decoded.yuv",
+        "zig/lib/video/testdata/av1-extended/av1-annex-b.ivf",
+        "--annexb"
+      ]
+    },
+    {
+      "name": "svc-ordered-0-False",
+      "decode": [
+        "/private/tmp/antfly-vpcodecs/aom-3.13.1-build/aomdec",
+        "--rawvideo",
+        "--oppoint=0",
+        "-o",
+        "/var/folders/4d/kpjq2k9s0290tgwy5n3rwxxr0000gn/T/antfly-av1-extended-anlnifpv/ordered-0-False.yuv",
+        "zig/lib/video/testdata/av1-extended/av1-svc.ivf"
+      ]
+    },
+    {
+      "name": "svc-0-False",
+      "decode": [
+        "/private/tmp/antfly-vpcodecs/aom-3.13.1-build/aomdec",
+        "--i420",
+        "--oppoint=0",
+        "-o",
+        "/var/folders/4d/kpjq2k9s0290tgwy5n3rwxxr0000gn/T/antfly-av1-extended-anlnifpv/svc-0-False-%4-%w-%h.yuv",
+        "zig/lib/video/testdata/av1-extended/av1-svc.ivf"
+      ]
+    },
+    {
+      "name": "svc-ordered-1-False",
+      "decode": [
+        "/private/tmp/antfly-vpcodecs/aom-3.13.1-build/aomdec",
+        "--rawvideo",
+        "--oppoint=1",
+        "-o",
+        "/var/folders/4d/kpjq2k9s0290tgwy5n3rwxxr0000gn/T/antfly-av1-extended-anlnifpv/ordered-1-False.yuv",
+        "zig/lib/video/testdata/av1-extended/av1-svc.ivf"
+      ]
+    },
+    {
+      "name": "svc-1-False",
+      "decode": [
+        "/private/tmp/antfly-vpcodecs/aom-3.13.1-build/aomdec",
+        "--i420",
+        "--oppoint=1",
+        "-o",
+        "/var/folders/4d/kpjq2k9s0290tgwy5n3rwxxr0000gn/T/antfly-av1-extended-anlnifpv/svc-1-False-%4-%w-%h.yuv",
+        "zig/lib/video/testdata/av1-extended/av1-svc.ivf"
+      ]
+    },
+    {
+      "name": "svc-ordered-2-False",
+      "decode": [
+        "/private/tmp/antfly-vpcodecs/aom-3.13.1-build/aomdec",
+        "--rawvideo",
+        "--oppoint=2",
+        "-o",
+        "/var/folders/4d/kpjq2k9s0290tgwy5n3rwxxr0000gn/T/antfly-av1-extended-anlnifpv/ordered-2-False.yuv",
+        "zig/lib/video/testdata/av1-extended/av1-svc.ivf"
+      ]
+    },
+    {
+      "name": "svc-2-False",
+      "decode": [
+        "/private/tmp/antfly-vpcodecs/aom-3.13.1-build/aomdec",
+        "--i420",
+        "--oppoint=2",
+        "-o",
+        "/var/folders/4d/kpjq2k9s0290tgwy5n3rwxxr0000gn/T/antfly-av1-extended-anlnifpv/svc-2-False-%4-%w-%h.yuv",
+        "zig/lib/video/testdata/av1-extended/av1-svc.ivf"
+      ]
+    },
+    {
+      "name": "svc-ordered-3-False",
+      "decode": [
+        "/private/tmp/antfly-vpcodecs/aom-3.13.1-build/aomdec",
+        "--rawvideo",
+        "--oppoint=3",
+        "-o",
+        "/var/folders/4d/kpjq2k9s0290tgwy5n3rwxxr0000gn/T/antfly-av1-extended-anlnifpv/ordered-3-False.yuv",
+        "zig/lib/video/testdata/av1-extended/av1-svc.ivf"
+      ]
+    },
+    {
+      "name": "svc-3-False",
+      "decode": [
+        "/private/tmp/antfly-vpcodecs/aom-3.13.1-build/aomdec",
+        "--i420",
+        "--oppoint=3",
+        "-o",
+        "/var/folders/4d/kpjq2k9s0290tgwy5n3rwxxr0000gn/T/antfly-av1-extended-anlnifpv/svc-3-False-%4-%w-%h.yuv",
+        "zig/lib/video/testdata/av1-extended/av1-svc.ivf"
+      ]
+    },
+    {
+      "name": "svc-ordered-4-False",
+      "decode": [
+        "/private/tmp/antfly-vpcodecs/aom-3.13.1-build/aomdec",
+        "--rawvideo",
+        "--oppoint=4",
+        "-o",
+        "/var/folders/4d/kpjq2k9s0290tgwy5n3rwxxr0000gn/T/antfly-av1-extended-anlnifpv/ordered-4-False.yuv",
+        "zig/lib/video/testdata/av1-extended/av1-svc.ivf"
+      ]
+    },
+    {
+      "name": "svc-4-False",
+      "decode": [
+        "/private/tmp/antfly-vpcodecs/aom-3.13.1-build/aomdec",
+        "--i420",
+        "--oppoint=4",
+        "-o",
+        "/var/folders/4d/kpjq2k9s0290tgwy5n3rwxxr0000gn/T/antfly-av1-extended-anlnifpv/svc-4-False-%4-%w-%h.yuv",
+        "zig/lib/video/testdata/av1-extended/av1-svc.ivf"
+      ]
+    },
+    {
+      "name": "svc-ordered-5-False",
+      "decode": [
+        "/private/tmp/antfly-vpcodecs/aom-3.13.1-build/aomdec",
+        "--rawvideo",
+        "--oppoint=5",
+        "-o",
+        "/var/folders/4d/kpjq2k9s0290tgwy5n3rwxxr0000gn/T/antfly-av1-extended-anlnifpv/ordered-5-False.yuv",
+        "zig/lib/video/testdata/av1-extended/av1-svc.ivf"
+      ]
+    },
+    {
+      "name": "svc-5-False",
+      "decode": [
+        "/private/tmp/antfly-vpcodecs/aom-3.13.1-build/aomdec",
+        "--i420",
+        "--oppoint=5",
+        "-o",
+        "/var/folders/4d/kpjq2k9s0290tgwy5n3rwxxr0000gn/T/antfly-av1-extended-anlnifpv/svc-5-False-%4-%w-%h.yuv",
+        "zig/lib/video/testdata/av1-extended/av1-svc.ivf"
+      ]
+    },
+    {
+      "name": "svc-ordered-0-True",
+      "decode": [
+        "/private/tmp/antfly-vpcodecs/aom-3.13.1-build/aomdec",
+        "--rawvideo",
+        "--oppoint=0",
+        "-o",
+        "/var/folders/4d/kpjq2k9s0290tgwy5n3rwxxr0000gn/T/antfly-av1-extended-anlnifpv/ordered-0-True.yuv",
+        "zig/lib/video/testdata/av1-extended/av1-svc.ivf",
+        "--all-layers"
+      ]
+    },
+    {
+      "name": "svc-0-True",
+      "decode": [
+        "/private/tmp/antfly-vpcodecs/aom-3.13.1-build/aomdec",
+        "--i420",
+        "--oppoint=0",
+        "-o",
+        "/var/folders/4d/kpjq2k9s0290tgwy5n3rwxxr0000gn/T/antfly-av1-extended-anlnifpv/svc-0-True-%4-%w-%h.yuv",
+        "zig/lib/video/testdata/av1-extended/av1-svc.ivf",
+        "--all-layers"
+      ]
+    },
+    {
+      "name": "svc-ordered-3-True",
+      "decode": [
+        "/private/tmp/antfly-vpcodecs/aom-3.13.1-build/aomdec",
+        "--rawvideo",
+        "--oppoint=3",
+        "-o",
+        "/var/folders/4d/kpjq2k9s0290tgwy5n3rwxxr0000gn/T/antfly-av1-extended-anlnifpv/ordered-3-True.yuv",
+        "zig/lib/video/testdata/av1-extended/av1-svc.ivf",
+        "--all-layers"
+      ]
+    },
+    {
+      "name": "svc-3-True",
+      "decode": [
+        "/private/tmp/antfly-vpcodecs/aom-3.13.1-build/aomdec",
+        "--i420",
+        "--oppoint=3",
+        "-o",
+        "/var/folders/4d/kpjq2k9s0290tgwy5n3rwxxr0000gn/T/antfly-av1-extended-anlnifpv/svc-3-True-%4-%w-%h.yuv",
+        "zig/lib/video/testdata/av1-extended/av1-svc.ivf",
+        "--all-layers"
+      ]
+    },
+    {
+      "name": "av1-svc",
+      "source": [
+        "/opt/homebrew/bin/ffmpeg",
+        "-v",
+        "error",
+        "-f",
+        "lavfi",
+        "-i",
+        "testsrc2=size=128x96:rate=6",
+        "-frames:v",
+        "12",
+        "-pix_fmt",
+        "yuv420p",
+        "-f",
+        "rawvideo",
+        "-y",
+        "/var/folders/4d/kpjq2k9s0290tgwy5n3rwxxr0000gn/T/antfly-av1-extended-anlnifpv/svc.yuv"
+      ],
+      "encode": [
+        "/private/tmp/antfly-vpcodecs/aom-3.13.1-build/examples/svc_encoder_rtc",
+        "--width=128",
+        "--height=96",
+        "--timebase=1/6",
+        "--spatial-layers=2",
+        "--temporal-layers=3",
+        "--scale-factors=1/2,1/1",
+        "--bitrates=30,50,80,100,150,240",
+        "--layering-mode=7",
+        "--threads=1",
+        "--speed=8",
+        "--kf-dist=6",
+        "--target-bitrate=320",
+        "--test-decode=1",
+        "--output=zig/lib/video/testdata/av1-extended/av1-svc.ivf",
+        "/var/folders/4d/kpjq2k9s0290tgwy5n3rwxxr0000gn/T/antfly-av1-extended-anlnifpv/svc.yuv"
+      ]
+    }
+  ]
+}

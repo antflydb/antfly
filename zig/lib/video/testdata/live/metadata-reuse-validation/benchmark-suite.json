@@ -1,0 +1,26 @@
+{
+  "cases": [
+    {
+      "id": "sintel-6s",
+      "path": "../../../../../../zig/pkg/inference/scripts/embeddinggemma2/testdata/live-pretrained/sintel-6s.mp4",
+      "init_end": 991,
+      "fragment_ends": [
+        5277,
+        7588,
+        14529,
+        22782,
+        28629,
+        35574
+      ],
+      "sha256": "5c6b29872ef18dc0145ad2bd90d26ec33a232fd55afba0cb9b8784bdaef2b694"
+    },
+    {
+      "id": "interleaved-fields",
+      "path": "../../h264-paff-interleaved-fragments-10-2.mp4",
+      "packet_units": true,
+      "normalize_clock": true,
+      "duration_ns": 250000000,
+      "sha256": "3e8411c0196ea84b2802abfb444fd06d68f7d441194a66389cc40bf80e882177"
+    }
+  ]
+}
