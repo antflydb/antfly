@@ -677,89 +677,192 @@ pub fn embedGroupCohort(out: std.mem.Allocator, session: Session, tokenizer: Tok
     defer std.debug.assert(std.meta.eql(pool.snapshot(), media_admission.Resources{}));
     var guard = if (has_video) try control.enterUninterruptible(session.interruption()) else @import("../execution_control.zig").UninterruptibleGuard{};
     defer guard.deinit();
-    var supplement = RunPermit{ .session = session, .lease = null };
-    defer supplement.deinit();
     var managed = try factory.getManagedComputeBackend(session, a, null, control);
     defer managed.deinit();
     const cb = &managed.backend;
     var cache = FrameCache{ .allocator = workspaceBackingAllocator(session.backend()), .session = session, .control = control };
     defer cache.deinit();
-    var media_parts = try projectCohortParts(a, session, cb, groups, indexes[0..inspected], options, control, &permit, errors);
+    var scheduler = CohortReady{ .a = a, .out = out, .session = session, .cb = cb, .tokenizer = tokenizer, .groups = groups, .indexes = indexes[0..inspected], .options = options, .control = control, .errors = errors, .permit = &permit, .pool = &pool, .cache = &cache, .vectors = vectors, .counts = counts, .inputs = inputs, .host = host, .retained = retained };
+    var media_parts = try projectCohortParts(a, session, cb, groups, indexes[0..inspected], options, control, &permit, errors, &scheduler);
     defer media_parts.deinit(a, cb);
-    var rows: [4]PreparedGroup = undefined;
-    var owners: [4]usize = undefined;
-    var prepared: usize = 0;
-    defer for (rows[0..prepared]) |row| row.deinit(a);
-    for (indexes[0..inspected]) |index| {
-        try control.check();
-        if (errors[index] != null) continue;
-        rows[prepared] = prepareGroupCombined(a, cb, tokenizer, groups[index], options, control, &pool, null, &cache, media_parts.parts[index]) catch |err| {
-            if (@import("audio_preparation.zig").abort(err)) return err;
-            errors[index] = err;
-            continue;
-        };
-        counts[index] = rows[prepared].ids.len;
-        owners[prepared] = index;
-        prepared += 1;
-    }
-    // Stable insertion sort over a tiny cohort; public results retain input order.
-    for (0..prepared) |i| {
-        var j = i;
-        while (j > 0 and rows[j].ids.len < rows[j - 1].ids.len) : (j -= 1) {
-            std.mem.swap(PreparedGroup, &rows[j], &rows[j - 1]);
-            std.mem.swap(usize, &owners[j], &owners[j - 1]);
-        }
-    }
-    var observation = BatchExecution.Observation{};
-    const Phase = struct { offset: usize, count: usize };
-    var phases: [4]Phase = undefined;
-    var phase_count: usize = 0;
-    var peak = @import("../runtime/tier/memory.zig").AdmissionAmounts{};
-    var offset: usize = 0;
-    while (offset < prepared) {
-        var lengths: [4]usize = undefined;
-        for (rows[offset..prepared], lengths[0 .. prepared - offset]) |row, *length| length.* = row.ids.len;
-        var take = preparedCohortCount(lengths[0 .. prepared - offset], 4);
-        var longest: usize = 0;
-        if (take == 0) return error.EmbeddingInputTooLong;
-        // Model intermediates are bounded by the same per-row envelope as
-        // segmented Metal frames; there is no cross-picture dense score matrix.
-        var request: @import("../backends/session.zig").RunRequest = undefined;
-        while (true) {
-            longest = rows[offset + take - 1].ids.len;
-            request = .{ .batch = take, .sequence = longest, .input_bytes = inputs, .host_preprocess_bytes = host, .workspace_bytes = 256 * 1024 * 1024 + take * longest * 192 * 1024 + retained, .output_bytes = take * options.dimensions * @sizeOf(f32) };
-            if (take == 1 or try session.fitsRun(request)) break;
-            take -= 1;
-        }
-        if (session.run_admission) |admission| {
-            const needed = try admission.estimateRequest(request, session.outputInfo());
-            inline for (@typeInfo(@TypeOf(peak)).@"struct".field_names) |name| @field(peak, name) = @max(@field(peak, name), @field(needed, name));
-        }
-        phases[phase_count] = .{ .offset = offset, .count = take };
-        phase_count += 1;
-        offset += take;
-    }
-    supplement = try session.admitSupplement(&permit, peak);
-    for (phases[0..phase_count]) |phase| {
-        offset = phase.offset;
-        const take = phase.count;
-        const packed_rows = try packVideoRows(a, cb, rows[offset..][0..take]);
-        defer packed_rows.deinit(a, cb);
-        const output = try encoder.forwardPooledEmbeddingsCT(cb, a, cfg, packed_rows.embeddings, packed_rows.mask, take, packed_rows.sequence, options.dimensions);
-        defer cb.free(output);
-        const compact = try readPooledBatch(a, cb, output, take, options.dimensions);
-        defer {
-            for (compact) |vector| a.free(vector);
-            a.free(compact);
-        }
-        for (compact, owners[offset..][0..take]) |vector, index| vectors[index] = try out.dupe(f32, vector);
-        observation.record(take);
-    }
-    return .{ .vectors = vectors, .input_tokens = counts, .execution = observation.execution(observation.native_items + observation.serial_items) };
+    return .{ .vectors = vectors, .input_tokens = counts, .execution = scheduler.observation.execution(scheduler.observation.native_items + scheduler.observation.serial_items) };
 }
+
+fn cohortGroupReady(group: Group, parts: []const ?SoftTokens, options: Options) bool {
+    for (group.content, 0..) |part, p| {
+        const eligible = ((part == .image or part == .raster) and options.resident_images) or ((part == .audio or part == .pcm) and options.resident_audio);
+        if (eligible and parts[p] == null) return false;
+    }
+    return true;
+}
+
+test "embeddinggemma2 cohort readiness respects every required modality and execution policy" {
+    const parts = [_]Part{ .{ .text = "query" }, .{ .image = "image" }, .{ .audio = "audio" } };
+    const group = Group{ .content = &parts };
+    var projected: [3]?SoftTokens = @splat(null);
+    try std.testing.expect(!cohortGroupReady(group, &projected, .{}));
+    projected[1] = .{ .id = 258880, .embeddings = &.{}, .tokens = 1 };
+    try std.testing.expect(!cohortGroupReady(group, &projected, .{}));
+    projected[2] = .{ .id = 258881, .embeddings = &.{}, .tokens = 1 };
+    try std.testing.expect(cohortGroupReady(group, &projected, .{}));
+    projected = @splat(null);
+    try std.testing.expect(cohortGroupReady(group, &projected, .{ .resident_images = false, .resident_audio = false }));
+    try std.testing.expect(cohortGroupReady(.{ .content = parts[0..1] }, projected[0..1], .{}));
+}
+
+/// Execute ready groups while the next CPU preparation wave is running. GPU
+/// work stays on the existing single leased backend; this is pipeline overlap,
+/// not concurrent encoders. Result ownership remains with original indexes.
+const CohortReady = struct {
+    a: std.mem.Allocator,
+    out: std.mem.Allocator,
+    session: Session,
+    cb: *const ComputeBackend,
+    tokenizer: Tokenizer,
+    groups: []const Group,
+    indexes: []const usize,
+    options: Options,
+    control: Control,
+    errors: []?anyerror,
+    permit: *const RunPermit,
+    pool: *media_admission.Pool,
+    cache: *FrameCache,
+    vectors: [][]f32,
+    counts: []usize,
+    inputs: usize,
+    host: usize,
+    retained: usize,
+    deferred: [4]bool = @splat(false),
+    done: [4]bool = @splat(false),
+    observation: BatchExecution.Observation = .{},
+
+    fn run(self: *CohortReady, parts: *CohortParts, force: bool) !void {
+        const a = self.a;
+        const out = self.out;
+        const session = self.session;
+        const cb = self.cb;
+        const tokenizer = self.tokenizer;
+        const groups = self.groups;
+        const cfg = factory.getEmbeddingGemma2Config(session) orelse return error.UnsupportedEmbeddingGemma2Backend;
+        const options = self.options;
+        const control = self.control;
+        const errors = self.errors;
+        const permit = self.permit;
+        const pool = self.pool;
+        const cache = self.cache;
+        const vectors = self.vectors;
+        const counts = self.counts;
+        const inputs = self.inputs;
+        const host = self.host;
+        const retained = self.retained;
+        var ready: [4]usize = undefined;
+        var ready_count: usize = 0;
+        var pending: usize = 0;
+        for (self.indexes) |index| {
+            if (self.done[index]) continue;
+            if (errors[index] != null) {
+                self.done[index] = true;
+                parts.releaseGroup(a, cb, index);
+                continue;
+            }
+            pending += 1;
+            if (!cohortGroupReady(groups[index], parts.parts[index], options)) continue;
+            ready[ready_count] = index;
+            ready_count += 1;
+        }
+        if (ready_count == 0) return;
+        // Coalesce a singleton for at most one preparation wave. This keeps
+        // small mixed requests from degenerating into one backbone per item,
+        // while a slow remaining group cannot indefinitely delay ready work.
+        if (!force and ready_count == 1 and pending > 1 and !self.deferred[ready[0]]) {
+            self.deferred[ready[0]] = true;
+            return;
+        }
+        for (ready[0..ready_count]) |index| self.done[index] = true;
+        if (@import("antfly_platform").env.getenvBool("ANTFLY_GEMMA4_GROUP_BROKER_TRACE")) std.debug.print("gemma4-group-ready items={d} indexes={any}\n", .{ ready_count, ready[0..ready_count] });
+        var rows: [4]PreparedGroup = undefined;
+        var owners: [4]usize = undefined;
+        var prepared: usize = 0;
+        defer for (rows[0..prepared]) |row| row.deinit(a);
+        for (ready[0..ready_count]) |index| {
+            try control.check();
+            if (errors[index] != null) continue;
+            rows[prepared] = prepareGroupCombined(a, cb, tokenizer, groups[index], options, control, pool, null, cache, parts.parts[index]) catch |err| {
+                if (@import("audio_preparation.zig").abort(err)) return err;
+                errors[index] = err;
+                continue;
+            };
+            counts[index] = rows[prepared].ids.len;
+            owners[prepared] = index;
+            prepared += 1;
+        }
+        // Stable insertion sort over a tiny cohort; public results retain input order.
+        for (0..prepared) |i| {
+            var j = i;
+            while (j > 0 and rows[j].ids.len < rows[j - 1].ids.len) : (j -= 1) {
+                std.mem.swap(PreparedGroup, &rows[j], &rows[j - 1]);
+                std.mem.swap(usize, &owners[j], &owners[j - 1]);
+            }
+        }
+        const observation = &self.observation;
+        const Phase = struct { offset: usize, count: usize };
+        var phases: [4]Phase = undefined;
+        var phase_count: usize = 0;
+        var peak = @import("../runtime/tier/memory.zig").AdmissionAmounts{};
+        var offset: usize = 0;
+        while (offset < prepared) {
+            var lengths: [4]usize = undefined;
+            for (rows[offset..prepared], lengths[0 .. prepared - offset]) |row, *length| length.* = row.ids.len;
+            var take = preparedCohortCount(lengths[0 .. prepared - offset], 4);
+            var longest: usize = 0;
+            if (take == 0) return error.EmbeddingInputTooLong;
+            // Model intermediates are bounded by the same per-row envelope as
+            // segmented Metal frames; there is no cross-picture dense score matrix.
+            var request: @import("../backends/session.zig").RunRequest = undefined;
+            while (true) {
+                longest = rows[offset + take - 1].ids.len;
+                request = .{ .batch = take, .sequence = longest, .input_bytes = inputs, .host_preprocess_bytes = host, .workspace_bytes = 256 * 1024 * 1024 + take * longest * 192 * 1024 + retained, .output_bytes = take * options.dimensions * @sizeOf(f32) };
+                if (take == 1 or try session.fitsRun(request)) break;
+                take -= 1;
+            }
+            if (session.run_admission) |admission| {
+                const needed = try admission.estimateRequest(request, session.outputInfo());
+                inline for (@typeInfo(@TypeOf(peak)).@"struct".field_names) |name| @field(peak, name) = @max(@field(peak, name), @field(needed, name));
+            }
+            phases[phase_count] = .{ .offset = offset, .count = take };
+            phase_count += 1;
+            offset += take;
+        }
+        var supplement = try session.admitSupplement(permit, peak);
+        defer supplement.deinit();
+        for (phases[0..phase_count]) |phase| {
+            offset = phase.offset;
+            const take = phase.count;
+            const packed_rows = try packVideoRows(a, cb, rows[offset..][0..take]);
+            defer packed_rows.deinit(a, cb);
+            const output = try encoder.forwardPooledEmbeddingsCT(cb, a, cfg, packed_rows.embeddings, packed_rows.mask, take, packed_rows.sequence, options.dimensions);
+            defer cb.free(output);
+            const compact = try readPooledBatch(a, cb, output, take, options.dimensions);
+            defer {
+                for (compact) |vector| a.free(vector);
+                a.free(compact);
+            }
+            for (compact, owners[offset..][0..take]) |vector, index| vectors[index] = try out.dupe(f32, vector);
+            observation.record(take);
+        }
+        for (ready[0..ready_count]) |index| parts.releaseGroup(a, cb, index);
+    }
+};
 
 const CohortParts = struct {
     parts: [4][]?SoftTokens = @splat(&.{}),
+    fn releaseGroup(self: *CohortParts, a: std.mem.Allocator, cb: *const ComputeBackend, index: usize) void {
+        for (self.parts[index]) |*part| if (part.*) |value| {
+            a.free(value.embeddings);
+            if (value.tensor) |tensor| cb.free(tensor);
+            part.* = null;
+        };
+    }
     fn deinit(self: *CohortParts, a: std.mem.Allocator, cb: *const ComputeBackend) void {
         for (self.parts) |parts| {
             for (parts) |part| if (part) |value| {
@@ -770,7 +873,23 @@ const CohortParts = struct {
         }
     }
 };
-const PartRef = struct { group: usize, part: usize };
+const PartRef = struct { group: usize, part: usize, image: bool };
+fn mixedWaveEnd(refs: []const PartRef, start: usize) usize {
+    var end = start + 1;
+    while (end < refs.len and end - start < 4 and refs[end].image == refs[start].image) : (end += 1) {}
+    return end;
+}
+
+test "embeddinggemma2 preparation waves cross modality boundaries without mixing tower batches" {
+    const refs = [_]PartRef{
+        .{ .group = 0, .part = 0, .image = true },
+        .{ .group = 1, .part = 0, .image = true },
+        .{ .group = 2, .part = 0, .image = false },
+        .{ .group = 3, .part = 0, .image = false },
+    };
+    try std.testing.expectEqual(@as(usize, 2), mixedWaveEnd(&refs, 0));
+    try std.testing.expectEqual(@as(usize, 4), mixedWaveEnd(&refs, 2));
+}
 /// CPU-only producer. No backend/model state enters the worker. Its own shared
 /// lease and allocator bound the one future wave until join and destruction.
 const MixedWave = struct {
@@ -859,83 +978,102 @@ const MixedWave = struct {
         std.debug.assert(self.budget.live == 0);
     }
 };
-fn projectCohortParts(a: std.mem.Allocator, session: Session, cb: *const ComputeBackend, groups: []const Group, indexes: []const usize, options: Options, control: Control, base: *const RunPermit, errors: []?anyerror) !CohortParts {
+fn projectCohortParts(a: std.mem.Allocator, session: Session, cb: *const ComputeBackend, groups: []const Group, indexes: []const usize, options: Options, control: Control, base: *const RunPermit, errors: []?anyerror, scheduler: *CohortReady) !CohortParts {
     var result = CohortParts{};
     errdefer result.deinit(a, cb);
     for (indexes) |index| {
         result.parts[index] = try a.alloc(?SoftTokens, groups[index].content.len);
         @memset(result.parts[index], null);
     }
+    var refs: [256]PartRef = undefined;
+    var count: usize = 0;
     for ([_]bool{ true, false }) |image| {
-        var refs: [256]PartRef = undefined;
-        var count: usize = 0;
         for (indexes) |index| for (groups[index].content, 0..) |part, p| {
             if (errors[index] != null) continue;
             const eligible = if (image) (part == .image or part == .raster) else (part == .audio or part == .pcm);
             if (eligible and (if (image) options.resident_images else options.resident_audio)) {
-                refs[count] = .{ .group = index, .part = p };
+                refs[count] = .{ .group = index, .part = p, .image = image };
                 count += 1;
             }
         };
-        var waves: [2]MixedWave = undefined;
-        var live: [2]bool = @splat(false);
-        defer for (&waves, live) |*wave, active| if (active) wave.deinit();
-        var current: usize = 0;
-        var offset: usize = 0;
-        if (count == 0) continue;
-        waves[0] = .{ .session = session, .groups = groups, .refs = refs[0..@min(count, 4)], .control = control, .image = image };
-        live[0] = true;
-        waves[0].run();
-        while (offset < count) {
-            const wave = &waves[current];
-            wave.join();
-            if (wave.failure) |err| return err;
-            for (wave.refs, wave.errors[0..wave.refs.len]) |ref, err| if (err) |failure| {
-                errors[ref.group] = failure;
+    }
+    var waves: [2]MixedWave = undefined;
+    var live: [2]bool = @splat(false);
+    defer for (&waves, live) |*wave, active| if (active) wave.deinit();
+    var current: usize = 0;
+    var offset: usize = 0;
+    if (count == 0) {
+        try scheduler.run(&result, true);
+        return result;
+    }
+    waves[0] = .{ .session = session, .groups = groups, .refs = refs[0..mixedWaveEnd(refs[0..count], 0)], .control = control, .image = refs[0].image };
+    live[0] = true;
+    if (options.prepare_ahead) {
+        _ = waves[0].start();
+    } else waves[0].run();
+    // Text-only or non-resident groups can run while the first CPU wave
+    // prepares, rather than delaying that producer behind the backbone.
+    try scheduler.run(&result, false);
+    while (offset < count) {
+        const wave = &waves[current];
+        const image = wave.image;
+        wave.join();
+        if (wave.failure) |err| return err;
+        for (wave.refs, wave.errors[0..wave.refs.len]) |ref, err| if (err) |failure| {
+            errors[ref.group] = failure;
+        };
+        const next = 1 - current;
+        const end = offset + wave.refs.len;
+        if (end < count) {
+            waves[next] = .{ .session = session, .groups = groups, .refs = refs[end..mixedWaveEnd(refs[0..count], end)], .control = control, .image = refs[end].image };
+            live[next] = true;
+            const spawned = if (options.prepare_ahead) waves[next].start() else blk: {
+                waves[next].run();
+                break :blk false;
             };
-            const next = 1 - current;
-            const end = offset + wave.refs.len;
-            if (end < count) {
-                waves[next] = .{ .session = session, .groups = groups, .refs = refs[end..@min(count, end + 4)], .control = control, .image = image };
-                live[next] = true;
-                const spawned = waves[next].start();
-                if (@import("antfly_platform").env.getenvBool("ANTFLY_GEMMA4_GROUP_BROKER_TRACE")) std.debug.print("gemma4-group-prepare overlap={}\n", .{spawned});
-            }
-            if (wave.count != 0) {
-                var request = base.request.?;
-                const scratch = if (image) try projector.embeddingGemma2PreparedScratch(wave.images[0..wave.count], 2 * 1024 * 1024 * 1024) else audioRunRequest(session.backend(), 0, 0, wave.count).workspace_bytes;
-                request.workspace_bytes = @max(request.workspace_bytes, scratch + groups.len * 8192 * 512 * 4);
-                var supplement = if (session.run_admission) |admission| try session.admitSupplement(base, try admission.estimateRequest(request, session.outputInfo())) else RunPermit{ .session = session, .lease = null };
-                defer supplement.deinit();
-                var audio: [4]*const projector.PreparedAudio = undefined;
-                if (!image) {
-                    for (wave.audio[0..wave.count], audio[0..wave.count]) |*clip, *dest| dest.* = clip;
-                }
-                var projected = if (image) try projector.encodePreparedEmbeddingGemma2ImagesResident(cb, a, wave.images[0..wave.count], .{ .max_scratch_bytes = scratch }) else try projector.encodePreparedEmbeddingGemma2AudioBatchResident(cb, a, audio[0..wave.count]);
-                defer projected.deinit();
-                if (@import("antfly_platform").env.getenvBool("ANTFLY_GEMMA4_GROUP_BROKER_TRACE")) std.debug.print("gemma4-group-tower kind={s} items={d}\n", .{ if (image) "image" else "audio", projected.max_batch_executed });
-                var first: usize = 0;
-                for (projected.tokens_per_image, wave.indexes[0..wave.count]) |tokens, slot| {
-                    const ref = wave.refs[slot];
-                    var total: usize = tokens;
-                    for (result.parts[ref.group]) |part| if (part) |value| {
-                        total += value.tokens;
-                    };
-                    if (total > 8192) {
-                        errors[ref.group] = error.EmbeddingInputTooLong;
-                        first += tokens;
-                        continue;
-                    }
-                    const view = try cb.sliceRows2D(a, projected.embeddings, first, tokens, 512);
-                    result.parts[ref.group][ref.part] = .{ .id = if (image) 258880 else 258881, .embeddings = &.{}, .tensor = view, .tokens = tokens };
-                    first += tokens;
-                }
-            }
-            wave.deinit();
-            live[current] = false;
-            offset = end;
-            current = next;
+            if (@import("antfly_platform").env.getenvBool("ANTFLY_GEMMA4_GROUP_BROKER_TRACE")) std.debug.print("gemma4-group-prepare overlap={}\n", .{spawned});
         }
+        if (wave.count != 0) {
+            var request = base.request.?;
+            const scratch = if (image) try projector.embeddingGemma2PreparedScratch(wave.images[0..wave.count], 2 * 1024 * 1024 * 1024) else audioRunRequest(session.backend(), 0, 0, wave.count).workspace_bytes;
+            request.workspace_bytes = @max(request.workspace_bytes, scratch + groups.len * 8192 * 512 * 4);
+            var supplement = if (session.run_admission) |admission| try session.admitSupplement(base, try admission.estimateRequest(request, session.outputInfo())) else RunPermit{ .session = session, .lease = null };
+            defer supplement.deinit();
+            var audio: [4]*const projector.PreparedAudio = undefined;
+            if (!image) {
+                for (wave.audio[0..wave.count], audio[0..wave.count]) |*clip, *dest| dest.* = clip;
+            }
+            var projected = if (image) try projector.encodePreparedEmbeddingGemma2ImagesResident(cb, a, wave.images[0..wave.count], .{ .max_scratch_bytes = scratch }) else try projector.encodePreparedEmbeddingGemma2AudioBatchResident(cb, a, audio[0..wave.count]);
+            defer projected.deinit();
+            if (@import("antfly_platform").env.getenvBool("ANTFLY_GEMMA4_GROUP_BROKER_TRACE")) std.debug.print("gemma4-group-tower kind={s} items={d}\n", .{ if (image) "image" else "audio", projected.max_batch_executed });
+            var first: usize = 0;
+            for (projected.tokens_per_image, wave.indexes[0..wave.count]) |tokens, slot| {
+                const ref = wave.refs[slot];
+                if (errors[ref.group] != null) {
+                    first += tokens;
+                    continue;
+                }
+                var total: usize = tokens;
+                for (result.parts[ref.group]) |part| if (part) |value| {
+                    total += value.tokens;
+                };
+                if (total > 8192) {
+                    errors[ref.group] = error.EmbeddingInputTooLong;
+                    first += tokens;
+                    continue;
+                }
+                const view = try cb.sliceRows2D(a, projected.embeddings, first, tokens, 512);
+                result.parts[ref.group][ref.part] = .{ .id = if (image) 258880 else 258881, .embeddings = &.{}, .tensor = view, .tokens = tokens };
+                first += tokens;
+            }
+        }
+        // The next bounded preparation wave was started above. Running
+        // ready backbones here overlaps it and retires projected owners.
+        try scheduler.run(&result, end == count);
+        wave.deinit();
+        live[current] = false;
+        offset = end;
+        current = next;
     }
     return result;
 }
@@ -2979,7 +3117,7 @@ test "embeddinggemma2 mixed preparation drains cancellation partial errors and d
     const session = Session{ .ptr = &dummy, .vtable = &.{ .run = Mock.run, .inputInfo = Mock.info, .outputInfo = Mock.info, .backend = Mock.backend, .close = Mock.close } };
     const pixels: [16]u8 = @splat(255);
     const groups = [_]Group{ .{ .content = &.{.{ .image = "bad" }} }, .{ .content = &.{.{ .raster = .{ .bytes = &pixels, .width = 2, .height = 2, .stride_bytes = 8 } }} } };
-    const refs = [_]PartRef{ .{ .group = 0, .part = 0 }, .{ .group = 1, .part = 0 } };
+    const refs = [_]PartRef{ .{ .group = 0, .part = 0, .image = true }, .{ .group = 1, .part = 0, .image = true } };
     var canceled = MixedWave{ .session = session, .groups = &groups, .refs = &refs, .control = .{ .check_fn = Mock.canceled }, .image = true };
     _ = canceled.start();
     canceled.join();

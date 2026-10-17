@@ -164,9 +164,10 @@ fn benchmark(io: std.Io, a: std.mem.Allocator, model: []const u8, output: []cons
     defer results.deinit(a);
     var random_source = std.Random.DefaultPrng.init(14517);
     const random = random_source.random();
-    for ([_]usize{ 128, 512, 2048, 8192 }) |queries| {
+    for ([_]usize{ 1, 7, 8, 15, 16, 31, 32, 63, 64, 127, 128, 512, 2048, 8192 }) |queries| {
         for ([_][2]usize{ .{ 256, 2 }, .{ 512, 1 } }) |shape| {
             for ([_]usize{ 1, 4 }) |items| {
+                if (queries % items != 0) continue;
                 const d = shape[0];
                 const kv = shape[1];
                 const q = try a.alloc(f32, queries * heads * d);
@@ -206,13 +207,22 @@ fn benchmark(io: std.Io, a: std.mem.Allocator, model: []const u8, output: []cons
                 const metadata = (try cb.fromInt32Shape(words, &.{@intCast(words.len)})) orelse return error.TypedMetadataUnavailable;
                 defer cb.free(metadata);
                 const first = results.items.len;
-                for (0..5) |candidate| try results.append(a, .{
+                var candidates: [8]usize = undefined;
+                var candidate_count: usize = 0;
+                for (0..8) |candidate| {
+                    if (candidate == 7 and queries > 128) continue;
+                    if (d != 512 and (candidate == 4 or candidate == 5)) continue;
+                    if (candidate == 5 and (queries % 16 != 0)) continue;
+                    candidates[candidate_count] = candidate;
+                    candidate_count += 1;
+                }
+                for (candidates[0..candidate_count]) |candidate| try results.append(a, .{
                     .queries = queries,
                     .head_dim = d,
                     .kv_heads = kv,
                     .items = items,
-                    .strategy = if (candidate == 4) "automatic" else if (candidate == 3) "flash" else "gemm",
-                    .query_tile = if (candidate == 4) (if (queries <= 512) @as(usize, 512) else @as(usize, 256)) else switch (candidate) {
+                    .strategy = if (candidate == 7) "flash_short" else if (candidate == 6) "automatic" else if (candidate >= 3) (if (candidate == 5) "flash_matrix64" else if (candidate == 4) "flash_matrix32" else "flash") else "gemm",
+                    .query_tile = if (candidate == 6) (if (queries <= 512) @as(usize, 512) else @as(usize, 256)) else switch (candidate) {
                         0 => 128,
                         1 => 256,
                         else => 512,
@@ -224,16 +234,18 @@ fn benchmark(io: std.Io, a: std.mem.Allocator, model: []const u8, output: []cons
                     .vm_after = @splat(0),
                 });
                 // Two warm passes, then ten measurements per candidate.
-                for (0..12) |iteration| for (0..5) |order| {
-                    const candidate = if (iteration % 2 == 0) order else 4 - order;
-                    const result = &results.items[first + candidate];
+                for (0..12) |iteration| for (0..candidate_count) |order| {
+                    const index = if (iteration % 2 == 0) order else candidate_count - 1 - order;
+                    const candidate = candidates[index];
+                    const result = &results.items[first + index];
                     const request = internal.ops.SegmentAttentionGrouped{
                         .visibility = .{ .ranges = ranges, .query_positions = positions, .key_positions = positions, .queries = queries, .keys = queries, .num_heads = heads, .head_dim = d, .window = if (d == 256) 512 else std.math.maxInt(u32) },
                         .metadata = metadata,
                         .num_kv_heads = kv,
                         .score_scale = 1,
-                        .metal_strategy = if (candidate == 4) .automatic else if (candidate == 3) .flash else .gemm,
-                        .metal_query_tile = if (candidate == 4) null else result.query_tile,
+                        .metal_strategy = if (candidate == 6) .automatic else if (candidate >= 3) .flash else .gemm,
+                        .metal_query_tile = if (candidate == 6) null else result.query_tile,
+                        .metal_key_block = if (candidate == 6) null else if (candidate == 7) 1 else if (candidate == 5) 64 else if (candidate == 4) 32 else 8,
                     };
                     if (iteration == 2 and termite_metal_host_vm_counters(&result.vm_before) != 0) return error.VmCountersUnavailable;
                     const start = try now();

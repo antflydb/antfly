@@ -42622,7 +42622,10 @@ fn expectGroupedAttentionF64(a: std.mem.Allocator, q: []const f32, k: []const f3
     defer a.free(scores);
     // Independent dot products and softmax. Sample long-context query rows,
     // never allocate a context-squared F64 tensor or reuse the device kernel.
-    for ([_]usize{ 0, 5, r.queries / 2, r.queries - 1 }) |row| for (0..r.num_heads) |head| {
+    const sampled_rows = [_]usize{ 0, 5, r.queries / 2, r.queries - 1 };
+    const checked_rows = if (r.queries <= 128) r.queries else sampled_rows.len;
+    for (0..checked_rows) |sample| for (0..r.num_heads) |head| {
+        const row = if (r.queries <= 128) sample else sampled_rows[sample];
         const kh = head / (r.num_heads / request.num_kv_heads);
         var best: f64 = -std.math.inf(f64);
         for (scores, 0..) |*score, key| {
@@ -42719,6 +42722,77 @@ test "metal_compute: embeddinggemma2 grouped attention matches independent F64 m
             };
         }
     };
+}
+
+test "metal_compute: embeddinggemma2 short grouped and fused attention preserve tails masks and scale" {
+    if (comptime !build_options.enable_metal) return error.SkipZigTest;
+    if (!@import("../backends/metal_runtime.zig").metalDeviceAvailable()) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var store = testMetalWeightStoreInit(a);
+    defer {
+        deinitSharedNativeProvider(&store);
+        store.lazy_weights.deinit(a);
+    }
+    var compute = try MetalCompute.init(a, &store, null);
+    defer compute.deinit();
+    var cb = compute.computeBackend();
+    var rng = std.Random.DefaultPrng.init(923);
+    const random = rng.random();
+    for ([_]usize{ 1, 7, 8, 15, 16, 31, 32, 63, 64, 127, 128 }) |queries| {
+        for ([_]usize{ 19, 24 }) |keys| for ([_][2]usize{ .{ 256, 2 }, .{ 512, 1 } }) |shape| {
+            const d = shape[0];
+            const kv = shape[1];
+            const heads = 4;
+            const q = try a.alloc(f32, queries * heads * d);
+            defer a.free(q);
+            const k = try a.alloc(f32, keys * kv * d);
+            defer a.free(k);
+            const v = try a.alloc(f32, keys * kv * d);
+            defer a.free(v);
+            for (q) |*x| x.* = (random.float(f32) - 0.5) * 2;
+            for (k) |*x| x.* = (random.float(f32) - 0.5) * 2;
+            for (v) |*x| x.* = random.float(f32) - 0.5;
+            const ranges = try a.alloc(u32, queries * 6);
+            defer a.free(ranges);
+            const qp = try a.alloc(i32, queries);
+            defer a.free(qp);
+            const kp = try a.alloc(i32, keys);
+            defer a.free(kp);
+            for (kp, 0..) |*pos, key| pos.* = @intCast(key * 2);
+            for (qp, 0..) |*pos, row| {
+                pos.* = @intCast(row * keys * 2 / queries);
+                const lo = if (row < queries / 2) 0 else keys / 2;
+                const hi = if (row < queries / 2) keys / 2 else keys;
+                const span = hi - lo;
+                ranges[row * 6 ..][0..6].* = .{ @intCast(lo), @intCast(lo + span / 3), @intCast(lo + span / 3 + 1), @intCast(lo + 2 * span / 3), @intCast(lo + 2 * span / 3 + 1), @intCast(hi) };
+            }
+            if (queries > 5) @memset(ranges[5 * 6 ..][0..6], 0);
+            const qc = try cb.fromFloat32Shape(q, &.{ @intCast(queries), @intCast(heads * d) });
+            defer cb.free(qc);
+            const kc = try cb.fromFloat32Shape(k, &.{ @intCast(keys), @intCast(kv * d) });
+            defer cb.free(kc);
+            const vc = try cb.fromFloat32Shape(v, &.{ @intCast(keys), @intCast(kv * d) });
+            defer cb.free(vc);
+            for ([_]bool{ false, true }) |dense_envelope| {
+                if (dense_envelope and keys != 19) continue;
+                if (dense_envelope) {
+                    for (0..queries) |row| ranges[row * 6 ..][0..6].* = .{ 0, @intCast(keys / 2), @intCast(keys / 3), @intCast(keys), 0, 0 };
+                    if (queries > 5) @memset(ranges[5 * 6 ..][0..6], 0);
+                }
+                for ([_]u32{ std.math.maxInt(u32), 5 }) |window| for ([_]usize{ 0, 256 * 1024 * 1024 }) |limit| for ([_]f32{ 1, 0.125 }) |scale| for ([_]usize{ 1, 64 }) |key_block| {
+                    const request = ops.SegmentAttentionGrouped{ .visibility = .{ .ranges = ranges, .query_positions = qp, .key_positions = kp, .window = window, .queries = queries, .keys = keys, .num_heads = heads, .head_dim = d }, .num_kv_heads = kv, .score_scale = scale, .workspace_limit_bytes = limit, .metal_key_block = key_block };
+                    const output = (try cb.vtable.segmentAttentionGrouped.?(cb.ptr, qc, kc, vc, &request)) orelse return error.TestUnexpectedResult;
+                    defer cb.free(output);
+                    const got = try cb.toFloat32(output, a);
+                    defer a.free(got);
+                    expectGroupedAttentionF64(a, q, k, v, got, request) catch |err| {
+                        std.debug.print("grouped attention keys={d} dim={d} kv={d} window={d} workspace={d} scale={d}\n", .{ keys, d, kv, window, limit, scale });
+                        return err;
+                    };
+                };
+            }
+        };
+    }
 }
 
 test "metal_compute: embeddinggemma2 masked device mean truncates skips NaNs and rejects empty masks" {

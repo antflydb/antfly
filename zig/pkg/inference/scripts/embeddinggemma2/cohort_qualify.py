@@ -112,6 +112,12 @@ def cases(video=None):
             }
             for i in range(2)
         ],
+        # A ready image/text pair must run before this multi-wave audio group.
+        "mixed_ready": [
+            {"content": [text("Describe the ready image."), image]},
+            {"content": [text("Describe these sounds."), *([clips[0]] * 9)]},
+            {"content": [text("A ready text document.")]},
+        ],
         "video": [{"content": [text(f"Describe video {i}."), movie]} for i in range(2)],
     }
 
@@ -276,8 +282,37 @@ def qualify(args):
         ]
         for name, batch in groups.items():
             samples = []
+            readiness = []
             for _ in range(args.iterations):
+                log_path = args.output.with_suffix(".cohort.log")
+                log_start = log_path.stat().st_size
                 result, elapsed = embed(url, args, batch)
+                if name == "mixed_ready":
+                    trace = log_path.read_bytes()[log_start:].decode("utf-8")
+                    ready = re.search(
+                        r"gemma4-group-ready items=2 indexes=\{ 0, 2 \}", trace
+                    )
+                    later_audio = trace.find(
+                        "gemma4-group-tower kind=audio", ready.end() if ready else 0
+                    )
+                    if ready is None or later_audio < 0:
+                        raise AssertionError(
+                            "ready image/text groups waited for later audio towers"
+                        )
+                    if (
+                        "gemma4-group-prepare overlap=true"
+                        not in trace[: ready.start()]
+                    ):
+                        raise AssertionError(
+                            "next preparation wave was not started before ready work"
+                        )
+                    readiness.append(
+                        {
+                            "ready_groups": [0, 2],
+                            "before_later_audio_tower": True,
+                            "next_preparation_started": True,
+                        }
+                    )
                 if result["model_identity"] != identity:
                     raise AssertionError("cohort generation changed")
                 actual = vectors(result)
@@ -291,6 +326,8 @@ def qualify(args):
             report["cases"][name] = dict(
                 parity=agreement, completed_timing=compare.timing(samples)
             )
+            if readiness:
+                report["cases"][name]["readiness"] = readiness
             print(name, "pass", flush=True)
             compare.publish(args.output, report)
         # Independent submitters borrow different request arenas and controls.

@@ -116,18 +116,47 @@ The model lease protects views, and cache pressure reclaims the parent as one
 allocation. Packed QKV/head preparation and packed GELU avoid extraction copies;
 activation storage remains bounded by the existing admitted row envelope.
 
+The pure Zig CPU backend also prepares immutable F32 GEMM panels for reused
+matrix weights. Panels use portable SIMD across output columns, 64-column
+panels, 256-element K blocks and bounded row blocks. Tiny inputs and system
+BLAS retain their existing kernels. Panels are admitted within the same model
+and class ceilings as dense snapshots; allocation/admission failure falls back
+to direct GEMM. Admission also protects space for unwarmed dense weights, so
+optional early panels cannot force late layers to widen on every request.
+A request reader pins both representations. Idle reclamation
+releases each parent and its panels together, and unload releases all owners.
+
+Mixed media cohorts use a bounded readiness scheduler. A group executes once
+all its required projected parts are available, while the next CPU preparation
+wave runs. A singleton may wait one preparation wave to coalesce a useful
+backbone batch; ready work cannot be deferred indefinitely. Waves remain
+homogeneous batches of at most four items but can
+cross image/audio boundaries. Text-only groups can overlap the first media
+preparation wave. Finished groups release projected tokens promptly; public
+result order, per-group failures, cancellation and shared admission remain
+unchanged. GPU tower and backbone work stay ordered on one leased backend.
+
+
 Metal grouped attention folds query heads sharing a KV head into matrix rows,
 then batches distinct KV heads for dense key envelopes. Partial envelopes
 encode one QK/PV pair per KV head, avoiding padded RHS batch strides and K/V
 expansion. Range/window masking stays exact. Query packing and score/output
 storage are bounded by the current tile; padded tail rows are not multiplied.
-Automatic dispatch uses the visible key envelope: at most 32 keys uses Flash;
-bounded local envelopes through 1536 keys use GEMM even above 512 total rows.
-Global 512-wide heads retain GEMM when the workspace fits. The 1536-key bound
-covers the maximum 512-query tile plus both 512-key windows. Explicit Flash
-and GEMM/tile overrides are reserved for qualification; workspace limits still
-apply. This avoids making a long cohort of short items inherit the wrong
-strategy from its total row count.
+Grouped K/V and resident visibility metadata now cover short queries too;
+metadata is uploaded once per forward, rather than once per layer. Queries
+below 64 rows with at most 64 keys, or visible envelopes through 32 keys,
+use a head-width-specialized SIMD-group kernel with no threadgroup scratch.
+Aligned 512-wide global heads with key
+envelopes through 128 use fused 64-key F32 attention. Local envelopes through 1536 use GEMM,
+even above 512 total rows. Longer global heads retain GEMM when its workspace
+fits. The 1536-key bound covers a 512-query tile plus two 512-key windows.
+When GEMM workspace cannot be admitted, global heads use fused 64-key tiles
+on aligned shapes and a tail-safe 32-key variant otherwise. These kernels
+retain online softmax and F32 matrix accumulation without materializing score
+tiles, with 21,632 and 27,776 bytes of threadgroup storage respectively.
+Device capability checks retain the original compact fallback. Explicit
+strategy, query-tile and key-block overrides are reserved for qualification;
+workspace limits and cancellation still apply.
 
 Audio relative-position inputs, query scales, normalization ones and completed
 per-layer relative-key projections are cached as immutable model constants.

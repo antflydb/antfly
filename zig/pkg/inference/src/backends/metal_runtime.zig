@@ -3144,7 +3144,7 @@ fn embeddingGemma2GroupedGemmPreferred(head_dim: usize, key_envelope: usize) boo
 pub fn decoderRuntimeSegmentAttentionGroupedF32Device(self: anytype, q: MetalTensor, k: MetalTensor, v: MetalTensor, grouped: anytype, metadata: ?MetalTensor, check_ctx: ?*anyopaque, check_fn: *const fn (?*anyopaque) callconv(.c) c_int) !?MetalTensor {
     const runtime = self.raw_decode_runtime orelse return null;
     const r = grouped.visibility;
-    if (r.queries < 128 or (r.head_dim != 256 and r.head_dim != 512)) return null;
+    if (r.queries == 0 or (r.head_dim != 256 and r.head_dim != 512)) return null;
     if (r.keys == 0 or grouped.num_kv_heads == 0 or r.num_heads % grouped.num_kv_heads != 0 or !std.math.isFinite(grouped.score_scale)) return error.InvalidTensorShape;
     if (r.ranges.len != r.queries * 6 or r.query_positions.len != r.queries or r.key_positions.len != r.keys) return error.InvalidTensorShape;
     for (0..r.queries * 3) |i| if (r.ranges[i * 2] > r.ranges[i * 2 + 1] or r.ranges[i * 2 + 1] > r.keys) return error.InvalidTensorShape;
@@ -3152,6 +3152,7 @@ pub fn decoderRuntimeSegmentAttentionGroupedF32Device(self: anytype, q: MetalTen
     const hidden = try std.math.mul(usize, r.num_heads, r.head_dim);
     const kv_hidden = try std.math.mul(usize, grouped.num_kv_heads, r.head_dim);
     if (q.elemCount() != r.queries * hidden or k.elemCount() != r.keys * kv_hidden or v.elemCount() != r.keys * kv_hidden) return error.InvalidTensorShape;
+    if (grouped.metal_key_block) |block| if (block != 1 and block != 8 and block != 32 and block != 64) return error.InvalidTensorShape;
     const requested_tile = grouped.metal_query_tile orelse try embeddingGemma2QueryTile(r.queries);
     if (requested_tile != 128 and requested_tile != 256 and requested_tile != 512) return error.InvalidEmbeddingGemma2QueryTile;
     const tile = @min(r.queries, requested_tile);
@@ -3165,13 +3166,13 @@ pub fn decoderRuntimeSegmentAttentionGroupedF32Device(self: anytype, q: MetalTen
     const gemm = switch (grouped.metal_strategy) {
         .flash => false,
         .gemm => within_budget,
-        .automatic => embeddingGemma2GroupedGemmPreferred(r.head_dim, score_stride) and within_budget and !@import("antfly_platform").env.getenvBool("TERMITE_METAL_EMBEDDINGGEMMA2_DISABLE_GEMM_ATTENTION"),
+        .automatic => !(r.queries < 64 and r.keys <= 64) and !(r.head_dim == 512 and r.queries % 16 == 0 and r.keys % 8 == 0 and score_stride <= 128) and embeddingGemma2GroupedGemmPreferred(r.head_dim, score_stride) and within_budget and !@import("antfly_platform").env.getenvBool("TERMITE_METAL_EMBEDDINGGEMMA2_DISABLE_GEMM_ATTENTION"),
     };
     var scores: ?MetalTensor = if (gemm) try MetalTensor.deviceAllocate(runtime, workspace_bytes, .private, &.{@intCast(workspace_bytes / @sizeOf(f32))}) else null;
     defer if (scores) |*value| value.deinit();
     var output = try MetalTensor.deviceAllocate(runtime, r.queries * hidden * @sizeOf(f32), .private, &.{ @intCast(r.queries), @intCast(hidden) });
     errdefer output.deinit();
-    const rc = termite_metal_decode_runtime_sdpa_grouped_f32_device(runtime, q.deviceHandle(), q.deviceByteOffset(), k.deviceHandle(), k.deviceByteOffset(), v.deviceHandle(), v.deviceByteOffset(), r.ranges.ptr, r.query_positions.ptr, r.key_positions.ptr, if (metadata) |tensor| tensor.deviceHandle() else null, if (metadata) |tensor| tensor.deviceByteOffset() else 0, r.queries, r.keys, r.num_heads, grouped.num_kv_heads, r.head_dim, grouped.score_scale, r.window, if (scores) |value| value.deviceHandle() else null, tile, score_stride, output.deviceHandle(), output.deviceByteOffset(), check_ctx, check_fn);
+    const rc = termite_metal_decode_runtime_sdpa_grouped_f32_device(runtime, q.deviceHandle(), q.deviceByteOffset(), k.deviceHandle(), k.deviceByteOffset(), v.deviceHandle(), v.deviceByteOffset(), r.ranges.ptr, r.query_positions.ptr, r.key_positions.ptr, if (metadata) |tensor| tensor.deviceHandle() else null, if (metadata) |tensor| tensor.deviceByteOffset() else 0, r.queries, r.keys, r.num_heads, grouped.num_kv_heads, r.head_dim, grouped.score_scale, r.window, if (scores) |value| value.deviceHandle() else null, tile, score_stride, grouped.metal_key_block orelse 0, output.deviceHandle(), output.deviceByteOffset(), check_ctx, check_fn);
     if (rc != 0) {
         if (check_fn(check_ctx) != 0) return error.Cancelled;
         output.deinit();
@@ -20333,7 +20334,7 @@ pub extern fn termite_metal_decode_runtime_sdpa_segments_f32_device(
 ) c_int;
 pub extern fn termite_metal_decode_runtime_masked_mean_rows(runtime: ?*RawMetalDecodeRuntime, input: ?*anyopaque, input_offset: usize, mask: [*c]const i64, rows: usize, width: usize, dimensions: usize, active: usize, output: ?*anyopaque, output_offset: usize) c_int;
 pub extern fn termite_metal_decode_runtime_masked_mean_rows_normalized(runtime: ?*RawMetalDecodeRuntime, input: ?*anyopaque, input_offset: usize, mask: [*c]const i64, rows: usize, width: usize, dimensions: usize, active: usize, output: ?*anyopaque, output_offset: usize) c_int;
-pub extern fn termite_metal_decode_runtime_sdpa_grouped_f32_device(runtime: ?*RawMetalDecodeRuntime, q: ?*anyopaque, q_offset: usize, k: ?*anyopaque, k_offset: usize, v: ?*anyopaque, v_offset: usize, ranges: [*c]const u32, query_positions: [*c]const i32, key_positions: [*c]const i32, metadata: ?*anyopaque, metadata_offset: usize, queries: usize, keys: usize, num_heads: usize, num_kv_heads: usize, head_dim: usize, score_scale: f32, window: u32, scores: ?*anyopaque, query_tile: usize, score_stride: usize, output: ?*anyopaque, output_offset: usize, check_ctx: ?*anyopaque, check_fn: *const fn (?*anyopaque) callconv(.c) c_int) c_int;
+pub extern fn termite_metal_decode_runtime_sdpa_grouped_f32_device(runtime: ?*RawMetalDecodeRuntime, q: ?*anyopaque, q_offset: usize, k: ?*anyopaque, k_offset: usize, v: ?*anyopaque, v_offset: usize, ranges: [*c]const u32, query_positions: [*c]const i32, key_positions: [*c]const i32, metadata: ?*anyopaque, metadata_offset: usize, queries: usize, keys: usize, num_heads: usize, num_kv_heads: usize, head_dim: usize, score_scale: f32, window: u32, scores: ?*anyopaque, query_tile: usize, score_stride: usize, key_block: usize, output: ?*anyopaque, output_offset: usize, check_ctx: ?*anyopaque, check_fn: *const fn (?*anyopaque) callconv(.c) c_int) c_int;
 pub extern fn termite_metal_decode_runtime_apply_mrope_device(
     runtime: ?*RawMetalDecodeRuntime,
     input_handle: ?*anyopaque,

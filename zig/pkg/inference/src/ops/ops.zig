@@ -98,6 +98,8 @@ pub const SegmentAttentionGrouped = struct {
     /// serving uses automatic; Native ignores the Metal strategy preference.
     metal_strategy: enum { automatic, gemm, flash } = .automatic,
     metal_query_tile: ?usize = null,
+    /// Qualification override for fused global attention (1, 8, 32 or 64 keys).
+    metal_key_block: ?usize = null,
     control: ?@import("../execution_control.zig").InferenceExecutionControl = null,
 };
 

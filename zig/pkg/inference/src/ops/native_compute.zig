@@ -859,12 +859,18 @@ pub const LazyWeightEntry = struct {
     active_tier: ResidencyTier = .disk,
 };
 
+const PreparedPanelKey = struct { address: usize, n: usize, k: usize };
+const PreparedPanelEntry = struct { panels: linalg.prepared_gemm.Panels, class: embeddinggemma2_weight_cache.MetalClass };
+
 pub const WeightStore = struct {
     scalar_bounds: @import("../models/embedding_gemma2_weight_cache.zig").ScalarBoundsCache = .{},
     allocator: std.mem.Allocator,
     resident_weights: std.StringHashMapUnmanaged(LoadedWeight),
     lazy_weights: std.StringHashMapUnmanaged(LazyWeightEntry),
     quantized_prepare_lock: std.atomic.Mutex = .unlocked,
+    embeddinggemma2_panel_class_bytes: [3]usize = @splat(0),
+    embeddinggemma2_dense_floor: ?[3]usize = null,
+    embeddinggemma2_panels: std.AutoHashMapUnmanaged(PreparedPanelKey, PreparedPanelEntry) = .empty,
     embeddinggemma2_f32_cache: std.StringHashMapUnmanaged(DenseDequantCacheEntry) = .empty,
     embeddinggemma2_f32_cache_bytes: usize = 0,
     embeddinggemma2_constant_bytes: usize = 0,
@@ -4608,6 +4614,13 @@ pub fn deinitPrefetchQueue(data: *WeightStore) void {
 fn deinitEmbeddingGemma2F32Cache(data: *WeightStore) void {
     platform.sync.lockYielding(&data.embeddinggemma2_f32_cache_lock);
     defer data.embeddinggemma2_f32_cache_lock.unlock();
+    var panels = data.embeddinggemma2_panels.valueIterator();
+    while (panels.next()) |entry| {
+        if (data.tier_cache) |*cache| cache.noteRelease(.host, entry.panels.data.len * @sizeOf(f32));
+        entry.panels.deinit(data.allocator);
+    }
+    data.embeddinggemma2_panels.deinit(data.allocator);
+    data.embeddinggemma2_panels = .empty;
     var it = data.embeddinggemma2_f32_cache.iterator();
     while (it.next()) |entry| {
         data.allocator.free(entry.key_ptr.*);
@@ -4621,6 +4634,7 @@ fn deinitEmbeddingGemma2F32Cache(data: *WeightStore) void {
     data.embeddinggemma2_constant_bytes = 0;
     data.embeddinggemma2_constant_count = 0;
     data.embeddinggemma2_f32_class_bytes = @splat(0);
+    data.embeddinggemma2_panel_class_bytes = @splat(0);
 }
 
 /// A compute context pins all immutable mirrors it can borrow until teardown.
@@ -4632,6 +4646,22 @@ pub fn reclaimEmbeddingGemma2Weights(data: *WeightStore, class: embeddinggemma2_
     defer data.embeddinggemma2_f32_cache_lock.unlock();
     if (data.embeddinggemma2_f32_readers != 0) return 0;
     var released: usize = 0;
+    while (true) {
+        var panels = data.embeddinggemma2_panels.iterator();
+        const key = blk: {
+            while (panels.next()) |entry| if (entry.value_ptr.class == class) break :blk entry.key_ptr.*;
+            break :blk null;
+        } orelse break;
+        const entry = data.embeddinggemma2_panels.fetchRemove(key).?.value;
+        const bytes = entry.panels.data.len * @sizeOf(f32);
+        entry.panels.deinit(data.allocator);
+        data.embeddinggemma2_f32_cache_bytes -= bytes;
+        data.embeddinggemma2_f32_class_bytes[@backingInt(class)] -= bytes;
+        data.embeddinggemma2_panel_class_bytes[@backingInt(class)] -= bytes;
+        if (data.tier_cache) |*cache| cache.noteRelease(.host, bytes);
+        released += bytes;
+    }
+
     while (true) {
         var it = data.embeddinggemma2_f32_cache.iterator();
         const name = blk: {
@@ -6630,12 +6660,16 @@ fn linearOp(ctx: *anyopaque, input: CT, weight: CT, bias: CT, rows: usize, in_di
         } else {
             const weight_view = try denseWeightView(self, weight);
             defer if (weight_view.owned) |owned| self.allocator.free(owned);
-            try self.dispatchSgemmTransB(rows, out_dim, in_dim, 1.0, getData(input), weight_view.data, 1.0, output);
+            if (try preparedEmbeddingGemma2Linear(self, getData(input), weight_view.data, output, rows, out_dim, in_dim)) {
+                addLinearBiasRows(output, getData(bias), rows, out_dim);
+            } else try self.dispatchSgemmTransB(rows, out_dim, in_dim, 1.0, getData(input), weight_view.data, 1.0, output);
         }
     } else {
         const weight_view = try denseWeightView(self, weight);
         defer if (weight_view.owned) |owned| self.allocator.free(owned);
-        try self.dispatchSgemmTransB(rows, out_dim, in_dim, 1.0, getData(input), weight_view.data, 1.0, output);
+        if (try preparedEmbeddingGemma2Linear(self, getData(input), weight_view.data, output, rows, out_dim, in_dim)) {
+            addLinearBiasRows(output, getData(bias), rows, out_dim);
+        } else try self.dispatchSgemmTransB(rows, out_dim, in_dim, 1.0, getData(input), weight_view.data, 1.0, output);
     }
     const result = try self.makeBuf(output, true);
     return self.withLogicalShape(result, &.{ @intCast(rows), @intCast(out_dim) });
@@ -8132,6 +8166,94 @@ fn gemma4AudioLocalAttentionOp(ctx: *anyopaque, q: CT, k: CT, v: CT, rel: CT, sc
     return try self.withLogicalShape(tensor, &.{ @intCast(params.rows), @intCast(params.hidden) });
 }
 
+/// Protect future dense mirrors before admitting optional panels. Otherwise a
+/// cold request could fill the class with early panels and repeatedly widen
+/// late-layer weights on every request. Lazy byte lengths conservatively allow
+/// the largest supported F32 widening, without loading any checkpoint pages.
+fn embeddingGemma2DenseFloor(data: *WeightStore) [3]usize {
+    if (data.embeddinggemma2_dense_floor) |floor| return floor;
+    var floor: [3]usize = @splat(0);
+    var resident = data.resident_weights.iterator();
+    while (resident.next()) |entry| {
+        if (shouldBorrowEmbeddingTensor(entry.key_ptr.*)) continue;
+        const class = embeddinggemma2_weight_cache.nativeClass(entry.key_ptr.*) orelse continue;
+        const source = &entry.value_ptr.tensor;
+        const bytes = if (source.dtype == .bf16) source.data.len *| 2 else if (embeddinggemma2_weight_cache.projectionGroup(entry.key_ptr.*) != null) source.data.len else 0;
+        floor[@backingInt(class)] +|= bytes;
+    }
+    var lazy = data.lazy_weights.iterator();
+    while (lazy.next()) |entry| {
+        if (data.resident_weights.contains(entry.key_ptr.*)) continue;
+        if (shouldBorrowEmbeddingTensor(entry.key_ptr.*)) continue;
+        const class = embeddinggemma2_weight_cache.nativeClass(entry.key_ptr.*) orelse continue;
+        const source = &entry.value_ptr.tensor_ref;
+        if (source.quantized) continue;
+        floor[@backingInt(class)] +|= if (source.byte_len == 0) embeddinggemma2_weight_cache.classLimit(class) else source.byte_len *| 2;
+    }
+    floor[@backingInt(embeddinggemma2_weight_cache.MetalClass.audio)] +|= embeddinggemma2_weight_cache.prepared_max_bytes;
+    data.embeddinggemma2_dense_floor = floor;
+    return floor;
+}
+
+/// Only model-owned immutable snapshots may publish panels. Pointer keys are
+/// valid while the existing model reader guard pins both caches together.
+fn preparedEmbeddingGemma2Panels(self: *NativeCompute, source: []const f32, n: usize, k: usize) !?linalg.prepared_gemm.Panels {
+    if (!self.cache_embeddinggemma2_bf16_weights or !self.embeddinggemma2_cache_reader or n < 64 or k < 64) return null;
+    const cache = if (self.data.tier_cache) |*cache| cache else return null;
+    const key = PreparedPanelKey{ .address = @intFromPtr(source.ptr), .n = n, .k = k };
+    {
+        platform.sync.lockYielding(&self.data.embeddinggemma2_f32_cache_lock);
+        defer self.data.embeddinggemma2_f32_cache_lock.unlock();
+        if (self.data.embeddinggemma2_panels.get(key)) |entry| return entry.panels;
+    }
+    self.data.prefetch.lock();
+    defer self.data.prefetch.unlock();
+    platform.sync.lockYielding(&self.data.embeddinggemma2_f32_cache_lock);
+    defer self.data.embeddinggemma2_f32_cache_lock.unlock();
+    if (self.data.embeddinggemma2_panels.get(key)) |entry| return entry.panels;
+    const class = blk: {
+        var it = self.data.embeddinggemma2_f32_cache.iterator();
+        while (it.next()) |entry| {
+            const begin = @intFromPtr(entry.value_ptr.data.ptr);
+            const end = begin + entry.value_ptr.data.len * @sizeOf(f32);
+            if (key.address >= begin and key.address <= end and source.len * @sizeOf(f32) <= end - key.address)
+                break :blk embeddinggemma2_weight_cache.nativeClass(std.mem.sliceTo(entry.key_ptr.*, '|')) orelse continue;
+        }
+        return null;
+    };
+    const bytes = try linalg.prepared_gemm.Panels.bytes(n, k);
+    const used = self.data.embeddinggemma2_f32_class_bytes[@backingInt(class)];
+    const limit = embeddinggemma2_weight_cache.classLimit(class);
+    const floor = embeddingGemma2DenseFloor(self.data);
+    const panel_limit = limit -| floor[@backingInt(class)];
+    const panel_used = self.data.embeddinggemma2_panel_class_bytes[@backingInt(class)];
+    if (panel_used > panel_limit or bytes > panel_limit - panel_used) return null;
+    if (used > limit or bytes > limit - used or self.data.embeddinggemma2_panels.count() >= embeddinggemma2_weight_cache.max_entries) return null;
+    cache.reserve(.host, bytes) catch {
+        cache.noteDenied(.host, bytes);
+        return null;
+    };
+    errdefer cache.noteRelease(.host, bytes);
+    const panels = try linalg.prepared_gemm.Panels.init(self.data.allocator, source, n, k);
+    errdefer panels.deinit(self.data.allocator);
+    try self.data.embeddinggemma2_panels.put(self.data.allocator, key, .{ .panels = panels, .class = class });
+    self.data.embeddinggemma2_f32_cache_bytes += bytes;
+    self.data.embeddinggemma2_f32_class_bytes[@backingInt(class)] += bytes;
+    self.data.embeddinggemma2_panel_class_bytes[@backingInt(class)] += bytes;
+    std.debug.assert(self.embeddinggemma2_cache_reader);
+    return panels;
+}
+fn preparedEmbeddingGemma2Linear(self: *NativeCompute, input: []const f32, source: []const f32, output: []f32, m: usize, n: usize, k: usize) !bool {
+    // Direct dot products remain preferable for tiny row counts.
+    if (m < 32 or native.useBlas()) return false;
+    const panels = (preparedEmbeddingGemma2Panels(self, source, n, k) catch |err| switch (err) {
+        error.OutOfMemory => return false,
+        else => return err,
+    }) orelse return false;
+    try linalg.sgemmPrepared(self.io, m, panels, input, output);
+    return true;
+}
+
 fn linearNoBiasOp(ctx: *anyopaque, input: CT, weight: CT, rows: usize, in_dim: usize, out_dim: usize) anyerror!CT {
     const self: *NativeCompute = @ptrCast(@alignCast(ctx));
     defer maybeDiscardMappedWeightAfterUse(self, weight);
@@ -8173,7 +8295,8 @@ fn linearNoBiasOp(ctx: *anyopaque, input: CT, weight: CT, rows: usize, in_dim: u
     }
     const weight_view = try denseWeightView(self, weight);
     defer if (weight_view.owned) |owned| self.allocator.free(owned);
-    try self.dispatchSgemmTransB(rows, out_dim, in_dim, 1.0, getData(input), weight_view.data, 0.0, output);
+    if (!try preparedEmbeddingGemma2Linear(self, getData(input), weight_view.data, output, rows, out_dim, in_dim))
+        try self.dispatchSgemmTransB(rows, out_dim, in_dim, 1.0, getData(input), weight_view.data, 0.0, output);
     return makeLinearNoBiasResult(self, output, rows, out_dim);
 }
 
@@ -53848,4 +53971,54 @@ test "embeddinggemma2 fused epilogues unwind allocation failures" {
         }
     };
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Case.run, .{});
+}
+
+test "embeddinggemma2 prepared panels share admission pin readers and reclaim atomically" {
+    const Case = struct {
+        fn run(a: std.mem.Allocator) !void {
+            var store = WeightStore{ .allocator = a, .resident_weights = .empty, .lazy_weights = .empty, .tier_cache = tier_cache_mod.SharedCache.init(.{ .host_limit_bytes = 49152 }) };
+            initPrefetchQueue(&store, a);
+            defer deinitPrefetchQueue(&store);
+            var compute = NativeCompute.init(a, &store, null);
+            var live = true;
+            defer if (live) compute.deinit();
+            compute.cache_embeddinggemma2_bf16_weights = true;
+            var raw: [128 * 64 * 2]u8 = undefined;
+            for (0..128 * 64) |i| {
+                raw[i * 2] = 0x80;
+                raw[i * 2 + 1] = 0x3f;
+            }
+            var source = tensor_mod.Tensor{ .data = &raw, .shape = &.{ 128, 64 }, .dtype = .bf16, .name = "language_model.layers.0.self_attn.o_proj.weight", .allocator = a, .owns_data = false, .owns_shape = false };
+            const dense = (try cachedEmbeddingGemma2F32Weight(&compute, source.name, &source)).?;
+            const panels = (try preparedEmbeddingGemma2Panels(&compute, dense[0..4096], 64, 64)).?;
+            const again = (try preparedEmbeddingGemma2Panels(&compute, dense[0..4096], 64, 64)).?;
+            try std.testing.expectEqual(panels.data.ptr, again.data.ptr);
+            try std.testing.expectEqual(@as(usize, 49152), store.tier_cache.?.host_bytes);
+            try std.testing.expectEqual(@as(usize, 0), reclaimEmbeddingGemma2Weights(&store, .language));
+            // Unowned request memory cannot become a persistent weight plan.
+            var other: [4096]f32 = @splat(2);
+            try std.testing.expect(try preparedEmbeddingGemma2Panels(&compute, &other, 64, 64) == null);
+            // A second geometry cannot bypass the shared cap.
+            try std.testing.expect(try preparedEmbeddingGemma2Panels(&compute, dense[4096..8192], 64, 64) == null);
+            compute.deinit();
+            live = false;
+            try std.testing.expectEqual(@as(usize, 49152), reclaimEmbeddingGemma2Weights(&store, .language));
+            try std.testing.expectEqual(@as(usize, 0), store.tier_cache.?.host_bytes);
+            try std.testing.expectEqual(@as(usize, 0), store.embeddinggemma2_panels.count());
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Case.run, .{});
+}
+
+test "embeddinggemma2 panel admission protects unwarmed dense weights" {
+    const a = std.testing.allocator;
+    var store = WeightStore{ .allocator = a, .resident_weights = .empty, .lazy_weights = .empty };
+    defer store.lazy_weights.deinit(a);
+    try store.lazy_weights.put(a, "language_model.layers.0.self_attn.o_proj.weight", .{ .tensor_ref = .{ .name = "weight", .byte_len = 1024 } });
+    try store.lazy_weights.put(a, "vision_tower.weight", .{ .tensor_ref = .{ .name = "vision", .byte_len = 2048 } });
+    try store.lazy_weights.put(a, "language_model.embed_tokens.weight", .{ .tensor_ref = .{ .name = "vocab", .byte_len = 1000000 } });
+    const floor = embeddingGemma2DenseFloor(&store);
+    try std.testing.expectEqual(@as(usize, 2048), floor[0]);
+    try std.testing.expectEqual(@as(usize, 4096), floor[1]);
+    try std.testing.expectEqual(embeddinggemma2_weight_cache.prepared_max_bytes, floor[2]);
 }
