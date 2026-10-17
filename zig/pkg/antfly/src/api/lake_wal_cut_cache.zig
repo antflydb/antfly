@@ -209,7 +209,7 @@ pub const Cache = struct {
         owner.masks = .init(owner.budget.allocator());
         errdefer owner.release();
         populate(owner, store, cut, head, previous) catch |err| {
-            if (err == error.OutOfMemory and owner.budget.isExhausted()) return error.LakeOverlayTooLarge;
+            if (err == error.OutOfMemory and owner.budget.isLocallyExhausted()) return error.LakeOverlayTooLarge;
             return err;
         };
         return .{ .owner = owner };
@@ -303,6 +303,14 @@ test "external lake bounded WAL cuts share normalization masks and immutable cha
     defer private.deinit();
     try std.testing.expectEqual(@as(usize, 0), pressure.heap.live);
     try std.testing.expectEqual(@as(u64, 2), private.overlay().pending.lsn);
+    // A cache's historical denial must not become the overlay's hard limit.
+    pressure.heap.limit = 256 * 1024 * 1024;
+    const admitted = try pressure.acquire(@splat(1), store, 0, .{ .io = io });
+    defer admitted.deinit();
+    const reused = try pressure.acquire(@splat(1), store, 0, .{ .io = io });
+    defer reused.deinit();
+    try std.testing.expect(admitted.owner != private.owner);
+    try std.testing.expectEqual(admitted.owner, reused.owner);
     const Worker = struct {
         fn acquire(shared: *Cache, queue: wal.Store, context: Context) !Pin {
             return shared.acquire(@splat(99), queue, 0, context);

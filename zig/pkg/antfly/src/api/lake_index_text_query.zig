@@ -2527,7 +2527,7 @@ const Execution = struct {
     fn hydrateTransformCandidates(self: *Execution, a: A, req: types.SearchRequest, fields: ?[]const []const u8, hits: []types.SearchHit) !void {
         var budget: local.sql_memory_budget = .{ .backing = a, .limit = transform_source_bytes };
         self.hydrateTransformCandidatesBounded(a, &budget, fields, hits) catch |err| {
-            if (budget.isExhausted() or err == error.TransformSourceBudgetExceeded) return if (req.hasHitEvaluation()) error.DecisionLimitExceeded else error.QueryCandidateBudgetExceeded;
+            if ((err == error.OutOfMemory and budget.isLocallyExhausted()) or err == error.TransformSourceBudgetExceeded) return if (req.hasHitEvaluation()) error.DecisionLimitExceeded else error.QueryCandidateBudgetExceeded;
             return err;
         };
     }

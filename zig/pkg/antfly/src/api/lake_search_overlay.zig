@@ -123,9 +123,9 @@ pub const Overlay = struct {
         owner.locked = .{ .backing = owner.budget.allocator() };
         owner.metadata_arena = .init(owner.locked.allocator());
         return self.buildRecent(owner, name, analysis, schema, field, context, null) catch |err| {
-            const exhausted = owner.budget.isExhausted();
+            const exhausted = owner.budget.isLocallyExhausted();
             RecentOwner.release(owner);
-            if (exhausted) return error.LakeOverlayTooLarge;
+            if (err == error.OutOfMemory and exhausted) return error.LakeOverlayTooLarge;
             return err;
         };
     }
@@ -143,9 +143,9 @@ pub const Overlay = struct {
         owner.metadata_arena = .init(owner.locked.allocator());
         // buildRecent releases its writer before this owner on failure.
         return self.buildRecent(owner, name, analysis, schema, field, context, previous) catch |err| {
-            const exhausted = owner.budget.isExhausted();
+            const exhausted = owner.budget.isLocallyExhausted();
             RecentOwner.release(owner);
-            if (exhausted) return error.LakeOverlayTooLarge;
+            if (err == error.OutOfMemory and exhausted) return error.LakeOverlayTooLarge;
             return err;
         };
     }
@@ -215,7 +215,7 @@ pub const Overlay = struct {
                 var build = try local.index.IndexWriter.init(built.locked.allocator());
                 defer build.deinit();
                 subset.appendRecent(built.locked.allocator(), &build, analysis, schema, field, context) catch |err| {
-                    if (built.budget.isExhausted()) return error.LakeOverlayTooLarge;
+                    if (err == error.OutOfMemory and built.budget.isLocallyExhausted()) return error.LakeOverlayTooLarge;
                     return err;
                 };
                 built.snapshot = build.acquireSnapshot();

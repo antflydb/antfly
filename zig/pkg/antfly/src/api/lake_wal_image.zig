@@ -82,7 +82,7 @@ pub const Part = struct {
         self.arena = .init(self.budget.allocator());
         errdefer self.release();
         return self.fill(keys, previous, delta, borrow_rows) catch |err| {
-            if (err == error.OutOfMemory and self.budget.isExhausted()) return error.LakeOverlayTooLarge;
+            if (err == error.OutOfMemory and self.budget.isLocallyExhausted()) return error.LakeOverlayTooLarge;
             return err;
         };
     }
@@ -313,6 +313,12 @@ test "external lake bounded WAL images share unchanged rows without ancestor own
     const last = try std.json.parseFromSliceLeaky(V, sa, "{\"id\":1000,\"body\":\"last\"}", .{});
     const first_id = try std.fmt.allocPrint(sa, "wal1:{s}", .{local.serverless_external_source_mod.lake_catalog.types.digestHex("[0]")});
     const last_id = try std.fmt.allocPrint(sa, "wal1:{s}", .{local.serverless_external_source_mod.lake_catalog.types.digestHex("[1000]")});
+    // Parent cache pressure stays retryable instead of claiming a 128 MiB
+    // partition-size violation. Part ownership is released on failed admission.
+    var parent: local.sql_memory_budget = .{ .backing = a, .limit = @sizeOf(Part) + 64 };
+    try std.testing.expectError(error.OutOfMemory, Part.build(parent.allocator(), keys, null, &.{.{ .id = first_id, .change = .{ .op = .upsert, .row = first } }}, false));
+    try std.testing.expect(parent.isExhausted());
+    try std.testing.expectEqual(@as(usize, 0), parent.live);
     var image = try Image.update(a, null, .{ .lsn = 1, .key_fields = keys, .changes = &.{ .{ .op = .upsert, .row = first }, .{ .op = .upsert, .row = last } } });
     defer image.release();
     const untouched = image.parts[partition(last_id)].?;
