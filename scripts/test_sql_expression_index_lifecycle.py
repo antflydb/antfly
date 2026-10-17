@@ -203,6 +203,24 @@ class ExpressionIndexTest(unittest.TestCase):
                 self.assertEqual(code, failure.exception.sqlstate)
                 verify(None)
 
+    def test_original_qualified_index_names_are_syntax_errors(self):
+        originals = {
+            entry["id"]: entry
+            for entry in json.loads(
+                (FIXTURES / "sql_parity_inventory.json").read_text()
+            )["entries"]
+        }
+        with postgres() as db:
+            db.execute("CREATE TABLE usage_records(status TEXT)")
+            for case_id in ("sql-0708", "sql-0709"):
+                with self.subTest(case=case_id):
+                    with self.assertRaises(psycopg.Error) as caught:
+                        with db.transaction():
+                            db.execute(originals[case_id]["sql"])
+                    self.assertEqual("42601", caught.exception.sqlstate)
+            db.execute("CREATE INDEX status_idx ON public.usage_records(status)")
+            db.execute("DROP INDEX public.status_idx")
+
     def test_original_expression_index_lifecycles(self):
         originals = {
             entry["id"]: entry

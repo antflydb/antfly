@@ -25,6 +25,10 @@ const Json = std.json.Value;
 const operators = @import("operators.zig");
 const Datum = @import("scalar.zig").Datum;
 
+test {
+    _ = @import("explain.zig");
+}
+
 pub const resource_limits = @import("resource_limits.zig");
 
 pub const Limits = struct {

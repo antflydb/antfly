@@ -99,14 +99,70 @@ fn indexedRows(ctx: *fixture.Context, profile: Profile, name: []const u8, expect
     try std.testing.expectEqual(@as(u16, 200), plan_response.status);
     var plan = try std.json.parseFromSlice(wire.SQLResponse, ctx.alloc, plan_response.body, .{});
     defer plan.deinit();
-    var index_seen = false;
-    for (plan.value.rows) |row| if (row[0] == .string and std.mem.indexOf(u8, row[0].string, "Index Scan") != null and std.mem.indexOf(u8, row[0].string, name) != null) {
-        index_seen = true;
+    var declaration_seen = false;
+    for (plan.value.rows) |row| if (row[0] == .string and std.mem.indexOf(u8, row[0].string, "index selection: snapshot-local") != null and std.mem.indexOf(u8, row[0].string, name) != null) {
+        declaration_seen = true;
     };
-    if (!index_seen) std.debug.print("expression index plan case={s} body={s}\n", .{ profile.id, plan_response.body });
-    try std.testing.expect(index_seen);
+    if (!declaration_seen) std.debug.print("expression index plan case={s} body={s}\n", .{ profile.id, plan_response.body });
+    try std.testing.expect(declaration_seen);
+    // A two-row table may legitimately cost less than an automatic index
+    // probe. EXPLAIN must not invent a choice before native snapshot planning.
+    // Independently force the exact named tuple span to prove physical index
+    // contents and mutation maintenance, rather than weakening this to DDL-only
+    // metadata or SQL result counts.
+    const metadata = server.StatusSource.fromMetadataHttpService(ctx.metadata.server.svc);
+    const domain = local.system_catalog_domain;
+    const lookup: domain.ResolveMany = .{ .relations = &.{.{ .namespace = profile.namespace, .name = "usage_records" }} };
+    const bytes = try metadata.systemCatalog(ctx.alloc, .{}, .{ .resolve_many = lookup });
+    defer ctx.alloc.free(bytes);
+    var owner = try std.json.parseFromSlice(domain.ResolvedMany, ctx.alloc, bytes, .{});
+    defer owner.deinit();
+    try owner.value.validateRelations(lookup);
+    const table = owner.value.relations[0] orelse return error.MissingCreatedRelation;
+    const reader = ctx.data.http_server.?.table_reads orelse return error.MissingOwnerReadSource;
+    // Named tuple reads carry membership proofs. Admit their durable tracking
+    // capability through the normal writer before pinning the read cut.
+    const writer = ctx.data.http_server.?.table_writes orelse return error.MissingOwnerWriteSource;
+    try writer.activateRangeTracking(ctx.alloc, table.table.name, .{});
+    var md5: [16]u8 = undefined;
+    std.crypto.hash.Md5.hash("owner@example.com", &md5, .{});
+    const md5_text = std.fmt.bytesToHex(md5, .lower);
+    const key = if (std.mem.eql(u8, profile.id, "sql-0017") or std.mem.eql(u8, profile.id, "sql-0718")) "new-start" else if (std.mem.eql(u8, profile.id, "sql-0716")) "OWNER@EXAMPLE.COM" else if (std.mem.eql(u8, profile.id, "sql-0717")) &md5_text else "owner@example.com";
+    const tuple: []const std.json.Value = if (profile.partial) &.{ .{ .string = "tenant" }, .{ .string = key } } else &.{.{ .string = key }};
+    var physical_page = page: {
+        const deadline = platform.time.monotonicNs() +| 15 * std.time.ns_per_s;
+        const physical = admitted: {
+            while (true) {
+                try ctx.checkDrivers();
+                if (platform.time.monotonicNs() >= deadline) return error.IndexProbeAdmissionTimeout;
+                const view = reader.openRelationalRead(ctx.alloc, table.table.name, "", "", .{
+                    .fields = &.{"id"},
+                    .include_documents = true,
+                    .include_range_proofs = true,
+                    .execution_deadline_ns = deadline,
+                    .limit = 128,
+                    .relational_query = .{ .index = name, .schema_version = table.owner.schema_version, .fields = &.{"id"}, .lower = .{ .values = tuple }, .upper = .{ .values = tuple } },
+                }, .read_index) catch |err| switch (err) {
+                    // No read view or row has escaped admission. Reopen the whole
+                    // cut, just as the mounted SQL read client does; never retry
+                    // a write, a page, or an integrity failure here.
+                    error.SqlStatementReadUnavailable => {
+                        try ctx.io.sleep(.fromMilliseconds(20), .awake);
+                        continue;
+                    },
+                    else => return err,
+                };
+                break :admitted view orelse return error.MissingOwnerReadSource;
+            }
+        };
+        defer physical.deinit();
+        break :page try physical.next(ctx.alloc, 128);
+    };
+    defer physical_page.deinit();
+    try std.testing.expect(physical_page.after == null);
     var response = try client.executeIn(ctx, profile.namespace, query, .read);
     defer response.deinit(ctx.alloc);
+    if (response.status != 200) std.debug.print("expression index query case={s} body={s}\n", .{ profile.id, response.body });
     try std.testing.expectEqual(@as(u16, 200), response.status);
     var parsed = try std.json.parseFromSlice(wire.SQLResponse, ctx.alloc, response.body, .{});
     defer parsed.deinit();
@@ -125,9 +181,20 @@ fn indexedRows(ctx: *fixture.Context, profile: Profile, name: []const u8, expect
         const id = try std.fmt.allocPrint(ctx.alloc, "00000000-0000-0000-0000-{d:0>12}", .{row.id});
         defer ctx.alloc.free(id);
         try std.testing.expectEqualStrings(id, parsed.value.rows[count][0].string);
+        // Equal expression keys are ordered by physical row identity, not
+        // this table's logical UUID key. Verify exact membership and unique
+        // occurrence independently of the SQL ORDER BY above.
+        var occurrences: usize = 0;
+        for (physical_page.rows) |physical_row| {
+            const physical_id = try physical_row.cell("id");
+            try std.testing.expect(!physical_id.sql_null);
+            if (std.mem.eql(u8, id, physical_id.value.string)) occurrences += 1;
+        }
+        try std.testing.expectEqual(@as(usize, 1), occurrences);
         count += 1;
     }
     try std.testing.expectEqual(count, parsed.value.rows.len);
+    try std.testing.expectEqual(count, physical_page.rows.len);
 }
 fn ready(ctx: *fixture.Context, profile: Profile, name: []const u8, expected_id: u64) !Cut {
     const domain = local.system_catalog_domain;
@@ -190,115 +257,130 @@ fn ready(ctx: *fixture.Context, profile: Profile, name: []const u8, expected_id:
     return error.ExpressionIndexBuildTimeout;
 }
 
-const Campaign = struct {
-    ids: [profiles.len]u64 = undefined,
-    cuts: [profiles.len]?Cut = @splat(null),
-    expected: [profiles.len][6]Row = undefined,
-    counts: [profiles.len]usize = @splat(0),
-    pub fn beforeRestart(self: *@This(), ctx: *fixture.Context) !void {
-        var corpus = try local.sql_parity_fixtures.Corpus.init(ctx.alloc);
-        defer corpus.deinit();
-        for (profiles, 0..) |profile, position| {
-            const ns = try std.fmt.allocPrint(ctx.alloc, "CREATE SCHEMA {s}", .{profile.namespace});
-            defer ctx.alloc.free(ns);
-            try command(ctx, .{ .id = profile.id, .namespace = "public" }, ns, true);
-            try std.testing.expect((try lifecycle.relationOwner(ctx, profile.namespace)) == null);
-            try command(ctx, profile, "CREATE TABLE usage_records(id UUID PRIMARY KEY,email TEXT,tenant_id TEXT,status TEXT)", true);
-            self.ids[position] = try lifecycle.owner(ctx, profile.namespace);
-            try fixture.waitForDonorRoute(ctx.alloc, ctx.io, ctx.metadata, ctx.data, self.ids[position]);
-            try lifecycle.waitEnforced(ctx, profile.namespace);
-            const first_status = if (profile.partial) "active" else "old-start";
-            const second_status = if (profile.partial) "active" else "old-finish";
-            const seed = try std.fmt.allocPrint(ctx.alloc, "INSERT INTO usage_records(id,email,tenant_id,status) VALUES('00000000-0000-0000-0000-000000000001','Owner@Example.com','tenant','{s}'),('00000000-0000-0000-0000-000000000002','other@example.com','tenant','{s}')", .{ first_status, second_status });
-            defer ctx.alloc.free(seed);
-            try command(ctx, profile, seed, false);
-            self.expected[position][0] = .{ .id = 1, .email = "Owner@Example.com", .status = first_status };
-            self.expected[position][1] = .{ .id = 2, .email = "other@example.com", .status = second_status };
-            self.counts[position] = 2;
-            try rows(ctx, profile, self.expected[position][0..self.counts[position]]);
-            const original = try corpus.get(profile.id);
-            try std.testing.expectEqual(@as(usize, 0), original.params.len);
-            var compiled = try local.sql_compiler.compile(ctx.alloc, original.sql, .{});
-            defer compiled.deinit();
-            const index_name = compiled.statement.catalog_ddl.schema_change.?.create_index.name;
-            if (profile.mutable) {
-                const before = try lifecycle.snapshotDefinition(ctx, profile.namespace);
-                defer ctx.alloc.free(before);
-                try failure(ctx, profile, original.sql, "42P17", .never, 400);
-                const after = try lifecycle.snapshotDefinition(ctx, profile.namespace);
-                defer ctx.alloc.free(after);
-                try std.testing.expectEqualStrings(before, after);
+fn Campaign(comptime nonunique_only: bool) type {
+    return struct {
+        ids: [profiles.len]u64 = undefined,
+        cuts: [profiles.len]?Cut = @splat(null),
+        expected: [profiles.len][6]Row = undefined,
+        counts: [profiles.len]usize = @splat(0),
+        pub fn beforeRestart(self: *@This(), ctx: *fixture.Context) !void {
+            var corpus = try local.sql_parity_fixtures.Corpus.init(ctx.alloc);
+            defer corpus.deinit();
+            for (profiles, 0..) |profile, position| {
+                if (nonunique_only and profile.unique) continue;
+                const ns = try std.fmt.allocPrint(ctx.alloc, "CREATE SCHEMA {s}", .{profile.namespace});
+                defer ctx.alloc.free(ns);
+                try command(ctx, .{ .id = profile.id, .namespace = "public" }, ns, true);
+                try std.testing.expect((try lifecycle.relationOwner(ctx, profile.namespace)) == null);
+                try command(ctx, profile, "CREATE TABLE usage_records(id UUID PRIMARY KEY,email TEXT,tenant_id TEXT,status TEXT)", true);
+                self.ids[position] = try lifecycle.owner(ctx, profile.namespace);
+                try fixture.waitForDonorRoute(ctx.alloc, ctx.io, ctx.metadata, ctx.data, self.ids[position]);
+                try lifecycle.waitEnforced(ctx, profile.namespace);
+                if (nonunique_only and std.mem.eql(u8, profile.id, "sql-0712")) {
+                    for ([_][]const u8{ "COPY usage_records TO STDOUT", "COPY (SELECT 1 AS n) TO STDOUT" }) |statement|
+                        try failure(ctx, profile, statement, "0A000", .never, 501);
+                }
+                const first_status = if (profile.partial) "active" else "old-start";
+                const second_status = if (profile.partial) "active" else "old-finish";
+                const seed = try std.fmt.allocPrint(ctx.alloc, "INSERT INTO usage_records(id,email,tenant_id,status) VALUES('00000000-0000-0000-0000-000000000001','Owner@Example.com','tenant','{s}'),('00000000-0000-0000-0000-000000000002','other@example.com','tenant','{s}')", .{ first_status, second_status });
+                defer ctx.alloc.free(seed);
+                try command(ctx, profile, seed, false);
+                self.expected[position][0] = .{ .id = 1, .email = "Owner@Example.com", .status = first_status };
+                self.expected[position][1] = .{ .id = 2, .email = "other@example.com", .status = second_status };
+                self.counts[position] = 2;
                 try rows(ctx, profile, self.expected[position][0..self.counts[position]]);
-                continue;
-            }
-            try command(ctx, profile, original.sql, true);
-            self.cuts[position] = try ready(ctx, profile, index_name, self.ids[position]);
-            try rows(ctx, profile, self.expected[position][0..self.counts[position]]);
-            try indexedRows(ctx, profile, index_name, self.expected[position][0..self.counts[position]]);
-            const collision_status = if (profile.partial) "active" else "new-start";
-            const collision = try std.fmt.allocPrint(ctx.alloc, "INSERT INTO usage_records(id,email,tenant_id,status) VALUES('00000000-0000-0000-0000-000000000003','owner@example.com','tenant','{s}')", .{collision_status});
-            defer ctx.alloc.free(collision);
-            const update = try std.fmt.allocPrint(ctx.alloc, "UPDATE usage_records SET email='OWNER@EXAMPLE.COM',status='{s}' WHERE id='00000000-0000-0000-0000-000000000002'", .{collision_status});
-            defer ctx.alloc.free(update);
-            if (profile.unique) {
-                try rejection(ctx, profile, collision);
+                const original = try corpus.get(profile.id);
+                try std.testing.expectEqual(@as(usize, 0), original.params.len);
+                var compiled = try local.sql_compiler.compile(ctx.alloc, original.sql, .{});
+                defer compiled.deinit();
+                const index_name = compiled.statement.catalog_ddl.schema_change.?.create_index.name;
+                if (profile.mutable) {
+                    const before = try lifecycle.snapshotDefinition(ctx, profile.namespace);
+                    defer ctx.alloc.free(before);
+                    try failure(ctx, profile, original.sql, "42P17", .never, 400);
+                    const after = try lifecycle.snapshotDefinition(ctx, profile.namespace);
+                    defer ctx.alloc.free(after);
+                    try std.testing.expectEqualStrings(before, after);
+                    try rows(ctx, profile, self.expected[position][0..self.counts[position]]);
+                    continue;
+                }
+                try command(ctx, profile, original.sql, true);
+                self.cuts[position] = try ready(ctx, profile, index_name, self.ids[position]);
                 try rows(ctx, profile, self.expected[position][0..self.counts[position]]);
-                try rejection(ctx, profile, update);
-            } else {
-                try command(ctx, profile, collision, false);
-                self.expected[position][2] = .{ .id = 3, .email = "owner@example.com", .status = collision_status };
-                self.counts[position] = 3;
-                try command(ctx, profile, update, false);
-                self.expected[position][1] = .{ .id = 2, .email = "OWNER@EXAMPLE.COM", .status = collision_status };
-            }
-            try rows(ctx, profile, self.expected[position][0..self.counts[position]]);
-            const nullable = if (profile.partial)
-                "INSERT INTO usage_records(id,email,tenant_id,status) VALUES('00000000-0000-0000-0000-000000000004','owner@example.com','tenant','inactive')"
-            else
-                "INSERT INTO usage_records(id,email,tenant_id,status) VALUES('00000000-0000-0000-0000-000000000004',NULL,'tenant',NULL)";
-            try command(ctx, profile, nullable, false);
-            self.expected[position][self.counts[position]] = .{ .id = 4, .email = if (profile.partial) "owner@example.com" else null, .status = if (profile.partial) "inactive" else null };
-            self.counts[position] += 1;
-            if (profile.partial) try rejection(ctx, profile, "UPDATE usage_records SET status='active' WHERE id='00000000-0000-0000-0000-000000000004'");
-            try rows(ctx, profile, self.expected[position][0..self.counts[position]]);
-            try indexedRows(ctx, profile, index_name, self.expected[position][0..self.counts[position]]);
-        }
-    }
-    pub fn afterRestart(self: *@This(), ctx: *fixture.Context) !void {
-        var corpus = try local.sql_parity_fixtures.Corpus.init(ctx.alloc);
-        defer corpus.deinit();
-        for (profiles, 0..) |profile, position| {
-            try std.testing.expectEqual(self.ids[position], try lifecycle.owner(ctx, profile.namespace));
-            try fixture.waitForDonorRoute(ctx.alloc, ctx.io, ctx.metadata, ctx.data, self.ids[position]);
-            const original = try corpus.get(profile.id);
-            var compiled = try local.sql_compiler.compile(ctx.alloc, original.sql, .{});
-            defer compiled.deinit();
-            if (self.cuts[position]) |cut| try std.testing.expectEqualDeep(cut, try ready(ctx, profile, compiled.statement.catalog_ddl.schema_change.?.create_index.name, self.ids[position]));
-            try rows(ctx, profile, self.expected[position][0..self.counts[position]]);
-            if (!profile.mutable) try indexedRows(ctx, profile, compiled.statement.catalog_ddl.schema_change.?.create_index.name, self.expected[position][0..self.counts[position]]);
-            try command(ctx, profile, "DELETE FROM usage_records WHERE id='00000000-0000-0000-0000-000000000001'", false);
-            const status = if (profile.partial) "active" else "new-start";
-            const insert = try std.fmt.allocPrint(ctx.alloc, "INSERT INTO usage_records(id,email,tenant_id,status) VALUES('00000000-0000-0000-0000-000000000006','owner@example.com','tenant','{s}')", .{status});
-            defer ctx.alloc.free(insert);
-            try command(ctx, profile, insert, false);
-            for (1..self.counts[position]) |i| self.expected[position][i - 1] = self.expected[position][i];
-            self.expected[position][self.counts[position] - 1] = .{ .id = 6, .email = "owner@example.com", .status = status };
-            try rows(ctx, profile, self.expected[position][0..self.counts[position]]);
-            if (profile.unique) {
-                const collision = try std.fmt.allocPrint(ctx.alloc, "INSERT INTO usage_records(id,email,tenant_id,status) VALUES('00000000-0000-0000-0000-000000000007','OWNER@EXAMPLE.COM','tenant','{s}')", .{status});
+                try indexedRows(ctx, profile, index_name, self.expected[position][0..self.counts[position]]);
+                const collision_status = if (profile.partial) "active" else "new-start";
+                const collision = try std.fmt.allocPrint(ctx.alloc, "INSERT INTO usage_records(id,email,tenant_id,status) VALUES('00000000-0000-0000-0000-000000000003','owner@example.com','tenant','{s}')", .{collision_status});
                 defer ctx.alloc.free(collision);
-                try rejection(ctx, profile, collision);
+                const update = try std.fmt.allocPrint(ctx.alloc, "UPDATE usage_records SET email='OWNER@EXAMPLE.COM',status='{s}' WHERE id='00000000-0000-0000-0000-000000000002'", .{collision_status});
+                defer ctx.alloc.free(update);
+                if (profile.unique) {
+                    try rejection(ctx, profile, collision);
+                    try rows(ctx, profile, self.expected[position][0..self.counts[position]]);
+                    try rejection(ctx, profile, update);
+                } else {
+                    try command(ctx, profile, collision, false);
+                    self.expected[position][2] = .{ .id = 3, .email = "owner@example.com", .status = collision_status };
+                    self.counts[position] = 3;
+                    try command(ctx, profile, update, false);
+                    self.expected[position][1] = .{ .id = 2, .email = "OWNER@EXAMPLE.COM", .status = collision_status };
+                }
                 try rows(ctx, profile, self.expected[position][0..self.counts[position]]);
+                const nullable = if (profile.partial)
+                    "INSERT INTO usage_records(id,email,tenant_id,status) VALUES('00000000-0000-0000-0000-000000000004','owner@example.com','tenant','inactive')"
+                else
+                    "INSERT INTO usage_records(id,email,tenant_id,status) VALUES('00000000-0000-0000-0000-000000000004',NULL,'tenant',NULL)";
+                try command(ctx, profile, nullable, false);
+                self.expected[position][self.counts[position]] = .{ .id = 4, .email = if (profile.partial) "owner@example.com" else null, .status = if (profile.partial) "inactive" else null };
+                self.counts[position] += 1;
+                if (profile.partial) try rejection(ctx, profile, "UPDATE usage_records SET status='active' WHERE id='00000000-0000-0000-0000-000000000004'");
+                try rows(ctx, profile, self.expected[position][0..self.counts[position]]);
+                try indexedRows(ctx, profile, index_name, self.expected[position][0..self.counts[position]]);
             }
-            if (!profile.mutable) try indexedRows(ctx, profile, compiled.statement.catalog_ddl.schema_change.?.create_index.name, self.expected[position][0..self.counts[position]]);
         }
-    }
-};
+        pub fn afterRestart(self: *@This(), ctx: *fixture.Context) !void {
+            var corpus = try local.sql_parity_fixtures.Corpus.init(ctx.alloc);
+            defer corpus.deinit();
+            for (profiles, 0..) |profile, position| {
+                if (nonunique_only and profile.unique) continue;
+                try std.testing.expectEqual(self.ids[position], try lifecycle.owner(ctx, profile.namespace));
+                try fixture.waitForDonorRoute(ctx.alloc, ctx.io, ctx.metadata, ctx.data, self.ids[position]);
+                const original = try corpus.get(profile.id);
+                var compiled = try local.sql_compiler.compile(ctx.alloc, original.sql, .{});
+                defer compiled.deinit();
+                if (self.cuts[position]) |cut| try std.testing.expectEqualDeep(cut, try ready(ctx, profile, compiled.statement.catalog_ddl.schema_change.?.create_index.name, self.ids[position]));
+                try rows(ctx, profile, self.expected[position][0..self.counts[position]]);
+                if (!profile.mutable) try indexedRows(ctx, profile, compiled.statement.catalog_ddl.schema_change.?.create_index.name, self.expected[position][0..self.counts[position]]);
+                try command(ctx, profile, "DELETE FROM usage_records WHERE id='00000000-0000-0000-0000-000000000001'", false);
+                const status = if (profile.partial) "active" else "new-start";
+                const insert = try std.fmt.allocPrint(ctx.alloc, "INSERT INTO usage_records(id,email,tenant_id,status) VALUES('00000000-0000-0000-0000-000000000006','owner@example.com','tenant','{s}')", .{status});
+                defer ctx.alloc.free(insert);
+                try command(ctx, profile, insert, false);
+                for (1..self.counts[position]) |i| self.expected[position][i - 1] = self.expected[position][i];
+                self.expected[position][self.counts[position] - 1] = .{ .id = 6, .email = "owner@example.com", .status = status };
+                try rows(ctx, profile, self.expected[position][0..self.counts[position]]);
+                if (profile.unique) {
+                    const collision = try std.fmt.allocPrint(ctx.alloc, "INSERT INTO usage_records(id,email,tenant_id,status) VALUES('00000000-0000-0000-0000-000000000007','OWNER@EXAMPLE.COM','tenant','{s}')", .{status});
+                    defer ctx.alloc.free(collision);
+                    try rejection(ctx, profile, collision);
+                    try rows(ctx, profile, self.expected[position][0..self.counts[position]]);
+                }
+                if (!profile.mutable) try indexedRows(ctx, profile, compiled.statement.catalog_ddl.schema_change.?.create_index.name, self.expected[position][0..self.counts[position]]);
+            }
+        }
+    };
+}
+
+test "mounted SQL original nonunique expression indexes preserve keys mutations and cold owners" {
+    // Original sql-0712, sql-0713, sql-0714, sql-0715, sql-0716,
+    // sql-0717 and sql-0718. Mutable declarations retain their PostgreSQL
+    // rejection; supported declarations require physical indexed reads.
+    try fixture.run(Campaign(true));
+}
 
 test "mounted SQL original expression indexes build maintain partial keys and recover owners" {
     // Exact originals sql-0017, sql-0712, sql-0713, sql-0714, sql-0715,
     // sql-0716, sql-0717, sql-0718, sql-0722, sql-0723, unchanged.
-    try fixture.run(Campaign);
+    try fixture.run(Campaign(false));
 }
 
 const UnsupportedOwnerCampaign = struct {

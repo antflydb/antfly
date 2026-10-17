@@ -2167,6 +2167,8 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "mounted SQL original nullability validates staged generations and preserves relaxation across restart",
             "mounted SQL original unique indexes enforce exact postimages across owner restart",
             "mounted SQL original expression indexes build maintain partial keys and recover owners",
+            "mounted SQL original nonunique expression indexes preserve keys mutations and cold owners",
+            "retained read page validates tagged cell extensions before serialization",
             "mounted SQL unsupported atomic index owner preserves definite nonadmission across restart",
             "SQL schema cache",
             "system catalog index prepare unsupported owner returns after one request",
@@ -2188,7 +2190,9 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "system catalog relation namespace transaction standby independently adopts publications resumes after restart and rejects forged effects",
         },
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
-        .max_rss = @as(usize, if (target.result.os.tag == .macos) 12 else 7) * 1024 * 1024 * 1024,
+        // This linked Debug owner peaked at 13,000,622,080 bytes locally;
+        // reserve at least 25% headroom without changing release/Linux bounds.
+        .max_rss = @as(usize, if (target.result.os.tag == .macos) (if (optimize == .debug) 16 else 12) else 7) * 1024 * 1024 * 1024,
     });
     const sql_primary_key_rewrite_run = addFilteredTestRunArtifactWithRuntimeFilters(b, sql_owner_lifecycle_tests, &.{"mounted SQL ADD PRIMARY KEY publishes only validated fresh generation"});
     sql_primary_key_rewrite_run.addArg("--require-no-skips");
@@ -2206,6 +2210,10 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     sql_expression_index_run.addArg("--require-no-skips");
     b.step("antfly-api-sql-expression-index-lifecycle-test", "Run original expression/covering/partial indexes through owner builds mutations and cold restart")
         .dependOn(&sql_expression_index_run.step);
+    const sql_nonunique_index_run = addFilteredTestRunArtifactWithRuntimeFilters(b, sql_owner_lifecycle_tests, &.{ "mounted SQL original nonunique expression indexes preserve keys mutations and cold owners", "retained read page validates tagged cell extensions before serialization" });
+    sql_nonunique_index_run.addArg("--require-no-skips");
+    b.step("antfly-api-sql-nonunique-index-lifecycle-test", "Run original nonunique expression indexes through native build, mutation maintenance and cold owner recovery")
+        .dependOn(&sql_nonunique_index_run.step);
     const sql_index_unsupported_owner_run = addFilteredTestRunArtifactWithRuntimeFilters(b, sql_owner_lifecycle_tests, &.{ "mounted SQL unsupported atomic index owner preserves definite nonadmission across restart", "system catalog index prepare unsupported owner returns after one request", "relational index publication unsupported owner has definite transport identity" });
     sql_index_unsupported_owner_run.addArg("--require-no-skips");
     b.step("antfly-api-sql-index-owner-admission-test", "Run definite unsupported-owner nonadmission across the real compiled metadata boundary and restart")

@@ -2,6 +2,9 @@
   "ledger_format": 1,
   "inventory_sha256": "c203a4dcf0094b75e1d3764e90beebddaf844a9ce604543c0a4dbc0ffe8ae173",
   "gates": {
+    "sql-nonunique-expression-index-native-debug": {"command":["zig","build","antfly-api-sql-nonunique-index-lifecycle-test","-Doptimize=Debug","-j1"],"cwd":"zig","timeout_seconds":1800},
+    "sql-expression-index-postgres": {"command":["uv","run","--offline","--no-project","--with","psycopg[binary]==3.3.6","python","-m","unittest","discover","-s","scripts","-p","test_sql_expression_index_lifecycle.py"],"cwd":".","timeout_seconds":180},
+    "sql-index-name-http-debug": {"command":["zig","build","public-api-parity-test","-Doptimize=Debug","-j1","-Dtest-filter=httpx SQL original index names and stream-only COPY"],"cwd":"zig","timeout_seconds":1800},
     "sql-copy-out-native-debug": {"command":["zig","build","antfly-api-sql-native-cells-test","-Doptimize=Debug","-j1"],"cwd":"zig","timeout_seconds":1800},
     "sql-copy-out-protocol-debug": {"command":["zig","build","sql-test","pgwire-test","-Doptimize=Debug","-j1","-Dtest-filter=COPY","-Dtest-filter=SQL exact original rejection contracts"],"cwd":"zig","timeout_seconds":1800},
     "sql-copy-out-postgres": {"command":["uv","run","--offline","--no-project","--with","psycopg[binary]==3.3.6","python","-m","unittest","discover","-s","scripts","-p","test_sql_copy_out.py"],"cwd":".","timeout_seconds":180},
@@ -7326,13 +7329,21 @@
     },
     {
       "id": "sql-0708",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "superseded",
+      "reason": "PostgreSQL rejects the unchanged qualified CREATE INDEX name with SQLSTATE 42601; the mounted HTTP compiler rejects it before catalog access. An unqualified index name on a qualified table remains legal, as does qualified DROP INDEX. This corrects an original accepted expectation rather than adding a SQL feature.",
+      "evidence": [
+        {"path":"zig/pkg/antfly/src/api/sql_name_resolution_test.zig","test":"httpx SQL original index names and stream-only COPY reject before catalog access","gate":"sql-index-name-http-debug"},
+        {"path":"zig/pkg/antfly/src/api/sql_name_resolution_test.zig","test":"httpx SQL original index names and stream-only COPY reject before catalog access","gate":"sql-expression-index-postgres"}
+      ]
     },
     {
       "id": "sql-0709",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "superseded",
+      "reason": "PostgreSQL rejects the unchanged qualified CREATE INDEX name with SQLSTATE 42601; the mounted HTTP compiler rejects it before catalog access. An unqualified index name on a qualified table remains legal, as does qualified DROP INDEX. This corrects an original accepted expectation rather than adding a SQL feature.",
+      "evidence": [
+        {"path":"zig/pkg/antfly/src/api/sql_name_resolution_test.zig","test":"httpx SQL original index names and stream-only COPY reject before catalog access","gate":"sql-index-name-http-debug"},
+        {"path":"zig/pkg/antfly/src/api/sql_name_resolution_test.zig","test":"httpx SQL original index names and stream-only COPY reject before catalog access","gate":"sql-expression-index-postgres"}
+      ]
     },
     {
       "id": "sql-0710",
@@ -7346,38 +7357,66 @@
     },
     {
       "id": "sql-0712",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "superseded",
+      "reason": "PostgreSQL rejects the unchanged concat/concat_ws index declaration with SQLSTATE 42P17 because its function is not immutable. Mounted native execution rejects it without changing rows or publishing the index, including cold-owner recovery. This corrects an original accepted expectation rather than counting an unsupported feature as implemented.",
+      "evidence": [
+        {"path":"zig/pkg/antfly/src/api/sql_expression_index_lifecycle_integration_test.zig","test":"mounted SQL original nonunique expression indexes preserve keys mutations and cold owners","gate":"sql-nonunique-expression-index-native-debug"},
+        {"path":"zig/pkg/antfly/src/api/sql_expression_index_lifecycle_integration_test.zig","test":"mounted SQL original nonunique expression indexes preserve keys mutations and cold owners","gate":"sql-expression-index-postgres"}
+      ]
     },
     {
       "id": "sql-0713",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "superseded",
+      "reason": "PostgreSQL rejects the unchanged concat/concat_ws index declaration with SQLSTATE 42P17 because its function is not immutable. Mounted native execution rejects it without changing rows or publishing the index, including cold-owner recovery. This corrects an original accepted expectation rather than counting an unsupported feature as implemented.",
+      "evidence": [
+        {"path":"zig/pkg/antfly/src/api/sql_expression_index_lifecycle_integration_test.zig","test":"mounted SQL original nonunique expression indexes preserve keys mutations and cold owners","gate":"sql-nonunique-expression-index-native-debug"},
+        {"path":"zig/pkg/antfly/src/api/sql_expression_index_lifecycle_integration_test.zig","test":"mounted SQL original nonunique expression indexes preserve keys mutations and cold owners","gate":"sql-expression-index-postgres"}
+      ]
     },
     {
       "id": "sql-0714",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "The unchanged expression-index DDL builds through mounted native metadata and storage. Named full-tuple physical index reads carry production range proofs and verify complete matching IDs before and after duplicate/NULL writes, key updates, deletion, reinsertion and cold restart. Full ordered SQL postimages independently match PostgreSQL. This proves the nonunique native-owner contract, not automatic SQL index selection or distributed UNIQUE activation.",
+      "evidence": [
+        {"path":"zig/pkg/antfly/src/api/sql_expression_index_lifecycle_integration_test.zig","test":"mounted SQL original nonunique expression indexes preserve keys mutations and cold owners","gate":"sql-nonunique-expression-index-native-debug"},
+        {"path":"zig/pkg/antfly/src/api/sql_expression_index_lifecycle_integration_test.zig","test":"mounted SQL original nonunique expression indexes preserve keys mutations and cold owners","gate":"sql-expression-index-postgres"}
+      ]
     },
     {
       "id": "sql-0715",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "The unchanged expression-index DDL builds through mounted native metadata and storage. Named full-tuple physical index reads carry production range proofs and verify complete matching IDs before and after duplicate/NULL writes, key updates, deletion, reinsertion and cold restart. Full ordered SQL postimages independently match PostgreSQL. This proves the nonunique native-owner contract, not automatic SQL index selection or distributed UNIQUE activation.",
+      "evidence": [
+        {"path":"zig/pkg/antfly/src/api/sql_expression_index_lifecycle_integration_test.zig","test":"mounted SQL original nonunique expression indexes preserve keys mutations and cold owners","gate":"sql-nonunique-expression-index-native-debug"},
+        {"path":"zig/pkg/antfly/src/api/sql_expression_index_lifecycle_integration_test.zig","test":"mounted SQL original nonunique expression indexes preserve keys mutations and cold owners","gate":"sql-expression-index-postgres"}
+      ]
     },
     {
       "id": "sql-0716",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "The unchanged expression-index DDL builds through mounted native metadata and storage. Named full-tuple physical index reads carry production range proofs and verify complete matching IDs before and after duplicate/NULL writes, key updates, deletion, reinsertion and cold restart. Full ordered SQL postimages independently match PostgreSQL. This proves the nonunique native-owner contract, not automatic SQL index selection or distributed UNIQUE activation.",
+      "evidence": [
+        {"path":"zig/pkg/antfly/src/api/sql_expression_index_lifecycle_integration_test.zig","test":"mounted SQL original nonunique expression indexes preserve keys mutations and cold owners","gate":"sql-nonunique-expression-index-native-debug"},
+        {"path":"zig/pkg/antfly/src/api/sql_expression_index_lifecycle_integration_test.zig","test":"mounted SQL original nonunique expression indexes preserve keys mutations and cold owners","gate":"sql-expression-index-postgres"}
+      ]
     },
     {
       "id": "sql-0717",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "The unchanged expression-index DDL builds through mounted native metadata and storage. Named full-tuple physical index reads carry production range proofs and verify complete matching IDs before and after duplicate/NULL writes, key updates, deletion, reinsertion and cold restart. Full ordered SQL postimages independently match PostgreSQL. This proves the nonunique native-owner contract, not automatic SQL index selection or distributed UNIQUE activation.",
+      "evidence": [
+        {"path":"zig/pkg/antfly/src/api/sql_expression_index_lifecycle_integration_test.zig","test":"mounted SQL original nonunique expression indexes preserve keys mutations and cold owners","gate":"sql-nonunique-expression-index-native-debug"},
+        {"path":"zig/pkg/antfly/src/api/sql_expression_index_lifecycle_integration_test.zig","test":"mounted SQL original nonunique expression indexes preserve keys mutations and cold owners","gate":"sql-expression-index-postgres"}
+      ]
     },
     {
       "id": "sql-0718",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "The unchanged expression-index DDL builds through mounted native metadata and storage. Named full-tuple physical index reads carry production range proofs and verify complete matching IDs before and after duplicate/NULL writes, key updates, deletion, reinsertion and cold restart. Full ordered SQL postimages independently match PostgreSQL. This proves the nonunique native-owner contract, not automatic SQL index selection or distributed UNIQUE activation.",
+      "evidence": [
+        {"path":"zig/pkg/antfly/src/api/sql_expression_index_lifecycle_integration_test.zig","test":"mounted SQL original nonunique expression indexes preserve keys mutations and cold owners","gate":"sql-nonunique-expression-index-native-debug"},
+        {"path":"zig/pkg/antfly/src/api/sql_expression_index_lifecycle_integration_test.zig","test":"mounted SQL original nonunique expression indexes preserve keys mutations and cold owners","gate":"sql-expression-index-postgres"}
+      ]
     },
     {
       "id": "sql-0719",

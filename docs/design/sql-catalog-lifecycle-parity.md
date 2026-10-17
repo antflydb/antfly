@@ -1,7 +1,7 @@
 # SQL catalog lifecycle and original-case qualification
 
 Status: draft follow-up PR #1061 to merged PR #1048, merged with `origin/main`
-at `d4d3a4a6ea` (2026-10-17). Earlier implementation and
+at `e37f9d3fd9` (2026-10-17). Earlier implementation and
 qualification checkpoints are retained below with their exact scope.
 This is an implementation and qualification backlog, not
 a completion claim. PostgreSQL is the SQL standard and independent test oracle.
@@ -9,16 +9,40 @@ a completion claim. PostgreSQL is the SQL standard and independent test oracle.
 ## Baseline and priorities
 
 The [original inventory](sql/parity-inventory.md) remains authoritative:
-535 implemented / 131 rejected / 121 superseded / 799 unresolved. Counts below
+540 implemented / 131 rejected / 125 superseded / 790 unresolved. Counts below
 are unresolved family pools, not promises that one implementation closes them.
 
 | Priority | Pool | Cases | Shared delivery boundary |
 | --- | --- | ---: | --- |
-| 1 | DDL, catalog and sessions | 300 | Public relation ownership, schema/index activation and retirement, session lifecycle and recovery |
+| 1 | DDL, catalog and sessions | 291 | Public relation ownership, schema/index activation and retirement, session lifecycle and recovery |
 | 2 | Source/joined mutations and MERGE/recursion | 126 | Captured source ownership, bounded selection, atomic commit and distributed failure evidence |
 | 3 | Read and query | 113 | Faithful typed fixtures, binding/correlation, endpoint results and diagnostics |
 | 4 | Document writes | 70 | Document-specific schema/index profiles, complete postimages and integrity admission |
 | 5 | Historically unsupported writes | 92 | Individual PostgreSQL contract review, implementations or proven required rejections |
+
+## Nonunique expression-index qualification (2026-10-17)
+
+Unchanged originals `sql-0714` through `sql-0718` now have mounted native
+CREATE INDEX, complete mutation postimages, named physical index membership
+and cold-restart evidence, independently checked against PostgreSQL 18.6.
+The named reads activate range tracking through the production writer and
+require full-tuple membership proofs; they cannot silently fall back to a
+table scan. Only definite pre-view read-admission failures receive bounded
+retries. Physical key tie order is not confused with SQL's logical ORDER BY.
+
+Originals `sql-0712` and `sql-0713` are superseded, not implemented: PostgreSQL
+rejects their nonimmutable concat/concat_ws index expressions with `42P17`.
+Originals `sql-0708` and `sql-0709` are likewise superseded: qualified CREATE
+INDEX names are syntax errors (`42601`), unlike qualified target tables and
+DROP INDEX names. Native checks preserve these distinctions and reject before
+catalog mutation. These four corrections are not four newly delivered features.
+
+EXPLAIN now identifies snapshot-local index selection and labels declarations
+as declarations, not selected or READY indexes. The physical probe proves
+index contents and maintenance, not the automatic SQL planner's access choice.
+The recorded inventory gates reproduce the native Debug lifecycle, HTTP
+boundary and independent PostgreSQL checks. Distributed UNIQUE activation,
+CONCURRENTLY protocols and the remaining catalog/DDL pool are still open.
 
 ## COPY output delivery (2026-10-17)
 

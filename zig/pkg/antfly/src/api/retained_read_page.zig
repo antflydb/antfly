@@ -76,13 +76,46 @@ const RowPlan = struct {
         const mapping = self.ordinals orelse return self.input.cell(names[ordinal]);
         const source = mapping[ordinal] orelse return .{};
         const result = try self.input.typed_cells.?.at(source);
+        result.validateTemporal() catch return error.InvalidRetainedReadPage;
         if ((!try self.present(names, ordinal) and !result.sql_null) or
-            (result.sql_null and (result.value != .null or result.array != null or result.numeric != null)) or
-            (result.array != null and (result.value != .null or result.numeric != null or result.patterns != null)) or
-            (result.numeric != null and (result.value != .null or result.patterns != null))) return error.InvalidRetainedReadPage;
+            result.patterns() != null or
+            (result.sql_null and (result.value != .null or result.array != null or result.numeric != null or result.extension != null)) or
+            (result.array != null and (result.value != .null or result.numeric != null or result.extension != null)) or
+            (result.numeric != null and (result.value != .null or result.extension != null))) return error.InvalidRetainedReadPage;
         return result;
     }
 };
+
+test "retained read page validates tagged cell extensions before serialization" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const layout = try catalog.Row.TypedLayout.init(arena.allocator(), &.{"v"});
+    const instant: sources.sql_temporal_value.Value = .{ .timestamp = .{ .micros = 42 } };
+    var cells = [_]Datum{Datum.typedTemporal(&instant)};
+    const row: View.Row = .{ .id = "row", .version = 1, .schema_version = 1, .value = .null, .typed_cells = .{ .layout = layout, .values = &cells } };
+    const plan: RowPlan = .{ .input = &row, .ordinals = &.{0} };
+    try std.testing.expectEqual(@as(i64, 42), (try plan.value(&.{"v"}, 0)).temporal().?.timestamp.micros);
+    var extension_bytes: [64]u8 align(16) = undefined;
+    for ([_]Datum{
+        .{ .extension = &instant },
+        .{ .extension_kind = .temporal },
+        .{ .extension_kind = .temporal, .extension = &instant, .sql_null = true },
+        .{ .extension_kind = .patterns, .extension = &extension_bytes, .sql_null = false },
+        .{ .extension_kind = .temporal, .extension = &instant, .sql_null = false, .value = .{ .integer = 1 } },
+        .{ .numeric = @ptrCast(&extension_bytes), .sql_null = false, .value = .{ .integer = 1 } },
+    }) |invalid| {
+        cells[0] = invalid;
+        try std.testing.expectError(error.InvalidRetainedReadPage, plan.value(&.{"v"}, 0));
+    }
+    cells[0] = Datum.typedTemporal(&instant);
+    const encoded = try encodeVersion(std.testing.allocator, 7, &.{row}, null, .v2);
+    defer std.testing.allocator.free(encoded);
+    var decoded = try decode(std.testing.allocator, encoded, 7, 1, 1);
+    defer decoded.deinit();
+    const restored = try decoded.rows[0].cell("v");
+    try std.testing.expect(!restored.sql_null);
+    try std.testing.expectEqual(@as(i64, 42), restored.temporal().?.timestamp.micros);
+}
 
 fn encodeBounded(alloc: A, output_budget: *sources.sql_memory_budget, sequence: u64, rows: []const View.Row, after: ?[]const u8, version: spill.ColumnarVersion) ![]u8 {
     if (rows.len > 4096) return error.InvalidRetainedReadPage;

@@ -24,6 +24,47 @@ const Handler = @import("httpx_handler.zig").AntflyApiHandler;
 const httpx = @import("httpx");
 const wire = @import("antfly_metadata_openapi").types;
 
+test "httpx SQL original index names and stream-only COPY reject before catalog access" {
+    const Guard = struct {
+        calls: usize = 0,
+        fn status(_: *anyopaque) !@import("../metadata/api.zig").MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{} };
+        }
+        fn catalogCall(raw: *anyopaque, _: std.mem.Allocator, _: local.api_operation.RequestContext, _: @import("../system_catalog/server_call.zig").Call) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            return error.UnexpectedBackendRead;
+        }
+    };
+    const a = std.testing.allocator;
+    var guard: Guard = .{};
+    var server = Server.init(a, .{}, .{ .ptr = &guard, .vtable = &.{ .status = Guard.status, .system_catalog = Guard.catalogCall, .supports_query_definitions = true } }, null, null);
+    defer server.deinit();
+    var handler: Handler = .{ .api_server = &server };
+    for ([_][]const u8{ "sql-0708", "sql-0709" }) |id| try @import("sql_parity_reference.zig").expectRejection(a, &handler, id, "42601");
+    for ([_][]const u8{ "COPY usage_records TO STDOUT", "COPY (SELECT 1 AS n) TO STDOUT" }) |statement| {
+        const body = try std.json.Stringify.valueAlloc(a, .{ .statement = statement }, .{});
+        defer a.free(body);
+        var request = try httpx.Request.init(a, .POST, "http://127.0.0.1/db/v1/sql");
+        defer request.deinit();
+        request.body = body;
+        var context: httpx.Context = .init(a, std.testing.io, &request);
+        defer context.deinit();
+        var response = try handler.executeSQL(&context);
+        defer response.deinit();
+        try std.testing.expectEqual(@as(u16, 501), response.status.code);
+        const diagnostic = try std.json.parseFromSlice(wire.SQLDiagnostic, a, response.body.?, .{});
+        defer diagnostic.deinit();
+        try std.testing.expectEqualStrings("0A000", diagnostic.value.code);
+    }
+    try std.testing.expectEqual(@as(usize, 0), guard.calls);
+    // Qualified table ownership remains legal; only the new index name must
+    // be unqualified. DROP INDEX may still address a qualified existing index.
+    var control = try local.sql_compiler.compile(a, "CREATE INDEX status_idx ON public.usage_records(status)", .{});
+    defer control.deinit();
+    try std.testing.expectEqualStrings("public", control.statement.catalog_ddl.index_table.?.namespace.?);
+}
+
 test "httpx SQL original PostgreSQL name resolution rejects aliases before data reads" {
     try run(&.{
         "sql-1228", "sql-1233", "sql-1234", "sql-1235",
