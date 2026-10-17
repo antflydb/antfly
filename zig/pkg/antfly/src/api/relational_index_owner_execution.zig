@@ -1874,7 +1874,7 @@ const TestDriver = struct {
             self.inventory_finished = true;
             const address = try local.storage_db_relational_integrity_contract.Address.init(expected.generation, "logical\x00\xff\x80");
             const position: local.storage_db_receipt_position.Native = .{ .namespace = binding.fence.namespace, .sequence = 6 };
-            return .{ .root_generation = self.root_generation, .outcome = try parsed(native.BuildResponse, alloc, .{ .inventory = .{ .binding = binding, .record = .{ .expected = expected, .fields = .{ .phase = .ready, .rows = 1, .inventory_xor = expected.inventory_xor, .claim_rows = 1, .claim_xor = expected.inventory_xor, .claim_cursor = address.claimKey(), .chain = @splat(7), .cursor = jobs.private_claims.inventoryKey(address) }, .position = position, .page_digest = @splat(8) }, .position = position, .duplicate = false } }) };
+            return .{ .root_generation = self.root_generation, .outcome = try parsed(native.BuildResponse, alloc, .{ .inventory = .{ .binding = binding, .record = .{ .expected = expected, .fields = .{ .phase = .ready, .rows = 1, .inventory_xor = expected.inventory_xor, .claim_rows = 1, .claim_xor = expected.inventory_xor, .claim_cursor = address.claimKey(), .chain = @splat(7), .cursor = jobs.private_claims.inventoryKey(address) }, .position = .{ .native = position }, .page_digest = @splat(8) }, .position = position, .duplicate = false } }) };
         }
         self.build_pages += 1;
         if (self.build_failed) return .{ .root_generation = self.root_generation, .outcome = try parsed(native.BuildResponse, alloc, .{ .complete = .{

@@ -8424,12 +8424,18 @@ pub const DB = struct {
         return self.applyCommittedRaftIndexEffect(prepared, owner_group, entry);
     }
 
+    pub fn applyCommittedRaftIndexInventory(self: *DB, prepared: *@import("relational_index_owner_control.zig").PreparedInventoryValidation, owner_group: u64, entry: OrderedApplyReceipt) !void {
+        if (prepared.batch.command.binding.authority != .raft) return error.InvalidControlReceiptPosition;
+        return self.applyCommittedRaftIndexEffect(prepared, owner_group, entry);
+    }
+
     fn applyCommittedRaftIndexEffect(self: *DB, prepared: anytype, owner_group: u64, entry: OrderedApplyReceipt) !void {
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
         if (self.local_execution.restore_staging_required.load(.acquire)) return error.RestoreStagingScopeChanged;
-        try prepared.command.validate();
-        if (owner_group == 0 or owner_group != prepared.command.binding.fence.owner_group_id) return error.PrivateIndexOwnerJobChanged;
-        if (!prepared.command.binding.fence.namespace.eql(self.core.identity_namespace)) return error.IdentityNamespaceMismatch;
+        const command = if (comptime @hasField(@typeInfo(@TypeOf(prepared)).pointer.child, "command")) prepared.command else prepared.batch.command;
+        try command.validate();
+        if (owner_group == 0 or owner_group != command.binding.fence.owner_group_id) return error.PrivateIndexOwnerJobChanged;
+        if (!command.binding.fence.namespace.eql(self.core.identity_namespace)) return error.IdentityNamespaceMismatch;
         // Until the ordered standby envelope carries this control, fail closed
         // for configured mirrors instead of committing an unmirrored effect.
         var replication_mutation = self.acquireReplicationMutationShared();
@@ -8832,7 +8838,8 @@ pub const DB = struct {
             defer read.abort();
             const record = (try claims.InventoryValidation.load(alloc, &read, binding)) orelse return error.InvalidPrivateIndexClaimInventory;
             if (!std.mem.eql(u8, &try record.expected.digest(), &try expected.digest())) return error.PrivateIndexOwnerJobChanged;
-            var result: native_index_control.InventoryOutcome = .{ .binding = binding, .record = record, .position = record.position, .duplicate = true };
+            if (record.position != .native) return error.InvalidControlReceiptPosition;
+            var result: native_index_control.InventoryOutcome = .{ .binding = binding, .record = record, .position = record.position.native, .duplicate = true };
             if (try durable_outbox_store.hasPendingTxn(&read)) {
                 result.replication_pending = true;
                 result.error_name = "ReplicationOutboxPending";

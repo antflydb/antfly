@@ -52,8 +52,12 @@ pub const TargetExpectation = struct {
             (self.rows != 0 and std.mem.allEqual(u8, &self.provenance, 0))) return error.InvalidPrivateIndexClaimInventory;
     }
     pub fn requireBinding(self: TargetExpectation, binding: jobs.Binding) !void {
+        if (binding.authority != .native) return error.PrivateIndexOwnerJobChanged;
+        return self.requireOwnerBinding(binding);
+    }
+    pub fn requireOwnerBinding(self: TargetExpectation, binding: jobs.Binding) !void {
         try self.validate();
-        if (binding.authority != .native or binding.phase != .reserved or !std.mem.eql(u8, &self.binding_digest, &try bindingDigest(binding))) return error.PrivateIndexOwnerJobChanged;
+        if (binding.phase != .reserved or !std.mem.eql(u8, &self.binding_digest, &try bindingDigest(binding))) return error.PrivateIndexOwnerJobChanged;
     }
     pub fn digest(self: TargetExpectation) !integrity.Digest {
         try self.validate();
@@ -948,6 +952,38 @@ test "relational index system compact claim cuts preserve authority and committe
     }
 }
 
+test "relational index system inventory authority codecs preserve native v2 and exact Raft cuts" {
+    const a = std.testing.allocator;
+    const expected: TargetExpectation = .{ .metadata_incarnation = @splat('1'), .binding_digest = @splat(2), .generation = @splat(3), .completion_revision = 1, .source_consumption_digest = @splat(4), .source_progress_digest = @splat(5), .table_name_digest = @splat(6), .rows = 0, .inventory_xor = @splat(0), .provenance = @splat(0) };
+    const native: Native = .{ .namespace = .{ .table_id = std.math.maxInt(u64), .shard_id = 2, .range_id = 3 }, .sequence = std.math.maxInt(u64) - 1 };
+    const fields = try InventoryValidation.initial(expected);
+    var record: InventoryValidation.Record = .{ .expected = expected, .fields = fields, .position = .{ .native = native }, .page_digest = @splat(7) };
+    const old_json = try std.json.Stringify.valueAlloc(a, .{ .expected = expected, .fields = fields, .position = native, .page_digest = record.page_digest }, .{});
+    defer a.free(old_json);
+    const old_bytes = try std.mem.concat(a, u8, &.{ "AICV\x02\x00\x00\x00", old_json, &hash(old_json) });
+    defer a.free(old_bytes);
+    const native_bytes = try record.encode(a);
+    defer a.free(native_bytes);
+    try std.testing.expectEqualSlices(u8, old_bytes, native_bytes);
+    try std.testing.expectEqualDeep(record, try InventoryValidation.Record.decode(a, native_bytes));
+    record.position = .{ .raft = .{ .term = 3, .index = std.math.maxInt(u64) - 1 } };
+    const raft_bytes = try record.encode(a);
+    defer a.free(raft_bytes);
+    try std.testing.expectEqualSlices(u8, "AICV\x03\x00\x00\x00", raft_bytes[0..8]);
+    try std.testing.expectEqualDeep(record, try InventoryValidation.Record.decode(a, raft_bytes));
+    const mismatched = try a.dupe(u8, raft_bytes);
+    defer a.free(mismatched);
+    mismatched[4] = 2;
+    try std.testing.expectError(error.InvalidPrivateIndexClaimInventory, InventoryValidation.Record.decode(a, mismatched));
+    const Allocation = struct {
+        fn run(backing: Allocator, bytes: []const u8) !void {
+            _ = try InventoryValidation.Record.decode(backing, bytes);
+        }
+    };
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(a, Allocation.run, .{native_bytes});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(a, Allocation.run, .{raft_bytes});
+}
+
 const Provenance = struct {
     binding_digest: integrity.Digest,
     reserved: u64,
@@ -1169,8 +1205,61 @@ pub const InventoryValidation = struct {
     pub const Record = struct {
         expected: TargetExpectation,
         fields: Fields,
-        position: Native,
+        position: Position,
         page_digest: integrity.Digest,
+        const WirePosition = struct {
+            namespace: ?@import("doc_identity_namespace.zig").Namespace = null,
+            sequence: ?u64 = null,
+            raft: ?@FieldType(Position, "raft") = null,
+            pub fn nativeJsonSkipField(self: @This(), comptime name: []const u8) bool {
+                return @field(self, name) == null;
+            }
+            pub fn jsonParse(a: Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+                var exact = options;
+                exact.parse_numbers = false;
+                const value = try std.json.innerParse(std.json.Value, a, source, exact);
+                if (value != .object) return error.UnexpectedToken;
+                exact.ignore_unknown_fields = false;
+                if (value.object.contains("namespace") and value.object.count() == 2) {
+                    var parsed = try std.json.parseFromValue(Native, a, value, exact);
+                    defer parsed.deinit();
+                    return .{ .namespace = parsed.value.namespace, .sequence = parsed.value.sequence };
+                }
+                if (!value.object.contains("raft") or value.object.count() != 1) return error.UnexpectedToken;
+                var parsed = try std.json.parseFromValue(Position, a, value, exact);
+                defer parsed.deinit();
+                if (parsed.value != .raft) return error.UnexpectedToken;
+                return .{ .raft = parsed.value.raft };
+            }
+        };
+        const Wire = struct { expected: TargetExpectation, fields: Fields, position: WirePosition, page_digest: integrity.Digest };
+        /// Native v2 bytes and native control replies retain their original
+        /// shape. The Raft form is explicit, not a synthetic namespace clock.
+        pub fn nativeJsonProjection(self: Record) Wire {
+            return .{ .expected = self.expected, .fields = self.fields, .position = switch (self.position) {
+                .native => |cut| .{ .namespace = cut.namespace, .sequence = cut.sequence },
+                .raft => |cut| .{ .raft = cut },
+            }, .page_digest = self.page_digest };
+        }
+        pub fn jsonStringify(self: Record, stream: anytype) @TypeOf(stream.*).Error!void {
+            try stream.beginObject();
+            try stream.objectField("expected");
+            try stream.write(self.expected);
+            try stream.objectField("fields");
+            try stream.write(self.fields);
+            try stream.objectField("position");
+            switch (self.position) {
+                .native => |cut| try stream.write(cut),
+                .raft => try stream.write(self.position),
+            }
+            try stream.objectField("page_digest");
+            try stream.write(self.page_digest);
+            try stream.endObject();
+        }
+        pub fn jsonParse(a: Allocator, source: anytype, options: std.json.ParseOptions) !Record {
+            const wire = try std.json.innerParse(Wire, a, source, options);
+            return .{ .expected = wire.expected, .fields = wire.fields, .position = if (wire.position.raft) |cut| .{ .raft = cut } else .{ .native = .{ .namespace = wire.position.namespace.?, .sequence = wire.position.sequence.? } }, .page_digest = wire.page_digest };
+        }
         pub fn validate(self: Record) !void {
             try self.fields.validate(self.expected);
             try self.position.validate();
@@ -1181,14 +1270,15 @@ pub const InventoryValidation = struct {
             const json = try std.json.Stringify.valueAlloc(alloc, self, .{});
             defer alloc.free(json);
             if (json.len > max_record_bytes - 40) return error.InvalidPrivateIndexClaimInventory;
-            return std.mem.concat(alloc, u8, &.{ "AICV\x02\x00\x00\x00", json, &hash(json) });
+            return std.mem.concat(alloc, u8, &.{ if (self.position == .native) "AICV\x02\x00\x00\x00" else "AICV\x03\x00\x00\x00", json, &hash(json) });
         }
         pub fn decode(alloc: Allocator, bytes: []const u8) !Record {
-            if (bytes.len <= 40 or bytes.len > max_record_bytes or !std.mem.eql(u8, bytes[0..8], "AICV\x02\x00\x00\x00") or
+            if (bytes.len <= 40 or bytes.len > max_record_bytes or (!std.mem.eql(u8, bytes[0..8], "AICV\x02\x00\x00\x00") and !std.mem.eql(u8, bytes[0..8], "AICV\x03\x00\x00\x00")) or
                 !std.mem.eql(u8, bytes[bytes.len - 32 ..], &hash(bytes[8 .. bytes.len - 32]))) return error.InvalidPrivateIndexClaimInventory;
             var parsed = try std.json.parseFromSlice(Record, alloc, bytes[8 .. bytes.len - 32], .{ .ignore_unknown_fields = false, .max_value_len = 128 });
             defer parsed.deinit();
             try parsed.value.validate();
+            if ((bytes[4] == 2) != (parsed.value.position == .native)) return error.InvalidPrivateIndexClaimInventory;
             const canonical = try parsed.value.encode(alloc);
             defer alloc.free(canonical);
             if (!std.mem.eql(u8, bytes, canonical)) return error.InvalidPrivateIndexClaimInventory;
@@ -1205,7 +1295,7 @@ pub const InventoryValidation = struct {
         finish: bool,
         next: Fields,
         pub fn validate(self: Command) !void {
-            try self.expected.requireBinding(self.binding);
+            try self.expected.requireOwnerBinding(self.binding);
             try self.next.validate(self.expected);
             if ((self.from != .scanning and self.from != .claims) or self.visited > max_claims or self.scanned > self.visited or
                 (self.from == .scanning and (self.visited != self.scanned or self.next.rows < self.scanned)) or
@@ -1290,7 +1380,8 @@ pub const InventoryValidation = struct {
             const parsed = try integrity.parseKey(item.key);
             if (parsed.kind != .claim or item.value.len > integrity.max_record_bytes) return error.InvalidPrivateIndexClaimInventory;
             const own = std.mem.eql(u8, &parsed.address.generation, &expected.generation);
-            const cost = item.value.len + integrity.key_len + (if (own) key_len + inventory_value_len else @as(usize, 0));
+            const own_inventory_len: usize = if (binding.authority == .native) inventory_value_len else max_inventory_value_len;
+            const cost = item.value.len + integrity.key_len + (if (own) key_len + own_inventory_len else @as(usize, 0));
             // Existing unrelated claims can reach the established record
             // limit. Permit one indivisible foreign record, not a new smaller
             // storage-format limit imposed by this audit's byte quantum.
@@ -1319,7 +1410,7 @@ pub const InventoryValidation = struct {
                     for (&next.claim_xor, member) |*byte, contribution| byte.* ^= contribution;
                     if (value.state == .live and value.schema_version == binding.physical_candidate.schema_version and std.mem.eql(u8, &hash(value.parent_table), &expected.table_name_digest)) {
                         if (try optional(txn, &inventoryKey(parsed.address))) |inventory| {
-                            if (inventory.len == inventory_value_len) {
+                            if (inventory.len == own_inventory_len) {
                                 chain.update(inventory);
                                 valid = if (decodeInventory(&inventoryKey(parsed.address), inventory, provenance, value_hash)) |_| true else |_| false;
                             }
@@ -1362,7 +1453,7 @@ pub const InventoryValidation = struct {
         return .{ .next = next, .scanned = scanned, .visited = visited };
     }
     fn requireLocal(txn: anytype, binding: jobs.Binding, expected: TargetExpectation) !Provenance {
-        try expected.requireBinding(binding);
+        try expected.requireOwnerBinding(binding);
         try jobs.requireReserved(txn, binding);
         const allocation = try requireRegistered(txn, binding);
         if (!std.mem.eql(u8, &allocation.generation, &expected.generation)) return error.PrivateIndexOwnerJobChanged;
@@ -1382,12 +1473,20 @@ pub const InventoryValidation = struct {
     pub fn load(alloc: Allocator, txn: anytype, binding: jobs.Binding) !?Record {
         const bytes = (try optional(txn, &key(binding))) orelse return null;
         const record = try Record.decode(alloc, bytes);
-        try record.expected.requireBinding(binding);
+        try record.expected.requireOwnerBinding(binding);
         const provenance = try Provenance.init(txn, binding);
-        if (!record.position.namespace.eql(binding.fence.namespace) or record.position.sequence <= provenance.reserved or record.position.sequence > provenance.maximum) return error.InvalidPrivateIndexClaimInventory;
+        try record.position.requireNamespace(binding.fence.namespace);
+        if ((record.position == .native) != (binding.authority == .native) or positionNumber(record.position) <= provenance.reserved or
+            positionNumber(record.position) > provenance.maximum or record.position.term() < provenance.reserved_cut.term() or
+            record.position.term() > provenance.maximum_cut.term() or (positionNumber(record.position) == provenance.maximum and record.position.term() != provenance.maximum_cut.term())) return error.InvalidPrivateIndexClaimInventory;
         return record;
     }
     pub fn requireReady(alloc: Allocator, txn: anytype, binding: jobs.Binding, expected: TargetExpectation) !struct { digest: integrity.Digest, source_members: u64, position: Native } {
+        if (binding.authority != .native) return error.InvalidControlReceiptPosition;
+        const ready = try requireReadyAt(alloc, txn, binding, expected);
+        return .{ .digest = ready.digest, .source_members = ready.source_members, .position = ready.position.native };
+    }
+    pub fn requireReadyAt(alloc: Allocator, txn: anytype, binding: jobs.Binding, expected: TargetExpectation) !struct { digest: integrity.Digest, source_members: u64, position: Position } {
         _ = try requireLocal(txn, binding, expected);
         const record = (try load(alloc, txn, binding)) orelse return error.PrivateIndexTargetValidationRequired;
         if (record.fields.phase != .ready or !std.mem.eql(u8, &try record.expected.digest(), &try expected.digest())) return error.PrivateIndexTargetValidationRequired;
@@ -1448,6 +1547,7 @@ pub const InventoryValidation = struct {
         digest.final(&page_digest);
         return .{ .root_incarnation = root_incarnation, .expectation_digest = expectation_digest, .canonical_digest = canonical_digest, .fields = page.command.next, .page_digest = page_digest };
     }
+    pub const Outcome = struct { record: Record, duplicate: bool };
     pub const Prepared = struct {
         command: Command,
         context: @import("../../api/operation.zig").RequestContext,
@@ -1500,11 +1600,14 @@ pub const InventoryValidation = struct {
                     if (replay_command) |command| if (scanned >= command.scanned) break;
                     try context.ensureActive();
                     const address = try addressFromInventory(item.key);
-                    if (item.value.len != inventory_value_len) return error.InvalidPrivateIndexClaimInventory;
-                    const inventory = item.value[0..inventory_value_len].*;
+                    const inventory_len: usize = if (binding.authority == .native) inventory_value_len else max_inventory_value_len;
+                    if (item.value.len != inventory_len) return error.InvalidPrivateIndexClaimInventory;
+                    var inventory_storage: [max_inventory_value_len]u8 = undefined;
+                    @memcpy(inventory_storage[0..inventory_len], item.value);
+                    const inventory = inventory_storage[0..inventory_len];
                     const raw = (try optional(txn, &address.claimKey())) orelse return error.InvalidPrivateIndexClaimInventory;
                     if (raw.len > integrity.max_record_bytes) return error.InvalidPrivateIndexClaimInventory;
-                    const cost = raw.len + key_len + integrity.key_len + inventory_value_len;
+                    const cost = raw.len + key_len + integrity.key_len + inventory_len;
                     if (cost > max_bytes) return error.InvalidPrivateIndexClaimInventory;
                     if (cost > byte_limit) return error.InvalidRelationalIndexBudget;
                     if (cost > byte_limit - bytes) break;
@@ -1512,12 +1615,12 @@ pub const InventoryValidation = struct {
                     const claim = try integrity.Claim.decode(&address.claimKey(), raw);
                     if (claim.state != .live or claim.schema_version != binding.physical_candidate.schema_version or !std.mem.eql(u8, &hash(claim.parent_table), &expected.table_name_digest)) return error.InvalidPrivateIndexClaimInventory;
                     const member = claim.memberDigest();
-                    _ = try decodeInventory(&inventoryKey(address), &inventory, provenance, value_hash);
+                    _ = try decodeInventory(&inventoryKey(address), inventory, provenance, value_hash);
                     var chain = std.crypto.hash.Blake3.init(.{});
                     chain.update(&next.chain);
                     chain.update(&inventoryKey(address));
                     chain.update(&value_hash);
-                    chain.update(&inventory);
+                    chain.update(inventory);
                     chain.final(&next.chain);
                     for (&next.inventory_xor, member) |*byte, contribution| byte.* ^= contribution;
                     next.rows = std.math.add(u64, next.rows, 1) catch return error.InvalidPrivateIndexClaimInventory;
@@ -1556,22 +1659,35 @@ pub const InventoryValidation = struct {
         }
         /// The enclosing mutation pipeline commits this record with the native
         /// authority and durable outbox, and MUST abort on every staging error.
-        pub fn stage(self: *const @This(), alloc: Allocator, txn: anytype, replay_position: ?Native) !struct { record: Record, duplicate: bool } {
+        pub fn stage(self: *const @This(), alloc: Allocator, txn: anytype, replay_position: ?Native) !Outcome {
+            if (self.command.binding.authority != .native) return error.InvalidControlReceiptPosition;
+            return self.stageAt(alloc, txn, if (replay_position) |cut| .{ .native = cut } else null);
+        }
+        pub fn stageAt(self: *const @This(), alloc: Allocator, txn: anytype, replay_position: ?Position) !Outcome {
             try self.context.ensureActive();
             try self.command.validate();
-            _ = try requireLocal(txn, self.command.binding, self.command.expected);
+            if (self.command.binding.authority == .raft and replay_position == null) return error.InvalidControlReceiptPosition;
+            if (replay_position) |cut| {
+                try cut.requireNamespace(self.command.binding.fence.namespace);
+                if ((cut == .native) != (self.command.binding.authority == .native)) return error.InvalidControlReceiptPosition;
+            }
+            const provenance = try requireLocal(txn, self.command.binding, self.command.expected);
             const digest = try self.command.digest();
             const current = try load(alloc, txn, self.command.binding);
             if (current) |record| if (std.mem.eql(u8, &record.page_digest, &digest)) {
-                if (replay_position) |position| if (!std.meta.eql(record.position, position)) return error.InvalidPrivateIndexClaimReceipt;
+                if (replay_position) |cut| {
+                    if (cut == .native and !std.meta.eql(record.position, cut)) return error.InvalidPrivateIndexClaimReceipt;
+                    if (positionNumber(cut) < positionNumber(record.position) or cut.term() < record.position.term() or
+                        (positionNumber(cut) == positionNumber(record.position) and cut.term() != record.position.term())) return error.InvalidControlReceiptPosition;
+                }
                 return .{ .record = record, .duplicate = true };
             };
             const previous = if (try optional(txn, &key(self.command.binding))) |bytes| hash(bytes) else @as(integrity.Digest, @splat(0));
             if (!std.mem.eql(u8, &previous, &self.command.previous)) return error.VersionConflict;
             if (current) |record| if (record.fields.phase != self.command.from or !std.mem.eql(u8, &try record.expected.digest(), &try self.command.expected.digest())) return error.PrivateIndexOwnerJobChanged;
-            if (replay_position) |position| if (!position.namespace.eql(self.command.binding.fence.namespace)) return error.IdentityNamespaceMismatch;
             try self.context.ensureActive();
-            const position: Native = .{ .namespace = self.command.binding.fence.namespace, .sequence = try authority.advance(txn, @import("online_source_contract.zig").namespaceBytes(self.command.binding.fence.namespace), if (replay_position) |value| value.sequence else null) };
+            const position: Position = if (self.command.binding.authority == .raft) replay_position.? else .{ .native = .{ .namespace = self.command.binding.fence.namespace, .sequence = try authority.advance(txn, @import("online_source_contract.zig").namespaceBytes(self.command.binding.fence.namespace), if (replay_position) |value| value.native.sequence else null) } };
+            if (position == .raft and (position.raft.index <= provenance.maximum or position.raft.term < provenance.maximum_cut.raft.term)) return error.InvalidControlReceiptPosition;
             const record: Record = .{ .expected = self.command.expected, .fields = self.command.next, .position = position, .page_digest = digest };
             const bytes = try record.encode(alloc);
             defer alloc.free(bytes);

@@ -2235,6 +2235,100 @@ test "relational index system Raft owner controls commit authentic phase cuts at
         try view.validateCompanion(&read, try Integrity.parseKey(&address.claimKey()), Integrity.hash(try read.get(&address.claimKey())));
         try std.testing.expectEqual(@as(u64, 0), (try @import("../source_authority.zig").load(&read)).?.sequence);
     }
+    const Validation = claim_store.InventoryValidation;
+    const expected = expected: {
+        var read = try db.core.store.beginReadTxn();
+        defer read.abort();
+        const head = (try source.load(&read, reserved_binding)).?;
+        const consumed = (try source.loadConsumption(&read, reserved_binding, head)).?;
+        var inventory_xor: [32]u8 = @splat(0);
+        for ([_]Integrity.Claim{ first_claim, second_claim, winner.command.claims[0] }) |claim| {
+            for (&inventory_xor, claim.memberDigest()) |*byte, member| byte.* ^= member;
+        }
+        break :expected claim_store.TargetExpectation{ .metadata_incarnation = consumed.accepted.metadata_incarnation, .binding_digest = first_accepted.binding_digest, .generation = target.batch.entries[0].address.generation, .completion_revision = 1, .source_consumption_digest = try consumed.prefix().digest(), .source_progress_digest = head.progress_digest, .table_name_digest = Integrity.hash("usage_records"), .rows = 3, .inventory_xor = inventory_xor, .provenance = @splat(11) };
+    };
+    const Inventory = struct {
+        fn prepare(database: *db_mod.DB, current: jobs.Binding, expectation: claim_store.TargetExpectation) !?owner_control.PreparedInventoryValidation {
+            var read = try database.core.store.beginReadTxn();
+            defer read.abort();
+            const page = (try Validation.Prepared.prepare(alloc, &read, current, expectation, .{ .records = 1, .time_ns = std.time.ns_per_s }, .{})) orelse return null;
+            return .{ .alloc = alloc, .batch = page };
+        }
+        fn replayPage(database: *db_mod.DB, command: Validation.Command) !owner_control.PreparedInventoryValidation {
+            var read = try database.core.store.beginReadTxn();
+            defer read.abort();
+            return .{ .alloc = alloc, .batch = try Validation.Prepared.replay(alloc, &read, command) };
+        }
+    };
+    var late_claim = second_claim;
+    late_claim.tuple = "late-source-tuple";
+    var late = try Claims.prepare(&db, .{ .binding = reserved_binding, .claims = &.{late_claim} });
+    defer late.deinit();
+    var freeze = (try Inventory.prepare(&db, reserved_binding, expected)).?;
+    defer freeze.deinit();
+    try std.testing.expectEqual(@as(u16, 0), freeze.batch.command.visited);
+    try std.testing.expectError(error.InvalidControlReceiptPosition, freeze.preparePayload());
+    try std.testing.expectError(error.InvalidControlReceiptPosition, (owner_control.Effect{ .inventory_validation = freeze.batch.command }).validate());
+    {
+        var txn = try db.core.store.beginWriteTxn();
+        defer txn.abort();
+        try freeze.stageRaft(db.core, &txn, 11, .{ .term = 10, .index = 120 });
+        _ = try txn.get(&Validation.key(reserved_binding));
+    }
+    {
+        var read = try db.core.store.beginReadTxn();
+        defer read.abort();
+        try std.testing.expectError(error.NotFound, read.get(&Validation.key(reserved_binding)));
+        try std.testing.expectEqual(@as(u64, 110), (try receipts.readOrderedApplyReceiptTxn(&read)).?.index);
+    }
+    var freeze_replay = try Inventory.replayPage(&db, freeze.batch.command);
+    defer freeze_replay.deinit();
+    try db.applyCommittedRaftIndexInventory(&freeze_replay, 11, .{ .term = 10, .index = 120 });
+    try db.applyCommittedRaftIndexInventory(&freeze_replay, 11, .{ .term = 10, .index = 121 });
+    try std.testing.expectError(error.PrivateIndexTargetSealed, db.applyCommittedRaftIndexClaims(&late, 11, .{ .term = 10, .index = 122 }));
+    try std.testing.expectEqual(@as(u64, 121), (try db.orderedApplyReceipt()).?.index);
+    try db.applyCommittedRaftIndexClaims(&target_retry, 11, .{ .term = 10, .index = 123 });
+    db.close();
+    db_live = false;
+    db = try db_mod.DB.open(alloc, directory.path(), options);
+    db_live = true;
+    {
+        var read = try db.core.store.beginReadTxn();
+        defer read.abort();
+        const record = (try Validation.load(alloc, &read, reserved_binding)).?;
+        try std.testing.expectEqualDeep(@import("receipt_position.zig").Position{ .raft = .{ .term = 10, .index = 120 } }, record.position);
+        try std.testing.expectError(error.PrivateIndexTargetValidationRequired, Validation.requireReadyAt(alloc, &read, reserved_binding, expected));
+    }
+    var last_validation_index: u64 = 123;
+    for (0..32) |_| {
+        var prepared = (try Inventory.prepare(&db, reserved_binding, expected)) orelse break;
+        defer prepared.deinit();
+        try std.testing.expect(prepared.batch.command.visited <= 1);
+        var replayed = try Inventory.replayPage(&db, prepared.batch.command);
+        defer replayed.deinit();
+        last_validation_index += 1;
+        try db.applyCommittedRaftIndexInventory(&replayed, 11, .{ .term = 10, .index = last_validation_index });
+    }
+    db.close();
+    db_live = false;
+    db = try db_mod.DB.open(alloc, directory.path(), options);
+    db_live = true;
+    {
+        var read = try db.core.store.beginReadTxn();
+        defer read.abort();
+        const record = (try Validation.load(alloc, &read, reserved_binding)).?;
+        try std.testing.expectEqual(Validation.Phase.ready, record.fields.phase);
+        try std.testing.expectEqual(@as(u64, 3), record.fields.rows);
+        try std.testing.expectEqual(@as(u64, 3), record.fields.claim_rows);
+        const inventory_ready = try Validation.requireReadyAt(alloc, &read, reserved_binding, expected);
+        try std.testing.expectEqual(@as(u64, 1), inventory_ready.source_members);
+        try std.testing.expectEqual(last_validation_index, inventory_ready.position.raft.index);
+        try std.testing.expectEqual(@as(u64, 0), (try @import("../source_authority.zig").load(&read)).?.sequence);
+        try std.testing.expectEqualDeep(reserved_binding, (try jobs.load(&read)).?);
+        const bytes = try record.encode(alloc);
+        defer alloc.free(bytes);
+        try std.testing.expectEqualSlices(u8, "AICV\x03\x00\x00\x00", bytes[0..8]);
+    }
     try @import("antfly_server_test_sources").local_test_sources.storage_relational_index_raft_apply.run(admission.command);
 }
 
@@ -4520,7 +4614,8 @@ test "relational index build pages identity dispatch caches immutable candidates
                         var observe_replay = try db.core.store.beginReadTxn();
                         defer observe_replay.abort();
                         const retained = (try Validation.load(alloc, &observe_replay, binding)).?;
-                        applied_override = .{ .inventory = .{ .binding = binding, .record = retained, .position = retained.position, .duplicate = false } };
+                        try std.testing.expect(retained.position == .native);
+                        applied_override = .{ .inventory = .{ .binding = binding, .record = retained, .position = retained.position.native, .duplicate = false } };
                     }
                 }
             }

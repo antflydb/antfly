@@ -45,13 +45,20 @@ watermark. Native inventory values remain 40 bytes; Raft values use 48 bytes,
 retaining both term and index without repeating the binding per member. Exact
 retries and regrouping recover the maximum original member cut, not the current
 apply position, without growing a per-batch ledger. Range ownership and duplicate
-postimages are rechecked under apply exclusion. Native proof adapters still
-reject Raft records. This does not yet wire replicated
+postimages are rechecked under apply exclusion. The bidirectional target verifier
+now advances at committed Raft cuts too: it freezes new claims, checks both the
+generation inventory and authoritative claim namespace in bounded pages, and
+replays fixed intervals rather than rerunning time-based scheduling. Progress
+and the apply watermark commit together; READY survives cold recovery but grants
+neither installation nor publication authority. Native AICV v2 bytes and control
+reply shapes stay unchanged; explicit Raft cuts use AICV v3, without advertising
+the still-incomplete Raft lifecycle. Native proof adapters still reject Raft
+records. This does not yet wire replicated
 claim delivery, validation, installation, cancellation or publication release
 through the public receiver.
 
 Verification: `zig build antfly-relational-index-system-test -Doptimize=Debug -j1`
-passes 289 storage tests and one server test, with no skips or leaks. The Raft
+passes 290 storage tests and one server test, with no skips or leaks. The Raft
 regression covers aborted apply, exact replay, retry cuts, physical membership,
 wrong-authority corruption, allocation failures and cold reopens. Consumption
 controls additionally cover expired apply, future cuts with valid checksums,
@@ -59,6 +66,9 @@ retained-cut retry and resumed production after full and partial backlog drain.
 Target controls cover compact authority-bound encoding, committed cut bounds,
 actual range checks, aborted claim pairs, expired apply, conflicting prepared
 writers, cold retry, regrouping and unchanged original inventory bytes.
+Verifier controls cover frozen late writers, permitted exact duplicates,
+bidirectional one-record pages, deterministic replay, cold READY and exact native
+v2 bytes, including 64-bit cuts and every allocation-failure boundary.
 
 ## Document conflict delivery (2026-10-17)
 

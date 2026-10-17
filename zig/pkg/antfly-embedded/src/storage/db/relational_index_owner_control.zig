@@ -335,7 +335,10 @@ pub const Effect = union(enum) {
                 try value.validate();
                 if (value.binding.authority != .native) return error.InvalidControlReceiptPosition;
             },
-            .inventory_validation => |value| try value.validate(),
+            .inventory_validation => |value| {
+                try value.validate();
+                if (value.binding.authority != .native) return error.InvalidControlReceiptPosition;
+            },
             .generation_validation => |value| try value.validate(),
             .validation_seal => |value| try value.validate(),
             .install => |value| try value.validate(),
@@ -883,7 +886,7 @@ pub const InventoryOutcome = struct {
         const expected = request.target_expectation orelse return error.InvalidPrivateIndexNativeReceipt;
         try self.record.validate();
         if (!std.mem.eql(u8, &try expected.digest(), &try self.record.expected.digest()) or
-            !std.meta.eql(self.position, self.record.position) or !self.position.namespace.eql(request.identity.namespace) or
+            self.record.position != .native or !std.meta.eql(self.position, self.record.position.native) or !self.position.namespace.eql(request.identity.namespace) or
             self.replication_pending != (self.error_name != null)) return error.InvalidPrivateIndexNativeReceipt;
     }
 };
@@ -909,17 +912,27 @@ pub const PreparedInventoryValidation = struct {
         try (Frame{ .effect = .{ .inventory_validation = self.batch.command }, .position = position }).validate();
     }
     pub fn replayDuplicateOutcome(self: *const @This(), position: Native) InventoryOutcome {
-        return .{ .binding = self.batch.command.binding, .record = .{ .expected = self.batch.command.expected, .fields = self.batch.command.next, .position = position, .page_digest = self.batch.command.digest() catch unreachable }, .position = position, .duplicate = true };
+        return .{ .binding = self.batch.command.binding, .record = .{ .expected = self.batch.command.expected, .fields = self.batch.command.next, .position = .{ .native = position }, .page_digest = self.batch.command.digest() catch unreachable }, .position = position, .duplicate = true };
     }
     pub fn stage(self: *@This(), _: anytype, txn: anytype, replay: ?Native) !InventoryOutcome {
         const result = try self.batch.stage(self.alloc, txn, replay);
-        return .{ .binding = self.batch.command.binding, .record = result.record, .position = result.record.position, .duplicate = result.duplicate };
+        return .{ .binding = self.batch.command.binding, .record = result.record, .position = result.record.position.native, .duplicate = result.duplicate };
+    }
+    pub fn stageRaft(self: *@This(), _: anytype, txn: anytype, owner_group: u64, entry: @import("apply_receipts.zig").OrderedApplyReceipt) !void {
+        try self.batch.context.ensureActive();
+        const binding = self.batch.command.binding;
+        if (binding.authority != .raft or owner_group == 0 or owner_group != binding.fence.owner_group_id) return error.PrivateIndexOwnerJobChanged;
+        const prior = try @import("apply_receipts.zig").readOrderedApplyReceiptTxn(txn);
+        if (try @import("apply_receipts.zig").orderedApplyDisposition(prior, entry) != .apply) return error.InvalidControlReceiptPosition;
+        if (prior) |value| if (entry.index <= value.index or entry.term < value.term) return error.InvalidControlReceiptPosition;
+        _ = try self.batch.stageAt(self.alloc, txn, .{ .raft = .{ .term = entry.term, .index = entry.index } });
     }
     pub fn hasPublicationReceipt(_: *const @This()) bool {
         return false;
     }
     pub fn populateReceipt(_: *const @This(), _: anytype, _: *InventoryOutcome) !void {}
     pub fn preparePayload(self: *@This()) !void {
+        if (self.batch.command.binding.authority != .native) return error.InvalidControlReceiptPosition;
         try prepareNativePayload(self, "inventory_validation", self.batch.command, private_claims.InventoryValidation.max_wire_bytes);
     }
     pub fn finalizePayload(self: *@This(), position: Native) ![]const u8 {
