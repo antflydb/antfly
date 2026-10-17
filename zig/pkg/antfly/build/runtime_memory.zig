@@ -143,10 +143,12 @@ pub fn runtimeCompileMaxRss(unit: RuntimeLibraryUnit, profile: CompileMemoryProf
         // platform frameworks. Linux ARM64 reached 4.99 GB in the
         // v0.2.1-rc0 release build, while the integrated HA API kernel
         // reached 8.10 GB in a clean aarch64-linux-musl ReleaseFast
-        // build. Linux retains 10 GiB. October's native lake codegen reached
+        // build. The v0.3 RC ARM64 GNU API peaked at 10,983,571,456 bytes;
+        // reserve 12 GiB on Linux, retaining about 17% headroom. October's
+        // native lake codegen reached
         // 19.81 GB on macOS with paged native maintenance. Reserve 24 GiB
         // to retain at least 25% headroom over that measured peak.
-        .api_kernel => @as(usize, if (target.os.tag == .macos) 24 else 10) * 1024 * 1024 * 1024,
+        .api_kernel => @as(usize, if (target.os.tag == .macos) 24 else 12) * 1024 * 1024 * 1024,
         // September's macOS 20 GiB claim is below the reported 22–23 GB
         // compiler peak. 28 GiB includes >=25% headroom at 23 decimal GB.
         // Keep the measured Linux profiles separate. The other macOS bumps
@@ -367,22 +369,22 @@ test "native Linux LLVM Debug claims cover measured peaks and account for overla
     try std.testing.expect(api + runtimeCompileMaxRss(.cli, profile) <= 22 * gib);
     var fallback = profile;
     fallback.host = macos;
-    try std.testing.expectEqual(10 * gib, runtimeCompileMaxRss(.api_kernel, fallback));
+    try std.testing.expectEqual(12 * gib, runtimeCompileMaxRss(.api_kernel, fallback));
     fallback = profile;
     fallback.target = try std.zig.system.resolveTargetQuery(std.testing.io, .{ .cpu_arch = .x86_64, .os_tag = .linux, .abi = .musl });
-    try std.testing.expectEqual(10 * gib, runtimeCompileMaxRss(.api_kernel, fallback));
+    try std.testing.expectEqual(12 * gib, runtimeCompileMaxRss(.api_kernel, fallback));
     fallback = profile;
     fallback.strip = true;
-    try std.testing.expectEqual(10 * gib, runtimeCompileMaxRss(.api_kernel, fallback));
+    try std.testing.expectEqual(12 * gib, runtimeCompileMaxRss(.api_kernel, fallback));
     fallback = profile;
     fallback.cpu_inference = false;
-    try std.testing.expectEqual(10 * gib, runtimeCompileMaxRss(.api_kernel, fallback));
+    try std.testing.expectEqual(12 * gib, runtimeCompileMaxRss(.api_kernel, fallback));
     fallback = profile;
     fallback.sanitize_thread = true;
-    try std.testing.expectEqual(10 * gib, runtimeCompileMaxRss(.api_kernel, fallback));
+    try std.testing.expectEqual(12 * gib, runtimeCompileMaxRss(.api_kernel, fallback));
     fallback = profile;
     fallback.target.cpu.features.addFeature(@backingInt(std.Target.x86.Feature.avx2));
-    try std.testing.expectEqual(10 * gib, runtimeCompileMaxRss(.api_kernel, fallback));
+    try std.testing.expectEqual(12 * gib, runtimeCompileMaxRss(.api_kernel, fallback));
 }
 
 test "linked LLVM Debug test reservations cover native peaks without lowering authored claims" {
@@ -440,5 +442,19 @@ test "native Darwin Debug test reservations cover measured peaks without unsafe 
         try std.testing.expectEqual(12 * gib, testCompileMaxRss(name, macos, linux, .debug, 12 * gib));
         try std.testing.expectEqual(12 * gib, testCompileMaxRss(name, linux, macos, .debug, 12 * gib));
         try std.testing.expectEqual(7 * gib, testCompileMaxRss(name, linux, linux, .debug, 7 * gib));
+    }
+}
+
+test "Linux release API reservations cover ARM64 GNU and musl peaks within the release budget" {
+    const host = try std.zig.system.resolveTargetQuery(std.testing.io, .{ .cpu_arch = .x86_64, .os_tag = .linux });
+    const gib = 1024 * 1024 * 1024;
+    for ([_]std.Target.Abi{ .gnu, .musl }) |abi| {
+        const target = try std.zig.system.resolveTargetQuery(std.testing.io, .{ .cpu_arch = .aarch64, .os_tag = .linux, .abi = abi });
+        const profile: CompileMemoryProfile = .{ .host = host, .target = target, .optimize = .fast, .strip = true, .cpu_inference = abi == .musl };
+        const claim = runtimeCompileMaxRss(.api_kernel, profile);
+        const peak: usize = if (abi == .gnu) 10_983_571_456 else 10_788_933_632;
+        try std.testing.expectEqual(12 * gib, claim);
+        try std.testing.expect(claim >= peak + peak / 6);
+        try std.testing.expect(claim + runtimeCompileMaxRss(.enrichment_compute, profile) <= 20 * gib);
     }
 }
