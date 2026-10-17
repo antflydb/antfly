@@ -12,6 +12,19 @@ export type EmbedResponse = components["schemas"]["InferenceEmbedResponse"];
 export type ChunkRequest = components["schemas"]["InferenceChunkRequest"];
 export type ChunkConfig = components["schemas"]["InferenceChunkConfig"];
 export type ChunkResponse = components["schemas"]["InferenceChunkResponse"];
+export type ChunkEmbeddingResponse = components["schemas"]["ChunkEmbeddingResponse"];
+export type ChunkEmbeddingObject = components["schemas"]["ChunkEmbeddingObject"];
+export type ChunkEmbeddingRequest = ChunkRequest & {
+  embedding: NonNullable<ChunkRequest["embedding"]>;
+};
+export type ChunkSourceReference = components["schemas"]["ChunkSourceReference"];
+export type MediaChunkPolicy = components["schemas"]["MediaChunkPolicy"];
+export type ChunkEmbeddingTarget = components["schemas"]["ChunkEmbeddingTarget"];
+export type ChunkEmbeddingContext = components["schemas"]["ChunkEmbeddingContext"];
+export type ChunkEmbeddingStreamEvent =
+  | { object: "chunk.embedding.start"; context: ChunkEmbeddingContext }
+  | { object: "chunk.embedding"; data: ChunkEmbeddingObject }
+  | { object: "chunk.embedding.complete"; response: ChunkEmbeddingResponse };
 export type Chunk = components["schemas"]["InferenceChunk"];
 
 export type RerankRequest = components["schemas"]["InferenceRerankRequest"];

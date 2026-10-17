@@ -37,6 +37,7 @@ pub fn chunkInputBounded(
 ) ![]types.Chunk {
     try cfg.validate();
     return switch (input) {
+        .source => error.ModelAwareChunkProviderRequired,
         .text => |text| fixed_text.chunkText(alloc, text, .{
             .target_tokens = cfg.text.target_tokens,
             .overlap_tokens = cfg.text.overlap_tokens,

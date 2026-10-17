@@ -72,3 +72,21 @@ func main() {
 
 See `examples/quickstart` for tables, indexes, hybrid search, reranking, and
 a retrieval agent end to end.
+
+## Model-aware media chunks
+
+`InferenceClient.ChunkAndEmbed` accepts `oapi.InferenceChunkRequest` with an
+explicit `Embedding` target. Text, PDF, images, GIF, audio and video share typed
+source coordinates and descriptor/vector pairs. Build text input with
+`input.FromInferenceChunkRequestInput0(text)`; use the generated media/source
+union helpers for inline base64 media or version-pinned HTTP/S3 objects.
+
+`ChunkAndEmbedStream` invokes its consumer for each chunk and returns the terminal
+coverage response. Its optional start callback receives source/plan/model context
+before vectors. EOF without a terminal record is an error; a consumer error
+closes delivery. Retain model identity with each vector. Check `Status`, `Gaps`
+and `NextContinuation` before declaring complete coverage. Resume with the same
+source and policy plus `Continuation`. `Embedding.Execute = &falseValue` requests
+planning without inference. See the
+[shared contract](../../../docs/plans/model-aware-media-chunking.md) for the HTTP
+shape, rendering policies, security, limits and database artifact integration.

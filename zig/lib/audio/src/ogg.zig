@@ -67,11 +67,14 @@ pub fn sniffCodec(allocator: std.mem.Allocator, ogg_bytes: []const u8) !Codec {
 pub fn reconstructFlacStreamAlloc(allocator: std.mem.Allocator, ogg_bytes: []const u8) ![]u8 {
     var packets = try parsePacketsAlloc(allocator, ogg_bytes);
     defer packets.deinit();
-    if (packets.packets.len == 0) return error.UnsupportedAudioFormat;
+    return reconstructFlacPacketsAlloc(allocator, packets.packets);
+}
 
-    const first_packet = packets.packets[0].bytes;
+pub fn reconstructFlacPacketsAlloc(allocator: std.mem.Allocator, packets: []const Packet) ![]u8 {
+    if (packets.len == 0) return error.UnsupportedAudioFormat;
+    const first_packet = packets[0].bytes;
     if ((try sniffFirstPacket(first_packet)) != .flac) return error.UnsupportedAudioFormat;
-    if (first_packet.len < 13 or !std.mem.eql(u8, first_packet[9..13], "fLaC")) {
+    if (first_packet.len < 14 or !std.mem.eql(u8, first_packet[9..13], "fLaC")) {
         return error.UnsupportedAudioFormat;
     }
 
@@ -81,7 +84,7 @@ pub fn reconstructFlacStreamAlloc(allocator: std.mem.Allocator, ogg_bytes: []con
     try out.appendSlice(allocator, first_packet[9..]);
     var saw_last_metadata = (first_packet[13] & 0x80) != 0;
 
-    for (packets.packets[1..]) |packet| {
+    for (packets[1..]) |packet| {
         const packet_bytes = packet.bytes;
         if (!saw_last_metadata and packet_bytes.len < 4) return error.UnsupportedAudioFormat;
         try out.appendSlice(allocator, packet_bytes);
@@ -264,7 +267,7 @@ fn finishPacketStreamAlloc(
     });
 }
 
-fn sniffFirstPacket(packet: []const u8) !Codec {
+pub fn sniffFirstPacket(packet: []const u8) !Codec {
     if (packet.len >= 8 and std.mem.eql(u8, packet[0..8], "OpusHead")) return .opus;
     if (packet.len >= 7 and packet[0] == 0x01 and std.mem.eql(u8, packet[1..7], "vorbis")) return .vorbis;
     if (packet.len >= 9 and packet[0] == 0x7f and std.mem.eql(u8, packet[1..5], "FLAC")) return .flac;

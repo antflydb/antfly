@@ -32,6 +32,7 @@ pub const Metrics = struct {
     requests_active: prometheus.Gauge(i64),
     errors_total: prometheus.Counter(u64),
     extraction_v2: extraction.Metrics = .{},
+    embedding_groups: @import("embedding_group_metrics.zig").Metrics = .{},
 
     embed_requests: prometheus.Counter(u64),
     embed_batches_total: prometheus.Counter(u64),
@@ -226,6 +227,7 @@ pub const Metrics = struct {
     pub fn render(self: *Metrics, writer: *std.Io.Writer) !void {
         try prometheus.write(self, writer);
         try self.extraction_v2.render(writer);
+        try self.embedding_groups.render(writer);
     }
 };
 

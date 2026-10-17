@@ -396,3 +396,31 @@ await client.streamRetrievalAgent(request, {
   },
 });
 ```
+
+## Model-aware media chunks
+
+`InferenceClient.chunkAndEmbed` and `chunkAndEmbedStream` accept text, PDF,
+images, GIF, audio and video. Every result carries source coordinates alongside
+its embedding. For example, using an inference client configured for your server:
+
+```typescript
+const response = await inference.chunkAndEmbed({
+  input: "A long document…",
+  embedding: { model: "embeddinggemma2", task_type: "RETRIEVAL_DOCUMENT" },
+  policy: { target_tokens: 500, overlap_tokens: 50 },
+  include_content: true,
+});
+for (const chunk of response.data) {
+  console.log(chunk.descriptor.coordinates, chunk.embedding);
+}
+```
+
+Check `status`, `gaps` and `next_continuation` before declaring complete coverage.
+Pass `next_continuation` as `continuation` with the same source and policy to
+resume. `chunkAndEmbedStream` yields start context, descriptor/vector pairs, then
+a terminal coverage record; EOF without that record throws. Retain the context's
+model identity with each vector. Use `embedding.execute: false` for planning only.
+Inline media uses `{type: "media", mime_type, data}` with base64 data; immutable
+HTTP/S3 objects use a version-pinned `ChunkSourceReference`. See the
+[shared contract](../../../docs/plans/model-aware-media-chunking.md) for source
+security, rendering policies, limits and native database integration.
