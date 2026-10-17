@@ -46,6 +46,13 @@ fn lock(self: *Budget) void {
 pub fn allocator(self: *Budget) std.mem.Allocator {
     return .{ .ptr = self, .vtable = &.{ .alloc = alloc, .resize = resize, .remap = remap, .free = free } };
 }
+/// Reusable child owners distinguish local failed admission from a parent's
+/// historical failure; restoring parent headroom can admit healthy new work.
+pub fn isLocallyExhausted(self: *Budget) bool {
+    self.lock();
+    defer self.mutex.unlock();
+    return self.exhausted or self.admission_exhausted;
+}
 pub fn isExhausted(self: *Budget) bool {
     self.lock();
     const exhausted = self.exhausted or self.admission_exhausted;
@@ -53,9 +60,13 @@ pub fn isExhausted(self: *Budget) bool {
     self.mutex.unlock();
     // A child can be below its own limit when shared parent admission fails.
     // Preserve genuine allocator OOMs: only known Budget owners carry policy.
-    if (exhausted) return true;
-    if (backing.vtable.alloc != alloc) return false;
-    const parent: *Budget = @ptrCast(@alignCast(backing.ptr));
+    return exhausted or allocatorExhausted(backing);
+}
+fn allocatorExhausted(a: std.mem.Allocator) bool {
+    if (@import("parallel_scheduler.zig").LockedAllocator.parentAllocator(a)) |parent| return allocatorExhausted(parent);
+    if (@import("spill.zig").Manager.parentAllocator(a)) |parent| return allocatorExhausted(parent);
+    if (a.vtable.alloc != alloc) return false;
+    const parent: *Budget = @ptrCast(@alignCast(a.ptr));
     return parent.isExhausted();
 }
 /// Conservative region footprint, including intermediate buffers retained by
@@ -68,6 +79,8 @@ pub fn footprint(self: *Budget) usize {
 /// Live headroom of this allocator's budget chain, when known. Unknown backing
 /// allocators provide no extra bound; they never imply unlimited admission.
 pub fn headroom(a: std.mem.Allocator) ?usize {
+    if (@import("parallel_scheduler.zig").LockedAllocator.parentAllocator(a)) |parent| return headroom(parent);
+    if (@import("spill.zig").Manager.parentAllocator(a)) |parent| return headroom(parent);
     if (a.vtable.alloc != alloc) return null;
     const self: *Budget = @ptrCast(@alignCast(a.ptr));
     self.lock();
@@ -216,6 +229,25 @@ test "SQL memory budget rejects before allocation and reclaims page capacity" {
     try std.testing.expectEqual(@as(usize, 128), budget.peak);
 }
 
+test "SQL memory headroom follows synchronization and spill allocator parents" {
+    const a = std.testing.allocator;
+    var parent: Budget = .{ .backing = a, .limit = 1024 };
+    var locked: @import("parallel_scheduler.zig").LockedAllocator = .{ .backing = parent.allocator() };
+    var manager: @import("spill.zig").Manager = .{ .alloc = locked.allocator(), .io = std.testing.io, .context = undefined, .checkpoint = struct {
+        fn check(_: *anyopaque) !void {}
+    }.check };
+    defer manager.deinit();
+    const reservation = try parent.allocator().alloc(u8, 512);
+    defer parent.allocator().free(reservation);
+    try std.testing.expectEqual(@as(?usize, 512), headroom(manager.allocator()));
+    var child: Budget = .{ .backing = manager.allocator(), .limit = 2048 };
+    const bytes = try child.allocator().alloc(u8, 128);
+    try std.testing.expectEqual(@as(?usize, 384), headroom(child.allocator()));
+    child.allocator().free(bytes);
+    try std.testing.expectEqual(@as(?usize, 512), headroom(locked.allocator()));
+    try std.testing.expect(headroom(a) == null);
+}
+
 test "SQL memory budget reports parent admission without misclassifying allocator OOM" {
     var parent: Budget = .{ .backing = std.testing.allocator, .limit = 32 };
     var child: Budget = .{ .backing = parent.allocator(), .limit = 128 };
@@ -223,6 +255,7 @@ test "SQL memory budget reports parent admission without misclassifying allocato
     defer child.allocator().free(bytes);
     try std.testing.expectError(error.OutOfMemory, child.allocator().alloc(u8, 17));
     try std.testing.expect(child.isExhausted());
+    try std.testing.expect(!child.isLocallyExhausted());
     try std.testing.expect(!child.exhausted);
     try std.testing.expectEqual(@as(usize, 16), parent.live);
     var empty: [0]u8 = .{};
@@ -230,4 +263,18 @@ test "SQL memory budget reports parent admission without misclassifying allocato
     var allocator_oom: Budget = .{ .backing = fixed.allocator(), .limit = 128 };
     try std.testing.expectError(error.OutOfMemory, allocator_oom.allocator().alloc(u8, 1));
     try std.testing.expect(!allocator_oom.isExhausted());
+    // Scheduler and spill wrappers preserve the same parent policy evidence.
+    var locked: @import("parallel_scheduler.zig").LockedAllocator = .{ .backing = parent.allocator() };
+    var manager: @import("spill.zig").Manager = .{ .alloc = locked.allocator(), .io = std.testing.io, .context = undefined, .checkpoint = struct {
+        fn check(_: *anyopaque) !void {}
+    }.check };
+    defer manager.deinit();
+    var wrapped: Budget = .{ .backing = manager.allocator(), .limit = 128 };
+    try std.testing.expectError(error.OutOfMemory, wrapped.allocator().alloc(u8, 17));
+    try std.testing.expect(wrapped.isExhausted());
+    try std.testing.expect(!wrapped.isLocallyExhausted());
+    try std.testing.expect(!wrapped.exhausted);
+    locked.backing = fixed.allocator();
+    try std.testing.expectError(error.OutOfMemory, wrapped.allocator().alloc(u8, 1));
+    try std.testing.expect(!wrapped.isExhausted());
 }

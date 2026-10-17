@@ -152,6 +152,51 @@ pub const Column = struct {
         self.clear(a);
         self.values = .{ .dynamic = states };
     }
+    pub fn appendGrowth(self: *const Column, additional: usize) usize {
+        return switch (self.values) {
+            inline else => |values| blk: {
+                const required = values.items.len +| additional;
+                if (required <= values.capacity) break :blk 0;
+                break :blk (required *| 2 +| 8) *| @sizeOf(@TypeOf(values.items[0]));
+            },
+        };
+    }
+    /// Mixed extrema promote the entire state column, including untouched
+    /// groups. Admit that transient copy before changing any live state.
+    pub fn updateGrowth(self: *const Column, value: Datum, additional: usize) usize {
+        if (value.sql_null or (self.spec.kind != .min and self.spec.kind != .max)) return 0;
+        const compatible = switch (self.values) {
+            .integers => value.value == .integer,
+            .numbers => value.value == .float,
+            .booleans => value.value == .bool,
+            .bytes => value.value == .string,
+            .dynamic => true,
+            else => false,
+        };
+        if (compatible) return 0;
+        const count = switch (self.values) {
+            inline else => |values| values.items.len,
+        };
+        var bytes = (count +| additional) *| (2 * @sizeOf(operators.Aggregate) + 1024);
+        if (self.values == .bytes) for (self.values.bytes.items) |state| if (state.value) |text| {
+            bytes +|= text.len;
+        };
+        return bytes;
+    }
+    pub fn physicalUpdateGrowth(self: *const Column, physical: @import("execution_batch.zig").PhysicalColumn, additional: usize) !usize {
+        if (self.spec.kind != .min and self.spec.kind != .max) return 0;
+        const compatible = switch (self.values) {
+            .integers => physical.kind == .integer,
+            .numbers => physical.kind == .number,
+            .booleans => physical.kind == .boolean,
+            .bytes => physical.kind == .string,
+            .dynamic => true,
+            else => false,
+        };
+        if (compatible) return 0;
+        for (0..physical.len()) |lane| if (!physical.vector.nulls.isNull(physical.rowAt(lane))) return self.updateGrowth(try physical.cell(lane), additional);
+        return 0;
+    }
     pub fn numericGrowth(self: *const Column, index: ?usize, weight: i32, length: usize) usize {
         var state: @import("numeric_aggregate.zig").State = .{};
         if (index) |slot| switch (self.values) {
@@ -285,14 +330,312 @@ pub const Column = struct {
     /// exactly the same update order as the scalar path.
     pub fn updateEncoded(self: *Column, a: A, ids: []const usize, batch: @import("execution_batch.zig").Batch) !void {
         if (batch.width() != 1 or batch.len() != ids.len) return error.InvalidSqlBackendResponse;
+        if (batch == .reader) if (batch.reader.cohort) |cohort| {
+            return self.updateCohort(a, ids, cohort.source.*, cohort.positions);
+        };
+        var scratch = std.heap.ArenaAllocator.init(a);
+        defer scratch.deinit();
+        if (self.values == .exact) if (try batch.decimalColumnSelected(scratch.allocator(), 0, null)) |decimal| {
+            const view = decimal.physical;
+            const coefficients = view.vector.values.decimal128;
+            for (ids, 0..) |id, lane| {
+                const row = view.rowAt(lane);
+                if (view.vector.nulls.isNull(row)) continue;
+                try @import("../common/decimal128.zig").validateCoefficient(coefficients.values[row], coefficients.precision, coefficients.scale);
+                const number = try @import("numeric_value.zig").ScaledInteger.init(coefficients.values[row], @intCast(coefficients.scale));
+                try self.values.exact.items[id].add(number.view());
+            }
+            return;
+        };
+        if (try batch.physicalColumn(scratch.allocator(), 0)) |physical| if (try self.updatePhysical(a, ids, physical)) return;
         switch (batch) {
             .vectors => |vectors| return self.updateBatch(a, ids, vectors.values[0]),
-            .dictionary => |dictionary| for (ids, dictionary.indices) |id, index| {
-                if (index >= dictionary.values.len) return error.InvalidSqlBackendResponse;
-                try self.update(a, id, dictionary.values[index]);
+            .dictionary => |dictionary| {
+                if (self.values == .counts) {
+                    for (ids, dictionary.indices) |id, index| {
+                        if (index >= dictionary.values.len) return error.InvalidSqlBackendResponse;
+                        if (!dictionary.values[index].sql_null) self.values.counts.items[id] = try mergedCount(self.values.counts.items[id], 1);
+                    }
+                    return;
+                }
+                for (ids, dictionary.indices) |id, index| {
+                    if (index >= dictionary.values.len) return error.InvalidSqlBackendResponse;
+                    try self.update(a, id, dictionary.values[index]);
+                }
             },
-            else => for (ids, 0..) |id, index| try self.update(a, id, try batch.cell(a, index, 0)),
+            else => for (ids, 0..) |id, index| try self.update(a, id, try batch.cell(scratch.allocator(), index, 0)),
         }
+    }
+    pub fn updateCohort(self: *Column, a: A, ids: []const usize, source: @import("execution_batch.zig").Batch, positions: []const usize) !void {
+        if (source.len() != positions.len) return error.InvalidSqlBackendResponse;
+        var scratch = std.heap.ArenaAllocator.init(a);
+        defer scratch.deinit();
+        if (self.values == .exact) if (try source.decimalColumnSelected(scratch.allocator(), 0, null)) |decimal| {
+            for (positions, 0..) |position, lane| {
+                if (position >= ids.len) return error.InvalidSqlBackendResponse;
+                var fixed: @import("numeric_value.zig").ScaledInteger = undefined;
+                var number: @import("numeric_value.zig").Value = undefined;
+                const value = try decimal.cell(lane, &fixed, &number);
+                if (!value.sql_null) try self.values.exact.items[ids[position]].add(number);
+            }
+            return;
+        };
+        const physical = try source.physicalColumn(scratch.allocator(), 0);
+        var begin: usize = 0;
+        var selected_ids: [256]usize = undefined;
+        while (begin < positions.len) {
+            const length = @min(selected_ids.len, positions.len - begin);
+            for (positions[begin..][0..length], selected_ids[0..length]) |position, *id| {
+                if (position >= ids.len) return error.InvalidSqlBackendResponse;
+                id.* = ids[position];
+            }
+            if (physical) |native| {
+                const view = native.slice(begin, begin + length);
+                if (try self.updatePhysical(a, selected_ids[0..length], view)) {
+                    begin += length;
+                    continue;
+                }
+            }
+            for (selected_ids[0..length], 0..) |id, offset| try self.update(a, id, try source.cell(scratch.allocator(), begin + offset, 0));
+            begin += length;
+        }
+    }
+    fn physicalValue(values: anytype, row: usize) switch (@typeInfo(@TypeOf(values))) {
+        .pointer => |p| p.child,
+        else => @TypeOf(values.values[0]),
+    } {
+        return switch (@typeInfo(@TypeOf(values))) {
+            .pointer => values[row],
+            else => values.at(row),
+        };
+    }
+    /// Dispatch once per state/vector pair. Nulls and selections stay physical;
+    /// dictionary IDs are gathered directly without creating Datum arrays.
+    pub fn updatePhysical(self: *Column, a: A, ids: []const usize, physical: @import("execution_batch.zig").PhysicalColumn) !bool {
+        if (physical.len() != ids.len) return error.InvalidSqlBackendResponse;
+        const compatible = switch (self.values) {
+            .counts => true,
+            .integers => physical.kind == .integer,
+            .numbers => physical.kind == .number or (physical.kind == .integer and self.spec.kind == .avg),
+            .booleans => physical.kind == .boolean,
+            .bytes => physical.kind == .string,
+            else => false,
+        };
+        if (!compatible) return false;
+        try physical.validate();
+        const vector = physical.vector;
+        switch (self.values) {
+            .counts => |*states| for (ids, 0..) |id, lane| {
+                const row = physical.rowAt(lane);
+                if (!vector.nulls.isNull(row)) states.items[id] = try mergedCount(states.items[id], 1);
+            },
+            .integers => |*states| switch (vector.values) {
+                inline .i64, .dictionary_i64 => |values| for (ids, 0..) |id, lane| {
+                    const row = physical.rowAt(lane);
+                    if (vector.nulls.isNull(row)) continue;
+                    const value = physicalValue(values, row);
+                    const state = &states.items[id];
+                    const count = try mergedCount(state.count, 1);
+                    if (self.spec.kind == .sum) {
+                        state.sum = std.math.add(i128, state.sum, value) catch return error.SqlNumericOutOfRange;
+                    } else if (state.count == 0 or (if (self.spec.kind == .min) value < state.selected else value > state.selected)) state.selected = value;
+                    state.count = count;
+                },
+                else => unreachable,
+            },
+            .numbers => |*states| switch (vector.values) {
+                inline .i64, .dictionary_i64, .f64, .dictionary_f64 => |values| for (ids, 0..) |id, lane| {
+                    const row = physical.rowAt(lane);
+                    if (vector.nulls.isNull(row)) continue;
+                    const native = physicalValue(values, row);
+                    const value: f64 = if (@TypeOf(native) == i64) @floatFromInt(native) else native;
+                    const state = &states.items[id];
+                    const count = try mergedCount(state.count, 1);
+                    if (self.spec.kind == .sum) {
+                        if (self.spec.input_element == .float32) state.sum = try operators.Aggregate.addRealSum(state.sum, value) else try operators.Aggregate.addFloatSum(&state.sum, &state.compensation, value);
+                    } else if (self.spec.kind == .min or self.spec.kind == .max) {
+                        // SQL orders NaN above finite values and treats NaNs
+                        // and signed zero ties as equal, retaining the first.
+                        const order: std.math.Order = if (std.math.isNan(value)) (if (std.math.isNan(state.selected)) .eq else .gt) else if (std.math.isNan(state.selected)) .lt else std.math.order(value, state.selected);
+                        if (state.count == 0 or order == (if (self.spec.kind == .min) std.math.Order.lt else .gt)) state.selected = value;
+                    } else {
+                        const n: f64 = @floatFromInt(count);
+                        const delta = value - state.mean;
+                        if (!std.math.isFinite(state.mean) or !std.math.isFinite(value)) state.mean += value else {
+                            state.mean = if (std.math.isFinite(delta)) state.mean + delta / n else state.mean * ((n - 1) / n) + value / n;
+                            if (!std.math.isFinite(state.mean)) return error.SqlNumericOutOfRange;
+                        }
+                    }
+                    state.count = count;
+                },
+                else => unreachable,
+            },
+            .booleans => |*states| for (ids, 0..) |id, lane| {
+                const row = physical.rowAt(lane);
+                if (vector.nulls.isNull(row)) continue;
+                const value = vector.values.bool[row];
+                const state = &states.items[id];
+                const count = try mergedCount(state.count, 1);
+                switch (self.spec.kind) {
+                    .bool_and => state.value = state.value and value,
+                    .bool_or => state.value = state.value or value,
+                    .min => state.value = if (state.count == 0) value else state.value and value,
+                    .max => state.value = if (state.count == 0) value else state.value or value,
+                    else => unreachable,
+                }
+                state.count = count;
+            },
+            .bytes => |*states| switch (vector.values) {
+                inline .bytes, .dictionary_bytes => |values| for (ids, 0..) |id, lane| {
+                    const row = physical.rowAt(lane);
+                    if (vector.nulls.isNull(row)) continue;
+                    const value = physicalValue(values, row);
+                    const state = &states.items[id];
+                    const count = try mergedCount(state.count, 1);
+                    if (state.value == null or std.mem.order(u8, value, state.value.?) == (if (self.spec.kind == .min) std.math.Order.lt else .gt)) {
+                        const owned = try a.dupe(u8, value);
+                        if (state.value) |previous| a.free(previous);
+                        state.value = owned;
+                    }
+                    state.count = count;
+                },
+                else => unreachable,
+            },
+            else => unreachable,
+        }
+        return true;
+    }
+    /// Merge one validated AGS column after a shared destination-key census.
+    pub fn mergeFixedBatch(self: *Column, a: A, ids: []const usize, states: []const @import("aggregate_partial.zig").Fixed) !void {
+        if (ids.len != states.len) return error.InvalidSqlBackendResponse;
+        switch (self.values) {
+            .counts => |*target| for (ids, states) |id, from| {
+                target.items[id] = try mergedCount(target.items[id], from.count);
+            },
+            .exact => |*target| for (ids, states) |id, from| {
+                try target.items[id].merge(from.numeric orelse return error.InvalidSqlBackendResponse);
+            },
+            .integers => |*target| for (ids, states) |id, from| {
+                const to = &target.items[id];
+                const count = try mergedCount(to.count, from.count);
+                if (self.spec.kind == .sum) to.sum = std.math.add(i128, to.sum, from.sum) catch return error.SqlNumericOutOfRange else if (from.count != 0 and (to.count == 0 or (if (self.spec.kind == .min) from.selected.value.integer < to.selected else from.selected.value.integer > to.selected))) to.selected = from.selected.value.integer;
+                to.count = count;
+            },
+            .booleans => |*target| for (ids, states) |id, from| {
+                const to = &target.items[id];
+                const count = try mergedCount(to.count, from.count);
+                const value = if (self.spec.kind == .min or self.spec.kind == .max) if (from.count == 0) false else from.selected.value.bool else from.boolean;
+                if (from.count != 0) to.value = if (to.count == 0) value else if (self.spec.kind == .bool_and or self.spec.kind == .min) to.value and value else to.value or value;
+                to.count = count;
+            },
+            .bytes => |*target| for (ids, states) |id, from| {
+                const to = &target.items[id];
+                const count = try mergedCount(to.count, from.count);
+                if (from.count != 0 and (to.count == 0 or std.mem.order(u8, from.selected.value.string, to.value.?) == (if (self.spec.kind == .min) std.math.Order.lt else .gt))) {
+                    const owned = try a.dupe(u8, from.selected.value.string);
+                    if (to.value) |old| a.free(old);
+                    to.value = owned;
+                }
+                to.count = count;
+            },
+            else => return error.InvalidSqlBackendResponse,
+        }
+    }
+    /// Merge compact partial vectors directly after resolving destination IDs.
+    /// Typed states need no Aggregate snapshots, cloned reducers or OwnedRows.
+    pub fn mergeBatch(self: *Column, a: A, ids: []const usize, source: *const Column, begin: usize) !void {
+        return self.mergeSelectedBatch(a, ids, source, begin, null);
+    }
+    /// Selection vectors keep partial states typed across hash-owner exchanges.
+    pub fn mergeSelectedBatch(self: *Column, a: A, ids: []const usize, source: *const Column, begin: usize, indices: ?[]const usize) !void {
+        if (indices) |selected| if (selected.len != ids.len) return error.InvalidSqlBackendResponse;
+        if (!std.meta.eql(self.spec, source.spec)) return error.InvalidSqlBackendResponse;
+        if (std.meta.activeTag(self.values) != std.meta.activeTag(source.values)) {
+            if (self.values != .dynamic) try self.promote(a);
+            var arena = std.heap.ArenaAllocator.init(a);
+            defer arena.deinit();
+            for (ids, 0..) |id, offset| {
+                const index = if (indices) |selected| selected[offset] else begin + offset;
+                _ = arena.reset(.retain_capacity);
+                try @import("aggregate_partial.zig").merge(&self.values.dynamic.items[id], try source.snapshot(arena.allocator(), index));
+            }
+            return;
+        }
+        switch (self.values) {
+            .counts => |*target| for (ids, 0..) |id, offset| {
+                const index = if (indices) |selected| selected[offset] else begin + offset;
+                target.items[id] = try mergedCount(target.items[id], source.values.counts.items[index]);
+            },
+            .exact => |*target| for (ids, 0..) |id, offset| {
+                const index = if (indices) |selected| selected[offset] else begin + offset;
+                try target.items[id].merge(source.values.exact.items[index].state);
+            },
+            .integers => |*target| for (ids, 0..) |id, offset| {
+                const index = if (indices) |selected| selected[offset] else begin + offset;
+                const from = source.values.integers.items[index];
+                const to = &target.items[id];
+                const count = try mergedCount(to.count, from.count);
+                if (self.spec.kind == .sum) {
+                    to.sum = std.math.add(i128, to.sum, from.sum) catch return error.SqlNumericOutOfRange;
+                } else if (from.count != 0 and (to.count == 0 or (if (self.spec.kind == .min) from.selected < to.selected else from.selected > to.selected))) {
+                    to.selected = from.selected;
+                }
+                to.count = count;
+            },
+            .booleans => |*target| for (ids, 0..) |id, offset| {
+                const index = if (indices) |selected| selected[offset] else begin + offset;
+                const from = source.values.booleans.items[index];
+                const to = &target.items[id];
+                const count = try mergedCount(to.count, from.count);
+                if (from.count != 0) to.value = if (to.count == 0) from.value else if (self.spec.kind == .bool_and or self.spec.kind == .min) to.value and from.value else to.value or from.value;
+                to.count = count;
+            },
+            .bytes => |*target| for (ids, 0..) |id, offset| {
+                const index = if (indices) |selected| selected[offset] else begin + offset;
+                const from = source.values.bytes.items[index];
+                const to = &target.items[id];
+                const count = try mergedCount(to.count, from.count);
+                if (from.count != 0 and (to.count == 0 or std.mem.order(u8, from.value.?, to.value.?) == (if (self.spec.kind == .min) std.math.Order.lt else .gt))) {
+                    const bytes = try a.dupe(u8, from.value.?);
+                    if (to.value) |old| a.free(old);
+                    to.value = bytes;
+                }
+                to.count = count;
+            },
+            .dynamic => |*target| for (ids, 0..) |id, offset| {
+                const index = if (indices) |selected| selected[offset] else begin + offset;
+                try @import("aggregate_partial.zig").merge(&target.items[id], source.values.dynamic.items[index]);
+            },
+            .numbers => {
+                var arena = std.heap.ArenaAllocator.init(a);
+                defer arena.deinit();
+                for (ids, 0..) |id, offset| {
+                    const index = if (indices) |selected| selected[offset] else begin + offset;
+                    _ = arena.reset(.retain_capacity);
+                    try self.mergeExact(a, id, try source.snapshot(arena.allocator(), index));
+                }
+            },
+        }
+    }
+    fn mergedCount(left: u64, right: u64) !u64 {
+        const count = std.math.add(u64, left, right) catch return error.SqlNumericOutOfRange;
+        if (count > std.math.maxInt(i64)) return error.SqlNumericOutOfRange;
+        return count;
+    }
+    pub fn mergeGrowth(self: *const Column, index: ?usize, source: *const Column, from: usize) !usize {
+        switch (source.values) {
+            .exact => |values| {
+                const state = values.items[from].state;
+                return self.numericGrowth(index, state.weight, state.buckets.items.len);
+            },
+            .dynamic => |values| {
+                if (values.items[from].numeric) |reducer| return self.numericGrowth(index, reducer.state.weight, reducer.state.buckets.items.len);
+                if (values.items[from].selected) |selected| return (try operators.datumBytes(selected.row.values[0])) *| 4;
+            },
+            .bytes => |values| return if (values.items[from].value) |bytes| bytes.len +| 64 else 0,
+            else => {},
+        }
+        return 0;
     }
     pub fn mergeExact(self: *Column, a: A, index: usize, state: operators.Aggregate) !void {
         if (state.kind != self.spec.kind or state.input_type != self.spec.input_type or state.input_element != self.spec.input_element or state.distinct != self.spec.distinct) return error.InvalidSqlBackendResponse;
@@ -385,4 +728,200 @@ test "SQL typed aggregate vectors match scalar states for nulls mixed numerics a
             try std.testing.expectEqualDeep(try reference.finish(), try column.finish(0));
         }
     };
+}
+
+test "SQL typed partial merge batches allocate no primitive snapshots and own strings" {
+    const a = std.testing.allocator;
+    for ([_]operators.AggregateSpec{
+        .{ .kind = .count },                            .{ .kind = .sum, .input_type = .integer },
+        .{ .kind = .min, .input_type = .integer },      .{ .kind = .max, .input_type = .integer },
+        .{ .kind = .min, .input_type = .boolean },      .{ .kind = .max, .input_type = .boolean },
+        .{ .kind = .bool_and, .input_type = .boolean }, .{ .kind = .bool_or, .input_type = .boolean },
+    }) |spec| {
+        try std.testing.expect(operators.exactMergeable(spec));
+        var source = Column.init(spec);
+        defer source.clear(a);
+        var target = Column.init(spec);
+        defer target.clear(a);
+        var reference = try operators.Aggregate.init(a, spec.kind, spec.input_type);
+        defer reference.deinit();
+        try target.append(a);
+        for (0..129) |index| {
+            try source.append(a);
+            const value: Datum = if (index % 7 == 0) .{} else if (spec.input_type == .boolean) Datum.json(.{ .bool = index % 3 == 0 }) else Datum.json(.{ .integer = @as(i64, @intCast(index)) - 64 });
+            try source.update(a, index, value);
+            try reference.update(value);
+        }
+        var none = std.heap.FixedBufferAllocator.init(&.{});
+        const ids: [129]usize = @splat(0);
+        try target.mergeBatch(none.allocator(), &ids, &source, 0);
+        try std.testing.expectEqualDeep(try reference.finish(), try target.finish(0));
+    }
+    for ([_]operators.Aggregate.Kind{ .min, .max }) |kind| {
+        var source = Column.init(.{ .kind = kind, .input_type = .string });
+        errdefer source.clear(a);
+        var target = Column.init(source.spec);
+        defer target.clear(a);
+        try target.append(a);
+        for ([_][]const u8{ "zebra", "apple", "apple" }, 0..) |text, index| {
+            try source.append(a);
+            try source.update(a, index, Datum.json(.{ .string = text }));
+        }
+        try target.mergeBatch(a, &.{ 0, 0, 0 }, &source, 0);
+        source.clear(a);
+        try std.testing.expectEqualStrings(if (kind == .min) "apple" else "zebra", (try target.finish(0)).value.string);
+    }
+    try std.testing.expect(!operators.exactMergeable(.{ .kind = .min, .input_type = .number }));
+    try std.testing.expect(operators.exactMergeable(.{ .kind = .min, .input_type = .integer, .input_element = .int32 }));
+    try std.testing.expect(operators.exactMergeable(.{ .kind = .max, .input_type = .string, .input_element = .text }));
+}
+
+test "SQL typed partial merge batches select exact NUMERIC lanes" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    var work: @import("array_value.zig").Budget = .{};
+    const scalar = @import("scalar.zig");
+    const low = try scalar.numericTextLeaky(arena.allocator(), "1.1", &work);
+    const high = try scalar.numericTextLeaky(arena.allocator(), "2.2", &work);
+    const expected = try scalar.numericTextLeaky(arena.allocator(), "5.5", &work);
+    var source = Column.init(.{ .kind = .sum, .input_type = .number, .input_element = .numeric });
+    defer source.clear(a);
+    var target = Column.init(source.spec);
+    defer target.clear(a);
+    try source.append(a);
+    try source.append(a);
+    try source.update(a, 0, low);
+    try source.update(a, 1, high);
+    try target.append(a);
+    try target.mergeSelectedBatch(a, &.{ 0, 0, 0 }, &source, 0, &.{ 1, 0, 1 });
+    try std.testing.expectEqual(std.math.Order.eq, try scalar.compareDatums(expected, try target.finish(0)));
+}
+
+fn physicalKernelScenario(a: A) !void {
+    var scratch = std.heap.ArenaAllocator.init(a);
+    defer scratch.deinit();
+    const alloc = scratch.allocator();
+    const Batch = @import("execution_batch.zig").Batch;
+    const Vector = @import("../storage/rowsource/types.zig").ColumnVector;
+    const vectors = [_]Vector{
+        .{ .name = "n", .values = .{ .i64 = &.{ std.math.maxInt(i64), -7, 0, std.math.minInt(i64) } }, .nulls = .{ .bytes = &.{ 0, 0, 1, 0 } } },
+        .{ .name = "n", .values = .{ .dictionary_i64 = .{ .values = &.{ std.math.maxInt(i64), -7, std.math.minInt(i64) }, .indices = &.{ 0, 1, 99, 2 } } }, .nulls = .{ .bytes = &.{ 0, 0, 1, 0 } } },
+        .{ .name = "n", .values = .{ .bool = &.{ true, false, true, false } }, .nulls = .{ .bytes = &.{ 0, 0, 1, 0 } } },
+        .{ .name = "n", .values = .{ .dictionary_bytes = .{ .values = &.{ "zeta", "alpha", "beta" }, .indices = &.{ 0, 1, 99, 2 } } }, .nulls = .{ .bytes = &.{ 0, 0, 1, 0 } } },
+        .{ .name = "n", .values = .{ .f64 = &.{ 9007199254740992, 1, 0, -9007199254740992 } }, .nulls = .{ .bytes = &.{ 0, 0, 1, 0 } } },
+    };
+    for (vectors) |vector| {
+        const kind: @import("ast.zig").ColumnType = switch (vector.values) {
+            .i64, .dictionary_i64 => .integer,
+            .bool => .boolean,
+            .dictionary_bytes => .string,
+            else => .number,
+        };
+        const definitions = [_]@import("scalar.zig").Column{.{ .name = "n", .type = kind }};
+        const source: Batch = .{ .columns = .{ .definitions = &definitions, .page = .{
+            .batch = .{ .snapshot = .{ .table_id = "t", .snapshot_id = "s" }, .row_refs = &.{ .{ .relational_key = "a" }, .{ .relational_key = "b" }, .{ .relational_key = "c" }, .{ .relational_key = "d" } }, .columns = &.{vector} },
+            .selection = &.{ 3, 2, 0, 1, 0 },
+        } } };
+        const projected = try source.project(alloc, 0);
+        const selected = try projected.select(alloc, &.{ 0, 1, 2, 3, 4, 2 });
+        try std.testing.expect((try selected.physicalColumn(alloc, 0)) != null);
+        const ids = [_]usize{ 0, 1, 0, 1, 0, 1 };
+        for ([_]operators.Aggregate.Kind{ .count, .sum, .avg, .min, .max, .bool_and, .bool_or }) |operation| {
+            if ((operation == .sum or operation == .avg) and kind != .integer and kind != .number) continue;
+            if ((operation == .bool_and or operation == .bool_or) and kind != .boolean) continue;
+            const spec: operators.AggregateSpec = .{ .kind = operation, .input_type = kind };
+            var native = Column.init(spec);
+            defer native.clear(alloc);
+            var scalar_state = Column.init(spec);
+            defer scalar_state.clear(alloc);
+            for (0..2) |_| {
+                try native.append(alloc);
+                try scalar_state.append(alloc);
+            }
+            try native.updateEncoded(alloc, &ids, selected);
+            for (ids, 0..) |id, index| try scalar_state.update(alloc, id, try selected.cell(alloc, index, 0));
+            for (0..2) |index| {
+                // Compare wide transition states before integer final narrowing.
+                const actual = try native.snapshot(alloc, index);
+                const expected = try scalar_state.snapshot(alloc, index);
+                try std.testing.expectEqual(expected.count, actual.count);
+                try std.testing.expectEqual(expected.integer_sum, actual.integer_sum);
+                try std.testing.expectEqual(@as(u64, @bitCast(expected.number_sum)), @as(u64, @bitCast(actual.number_sum)));
+                try std.testing.expectEqual(@as(u64, @bitCast(expected.compensation)), @as(u64, @bitCast(actual.compensation)));
+                if (!(operation == .sum and kind == .integer)) try std.testing.expectEqualDeep(try expected.finish(), try actual.finish());
+            }
+        }
+    }
+}
+test "SQL physical aggregate kernels preserve selections null dictionaries and exact transitions" {
+    try physicalKernelScenario(std.testing.allocator);
+    var column = Column.init(.{ .kind = .sum, .input_type = .integer });
+    defer column.clear(std.testing.allocator);
+    try column.append(std.testing.allocator);
+    var none = std.heap.FixedBufferAllocator.init(&.{});
+    try std.testing.expect(try column.updatePhysical(none.allocator(), &.{ 0, 0, 0 }, .{
+        .kind = .integer,
+        .selection = &.{ 2, 0, 1 },
+        .vector = .{ .name = "n", .values = .{ .dictionary_i64 = .{ .values = &.{ 7, -3 }, .indices = &.{ 0, 1, 99 } } }, .nulls = .{ .bytes = &.{ 0, 0, 1 } } },
+    }));
+    try std.testing.expectEqual(@as(i64, 4), (try column.finish(0)).value.integer);
+}
+
+fn physicalBytesFailure(a: A) !void {
+    var column = Column.init(.{ .kind = .min, .input_type = .string });
+    defer column.clear(a);
+    try column.append(a);
+    try std.testing.expect(try column.updatePhysical(a, &.{ 0, 0, 0 }, .{
+        .kind = .string,
+        .selection = &.{ 0, 1, 2 },
+        .vector = .{ .name = "n", .values = .{ .bytes = &.{ "zeta", "alpha", "beta" } } },
+    }));
+    try std.testing.expectEqualStrings("alpha", (try column.finish(0)).value.string);
+}
+test "SQL physical aggregate byte winners unwind allocation failures" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, physicalBytesFailure, .{});
+}
+
+test "SQL physical floating extrema retain NaN ordering and signed zero ties" {
+    const a = std.testing.allocator;
+    for ([_]operators.Aggregate.Kind{ .min, .max }) |kind| {
+        var column = Column.init(.{ .kind = kind, .input_type = .number, .input_element = .float64 });
+        defer column.clear(a);
+        try column.append(a);
+        var none = std.heap.FixedBufferAllocator.init(&.{});
+        try std.testing.expect(try column.updatePhysical(none.allocator(), &.{ 0, 0, 0, 0 }, .{
+            .kind = .number,
+            .element = .float64,
+            .selection = &.{ 0, 1, 2, 3 },
+            .vector = .{ .name = "f", .values = .{ .f64 = &.{ -0.0, 0.0, std.math.nan(f64), std.math.inf(f64) } } },
+        }));
+        const value = (try column.finish(0)).value.float;
+        if (kind == .max) try std.testing.expect(std.math.isNan(value)) else try std.testing.expectEqual(@as(u64, @bitCast(@as(f64, -0.0))), @as(u64, @bitCast(value)));
+    }
+}
+
+test "SQL decimal coefficient aggregates widen without per-lane allocations and retain null selections" {
+    const a = std.testing.allocator;
+    var tracked = std.testing.FailingAllocator.init(a, .{});
+    const alloc = tracked.allocator();
+    var selection: [1024]usize = undefined;
+    for (&selection, 0..) |*row_index, index| row_index.* = if (index % 7 == 0) 2 else index % 2;
+    const source: @import("catalog.zig").ColumnPage = .{ .batch = .{ .snapshot = .{ .table_id = "t", .snapshot_id = "s" }, .row_refs = &.{ .{ .relational_key = "a" }, .{ .relational_key = "b" }, .{ .relational_key = "null" } }, .columns = &.{.{ .name = "n", .values = .{ .decimal128 = .{ .values = &.{ 99999999999999999999999999999999999999, 99999999999999999999999999999999999999, std.math.minInt(i128) }, .precision = 38, .scale = 4 } }, .nulls = .{ .bytes = &.{ 0, 0, 1 } } }} }, .selection = &selection };
+    const batch: @import("execution_batch.zig").Batch = .{ .columns = .{ .page = source, .definitions = &.{.{ .name = "n", .type = .number, .element_type = .numeric }} } };
+    var state = Column.init(.{ .kind = .sum, .input_type = .number, .input_element = .numeric });
+    defer state.clear(alloc);
+    try state.append(alloc);
+    var warm = batch;
+    warm.columns.page.selection = &.{0};
+    try state.updateEncoded(alloc, &.{0}, warm);
+    const before = tracked.alloc_index;
+    const ids: [1024]usize = @splat(0);
+    try state.updateEncoded(alloc, &ids, batch);
+    try std.testing.expectEqual(before, tracked.alloc_index);
+    const result = try state.finish(0);
+    var context: @import("numeric_value.zig").Context = .{ .alloc = a };
+    const text = try @import("numeric_value.zig").format(&context, result.numeric.?.*);
+    defer a.free(text);
+    try std.testing.expectEqualStrings("8779999999999999999999999999999999999.9122", text);
 }

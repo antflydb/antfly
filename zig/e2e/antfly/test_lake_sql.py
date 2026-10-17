@@ -24,6 +24,7 @@ import os
 import shutil
 import struct
 import time
+from decimal import Decimal
 from pathlib import Path
 
 import pytest
@@ -121,16 +122,31 @@ def test_parquet_attachment_survives_restart_and_streams_over_pgwire(
     try:
 
         def request(method, path, payload=None):
-            try:
-                response = requests.request(
-                    method,
-                    server.api_url + path,
-                    json=payload,
-                    auth=("admin", AUTH_BOOTSTRAP_PASSWORD),
-                    timeout=60,
-                )
-            except requests.RequestException as exc:
-                pytest.fail(f"{exc}\n{server.debug_logs()}")
+            deadline = time.monotonic() + 30
+            while True:
+                try:
+                    response = requests.request(
+                        method,
+                        server.api_url + path,
+                        json=payload,
+                        auth=("admin", AUTH_BOOTSTRAP_PASSWORD),
+                        timeout=60,
+                    )
+                except requests.RequestException as exc:
+                    pytest.fail(f"{exc}\n{server.debug_logs()}")
+                # Background publication may win the catalog CAS before this
+                # index creation is admitted. Replay only that explicit conflict.
+                if (
+                    method == "POST"
+                    and "/indexes/" in path
+                    and response.status_code == 409
+                    and response.json().get("error") == "table_mutation_conflict"
+                    and response.json().get("retryable") is True
+                    and time.monotonic() < deadline
+                ):
+                    time.sleep(0.1)
+                    continue
+                break
             assert response.ok, (
                 response.text + "\n" + server.log_path.read_text()[-8000:]
             )
@@ -2266,6 +2282,10 @@ def test_native_remote_incremental_generations_keep_public_identity_and_file_art
             # Resolve both legacy arrays and authenticated paged catalogs.
             # Detailed segment descriptors are not maintenance file manifests.
             for document in roots:
+                if document.get("serving"):
+                    # The publication carries the prior-snapshot proof used by
+                    # append/replacement planning, including after cold restart.
+                    assert document.get("inventory_delta_version") == 2, document
                 if document.get("inventory_version") == 3:
                     chunks = {}
                     file_root = document["directories"]["files"]
@@ -2955,6 +2975,33 @@ def test_native_remote_indexed_metadata_predicates_above_id_list_limit(tmp_path)
                 == fallback["hits"]["total"]
                 == {"value": expected, "relation": "exact"}
             )
+        # More than 4,096 matching rows can still occupy a small pack range.
+        # Compare lazy indexed admission with an equivalent authoritative filter
+        # whose required-condition proof deliberately cannot be extracted.
+        large_range = {"range": {"path": "/amount", "gte": count - 10000}}
+        ranged_native = query(large_range, profile=True)
+        assert ranged_native["profile"]["sort"]["selection_reason"] == (
+            "indexed_predicate_text_admission"
+        ), ranged_native
+        ranged_oracle = query(
+            {
+                "bool": {
+                    "should": [large_range, {"match_all": {}}],
+                    "minimum_should_match": 2,
+                }
+            }
+        )
+        assert [hit["_id"] for hit in ranged_native["hits"]["hits"]] == [
+            hit["_id"] for hit in ranged_oracle["hits"]["hits"]
+        ]
+        for direct_hit, oracle_hit in zip(
+            ranged_native["hits"]["hits"], ranged_oracle["hits"]["hits"], strict=True
+        ):
+            assert direct_hit["_score"] == pytest.approx(oracle_hit["_score"], abs=1e-6)
+        assert query(large_range, count=True, fields=[], limit=0)["hits"]["total"] == {
+            "value": 10000,
+            "relation": "exact",
+        }
         broad = {"term": {"path": "/category", "value": "comment"}}
         hits = query(broad)["hits"]["hits"]
         assert len(hits) == 10 and all(h["_source"]["amount"] >= 2 for h in hits)
@@ -2974,7 +3021,7 @@ def test_native_remote_indexed_metadata_predicates_above_id_list_limit(tmp_path)
             assert [h["_source"]["amount"] for h in unfiltered["hits"]["hits"]] == [
                 amount
             ]
-            # The prefix clause forces full-corpus admission but cannot match.
+            # The prefix clause requires complete bounded admission but cannot match.
             # Selective routing must retain global BM25 collection statistics.
             full_corpus = query(
                 {"match_all": {}},
@@ -4287,7 +4334,10 @@ def test_dynamic_join_uses_bounded_native_index_seeks(tmp_path, covering):
         server.stop(test_failed=failed)
 
 
-@pytest.mark.parametrize("physical_type", ["integer", "decimal_string"])
+@pytest.mark.parametrize(
+    "physical_type",
+    ["integer", "decimal_string", "decimal128", "decimal128_dictionary"],
+)
 def test_numeric_dynamic_join_uses_exact_covering_index(tmp_path, physical_type):
     """NUMERIC seeks and covering filters agree beyond f64 precision, cold too."""
     pa = pytest.importorskip("pyarrow")
@@ -4305,13 +4355,17 @@ def test_numeric_dynamic_join_uses_exact_covering_index(tmp_path, physical_type)
             f"{i}.125" for i in range(2, count)
         ]
         targets = ["9007199254740993.125", "4095.125"]
-        values = pa.array(keys, type=pa.string())
+        values = (
+            pa.array([Decimal(k) for k in keys], type=pa.decimal128(38, 3))
+            if physical_type.startswith("decimal128")
+            else pa.array(keys, type=pa.string())
+        )
     path = tmp_path / "numeric.parquet"
     pq.write_table(
         pa.table({"k": values, "v": pa.array(range(count), type=pa.int64())}),
         path,
         compression="snappy",
-        use_dictionary=False,
+        use_dictionary=physical_type.endswith("_dictionary"),
         row_group_size=256,
     )
     payload = path.read_bytes()
@@ -4411,6 +4465,27 @@ def test_numeric_dynamic_join_uses_exact_covering_index(tmp_path, physical_type)
         residual = statement.replace("ON p.k=b.k", "ON p.k+CAST('0' AS NUMERIC)=b.k")
         assert call("POST", "/sql", {"statement": residual})["rows"] == expected
         assert call("POST", "/sql", {"statement": statement})["rows"] == expected
+        # Filtered three-way joins retain qualified output order after costing
+        # and inner-join enumeration; every scan shares the statement snapshot.
+        assert call(
+            "POST",
+            "/sql",
+            {
+                "statement": (
+                    "SELECT p.v,q.v,r.v FROM numeric_probe p "
+                    "JOIN numeric_probe q ON p.k=q.k "
+                    "JOIN (SELECT k,v FROM numeric_probe WHERE v=0) r "
+                    "ON q.k=r.k ORDER BY p.v"
+                )
+            },
+        )["rows"] == [["0", "0", "0"]]
+        assert call(
+            "POST",
+            "/sql",
+            {
+                "statement": f"SELECT k=CAST('{targets[0]}' AS NUMERIC) FROM numeric_probe WHERE v<2 ORDER BY v"
+            },
+        )["rows"] == [[True], [False]]
         server.pause()
         # Keep identity/footer intact but remove usable data pages, then drop
         # range caches. The repeated cold query must consume covering values.
@@ -4441,7 +4516,10 @@ def test_numeric_dynamic_join_uses_exact_covering_index(tmp_path, physical_type)
         server.stop(test_failed=failed)
 
 
-@pytest.mark.parametrize("physical_type", ["integer", "decimal_string"])
+@pytest.mark.parametrize(
+    "physical_type",
+    ["integer", "decimal_string", "decimal128", "decimal128_dictionary"],
+)
 def test_numeric_algebraic_materializations_keep_exact_groups_and_inputs(
     tmp_path, physical_type
 ):
@@ -4456,6 +4534,8 @@ def test_numeric_algebraic_materializations_keep_exact_groups_and_inputs(
     values = (
         pa.array([int(k) for k in keys] + [None], type=pa.int64())
         if physical_type == "integer"
+        else pa.array([Decimal(k) for k in keys] + [None], type=pa.decimal128(38, 3))
+        if physical_type.startswith("decimal128")
         else pa.array(keys + [None])
     )
     root = tmp_path / "lake"
@@ -4463,7 +4543,10 @@ def test_numeric_algebraic_materializations_keep_exact_groups_and_inputs(
     objects.mkdir(parents=True)
     path = tmp_path / "numeric.parquet"
     pq.write_table(
-        pa.table({"k": values}), path, compression="snappy", use_dictionary=False
+        pa.table({"k": values}),
+        path,
+        compression="snappy",
+        use_dictionary=physical_type.endswith("_dictionary"),
     )
     payload = path.read_bytes()
     header = (
@@ -4575,17 +4658,43 @@ def test_numeric_algebraic_materializations_keep_exact_groups_and_inputs(
         server.stop(test_failed=failed)
 
 
-def test_broad_native_text_windows_preserve_scores_ties_counts_and_hydration(tmp_path):
-    """More than 64 independent Parquet segments match the full-corpus path exactly."""
+def test_broad_native_text_windows_preserve_scores_ties_counts_and_hydration(
+    tmp_path, inference_reranker, monkeypatch
+):
+    """Paged source spans from 131 independent Parquet files match the full corpus exactly."""
+    import conftest
+
+    original_config = conftest._write_remote_content_e2e_config
+
+    def configured(root, **kwargs):
+        path = original_config(root, **kwargs)
+        config = json.loads(path.read_text())
+        config.setdefault("lake_indexes", {}).setdefault("text_cache", {})[
+            "admission_window_segments"
+        ] = 1
+        path.write_text(json.dumps(config))
+        return path
+
+    monkeypatch.setattr(conftest, "_write_remote_content_e2e_config", configured)
     pa = pytest.importorskip("pyarrow")
     pq = pytest.importorskip("pyarrow.parquet")
     root = tmp_path / "lake"
     objects = root / "buckets" / "antfly" / "objects"
     objects.mkdir(parents=True)
-    for part in range(67):
+    file_count = 131
+    row_count = file_count * 3
+    for part in range(file_count):
         path = tmp_path / "part.parquet"
         rows = [
-            {"body": "quasar " * (i % 4 + 1) + "common " * (i % 3), "amount": i}
+            {
+                "body": "quasar " * (i % 4 + 1)
+                + "common " * (i % 3)
+                + ("beta " if i % 2 else "alpha ")
+                + ("navquasar " if i in (3, row_count - 2) else "")
+                + f"vocab{i} ",
+                "amount": i,
+                "sparse_native": '{"1":1}',
+            }
             for i in range(part * 3, part * 3 + 3)
         ]
         pq.write_table(
@@ -4622,59 +4731,76 @@ def test_broad_native_text_windows_preserve_scores_ties_counts_and_hydration(tmp
                 else value
             )
 
-        call(
-            "POST",
-            "/tables/paged_text",
-            {
-                "num_shards": 1,
-                "schema": {
-                    "storage_mode": "relational",
-                    "default_type": "doc",
-                    "document_schemas": {
-                        "doc": {
-                            "schema": {
-                                "type": "object",
-                                "properties": {
-                                    "amount": {
-                                        "type": "integer",
-                                        "x-antfly-field": {
-                                            "type": "number",
-                                            "sortable": True,
-                                        },
-                                    },
-                                    "body": {
-                                        "type": "string",
-                                        "x-antfly-field": {"type": "text"},
+        definition = {
+            "num_shards": 1,
+            "schema": {
+                "storage_mode": "relational",
+                "default_type": "doc",
+                "document_schemas": {
+                    "doc": {
+                        "schema": {
+                            "type": "object",
+                            "properties": {
+                                "amount": {
+                                    "type": "integer",
+                                    "x-antfly-field": {
+                                        "type": "number",
+                                        "sortable": True,
                                     },
                                 },
-                            }
+                                "body": {
+                                    "type": "string",
+                                    "x-antfly-field": {"type": "text"},
+                                },
+                                "sparse_native": {"type": "string"},
+                            },
                         }
-                    },
-                    "relational_indexes": [
-                        {
-                            "name": "amount_idx",
-                            "keys": [{"column": "amount"}],
-                            "include_columns": ["body"],
-                        }
-                    ],
-                    "base_source": {
-                        "kind": "external",
-                        "table_id": "paged-text",
-                        "format": "parquet",
-                        "uri": root.as_uri(),
-                    },
+                    }
                 },
-                "indexes": {
-                    "body_text": {"type": "full_text", "field": "body"},
-                    "all_text": {"type": "full_text"},
-                    "stored_text": {
-                        "type": "full_text",
-                        "field": "body",
-                        "store_source": True,
-                    },
+                "relational_indexes": [
+                    {
+                        "name": "amount_idx",
+                        "keys": [{"column": "amount"}],
+                        "include_columns": ["body"],
+                    }
+                ],
+                "base_source": {
+                    "kind": "external",
+                    "table_id": "paged-text",
+                    "format": "parquet",
+                    "uri": root.as_uri(),
                 },
             },
+            "indexes": {
+                "body_text": {"type": "full_text", "field": "body"},
+                "all_text": {"type": "full_text"},
+                "stored_text": {
+                    "type": "full_text",
+                    "field": "body",
+                    "store_source": True,
+                },
+                "sparse_native": {
+                    "type": "embeddings",
+                    "external": True,
+                    "sparse": True,
+                },
+            },
+        }
+        call("POST", "/tables/paged_text", definition)
+        # One text index allows direct retrieval, exposing the native profile
+        # separately from the named-component fusion profile below.
+        profile_definition = json.loads(json.dumps(definition))
+        profile_definition["schema"]["base_source"]["table_id"] = "profile-text"
+        profile_definition["schema"]["relational_indexes"][0]["name"] = (
+            "profile_amount_idx"
         )
+        profile_definition["schema"]["relational_indexes"][0]["keys"] = [
+            {"column": "amount", "direction": "desc", "nulls": "last"}
+        ]
+        profile_definition["indexes"] = {
+            "body_text": {"type": "full_text", "store_source": True}
+        }
+        call("POST", "/tables/profile_text", profile_definition)
         deadline = time.monotonic() + 120
         while True:
             resource = call("GET", "/tables/paged_text/indexes/body_text")
@@ -4690,9 +4816,17 @@ def test_broad_native_text_windows_preserve_scores_ties_counts_and_hydration(tmp
             assert stored["status"]["readiness"]["state"] != "failed", (
                 str(stored) + server.debug_logs()
             )
+            sparse = call("GET", "/tables/paged_text/indexes/sparse_native")
+            assert sparse["status"]["readiness"]["state"] != "failed", (
+                str(sparse) + server.debug_logs()
+            )
+            profile_index = call("GET", "/tables/profile_text/indexes/body_text")
+            assert profile_index["status"]["readiness"]["state"] != "failed", (
+                str(profile_index) + server.debug_logs()
+            )
             if all(
                 item["status"]["readiness"]["queryable"]
-                for item in (resource, sortable, stored)
+                for item in (resource, sortable, stored, sparse, profile_index)
             ):
                 break
             assert time.monotonic() < deadline, str(resource) + server.debug_logs()
@@ -4701,16 +4835,30 @@ def test_broad_native_text_windows_preserve_scores_ties_counts_and_hydration(tmp
             "full_text_search": {"match": "quasar", "field": "body"},
             "full_text_index": "body_text",
             "fields": ["amount"],
-            "limit": 201,
+            "limit": row_count,
         }
-        # Profiling deliberately uses full admission, providing an independent
-        # score/tie oracle for the bounded coordinator and final hydration.
-        oracle = call("POST", "/tables/paged_text/query", dict(request, profile=True))
+
+        def full_admission(query):
+            # Exercise alternate Boolean lowering without changing scores.
+            # The all-row regression below independently verifies global cuts.
+            baseline = {
+                "bool": {
+                    "must_not": [{"term": "neverpresentoracle", "field": "body"}],
+                    "boost": 0,
+                }
+            }
+            reference = dict(query, profile=True)
+            reference["full_text_search"] = {
+                "bool": {"must": [query["full_text_search"]], "should": [baseline]}
+            }
+            return call("POST", "/tables/paged_text/query", reference)
+
+        oracle = full_admission(request)
         expected = [
             (h["_id"], h["_score"], h["_source"]["amount"])
             for h in oracle["hits"]["hits"]
         ]
-        assert len(expected) == 201
+        assert len(expected) == row_count
 
         def check():
             result = call(
@@ -4720,15 +4868,237 @@ def test_broad_native_text_windows_preserve_scores_ties_counts_and_hydration(tmp
                 (h["_id"], h["_score"], h["_source"]["amount"])
                 for h in result["hits"]["hits"]
             ] == expected[61:80]
+            # Direct retrieval exposes its native profile. Named components
+            # retain the parent's fusion profile instead.
+            direct = dict(request, limit=19, offset=61, profile=True)
+            del direct["full_text_index"]
+            profiled = call("POST", "/tables/profile_text/query", direct)
+            assert [
+                (h["_score"], h["_source"]["amount"]) for h in profiled["hits"]["hits"]
+            ] == [(score, amount) for _, score, amount in expected[61:80]]
+            assert profiled["profile"]["sort"]["plan"] == "score_top_k", profiled
+            assert profiled["profile"]["sort"]["selection_reason"] == (
+                "bounded_global_text_frontier"
+            ), profiled
+            # Constant-score clauses keep finite bounds in selective Boolean trees.
+            for clause in ("must", "should"):
+                boolean = {"must": [direct["full_text_search"]]}
+                boolean.setdefault(clause, []).append({"match_all": {}})
+                mixed = dict(direct, full_text_search={"bool": boolean})
+                found = call("POST", "/tables/profile_text/query", mixed)
+                complete = full_admission(
+                    dict(request, full_text_search=mixed["full_text_search"])
+                )
+                assert [
+                    (h["_score"], h["_source"]["amount"]) for h in found["hits"]["hits"]
+                ] == [
+                    (h["_score"], h["_source"]["amount"])
+                    for h in complete["hits"]["hits"][61:80]
+                ]
+                assert found["profile"]["sort"]["selection_reason"] == (
+                    "bounded_global_text_frontier"
+                ), found
+            # Pattern admission uses the global vocabulary and routing summaries,
+            # with equivalent Boolean lowering for score and result comparisons.
+            for pattern in (
+                {"prefix": "navquasa", "field": "body"},
+                {"wildcard": "navquasa?", "field": "body"},
+                {"regexp": "navquasa[a-z]", "field": "body"},
+                {"fuzzy": "navquasor", "field": "body", "fuzziness": 1},
+            ):
+                patterned = dict(direct, full_text_search=pattern, offset=0, limit=7)
+                found = call("POST", "/tables/profile_text/query", patterned)
+                complete = full_admission(dict(request, full_text_search=pattern))
+                assert [
+                    (h["_score"], h["_source"]["amount"]) for h in found["hits"]["hits"]
+                ] == [
+                    (h["_score"], h["_source"]["amount"])
+                    for h in complete["hits"]["hits"]
+                ]
+                assert {h["_source"]["amount"] for h in found["hits"]["hits"]} == {
+                    3,
+                    row_count - 2,
+                }
+                assert found["profile"]["sort"]["selection_reason"] == (
+                    "bounded_global_text_frontier"
+                ), found
+            # Constant-score ties retain the independent full-admission order.
+            for prefix, offset in (("qu", 0), ("qu", 61), ("vocab", 0), ("vocab", 61)):
+                tied = dict(
+                    direct,
+                    full_text_search={"prefix": prefix, "field": "body"},
+                    offset=offset,
+                    limit=19,
+                )
+                found = call("POST", "/tables/profile_text/query", tied)
+                complete = full_admission(
+                    dict(
+                        request,
+                        full_text_search=tied["full_text_search"],
+                        offset=offset,
+                        limit=19,
+                    )
+                )
+                assert [
+                    (h["_score"], h["_source"]["amount"]) for h in found["hits"]["hits"]
+                ] == [
+                    (h["_score"], h["_source"]["amount"])
+                    for h in complete["hits"]["hits"]
+                ]
+            # The global upper bound must include nested negative-only scores.
+            # Fetching all rows establishes an independent page oracle without
+            # allowing a competitive global cutoff to prune any pack.
+            for positive in (
+                {"match": "quasar", "field": "body"},
+                {"prefix": "vocab", "field": "body"},
+                {"match_phrase": "quasar quasar", "field": "body"},
+            ):
+                nested = {
+                    "bool": {
+                        "must": [
+                            positive,
+                            {
+                                "bool": {
+                                    "must_not": [
+                                        {
+                                            "term": "neverpresentbaseline",
+                                            "field": "body",
+                                        }
+                                    ],
+                                    "boost": 3,
+                                }
+                            },
+                        ]
+                    }
+                }
+                all_rows = call(
+                    "POST",
+                    "/tables/profile_text/query",
+                    dict(direct, full_text_search=nested, offset=0, limit=row_count),
+                )["hits"]["hits"]
+                for offset in (0, 61):
+                    page = call(
+                        "POST",
+                        "/tables/profile_text/query",
+                        dict(direct, full_text_search=nested, offset=offset, limit=19),
+                    )["hits"]["hits"]
+                    assert page == all_rows[offset : offset + 19]
+            filtered_query = dict(
+                direct,
+                offset=0,
+                limit=7,
+                filter_query={"range": {"path": "/amount", "gte": 50, "lt": 160}},
+            )
+            filtered = call("POST", "/tables/profile_text/query", filtered_query)
+            complete = full_admission(
+                dict(
+                    request,
+                    filter_query=filtered_query["filter_query"],
+                    offset=0,
+                    limit=7,
+                )
+            )
+            assert [
+                (h["_score"], h["_source"]["amount"]) for h in filtered["hits"]["hits"]
+            ] == [
+                (h["_score"], h["_source"]["amount"]) for h in complete["hits"]["hits"]
+            ]
+            highlighted = call(
+                "POST",
+                "/tables/profile_text/query",
+                dict(direct, highlight={"fields": ["body"]}),
+            )
+            assert highlighted["profile"]["sort"]["selection_reason"] == (
+                "bounded_global_text_frontier"
+            ), highlighted
+            assert all(h["_highlights"]["body"] for h in highlighted["hits"]["hits"])
+            metadata_count = call(
+                "POST", "/tables/profile_text/query", dict(direct, limit=0, offset=0)
+            )
+            assert metadata_count["hits"]["total"] == {
+                "value": row_count,
+                "relation": "exact",
+            }
+            assert metadata_count["profile"]["sort"]["selection_reason"] == (
+                "native_text_metadata_count"
+            ), metadata_count
+            ordered_query = dict(
+                direct, limit=7, offset=0, order_by=[{"field": "amount", "desc": True}]
+            )
+            ordered = call("POST", "/tables/profile_text/query", ordered_query)
+            assert ordered["profile"]["sort"]["selection_reason"] == (
+                "bounded_ordered_lake_index"
+            ), json.dumps(ordered["profile"], sort_keys=True)
+            assert [h["_source"]["amount"] for h in ordered["hits"]["hits"]] == list(
+                range(row_count - 1, row_count - 8, -1)
+            )
+            forward = call(
+                "POST",
+                "/tables/profile_text/query",
+                dict(
+                    ordered_query,
+                    search_after=ordered["hits"]["hits"][-1]["_sort"],
+                    remote_snapshot=ordered["remote_snapshot"],
+                ),
+            )
+            assert [h["_source"]["amount"] for h in forward["hits"]["hits"]] == list(
+                range(row_count - 8, row_count - 15, -1)
+            )
+            backward = call(
+                "POST",
+                "/tables/profile_text/query",
+                dict(
+                    ordered_query,
+                    search_before=forward["hits"]["hits"][0]["_sort"],
+                    remote_snapshot=forward["remote_snapshot"],
+                ),
+            )
+            assert backward["hits"]["hits"] == ordered["hits"]["hits"]
             total = result["hits"]["total"]
             assert total["relation"] in ("exact", "gte")
-            assert total["value"] <= 201
+            assert total["value"] <= row_count
             if total["relation"] == "exact":
-                assert total["value"] == 201
+                assert total["value"] == row_count
             counted = call("POST", "/tables/paged_text/query", dict(request, limit=0))
-            assert counted["hits"]["total"] == {"value": 201, "relation": "exact"}
+            assert counted["hits"]["total"] == {"value": row_count, "relation": "exact"}
             assert counted["hits"]["hits"] == []
             shapes = [
+                {
+                    "embeddings": {"sparse_native": {"indices": [1], "values": [1]}},
+                    "indexes": ["sparse_native"],
+                    "highlight": {"fields": ["body"]},
+                },
+                {
+                    "evaluate": {
+                        "scope": "candidates",
+                        "candidate_count": 31,
+                        "compute": {"hidden_body": {"field": "body"}},
+                        "order_by": [
+                            {"expression": {"field": "amount"}, "descending": True}
+                        ],
+                    }
+                },
+                {
+                    "evaluate": {
+                        "scope": "matches",
+                        "max_rows": row_count,
+                        "compute": {"hidden_body": {"field": "body"}},
+                        "order_by": [
+                            {"expression": {"field": "amount"}, "descending": True}
+                        ],
+                    },
+                    "highlight": {"fields": ["body"]},
+                },
+                {"pruner": {"min_score_ratio": 0.75}},
+                {
+                    "reranker": {
+                        "provider": "antfly",
+                        "model": "test-reranker",
+                        "url": inference_reranker,
+                        "field": "body",
+                        "candidate_count": 31,
+                    }
+                },
                 {"highlight": {"fields": ["body"]}},
                 {"full_text_index": "stored_text", "highlight": {"fields": ["body"]}},
                 {"filter_query": {"range": {"path": "/amount", "gte": 50, "lt": 160}}},
@@ -4752,29 +5122,69 @@ def test_broad_native_text_windows_preserve_scores_ties_counts_and_hydration(tmp
                     "highlight": {"fields": ["body"]},
                 },
             ]
+            # Score transforms and evaluation must page once after the global
+            # candidate pool is selected, including nonzero offsets.
+            shapes += [
+                dict(shape, offset=3)
+                for shape in shapes
+                if any(name in shape for name in ("evaluate", "pruner", "reranker"))
+            ]
+            shapes += [
+                dict(shape, fields=[])
+                for shape in shapes
+                if "reranker" in shape and "offset" not in shape
+            ]
             for shape in shapes:
                 query = dict(request, **shape, limit=7)
-                reference = call(
-                    "POST", "/tables/paged_text/query", dict(query, profile=True)
-                )
+                reference = full_admission(query)
                 actual = call("POST", "/tables/paged_text/query", query)
                 assert actual["hits"]["hits"] == reference["hits"]["hits"], (
                     actual,
                     reference,
                 )
-                counted = call("POST", "/tables/paged_text/query", dict(query, limit=0))
-                assert (
-                    counted["hits"]["total"]
-                    == call(
-                        "POST",
-                        "/tables/paged_text/query",
-                        dict(query, limit=0, profile=True),
-                    )["hits"]["total"]
+                profiled = call(
+                    "POST", "/tables/paged_text/query", dict(query, profile=True)
                 )
-                assert counted["hits"]["hits"] == []
+                assert profiled["hits"]["hits"] == actual["hits"]["hits"]
+                if (
+                    "reranker" not in shape
+                    and "pruner" not in shape
+                    and "evaluate" not in shape
+                ):
+                    counted = call(
+                        "POST", "/tables/paged_text/query", dict(query, limit=0)
+                    )
+                    assert (
+                        counted["hits"]["total"]
+                        == full_admission(dict(query, limit=0))["hits"]["total"]
+                    )
+                    assert counted["hits"]["hits"] == []
                 assert all(
-                    set(h["_source"]) == {"amount"} for h in actual["hits"]["hits"]
+                    set(h["_source"]) == set(query["fields"])
+                    for h in actual["hits"]["hits"]
                 )
+                if "evaluate" in shape:
+                    assert actual["evaluation"]["evaluated_rows"] == shape[
+                        "evaluate"
+                    ].get("candidate_count", shape["evaluate"].get("max_rows")), actual
+                    for hit in actual["hits"]["hits"]:
+                        amount = hit["_source"]["amount"]
+                        assert hit["_computed"]["hidden_body"] == (
+                            "quasar " * (amount % 4 + 1)
+                            + "common " * (amount % 3)
+                            + ("beta " if amount % 2 else "alpha ")
+                            + ("navquasar " if amount in (3, row_count - 2) else "")
+                            + f"vocab{amount} "
+                        )
+                if "reranker" in shape:
+                    assert (
+                        profiled["profile"]["reranker"]["documents_reranked"] == 31
+                    ), profiled
+                if "reranker" in shape and query["fields"]:
+                    for hit in actual["hits"]["hits"]:
+                        assert hit["_score"] == pytest.approx(
+                            0.95 if hit["_source"]["amount"] % 2 else 0.6
+                        )
                 if "highlight" in shape:
                     assert all(h["_highlights"]["body"] for h in actual["hits"]["hits"])
                 if "order_by" in shape:
@@ -4787,11 +5197,7 @@ def test_broad_native_text_windows_preserve_scores_ties_counts_and_hydration(tmp
                     following = call("POST", "/tables/paged_text/query", forward)
                     assert (
                         following["hits"]["hits"]
-                        == call(
-                            "POST",
-                            "/tables/paged_text/query",
-                            dict(forward, profile=True),
-                        )["hits"]["hits"]
+                        == full_admission(forward)["hits"]["hits"]
                     )
                     backward = dict(
                         query,
@@ -4806,6 +5212,23 @@ def test_broad_native_text_windows_preserve_scores_ties_counts_and_hydration(tmp
                     )
 
         check()
+        rejected = requests.post(
+            server.api_url + "/tables/paged_text/query",
+            json=dict(
+                request,
+                evaluate={
+                    "scope": "matches",
+                    "max_rows": 31,
+                    "compute": {"hidden_body": {"field": "body"}},
+                },
+            ),
+            auth=("admin", AUTH_BOOTSTRAP_PASSWORD),
+            timeout=120,
+        )
+        assert (
+            rejected.status_code == 422
+            and "decision_limit_exceeded" in rejected.text.lower()
+        ), rejected.text + server.debug_logs()
         server.restart()
         check()
         failed = False
@@ -4813,7 +5236,10 @@ def test_broad_native_text_windows_preserve_scores_ties_counts_and_hydration(tmp
         server.stop(test_failed=failed)
 
 
-@pytest.mark.parametrize("physical_type", ["integer", "decimal_string"])
+@pytest.mark.parametrize(
+    "physical_type",
+    ["integer", "decimal_string", "decimal128", "decimal128_dictionary"],
+)
 def test_numeric_predicates_use_only_compatible_parquet_pruning(
     tmp_path, physical_type
 ):
@@ -4828,6 +5254,8 @@ def test_numeric_predicates_use_only_compatible_parquet_pruning(
     values = (
         pa.array(keys, type=pa.int64())
         if physical_type == "integer"
+        else pa.array([Decimal(k) for k in keys], type=pa.decimal128(38, 0))
+        if physical_type.startswith("decimal128")
         else pa.array([str(k) for k in keys])
     )
     root = tmp_path / "lake"
@@ -4838,7 +5266,7 @@ def test_numeric_predicates_use_only_compatible_parquet_pruning(
         pa.table({"k": values}),
         path,
         compression=None,
-        use_dictionary=False,
+        use_dictionary=physical_type.endswith("_dictionary"),
         write_page_index=True,
         data_page_version="2.0",
     )
@@ -4982,3 +5410,427 @@ def test_numeric_predicates_use_only_compatible_parquet_pruning(
         failed = False
     finally:
         server.stop(test_failed=failed)
+
+
+def test_remote_transform_dependencies_bound_wide_candidate_sources(tmp_path):
+    """Unrelated wide columns cannot enter the transform candidate pool."""
+    pa = pytest.importorskip("pyarrow")
+    pq = pytest.importorskip("pyarrow.parquet")
+    root = tmp_path / "lake"
+    objects = root / "buckets" / "antfly" / "objects"
+    objects.mkdir(parents=True)
+    for part in range(67):
+        path = tmp_path / "part.parquet"
+        pq.write_table(
+            pa.table({"body": ["quasar"] * 3, "unused": ["x" * (512 * 1024)] * 3}),
+            path,
+            compression="snappy",
+            use_dictionary=False,
+            write_statistics=False,
+            row_group_size=2,
+        )
+        data = path.read_bytes()
+        (objects / f"part-{part:03}.parquet").write_bytes(
+            b"AFOBJ001"
+            + struct.pack("<QI", len(data), 0)
+            + hashlib.sha256(data).hexdigest().encode()
+            + data
+        )
+    server = StandaloneAntflyServer(
+        resolve_binary_path(os.environ.get("ANTFLY_BIN", str(DEFAULT_ANTFLY_BIN))),
+        "127.0.0.1",
+        0,
+    )
+    failed = True
+    try:
+        definition = {
+            "num_shards": 1,
+            "schema": {
+                "storage_mode": "relational",
+                "default_type": "doc",
+                "document_schemas": {
+                    "doc": {
+                        "schema": {
+                            "type": "object",
+                            "properties": {
+                                "body": {
+                                    "type": "string",
+                                    "x-antfly-field": {"type": "text"},
+                                },
+                                "unused": {"type": "string"},
+                            },
+                        }
+                    }
+                },
+                "base_source": {
+                    "kind": "external",
+                    "table_id": "wide-transform",
+                    "format": "parquet",
+                    "uri": root.as_uri(),
+                },
+            },
+            "indexes": {"body_text": {"type": "full_text", "field": "body"}},
+        }
+
+        def call(method, path, body=None):
+            return requests.request(
+                method, server.api_url + path, json=body, timeout=120
+            )
+
+        created = call("POST", "/tables/wide_transform", definition)
+        assert created.ok, created.text + server.debug_logs()
+        deadline = time.monotonic() + 120
+        while True:
+            index = call("GET", "/tables/wide_transform/indexes/body_text").json()
+            assert index["status"]["readiness"]["state"] != "failed", index
+            if index["status"]["readiness"]["queryable"]:
+                break
+            assert time.monotonic() < deadline, str(index) + server.debug_logs()
+            time.sleep(0.1)
+        query = {
+            "full_text_search": {"match": "quasar", "field": "body"},
+            "full_text_index": "body_text",
+            "fields": ["body"],
+            "limit": 1,
+            "evaluate": {
+                "scope": "candidates",
+                "candidate_count": 201,
+                "compute": {"tiny": {"field": "body"}},
+            },
+        }
+        for restart in (False, True):
+            if restart:
+                server.restart()
+            response = call("POST", "/tables/wide_transform/query", query)
+            assert response.ok, response.text + server.debug_logs()
+            value = response.json()
+            result = value.get("responses", [value])[0]
+            assert result["evaluation"]["evaluated_rows"] == 201
+            assert len(result["hits"]["hits"]) == 1
+            hit = result["hits"]["hits"][0]
+            assert hit["_source"] == {"body": "quasar"}
+            assert hit["_computed"]["tiny"] == "quasar"
+            # A genuine wide dependency uses the same pre-hydration byte guard.
+            wide = dict(
+                query,
+                evaluate=dict(query["evaluate"], compute={"wide": {"field": "unused"}}),
+            )
+            rejected = call("POST", "/tables/wide_transform/query", wide)
+            assert rejected.status_code == 422, rejected.text + server.debug_logs()
+            assert rejected.json()["code"] == "decision_limit_exceeded"
+            # Final full source is needed only for the one surviving row.
+            complete = dict(query)
+            del complete["fields"]
+            response = call("POST", "/tables/wide_transform/query", complete)
+            assert response.ok, response.text + server.debug_logs()
+            value = response.json()
+            result = value.get("responses", [value])[0]
+            assert len(result["hits"]["hits"][0]["_source"]["unused"]) == 512 * 1024
+        failed = False
+    finally:
+        server.stop(test_failed=failed)
+
+
+def test_published_parquet_skewed_files_share_row_groups_and_stream_in_order(tmp_path):
+    """A 20,000-row file plus tiny files exercises cold rolling scan workers."""
+    from decimal import Decimal
+
+    pa = pytest.importorskip("pyarrow")
+    pq = pytest.importorskip("pyarrow.parquet")
+    psycopg = pytest.importorskip("psycopg")
+    root = tmp_path / "lake"
+    objects = root / "buckets" / "antfly" / "objects"
+    objects.mkdir(parents=True)
+    total = 0
+    for part in range(10):
+        count = 20000 if part == 4 else 32
+        path = tmp_path / "part.parquet"
+        pq.write_table(
+            pa.table(
+                {
+                    "amount": pa.array(range(total, total + count), type=pa.int64()),
+                    "body": ["common"] * count,
+                    # Preserve >2 MiB of source bytes so ordinary SQL delivery
+                    # admits its ordered worker path, regardless of compression.
+                    "payload": ["x" * 256] * count,
+                    "amount_decimal": pa.array(
+                        [Decimal(i).scaleb(-2) for i in range(total, total + count)],
+                        type=pa.decimal128(20, 2),
+                    ),
+                    "maybe": [
+                        None if i % 7 == 0 else "kept"
+                        for i in range(total, total + count)
+                    ],
+                }
+            ),
+            path,
+            compression=None,
+            use_dictionary=False,
+            write_page_index=True,
+            row_group_size=256,
+        )
+        data = path.read_bytes()
+        (objects / f"part-{part:02}.parquet").write_bytes(
+            b"AFOBJ001"
+            + struct.pack("<QI", len(data), 0)
+            + hashlib.sha256(data).hexdigest().encode()
+            + data
+        )
+        total += count
+    server = StandaloneAntflyServer(
+        resolve_binary_path(os.environ.get("ANTFLY_BIN", str(DEFAULT_ANTFLY_BIN))),
+        "127.0.0.1",
+        0,
+        pgwire=True,
+    )
+    failed = True
+    try:
+
+        def call(method, path, body=None):
+            response = requests.request(
+                method,
+                server.api_url + path,
+                json=body,
+                auth=("admin", AUTH_BOOTSTRAP_PASSWORD),
+                timeout=180,
+            )
+            assert response.ok, response.text + server.debug_logs()
+            return response.json()
+
+        call(
+            "POST",
+            "/tables/skew_scan",
+            {
+                "num_shards": 1,
+                "schema": {
+                    "storage_mode": "relational",
+                    "base_source": {
+                        "kind": "external",
+                        "table_id": "skew-scan",
+                        "format": "parquet",
+                        "object_mutability": "immutable",
+                        "uri": root.as_uri(),
+                    },
+                },
+                "indexes": {"body_text": {"type": "full_text", "field": "body"}},
+            },
+        )
+        deadline = time.monotonic() + 180
+        while True:
+            index = call("GET", "/tables/skew_scan/indexes/body_text")
+            assert index["status"]["readiness"]["state"] != "failed", index
+            if index["status"]["readiness"]["queryable"]:
+                break
+            assert time.monotonic() < deadline, str(index) + server.debug_logs()
+            time.sleep(0.1)
+        expected = list(range(total))
+        divisible = [i for i in expected if i % 3 == 0]
+        first_order = None
+        first_ids = None
+        for _ in range(2):
+            server.restart()
+            with (
+                psycopg.connect(
+                    host="127.0.0.1",
+                    port=server.pgwire_port,
+                    user="admin",
+                    password=AUTH_BOOTSTRAP_PASSWORD,
+                    dbname="default",
+                    sslmode="disable",
+                    autocommit=True,
+                ) as connection,
+                connection.cursor() as cursor,
+            ):
+                # Full delivery uses the streaming transport; the HTTP result
+                # cap remains appropriate for the small aggregates below.
+                order = [
+                    row[0]
+                    for row in cursor.stream(
+                        f"SELECT amount FROM skew_scan LIMIT {total}", size=137
+                    )
+                ]
+            # Sparse survivor masks precede wide/decimal projection decoding.
+            # Check both a surviving NULL and a nonnull value after each restart.
+            assert call(
+                "POST",
+                "/sql",
+                {
+                    "statement": "SELECT amount, payload, amount_decimal, maybe FROM skew_scan WHERE amount >= 250 AND amount <= 252 ORDER BY amount"
+                },
+            )["rows"] == [
+                ["250", "x" * 256, "2.50", "kept"],
+                ["251", "x" * 256, "2.51", "kept"],
+                ["252", "x" * 256, "2.52", None],
+            ]
+            assert call(
+                "POST",
+                "/sql",
+                {
+                    "statement": "SELECT amount_decimal = '2.50' FROM skew_scan WHERE amount >= 250 AND amount <= 252 ORDER BY amount"
+                },
+            )["rows"] == [[True], [False], [False]]
+            delivered = []
+            with (
+                psycopg.connect(
+                    host="127.0.0.1",
+                    port=server.pgwire_port,
+                    user="admin",
+                    password=AUTH_BOOTSTRAP_PASSWORD,
+                    dbname="default",
+                    sslmode="disable",
+                    autocommit=True,
+                ) as connection,
+                connection.cursor() as cursor,
+                pytest.raises(psycopg.errors.InvalidTextRepresentation),
+            ):
+                delivered.extend(
+                    row[0]
+                    for row in cursor.stream(
+                        f"SELECT CAST(CASE WHEN amount = {order[0]} THEN '1' ELSE 'bad' END AS BIGINT) FROM skew_scan LIMIT 2",
+                        size=1,
+                    )
+                )
+            assert delivered == [1]
+            assert call(
+                "POST",
+                "/sql",
+                {
+                    "statement": "SELECT COUNT(*), SUM(total) FROM (SELECT amount, SUM(amount + 1) AS total FROM skew_scan GROUP BY amount) groups"
+                },
+            )["rows"] == [[str(total), str(sum(expected) + total)]]
+            assert sorted(order) == expected
+            if first_order is None:
+                first_order = order
+            else:
+                assert order == first_order
+            assert call(
+                "POST",
+                "/sql",
+                {
+                    "statement": "SELECT SUM(amount), COUNT(*) FROM skew_scan WHERE amount % 3 = 0"
+                },
+            )["rows"] == [[str(sum(divisible)), str(len(divisible))]]
+            bounded = [value for value in expected if 4000 <= value < 7000]
+            assert call(
+                "POST",
+                "/sql",
+                {
+                    "statement": "SELECT COUNT(*), SUM(amount) FROM skew_scan WHERE amount >= 4000 AND amount < 7000"
+                },
+            )["rows"] == [[str(len(bounded)), str(sum(bounded))]]
+            identities = call(
+                "POST",
+                "/sql",
+                {
+                    "statement": "SELECT _id, amount FROM skew_scan WHERE amount >= 4000 AND amount < 7000 ORDER BY amount LIMIT 3"
+                },
+            )["rows"]
+            assert [int(row[1]) for row in identities] == bounded[:3]
+            assert len({row[0] for row in identities}) == 3
+            if first_ids is None:
+                first_ids = identities
+            else:
+                assert identities == first_ids
+            # Mixed FILTER cohorts retain native computed vectors and evaluate
+            # invalid expressions only for lanes that survive their filter.
+            filtered = call(
+                "POST",
+                "/sql",
+                {
+                    "statement": "SELECT amount % 5 AS bucket, SUM(amount + 1) FILTER (WHERE amount % 3 = 0), COUNT(*) FILTER (WHERE amount % 3 = 0), SUM(1 / 0) FILTER (WHERE FALSE), SUM(amount) FROM skew_scan GROUP BY amount % 5 ORDER BY bucket"
+                },
+            )
+            assert filtered["rows"] == [
+                [
+                    str(bucket),
+                    str(sum(i + 1 for i in divisible if i % 5 == bucket)),
+                    str(sum(1 for i in divisible if i % 5 == bucket)),
+                    None,
+                    str(sum(expected[bucket::5])),
+                ]
+                for bucket in range(5)
+            ], filtered
+            assert call(
+                "POST",
+                "/sql",
+                {
+                    "statement": "SELECT "
+                    + ", ".join(["COUNT(*)"] * 12)
+                    + " FROM skew_scan"
+                },
+            )["rows"] == [[str(total)] * 12]
+            assert call(
+                "POST",
+                "/sql",
+                {
+                    "statement": "SELECT amount % 5 AS bucket, SUM(amount), COUNT(*), MIN(amount), MAX(amount) FROM skew_scan GROUP BY amount % 5 ORDER BY bucket"
+                },
+            )["rows"] == [
+                [
+                    str(bucket),
+                    str(sum(expected[bucket::5])),
+                    str(len(expected[bucket::5])),
+                    str(min(expected[bucket::5])),
+                    str(max(expected[bucket::5])),
+                ]
+                for bucket in range(5)
+            ]
+            # Derived expressions retain typed columns through the relation
+            # adapter; selected FILTER cohorts reach aggregate kernels directly.
+            derived = call(
+                "POST",
+                "/sql",
+                {
+                    "statement": "SELECT bucket, SUM(v) FILTER (WHERE v % 3 = 1), COUNT(*) FROM (SELECT amount % 5 AS bucket, amount + 1 AS v FROM skew_scan) d GROUP BY bucket ORDER BY bucket"
+                },
+            )
+            assert derived["rows"] == [
+                [
+                    str(bucket),
+                    str(sum(i + 1 for i in expected[bucket::5] if i % 3 == 0)),
+                    str(len(expected[bucket::5])),
+                ]
+                for bucket in range(5)
+            ], derived
+            # Mixed exact-array/native outputs keep primitive lanes batched;
+            # unused derived expressions never fetch or evaluate cold payloads.
+            mixed = call(
+                "POST",
+                "/sql",
+                {
+                    "statement": "SELECT SUM(v), COUNT(arr) FROM (SELECT amount + 1 AS v, ARRAY[amount, amount+1]::int8[] AS arr, 1/0 AS unused FROM skew_scan) d"
+                },
+            )
+            assert mixed["rows"] == [[str(sum(expected) + total), str(total)]], mixed
+            # Thousands of partial groups use hash-owned final reduction. The
+            # final typed batches must preserve exact totals across cold starts.
+            assert call(
+                "POST",
+                "/sql",
+                {
+                    "statement": "SELECT amount % 2048 AS bucket, SUM(amount), COUNT(*) "
+                    "FROM skew_scan GROUP BY amount % 2048 ORDER BY bucket LIMIT 16"
+                },
+            )["rows"] == [
+                [
+                    str(bucket),
+                    str(sum(expected[bucket::2048])),
+                    str(len(expected[bucket::2048])),
+                ]
+                for bucket in range(16)
+            ]
+            # The sealed join filter must reach the probe scan even though
+            # only aggregate output is projected; duplicates retain join weight.
+            assert call(
+                "POST",
+                "/sql",
+                {
+                    "statement": "SELECT SUM(p.amount), COUNT(*) FROM skew_scan p "
+                    "JOIN (VALUES (0),(1),(1),(2),(NULL)) b(k) ON p.amount=b.k"
+                },
+            )["rows"] == [["4", "4"]]
+        failed = False
+    finally:
+        server.stop()
+        if failed and server.log_path.exists():
+            print(server.debug_logs())

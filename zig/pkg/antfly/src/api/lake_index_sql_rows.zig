@@ -435,8 +435,8 @@ const Owner = struct {
                 try page.validate();
                 const cells = try sa.alloc(local.sql_scalar.Datum, request.fields.len);
                 for (page.selection, 0..) |physical, row| {
-                    if (physical >= page.batch.row_refs.len) return error.InvalidNativeLakeRowIndex;
-                    const rank = ranks.get(try local.storage_rowsource_identity.allocId(sa, page.batch.row_refs[physical])) orelse return error.InvalidNativeLakeRowIndex;
+                    if (physical >= page.batch.rowCount()) return error.InvalidNativeLakeRowIndex;
+                    const rank = ranks.get(try local.storage_rowsource_identity.allocId(sa, page.batch.rowRef(physical))) orelse return error.InvalidNativeLakeRowIndex;
                     if (positions[rank] != null) return error.InvalidNativeLakeRowIndex;
                     for (request.fields, cells) |field, *cell| {
                         const value = try page.cell(sa, row, field);
@@ -474,8 +474,8 @@ const Owner = struct {
             if (page.selection.len == 0) continue;
             if (!self.exhausted() and page.after == null) {
                 const last = page.selection[page.selection.len - 1];
-                if (last >= page.batch.row_refs.len) return error.InvalidSqlBackendResponse;
-                page.after = try local.storage_rowsource_identity.allocId(self.window.allocator(), page.batch.row_refs[last]);
+                if (last >= page.batch.rowCount()) return error.InvalidSqlBackendResponse;
+                page.after = try local.storage_rowsource_identity.allocId(self.window.allocator(), page.batch.rowRef(last));
             }
             try self.read_context.ensureActive();
             return page;
@@ -514,6 +514,12 @@ pub const Predicate = struct {
         try owner.read_context.ensureActive();
         return owner.reader.containsPhysical(ref, owner.predicate_lower, owner.predicate_upper);
     }
+    pub fn intersectsPhysical(self: *Predicate, first: local.storage_rowsource_types.RowRef, last: local.storage_rowsource_types.RowRef) !?bool {
+        if (self.scan) return null;
+        const owner: *Owner = @ptrCast(@alignCast(self.cursor.ptr));
+        try owner.read_context.ensureActive();
+        return owner.reader.intersectsPhysical(first, last, owner.predicate_lower, owner.predicate_upper);
+    }
     pub fn hasBlocks(self: Predicate) bool {
         if (self.scan) return false;
         const owner: *Owner = @ptrCast(@alignCast(self.cursor.ptr));
@@ -539,7 +545,7 @@ pub const Predicate = struct {
                 continue;
             }
             const refs = try a.alloc(local.storage_rowsource_types.RowRef, page.selection.len);
-            for (refs, page.selection) |*ref, position| ref.* = page.batch.row_refs[position];
+            for (refs, page.selection) |*ref, position| ref.* = page.batch.rowRef(position);
             return refs;
         };
         const owner: *Owner = @ptrCast(@alignCast(self.cursor.ptr));
@@ -1295,7 +1301,7 @@ fn openDynamicContext(a: A, server: *server_api.ApiHttpServer, table: catalog.Ta
             return err;
         };
         owner.read_context = owner.lease.?.readContext();
-        selected = (try @import("lake_index_selection.zig").selectCached(ca, table, source, &owner.store, owner.read_context, policy, &server.lake_read_cache)) orelse return null;
+        selected = (try @import("lake_index_selection.zig").selectCachedWithLease(ca, table, source, &owner.store, owner.read_context, policy, &server.lake_read_cache, owner.lease)) orelse return null;
     }
     var parsed = try local.schema_mod.parseValidatedTableSchema(a, definitions.schema_json);
     defer parsed.deinit(a);

@@ -130,6 +130,14 @@ const BuildProgress = struct {
         for (declarations, self.declarations.items) |*value, owned| value.* = owned.value;
         var saved = self.saved;
         saved.directory = try @import("lake_index_directory.zig").publish(scratch.allocator(), self.store, declarations, self.cancellation);
+        const maps = @import("../serverless/artifacts/cloud_generations.zig");
+        const writer = if (self.store.providerStore()) |object| object.cloud_writer else null;
+        const map_root = if (writer) |w| try w.finish(self.cancellation) else null;
+        defer if (map_root) |root| maps.freeRef(writer.?.a, root);
+        // A checkpoint is a closed subset of finished declarations. Preserve
+        // selector completeness so restart does not turn an incremental build
+        // into a migration audit; it carries no publication certificate.
+        if (map_root) |root| saved.cloud_generations = .{ .root = root, .complete = writer.?.complete and !writer.?.disabled, .vacuum = writer.?.vacuum_progress };
         saved.published_at_ms = try self.clock.now_ms(self.clock.ptr);
         try self.lease.save_checkpoint.?(self.lease.ptr, saved);
     }
@@ -140,7 +148,7 @@ pub fn buildWithLease(a: A, artifact_store: *stores.ArtifactStore, table: record
 pub fn buildWithLeaseAndEmbedding(a: A, artifact_store: *stores.ArtifactStore, table: records.TableRecord, source: *serving.ServingSource, store_identity: catalog.Digest, context: Context, cancellation: Cancellation, clock: Clock, lease: ?Lease, embedding_options: ?local.inference_managed_embedder.InitOptions, memo: ?@import("lake_vector_enrichment.zig").Memo) ![]u8 {
     return buildAttempt(a, artifact_store, table, source, store_identity, context, cancellation, clock, lease, embedding_options, memo, true) catch |err| {
         switch (err) {
-            error.LakeIndexArtifactUnavailable, error.ArtifactIntegrityMismatch => {},
+            error.LakeIndexArtifactUnavailable, error.CloudGenerationMapUnavailable, error.ArtifactIntegrityMismatch => {},
             else => return err,
         }
         try context.ensureActive();
@@ -164,6 +172,24 @@ pub fn buildWithLeaseAndEmbedding(a: A, artifact_store: *stores.ArtifactStore, t
         return buildAttempt(a, artifact_store, table, source, store_identity, context, cancellation, clock, lease, embedding_options, memo, false);
     };
 }
+/// Prior inventory is an optional planning proof. Missing/corrupt derived
+/// metadata migrates through full native reconciliation; operational failures
+/// retain their normal cancellation/retry semantics.
+fn priorInventory(a: A, store: stores.ArtifactStore, ref: local.serverless_manifest_artifact_ref.ArtifactRef, token: Cancellation) !?local.serverless_external_source_types.Inventory {
+    try token.check();
+    if (ref.byte_len == 0 or ref.byte_len > (local.serverless_external_source_mod.codec.DecodeLimits{}).max_artifact_bytes) return null;
+    const bytes = @import("lake_index_aggregate_artifact.zig").readArtifact(a, store, .{ .artifact_id = ref.artifact_id, .checksum = ref.checksum, .byte_len = ref.byte_len }, token, null) catch |err| switch (err) {
+        error.FileNotFound, error.NotFound, error.ObjectNotFound, error.ArtifactIntegrityMismatch, error.CloudGenerationMapUnavailable, error.LakeIndexArtifactUnavailable => return null,
+        else => return err,
+    };
+    defer a.free(bytes);
+    try token.check();
+    const inventory = local.serverless_external_source_mod.decodeInventoryAlloc(a, bytes) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => return null, // pure decode/validation failure, not provider I/O
+    };
+    return inventory;
+}
 fn buildAttempt(a: A, artifact_store: *stores.ArtifactStore, table: records.TableRecord, source: *serving.ServingSource, store_identity: catalog.Digest, context: Context, cancellation: Cancellation, clock: Clock, lease: ?Lease, embedding_options: ?local.inference_managed_embedder.InitOptions, memo: ?@import("lake_vector_enrichment.zig").Memo, reuse: bool) ![]u8 {
     try context.ensureActive();
     try cancellation.check();
@@ -186,7 +212,41 @@ fn buildAttempt(a: A, artifact_store: *stores.ArtifactStore, table: records.Tabl
     var scoped = artifact_store.*;
     scoped.allocator = a;
     scoped.upload_scope = scope;
-    const inventory_bytes = try local.serverless_external_source_mod.encodeInventoryAlloc(a, source.inventory);
+    const cloud_api = @import("lake_cloud_publication.zig");
+    const maps = @import("../serverless/artifacts/cloud_generations.zig");
+    const cloud_object = artifact_store.providerStore();
+    if (cloud_object) |object| object.cloud_io = context.io;
+    const cloud_seed_candidate = if (!reuse) @as(?catalog.Publication, null) else if (current.value.checkpoint) |saved| if (saved.cloud_generations != null and std.meta.eql(saved.signature, signature) and std.meta.eql(saved.namespace, current.value.namespace)) @as(?catalog.Publication, saved) else current.value.published else current.value.published;
+    const cloud_seed = if (cloud_seed_candidate) |seed_| if (std.meta.eql(seed_.namespace, current.value.namespace) and std.mem.eql(u8, &seed_.signature.store, &store_identity)) @as(?catalog.Publication, seed_) else null else null;
+    var cloud_binding: ?cloud_api.Binding = if (cloud_object != null and cloud_seed != null) try cloud_api.Binding.init(std.heap.page_allocator, cloud_object.?, cloud_seed.?, cancellation) else null;
+    defer if (cloud_binding) |*held| held.deinit();
+    // Fresh/checkpoint artifacts may not belong to the previous closure. A
+    // builder verifies and records them; a query's complete binding stays strict.
+    if (cloud_binding) |*held| held.reader.complete = false;
+    var cloud_memory: local.sql_memory_budget = .{ .backing = std.heap.page_allocator, .limit = 64 * 1024 * 1024 };
+    var map_alloc: local.sql_parallel_scheduler.LockedAllocator = .{ .backing = cloud_memory.allocator() };
+    var cloud_writer: ?maps.Writer = if (cloud_object) |object| if (object.fs_client == null and object.client.vtable.version_retention != null) .{ .a = map_alloc.allocator(), .io = context.io, .vacuum_progress = if (cloud_seed) |seed_| if (seed_.cloud_generations) |cloud| cloud.vacuum else .{} else .{}, .reader = .{ .io = context.io, .client = object.client, .bucket = object.bucket, .prefix = object.prefix, .shared = maps.sharedNavigation(object.cloud_cache_scope), .root = if (cloud_binding) |held| try maps.cloneRef(map_alloc.allocator(), held.reader.root.?) else null }, .scope = scope, .qualified_retention = object.cloud_retention_qualified, .cancellation = cancellation, .complete = cloud_api.seedComplete(cloud_seed, current.value.checkpoint, signature, current.value.namespace, !reuse or (current.value.published == null and current.value.checkpoint == null)) } else null else null;
+    const previous_writer = if (cloud_object) |object| object.cloud_writer else null;
+    if (cloud_writer) |*writer| cloud_object.?.cloud_writer = writer;
+    defer if (cloud_writer) |*writer| {
+        cloud_object.?.cloud_writer = previous_writer;
+        writer.deinit();
+    };
+    var inventory_view = source.inventory;
+    var qualified_files: ?[]local.serverless_external_source_types.FileEntry = null;
+    defer if (qualified_files) |files| a.free(files);
+    if (source.verified_files) |verified| {
+        const files = try a.dupe(local.serverless_external_source_types.FileEntry, source.inventory.files);
+        qualified_files = files;
+        for (files) |*file| {
+            const selected_file = verified.get(file.file_id) orelse return error.ExternalLakeSnapshotMismatch;
+            if (!std.mem.eql(u8, file.object_uri, selected_file.object_uri) or file.byte_len != selected_file.byte_len) return error.ExternalLakeSnapshotMismatch;
+            file.etag = selected_file.etag;
+            file.version_id = selected_file.version_id;
+        }
+        inventory_view.files = files;
+    }
+    const inventory_bytes = try local.serverless_external_source_mod.encodeInventoryAlloc(a, inventory_view);
     defer a.free(inventory_bytes);
     var inventory_artifact = try scoped.putScoped(scope, inventory_bytes, cancellation);
     defer inventory_artifact.deinit(a);
@@ -246,7 +306,22 @@ fn buildAttempt(a: A, artifact_store: *stores.ArtifactStore, table: records.Tabl
         if (!present) try candidate_list.append(na, declaration);
     }
     const candidates = candidate_list.items;
-    var progress: BuildProgress = .{ .a = a, .store = &scoped, .cancellation = cancellation, .clock = clock, .lease = lease orelse .{ .ptr = undefined, .snapshot = undefined }, .saved = .{ .reader_protocol = attempt.reader_protocol, .reuse_published = reuse_published, .store_locator = attempt.store_locator, .namespace = current.value.namespace, .generation = attempt.generation, .token = attempt.token, .signature = signature, .published_at_ms = started, .base_source = base_source, .inventory = inventory } };
+    const navigation_api = @import("lake_source_navigation.zig");
+    var prior_navigation: ?navigation_api.Root = null;
+    if (current.value.published) |previous| {
+        if (reusable_directory and std.meta.eql(previous.namespace, current.value.namespace) and
+            std.mem.eql(u8, &previous.signature.credentials, &signature.credentials) and
+            std.mem.eql(u8, &previous.signature.store, &signature.store))
+            if (previous.source_navigation) |ref| {
+                prior_navigation = navigation_api.load(na, scoped, ref, cancellation, null) catch |err| switch (err) {
+                    error.FileNotFound, error.NotFound, error.ObjectNotFound, error.ArtifactIntegrityMismatch, error.InvalidNativeLakeFileState, error.CloudGenerationMapUnavailable, error.LakeIndexArtifactUnavailable => null,
+                    else => return err,
+                };
+            };
+    }
+    const navigation = try navigation_api.buildProven(a, na, &scoped, &provider, prior_navigation, cancellation, pinned.data);
+    provider.native_delta = navigation.delta;
+    var progress: BuildProgress = .{ .a = a, .store = &scoped, .cancellation = cancellation, .clock = clock, .lease = lease orelse .{ .ptr = undefined, .snapshot = undefined }, .saved = .{ .reader_protocol = attempt.reader_protocol, .reuse_published = reuse_published, .store_locator = attempt.store_locator, .namespace = current.value.namespace, .generation = attempt.generation, .token = attempt.token, .signature = signature, .published_at_ms = started, .base_source = base_source, .inventory = inventory, .source_navigation = navigation.ref } };
     defer progress.deinit();
     if (lease) |owner| if (owner.save_checkpoint != null) {
         if (current.value.checkpoint) |saved| for (saved.declarations) |declaration| try progress.remember(declaration);
@@ -265,15 +340,22 @@ fn buildAttempt(a: A, artifact_store: *stores.ArtifactStore, table: records.Tabl
     // The authenticated inventory supplies the file delta once per refresh.
     // Counted ownership proves all prior files belong to the unchanged recipes;
     // replay need not point-probe every file/recipe in the contribution tree.
-    if (previous_root != null and previous_ownership == 1) {
-        const previous = current.value.published.?;
-        if (std.mem.eql(u8, &previous.signature.desired, &signature.desired) and source.inventory.deleted_row_groups.len == 0 and (if (source.scanner.iceberg_delete_plan) |plan| plan.files.len == 0 else true)) {
-            if (previous.inventory.byte_len > (local.serverless_external_source_mod.codec.DecodeLimits{}).max_artifact_bytes) return error.ExternalSourceInventoryTooLarge;
-            const bytes = try @import("lake_index_aggregate_artifact.zig").readArtifact(na, scoped, .{ .artifact_id = previous.inventory.artifact_id, .checksum = previous.inventory.checksum, .byte_len = previous.inventory.byte_len }, cancellation, null);
-            const old_inventory = try local.serverless_external_source_mod.decodeInventoryAlloc(na, bytes);
-            if (old_inventory.deleted_row_groups.len == 0) {
-                for (old_inventory.files) |file| try contribution_index.covered_files.put(a, @import("lake_index_native_aggregates.zig").inventoryFileIdentity(old_inventory, file), {});
-                contribution_index.has_file_coverage = true;
+    if (current.value.published) |previous| {
+        if (reusable_directory and std.meta.eql(previous.namespace, current.value.namespace) and
+            std.mem.eql(u8, &previous.signature.credentials, &signature.credentials) and
+            std.mem.eql(u8, &previous.signature.store, &signature.store) and
+            (prior_navigation == null or previous_root != null) and
+            source.inventory.deleted_row_groups.len == 0 and
+            (if (source.scanner.iceberg_delete_plan) |plan| plan.files.len == 0 else true))
+        {
+            if (try priorInventory(na, scoped, previous.inventory, cancellation)) |old_inventory| {
+                if (old_inventory.deleted_row_groups.len == 0) {
+                    provider.previous_inventory = old_inventory;
+                    if (previous_root != null and previous_ownership == 1 and std.mem.eql(u8, &previous.signature.desired, &signature.desired)) {
+                        for (old_inventory.files) |file| try contribution_index.covered_files.put(a, @import("lake_index_native_aggregates.zig").inventoryFileIdentity(old_inventory, file), {});
+                        contribution_index.has_file_coverage = true;
+                    }
+                }
             }
         }
     }
@@ -329,8 +411,11 @@ fn buildAttempt(a: A, artifact_store: *stores.ArtifactStore, table: records.Tabl
         try context.ensureActive();
         try cancellation.check();
     };
-    const completed = try clock.now_ms(clock.ptr);
-    const publication: catalog.Publication = .{ .reader_protocol = attempt.reader_protocol, .store_locator = attempt.store_locator, .namespace = current.value.namespace, .generation = attempt.generation, .token = attempt.token, .signature = signature, .published_at_ms = completed, .base_source = base_source, .inventory = inventory, .directory = directory };
+    var completed = try clock.now_ms(clock.ptr);
+    var publication: catalog.Publication = .{ .reader_protocol = attempt.reader_protocol, .store_locator = attempt.store_locator, .namespace = current.value.namespace, .generation = attempt.generation, .token = attempt.token, .signature = signature, .published_at_ms = completed, .base_source = base_source, .inventory = inventory, .source_navigation = navigation.ref, .directory = directory };
+    if (cloud_writer) |*writer| try cloud_api.finish(na, writer, cloud_object.?, &publication, declarations, table.table_id, store_identity, context, cancellation, cloud_binding != null and cloud_object.?.cloud_certificate_until_ms != 0 and current.value.checkpoint == null);
+    completed = try clock.now_ms(clock.ptr);
+    publication.published_at_ms = completed;
     const latest = if (lease) |owner| try owner.snapshot(owner.ptr, a) else table;
     defer if (lease != null) a.free(latest.lake_index_catalog_json);
     var final_state = try catalog.parse(a, latest.lake_index_catalog_json);
@@ -412,9 +497,22 @@ test "external lake native publication builds scoped text artifacts and fences e
         try std.testing.expectEqual(@as(usize, 1), progress.declarations.items.len);
         var batch: [16]local.serverless_segment_sidecar_manifest.DeclaredArtifact = undefined;
         var names: [16][32]u8 = undefined;
+        var batch_objects: [16]?stores.ArtifactMetadata = @splat(null);
+        defer for (&batch_objects) |*object| if (object.*) |*value| value.deinit(a);
+        const original = parsed.value.published.?.declarations[0].artifact;
+        const payload = try artifact_store.getVerifiedAllocWithCancellation(original.artifact_id, original.byte_len, original.checksum, .none);
+        defer a.free(payload);
         for (&batch, &names, 0..) |*declaration, *name, index| {
             declaration.* = parsed.value.published.?.declarations[0];
             declaration.name = try std.fmt.bufPrint(name, "batch-{d}", .{index});
+            declaration.artifact.name = declaration.name;
+            // Distinct completed indexes require distinct scoped identities;
+            // reusing one artifact ID under different names is forbidden.
+            const scope = checkpoint_store.upload_scope.?;
+            batch_objects[index] = try checkpoint_store.putScoped(try stores.UploadScope.forPublication(scope.domain, scope.fencingToken(), std.testing.io), payload, .none);
+            declaration.artifact.artifact_id = batch_objects[index].?.artifact_id;
+            declaration.artifact.checksum = batch_objects[index].?.checksum;
+            declaration.artifact.byte_len = batch_objects[index].?.byte_len;
         }
         // One completed set has one durable checkpoint containing every
         // declaration, alongside the earlier resumable declaration.
@@ -563,4 +661,30 @@ test "external lake native publication builds scoped text artifacts and fences e
 fn constructionFailure(err: anyerror, stage: []const u8, generation: u64) anyerror {
     if (err != error.Canceled and err != error.Cancelled) std.log.warn("native lake construction deferred stage={s} generation={d} err={s}", .{ stage, generation, @errorName(err) });
     return err;
+}
+
+test "external lake bounded WAL prior inventory proofs recover missing corrupt and canceled reads" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const ca = arena.allocator();
+    var directory = try local.common_test_directory.TestDirectory.init("prior-inventory-recovery");
+    defer directory.cleanup();
+    var fs = try @import("../serverless/artifacts/fs_store.zig").FsStore.init(a, directory.path());
+    defer fs.deinit();
+    var store = fs.artifactStore();
+    store.upload_scope = try stores.UploadScope.forPublication(@splat(6), 1, std.testing.io);
+    const inventory: local.serverless_external_source_types.Inventory = .{ .format = .parquet, .source_id = @constCast("source"), .source_uri = @constCast("file:///source"), .snapshot_id = @constCast("snapshot"), .schema_fingerprint = @constCast("schema"), .files = &.{} };
+    const bytes = try local.serverless_external_source_mod.encodeInventoryAlloc(ca, inventory);
+    var good = try store.put(bytes);
+    defer good.deinit(a);
+    const ref: local.serverless_manifest_artifact_ref.ArtifactRef = .{ .kind = .external_base_source, .artifact_id = good.artifact_id, .checksum = good.checksum, .byte_len = good.byte_len };
+    try std.testing.expect((try priorInventory(ca, store, ref, .none)) != null);
+    var bad = try store.put("invalid inventory bytes");
+    defer bad.deinit(a);
+    try std.testing.expect((try priorInventory(ca, store, .{ .kind = .external_base_source, .artifact_id = bad.artifact_id, .checksum = bad.checksum, .byte_len = bad.byte_len }, .none)) == null);
+    try store.delete(good.artifact_id);
+    try std.testing.expect((try priorInventory(ca, store, ref, .none)) == null);
+    var canceled = std.atomic.Value(bool).init(true);
+    try std.testing.expectError(error.Canceled, priorInventory(ca, store, ref, Cancellation.fromAtomic(&canceled)));
 }

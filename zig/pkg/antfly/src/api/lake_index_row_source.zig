@@ -27,6 +27,9 @@ const Cancellation = @import("antfly_cancellation").CancellationToken;
 const A = std.mem.Allocator;
 pub const Provider = struct {
     source: *serving.ServingSource,
+    /// Borrowed authenticated prior inventory, shared by all native builders.
+    previous_inventory: ?local.serverless_external_source_types.Inventory = null,
+    native_delta: ?@import("lake_source_navigation.zig").Delta = null,
     enrichment_columns: bool = false,
     vector_memo: ?@import("lake_vector_enrichment.zig").Memo = null,
     progress: ?BuildProgress = null,
@@ -240,13 +243,15 @@ fn slice(columns: []rows.ColumnVector, batch: rows.ColumnBatch, begin: usize, en
     if (columns.len != batch.columns.len) return error.RowSourceColumnLengthMismatch;
     for (columns, batch.columns) |*column, original| {
         column.* = original;
-        if (original.nulls.bytes.len != 0) column.nulls.bytes = original.nulls.bytes[begin..end];
+        column.nulls = original.nulls.slice(begin, end - begin);
         column.values = switch (original.values) {
+            .decimal128 => |values| .{ .decimal128 = values.slice(begin, end - begin) },
+            .encoded => return error.UnsupportedSqlExecution,
             inline .dictionary_bytes, .dictionary_i64, .dictionary_f64 => |dictionary, tag| @unionInit(rows.ColumnValues, @tagName(tag), .{ .values = dictionary.values, .indices = dictionary.indices[begin..end] }),
             inline else => |values, tag| @unionInit(rows.ColumnValues, @tagName(tag), values[begin..end]),
         };
     }
-    return .{ .snapshot = batch.snapshot, .row_refs = batch.row_refs[begin..end], .columns = columns };
+    return batch.identitySlice(begin, end, columns);
 }
 
 test "external lake native index input preserves dictionary ids and nulls across filtered runs" {

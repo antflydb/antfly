@@ -37,7 +37,7 @@ fn optionalWord(hash: *Hash, value: ?u64) void {
     hash.update(&.{@intFromBool(value != null)});
     if (value) |number| word(hash, number);
 }
-fn versionIsStrong(etag: []const u8, version: []const u8) bool {
+pub fn versionIsStrong(etag: []const u8, version: []const u8) bool {
     return etag.len != 0 or (version.len != 0 and !std.mem.startsWith(u8, version, "object-stat:v1:") and !std.mem.startsWith(u8, version, "iceberg:"));
 }
 fn jsonPart(a: A, hash: *Hash, value: anytype) !void {
@@ -60,7 +60,7 @@ const ObjectStat = struct {
         return worker_client.statObject(location.bucket, location.key);
     }
 };
-pub const Coverage = struct { source: [32]u8, delete_objects: [32]u8 };
+pub const Coverage = struct { source: [32]u8, delete_objects: [32]u8, data: [32]u8 };
 pub fn pin(source: *Source, context: Context) !Coverage {
     return pinWithInventory(source, context, null);
 }
@@ -78,6 +78,7 @@ pub fn pinWithFileMap(source: *Source, context: Context, previous: ?local.server
 // delete-object evidence remains fresh for every selection.
 pub const DataProof = Hash;
 pub fn pinData(source: *Source, context: Context, previous: ?local.serverless_external_source_types.Inventory, verified_files: ?*const FileMap) !DataProof {
+    try source.ensureInventory(context);
     try source.ownInventory();
     const a = source.alloc;
     if (source.immutable_objects) if (previous) |inventory| {
@@ -195,9 +196,52 @@ pub fn pinData(source: *Source, context: Context, previous: ?local.serverless_ex
     try jsonPart(a, &hash, source.inventory.deleted_row_groups);
     return hash;
 }
+pub fn dataDigest(data: DataProof) [32]u8 {
+    var copy = data;
+    return copy.finalResult();
+}
+/// Protocol 47 persists the data census digest independently of fresh delete
+/// evidence. No compiler-specific hash state becomes durable wire metadata.
 pub fn finish(source: *Source, context: Context, data: DataProof) !Coverage {
+    return finishDigest(source, context, dataDigest(data));
+}
+pub fn finishDigest(source: *Source, context: Context, data: [32]u8) !Coverage {
+    var hash = Hash.init(.{});
+    part(&hash, "native-lake-source-coverage-v2");
+    hash.update(&data);
+    return finishHash(source, context, hash, data);
+}
+/// A serving statement pins delete evidence once, before admitting native
+/// coverage, and shares that exact evidence with selected hydration views.
+/// Build/publication verification continues to use finish()/finishDigest(),
+/// which deliberately re-stat objects before and after construction.
+pub fn finishReadDigest(source: *Source, context: Context, data: [32]u8) !Coverage {
+    const qualified = (try source.qualifiedDeletes(context)) orelse return finishDigest(source, context, data);
+    if (qualified.proof) |proof| {
+        if (!std.mem.eql(u8, &proof.data, &data)) return error.InvalidExternalLakeIndexCoverage;
+        try context.ensureActive();
+        return .{ .source = proof.source, .delete_objects = qualified.digest, .data = data };
+    }
+    var hash = Hash.init(.{});
+    part(&hash, "native-lake-source-coverage-v2");
+    hash.update(&data);
+    const plan = source.scanner.iceberg_delete_plan.?;
+    if (plan.files.len != qualified.versions.len) return error.InvalidExternalLakeIndexCoverage;
+    for (plan.files, qualified.versions) |file, version| {
+        try context.ensureActive();
+        if (!versionIsStrong(version.etag, version.version)) return error.InvalidExternalLakeIndexCoverage;
+        try jsonPart(source.alloc, &hash, file);
+        part(&hash, version.etag);
+        part(&hash, version.version);
+    }
+    return .{ .source = hash.finalResult(), .delete_objects = qualified.digest, .data = data };
+}
+pub fn finishLegacy(source: *Source, context: Context, data: DataProof) !Coverage {
+    return finishHash(source, context, data, dataDigest(data));
+}
+fn finishHash(source: *Source, context: Context, input: Hash, digest: [32]u8) !Coverage {
     const a = source.alloc;
-    var hash = data;
+    var hash = input;
     var client = source.scanner.object_reader.client;
     client.allocator = a;
     const Work = ObjectStat;
@@ -243,7 +287,7 @@ pub fn finish(source: *Source, context: Context, data: DataProof) !Coverage {
         }
     }
     try context.ensureActive();
-    return .{ .source = hash.finalResult(), .delete_objects = delete_versions.finalResult() };
+    return .{ .source = hash.finalResult(), .delete_objects = delete_versions.finalResult(), .data = digest };
 }
 
 test "external lake native index coverage rejects synthetic provider identities" {
@@ -339,4 +383,13 @@ test "external lake immutable object contract avoids data HEAD while mutable cov
     const serial = try pin(&source, .{});
     try std.testing.expectEqual(parallel, serial);
     try std.testing.expectEqual(@as(usize, 4), spy.heads.load(.acquire));
+    const read_data = dataDigest(try pinData(&source, .{}, null, null));
+    const pinned_read = try finishReadDigest(&source, .{ .io = std.testing.io }, read_data);
+    try std.testing.expectEqual(serial, pinned_read);
+    try std.testing.expectEqual(@as(usize, 6), spy.heads.load(.acquire));
+    try std.testing.expectEqual(pinned_read, try finishReadDigest(&source, .{}, read_data));
+    try std.testing.expectEqual(@as(usize, 6), spy.heads.load(.acquire));
+    // Publication still freshly checks objects even after serving qualification.
+    try std.testing.expectEqual(serial, try finishDigest(&source, .{}, read_data));
+    try std.testing.expectEqual(@as(usize, 8), spy.heads.load(.acquire));
 }

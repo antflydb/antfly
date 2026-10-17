@@ -85,8 +85,17 @@ pub const Stream = struct {
     context: Context,
     limits: Limits,
     stats: Stats = .{},
+    /// Statement-owned admission survives worker ranges and rolling windows.
+    examined: ?*std.atomic.Value(u64) = null,
     files: []usize,
     owns_files: bool = true,
+    iterator: ?serving.ServingSource.FileIterator = null,
+    iterator_parent: ?*serving.ServingSource = null,
+    iterator_started: bool = false,
+    enumerated_files: usize = 0,
+    enumeration_lookahead: ?*EnumerationLookahead = null,
+    enumeration_prefetch_tasks: usize = 0,
+    enumeration_prefetch_files: usize = 0,
     selection: ?@import("lake_row_selection.zig").Selection = null,
     resume_at: ?struct { group: u32, row: u64 } = null,
     active_file: usize = 0,
@@ -123,6 +132,92 @@ pub const Stream = struct {
     lookahead_names: []const []const u8 = &.{},
     lookahead_required: []const bool = &.{},
 
+    /// One independently owned navigation cursor warms the next bounded file
+    /// window while current row groups execute. Required enumeration remains
+    /// untouched: speculative metadata errors are observed only on demand.
+    const EnumerationLookahead = struct {
+        backing: Allocator,
+        budget: @import("../../sql/memory_budget.zig"),
+        stream: Stream = undefined,
+        io: std.Io,
+        task: ?@import("../../sql/parallel_scheduler.zig").Task(anyerror!void) = null,
+        target: usize = 0,
+        width: usize = 1,
+        warmed: usize = 0,
+        ended: bool = false,
+        disabled: bool = false,
+        fn run(self: *@This()) anyerror!void {
+            // Catch up only descriptors when earlier speculative admission was
+            // denied. A cursor advances monotonically, never rescans a prefix.
+            const iterator = self.stream.iterator.?;
+            while (self.stream.enumerated_files < self.target) {
+                try self.stream.context.ensureActive();
+                var file = (try iterator.next(iterator.ptr, self.stream.alloc, self.stream.context)) orelse {
+                    self.ended = true;
+                    return;
+                };
+                file.deinit(self.stream.alloc);
+                self.stream.enumerated_files += 1;
+            }
+            if (!try self.stream.nextEnumerationWindow(self.width)) {
+                self.ended = true;
+                return;
+            }
+            for (self.stream.files) |index| {
+                try self.stream.context.ensureActive();
+                if (!self.stream.fileMatches(self.stream.source.inventory.files[index])) continue;
+                try self.stream.pinFileVersion(index);
+                const reader = self.stream.source.scanner.shared_reader.?;
+                const footer = try reader.footer(self.stream.source.fileAt(index));
+                footer.release();
+                self.warmed += 1;
+            }
+        }
+        fn deinit(self: *@This()) void {
+            if (self.task) |*task| task.cancel(self.io) catch {};
+            self.stream.deinit();
+            std.debug.assert(self.budget.live == 0);
+            self.backing.destroy(self);
+        }
+    };
+    fn joinEnumerationLookahead(self: *Stream) void {
+        const warm = self.enumeration_lookahead orelse return;
+        if (warm.task) |*task| {
+            // Speculation never gates required progress. Required readers
+            // coalesce through the shared footer cache when they catch up.
+            if (!task.isComplete()) return;
+            task.await(warm.io) catch {
+                warm.disabled = true;
+            };
+            warm.task = null;
+            self.enumeration_prefetch_files = warm.warmed;
+        }
+    }
+    pub fn prefetchEnumeration(self: *Stream, width: usize) void {
+        if (self.iterator == null or self.iterator_parent == null) return;
+        const reader = self.source.scanner.shared_reader orelse return;
+        const io = reader.context.io orelse return;
+        if (self.enumeration_lookahead == null) {
+            const backing = @import("antfly_platform").allocator.processAllocator(std.heap.page_allocator);
+            const warm = backing.create(EnumerationLookahead) catch return;
+            warm.* = .{ .backing = backing, .budget = .{ .backing = backing, .limit = 16 * 1024 * 1024 }, .io = io };
+            warm.stream = initEnumerated(warm.budget.allocator(), self.iterator_parent.?, self.columns, self.predicates, self.context, self.limits) catch {
+                backing.destroy(warm);
+                return;
+            };
+            warm.stream.schema_contract = self.schema_contract;
+            self.enumeration_lookahead = warm;
+        }
+        const warm = self.enumeration_lookahead.?;
+        // Worker-owned fields are read only after the task has joined. In
+        // particular, EOF can race with another required window advancing.
+        if (warm.task != null) return;
+        if (warm.disabled or warm.ended) return;
+        warm.target = self.enumerated_files;
+        warm.width = @max(1, @min(4, width));
+        warm.task = @import("../../sql/parallel_scheduler.zig").global().submitIoTransient(io, 16 * 1024 * 1024, EnumerationLookahead.run, .{warm});
+        if (warm.task != null) self.enumeration_prefetch_tasks += 1;
+    }
     fn lookaheadCanceled(raw: *const anyopaque) bool {
         const self: *const Stream = @ptrCast(@alignCast(raw));
         if (self.lookahead_cancelled.load(.acquire)) return true;
@@ -210,6 +305,9 @@ pub const Stream = struct {
         // Avoid recursively reserving scheduler slots from an admitted task.
         worker_reader.context.io = null;
         cursor.shared_reader = &worker_reader;
+        if (self.filter) |filter| {
+            if (filter.encoded) cursor.filter = filter;
+        }
         for (cursor.columns, required) |*column, needed| column.required = needed;
         try worker_reader.context.ensureActive();
         try cursor.prepareEvidence();
@@ -273,6 +371,12 @@ pub const Stream = struct {
         const self: *Stream = @ptrCast(@alignCast(raw));
         const filter = self.filter.?;
         return filter.any_match(filter.ptr, try self.logicalBatch(batch));
+    }
+
+    fn selectMask(raw: *anyopaque, batch: types.ColumnBatch) anyerror![]const bool {
+        const self: *Stream = @ptrCast(@alignCast(raw));
+        const filter = self.filter.?;
+        return filter.select.?(filter.ptr, try self.logicalBatch(batch));
     }
 
     fn pageMayMatch(raw: *anyopaque, chunk: external.ColumnChunk, page: @import("lake_parquet_metadata.zig").IndexedPage) bool {
@@ -350,10 +454,122 @@ pub const Stream = struct {
     pub fn init(alloc: Allocator, source: *serving.ServingSource, columns: []const []const u8, predicates: []const Predicate, parent: Context, limits: Limits) !Stream {
         const context = source.protectContext(parent);
         try context.ensureActive();
+        if (source.canEnumerate()) return initEnumerated(alloc, source, columns, predicates, context, limits);
+        try source.ensureInventory(context);
+        try source.ensureCanonicalPlan(context);
         const cached_order = source.canonicalOrder();
         if (cached_order == null) try source.inventory.validate();
         const files = cached_order orelse try serving.ServingSource.canonicalFileOrder(alloc, source.inventory);
         return .{ .alloc = alloc, .source = source, .columns = columns, .predicates = predicates, .context = context, .limits = limits, .files = files, .owns_files = cached_order == null, .schema_contract = if (source.iceberg_schema) |schema| schema.columns else &.{} };
+    }
+    fn initEnumerated(a: Allocator, parent: *serving.ServingSource, columns: []const []const u8, predicates: []const Predicate, context: Context, limits: Limits) !Stream {
+        const navigation = parent.file_navigation.?;
+        const iterator = try navigation.enumerate.?(navigation.ptr, a, context);
+        errdefer iterator.close(iterator.ptr);
+        const view = try a.create(serving.ServingSource);
+        errdefer a.destroy(view);
+        view.* = try parent.parallelView(a);
+        errdefer view.closeParallelView(parent);
+        if (view.delete_lease) |lease| lease.release();
+        view.delete_lease = null;
+        view.prepared_deletes = null;
+        view.inventory.files = &.{};
+        view.scanner.inventory = view.inventory;
+        view.selected_catalog_view = true;
+        view.plan_identity = null;
+        view.version_parent = null;
+        view.pinned_files = &.{};
+        view.pinned_files_owned = false;
+        const files = try a.dupe(usize, &.{0});
+        return .{ .alloc = a, .source = view, .columns = columns, .predicates = predicates, .context = context, .limits = limits, .files = files, .file_index = 1, .iterator = iterator, .iterator_parent = parent, .schema_contract = if (parent.iceberg_schema) |schema| schema.columns else &.{} };
+    }
+    /// A tiny authenticated inventory can reuse native row-group scheduling.
+    /// Construction uses an independent iterator, so failure leaves this cursor
+    /// untouched for serial fallback. Large inventories remain streamed.
+    pub fn freezeSmallEnumeration(self: *Stream, maximum_files: usize) !bool {
+        const iterator = self.iterator orelse return false;
+        if (self.iterator_started) return false;
+        const parent = self.iterator_parent.?;
+        const count = parent.fileCount();
+        if (count == 0 or count > @min(maximum_files, 8)) return false;
+        const split = iterator.split orelse return false;
+        const copy = try split(iterator.ptr, self.alloc, 0, 1, self.context);
+        defer copy.close(copy.ptr);
+        const entries = try self.alloc.alloc(external.FileEntry, count);
+        var owned: usize = 0;
+        errdefer {
+            for (entries[0..owned]) |*file| file.deinit(self.alloc);
+            self.alloc.free(entries);
+        }
+        const pinned = try self.alloc.alloc(bool, count);
+        errdefer self.alloc.free(pinned);
+        const order = try self.alloc.alloc(usize, count);
+        errdefer self.alloc.free(order);
+        var view = try parent.parallelView(self.alloc);
+        errdefer view.closeParallelView(parent);
+        for (entries, pinned, order, 0..) |*file, *pin, *index, i| {
+            file.* = (try copy.next(copy.ptr, self.alloc, self.context)) orelse return error.InvalidExternalSourceInventory;
+            owned += 1;
+            pin.* = view.immutable_objects and (file.etag.len != 0 or (file.version_id.len != 0 and !std.mem.startsWith(u8, file.version_id, "iceberg:") and !std.mem.startsWith(u8, file.version_id, "object-stat:")));
+            index.* = i;
+        }
+        if (try copy.next(copy.ptr, self.alloc, self.context)) |extra_| {
+            var extra = extra_;
+            extra.deinit(self.alloc);
+            return error.InvalidExternalSourceInventory;
+        }
+        if (view.delete_lease) |lease| lease.release();
+        view.delete_lease = null;
+        view.prepared_deletes = null;
+        view.inventory.files = entries;
+        view.scanner.inventory = view.inventory;
+        view.catalog_files = true;
+        view.catalog_files_owned = true;
+        view.selected_catalog_view = true;
+        view.plan_identity = null;
+        view.version_parent = null;
+        view.pinned_files = pinned;
+        view.pinned_files_owned = true;
+        self.source.closeParallelView(parent);
+        self.source.* = view;
+        if (self.owns_files) self.alloc.free(self.files);
+        self.files = order;
+        self.owns_files = true;
+        self.file_index = 0;
+        iterator.close(iterator.ptr);
+        self.iterator = null;
+        return true;
+    }
+    fn nextEnumeratedFile(self: *Stream) !bool {
+        const iterator = self.iterator.?;
+        self.iterator_started = true;
+        var file = (try iterator.next(iterator.ptr, self.alloc, self.context)) orelse return false;
+        self.enumerated_files += 1;
+        errdefer file.deinit(self.alloc);
+        const files = try self.alloc.alloc(external.FileEntry, 1);
+        errdefer self.alloc.free(files);
+        const pinned = try self.alloc.alloc(bool, 1);
+        errdefer self.alloc.free(pinned);
+        const parent = self.iterator_parent.?;
+        var view = try parent.parallelView(self.alloc);
+        if (view.delete_lease) |lease| lease.release();
+        view.delete_lease = null;
+        view.prepared_deletes = null;
+        files[0] = file;
+        view.inventory.files = files;
+        view.scanner.inventory = view.inventory;
+        view.catalog_files = true;
+        view.catalog_files_owned = true;
+        view.selected_catalog_view = true;
+        view.plan_identity = null;
+        view.version_parent = null;
+        pinned[0] = view.immutable_objects and (file.etag.len != 0 or (file.version_id.len != 0 and !std.mem.startsWith(u8, file.version_id, "iceberg:") and !std.mem.startsWith(u8, file.version_id, "object-stat:")));
+        view.pinned_files = pinned;
+        view.pinned_files_owned = true;
+        self.source.closeParallelView(parent);
+        self.source.* = view;
+        self.file_index = 0;
+        return true;
     }
     /// A contribution scan keeps the parent snapshot and delete applicability,
     /// but schedules only one pinned object. All footer offsets remain file-local.
@@ -395,7 +611,13 @@ pub const Stream = struct {
         self.owns_files = true;
         self.selection = selection;
     }
+    pub fn enumeratedHasMore(self: *Stream) !bool {
+        const iterator = self.iterator orelse return false;
+        const check = iterator.has_more orelse return true;
+        return check(iterator.ptr, self.context);
+    }
     pub fn partitionCount(self: *Stream, maximum: usize) !usize {
+        if (self.iterator != null) return 1;
         if (self.files.len == 0 or maximum < 2 or self.source.scanner.shared_reader == null) return 1;
         if (self.work) |work| return @min(maximum, work.units.len);
         const planning_io = self.source.scanner.shared_reader.?.context.io orelse self.context.io;
@@ -513,7 +735,7 @@ pub const Stream = struct {
             source.delete_lease = null;
             source.versions = .empty;
             defer source.clearVersions();
-            if (parent.source.versions.get(job.index)) |pinned| {
+            if (parent.source.pinnedVersion(job.index)) |pinned| {
                 var owned = pinned;
                 owned.etag = try job.alloc.dupe(u8, pinned.etag);
                 errdefer job.alloc.free(owned.etag);
@@ -537,17 +759,118 @@ pub const Stream = struct {
             job.stats = worker.stats;
         }
     };
-    pub fn deinit(self: *Stream) void {
+    /// All children of the previous file must be closed before advancing.
+    /// Only one footer's work census is retained by the rolling scheduler.
+    pub fn nextEnumerationWork(self: *Stream) !bool {
+        self.joinEnumerationLookahead();
         self.clearFile();
-        if (self.source.scanner.shared_reader) |reader| reader.drain(true);
+        self.releaseWork();
+        if (self.iterator == null) return false;
+        return self.nextEnumeratedFile();
+    }
+    /// Unordered work keeps a small rolling window so tiny files can overlap
+    /// while a large file still shares all its row groups among workers.
+    pub fn nextEnumerationWindow(self: *Stream, maximum: usize) !bool {
+        self.joinEnumerationLookahead();
+        self.clearFile();
+        self.releaseWork();
+        const iterator = self.iterator orelse return false;
+        const parent = self.iterator_parent.?;
+        var entries: std.ArrayList(external.FileEntry) = .empty;
+        var moved = false;
+        defer {
+            if (!moved) for (entries.items) |*file| file.deinit(self.alloc);
+            entries.deinit(self.alloc);
+        }
+        self.iterator_started = true;
+        for (0..@min(maximum, 4)) |_| {
+            var file = (try iterator.next(iterator.ptr, self.alloc, self.context)) orelse break;
+            errdefer file.deinit(self.alloc);
+            try entries.append(self.alloc, file);
+            self.enumerated_files += 1;
+        }
+        if (entries.items.len == 0) return false;
+        const pinned = try self.alloc.alloc(bool, entries.items.len);
+        errdefer self.alloc.free(pinned);
+        const order = try self.alloc.alloc(usize, entries.items.len);
+        errdefer self.alloc.free(order);
+        var view = try parent.parallelView(self.alloc);
+        errdefer view.closeParallelView(parent);
+        const files = try entries.toOwnedSlice(self.alloc);
+        moved = true;
+        for (files, pinned, order, 0..) |file, *pin, *index, i| {
+            pin.* = view.immutable_objects and (file.etag.len != 0 or (file.version_id.len != 0 and !std.mem.startsWith(u8, file.version_id, "iceberg:") and !std.mem.startsWith(u8, file.version_id, "object-stat:")));
+            index.* = i;
+        }
+        if (view.delete_lease) |lease| lease.release();
+        view.delete_lease = null;
+        view.prepared_deletes = null;
+        view.inventory.files = files;
+        view.scanner.inventory = view.inventory;
+        view.catalog_files = true;
+        view.catalog_files_owned = true;
+        view.selected_catalog_view = true;
+        view.plan_identity = null;
+        view.version_parent = null;
+        view.pinned_files = pinned;
+        view.pinned_files_owned = true;
+        self.source.closeParallelView(parent);
+        self.source.* = view;
+        if (self.owns_files) self.alloc.free(self.files);
+        self.files = order;
+        self.owns_files = true;
+        self.file_index = 0;
+        return true;
+    }
+    /// Transfer a planned window to a stable owner while the producer keeps
+    /// the same monotonic enumeration cursor. Children borrow this window's
+    /// descriptors and work census until its last claim closes.
+    pub fn detachWork(self: *Stream) !Stream {
+        std.debug.assert(self.iterator != null and self.work != null);
+        var following = try initEnumerated(self.alloc, self.iterator_parent.?, self.columns, self.predicates, self.context, self.limits);
+        // Initialization is the only fallible step; the original remains
+        // intact on allocation failure, including all borrowed child plans.
+        following.iterator.?.close(following.iterator.?.ptr);
+        following.iterator = self.iterator;
+        following.iterator_started = self.iterator_started;
+        following.enumerated_files = self.enumerated_files;
+        following.enumeration_lookahead = self.enumeration_lookahead;
+        following.enumeration_prefetch_tasks = self.enumeration_prefetch_tasks;
+        following.enumeration_prefetch_files = self.enumeration_prefetch_files;
+        following.schema_contract = self.schema_contract;
+        following.identity_only = self.identity_only;
+        following.examined = self.examined;
+        following.filter = self.filter;
+        following.filter_columns = self.filter_columns;
+        self.iterator = null;
+        self.enumeration_lookahead = null;
+        const window = self.*;
+        self.* = following;
+        return window;
+    }
+    fn releaseWork(self: *Stream) void {
         if (self.owns_work) if (self.work) |work| {
             for (work.plans) |*plan| if (plan.*) |*owned| owned.deinit(self.alloc);
             self.alloc.free(work.plans);
             self.alloc.free(work.units);
             self.alloc.destroy(work);
         };
+        self.work = null;
+        self.owns_work = false;
+    }
+    pub fn deinit(self: *Stream) void {
+        if (self.enumeration_lookahead) |warm| warm.deinit();
+        self.enumeration_lookahead = null;
+        self.clearFile();
+        if (self.source.scanner.shared_reader) |reader| reader.drain(true);
+        self.releaseWork();
         if (self.owns_files) self.alloc.free(self.files);
         self.mapped_columns.deinit(self.alloc);
+        if (self.iterator_parent) |parent| {
+            self.source.closeParallelView(parent);
+            self.alloc.destroy(self.source);
+        }
+        if (self.iterator) |iterator| iterator.close(iterator.ptr);
         self.* = undefined;
     }
     fn clearBatch(self: *Stream) void {
@@ -586,6 +909,17 @@ pub const Stream = struct {
         self.group_index = 0;
         self.bloom_next_input = 0;
         self.lookahead_next_input = 0;
+    }
+    fn admitRows(self: *Stream, rows: u64) !void {
+        const counter = self.examined orelse {
+            if (rows > self.limits.max_examined_rows -| self.stats.rows_examined) return error.LakeRowsScanBudgetExceeded;
+            return;
+        };
+        var used = counter.load(.monotonic);
+        while (true) {
+            if (rows > self.limits.max_examined_rows -| used) return error.LakeRowsScanBudgetExceeded;
+            if (counter.cmpxchgWeak(used, used + rows, .monotonic, .monotonic)) |current| used = current else return;
+        }
     }
     /// The returned vectors remain valid until the next pull or close.
     pub fn next(self: *Stream) !?types.ColumnBatch {
@@ -632,7 +966,7 @@ pub const Stream = struct {
                         self.stats.bloom_groups_pruned += 1;
                         continue;
                     }
-                    if (group.row_count > self.limits.max_examined_rows -| self.stats.rows_examined) return error.LakeRowsScanBudgetExceeded;
+                    try self.admitRows(group.row_count);
                     self.page_cursor = try @import("lake_parquet_cursor.zig").Cursor.init(self.alloc, self.source.scanner.reader(), plan.inventory, input.file_id, input.row_group_ordinal, if (self.identity_only) &.{} else if (self.schema_contract.len != 0) self.file_columns else self.columns, .{
                         .max_rows = self.limits.max_row_group_rows,
                         .max_struct_allocation_bytes = self.limits.max_decoded_bytes,
@@ -668,7 +1002,7 @@ pub const Stream = struct {
                         // A driver supplies row ordinals for ID-only or missing
                         // nullable predicates; other columns remain deferred.
                         if (required == 0 and self.page_cursor.?.columns.len != 0) self.page_cursor.?.columns[0].required = true;
-                        self.page_cursor.?.filter = .{ .ptr = self, .any_match = anyMatch };
+                        self.page_cursor.?.filter = .{ .ptr = self, .any_match = anyMatch, .select = if (self.filter.?.select != null) selectMask else null, .encoded = self.filter.?.encoded };
                     }
                     const batch = try self.page_cursor.?.next();
                     if (batch == null) {
@@ -700,7 +1034,9 @@ pub const Stream = struct {
                 self.group_index = unit.group_index;
                 continue;
             } else blk: {
-                if (self.file_index == self.files.len) return null;
+                if (self.file_index == self.files.len) {
+                    if (self.iterator == null or !try self.nextEnumeratedFile()) return null;
+                }
                 const index = self.files[self.file_index];
                 self.file_index += 1;
                 if (self.partition_count > 1 and self.files.len > 1 and (self.file_index - 1) * self.partition_count / self.files.len != self.partition_index) continue;
@@ -768,7 +1104,7 @@ pub const Stream = struct {
             return;
         }
     }
-    fn loadFile(self: *Stream, index: usize) !void {
+    fn pinFileVersion(self: *Stream, index: usize) !void {
         // Metadata and partition pruning happen before statting data objects.
         // Pin each surviving file once, before any footer or payload read.
         if (self.source.lazy_versions and !self.source.isFilePinned(index)) {
@@ -801,12 +1137,22 @@ pub const Stream = struct {
                 self.source.alloc.free(entry.version_id);
                 entry.etag = etag;
                 entry.version_id = version;
+            } else if (self.source.immutable_objects and self.source.verified_selector != null) {
+                const selector = self.source.verified_selector.?;
+                const versions = try selector.read(selector.ptr, self.source.alloc, entry, self.context);
+                self.source.alloc.free(entry.etag);
+                self.source.alloc.free(entry.version_id);
+                entry.etag = versions.etag;
+                entry.version_id = versions.version_id;
             } else try iceberg.pinInventoryDataFileObjectVersions(self.source.alloc, self.source.scanner.object_reader.client, &single);
             if (sparse) try self.source.versions.put(self.source.alloc, index, entry) else {
                 self.source.inventory.files[index] = entry;
                 self.source.pinned_files[index] = true;
             }
         }
+    }
+    fn loadFile(self: *Stream, index: usize) !void {
+        try self.pinFileVersion(index);
         // Candidate hydration windows share immutable projected file readers.
         // Fresh version pinning above and delete preparation below remain
         // request-owned; cached plans contain only fully owned metadata.
@@ -977,6 +1323,7 @@ pub const Stream = struct {
                     .coalesce_options = self.source.scanner.coalesce_options,
                     .materialization_limits = .{ .max_struct_allocation_bytes = self.limits.max_decoded_bytes, .max_input_bytes = self.limits.max_input_bytes, .max_decoded_bytes = self.limits.max_decoded_bytes },
                 };
+                const qualified = try self.source.qualifiedDeletes(self.context);
                 if (self.source.scanner.shared_reader) |reader| {
                     var hash = std.crypto.hash.sha2.Sha256.init(.{});
                     hash.update(&reader.scope);
@@ -990,13 +1337,15 @@ pub const Stream = struct {
                     var versions = std.crypto.hash.sha2.Sha256.init(.{});
                     const index_identity = if (self.source.plan_identity) |plan_key|
                         try std.json.Stringify.valueAlloc(self.alloc, plan_key, .{})
+                    else if (qualified) |evidence|
+                        try std.json.Stringify.valueAlloc(self.alloc, .{ .delete_recipe = evidence.recipe, .inventory = self.source.inventory }, .{})
                     else
                         try std.json.Stringify.valueAlloc(self.alloc, .{ .deletes = delete_plan, .inventory = self.source.inventory }, .{});
                     defer self.alloc.free(index_identity);
                     hash.update(index_identity);
                     var cacheable = true;
                     var delete_client = request.client.?;
-                    for (delete_plan.files) |file| {
+                    if (qualified) |evidence| cacheable = evidence.cacheable else for (delete_plan.files) |file| {
                         const location = try @import("lake_range_io.zig").objectLocationForUri(file.file_path);
                         var meta = try delete_client.statObject(location.bucket, location.key);
                         defer meta.deinit(request.client.?.allocator);
@@ -1005,21 +1354,23 @@ pub const Stream = struct {
                         // An unversioned provider cannot safely reuse an index.
                         if (meta.etag == null and meta.version_id == null) cacheable = false;
                     }
-                    const version_key = versions.finalResult();
+                    const version_key = if (qualified) |evidence| evidence.digest else versions.finalResult();
                     hash.update(&version_key);
                     const key = hash.finalResult();
                     const cached = if (cacheable) reader.cache.decoded.lookup(key) else null;
                     const lease = cached orelse blk: {
                         const owned = try reader.cache.decoded.create(64 * 1024 * 1024);
                         errdefer owned.release();
-                        owned.item.payload = .{ .prepared = try @import("lake_prepared_deletes.zig").Prepared.create(owned.item.budget.allocator(), request) };
+                        const decoded = try @import("lake_prepared_deletes.zig").Prepared.createQualified(owned.item.budget.allocator(), request, &reader.cache.delete_files, reader.scope, self.context, qualified);
+                        owned.item.payload = .{ .prepared = decoded };
+                        owned.item.foreign_bytes = owned.item.payload.prepared.foreignBytes();
                         try self.context.ensureActive();
                         if (cacheable and std.mem.eql(u8, &version_key, &owned.item.payload.prepared.object_versions)) reader.cache.decoded.publish(key, owned);
                         break :blk owned;
                     };
                     self.source.delete_lease = lease;
                     self.source.prepared_deletes = lease.item.payload.prepared;
-                } else self.source.prepared_deletes = try @import("lake_prepared_deletes.zig").Prepared.create(self.source.alloc, request);
+                } else self.source.prepared_deletes = try @import("lake_prepared_deletes.zig").Prepared.createQualified(self.source.alloc, request, null, @splat(0), self.context, qualified);
             }
         }
     }
@@ -1039,6 +1390,18 @@ pub const Stream = struct {
         return starts;
     }
     pub fn countAll(self: *Stream) !?u64 {
+        if (self.iterator != null) {
+            if (self.iterator_started or self.predicates.len != 0) return null;
+            var total: u64 = 0;
+            while (try self.nextEnumeratedFile()) {
+                try self.context.ensureActive();
+                try self.loadFile(0);
+                if (self.discovered) |plan| total = std.math.add(u64, total, plan.inventory.files[0].row_count) catch return error.LakeRowsScanBudgetExceeded;
+                self.clearFile();
+                self.file_index = self.files.len;
+            }
+            return total;
+        }
         if (self.file_index != 0 or self.predicates.len != 0) return null;
         var total: u64 = 0;
         for (self.files) |index| {
@@ -1051,14 +1414,14 @@ pub const Stream = struct {
         return total;
     }
     pub fn deleteMask(self: Stream, a: Allocator, batch: types.ColumnBatch, selected: []bool) !void {
-        for (batch.row_refs, selected) |ref, *keep| if (keep.* and self.isDeleted(ref)) {
-            keep.* = false;
-        };
+        for (selected, 0..) |*keep, index| {
+            if (keep.* and self.isDeleted(batch.rowRef(index))) keep.* = false;
+        }
         if (self.source.prepared_deletes) |prepared|
             try prepared.maskPositions(a, self.discovered.?.inventory.files[0], batch, selected, self.position_starts);
     }
     pub fn isDeletedBatch(self: Stream, a: Allocator, batch: types.ColumnBatch, index: usize) !bool {
-        if (self.isDeleted(batch.row_refs[index])) return true;
+        if (self.isDeleted(batch.rowRef(index))) return true;
         if (self.source.prepared_deletes) |prepared|
             return prepared.matchesPositions(a, self.discovered.?.inventory.files[0], batch, index, self.position_starts);
         return false;

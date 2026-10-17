@@ -107,7 +107,9 @@ pub fn validateExternalBatch(binding: Binding, batch: rowsource.ColumnBatch) !vo
     try batch.validate();
     if (!std.mem.eql(u8, batch.snapshot.table_id, binding.source_id)) return error.InvalidExternalRowSource;
     if (!std.mem.eql(u8, batch.snapshot.snapshot_id, binding.snapshot_id)) return error.InvalidExternalRowSource;
-    for (batch.row_refs) |row_ref| {
+    if (batch.external_span != null) return; // validate() checked the shared identity.
+    for (0..batch.rowCount()) |row_index| {
+        const row_ref = batch.rowRef(row_index);
         switch (row_ref) {
             .external => |external| {
                 if (!std.mem.eql(u8, external.source_id, binding.source_id)) return error.InvalidExternalRowSource;

@@ -506,6 +506,19 @@ pub const BatchKeys = struct {
                     .element_type = column.sql_element_type orelse return error.RelationalIndexColumnTypeMismatch,
                     .bytes = try vector.bytesAt(row),
                 } };
+                if (self.external_values and vector.values == .decimal128) {
+                    const decimal = vector.values.decimal128;
+                    if (column.column_type == .numeric) {
+                        try @import("../../common/decimal128.zig").validateCoefficient(decimal.values[row], decimal.precision, decimal.scale);
+                        var context: NumericContext = .{ .alloc = self.scratch.allocator() };
+                        const number = try @import("../../sql/numeric_value.zig").ScaledInteger.init(decimal.values[row], @intCast(decimal.scale));
+                        break :blk .{ .numeric = try @import("../../sql/numeric_binary.zig").encodeAlloc(&context, number.view()) };
+                    }
+                    if (column.column_type == .string or column.column_type == .blob) {
+                        const text = try decimal.text(self.scratch.allocator(), row);
+                        break :blk if (column.column_type == .string) .{ .string = text } else .{ .blob = text };
+                    }
+                }
                 if (self.external_values and column.column_type == .numeric) {
                     const raw: std.json.Value = switch (vector.values) {
                         .i64, .dictionary_i64 => .{ .integer = try vector.integerAt(row) },
@@ -1235,6 +1248,7 @@ test "external lake NUMERIC physical batch keys share native canonical tuple enc
         const vectors = [_]source.ColumnValues{
             if (index == 0) .{ .i64 = &.{9007199254740993} } else .{ .bytes = &.{text} },
             .{ .dictionary_bytes = .{ .values = &.{text}, .indices = &.{0} } },
+            .{ .decimal128 = .{ .values = &.{if (index == 0) @as(i128, 9007199254740993) else 90071992547409931250}, .precision = 38, .scale = if (index == 0) 0 else 4 } },
         };
         for (vectors) |vector| {
             const batch: source.ColumnBatch = .{ .snapshot = .{ .table_id = "numeric", .snapshot_id = "one" }, .row_refs = &.{.{ .relational_key = "one" }}, .columns = &.{.{ .name = "n", .values = vector }} };
@@ -1267,4 +1281,24 @@ test "external lake NUMERIC physical batch keys share native canonical tuple enc
     try out.appendSlice(a, "prefix");
     try std.testing.expectError(error.RowSourceColumnKindMismatch, rejected.append(a, &out, 0));
     try std.testing.expectEqualStrings("prefix", out.items);
+}
+
+test "external lake fixed decimal ordered string keys preserve display scale" {
+    const a = std.testing.allocator;
+    const source = @import("../rowsource/types.zig");
+    const table: schema.TableSchema = .{ .version = 1, .storage_mode = .relational, .relational_columns = &.{.{ .name = "n", .path = "n", .column_type = .string, .allows_null = false }} };
+    var layout = try rows.PhysicalLayout.init(a, table);
+    defer layout.deinit();
+    var plan = try TuplePlan.init(a, table, &layout, &.{.{ .column = "n" }});
+    defer plan.deinit();
+    const batch: source.ColumnBatch = .{ .snapshot = .{ .table_id = "t", .snapshot_id = "s" }, .row_refs = &.{.{ .relational_key = "r" }}, .columns = &.{.{ .name = "n", .values = .{ .decimal128 = .{ .values = &.{12300}, .precision = 38, .scale = 4 } } }} };
+    var bound = try plan.bindExternalBatch(a, batch);
+    defer bound.deinit();
+    var actual: std.ArrayList(u8) = .empty;
+    defer actual.deinit(a);
+    var expected: std.ArrayList(u8) = .empty;
+    defer expected.deinit(a);
+    _ = try bound.append(a, &actual, 0);
+    _ = try plan.appendValues(a, &expected, &.{.{ .string = "1.2300" }});
+    try std.testing.expectEqualSlices(u8, expected.items, actual.items);
 }

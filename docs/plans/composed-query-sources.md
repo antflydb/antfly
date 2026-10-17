@@ -272,7 +272,11 @@ reused after restart and during archive promotion. Leases fence stale completion
 Graceful cancellation conditionally releases unfinished claims with a separate
 one-second cleanup budget, including ambiguous successful claim writes recovered
 by random ownership token; hard crashes use the 120-second lease expiry. `{"action":"enrichment_status"}` on
-`/tables/{table}/lake/maintenance` reports completed/failed recent coverage. Jobs
+`/tables/{table}/lake/maintenance` reports composed table coverage under the actual
+WAL position, archive generation, incarnation, and recipe. Its version-2 status
+includes required/ready partition counts and the minimum covered artifact-retention
+horizon; reusable partition claims keep their separate version-1 job identity.
+Older completions cannot replace newer archive/WAL coverage. Jobs
 and segment artifacts retain for 24 hours; bounded background conditional cleanup
 collects expired state. Index work still obeys the bounded WAL, memory and request
 budgets; large jobs make vendor progress through durable memoized inputs. A live
@@ -594,3 +598,12 @@ horizon before conditionally publishing the manifest. Foreign authorities, parti
 views and extensions beyond the chunk horizon fail closed. Mutable host storage
 falls back to a coherent native capture. A new chunk-retention extension protocol
 would be needed to pin an immutable view beyond its existing protection horizon.
+
+Archive and accepted-WAL vector partitions share bounded parallel admission.
+Every lane owns mutable source-version maps, range-reader flights, index runtime
+pins and predicate cursors, while borrowing pinned immutable publication data.
+Merge order remains archive then recent-run order. All lanes join or cancel
+before their parent reader authority ends; saturation and oversized work retain
+serial execution. Native text admission uses streaming predicate pack proofs and
+range-local pattern proofs; fixed-frequency BM25 envelopes can also prove
+logical-order tie pruning using the scorer's actual f32 arithmetic.

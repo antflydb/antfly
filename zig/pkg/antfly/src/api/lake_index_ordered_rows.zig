@@ -27,12 +27,13 @@ const A = std.mem.Allocator;
 const tie_directory = @import("lake_index_tie_directory.zig");
 const Ref = local.serverless_manifest_artifact_ref.ArtifactRef;
 const rows = local.storage_rowsource_types;
-pub const metadata_version: u16 = 5;
+pub const metadata_version: u16 = 9;
+pub const file_dictionary = @import("lake_index_ordered_files.zig");
 // Distinct checkpoint metadata lets older workers safely discard derived runs
 // instead of mistaking a partial forest for a complete serving index.
-pub const checkpoint_metadata_version: u16 = 6;
+pub const checkpoint_metadata_version: u16 = 10;
 pub fn supportsBuildMetadata(version: u16) bool {
-    return version == metadata_version or version == checkpoint_metadata_version;
+    return version == 5 or version == 6 or version == 7 or version == 8 or version == metadata_version or version == checkpoint_metadata_version;
 }
 pub const predicate_blocks = @import("lake_index_predicate_blocks.zig");
 pub const max_root_bytes = 4 * 1024 * 1024;
@@ -60,15 +61,19 @@ pub const Root = struct {
     predicates: ?tree.Ref = null,
     source: []const u8,
     snapshot: []const u8,
-    files: []const []const u8,
+    files: []const []const u8 = &.{},
+    file_dictionary: ?file_dictionary.Roots = null,
+    /// Build-only borrowed publication directory; its references persist in the dictionary.
+    public_navigation: ?file_dictionary.Public = null,
     cover: []const []const u8 = &.{},
     file_fingerprints: []const [32]u8 = &.{},
     pub fn jsonStringify(self: Root, stream: anytype) @TypeOf(stream.*).Error!void {
         try stream.beginObject();
         inline for (@typeInfo(Root).@"struct".field_names) |field| {
-            if (comptime !std.mem.eql(u8, field, "retained_id") and !std.mem.eql(u8, field, "public_digests") and !std.mem.eql(u8, field, "public_slots") and !std.mem.eql(u8, field, "file_slots")) {
+            if (comptime !std.mem.eql(u8, field, "public_navigation") and !std.mem.eql(u8, field, "retained_id") and !std.mem.eql(u8, field, "public_digests") and !std.mem.eql(u8, field, "public_slots") and !std.mem.eql(u8, field, "file_slots")) {
                 const checkpoint_field = comptime std.mem.eql(u8, field, "building") or std.mem.eql(u8, field, "build_level") or std.mem.eql(u8, field, "build_runs");
-                if (!checkpoint_field or self.building) {
+                const dictionary_field = comptime std.mem.eql(u8, field, "files") or std.mem.eql(u8, field, "file_fingerprints");
+                if ((!checkpoint_field or self.building) and (!dictionary_field or self.file_dictionary == null)) {
                     try stream.objectField(field);
                     try stream.write(@field(self, field));
                 }
@@ -76,10 +81,19 @@ pub const Root = struct {
         }
         try stream.endObject();
     }
+    pub fn fileCount(self: Root) usize {
+        return if (self.file_dictionary) |dictionary| dictionary.count else self.files.len;
+    }
     pub fn validate(self: Root) !void {
-        if (self.version != (if (self.building) checkpoint_metadata_version else metadata_version) or self.tuple_encoding != tuples.encoding_version or std.mem.allEqual(u8, &self.domain, 0) or std.mem.allEqual(u8, &self.fingerprint, 0) or self.source.len == 0 or self.snapshot.len == 0) return error.InvalidNativeLakeRowIndex;
+        if (!(if (self.building) (self.version == 6 or self.version == 8 or self.version == checkpoint_metadata_version) else (self.version == 5 or self.version == 7 or self.version == metadata_version)) or self.tuple_encoding != tuples.encoding_version or std.mem.allEqual(u8, &self.domain, 0) or std.mem.allEqual(u8, &self.fingerprint, 0) or self.source.len == 0 or self.snapshot.len == 0) return error.InvalidNativeLakeRowIndex;
         if (self.file_fingerprints.len != 0 and self.file_fingerprints.len != self.files.len) return error.InvalidNativeLakeRowIndex;
-        if (self.files.len > 16384) return error.InvalidNativeLakeRowIndex;
+        if (self.files.len > std.math.maxInt(u32) or (self.version <= 6 and self.files.len > 16384)) return error.InvalidNativeLakeRowIndex;
+        if (self.file_dictionary) |dictionary| {
+            if (self.version < 7) return error.InvalidNativeLakeRowIndex;
+            try file_dictionary.validate(dictionary);
+            if (dictionary.public_names and self.version < 9) return error.InvalidNativeLakeRowIndex;
+            if (self.files.len != 0 and self.files.len != dictionary.count) return error.InvalidNativeLakeRowIndex;
+        }
         if (self.build_runs.len > 16 or self.build_level > 16 or (!self.building and (self.build_runs.len != 0 or self.build_level != 0))) return error.InvalidNativeLakeRowIndex;
         var levels: u32 = if (self.page != null) @as(u32, 1) << @as(u5, @intCast(self.build_level)) else 0;
         for (self.build_runs) |run| {
@@ -114,13 +128,41 @@ pub fn publish(a: A, result_alloc: A, store: *stores.ArtifactStore, sort: *local
     return publishIncremental(a, result_alloc, store, sort, name, fingerprint, inventory, cover, cancellation, .{});
 }
 pub const Delta = struct {
+    public_navigation: ?file_dictionary.Public = null,
     run_only: bool = false,
+    // Dictionary ownership is independent of a data run's merge ancestry.
+    dictionary_previous: ?Root = null,
+    dictionary_slots: ?[]const u32 = null,
     previous: ?Root = null,
     keep: []const bool = &.{},
+    /// Explicit retirements avoid walking the complete slot mask per checkpoint.
+    retired_slots: ?[]const u32 = null,
     files: []const []const u8 = &.{},
     fingerprints: []const [32]u8 = &.{},
     reverse_built: bool = false,
     built_reverse: ?tree.Ref = null,
+};
+const Retirements = struct {
+    keep: []const bool,
+    slots: ?[]const u32,
+    position: usize = 0,
+    previous: ?u32 = null,
+    fn next(self: *@This()) !?u32 {
+        if (self.slots) |slots| {
+            if (self.position == slots.len) return null;
+            const slot = slots[self.position];
+            if (slot >= self.keep.len or self.keep[slot] or (self.previous != null and slot <= self.previous.?)) return error.InvalidNativeLakeRowIndex;
+            self.position += 1;
+            self.previous = slot;
+            return slot;
+        }
+        while (self.position < self.keep.len) {
+            const slot = self.position;
+            self.position += 1;
+            if (!self.keep[slot]) return @intCast(slot);
+        }
+        return null;
+    }
 };
 /// Initial scans arrive in file-slot/row coordinates. Build the reverse tree
 /// directly in that order instead of sorting the tuple stream a second time.
@@ -136,7 +178,9 @@ pub const ReverseBuilder = struct {
         const self = try a.create(ReverseBuilder);
         self.* = .{ .a = a, .pages = undefined, .builder = undefined };
         self.pages = .{ .domain = scope.domain, .attempt = scope.attempt, .artifacts = store, .cancellation = cancellation, .remaining_read_bytes = &self.reads, .remaining_write_bytes = &self.writes, .streaming = true };
-        self.builder = .{ .alloc = a, .store = self.pages.store() };
+        var storage = self.pages.store();
+        storage.reduce = @import("lake_index_predicate_ranges.zig").reduce;
+        self.builder = .{ .alloc = a, .store = storage };
         return self;
     }
     pub fn add(self: *ReverseBuilder, key: []const u8) !void {
@@ -159,6 +203,8 @@ pub fn publishIncremental(a: A, result_alloc: A, store: *stores.ArtifactStore, s
     var read_bytes: u64 = 256 * 1024 * 1024;
     var write_bytes: u64 = 512 * 1024 * 1024;
     var pages: page_store.PageStore = .{ .domain = scope.domain, .attempt = scope.attempt, .artifacts = store, .cancellation = cancellation, .remaining_read_bytes = &read_bytes, .remaining_write_bytes = &write_bytes, .streaming = true, .io = sort.manager.io };
+    var reverse_storage = pages.store();
+    reverse_storage.reduce = @import("lake_index_predicate_ranges.zig").reduce;
     var predicates = predicate_blocks.Builder.init(a, sort.manager);
     defer predicates.deinit();
     var reverse_sort = local.sql_spill.Sort.init(a, sort.manager, &.{.{}}, 512 * 1024);
@@ -202,6 +248,7 @@ pub fn publishIncremental(a: A, result_alloc: A, store: *stores.ArtifactStore, s
                     var upload = self.store.*;
                     upload.allocator = scratch_alloc;
                     const ref = try upload.putScoped(self.scope, payload, self.cancellation);
+                    defer if (ref.provider_version) |version| upload.allocator.free(version);
                     var encoded: [52]u8 = undefined;
                     @memcpy(encoded[0..32], &try stores.sha256DigestFromChecksum(ref.checksum));
                     @memcpy(encoded[32..48], &self.scope.attempt);
@@ -266,7 +313,7 @@ pub fn publishIncremental(a: A, result_alloc: A, store: *stores.ArtifactStore, s
     };
     var merge: Merge = .{ .sorted = &sorted, .keep = delta.keep };
     if (delta.previous) |previous| {
-        if (!std.mem.eql(u8, &previous.domain, &scope.domain) or !std.mem.eql(u8, &previous.fingerprint, &fingerprint) or delta.keep.len != previous.files.len) return error.InvalidNativeLakeRowIndex;
+        if (!std.mem.eql(u8, &previous.domain, &scope.domain) or !std.mem.eql(u8, &previous.fingerprint, &fingerprint) or delta.keep.len != previous.fileCount()) return error.InvalidNativeLakeRowIndex;
         merge.cursor = try RunSource.init(a, pages.store(), previous, sort.manager);
     }
     defer if (merge.cursor) |*cursor| cursor.deinit();
@@ -278,8 +325,8 @@ pub fn publishIncremental(a: A, result_alloc: A, store: *stores.ArtifactStore, s
     const has_delta = if (delta.previous) |previous| blk: {
         if (previous.building or delta.run_only or previous.tie_version != 1 or previous.reverse == null or (previous.page != null and previous.predicates == null)) break :blk false;
         var removed: u64 = 0;
-        for (delta.keep, 0..) |keep_file, slot| {
-            if (keep_file) continue;
+        var retirements: Retirements = .{ .keep = delta.keep, .slots = delta.retired_slots };
+        while (try retirements.next()) |slot| {
             var lower: [4]u8 = undefined;
             var upper: [4]u8 = undefined;
             std.mem.writeInt(u32, &lower, @intCast(slot), .big);
@@ -296,8 +343,8 @@ pub fn publishIncremental(a: A, result_alloc: A, store: *stores.ArtifactStore, s
         // Walk only the reverse ranges belonging to replaced/removed files.
         // Every cursor stays on the retained prior root while copy-on-write
         // mutations publish a new candidate, never a partially visible index.
-        for (delta.keep, 0..) |keep_file, slot| {
-            if (keep_file) continue;
+        var retirements: Retirements = .{ .keep = delta.keep, .slots = delta.retired_slots };
+        while (try retirements.next()) |slot| {
             var prefix: [4]u8 = undefined;
             std.mem.writeInt(u32, &prefix, @intCast(slot), .big);
             var upper: [4]u8 = undefined;
@@ -325,7 +372,7 @@ pub fn publishIncremental(a: A, result_alloc: A, store: *stores.ArtifactStore, s
                 if (forward_changes.items.len == 0) break;
                 ties = try tie_directory.apply(a, pages.store(), ties, forward_changes.items);
                 page = try applyChanges(a, pages.store(), page, forward_changes.items);
-                reverse = try applyChanges(a, pages.store(), reverse, reverse_changes.items);
+                reverse = try applyChanges(a, reverse_storage, reverse, reverse_changes.items);
             }
         }
         var batch_arena = std.heap.ArenaAllocator.init(a);
@@ -349,7 +396,7 @@ pub fn publishIncremental(a: A, result_alloc: A, store: *stores.ArtifactStore, s
             if (forward_changes.items.len == 0) break;
             ties = try tie_directory.apply(a, pages.store(), ties, forward_changes.items);
             page = try applyChanges(a, pages.store(), page, forward_changes.items);
-            reverse = try applyChanges(a, pages.store(), reverse, reverse_changes.items);
+            reverse = try applyChanges(a, reverse_storage, reverse, reverse_changes.items);
         }
     } else {
         // Initial and legacy roots get a streaming reverse tree once.
@@ -394,19 +441,38 @@ pub fn publishIncremental(a: A, result_alloc: A, store: *stores.ArtifactStore, s
             }
         };
         var reverse_source: ReverseSource = .{ .sorted = &reverse_sorted };
-        reverse = if (delta.run_only) null else if (delta.reverse_built) delta.built_reverse else try tree.buildSortedWithOptions(a, pages.store(), &reverse_source, .{ .target_bytes = tree.bulk_target_page_bytes });
+        reverse = if (delta.run_only) null else if (delta.reverse_built) delta.built_reverse else try tree.buildSortedWithOptions(a, reverse_storage, &reverse_source, .{ .target_bytes = tree.bulk_target_page_bytes });
         if (!delta.run_only and delta.reverse_built and (page != null) != (reverse != null)) return error.InvalidNativeLakeRowIndex;
     }
     const predicate_root = if (delta.run_only) null else try predicates.publish(pages.store(), if (has_delta) delta.previous.?.predicates else null);
-    const files = try a.alloc([]const u8, inventory.files.len);
+    const files: [][]const u8 = if (delta.files.len == 0) try a.alloc([]const u8, inventory.files.len) else @constCast(&.{});
     defer a.free(files);
-    for (files, inventory.files) |*file, entry| file.* = entry.file_id;
-    const root: Root = .{ .fingerprint = fingerprint, .domain = scope.domain, .page = page, .reverse = reverse, .ties = ties, .tie_version = if (delta.run_only) 0 else 1, .building = delta.run_only, .predicates = predicate_root, .source = inventory.source_id, .snapshot = inventory.snapshot_id, .files = if (delta.files.len != 0) delta.files else files, .file_fingerprints = delta.fingerprints, .cover = cover };
-    return persistRoot(a, result_alloc, store, root, name, cancellation, delta.previous, !delta.run_only);
+    for (files, if (delta.files.len == 0) inventory.files else &.{}) |*file, entry| file.* = entry.file_id;
+    var dictionary: ?file_dictionary.Roots = null;
+    if (delta.dictionary_slots) |slots| {
+        const previous = delta.dictionary_previous orelse delta.previous orelse return error.InvalidNativeLakeRowIndex;
+        dictionary = try file_dictionary.updateFingerprints(a, pages.store(), previous.file_dictionary orelse return error.InvalidNativeLakeRowIndex, delta.files, delta.fingerprints, slots);
+    }
+    const root: Root = .{ .fingerprint = fingerprint, .domain = scope.domain, .page = page, .reverse = reverse, .ties = ties, .tie_version = if (delta.run_only) 0 else 1, .building = delta.run_only, .predicates = predicate_root, .source = inventory.source_id, .snapshot = inventory.snapshot_id, .files = if (delta.files.len != 0) delta.files else files, .file_fingerprints = delta.fingerprints, .public_navigation = delta.public_navigation, .cover = cover };
+    return persistRoot(a, result_alloc, store, root, name, cancellation, delta.dictionary_previous orelse delta.previous, !delta.run_only, sort.manager, dictionary);
 }
-fn persistRoot(a: A, result_alloc: A, store: *stores.ArtifactStore, root: Root, name: []const u8, cancellation: Cancellation, previous_root: ?Root, register_closure: bool) !Ref {
+fn persistRoot(a: A, result_alloc: A, store: *stores.ArtifactStore, root: Root, name: []const u8, cancellation: Cancellation, previous_root: ?Root, register_closure: bool, manager: ?*local.sql_spill.Manager, ready_dictionary: ?file_dictionary.Roots) !Ref {
     var persisted = root;
     persisted.version = if (root.building) checkpoint_metadata_version else metadata_version;
+    if (ready_dictionary) |ready| {
+        persisted.file_dictionary = ready;
+    } else if (root.files.len != 0 or root.file_dictionary == null) {
+        var reads: u64 = 256 * 1024 * 1024;
+        var writes: u64 = 512 * 1024 * 1024;
+        const scope = store.upload_scope orelse return error.InvalidArtifactUploadScope;
+        var dictionary_pages: page_store.PageStore = .{ .domain = root.domain, .attempt = scope.attempt, .artifacts = store, .cancellation = cancellation, .remaining_read_bytes = &reads, .remaining_write_bytes = &writes, .streaming = true };
+        const prior: ?file_dictionary.Previous = if (previous_root) |old| if (old.file_dictionary) |dictionary| .{ .roots = dictionary, .files = old.files, .fingerprints = old.file_fingerprints, .same_snapshot = std.mem.eql(u8, old.source, root.source) and std.mem.eql(u8, old.snapshot, root.snapshot) } else null else null;
+        persisted.file_dictionary = try file_dictionary.publishWithOptions(a, dictionary_pages.store(), root.source, root.snapshot, root.files, root.file_fingerprints, prior, .{ .shared = root.public_navigation, .manager = manager });
+    }
+    // Published dictionaries authenticate their own slot/name census. Do not
+    // revalidate an archive-sized borrowed array at every per-file checkpoint.
+    persisted.files = &.{};
+    persisted.file_fingerprints = &.{};
     try persisted.validate();
     const bytes = try std.json.Stringify.valueAlloc(a, persisted, .{});
     defer a.free(bytes);
@@ -414,6 +480,11 @@ fn persistRoot(a: A, result_alloc: A, store: *stores.ArtifactStore, root: Root, 
     var upload = store.*;
     upload.allocator = result_alloc;
     var ref = try upload.putWithCancellation(bytes, cancellation);
+    // The durable map owns its selector copy; ArtifactRef transfers only the
+    // public artifact identity, not this temporary provider response.
+    const provider_version = ref.provider_version;
+    ref.provider_version = null;
+    defer if (provider_version) |version| result_alloc.free(version);
     errdefer ref.deinit(result_alloc);
     // Only authenticated previous closures may be inherited. Advisory backend
     // failures retain the full audit path, while cancellation remains fatal.
@@ -468,17 +539,33 @@ const RunSource = struct {
 pub fn publishRunCheckpoint(a: A, out: A, store: *stores.ArtifactStore, sort: *local.sql_spill.Sort, name: []const u8, fingerprint: [32]u8, inventory: local.serverless_external_source_types.Inventory, cover: []const []const u8, cancellation: Cancellation, delta: Delta) !Ref {
     const scope = store.upload_scope orelse return error.InvalidArtifactUploadScope;
     if (delta.previous) |previous| {
-        if (!previous.building or delta.keep.len != previous.files.len or previous.file_fingerprints.len != previous.files.len or !std.mem.eql(u8, &previous.fingerprint, &fingerprint) or !std.mem.eql(u8, &previous.domain, &scope.domain)) return error.InvalidNativeLakeRowIndex;
+        if (!previous.building or delta.keep.len != previous.fileCount() or (previous.file_fingerprints.len != 0 and previous.file_fingerprints.len != previous.files.len) or !std.mem.eql(u8, &previous.fingerprint, &fingerprint) or !std.mem.eql(u8, &previous.domain, &scope.domain)) return error.InvalidNativeLakeRowIndex;
         // A changed immutable identity retires old coordinates through the
         // ordinary filtered merge, never appends a conflicting run.
-        for (delta.keep, previous.file_fingerprints) |keep, digest| if (!keep and !std.mem.allEqual(u8, &digest, 0))
-            return publishIncremental(a, out, store, sort, name, fingerprint, inventory, cover, cancellation, delta);
+        var reads: u64 = 16 * 1024 * 1024;
+        var writes: u64 = 0;
+        var pages: page_store.PageStore = .{ .domain = scope.domain, .artifacts = store, .cancellation = cancellation, .remaining_read_bytes = &reads, .remaining_write_bytes = &writes };
+        var slot_arena = std.heap.ArenaAllocator.init(a);
+        defer slot_arena.deinit();
+        const slots = delta.dictionary_slots;
+        const n = if (slots) |selected| selected.len else delta.keep.len;
+        for (0..n) |i| {
+            const slot = if (slots) |selected| selected[i] else i;
+            if (slot >= delta.keep.len) return error.InvalidNativeLakeRowIndex;
+            if (delta.keep[slot]) continue;
+            _ = slot_arena.reset(.retain_capacity);
+            const digest = if (previous.file_dictionary) |dictionary|
+                (try file_dictionary.file(slot_arena.allocator(), pages.store(), dictionary, @intCast(slot))).fingerprint
+            else
+                previous.file_fingerprints[slot];
+            if (!std.mem.allEqual(u8, &digest, 0)) return publishIncremental(a, out, store, sort, name, fingerprint, inventory, cover, cancellation, delta);
+        }
     }
     var scratch = std.heap.ArenaAllocator.init(a);
     defer scratch.deinit();
     const ca = scratch.allocator();
-    const fresh_ref = try publishIncremental(a, ca, store, sort, name, fingerprint, inventory, cover, cancellation, .{ .run_only = delta.previous != null, .files = delta.files, .fingerprints = delta.fingerprints, .reverse_built = delta.reverse_built, .built_reverse = delta.built_reverse });
-    var fresh = try loadRoot(ca, store.*, fresh_ref, cancellation, null);
+    const fresh_ref = try publishIncremental(a, ca, store, sort, name, fingerprint, inventory, cover, cancellation, .{ .dictionary_previous = delta.previous, .dictionary_slots = delta.dictionary_slots, .run_only = delta.previous != null, .public_navigation = delta.public_navigation, .files = delta.files, .fingerprints = delta.fingerprints, .reverse_built = delta.reverse_built, .built_reverse = delta.built_reverse });
+    var fresh = try loadRootLazy(ca, store.*, fresh_ref, cancellation, null);
     var runs: std.ArrayList(Root.Run) = .empty;
     var incoming: ?tree.Ref = fresh.page;
     var level: u8 = 0;
@@ -508,13 +595,14 @@ pub fn publishRunCheckpoint(a: A, out: A, store: *stores.ArtifactStore, sort: *l
     fresh.build_level = if (runs.items.len == 0) 0 else runs.items[0].level;
     fresh.build_runs = if (runs.items.len == 0) &.{} else runs.items[1..];
     fresh.building = true;
+    fresh.public_navigation = delta.public_navigation;
     if (delta.previous != null) {
         fresh.reverse = null;
         fresh.ties = null;
         fresh.predicates = null;
         fresh.tie_version = 0;
     }
-    return persistRoot(a, out, store, fresh, name, cancellation, delta.previous orelse fresh, true);
+    return persistRoot(a, out, store, fresh, name, cancellation, delta.previous orelse fresh, true, sort.manager, fresh.file_dictionary);
 }
 
 /// A single-file checkpoint already owns all serving trees. Seal its metadata
@@ -524,8 +612,9 @@ pub fn finalizeRunCheckpoint(a: A, out: A, store: *stores.ArtifactStore, sort: *
         if (previous.building and previous.build_runs.len == 0 and previous.tie_version == 1 and sort.total == 0 and std.mem.allEqual(bool, delta.keep, true)) {
             var root = previous;
             root.building = false;
+            root.public_navigation = delta.public_navigation;
             root.build_level = 0;
-            return persistRoot(a, out, store, root, name, cancellation, previous, true);
+            return persistRoot(a, out, store, root, name, cancellation, previous, true, sort.manager, previous.file_dictionary);
         }
     }
     return publishIncremental(a, out, store, sort, name, fingerprint, inventory, cover, cancellation, delta);
@@ -540,13 +629,36 @@ fn applyChanges(a: A, store: tree.Store, root: ?tree.Ref, changes: []tree.Mutati
     return tree.apply(a, store, root, changes);
 }
 
-pub fn loadRoot(a: A, store: stores.ArtifactStore, ref: Ref, cancellation: Cancellation, cache: ?artifacts.CachedRead) !Root {
+pub fn loadRootLazy(a: A, store: stores.ArtifactStore, ref: Ref, cancellation: Cancellation, cache: ?artifacts.CachedRead) !Root {
     if (ref.kind != .ordered_row_index or !supportsBuildMetadata(ref.metadata_version) or ref.byte_len > max_root_bytes) return error.InvalidNativeLakeRowIndex;
     const bytes = try artifacts.readArtifact(a, store, .{ .artifact_id = ref.artifact_id, .checksum = ref.checksum, .byte_len = ref.byte_len }, cancellation, cache);
     defer a.free(bytes);
     var root = try std.json.parseFromSliceLeaky(Root, a, bytes, .{ .allocate = .alloc_always });
     try root.validate();
     if (root.version != ref.metadata_version) return error.InvalidNativeLakeRowIndex;
+    if (root.file_dictionary == null) try deriveFiles(a, &root);
+    const scope = (try stores.uploadScopeFromArtifactId(ref.artifact_id)) orelse return error.InvalidNativeLakeRowIndex;
+    if (!std.mem.eql(u8, &scope.domain, &root.domain)) return error.InvalidNativeLakeRowIndex;
+    root.retained_id = try a.dupe(u8, ref.artifact_id);
+    return root;
+}
+/// Full slot state is a maintenance operation, never a serving prerequisite.
+pub fn loadRoot(a: A, store: stores.ArtifactStore, ref: Ref, cancellation: Cancellation, cache: ?artifacts.CachedRead) !Root {
+    var root = try loadRootLazy(a, store, ref, cancellation, cache);
+    if (root.file_dictionary) |dictionary| {
+        var reads: u64 = 256 * 1024 * 1024;
+        var writes: u64 = 0;
+        var backend = store;
+        var pages: page_store.PageStore = .{ .domain = root.domain, .artifacts = &backend, .cancellation = cancellation, .remaining_read_bytes = &reads, .remaining_write_bytes = &writes };
+        const slots = try file_dictionary.materialize(a, pages.store(), dictionary);
+        root.files = slots.files;
+        root.file_fingerprints = slots.fingerprints;
+        try deriveFiles(a, &root);
+        try root.validate();
+    }
+    return root;
+}
+fn deriveFiles(a: A, root: *Root) !void {
     const digests = try a.alloc([32]u8, root.files.len);
     for (root.files, digests) |file, *digest| digest.* = local.storage_rowsource_identity.fileDigest(root.source, root.snapshot, file);
     root.public_digests = digests;
@@ -566,10 +678,6 @@ pub fn loadRoot(a: A, store: stores.ArtifactStore, ref: Ref, cancellation: Cance
         }
     }.less);
     root.file_slots = slots;
-    const scope = (try stores.uploadScopeFromArtifactId(ref.artifact_id)) orelse return error.InvalidNativeLakeRowIndex;
-    if (!std.mem.eql(u8, &scope.domain, &root.domain)) return error.InvalidNativeLakeRowIndex;
-    root.retained_id = try a.dupe(u8, ref.artifact_id);
-    return root;
 }
 
 /// Prove the complete retained dependency graph before trusting file fingerprints.
@@ -674,6 +782,11 @@ fn validateReuseWithCache(a: A, backend: stores.ArtifactStore, root: Root, conte
     try validator.pages(root.reverse, false);
     try validator.pages(root.ties, false);
     try validator.pages(root.predicates, false);
+    if (root.file_dictionary) |dictionary| {
+        try validator.pages(dictionary.slots, false);
+        try validator.pages(dictionary.names, false);
+        try validator.pages(dictionary.public, false);
+    }
     try validator.certify(root.retained_id);
 }
 
@@ -684,7 +797,7 @@ fn validateReuseWithCache(a: A, backend: stores.ArtifactStore, root: Root, conte
 pub const VerifiedRoot = struct {
     value: Root,
     pub fn load(a: A, store: stores.ArtifactStore, ref: Ref, cancellation: Cancellation, cache: ?artifacts.CachedRead) !VerifiedRoot {
-        const root = try loadRoot(a, store, ref, cancellation, cache);
+        const root = try loadRootLazy(a, store, ref, cancellation, cache);
         if (root.building) return error.InvalidNativeLakeRowIndex;
         return .{ .value = root };
     }
@@ -694,6 +807,15 @@ pub const Reader = struct {
     physical_cursor: ?tree.Cursor = null,
     membership_arena: ?std.heap.ArenaAllocator = null,
     membership_reads: u64 = 8 * 1024 * 1024,
+    range_reads: u64 = 256 * 1024 * 1024,
+    range_pages: page_store.PageStore = undefined,
+    range_cache: ?tree.Cache = null,
+    dictionary_cache: ?tree.Cache = null,
+    // A small decoded-name memo avoids reparsing the same slot for every row.
+    // Output strings are copied into the caller, independently of eviction.
+    file_names: [32]?struct { slot: u32, name: []u8, age: u64 } = @splat(null),
+    file_name_tick: u64 = 0,
+    file_name_misses: usize = 0,
     predicate_cursor: ?tree.Cursor = null,
     root: Root,
     pages: page_store.PageStore,
@@ -730,6 +852,14 @@ pub const Reader = struct {
         return artifacts.readArtifact(a, store.*, .{ .artifact_id = ref.artifact_id, .checksum = ref.checksum, .byte_len = ref.byte_len }, cancellation, self.cached);
     }
     pub fn deinit(self: *Reader) void {
+        for (&self.file_names) |*entry| if (entry.*) |held| {
+            self.cursor.?.alloc.free(held.name);
+            entry.* = null;
+        };
+        if (self.dictionary_cache) |*cache| cache.deinit();
+        self.dictionary_cache = null;
+        if (self.range_cache) |*cache| cache.deinit();
+        self.range_cache = null;
         if (self.membership_arena) |*arena| arena.deinit();
         self.membership_arena = null;
         if (self.cursor) |*cursor| cursor.deinit();
@@ -738,6 +868,81 @@ pub const Reader = struct {
         self.physical_cursor = null;
         if (self.predicate_cursor) |*cursor| cursor.deinit();
         self.predicate_cursor = null;
+    }
+    pub fn dictionaryStore(self: *Reader) tree.Store {
+        if (self.dictionary_cache == null) self.dictionary_cache = .{ .alloc = self.cursor.?.alloc, .underlying = self.pages.store(), .max_bytes = 1024 * 1024 };
+        return self.dictionary_cache.?.store();
+    }
+    pub fn fileAtAlloc(self: *Reader, a: A, slot: u32) ![]const u8 {
+        if (slot >= self.root.fileCount()) return error.InvalidNativeLakeRowIndex;
+        if (self.root.files.len != 0) return self.root.files[slot];
+        self.file_name_tick +%= 1;
+        var target: usize = 0;
+        for (&self.file_names, 0..) |*entry, i| {
+            if (entry.*) |*held| {
+                if (held.slot == slot) {
+                    held.age = self.file_name_tick;
+                    return a.dupe(u8, held.name);
+                }
+                if (self.file_names[target] != null and held.age < self.file_names[target].?.age) target = i;
+            } else target = i;
+        }
+        self.file_name_misses += 1;
+        var scratch = std.heap.ArenaAllocator.init(self.cursor.?.alloc);
+        defer scratch.deinit();
+        const record = try file_dictionary.file(scratch.allocator(), self.dictionaryStore(), self.root.file_dictionary orelse return error.InvalidNativeLakeRowIndex, slot);
+        if (record.file.len <= 4096) {
+            const owned = try self.cursor.?.alloc.dupe(u8, record.file);
+            if (self.file_names[target]) |held| self.cursor.?.alloc.free(held.name);
+            self.file_names[target] = .{ .slot = slot, .name = owned, .age = self.file_name_tick };
+        }
+        return a.dupe(u8, record.file);
+    }
+    pub fn fileSlot(self: *Reader, a: A, name: []const u8) !u32 {
+        if (self.root.files.len == 0) if (self.root.file_dictionary) |dictionary| return (try file_dictionary.named(a, self.dictionaryStore(), dictionary, name)) orelse error.ExternalLakeSnapshotMismatch;
+        var lo: usize = 0;
+        var hi = self.root.file_slots.len;
+        while (lo < hi) {
+            const mid = lo + (hi - lo) / 2;
+            if (std.mem.order(u8, self.root.file_slots[mid].file, name) == .lt) lo = mid + 1 else hi = mid;
+        }
+        if (lo < self.root.file_slots.len and std.mem.eql(u8, self.root.file_slots[lo].file, name)) return self.root.file_slots[lo].slot;
+        if (self.root.file_slots.len == 0) for (self.root.files, 0..) |file, i| if (std.mem.eql(u8, file, name)) {
+            return @intCast(i);
+        };
+        return error.ExternalLakeSnapshotMismatch;
+    }
+    pub fn publicRecordSlot(self: *Reader, a: A, record: tree.Cursor.Record) !u32 {
+        const dictionary = self.root.file_dictionary orelse return error.InvalidNativeLakeRowIndex;
+        if (record.key.len != 32) return error.InvalidNativeLakeRowIndex;
+        if (dictionary.public_names) return self.fileSlot(a, record.value);
+        if (record.value.len != 4) return error.InvalidNativeLakeRowIndex;
+        const slot = std.mem.readInt(u32, record.value[0..4], .big);
+        if (slot >= dictionary.count) return error.InvalidNativeLakeRowIndex;
+        return slot;
+    }
+    pub fn publicSlot(self: *Reader, a: A, digest: [32]u8) !?u32 {
+        if (self.root.file_dictionary) |dictionary| return file_dictionary.publicSlot(a, self.dictionaryStore(), dictionary, digest);
+        var lo: usize = 0;
+        var hi = self.root.public_slots.len;
+        while (lo < hi) {
+            const mid = lo + (hi - lo) / 2;
+            const slot = self.root.public_slots[mid];
+            switch (std.mem.order(u8, &self.root.public_digests[slot], &digest)) {
+                .lt => lo = mid + 1,
+                .gt => hi = mid,
+                .eq => return slot,
+            }
+        }
+        return null;
+    }
+    pub fn publicDigest(self: *Reader, a: A, slot: u32) ![32]u8 {
+        if (self.root.public_digests.len != 0) {
+            if (slot >= self.root.public_digests.len) return error.InvalidNativeLakeRowIndex;
+            return self.root.public_digests[slot];
+        }
+        const file = try self.fileAtAlloc(a, slot);
+        return local.storage_rowsource_identity.fileDigest(self.root.source, self.root.snapshot, file);
     }
     pub fn nextPredicateBlocks(self: *Reader, a: A, lower: []const u8, upper: ?[]const u8) ![]const predicate_blocks.Block {
         if (self.exhausted) return &.{};
@@ -749,8 +954,8 @@ pub const Reader = struct {
             const physical = record.key[record.key.len - 16 ..];
             const file = std.mem.readInt(u32, physical[0..4], .big);
             const base = std.mem.readInt(u64, physical[8..16], .big);
-            if (file >= self.root.files.len or base & ((1 << predicate_blocks.shift) - 1) != 0) return error.InvalidNativeLakeRowIndex;
-            try blocks.append(a, .{ .file = self.root.files[file], .group = std.mem.readInt(u32, physical[4..8], .big), .base = base, .selection = try predicate_blocks.decode(a, record.value) });
+            if (file >= self.root.fileCount() or base & ((1 << predicate_blocks.shift) - 1) != 0) return error.InvalidNativeLakeRowIndex;
+            try blocks.append(a, .{ .file = try self.fileAtAlloc(a, file), .group = std.mem.readInt(u32, physical[4..8], .big), .base = base, .selection = try predicate_blocks.decode(a, record.value) });
         }
         return blocks.toOwnedSlice(a);
     }
@@ -765,19 +970,9 @@ pub const Reader = struct {
         if (ref != .external) return error.InvalidNativeLakeRowIndex;
         const row = ref.external;
         if (!std.mem.eql(u8, row.source_id, self.root.source) or !std.mem.eql(u8, row.snapshot_id, self.root.snapshot)) return error.ExternalLakeSnapshotMismatch;
-        const slot = blk: {
-            var lo: usize = 0;
-            var hi = self.root.file_slots.len;
-            while (lo < hi) {
-                const mid = lo + (hi - lo) / 2;
-                if (std.mem.order(u8, self.root.file_slots[mid].file, row.file_id) == .lt) lo = mid + 1 else hi = mid;
-            }
-            if (lo < self.root.file_slots.len and std.mem.eql(u8, self.root.file_slots[lo].file, row.file_id)) break :blk self.root.file_slots[lo].slot;
-            if (self.root.file_slots.len != 0) return error.ExternalLakeSnapshotMismatch;
-            // Direct in-memory roots may lack the load-time derived directory.
-            for (self.root.files, 0..) |file, index| if (std.mem.eql(u8, file, row.file_id)) break :blk @as(u32, @intCast(index));
-            return error.ExternalLakeSnapshotMismatch;
-        };
+        var lookup_scratch = std.heap.ArenaAllocator.init(self.cursor.?.alloc);
+        defer lookup_scratch.deinit();
+        const slot = try self.fileSlot(lookup_scratch.allocator(), row.file_id);
         const physical = coordinate(slot, row);
         if (self.membership_arena == null) self.membership_arena = .init(self.cursor.?.alloc);
         _ = self.membership_arena.?.reset(.retain_capacity);
@@ -790,6 +985,24 @@ pub const Reader = struct {
         if (record.key.len < 32 or !std.mem.eql(u8, record.key[record.key.len - 16 ..], &physical)) return error.InvalidNativeLakeRowIndex;
         const key = record.key[16..];
         return std.mem.order(u8, key, lower) != .lt and (upper == null or std.mem.order(u8, key, upper.?) == .lt);
+    }
+    pub fn intersectsPhysical(self: *Reader, first: rows.RowRef, last: rows.RowRef, lower: []const u8, upper: ?[]const u8) !?bool {
+        if (first != .external or last != .external or !std.mem.eql(u8, first.external.file_id, last.external.file_id)) return error.InvalidNativeLakeRowIndex;
+        const row = first.external;
+        if (!std.mem.eql(u8, row.source_id, self.root.source) or !std.mem.eql(u8, row.snapshot_id, self.root.snapshot) or
+            !std.mem.eql(u8, last.external.source_id, self.root.source) or !std.mem.eql(u8, last.external.snapshot_id, self.root.snapshot)) return error.ExternalLakeSnapshotMismatch;
+        if (self.root.reverse == null or self.range_reads == 0) return null;
+        var lookup_scratch = std.heap.ArenaAllocator.init(self.cursor.?.alloc);
+        defer lookup_scratch.deinit();
+        const selected = try self.fileSlot(lookup_scratch.allocator(), row.file_id);
+        if (self.membership_arena == null) self.membership_arena = .init(self.cursor.?.alloc);
+        _ = self.membership_arena.?.reset(.retain_capacity);
+        if (self.range_cache == null) {
+            self.range_pages = self.pages;
+            self.range_pages.remaining_read_bytes = &self.range_reads;
+            self.range_cache = .{ .alloc = self.cursor.?.alloc, .underlying = self.range_pages.store(), .max_bytes = 1024 * 1024 };
+        }
+        return @import("lake_index_predicate_ranges.zig").intersects(self.membership_arena.?.allocator(), self.range_cache.?.store(), self.root.reverse, coordinate(selected, row), coordinate(selected, last.external), lower, upper);
     }
     /// Reverse-tree order is physical file/group/row order. Test the stored
     /// tuple against the exact seek bounds without opening Parquet columns.
@@ -805,7 +1018,7 @@ pub const Reader = struct {
             if (!std.mem.eql(u8, record.key[0..16], key[key.len - 16 ..])) return error.InvalidNativeLakeRowIndex;
             if (std.mem.order(u8, key, lower) == .lt) continue;
             if (upper) |end| if (std.mem.order(u8, key, end) != .lt) continue;
-            try refs.append(a, try self.decode(.{ .key = key, .value = record.key[0..16] }));
+            try refs.append(a, try self.decode(a, .{ .key = key, .value = record.key[0..16] }));
         }
         return refs.toOwnedSlice(a);
     }
@@ -823,16 +1036,16 @@ pub const Reader = struct {
                 self.exhausted = true;
                 break;
             };
-            try entries.append(a, .{ .key = try a.dupe(u8, record.key), .ref = try self.decode(record), .cover = try coverReference(a, self.root.domain, record.value) });
+            try entries.append(a, .{ .key = try a.dupe(u8, record.key), .ref = try self.decode(a, record), .cover = try coverReference(a, self.root.domain, record.value) });
         }
         return entries.toOwnedSlice(a);
     }
-    pub fn decode(self: *Reader, record: tree.Cursor.Record) !rows.RowRef {
+    pub fn decode(self: *Reader, a: A, record: tree.Cursor.Record) !rows.RowRef {
         if ((record.value.len != 16 and record.value.len != 70) or record.key.len < 16 or !std.mem.eql(u8, record.value[0..16], record.key[record.key.len - 16 ..])) return error.InvalidNativeLakeRowIndex;
         const physical: *const [16]u8 = @ptrCast(record.value.ptr);
         const file = std.mem.readInt(u32, physical[0..4], .big);
-        if (file >= self.root.files.len) return error.InvalidNativeLakeRowIndex;
-        return .{ .external = .{ .source_id = self.root.source, .snapshot_id = self.root.snapshot, .file_id = self.root.files[file], .row_group_ordinal = std.mem.readInt(u32, physical[4..8], .big), .row_ordinal = std.mem.readInt(u64, physical[8..16], .big) } };
+        if (file >= self.root.fileCount()) return error.InvalidNativeLakeRowIndex;
+        return .{ .external = .{ .source_id = self.root.source, .snapshot_id = self.root.snapshot, .file_id = try self.fileAtAlloc(a, file), .row_group_ordinal = std.mem.readInt(u32, physical[4..8], .big), .row_ordinal = std.mem.readInt(u64, physical[8..16], .big) } };
     }
     pub fn next(self: *Reader, a: A, max_rows: usize) ![]const rows.RowRef {
         if (max_rows == 0 or max_rows > 65536) return error.InvalidNativeLakeRowIndex;
@@ -843,7 +1056,7 @@ pub const Reader = struct {
                 self.exhausted = true;
                 break;
             };
-            try refs.append(a, try self.decode(record));
+            try refs.append(a, try self.decode(a, record));
         }
         // Root strings already belong to the reader's arena. The consumer
         // retains that owner throughout candidate hydration.
@@ -907,6 +1120,18 @@ test "external lake ordered deltas retain untouched pages and delete only one fi
     for (0..16384) |n| try Make.add(&first, @intCast(n), 0, n);
     const ref = try publish(a, ca, &store, &first, "ordered", @splat(3), inventory, &.{}, .none);
     const root = try loadRoot(ca, store, ref, .none, null);
+    {
+        const lazy = try loadRootLazy(ca, store, ref, .none, null);
+        try std.testing.expectEqual(@as(usize, 0), lazy.files.len);
+        try std.testing.expectEqual(@as(usize, 1), lazy.fileCount());
+        var selective: Reader = undefined;
+        try selective.init(a, &store, lazy, @splat(3), "", null, .none);
+        defer selective.deinit();
+        const first_rows = try selective.next(ca, 2);
+        try std.testing.expectEqual(@as(usize, 2), first_rows.len);
+        for (first_rows) |row| try std.testing.expectEqualStrings("a", row.external.file_id);
+        try std.testing.expectEqual(@as(usize, 1), selective.file_name_misses);
+    }
     // Physical reverse traversal applies tuple bounds without hydration.
     var predicate_reader: Reader = undefined;
     var lower_key: [4]u8 = undefined;
@@ -929,7 +1154,12 @@ test "external lake ordered deltas retain untouched pages and delete only one fi
     const materialization_reads = predicate_reader.remaining_reads;
     try std.testing.expect(try predicate_reader.containsPhysical(Probe.row(101), &lower_key, &upper_key));
     try std.testing.expectEqual(materialization_reads, predicate_reader.remaining_reads);
+    try std.testing.expectEqual(@as(?bool, true), try predicate_reader.intersectsPhysical(Probe.row(90), Probe.row(110), &lower_key, &upper_key));
+    try std.testing.expectEqual(@as(?bool, false), try predicate_reader.intersectsPhysical(Probe.row(500), Probe.row(16000), &lower_key, &upper_key));
+    try std.testing.expectError(error.ExternalLakeSnapshotMismatch, predicate_reader.intersectsPhysical(Probe.row(90), wrong, &lower_key, &upper_key));
     predicate_reader.membership_reads = 0;
+    predicate_reader.range_reads = 0;
+    try std.testing.expect((try predicate_reader.intersectsPhysical(Probe.row(90), Probe.row(110), &lower_key, &upper_key)) == null);
     try std.testing.expect(!predicate_reader.canProbeMembership());
     const physical_matches = try predicate_reader.nextPhysical(ca, 1024, &lower_key, &upper_key);
     try std.testing.expectEqual(@as(usize, 3), physical_matches.len);
@@ -1166,18 +1396,18 @@ test "external lake warm tie pagination reuses scoped file order with bounded pa
     var dummy: u8 = 0;
     var manager: local.sql_spill.Manager = .{ .alloc = a, .io = std.testing.io, .context = &dummy, .checkpoint = Check.check };
     defer manager.deinit();
-    const files = try ca.alloc(local.serverless_external_source_types.FileEntry, 512);
+    const files = try ca.alloc(local.serverless_external_source_types.FileEntry, 32);
     for (files, 0..) |*file, i| file.* = .{ .file_id = try std.fmt.allocPrint(ca, "file-{d}", .{i}), .object_uri = @constCast("file://fixture"), .byte_len = 1, .row_count = 2, .row_groups = &.{} };
     const inventory: local.serverless_external_source_types.Inventory = .{ .format = .parquet, .source_id = @constCast("lake"), .source_uri = @constCast("file://lake"), .snapshot_id = @constCast("snapshot"), .schema_fingerprint = @constCast("schema"), .files = files };
     var sort = local.sql_spill.Sort.init(a, &manager, &.{.{}}, 512 * 1024);
     defer sort.deinit();
-    const expected = try ca.alloc([]const u8, 1024);
-    const prefix: [256]u8 = @splat(1);
+    const expected = try ca.alloc([]const u8, 64);
+    const prefix: [2048]u8 = @splat(1);
     for (files, 0..) |file, slot| for (0..2) |row| {
         const ref: rows.RowRef = .{ .external = .{ .source_id = inventory.source_id, .snapshot_id = inventory.snapshot_id, .file_id = file.file_id, .row_group_ordinal = 0, .row_ordinal = row } };
-        var key: [272]u8 = undefined;
-        @memcpy(key[0..256], &prefix);
-        @memcpy(key[256..], &coordinate(@intCast(slot), ref.external));
+        var key: [2064]u8 = undefined;
+        @memcpy(key[0..2048], &prefix);
+        @memcpy(key[2048..], &coordinate(@intCast(slot), ref.external));
         const position = slot * 2 + row;
         try sort.add(.{ .keys = &.{local.sql_scalar.Datum.fromJson(.{ .string = &key })}, .values = &.{}, .ordinal = position });
         expected[position] = try local.storage_rowsource_identity.allocId(ca, ref);
@@ -1224,15 +1454,35 @@ test "external lake warm tie pagination reuses scoped file order with bounded pa
         for (page, 0..) |ref, i| try std.testing.expectEqualStrings(expected[expected.len - 1 - i], try local.storage_rowsource_identity.allocId(ca, ref));
     }
     try std.testing.expectEqual(hits_scoped, cache.decoded.hits);
+    // Identical tuple/count trees can belong to different stable slot histories.
+    // Keep the inventory valid and supply the second index's independent layout.
+    const other_names = try ca.alloc([]const u8, files.len);
+    for (other_names, 0..) |*name, i| name.* = files[files.len - i - 1].file_id;
+    try sort.rewind();
+    const other_artifact = try publishIncremental(a, ca, &store, &sort, "other", @splat(3), inventory, &.{}, .none, .{ .files = other_names });
+    const other_root = try loadRoot(ca, store, other_artifact, .none, null);
+    try std.testing.expectEqualDeep(root.ties, other_root.ties);
+    var other_reader: Reader = undefined;
+    try other_reader.initCached(a, &store, other_root, @splat(3), "", null, .none, cached);
+    defer other_reader.deinit();
+    for ([_]bool{ false, true }) |descending| for ([_]bool{ false, true }) |before| {
+        var other = try public.Cursor.init(a, &other_reader, "", null, &prefix, expected[31], descending, before);
+        defer other.deinit();
+        const page = try other.next(ca, 3);
+        for (page, 0..) |ref, i| {
+            const rank = if (descending != before) 30 - i else 32 + i;
+            try std.testing.expectEqualStrings(expected[rank], try local.storage_rowsource_identity.allocId(ca, ref));
+        }
+    };
     const retained = try first.next(ca, 3);
     for (retained, expected[3..6]) |ref, id| try std.testing.expectEqualStrings(id, try local.storage_rowsource_identity.allocId(ca, ref));
     for ([_]bool{ false, true }) |descending| for ([_]bool{ false, true }) |before| {
-        var cursor = try public.Cursor.init(a, &reader, "", null, &prefix, expected[511], descending, before);
+        var cursor = try public.Cursor.init(a, &reader, "", null, &prefix, expected[31], descending, before);
         defer cursor.deinit();
         const page = try cursor.next(ca, 3);
         try std.testing.expectEqual(@as(usize, 3), page.len);
         for (page, 0..) |ref, i| {
-            const rank = if (descending != before) 510 - i else 512 + i;
+            const rank = if (descending != before) 30 - i else 32 + i;
             try std.testing.expectEqualStrings(expected[rank], try local.storage_rowsource_identity.allocId(ca, ref));
         }
     };
@@ -1257,8 +1507,8 @@ test "external lake warm tie pagination distinct tuples retain sequential reads"
     var manager: local.sql_spill.Manager = .{ .alloc = a, .io = std.testing.io, .context = &dummy, .checkpoint = Check.check };
     defer manager.deinit();
     const count = 5000;
-    const files = try ca.alloc(local.serverless_external_source_types.FileEntry, 1);
-    files[0] = .{ .file_id = @constCast("file"), .object_uri = @constCast("file://fixture"), .byte_len = 1, .row_count = count, .row_groups = &.{} };
+    const files = try ca.alloc(local.serverless_external_source_types.FileEntry, 128);
+    for (files, 0..) |*file, i| file.* = .{ .file_id = if (i == 0) @constCast("file") else try std.fmt.allocPrint(ca, "empty-{d}", .{i}), .object_uri = @constCast("file://fixture"), .byte_len = 1, .row_count = if (i == 0) count else 0, .row_groups = &.{} };
     const inventory: local.serverless_external_source_types.Inventory = .{ .format = .parquet, .source_id = @constCast("lake"), .source_uri = @constCast("file://lake"), .snapshot_id = @constCast("snapshot"), .schema_fingerprint = @constCast("schema"), .files = files };
     var sort = local.sql_spill.Sort.init(a, &manager, &.{.{}}, 512 * 1024);
     defer sort.deinit();
@@ -1283,6 +1533,7 @@ test "external lake warm tie pagination distinct tuples retain sequential reads"
         const before_reads = reader.remaining_reads;
         const page = try cursor.next(ca, count);
         try std.testing.expectEqual(@as(usize, count), page.len);
+        try std.testing.expectEqual(@as(usize, 0), cursor.group_counts);
         try std.testing.expect(before_reads - reader.remaining_reads < 4 * 1024 * 1024);
         for (page, 0..) |ref, i| try std.testing.expectEqual(@as(u64, if (reverse) count - i - 1 else i), ref.external.row_ordinal);
     }
@@ -1391,9 +1642,10 @@ test "external lake ordered durable run checkpoints compact resume and certify f
         }
         hashes[file] = @splat(1);
         keep[file] = false;
-        final_ref = try publishRunCheckpoint(a, ca, &store, &sort, "ordered", @splat(3), inventory, &.{"v"}, .none, .{ .previous = previous, .keep = if (previous == null) &.{} else keep, .files = names, .fingerprints = hashes });
+        final_ref = try publishRunCheckpoint(a, ca, &store, &sort, "ordered", @splat(3), inventory, &.{"v"}, .none, .{ .previous = previous, .keep = if (previous == null) &.{} else keep, .files = names, .fingerprints = hashes, .dictionary_slots = if (previous != null) &.{@intCast(file)} else null });
         keep[file] = true;
-        previous = try loadRoot(ca, store, final_ref, .none, null);
+        previous = try loadRootLazy(ca, store, final_ref, .none, null);
+        try std.testing.expectEqual(@as(usize, 0), previous.?.files.len);
         try std.testing.expect(previous.?.building);
         try std.testing.expect(previous.?.build_runs.len <= 6);
         var records: u64 = if (previous.?.page) |page| page.records else 0;
@@ -1412,7 +1664,7 @@ test "external lake ordered durable run checkpoints compact resume and certify f
     }
     var empty = local.sql_spill.Sort.init(a, &manager, &.{.{}}, 16 * 1024);
     defer empty.deinit();
-    final_ref = try publishIncremental(a, ca, &store, &empty, "ordered", @splat(3), inventory, &.{"v"}, .none, .{ .previous = previous, .keep = keep, .files = names, .fingerprints = hashes });
+    final_ref = try publishIncremental(a, ca, &store, &empty, "ordered", @splat(3), inventory, &.{"v"}, .none, .{ .previous = previous, .keep = keep, .files = names, .fingerprints = hashes, .dictionary_slots = &.{} });
     const root = try loadRoot(ca, store, final_ref, .none, null);
     try std.testing.expect(!root.building);
     try std.testing.expectEqual(@as(usize, 0), root.build_runs.len);
@@ -1529,4 +1781,279 @@ test "external lake reverse construction streams beyond cumulative write admissi
         try std.testing.expectEqual(6000 - row, std.mem.readInt(u64, record.key[16..24], .big));
     }
     try std.testing.expectEqual(@as(u64, 6000), row);
+}
+
+test "external lake metadata navigation ordered root publication releases provider selectors" {
+    const a = std.testing.allocator;
+    var provider = @import("../serverless/artifacts/cloud_generations_test_provider.zig").Provider.init(a);
+    defer provider.deinit();
+    var client = provider.client();
+    try client.makeBucket("bucket");
+    var object = try @import("../serverless/artifacts/object_store.zig").ObjectStore.initWithClientOptions(a, client, "bucket", "native", .{});
+    defer object.deinit();
+    var store = object.artifactStore();
+    store.upload_scope = try stores.UploadScope.forPublication(@splat(6), 1, std.testing.io);
+    const root: Root = .{ .fingerprint = @splat(3), .domain = @splat(6), .source = "source", .snapshot = "snapshot", .page = null };
+    const published = try persistRoot(a, a, &store, root, "ordered", .none, null, false, null, null);
+    defer {
+        a.free(published.name);
+        a.free(published.artifact_id);
+        a.free(published.checksum);
+    }
+    try std.testing.expectEqual(metadata_version, published.metadata_version);
+    try std.testing.expect(provider.serial > 0);
+}
+
+test "external lake metadata navigation wide public ties seek bounded prefixes across sparse files and tuple boundaries" {
+    const public = @import("lake_index_public_order.zig");
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const ca = arena.allocator();
+    var directory = try local.common_test_directory.TestDirectory.init("bounded-public-ties");
+    defer directory.cleanup();
+    var fs = try @import("../serverless/artifacts/fs_store.zig").FsStore.init(a, directory.path());
+    defer fs.deinit();
+    var store = fs.artifactStore();
+    store.upload_scope = .{ .domain = @splat(5), .attempt = @splat(1) };
+    const Check = struct {
+        fn check(_: *anyopaque) !void {}
+    };
+    var dummy: u8 = 0;
+    var manager: local.sql_spill.Manager = .{ .alloc = a, .io = std.testing.io, .context = &dummy, .checkpoint = Check.check };
+    defer manager.deinit();
+    const files = try ca.alloc(local.serverless_external_source_types.FileEntry, 512);
+    for (files, 0..) |*file, i| file.* = .{ .file_id = try std.fmt.allocPrint(ca, "file-{d}", .{i}), .object_uri = @constCast("file://fixture"), .byte_len = 1, .row_count = 2, .row_groups = &.{} };
+    const inventory: local.serverless_external_source_types.Inventory = .{ .format = .parquet, .source_id = @constCast("lake"), .source_uri = @constCast("file://lake"), .snapshot_id = @constCast("snapshot"), .schema_fingerprint = @constCast("schema"), .files = files };
+    var sort = local.sql_spill.Sort.init(a, &manager, &.{.{}}, 512 * 1024);
+    defer sort.deinit();
+    const Expected = struct { group: u8, id: []const u8 };
+    var expected: std.ArrayList(Expected) = .empty;
+    for (0..2) |group| for (files, 0..) |file, slot| {
+        if (group == 0 and slot % 3 == 0) continue;
+        const ref: rows.RowRef = .{ .external = .{ .source_id = inventory.source_id, .snapshot_id = inventory.snapshot_id, .file_id = file.file_id, .row_group_ordinal = 0, .row_ordinal = group } };
+        var key: [17]u8 = undefined;
+        key[0] = @intCast(group);
+        @memcpy(key[1..], &coordinate(@intCast(slot), ref.external));
+        try sort.add(.{ .keys = &.{local.sql_scalar.Datum.fromJson(.{ .string = &key })}, .values = &.{}, .ordinal = expected.items.len });
+        try expected.append(ca, .{ .group = @intCast(group), .id = try local.storage_rowsource_identity.allocId(ca, ref) });
+    };
+    // Build the same digest-to-name directory shared by production publication.
+    var directory_reads: u64 = 16 * 1024 * 1024;
+    var directory_writes: u64 = 16 * 1024 * 1024;
+    var directory_pages: page_store.PageStore = .{ .domain = store.upload_scope.?.domain, .attempt = store.upload_scope.?.attempt, .artifacts = &store, .remaining_read_bytes = &directory_reads, .remaining_write_bytes = &directory_writes };
+    var public_builder: tree.SortedBuilder = .{ .alloc = a, .store = directory_pages.store() };
+    defer public_builder.deinit();
+    const file_order = try local.serverless_query_lake_serving.ServingSource.canonicalFileOrder(ca, inventory);
+    for (file_order) |slot| {
+        const name = files[slot].file_id;
+        try public_builder.add(&local.storage_rowsource_identity.fileDigest(inventory.source_id, inventory.snapshot_id, name), name);
+    }
+    const shared = try public_builder.finish();
+    const artifact = try publishIncremental(a, ca, &store, &sort, "ordered", @splat(3), inventory, &.{}, .none, .{ .public_navigation = .{ .root = shared, .count = @intCast(files.len), .source = inventory.source_id, .snapshot = inventory.snapshot_id } });
+    const root = try loadRootLazy(ca, store, artifact, .none, null);
+    try std.testing.expectEqual(@as(usize, 0), root.files.len);
+    var reader: Reader = undefined;
+    try reader.init(a, &store, root, @splat(3), "", null, .none);
+    defer reader.deinit();
+    const Order = struct {
+        descending: bool,
+        fn less(self: @This(), x: Expected, y: Expected) bool {
+            return if (x.group != y.group) x.group < y.group else std.mem.order(u8, x.id, y.id) == (if (self.descending) std.math.Order.gt else .lt);
+        }
+    };
+    for ([_]bool{ false, true }) |descending| {
+        std.mem.sort(Expected, expected.items, Order{ .descending = descending }, Order.less);
+        var first = try public.Cursor.init(a, &reader, "", null, null, null, descending, false);
+        defer first.deinit();
+        const misses = reader.file_name_misses;
+        const page = try first.next(ca, 3);
+        try std.testing.expectEqual(@as(usize, 3), page.len);
+        for (page, expected.items[0..3]) |ref, item| try std.testing.expectEqualStrings(item.id, try local.storage_rowsource_identity.allocId(ca, ref));
+        try std.testing.expectEqual(@as(usize, 0), first.files.len);
+        try std.testing.expect(first.public_probes < 16);
+        try std.testing.expect(reader.file_name_misses - misses <= 3);
+        const split = expected.items.len - files.len;
+        for ([_]usize{ 0, 170, split - 1, split, expected.items.len - 1 }) |boundary| for ([_]bool{ false, true }) |before| {
+            const item = expected.items[boundary];
+            var cursor = try public.Cursor.init(a, &reader, "", null, &.{item.group}, item.id, descending, before);
+            defer cursor.deinit();
+            const next = try cursor.next(ca, 5);
+            const remaining = if (before) boundary else expected.items.len - boundary - 1;
+            try std.testing.expectEqual(@min(remaining, 5), next.len);
+            for (next, 0..) |ref, i| {
+                const rank = if (before) boundary - i - 1 else boundary + i + 1;
+                try std.testing.expectEqualStrings(expected.items[rank].id, try local.storage_rowsource_identity.allocId(ca, ref));
+            }
+        };
+    }
+}
+
+test "external lake sparse wide public ties spill participants without archive probes" {
+    const public = @import("lake_index_public_order.zig");
+    const a = std.testing.allocator;
+    // The large independent fixture uses an explicitly accounted allocator;
+    // per-allocation debug stack unwinding would dominate its spill merges.
+    var budget: local.sql_memory_budget = .{ .backing = std.heap.page_allocator, .limit = 128 * 1024 * 1024 };
+    defer std.debug.assert(budget.live == 0);
+    const ba = budget.allocator();
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const ca = arena.allocator();
+    var directory = try local.common_test_directory.TestDirectory.init("sparse-wide-public-ties");
+    defer directory.cleanup();
+    var fs = try @import("../serverless/artifacts/fs_store.zig").FsStore.init(ba, directory.path());
+    defer fs.deinit();
+    var store = fs.artifactStore();
+    store.upload_scope = .{ .domain = @splat(5), .attempt = @splat(1) };
+    const Check = struct {
+        fn check(_: *anyopaque) !void {}
+    };
+    var dummy: u8 = 0;
+    var manager: local.sql_spill.Manager = .{ .alloc = ba, .io = std.testing.io, .context = &dummy, .checkpoint = Check.check };
+    defer manager.deinit();
+    const participants = 4097;
+    const files = try ca.alloc(local.serverless_external_source_types.FileEntry, participants * 16 + 1);
+    for (files, 0..) |*file, i| file.* = .{ .file_id = try std.fmt.allocPrint(ca, "file-{d:0>6}", .{i}), .object_uri = @constCast("file://fixture"), .byte_len = 1, .row_count = 1, .row_groups = &.{} };
+    const inventory: local.serverless_external_source_types.Inventory = .{ .format = .parquet, .source_id = @constCast("lake"), .source_uri = @constCast("file://lake"), .snapshot_id = @constCast("snapshot"), .schema_fingerprint = @constCast("schema"), .files = files };
+    var sort = local.sql_spill.Sort.init(ba, &manager, &.{.{}}, 512 * 1024);
+    defer sort.deinit();
+    const expected = try ca.alloc([]const u8, participants);
+    for (files[0..participants], 0..) |file, slot| {
+        const ref: rows.RowRef = .{ .external = .{ .source_id = inventory.source_id, .snapshot_id = inventory.snapshot_id, .file_id = file.file_id, .row_group_ordinal = 0, .row_ordinal = 0 } };
+        var key: [17]u8 = undefined;
+        key[0] = 1;
+        key[1..17].* = coordinate(@intCast(slot), ref.external);
+        try sort.add(.{ .keys = &.{local.sql_scalar.Datum.fromJson(.{ .string = &key })}, .values = &.{}, .ordinal = slot });
+        expected[slot] = try local.storage_rowsource_identity.allocId(ca, ref);
+    }
+    files[0].row_count = 2;
+    const tail_ref: rows.RowRef = .{ .external = .{ .source_id = inventory.source_id, .snapshot_id = inventory.snapshot_id, .file_id = files[0].file_id, .row_group_ordinal = 0, .row_ordinal = 1 } };
+    var tail_key: [17]u8 = undefined;
+    tail_key[0] = 2;
+    tail_key[1..17].* = coordinate(0, tail_ref.external);
+    try sort.add(.{ .keys = &.{local.sql_scalar.Datum.fromJson(.{ .string = &tail_key })}, .values = &.{}, .ordinal = participants });
+    const tail_id = try local.storage_rowsource_identity.allocId(ca, tail_ref);
+    std.mem.sort([]const u8, expected, {}, struct {
+        fn less(_: void, x: []const u8, y: []const u8) bool {
+            return std.mem.lessThan(u8, x, y);
+        }
+    }.less);
+    const artifact = try publish(ba, ca, &store, &sort, "ordered", @splat(3), inventory, &.{}, .none);
+    const root = try loadRootLazy(ca, store, artifact, .none, null);
+    var cache = local.serverless_query_lake_serving_cache.Cache.init(ba);
+    defer cache.deinit();
+    const cached: artifacts.CachedRead = .{ .cache = &cache, .scope = @splat(1), .context = .{ .io = std.testing.io } };
+    for ([_]bool{ false, true }) |descending| {
+        var reader: Reader = undefined;
+        try reader.initCached(ba, &store, root, @splat(3), "", null, .none, cached);
+        defer reader.deinit();
+        var cursor = try public.Cursor.init(ba, &reader, "", null, null, null, descending, false);
+        defer cursor.deinit();
+        var rank: usize = 0;
+        while (true) {
+            const page = try cursor.next(ca, 8);
+            if (page.len == 0) break;
+            for (page) |ref| {
+                const id = if (rank == expected.len) tail_id else expected[if (descending) expected.len - rank - 1 else rank];
+                try std.testing.expectEqualStrings(id, try local.storage_rowsource_identity.allocId(ca, ref));
+                rank += 1;
+            }
+        }
+        try std.testing.expectEqual(expected.len + 1, rank);
+        try std.testing.expectEqual(@as(usize, 1), cursor.participant_sorts);
+        try std.testing.expect(cursor.public_probes > 0);
+        try std.testing.expect(cursor.public_probes <= participants * 4);
+        try std.testing.expect(cursor.participant_spill_files_peak > 0);
+        {
+            var whole_reader: Reader = undefined;
+            try whole_reader.initCached(ba, &store, root, @splat(3), "", null, .none, cached);
+            defer whole_reader.deinit();
+            var whole = try public.Cursor.init(ba, &whole_reader, "", null, null, null, descending, false);
+            defer whole.deinit();
+            const page = try whole.next(ca, 65536);
+            try std.testing.expectEqual(expected.len + 1, page.len);
+            for (page, 0..) |ref, i| {
+                const id = if (i == expected.len) tail_id else expected[if (descending) expected.len - i - 1 else i];
+                try std.testing.expectEqualStrings(id, try local.storage_rowsource_identity.allocId(ca, ref));
+            }
+            try std.testing.expectEqual(@as(usize, 0), whole.public_probes);
+            try std.testing.expectEqual(@as(usize, 1), whole.participant_sorts);
+        }
+        {
+            var fallback_reader: Reader = undefined;
+            try fallback_reader.initCached(ba, &store, root, @splat(3), "", null, .none, cached);
+            defer fallback_reader.deinit();
+            fallback_reader.remaining_reads = 8 * 1024 * 1024;
+            var fallback = try public.Cursor.init(ba, &fallback_reader, "", null, null, null, descending, false);
+            defer fallback.deinit();
+            fallback.participant_spill_limit = 1;
+            const page = try fallback.next(ca, 3);
+            try std.testing.expectEqual(@as(usize, 3), page.len);
+            for (page, 0..) |ref, i| {
+                const position = if (descending) expected.len - i - 1 else i;
+                try std.testing.expectEqualStrings(expected[position], try local.storage_rowsource_identity.allocId(ca, ref));
+            }
+            try std.testing.expectEqual(@as(usize, 0), fallback.participant_sorts);
+            try std.testing.expect(fallback.public_probes > 0);
+            try std.testing.expect(fallback.promotion_disabled);
+        }
+        {
+            var stream_reader: Reader = undefined;
+            try stream_reader.initCached(ba, &store, root, @splat(3), "", null, .none, cached);
+            defer stream_reader.deinit();
+            var fallback = try public.Cursor.init(ba, &stream_reader, "", null, null, null, descending, false);
+            defer fallback.deinit();
+            fallback.participant_spill_limit = 1;
+            var seen: usize = 0;
+            for (0..32) |_| {
+                const page = try fallback.next(ca, 8);
+                try std.testing.expectEqual(@as(usize, 8), page.len);
+                for (page) |ref| {
+                    const position = if (descending) expected.len - seen - 1 else seen;
+                    try std.testing.expectEqualStrings(expected[position], try local.storage_rowsource_identity.allocId(ca, ref));
+                    seen += 1;
+                }
+            }
+            try std.testing.expectEqual(@as(usize, 256), seen);
+            try std.testing.expectEqual(@as(usize, 0), fallback.participant_sorts);
+            try std.testing.expect(fallback.promotion_disabled);
+            try std.testing.expect(fallback.public_probes >= fallback.promotion_probe_limit);
+        }
+        for ([_]bool{ false, true }) |before| {
+            var resume_reader: Reader = undefined;
+            try resume_reader.initCached(ba, &store, root, @splat(3), "", null, .none, cached);
+            defer resume_reader.deinit();
+            var resumed = try public.Cursor.init(ba, &resume_reader, "", null, &.{1}, expected[2048], descending, before);
+            defer resumed.deinit();
+            const page = try resumed.next(ca, 5);
+            try std.testing.expectEqual(@as(usize, 5), page.len);
+            for (page, 0..) |ref, i| {
+                const position = if (descending != before) 2047 - i else 2049 + i;
+                try std.testing.expectEqualStrings(expected[position], try local.storage_rowsource_identity.allocId(ca, ref));
+            }
+            try std.testing.expectEqual(@as(usize, 0), resumed.participant_sorts);
+            try std.testing.expect(resumed.public_probes > 0 and resumed.public_probes < 512);
+        }
+    }
+}
+
+test "external lake ordered retirement planning visits explicit changed slots only" {
+    const a = std.testing.allocator;
+    const keep = try a.alloc(bool, 1_000_000);
+    defer a.free(keep);
+    @memset(keep, true);
+    keep[999_999] = false;
+    var changed: Retirements = .{ .keep = keep, .slots = &.{999_999} };
+    try std.testing.expectEqual(@as(?u32, 999_999), try changed.next());
+    try std.testing.expectEqual(@as(?u32, null), try changed.next());
+    try std.testing.expectEqual(@as(usize, 1), changed.position);
+    var unchanged: Retirements = .{ .keep = keep, .slots = &.{} };
+    try std.testing.expectEqual(@as(?u32, null), try unchanged.next());
+    try std.testing.expectEqual(@as(usize, 0), unchanged.position);
+    var legacy: Retirements = .{ .keep = keep, .slots = null };
+    try std.testing.expectEqual(@as(?u32, 999_999), try legacy.next());
+    try std.testing.expectEqual(@as(?u32, null), try legacy.next());
+    var invalid: Retirements = .{ .keep = keep, .slots = &.{0} };
+    try std.testing.expectError(error.InvalidNativeLakeRowIndex, invalid.next());
 }

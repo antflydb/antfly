@@ -2705,6 +2705,23 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
     b.step("lake-integration-test", "Run public lake binding and SQL cursor integration tests").dependOn(&addFilteredTestRunArtifact(b, lake_integration_tests).step);
+    const text_frontier_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/lake_text_frontier_test_root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    test_imports.configure(b, text_frontier_mod, true, true);
+    text_frontier_mod.addImport("antfly_openapi_specs", antfly_imports.embedded_openapi);
+    const text_frontier_tests = b.addTest(.{
+        .root_module = text_frontier_mod,
+        .filters = selectTestFilters(b, &.{ "external lake global frontier", "external lake metadata navigation", "external lake bounded window profiles", "external lake exact segment admission", "external lake bounded transforms", "external lake bounded window lookahead", "external lake bounded WAL", "constant score" }),
+        // The combined real-file/cloud owner peaks near 10 GB under optimized
+        // codegen; declare headroom instead of compiling twice on RSS retry.
+        .max_rss = @as(usize, if (optimize == .debug) 8 else 12) * 1024 * 1024 * 1024,
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("lake-text-frontier-test", "Verify metadata-only global admission, score bounds, ties and bounded profile aggregation")
+        .dependOn(&addFilteredTestRunArtifact(b, text_frontier_tests).step);
     const filtered_topk_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/lake_filtered_topk_test_root.zig"),
         .target = target,

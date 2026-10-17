@@ -39,11 +39,20 @@ pub const SnapshotReadRequest = struct {
     requested_snapshot_id: ?[]const u8 = null,
     cache: ?*lake_parquet_rowgroup.ObjectRangeCache = null,
     limits: ReadLimits = .{},
+    /// Opt in only for immutable manifest locations under a freshly authorized
+    /// credential scope. Fresh metadata/list selection remains mandatory.
+    manifests: ?*@import("lake_decoded_cache.zig").Cache = null,
+    inventory_chunks: ?*@import("lake_decoded_cache.zig").Cache = null,
+    catalogs: ?*@import("lake_inventory_catalog.zig").Cache = null,
+    manifest_scope: [32]u8 = @splat(0),
+    context: @import("lake_read_context.zig").Context = .{},
 
     pub fn validate(self: SnapshotReadRequest) !void {
         if (self.source_id.len == 0) return error.InvalidIcebergSnapshotRead;
         if (self.metadata_uri.len == 0) return error.InvalidIcebergSnapshotRead;
         try self.limits.validate();
+        if (self.catalogs != null and self.inventory_chunks == null) return error.InvalidIcebergSnapshotRead;
+        if ((self.manifests != null or self.inventory_chunks != null) and std.mem.allEqual(u8, &self.manifest_scope, 0)) return error.InvalidIcebergSnapshotRead;
     }
 };
 
@@ -163,11 +172,23 @@ pub const IcebergDeletePlan = struct {
 };
 
 pub const SnapshotWithDeletePlan = struct {
+    catalog: ?*@import("lake_inventory_catalog.zig").Index = null,
     inventory: external_source.Inventory,
     delete_plan: IcebergDeletePlan = .{ .files = &.{} },
+    /// File payloads belong to immutable manifest chunks; only the flat view
+    /// and snapshot-qualified version strings are owned by this snapshot.
+    file_leases: []@import("lake_decoded_cache.zig").Lease = &.{},
 
     pub fn deinit(self: *SnapshotWithDeletePlan, alloc: Allocator) void {
+        if (self.catalog) |catalog| catalog.release();
+        if (self.file_leases.len != 0) {
+            for (self.inventory.files) |file| alloc.free(file.version_id);
+            alloc.free(self.inventory.files);
+            self.inventory.files = &.{};
+        }
         self.inventory.deinit(alloc);
+        for (self.file_leases) |lease| lease.release();
+        if (self.file_leases.len != 0) alloc.free(self.file_leases);
         self.delete_plan.deinit(alloc);
         self.* = undefined;
     }
@@ -325,6 +346,62 @@ fn emptyInventoryAlloc(alloc: Allocator, request: SnapshotReadRequest, bytes: []
     return .{ .format = .iceberg, .source_id = source_id, .source_uri = uri, .snapshot_id = snapshot_id, .schema_fingerprint = fingerprint, .files = try alloc.alloc(external_source.FileEntry, 0) };
 }
 
+/// Read the selected snapshot identity without discovering data manifests.
+/// A caller may use this only with an independently authenticated file proof.
+pub fn snapshotHeaderAlloc(a: Allocator, request: SnapshotReadRequest, bytes: []const u8) !external_source.Inventory {
+    try request.validate();
+    if (bytes.len == 0 or bytes.len > request.limits.metadata_object_bytes) return error.IcebergMetadataObjectTooLarge;
+    try request.context.ensureActive();
+    if (try emptyInventoryAlloc(a, request, bytes)) |empty| return empty;
+    var plan = try iceberg_metadata.parseMetadataPlanAlloc(a, request.metadata_uri, bytes, request.requested_snapshot_id);
+    defer plan.deinit(a);
+    const source = try a.dupe(u8, request.source_id);
+    errdefer a.free(source);
+    const uri = try a.dupe(u8, plan.location);
+    errdefer a.free(uri);
+    const snapshot = try a.dupe(u8, plan.current_snapshot_id);
+    errdefer a.free(snapshot);
+    return .{ .format = .iceberg, .source_id = source, .source_uri = uri, .snapshot_id = snapshot, .schema_fingerprint = try a.dupe(u8, plan.schema_fingerprint), .files = &.{} };
+}
+/// Delete applicability stays fresh even when data-file discovery is deferred.
+/// Read the manifest list and delete manifests; data manifests remain unopened.
+pub fn deletePlanFromMetadataAlloc(a: Allocator, request: SnapshotReadRequest, bytes: []const u8) !IcebergDeletePlan {
+    try request.validate();
+    if (bytes.len == 0 or bytes.len > request.limits.metadata_object_bytes) return error.IcebergMetadataObjectTooLarge;
+    try request.context.ensureActive();
+    if (try emptyInventoryAlloc(a, request, bytes)) |empty_| {
+        var empty = empty_;
+        empty.deinit(a);
+        return .{ .files = &.{} };
+    }
+    var plan = try iceberg_metadata.parseMetadataPlanAlloc(a, request.metadata_uri, bytes, request.requested_snapshot_id);
+    defer plan.deinit(a);
+    var client = request.client;
+    client.allocator = a;
+    const list_bytes = try readFullObjectAlloc(a, &client, request.cache, plan.currentSnapshot().manifest_list_uri, .iceberg_metadata, null, request.limits.manifest_list_object_bytes);
+    defer a.free(list_bytes);
+    var list = try iceberg_avro.parseManifestListAlloc(a, list_bytes);
+    defer list.deinit(a);
+    var files: std.ArrayList(IcebergDeleteFile) = .empty;
+    errdefer {
+        deinitDeleteFileItems(a, files.items);
+        files.deinit(a);
+    }
+    for (list.entries) |entry| if (entry.content == .deletes) {
+        try request.context.ensureActive();
+        var manifest = try readManifest(a, request, entry);
+        defer manifest.close(a);
+        try appendActiveDeleteFilesFromManifestAlloc(a, &files, entry, manifest.value, plan);
+    };
+    const result: IcebergDeletePlan = .{ .files = try files.toOwnedSlice(a) };
+    errdefer {
+        var owned = result;
+        owned.deinit(a);
+    }
+    try result.validate();
+    return result;
+}
+
 pub fn readSnapshotInventoryAndDeletePlanAlloc(
     alloc: Allocator,
     request: SnapshotReadRequest,
@@ -336,6 +413,55 @@ pub fn readSnapshotInventoryAndDeletePlanAlloc(
     const metadata_bytes = try readFullObjectAlloc(alloc, &client, request.cache, request.metadata_uri, .iceberg_metadata, null, request.limits.metadata_object_bytes);
     defer alloc.free(metadata_bytes);
     return planSnapshotInventoryAndDeletePlanFromMetadataAlloc(alloc, request, metadata_bytes);
+}
+
+const Manifest = struct {
+    value: iceberg_avro.DataManifest,
+    lease: ?@import("lake_decoded_cache.zig").Lease = null,
+    fn close(self: *@This(), a: Allocator) void {
+        if (self.lease) |lease| lease.release() else self.value.deinit(a);
+    }
+};
+fn readManifest(a: Allocator, request: SnapshotReadRequest, entry: iceberg_avro.ManifestListEntry) !Manifest {
+    if (entry.manifest_length == 0 or entry.manifest_length > request.limits.manifest_object_bytes) return error.IcebergMetadataObjectTooLarge;
+    const Loader = struct {
+        request: SnapshotReadRequest,
+        entry: iceberg_avro.ManifestListEntry,
+        fn load(raw: *anyopaque, item: *@import("lake_decoded_cache.zig").Item) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const alloc = item.budget.allocator();
+            var client = self.request.client;
+            client.allocator = alloc;
+            const bytes = try readFullObjectAlloc(alloc, &client, self.request.cache, self.entry.manifest_path, if (self.entry.content == .data) .iceberg_metadata else .iceberg_delete_metadata, self.entry.manifest_length, self.request.limits.manifest_object_bytes);
+            defer alloc.free(bytes);
+            const decoded = try iceberg_avro.parseDataManifestAlloc(alloc, bytes);
+            item.payload = .{ .iceberg_manifest = decoded };
+        }
+    };
+    if (request.manifests) |cache| {
+        var hash = std.crypto.hash.sha2.Sha256.init(.{});
+        hash.update("immutable-iceberg-manifest-v1");
+        hash.update(&request.manifest_scope);
+        @import("lake_prepared_deletes.zig").Prepared.hashObjectVersion(&hash, entry.manifest_path, "", "");
+        var length: [8]u8 = undefined;
+        std.mem.writeInt(u64, &length, entry.manifest_length, .big);
+        hash.update(&length);
+        var loader: Loader = .{ .request = request, .entry = entry };
+        const lease = cache.acquire(hash.finalResult(), 64 * 1024 * 1024, request.context, .{ .ptr = &loader, .load = Loader.load }) catch |err| switch (err) {
+            error.OutOfMemory, error.SqlMemoryLimitExceeded => return readManifest(a, no_cache: {
+                var fallback = request;
+                fallback.manifests = null;
+                break :no_cache fallback;
+            }, entry),
+            else => return err,
+        };
+        return .{ .value = lease.item.payload.iceberg_manifest, .lease = lease };
+    }
+    var client = request.client;
+    client.allocator = a;
+    const bytes = try readFullObjectAlloc(a, &client, request.cache, entry.manifest_path, if (entry.content == .data) .iceberg_metadata else .iceberg_delete_metadata, entry.manifest_length, request.limits.manifest_object_bytes);
+    defer a.free(bytes);
+    return .{ .value = try iceberg_avro.parseDataManifestAlloc(a, bytes) };
 }
 
 /// One pinned metadata object governs inventory, deletes and schema selection.
@@ -365,54 +491,31 @@ pub fn planSnapshotInventoryAndDeletePlanFromMetadataAlloc(
     var manifest_list = try iceberg_avro.parseManifestListAlloc(alloc, manifest_list_bytes);
     defer manifest_list.deinit(alloc);
 
+    if (request.inventory_chunks != null) return planSharedChunks(alloc, request, metadata_plan, manifest_list);
+
     const decoded_manifests = try alloc.alloc(iceberg_inventory.DecodedManifest, manifest_list.entries.len);
     defer alloc.free(decoded_manifests);
+    const retained = try alloc.alloc(Manifest, manifest_list.entries.len);
+    defer alloc.free(retained);
+    var retained_count: usize = 0;
+    defer for (retained[0..retained_count]) |*manifest| manifest.close(alloc);
     var initialized: usize = 0;
-    defer {
-        for (decoded_manifests[0..initialized]) |*decoded| {
-            decoded.manifest.deinit(alloc);
-        }
-    }
 
     var delete_files = std.ArrayListUnmanaged(IcebergDeleteFile).empty;
     defer delete_files.deinit(alloc);
     errdefer deinitDeleteFileItems(alloc, delete_files.items);
 
     for (manifest_list.entries) |manifest_entry| {
+        try request.context.ensureActive();
+        retained[retained_count] = try readManifest(alloc, request, manifest_entry);
+        const manifest = retained[retained_count].value;
+        retained_count += 1;
         switch (manifest_entry.content) {
             .data => {
-                const manifest_bytes = try readFullObjectAlloc(
-                    alloc,
-                    &client,
-                    request.cache,
-                    manifest_entry.manifest_path,
-                    .iceberg_metadata,
-                    manifest_entry.manifest_length,
-                    request.limits.manifest_object_bytes,
-                );
-                defer alloc.free(manifest_bytes);
-                decoded_manifests[initialized] = .{
-                    .manifest_path = manifest_entry.manifest_path,
-                    .manifest = try iceberg_avro.parseDataManifestAlloc(alloc, manifest_bytes),
-                };
+                decoded_manifests[initialized] = .{ .manifest_path = manifest_entry.manifest_path, .manifest = manifest };
                 initialized += 1;
             },
-            .deletes => {
-                const manifest_bytes = try readFullObjectAlloc(
-                    alloc,
-                    &client,
-                    request.cache,
-                    manifest_entry.manifest_path,
-                    .iceberg_delete_metadata,
-                    manifest_entry.manifest_length,
-                    request.limits.manifest_object_bytes,
-                );
-                defer alloc.free(manifest_bytes);
-
-                var delete_manifest = try iceberg_avro.parseDataManifestAlloc(alloc, manifest_bytes);
-                defer delete_manifest.deinit(alloc);
-                try appendActiveDeleteFilesFromManifestAlloc(alloc, &delete_files, manifest_entry, delete_manifest, metadata_plan);
-            },
+            .deletes => try appendActiveDeleteFilesFromManifestAlloc(alloc, &delete_files, manifest_entry, manifest, metadata_plan),
         }
     }
 
@@ -772,7 +875,7 @@ fn appendEqualityDeleteRowRefsAlloc(
                 const key = try lake_iceberg_deletes.equalityKeyFromBatchRowAlloc(alloc, batch, row_idx, equality_columns);
                 defer alloc.free(key);
                 const file_indexes = delete_keys.get(key) orelse continue;
-                const stable_ref = try rebindRowRefToInventory(request.data_inventory, batch.row_refs[row_idx]);
+                const stable_ref = try rebindRowRefToInventory(request.data_inventory, batch.rowRef(row_idx));
                 for (file_indexes.items) |delete_idx| {
                     if (!try equalityDeleteAppliesToRowRef(
                         request.data_inventory,
@@ -796,6 +899,188 @@ fn equalityColumnSetsEqual(left: []const []const u8, right: []const []const u8) 
     return true;
 }
 
+const decoded_cache = @import("lake_decoded_cache.zig");
+/// The chunk key binds manifest bytes plus every inheritance input. Source
+/// headers and selected-snapshot strings stay outside reusable file payloads.
+fn inventoryChunkKey(request: SnapshotReadRequest, entry: iceberg_avro.ManifestListEntry, format: u8) ![32]u8 {
+    const key_bytes = try std.json.Stringify.valueAlloc(std.heap.page_allocator, .{ .format = "iceberg-inventory-chunk-v1", .scope = request.manifest_scope, .table_format = format, .entry = entry }, .{});
+    defer std.heap.page_allocator.free(key_bytes);
+    var key: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(key_bytes, &key, .{});
+    return key;
+}
+fn acquireInventoryChunk(request: SnapshotReadRequest, entry: iceberg_avro.ManifestListEntry, format: u8) anyerror!decoded_cache.Lease {
+    const key = try inventoryChunkKey(request, entry, format);
+    const Loader = struct {
+        request: SnapshotReadRequest,
+        entry: iceberg_avro.ManifestListEntry,
+        format: u8,
+        fn load(raw: *anyopaque, item: *decoded_cache.Item) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const a = item.budget.allocator();
+            var manifest = try readManifest(a, self.request, self.entry);
+            defer manifest.close(a);
+            try validateDataManifestSummary(self.entry, manifest.value);
+            const entries = try a.alloc(iceberg_avro.DataFileEntry, manifest.value.entries.len);
+            defer a.free(entries);
+            for (manifest.value.entries, entries) |input, *out| {
+                out.* = try iceberg_inventory.resolveManifestEntry(input, self.entry, self.format);
+                out.partition_spec_id = self.entry.partition_spec_id;
+            }
+            const decoded = try iceberg_inventory.planInventoryFromDataFilesAlloc(a, .{ .source_id = "chunk", .source_uri = "chunk", .snapshot_id = "manifest-chunk", .schema_fingerprint = "chunk", .data_files = entries });
+            item.payload = .{ .iceberg_chunk = decoded };
+        }
+    };
+    var loader: Loader = .{ .request = request, .entry = entry, .format = format };
+    const cache = request.inventory_chunks.?;
+    return cache.acquire(key, 64 * 1024 * 1024, request.context, .{ .ptr = &loader, .load = Loader.load }) catch |err| switch (err) {
+        error.OutOfMemory, error.SqlMemoryLimitExceeded => private: {
+            const lease = try cache.create(256 * 1024 * 1024);
+            errdefer lease.release();
+            try Loader.load(&loader, lease.item);
+            break :private lease;
+        },
+        else => return err,
+    };
+}
+fn planSharedChunks(a: Allocator, request: SnapshotReadRequest, metadata: iceberg_metadata.Plan, list: iceberg_avro.ManifestList) !SnapshotWithDeletePlan {
+    const scheduler = @import("../../sql/parallel_scheduler.zig");
+    const catalog_api = @import("lake_inventory_catalog.zig");
+    var scope_hash = std.crypto.hash.sha2.Sha256.init(.{});
+    scope_hash.update(&request.manifest_scope);
+    @import("lake_prepared_deletes.zig").Prepared.hashObjectVersion(&scope_hash, request.source_id, metadata.location, "iceberg-file-catalog-v1");
+    const catalog_key = scope_hash.finalResult();
+    const prior = if (request.catalogs) |cache| cache.get(catalog_key) else null;
+    defer if (prior) |value| value.release();
+    var chunks: std.ArrayList(catalog_api.Chunk) = .empty;
+    defer chunks.deinit(a);
+    var leases: std.ArrayList(decoded_cache.Lease) = .empty;
+    defer leases.deinit(a);
+    var moved = false;
+    var pinned_bytes: usize = 0;
+    defer if (!moved) for (leases.items) |lease| lease.release();
+    var deletes: std.ArrayList(IcebergDeleteFile) = .empty;
+    defer deletes.deinit(a);
+    errdefer deinitDeleteFileItems(a, deletes.items);
+    var seen: std.StringHashMapUnmanaged(void) = .empty;
+    defer seen.deinit(a);
+    var offset: usize = 0;
+    while (offset < list.entries.len) {
+        const count = @min(3, list.entries.len - offset);
+        var tasks: [3]?scheduler.Task(anyerror!decoded_cache.Lease) = @splat(null);
+        var ready: [3]?decoded_cache.Lease = @splat(null);
+        var keys: [3][32]u8 = undefined;
+        defer {
+            for (&tasks) |*task| if (task.*) |pending| {
+                var running = pending;
+                if (running.cancel(request.context.io.?)) |lease| lease.release() else |_| {}
+            };
+            for (ready) |lease| if (lease) |held| held.release();
+        }
+        for (list.entries[offset..][0..count], 0..) |entry, i| {
+            try request.context.ensureActive();
+            const unique = try seen.getOrPut(a, entry.manifest_path);
+            if (unique.found_existing) return error.DuplicateIcebergManifest;
+            if (entry.content == .deletes) {
+                var manifest = try readManifest(a, request, entry);
+                defer manifest.close(a);
+                try appendActiveDeleteFilesFromManifestAlloc(a, &deletes, entry, manifest.value, metadata);
+            } else {
+                keys[i] = try inventoryChunkKey(request, entry, metadata.format_version);
+                ready[i] = if (prior) |value| value.acquireChunk(keys[i]) else null;
+                if (ready[i] == null) {
+                    if (request.context.io) |io| tasks[i] = scheduler.global().submitIoTransient(io, 16 * 1024 * 1024, acquireInventoryChunk, .{ request, entry, metadata.format_version });
+                    if (tasks[i] == null) ready[i] = try acquireInventoryChunk(request, entry, metadata.format_version);
+                }
+            }
+        }
+        for (0..count) |i| {
+            if (tasks[i]) |pending| {
+                var running = pending;
+                tasks[i] = null;
+                ready[i] = try running.await(request.context.io.?);
+            }
+            try request.context.ensureActive();
+            if (ready[i]) |lease| {
+                pinned_bytes = try std.math.add(usize, pinned_bytes, lease.item.budget.live);
+                if (pinned_bytes > 256 * 1024 * 1024) return error.SqlMemoryLimitExceeded;
+                try leases.append(a, lease);
+                ready[i] = null;
+                try chunks.append(a, .{ .key = keys[i], .lease = lease });
+            }
+        }
+        offset += count;
+    }
+    if (request.catalogs) |cache| {
+        const catalog = cache.build(catalog_key, prior, chunks.items, request.context) catch |err| switch (err) {
+            error.OutOfMemory => null,
+            else => return err,
+        };
+        if (catalog) |index| {
+            errdefer index.release();
+            var inventory: external_source.Inventory = .{ .format = .iceberg, .source_id = &.{}, .source_uri = &.{}, .snapshot_id = &.{}, .schema_fingerprint = &.{}, .files = &.{} };
+            errdefer inventory.deinit(a);
+            inventory.source_id = try a.dupe(u8, request.source_id);
+            inventory.source_uri = try a.dupe(u8, metadata.location);
+            inventory.snapshot_id = try a.dupe(u8, metadata.current_snapshot_id);
+            inventory.schema_fingerprint = try a.dupe(u8, metadata.schema_fingerprint);
+            var delete_plan: IcebergDeletePlan = .{ .files = try deletes.toOwnedSlice(a) };
+            errdefer delete_plan.deinit(a);
+            try delete_plan.validate();
+            return .{ .catalog = index, .inventory = inventory, .delete_plan = delete_plan };
+        }
+    }
+    // Each manifest's files are already ordered. Merge immutable views rather
+    // than resolving, cloning metrics/partitions, and sorting every file again.
+    const Head = struct { chunk: usize, position: usize, files: []const external_source.FileEntry };
+    const Order = struct {
+        fn less(_: void, l: Head, r: Head) std.math.Order {
+            return std.mem.order(u8, l.files[l.position].file_id, r.files[r.position].file_id);
+        }
+    };
+    var queue: std.PriorityQueue(Head, void, Order.less) = .initContext({});
+    defer queue.deinit(a);
+    var total: usize = 0;
+    for (leases.items, 0..) |lease, i| {
+        const files = lease.item.payload.iceberg_chunk.files;
+        total = try std.math.add(usize, total, files.len);
+        if (files.len != 0) try queue.push(a, .{ .chunk = i, .position = 0, .files = files });
+    }
+    var inventory: external_source.Inventory = .{ .format = .iceberg, .source_id = &.{}, .source_uri = &.{}, .snapshot_id = &.{}, .schema_fingerprint = &.{}, .files = &.{} };
+    var initialized: usize = 0;
+    errdefer {
+        for (inventory.files[0..initialized]) |file| a.free(file.version_id);
+        a.free(inventory.files);
+        inventory.files = &.{};
+        inventory.deinit(a);
+    }
+    inventory.source_id = try a.dupe(u8, request.source_id);
+    inventory.source_uri = try a.dupe(u8, metadata.location);
+    inventory.snapshot_id = try a.dupe(u8, metadata.current_snapshot_id);
+    inventory.schema_fingerprint = try a.dupe(u8, metadata.schema_fingerprint);
+    inventory.files = try a.alloc(external_source.FileEntry, total);
+    while (queue.pop()) |head| {
+        var file = head.files[head.position];
+        if (initialized != 0 and std.mem.eql(u8, inventory.files[initialized - 1].file_id, file.file_id)) return error.InvalidExternalSourceInventory;
+        const marker = "iceberg:v1:snapshot=manifest-chunk";
+        if (!std.mem.startsWith(u8, file.version_id, marker)) return error.InvalidIcebergInventory;
+        file.version_id = try std.fmt.allocPrint(a, "iceberg:v1:snapshot={s}{s}", .{ metadata.current_snapshot_id, file.version_id[marker.len..] });
+        inventory.files[initialized] = file;
+        initialized += 1;
+        if (head.position + 1 < head.files.len) {
+            var next = head;
+            next.position += 1;
+            try queue.push(a, next);
+        }
+    }
+    var delete_plan: IcebergDeletePlan = .{ .files = try deletes.toOwnedSlice(a) };
+    errdefer delete_plan.deinit(a);
+    try delete_plan.validate();
+    const owned_leases = try leases.toOwnedSlice(a);
+    moved = true;
+    return .{ .inventory = inventory, .delete_plan = delete_plan, .file_leases = owned_leases };
+}
+
 fn planInventoryFromDecodedDataManifestsAllowingDeletesAlloc(
     alloc: Allocator,
     source_id: []const u8,
@@ -803,10 +1088,19 @@ fn planInventoryFromDecodedDataManifestsAllowingDeletesAlloc(
     manifest_list: iceberg_avro.ManifestList,
     data_manifests: []const iceberg_inventory.DecodedManifest,
 ) !external_source.Inventory {
+    // Snapshot assembly stays linear in manifests and entries. Reused manifests
+    // retain decoded buffers independently of this freshly selected snapshot.
+    var by_path: std.StringHashMapUnmanaged(iceberg_inventory.DecodedManifest) = .empty;
+    defer by_path.deinit(alloc);
+    for (data_manifests) |decoded| {
+        const entry = try by_path.getOrPut(alloc, decoded.manifest_path);
+        if (entry.found_existing) return error.DuplicateIcebergManifest;
+        entry.value_ptr.* = decoded;
+    }
     var total_entries: usize = 0;
     for (manifest_list.entries) |manifest_entry| {
         if (manifest_entry.content != .data) continue;
-        const decoded = try decodedManifestForPath(data_manifests, manifest_entry.manifest_path);
+        const decoded = (by_path.get(manifest_entry.manifest_path) orelse return error.MissingIcebergManifest);
         try validateDataManifestSummary(manifest_entry, decoded.manifest);
         total_entries += decoded.manifest.entries.len;
     }
@@ -816,7 +1110,7 @@ fn planInventoryFromDecodedDataManifestsAllowingDeletesAlloc(
     var next_file: usize = 0;
     for (manifest_list.entries) |manifest_entry| {
         if (manifest_entry.content != .data) continue;
-        const decoded = try decodedManifestForPath(data_manifests, manifest_entry.manifest_path);
+        const decoded = (by_path.get(manifest_entry.manifest_path) orelse return error.MissingIcebergManifest);
         for (decoded.manifest.entries) |entry| {
             data_files[next_file] = try iceberg_inventory.resolveManifestEntry(entry, manifest_entry, metadata_plan.format_version);
             data_files[next_file].partition_spec_id = manifest_entry.partition_spec_id;
@@ -2893,4 +3187,81 @@ test "external lake equality deletes preserve exact decimal keys across physical
         try std.testing.expectEqual(@as(usize, 1), refs.len);
         try std.testing.expectEqual(@as(u64, 1), refs[0].external.row_ordinal);
     }
+}
+
+test "external lake metadata navigation reuses immutable manifests across fresh snapshot plans" {
+    const a = std.testing.allocator;
+    var memory = object_storage.MemoryObjectStorage.init(a);
+    defer memory.deinit();
+    var client = memory.client();
+    try client.makeBucket("bucket");
+    var manifest = try buildDataManifestFixture(a);
+    defer manifest.deinit(a);
+    var list = try buildManifestListFixture(a, manifest.items.len);
+    defer list.deinit(a);
+    var put = try client.putObject("bucket", "t/metadata/m-a.avro", manifest.items, .{});
+    put.deinit(a);
+    put = try client.putObject("bucket", "t/metadata/snap-12.avro", list.items, .{});
+    put.deinit(a);
+    var cache: @import("lake_decoded_cache.zig").Cache = .{ .a = a };
+    defer cache.deinit();
+    const request: SnapshotReadRequest = .{ .client = client, .source_id = "events", .metadata_uri = "s3://bucket/t/metadata/v1.metadata.json", .manifests = &cache, .manifest_scope = @splat(1), .context = .{ .io = std.testing.io } };
+    var one = try planSnapshotInventoryAndDeletePlanFromMetadataAlloc(a, request, testMetadataJson());
+    defer one.deinit(a);
+    const fresh = try std.mem.replaceOwned(u8, a, testMetadataJson(), "\"snapshot-id\": 12", "\"snapshot-id\": 13");
+    defer a.free(fresh);
+    const next = try std.mem.replaceOwned(u8, a, fresh, "\"current-snapshot-id\": 12", "\"current-snapshot-id\": 13");
+    defer a.free(next);
+    var two = try planSnapshotInventoryAndDeletePlanFromMetadataAlloc(a, request, next);
+    defer two.deinit(a);
+    try std.testing.expectEqualStrings("13", two.inventory.snapshot_id);
+    try std.testing.expectEqual(@as(usize, 2), two.inventory.files.len);
+    try std.testing.expect(cache.hits > 0);
+    var changed = request;
+    changed.manifest_scope = @splat(2);
+    const before = cache.hits;
+    var three = try planSnapshotInventoryAndDeletePlanFromMetadataAlloc(a, changed, next);
+    defer three.deinit(a);
+    try std.testing.expectEqual(before, cache.hits);
+    var chunks: decoded_cache.Cache = .{ .a = a };
+    defer chunks.deinit();
+    var shared_request = request;
+    shared_request.inventory_chunks = &chunks;
+    var four = try planSnapshotInventoryAndDeletePlanFromMetadataAlloc(a, shared_request, testMetadataJson());
+    defer four.deinit(a);
+    var five = try planSnapshotInventoryAndDeletePlanFromMetadataAlloc(a, shared_request, next);
+    defer five.deinit(a);
+    try std.testing.expect(chunks.hits > 0);
+    try std.testing.expect(four.file_leases[0].item == five.file_leases[0].item);
+    try std.testing.expect(four.inventory.files[0].file_id.ptr == five.inventory.files[0].file_id.ptr);
+    try std.testing.expect(std.mem.startsWith(u8, four.inventory.files[0].version_id, "iceberg:v1:snapshot=12:"));
+    try std.testing.expect(std.mem.startsWith(u8, five.inventory.files[0].version_id, "iceberg:v1:snapshot=13:"));
+    var catalogs: @import("lake_inventory_catalog.zig").Cache = .{ .budget = .{ .backing = a, .limit = 8 * 1024 * 1024 } };
+    defer catalogs.deinit();
+    shared_request.catalogs = &catalogs;
+    var lazy_one = try planSnapshotInventoryAndDeletePlanFromMetadataAlloc(a, shared_request, testMetadataJson());
+    defer lazy_one.deinit(a);
+    var fresh_request = shared_request;
+    fresh_request.metadata_uri = "s3://bucket/t/metadata/v2.metadata.json";
+    var lazy_two = try planSnapshotInventoryAndDeletePlanFromMetadataAlloc(a, fresh_request, next);
+    defer lazy_two.deinit(a);
+    try std.testing.expectEqual(@as(usize, 0), lazy_two.inventory.files.len);
+    try std.testing.expectEqual(@as(usize, 2), lazy_two.catalog.?.count());
+    try std.testing.expectEqual(@as(usize, 0), lazy_two.catalog.?.new_files);
+    try std.testing.expect(lazy_one.catalog.?.root == lazy_two.catalog.?.root);
+    try std.testing.expect(lazy_two.catalog.?.ordering.load(.acquire) == null);
+    const materialized = try lazy_two.catalog.?.materialize(a, lazy_two.inventory.snapshot_id, request.context);
+    defer {
+        for (materialized) |file| a.free(file.version_id);
+        a.free(materialized);
+    }
+    try std.testing.expect(std.mem.startsWith(u8, materialized[0].version_id, "iceberg:v1:snapshot=13:"));
+    try std.testing.expectEqualStrings(four.inventory.files[0].file_id, materialized[0].file_id);
+    shared_request.catalogs = null;
+    chunks.max_bytes = 0;
+    chunks.max_entries = 0;
+    shared_request.manifest_scope = @splat(3);
+    var six = try planSnapshotInventoryAndDeletePlanFromMetadataAlloc(a, shared_request, next);
+    defer six.deinit(a);
+    try std.testing.expectEqualStrings(four.inventory.files[0].file_id, five.inventory.files[0].file_id);
 }

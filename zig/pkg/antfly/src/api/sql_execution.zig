@@ -985,7 +985,7 @@ pub const Adapter = struct {
         const normalized = try self.context.platformDeadline();
         var context: local.serverless_query_lake_read_context.Context = .{ .io = self.server.embedding_provider_runtime.io, .deadline_ns = normalized.deadline_ns, .cancellation = local.storage_object_storage.CancellationToken.fromCallback(normalized.cancellation.ptr, normalized.cancellation.is_cancelled_fn) };
         const options: @import("../serverless/configured_object_store_support.zig").BindingObjectStoreOpenOptions = .{ .node_config = self.server.cfg.node_config, .secret_store = self.server.cfg.secret_store };
-        var source = try local.serverless_query_lake_serving.ServingSource.openCached(a, .{ .storage_mode = .relational, .external_base_source = table.external_base_source }, options.lakeOptions(), context, &self.server.lake_read_cache);
+        var source = try @import("lake_published_navigation.zig").open(a, self.server, table.id, if (table.external_indexes) |indexes| indexes.catalog_json else "", .{ .storage_mode = .relational, .external_base_source = table.external_base_source }, options.lakeOptions(), context, self.context, null);
         defer source.deinit();
         const owner = try a.create(AggregateArtifactCursor);
         owner.a = a;
@@ -1008,7 +1008,7 @@ pub const Adapter = struct {
             };
             context = owner.reader_lease.?.readContext();
         }
-        var selected = (try @import("lake_index_selection.zig").selectCached(sa, table, &source, &owner.store, context, .automatic, &self.server.lake_read_cache)) orelse return null;
+        var selected = (try @import("lake_index_selection.zig").selectCachedWithLease(sa, table, &source, &owner.store, context, .automatic, &self.server.lake_read_cache, owner.reader_lease)) orelse return null;
         defer selected.deinit();
         const owned = owner.arena.allocator();
         const references = try owned.alloc(local.serverless_manifest_artifact_ref.ArtifactRef, identities.len);
@@ -1247,7 +1247,7 @@ pub const Adapter = struct {
                 const ready_metadata = if (retained == null) try self.awaitSqlReceipt(scratch.allocator(), alloc, request.table) else null;
                 const normalized = try self.context.platformDeadline();
                 const lake_options: @import("../serverless/configured_object_store_support.zig").BindingObjectStoreOpenOptions = .{ .retained_catalog_metadata = if (retained) |cut| .{ .metadata_location = @constCast(cut.metadata_location), .metadata_json = @constCast(cut.metadata_json) } else ready_metadata, .node_config = self.server.cfg.node_config, .secret_store = self.server.cfg.secret_store, .catalog_table_id = request.table.id, .catalog_generation = if (request.table.external_indexes) |indexes| indexes.object_generation else 0 };
-                source.* = try @import("antfly_local_sources").serverless_query_lake_serving.ServingSource.openCached(alloc, schema, lake_options.lakeOptions(), .{ .io = self.server.embedding_provider_runtime.io, .deadline_ns = normalized.deadline_ns, .cancellation = @import("antfly_local_sources").storage_object_storage.CancellationToken.fromCallback(normalized.cancellation.ptr, normalized.cancellation.is_cancelled_fn) }, &self.server.lake_read_cache);
+                source.* = try @import("lake_published_navigation.zig").open(alloc, self.server, request.table.id, if (request.table.external_indexes) |indexes| indexes.catalog_json else "", schema, lake_options.lakeOptions(), .{ .io = self.server.embedding_provider_runtime.io, .deadline_ns = normalized.deadline_ns, .cancellation = @import("antfly_local_sources").storage_object_storage.CancellationToken.fromCallback(normalized.cancellation.ptr, normalized.cancellation.is_cancelled_fn) }, self.context, null);
                 errdefer source.deinit();
                 try source.attachCache(&self.server.lake_read_cache, schema.external_base_source.?.binding, .{ .io = self.server.embedding_provider_runtime.io, .deadline_ns = normalized.deadline_ns, .cancellation = @import("antfly_local_sources").storage_object_storage.CancellationToken.fromCallback(normalized.cancellation.ptr, normalized.cancellation.is_cancelled_fn) });
                 if (retained) |cut| {
@@ -1255,7 +1255,7 @@ pub const Adapter = struct {
                     const oa = owner.overlay_arena.?.allocator();
                     const overlay = try oa.create(@import("lake_sql_overlay.zig").Cut);
                     overlay.* = try @import("lake_sql_overlay.zig").Cut.initForTable(oa, cut.pending, request.table);
-                    if (cut.pending.changes.len != 0) try owner.overlays.put(alloc, request.table.id, overlay);
+                    if (cut.pending.count() != 0) try owner.overlays.put(alloc, request.table.id, overlay);
                 } else if (self.lake_visibility == .accepted and schema.external_base_source.?.binding.write_policy == .iceberg_writer) {
                     if (owner.overlay_arena == null) owner.overlay_arena = .init(alloc);
                     const oa = owner.overlay_arena.?.allocator();
@@ -1274,7 +1274,7 @@ pub const Adapter = struct {
                     const pending = try @import("../serverless/lake_ingestion.zig").pending(oa, binding, lake_options, context, cut);
                     if (self.read_requirements.after_write) |receipt| if (receipt.table_id == request.table.id) try self.read_requirements.requireCoverage(request.table.id, lake_options.catalog_generation, pending.lsn, false);
                     const overlay = try oa.create(@import("lake_sql_overlay.zig").Cut);
-                    if (pending.changes.len != 0) try @import("lake_search_overlay.zig").requireNativeAncestry(current_root, source.inventory.snapshot_id);
+                    if (pending.count() != 0) try @import("lake_search_overlay.zig").requireNativeAncestry(current_root, source.inventory.snapshot_id);
                     // Persist the unmodified physical WAL before SQL converts
                     // timestamp values to its logical representation.
                     if (self.active_transaction != null) try self.saveSqlLakeCut(oa, request.table, .{
@@ -1290,7 +1290,7 @@ pub const Adapter = struct {
                         .pending = pending,
                     }, lake_options, context);
                     overlay.* = try @import("lake_sql_overlay.zig").Cut.initForTable(oa, pending, request.table);
-                    if (pending.changes.len != 0) try owner.overlays.put(alloc, request.table.id, overlay);
+                    if (pending.count() != 0) try owner.overlays.put(alloc, request.table.id, overlay);
                 }
                 try owner.sources.put(alloc, request.table.id, source);
             } else try native.append(scratch.allocator(), request);
@@ -1343,6 +1343,7 @@ pub const Adapter = struct {
                 .split_scan = if (child.split_scan != null) splitScan else null,
                 .split_ordered = if (child.split_ordered != null) splitOrdered else null,
                 .order_satisfied = child.order_satisfied,
+                .estimated_filtered_rows = child.estimated_filtered_rows,
                 .estimated_rows = child.estimated_rows,
                 .estimated_bytes = child.estimated_bytes,
                 .ordered_split_bytes = child.ordered_split_bytes,

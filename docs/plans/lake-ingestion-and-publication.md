@@ -335,6 +335,12 @@ candidate evaluation; independent top-K lists are not automatically a correct
 global top-K. Cursor tokens must bind both archive and overlay coverage, and
 expire explicitly if their retained generation is unavailable.
 
+Accepted native rows use the same canonical key identity as ingestion, including
+numeric equivalence. Retained data records its encoding so legacy opaque row IDs
+stay stable during replay. Final unit/chunk delivery resolves the exact declared
+artifact for the winning stable-prefix run, even when several runs share an
+index name.
+
 Preserve the existing freshness contract: consume only proved index coverage;
 scan uncovered data through a correct bounded fallback, wait/reject when the
 requested visibility cannot be met, or serve an older snapshot only when the
@@ -356,11 +362,89 @@ work to a foreground search. Local cut admission still enforces capacity and
 protects active readers. Deployments must keep the background artifact collector
 enabled, or run explicit maintenance when they disable automatic collection.
 
+Lake search cursors issue a fresh small lease envelope per query, with its current
+reader token and full configured retention period. Envelopes reference reusable
+immutable state and at most sixteen row groups; unchanged groups survive WAL
+updates without reserialization. Cached partition digests avoid walking the full
+suffix on warm queries. Payload reuse requires expiry beyond the new envelope's
+expiry, and the bounded retained-cut collector observes both expiry classes.
+Restart loads exact provider-qualified state and row objects, using the shared
+I/O scheduler with four concurrent reads and a bounded inline fallback. Combined
+encoded state remains limited to 40 MiB and 65,536 changes.
+
+The reusable state's retention horizon is the minimum across its own scope and
+all referenced row groups. Extending a cursor renews aging groups and publishes
+a new state; it cannot extend immutable objects by changing memo metadata.
+Bounded in-process construction flights coalesce concurrent state and group
+uploads. Waiters preserve their own cancellation, deadline and requested expiry;
+a failed leader releases admission for another request to retry. Every fresh cut capture
+still writes its own small lease envelope.
+
+Pinned pagination shares decoded state and overlay maps through the existing
+resource-accounted decoded cache. Keys include store, table incarnation and the
+exact state reference, including provider generation and length. Each request
+reads and validates its envelope, checks every transitive scope against its own
+expiry, and independently acquires source and index reader leases. Cached data
+holds no provider client or request capability. Cold restart retains the durable
+four-read path; cache saturation preserves bounded query-owned leases.
+
+Selective required metadata conjuncts can lead text serving-pack admission.
+The planner consults native compound or column indexes, retains a physical
+selection only up to 4,096 rows, and maps it through paged source/rank routes.
+The complete predicate (including disjunctions and exclusions) remains a ranking
+membership check. Recent accepted rows are evaluated separately. Broad or
+unsupported predicates keep compressed membership and bounded text windows;
+planning never scans Parquet merely to attempt this optimization. Global term
+statistics, score order, highlight delivery and cursor semantics stay unchanged.
+
+Archive file maps depend on publication and schema rather than the WAL head.
+Recent vector planning borrows immutable prefix views and memoizes ready job
+metadata only through its proved retention interval. Bounded, resource-accounted
+memos hold copied identities and declarations; every query still validates source
+coverage, permissions and reader authority. See the protocol-44 implementation
+and qualification details in
+[`NATIVE_LAKE_PERFORMANCE_FOLLOWUP.md`](../../zig/NATIVE_LAKE_PERFORMANCE_FOLLOWUP.md).
+
 Filesystem object-store prefix listings descend only through the prefix's
 complete path components. The final partial component remains a string filter,
 and ordering, continuation tokens, delimiter grouping and symbolic-link behavior
 retain the bucket-listing contract. Listing a cursor namespace must not traverse
 unrelated archive artifacts.
+
+Automatic Iceberg source opening treats publication navigation as optional until
+it is adopted. Unavailable native stores or reader admission leave ordinary SQL
+source scans usable; cancellation, allocation failure, ambiguous metadata outcomes
+and explicitly required native reader errors still propagate. Retained/native
+reads continue to validate their own authority. Once navigation is adopted, its
+file lookups retain the independent publication reader pin.
+
+Full scans over an authenticated immutable snapshot share a separate flat plan
+keyed by the frozen metadata, requested snapshot and credential scope. The plan
+owns its qualified version strings, manifest-chunk leases, file map and canonical
+ordering. Queries borrow it through the bounded decoded cache and keep version
+changes in private maps. A new metadata selection creates a new key; neither
+snapshot labels nor TTLs establish freshness. Selective reads still defer data
+manifests, and full scans build this view only on demand.
+
+Selected Iceberg views share query-owned delete qualification under a 16 MiB
+workspace. At most eight provider stats run concurrently on the shared scheduler;
+only owned version strings and partition/sequence routes survive admission.
+Native coverage validation and hydration use the same pinned evidence. Complete
+partition tuples route candidate delete files, and sequence seeks exclude older
+deletes before decoding. Incomplete scopes preserve authoritative applicability
+checks. Only relevant recipes and decoded membership leases enter each prepared
+view. New source admissions revalidate provider versions; publication retains its
+independent fresh checks before and after construction. Workspace denial keeps
+the bounded original path. None of this authority becomes a resident cache entry.
+
+Ordered text batches share pattern leaves between membership prefiltering and
+ordinary scoring. Prefix, wildcard, regex and fuzzy bitmaps are keyed by immutable
+pack/segment and complete filter semantics. Four packs share the existing 8 MiB
+query quota, with at most 32 pattern leaves per pack. Parallel scoring receives
+private bitmap copies, checks current cancellation/deadlines and joins before
+memo teardown. Cache denial or eviction recomputes authoritative membership;
+BM25, Boolean boosts, deletions, totals, tie ordering and cursors retain shared
+engine semantics.
 
 Cold-query qualification must distinguish local execution, process restart,
 empty Antfly serving caches, and fully remote reads. A restart with a retained
@@ -752,3 +836,953 @@ by exact ranking. Existing corpus/read/memory admission remains enforced and an
 unaffordable optional batch falls back to exact physical windows. Deferred
 highlights use the admitted snapshot's canonical segment identities, since
 priority arrival order can differ from its native document ordinal order.
+
+
+### Native retained payloads and inventory delta planning
+
+Search cursor replay must preserve fresh-cut admission independently of optional
+cache residency. Modern retained WAL groups use versioned typed native values
+with preallocated containers; legacy JSON groups have a bounded private replay
+workspace when shared decoding cannot admit them. Both use process-accounted
+ownership, exact artifact generations, independent reader envelopes, and existing
+retained-domain collection. Cache pressure must not invalidate an issued cut.
+
+Broad indexed metadata predicates route compressed physical selections through
+source rank/select and serving spans. The planner bounds metadata work and uses
+full residual evaluation; an expensive or near-full proof falls back to bounded
+text windows. Matching row count is not itself an admission limit for compressed
+producers.
+
+Publication inventories persist the exact provider identities used by native
+file state. Eligible refreshes share one authenticated previous inventory and
+seek only changed native file records, inheriting unchanged catalog roots.
+Native roots persist proof that the prior inventory was delete-free.
+Delete-bearing prior/current snapshots, partial checkpoint recovery, and legacy
+roots or unqualified inventories retain complete reconciliation. Broad
+replacement uses a bounded sequential catalog walk. Source inventory processing and
+mandatory closure auditing remain separate costs; this optimization does not
+claim constant-time snapshot discovery or waive retention qualification.
+
+
+### Publication-bound file navigation and incremental delete proofs
+
+Native search resolves public/private file identities through authenticated paged
+navigation owned by the selected publication. Cold queries no longer build maps for
+every source file. GC and cloud closure ownership include these navigation pages;
+reader leases protect older publications independently of a refresh.
+
+Refresh planning persists the same exact object selectors and per-file delete
+fingerprints used to build native row identities. Authenticated subtree reductions
+skip unchanged prior file proofs, including on snapshots containing Iceberg deletes.
+Changed and removed files seek their native maintenance records, while incompatible
+or historical metadata retains complete reconciliation. Current snapshot discovery
+and fresh source coverage remain authoritative and may still enumerate files.
+
+Accepted-data enrichment status describes the composed table cut, with its actual
+WAL position, partition progress, and artifact-retention horizon. Reusable partition
+jobs have separate identities and cannot individually claim table-wide readiness.
+Retained cursor replay shares decoded immutable WAL groups across neighboring cuts,
+with independent admission and conservative accounting for all pinned buffers.
+
+
+### Compact coverage, bounded patterns, and recent-vector scheduling
+
+Reader protocol 47 introduced the separation between the canonical data census
+digest and qualified delete-object evidence; the current reader protocol is 49.
+The publication owns a version-2 source-navigation root containing that digest and, for explicitly immutable sources, the exact
+freshly discovered source-plan identity. Selection checks current binding,
+credentials, schema, snapshot, file count, and reader authority before using this
+proof. An identical immutable plan can reuse its census without decoding or mapping
+the published inventory. Mutable sources and unmatched plans still qualify current
+objects and recompute the complete census. Historical publications retain their
+original signature preimage and validation path.
+
+Reached Parquet files obtain their exact provider selectors through authenticated
+point seeks in the publication's file tree. The source owns an independent native
+store client and retained reader handle, so closing a short SQL index cursor cannot
+invalidate later projected hydration. Conflicting fresh selectors fail validation;
+selector caches carry no authorization. Delete-object versions remain fresh on
+every selection unless the selected publication supplies exact version proofs
+under an immutable source contract and an active catalog snapshot pin.
+
+Prefix, wildcard, regexp, and fuzzy text queries participate in bounded routing
+windows and shared Boolean preparation. Segment-local compressed membership feeds
+the ordinary top-k collector instead of corpus-wide document-ID and score arrays.
+Unknown pattern membership never prunes a segment. Mixed clauses retain global
+BM25 statistics, constant-score boosts, deletions, filtering, and stable cursor ties.
+Explicit sorts and aggregations keep their existing complete-input operators.
+
+Recent dense and sparse vector partitions use independent mutable executions in
+batches of at most three. Shared I/O scheduler admission remains held through result
+joining, with a 16 MiB workspace per concurrent lane. Saturated work runs inline;
+a partition exceeding its lane quota is retried serially under the existing request
+allocation policy. Cancelable completion points precede joining; inline
+cancellation immediately unwinds sibling work. All lanes join or cancel before
+owners are released, and merges retain partition order and global result shaping. This improves overlap across
+recent partitions without creating an operator-specific thread pool.
+
+Cloud generation-map vacuum progress binds its cursor and completion state to a
+versioned digest of the entire GC cut: retention domain, floor, cutoff, and mark-tree
+root. Changed evidence or legacy progress without that digest restarts enumeration,
+even when the numerical cutoff is unchanged. Prior reader-held map roots remain
+immutable and independently retained.
+
+
+Selective text patterns use publication-bound vocabulary and term-routing
+summaries to admit serving packs before reading postings. Bounded complete
+expansions are admission proofs; their terms never replace the pattern's scoring
+semantics. Broad expansion or allocation pressure retains complete admission.
+Cold Iceberg manifest plans use shared singleflight construction after fresh
+catalog resolution, so concurrent readers share immutable data without sharing
+request authority. Missing cloud generation-map pages are derived-artifact loss
+and admit rebuilding; provider authorization failures remain operational errors.
+
+
+Native serving refinements intersect complete indexed-predicate pack proofs with
+the global score frontier, and use regex/fuzzy automata to skip impossible
+vocabulary ranges before postings admission. Serving packs also publish paged,
+authenticated minimum logical positions for safe equal-score pruning under the
+default comparator. These pages participate in publication reuse and reader-safe
+GC; existing publications acquire them during the next serving refresh.
+Retained native WAL cuts pin independently cached row-group partition indexes
+and borrow their decoded row values, so unchanged groups share indexes and key
+filters across cuts without reconstructing the entire overlay. Legacy cuts keep
+their existing compatibility path. Exact counts, typed tie ordering and recent
+row visibility preserve their conservative execution contracts.
+
+#### Query-local broad admission and immutable manifest reuse
+
+Broad native metadata predicates stream compressed index pages through inverse
+source routes into a quota-controlled temporary pack index. The text score
+frontier intersects ranges with that index without retaining all matching rows
+or pack IDs in memory. Broad patterns use bounded range-local membership proofs;
+unknown proofs retain candidates. Row filtering and text scoring still establish
+final correctness under the same publication and reader lease.
+
+Fresh Iceberg metadata and manifest lists govern every new snapshot plan.
+Immutable manifest Avro is reusable across snapshots under a credential/backend
+scoped cache key containing its path and declared length. A separate manifest
+construction coordinator prevents nested snapshot-cache admission deadlocks.
+Sequence inheritance, schema and delete applicability are recomputed from the
+fresh snapshot metadata/list. Mutable attachments do not use URI-only manifest
+reuse. Inventory assembly remains linear in its entries.
+
+
+#### Lazy physical admission and independent composed execution
+
+Necessary metadata predicates with more than 4,096 estimated matches can lead
+admission through physical-range probes instead of a complete pack census.
+Reverse row-index pages optionally retain authenticated tuple minima/maxima;
+new publications write these reductions and old pages keep a bounded leaf-walk
+fallback. A text-competitive serving pack supplies its physical source ranges.
+Only a completed negative proof excludes the pack. Unknown, memory pressure,
+and exhausted optional read/work budgets retain it for final row filtering.
+Tiny sets keep the existing complete compressed/spillable routing proof.
+Range probes own a 1 MiB page cache and a 256 MiB cumulative read allowance,
+independent of point membership's accounting. Their owner is bounded to 16 MiB.
+
+Patterns compile one query-owned matcher per distinct clause. Broad patterns
+visit the lexical field/prefix range of the existing authenticated term directory
+and reject child pages whose pack envelopes cannot intersect the current hash
+range. They do not rebuild a vocabulary union or compile an automaton for every
+range. Bounded unsuccessful walks remain unknown, never evidence of absence.
+No new publication root or provider authority is introduced.
+
+Exact BM25 score ceilings evaluate the supported integer frequency domain
+(up to 256) under the scorer's actual floating-point arithmetic at authenticated
+norm minima. The same proof covers scored phrase frequency using its first
+term and combined phrase IDF. Large/escaped domains retain conservative bounds.
+A bounded query cache reuses ceilings across range probes. Boolean bounds include
+the canonical baseline before child accumulation and boost multiplication.
+
+Immutable Iceberg data manifests also own reusable derived file chunks. Keys
+bind credential/backend scope, format version and manifest-list inheritance
+inputs. Fresh snapshots merge sorted chunk views, own their snapshot-qualified
+version strings, and pin borrowed paths, partitions and metrics through explicit
+leases. Manifest/chunk construction uses separate cache admission from snapshot
+construction and bounded shared scheduling. Deletes still use the freshly
+selected schema and manifest list. The flat file view and snapshot-qualified
+canonical row ordering remain proportional to the inventory; this design does
+not claim constant-time discovery of an arbitrarily large new snapshot.
+
+Native composed text/dense/sparse components run under independent executions,
+source version maps, membership cursors, allocators and runtime pins. At most
+three lanes participate in a pass using the shared scheduler; saturation runs
+on the caller, cancellation drains pending lanes, and a lane that exhausts its
+16 MiB workspace retries serially under the ordinary request allocation policy.
+Owned results return in declaration order. Fusion, graph dependencies,
+highlights, transforms and final source delivery remain coordinator-owned.
+
+Nested archive/recent vector partitions execute serially inside an already
+scheduled composed lane, using that lane's allocator and workspace quota.
+Standalone vector queries retain archive/recent overlap. This prevents scheduler
+saturation from multiplying unadmitted nested caller workspaces. Regressions
+exercise nested execution, cancellation, and enclosing-quota exhaustion.
+
+Reverse-index tuple envelopes fit the existing 256-byte authenticated page
+reduction. Long lower keys use conservative prefixes; long upper keys use
+prefix successors. A saturated upper prefix or legacy child emits a nonempty
+unknown reduction, preserving publication compatibility and retaining candidate
+packs. Exact row membership remains authoritative after this lossy pruning.
+
+
+Legacy compacted text-root pointers carry no version. Serving and resumable GC
+authenticate the root body before choosing the supported decoder; roots with an
+advertised metadata version continue to require an exact match. GC persists a
+version-discovery job so resumed traversal follows the same contract.
+
+Composed execution lanes borrow their quiescent parent's immutable version map
+and keep only private overrides. The parent remains pinned until every lane
+joins. Workspace exhaustion during lane setup uses the same serial fallback as
+execution exhaustion; cancellation and real allocation failures still propagate.
+
+Immutable Iceberg snapshot catalogs use refcounted, path-copying file-ID trees
+that pin immutable manifest chunks. A bounded predecessor cache scopes reuse to
+credentials, source, table location and manifest inheritance. A new snapshot
+reuses unchanged nodes and derives only changed manifest entries. Headers, schema
+and delete applicability remain authoritative. Point hydration creates a bounded
+view of the selected files. Publication-backed scans enumerate canonical public
+file records through bounded independent cursors; legacy navigation and explicit
+continuation validation retain flat inventory planning. For those consumers,
+canonical ordering is published once per snapshot with cancellation-aware waiting.
+Cache admission failure preserves the ordinary statement-owned materialized plan.
+Initial discovery still reads the manifest list; this does not promise constant-time discovery of a new snapshot.
+
+Constant-score match-all and bitmap leaves expose finite nonnegative score
+bounds within selective Boolean trees. Invalid or signed boosts retain
+conservative bounds. Independent full-admission ranked pages remain the oracle
+for score, tie and offset behavior.
+
+
+Cold snapshot catalogs merge the sorted manifest chunks and bulk-build their
+Cartesian tree. Each file allocates one node and hashes its priority once;
+construction takes O(N log M) merge work for N files across M chunks and O(N)
+tree work. Incremental snapshots retain path copying. Catalog construction and
+lazy canonical ordering retry allocation after evicting cache pins, while reader
+pins preserve ownership. Exhausting reclaimable entries uses the existing flat
+planning fallback rather than making cache residency a prerequisite for queries.
+
+Delete-file decoding has a separate immutable cache shared across selected data
+views. Its identity binds fresh provider ETag/version, complete delete recipe,
+schema, credential scope and decoding/application policy. Objects without a
+strong provider identity bypass it. Selected views apply sequence/partition
+rules and row bounds independently and retain leases for shared compressed
+position membership and equality keys. Loading is bounded to 64 MiB, each prepared
+view retains at most 256 MiB of foreign indexes, and residency includes leased
+bytes. Oversized indexes use streaming subset decoding with direct path lookup.
+Fresh object validation remains mandatory before cache lookup unless an adopted
+publication supplies exact provider versions for a pinned immutable catalog
+snapshot. That proof binds the fresh metadata plan, complete delete recipe,
+coverage and credential/store/namespace scope; reached delete files still use
+version-qualified reads. Unversioned, mutable and unpinned sources retain HEAD
+qualification.
+
+Cold text-frontier traversal may warm sibling term-directory pages on two
+shared scheduler lanes. Each lane owns a 2 MiB workspace and 1 MiB read allowance;
+a query spends at most 8 MiB on optional warming, separately from required
+navigation. Scheduler saturation skips warming. Workers publish only immutable
+artifact bytes; the coordinator still authenticates and reduces metadata with
+private scoring/traversal state. Cancellation drains workers before request
+state is released. Benchmark component durations measure each worker's actual
+execution, including membership preparation, rather than result transfer;
+parallel durations can overlap and are not additive wall-clock time.
+
+
+Publication file navigation can now open immutable Iceberg sources before data
+manifest discovery. The source still resolves the fresh metadata location,
+selected snapshot and schema. An authenticated publication root must match the
+credential-scoped metadata-plan digest, table/store/namespace domain, source,
+snapshot and schema. The existing digest variants for current and explicitly
+pinned selectors can authenticate the same selected snapshot; the wire format
+is unchanged. Missing or mismatched proof falls back to ordinary discovery.
+Manifest lists and delete manifests remain fresh. Sparse hydration seeks only
+selected file records, with independent native reader authority and fully owned
+file fields. Ordinary full scans enumerate the authenticated public file tree in
+canonical digest order, holding one owned file view at a time. Independent cursors
+over disjoint digest ranges preserve shared scheduling and ordered parallel
+scans. Legacy navigation without totals, explicit row selections and continuation
+validation retain the frozen metadata planner. Shared flat-plan cache admission
+is optional; overflow plans use the statement allocator and pin bounded manifest
+chunks rather than adding a 64 MiB SQL limit.
+
+Shared position-delete indexes keep 64-bit ordinals in high-word Roaring blocks.
+A selected view borrows a single immutable set; overlapping delete files merge
+compressed blocks only when necessary. Decoding computes the canonical sorted
+fingerprint prefix once, preserving existing publication identities without
+re-expanding every selected view into a row hash map. Row bounds, sequence and
+partition applicability, scanned-row and retained-byte limits still apply.
+
+Ordered text pagination prepares analysis and global statistics once and reuses
+query-local membership across physical candidate batches. Four immutable pack
+bitmaps share an 8 MiB budget and LRU eviction. The memo retains no source pins,
+request callbacks or mutable scorer state. Allocation pressure returns to the
+ordinary candidate path; cancellation still propagates. Distributed statistics
+retain their existing preparation path. Exact scoring and predicates remain
+authoritative after the optional membership prefilter.
+
+Cloud generation navigation reclaims idle credential-scope cache owners when
+either a new owner or an existing owner's decoded pages need shared-budget
+headroom. Only cache pins are reclaimed; active reader pins retain their owners.
+With no reclaimable owner, optional navigation caching keeps its uncached or
+query-local fallback rather than requiring shared cache admission.
+
+
+Fallible decoded-cache constructors now complete before installing the payload
+union tag. Missing manifest or allocation failures leave the prior empty payload
+valid for cleanup; fully constructed resources retain normal destruction if a
+later preparation step fails. Regression coverage retries a missing-manifest
+load and verifies surviving shared snapshot leases. Synonym membership also
+propagates allocation failure instead of silently dropping expansion matches,
+allowing the optional ordered bitmap memo to fall back without false negatives.
+
+
+Publication navigation binds read callbacks to its own retained native handle,
+not the source opener's temporary handle. Native search shares its existing
+reader lease; SQL acquires a lease only when it has none. Navigation authority
+therefore survives source-open return without adding a second search lease.
+The cold-restart test exercises this boundary during final source hydration.
+
+
+Residual predicates resolve a bounded source view directly from the physical
+selection's file identities before assigning scan-local file ordinals. This
+works with both persistent catalogs and publication navigation, without expanding
+selected row coordinates or discovering unrelated data manifests. Full scans
+retain credential-scoped immutable parsed-manifest reuse under fresh selection.
+The cold E2E includes ordered indexed-range plus unindexed-prefix filtering while
+data manifests remain unavailable.
+
+
+Final qualification with origin/main `e32171bfb1`: the Debug CLI built; all
+485 lake integration tests passed (180 shared-engine and 305 server), all 81
+focused tests passed (19 and 62), and all 47 real Parquet/Iceberg E2Es passed in
+313.34 seconds. The strengthened cold restart E2E covers native text, retained
+text, SQL point lookup, ordered indexed-range/unindexed-prefix residual filtering
+with data manifests unavailable, and ordinary full scans after restoration.
+Pinned-compiler error metadata, Zig/Python formatting and lint, whitespace, all
+109 changed source license headers, and the Apache boundary passed (2,064 source
+files). Live-provider retention qualification and representative archive-scale
+latency/RSS benchmarks remain deferred; no archive speedup multiplier is claimed.
+
+
+### Paged ordered dictionaries and immutable membership pins
+
+Protocol 48 publishes ordered roots with independently authenticated slot, name
+and public-digest dictionaries. Roots contain tree references and counts instead
+of archive-wide file arrays. Serving resolves reached file names/slots through a
+bounded page cache; public-ID ties prepare digests only for participating files.
+Maintenance explicitly materializes slot fingerprints under its existing build
+budget. Dictionary updates copy changed paths and preserve unchanged trees;
+reader-safe GC and closure audits retain all dictionary pages. Version 5/6 roots
+remain readable by the new reader, while new serving/checkpoint roots use 7/8.
+The historical 16,384-file admission limit is replaced by the existing u32 physical
+coordinate domain and actual resource admission.
+
+Pattern membership exposes immutable, query-owned pins for scorer leaves.
+Segment-local iterators avoid both full bitmap cloning and global-offset copies
+on cache hits. Pinned slots cannot be evicted; each builder releases its pins
+before the query memo closes. Mutable filter APIs still return private copies,
+and exhausted optional cache admission retains authoritative execution.
+
+Delete candidate routing unions each partition's sequence suffix once, using its
+minimum data sequence; global and unknown-scope lists are also visited once.
+Publication-bound delete version pages are available only with an immutable
+source contract, an active catalog snapshot pin and exact version-capable
+provider selectors. The query builds routing metadata without per-delete HEADs,
+and loads version records only for applicable delete files. Publication still
+checks fresh providers before and after construction. Recipe mismatch, deadline,
+credential changes and lost reader/snapshot authority remain errors; absent
+proofs and exhausted optional routing admission use fresh qualification.
+
+
+### Shared public ordering and bounded publication scan planning
+
+Reader protocol 49 publishes ordered serving/checkpoint roots as versions 9/10.
+Versions 5/6 and 7/8 remain readable for migration and reader-safe collection.
+Every ordered index borrows the publication's authenticated public-digest-to-file
+name directory. Each index keeps its own stable file slots, including retired
+slots; a name lookup translates shared navigation to that index's coordinates.
+The live public-file count is independent of its historical slot count. Snapshot
+changes replace the shared reference without rewriting unchanged slot/name trees.
+Fresh slot trees are bulk-built in slot order; hashed dictionaries use bounded
+512 KiB sort runs with a four-run merge limit. Incremental edits still copy only
+changed paths.
+
+A sequential prefix of at most 65 file records identifies wide groups; small
+groups pay no separate cardinality seek. For large or sufficiently dense
+logical-key ties, public ordering walks that shared directory in digest order and probes exact tie membership. A small LIMIT
+can stop before reading every participating file. Continuation seeks start at
+the boundary digest and preserve physical row coordinates, ascending/descending
+IDs, backward pages and transitions between tuples. Small or sparse ties retain
+local ordering and its scoped cache; wide dense groups use lazy intersection, while sparse wide groups use
+bounded participant spilling as described below. Counts choose execution strategy only;
+exact membership and native rows decide results. Spill-admission fallback may still
+require many directory probes, so representative archive benchmarks remain
+necessary.
+
+Publication scans can freeze at most eight file descriptors into a private
+statement view, with an independent iterator preserving serial fallback after
+setup failure. Unordered scans then use the existing shared row-group work queue;
+single-file ordered scans split row groups into contiguous canonical ranges.
+The original multi-file scan path used lazy contiguous file ranges. The rolling
+row-group scheduler below replaces fixed file lanes for large publication scans
+while retaining deferred descriptor/footer errors and bounded file views. Startup warming
+loads compact ordered roots and selected dictionary pages under the existing
+page/time budget, avoiding full dictionary materialization.
+
+Ordinary and resumable GC now use one source-navigation dependency walker,
+including delete-version proof pages. An actual bounded-sweep regression pins an
+old publication, replaces its proof, verifies the page survives collection, then
+releases the last reader and verifies retirement. Other regressions cover shared
+dictionaries with distinct slot histories, bulk write counts, bounded sparse-tie
+prefix work and continuation boundaries, small-scan allocation failures, and
+real cold Iceberg scans with one/two files and many Parquet row groups.
+
+
+Qualification with origin/main `f9f1582346` included: the Debug CLI built;
+495 integration tests (184 shared-engine + 311 server) and 90 focused tests
+(22 + 68) passed without failures or leaks. All 48 real Parquet/Iceberg E2Es
+passed in 636.58 seconds. The final ordered-scan refinement passed its native
+allocation/row-group regression and four ordered/cold-Iceberg E2Es against the
+rebuilt CLI (28.09 seconds). Compiler-derived error metadata, formatting/lint,
+source licenses, whitespace and the Apache boundary (2,065 files) passed.
+Live-provider retention qualification and representative archive latency/RSS
+benchmarks remain deferred; these E2E timings are functional qualification.
+
+
+## Dictionary-bound pagination and rolling row-group scheduling
+
+The public tie cache binds its slot order to the authenticated ordered-file
+mapping as well as the tuple tree, publication source/snapshot and authorization
+scope. Two indexes with equivalent definitions can retain different stable slot
+histories, so the tuple-tree identity alone cannot authorize reuse of cached
+slot numbers. Regression coverage warms one mapping and queries the other in
+both directions with continuation boundaries.
+
+Ordered data-run ancestry and dictionary ancestry are independent. Within a
+checkpoint sequence, the first root establishes the complete slot/name layout;
+subsequent roots authenticate and edit only the reached fingerprint slots.
+Fresh data runs inherit the dictionary independently of their merge forest,
+and checkpoint assembly reuses that dictionary directly. Maintenance reloads
+compact roots instead of materializing/sorting all file names after each file.
+The first incremental merge retains the previous layout's length when newly
+admitted files extend the census. Final assembly streams the row runs normally.
+
+Public ordering chooses between snapshot-directory intersection for dense ties
+and a participant-only external sort for sparse wide ties. Participant sorting
+uses 128 KiB runs and the existing bounded spill manager, resolves only group
+members, and orders digest/slot keys in the requested direction. Continuations
+filter digest bounds before sorting and preserve exact physical row-coordinate
+seeks at an equal boundary. This bounds memory and avoids unrelated archive
+membership probes; it trades up-front participant work for predictable sparse
+group traversal. Small pages keep the lazy prefix when it is cheaper. Continued
+traversal switches to a spilled unvisited suffix once probes exceed participant
+preparation cost or the reserved metadata-read budget, finishing any current
+file before switching. Spill admission
+failure retains lazy traversal. A native fixture exceeds 65,000 files and 4,096 participants,
+forces spilling, and checks full order plus forward/backward continuations.
+
+Large publication scans use a rolling, query-owned row-group scheduler.
+Unordered lanes share a window of at most four footer plans and claim individual
+row groups by compressed size; tiny files overlap and a large file can occupy
+every worker. The next window is planned after current ranges have finished and
+released their borrowed plans. An independent producer preserves the unopened
+parent for serial spilling fallback, and reducers release active claims on early
+exit. Physical row admission belongs to the statement and survives worker
+ranges, rolling windows and fallback. Waiting lanes retain immutable statement
+context and I/O, independently of the producer's changing file view. Ordered
+SQL delivery consumes contiguous row-group ranges as a bounded batch, joins and closes the batch, then advances to the next file.
+Later descriptor/footer errors cannot displace an already delivered prefix.
+Scheduler saturation executes required ordered ranges on the caller rather
+than discarding an already advanced batch. The existing small-inventory path
+continues to support its fixed immutable work plan.
+
+These changes do not claim an archive-scale speedup factor. Representative
+cold/warm latency, publication request counts, RSS and skewed-file throughput
+measurements remain qualification work; real-provider retention qualification
+remains deferred.
+
+
+Validation with origin/main `f9f1582346` included: the Debug CLI built;
+497 lake integration tests (185 shared-engine + 312 server) and 15 focused SQL
+contracts passed without failures or leaks. The final adaptive traversal passed
+four focused cache/tie regressions, including the 65,553-file fixture, small-page
+prefixes, bounded promotion, spill rejection, backward cursors and a following
+tuple. All 50 real Parquet/Iceberg E2Es passed in 621.84 seconds. The new Parquet
+case streams 20,288 rows over pgwire in 137-row delivery batches across cold
+restarts and checks filtered/grouped aggregates; cold Iceberg coverage now also
+includes ten independently written files. Compiler error metadata, lint,
+whitespace, source licenses and the Apache boundary passed. These timings are
+functional qualification rather than archive latency benchmarks.
+
+
+### Rolling scan work and ordered maintenance
+
+Publication scans retain bounded file windows and share individual row-group
+claims. Sealed dynamic filters travel with every fixed or rolling worker; their
+physical min/max bounds only prune, while exact membership remains authoritative
+and includes fields hidden from the result projection. Idle consumers park on
+an I/O condition and continue observing request cancellation and deadlines.
+
+One optional independently owned cursor warms parsed Parquet footers for the
+next window under shared I/O admission and a 16 MiB private workspace. Required
+navigation advances only on demand. Warming cannot surface a later file's
+metadata error before an earlier delivered prefix, and statement close joins
+all warming before releasing navigation/source authority. Denied admission
+uses the ordinary required read path. Ordered batches use statement-backed
+caller workspace when concurrent scheduling is saturated; their batch sizing
+follows that workspace. Terminal worker EOF does not consume SQL scan quota.
+
+Ordered index updates keep dictionary ancestry and data-run ancestry separate,
+and carry explicit retirement slots as well as the streaming merge's keep mask.
+The initial checkpoint handles the snapshot delta; subsequent file checkpoints
+authenticate and edit only that file's dictionary/retirement paths. This preserves
+stable slot histories and old-reader roots without repeated archive-sized mask
+walks during sparse incremental publication.
+
+
+### Overlapping windows and direct metadata reduction
+
+Unordered SQL scans keep at most two independently owned windows of four files.
+An idle consumer can plan and consume later work while an earlier claim retains
+its footer and borrowed columns. The producer keeps one monotonic enumeration
+cursor; every window pins its own plans until its last claim closes. Planning
+errors are sticky across consumers. Aggregate worker EOF is administrative and
+spends no logical scan page; nonterminal empty pages remain quota-bounded.
+
+Reducers select fan-out from useful workspace and shared CPU admission, reserve
+node I/O headroom, and retain local state in explicit worker allocator budgets.
+One caller lane and admitted siblings share the operator's bounded allowance.
+Local spill/fallback preserves the original pinned source and exact reducers.
+
+Publication-wide text navigation computes sibling score bounds concurrently
+with independent, bounded navigation/pattern caches. Only completed reductions
+and accounting cross back to the coordinator; successful bounds avoid a second
+serial traversal. Prepared syntax remains immutable, and spilled selection
+clipping, ranking, errors, and read-budget reconciliation retain one owner.
+Worker memory/admission failures use the required serial path. Cloud retention
+qualification on real providers remains deferred.
+
+
+### Logical scan credits and typed final aggregation
+
+Native aggregates charge positive rows in statement-sized logical batches,
+independently of worker memory, row-group/file fragmentation and output delivery.
+Empty nonterminal pulls spend a credit; terminal EOF does not. Serial and parallel
+reducers share this policy and continue enforcing the statement row limit.
+
+Integer, boolean and text MIN/MAX participate in exact parallel reduction.
+Fixed-width final group states merge by column in admitted batches of up to 64,
+with one packed key matrix and no scalar reducer snapshots. Exact NUMERIC and
+variable-width winners merge directly after per-group memory admission. Spilling
+keeps the durable partial format and bounded reusable per-partial scratch.
+Small nested spill reducers size hash partition fan-out from workspace, leaving
+room for merge runs within the existing shared file ceiling. Sorted skew
+fallbacks place logical runs in the existing reusable anonymous extent store,
+retaining one descriptor per sort.
+Floating/dynamic extrema retain source-order execution until representative ties
+have a defined parallel contract. Ordered producers reserve shared I/O workspace
+using the same scheduling policy as aggregates, retaining bounded caller fallback.
+
+
+## GC expansion upgrades and final serving refinements
+
+Artifact marking and dependency traversal are separate. Ordinary GC planning and
+cloud publication audits retain a bounded expansion bitset beside each marked
+reference. A maintenance-only canonical manifest can later be expanded for an
+older reader-held serving publication, including seekable directory children.
+Full expansion subsumes maintenance expansion; visiting a raw reference cannot
+suppress its later traversal. Resumable collection keeps its durable expansion
+keys, including a separate seekable-manifest key. Failed or incomplete traversals
+never authorize a sweep.
+
+Parquet cursors load the embedded OffsetIndex for projected chunks even without a
+filter. Unfiltered scans omit the ColumnIndex bounds read. For indexed data pages,
+required reads and rolling prefetch use the exact header-inclusive compressed
+range. The encoded header must agree with the index length, page type, and row
+count before decoding. Range and input admission precede the read. Dictionary
+preludes and chunks without an OffsetIndex retain bounded header discovery.
+Optional indexes that exceed navigation admission use the ordinary bounded
+header path; malformed admitted indexes still fail validation.
+This removes a header-probe GET for cold indexed pages larger than the probe;
+small pages already fit the existing probe. The page directory remains versioned,
+leased, and bounded by each consumer's allocation policy.
+
+Exact parallel aggregation partitions in-memory partial groups by their existing
+semantic key hash once there are at least 4,096 partial groups. Each admitted
+reducer exclusively owns its destination hash table and merges typed state through
+selection vectors. A stable owner retains reducer budgets until result shaping
+consumes their batches. Final batches go directly to the existing result collector,
+without a serial hash-table rebuild. Source ordinals preserve implicit ordering;
+global group limits apply across all reducers. Every task joins before scratch or
+source release. Low-cardinality, spilled-source, and declined-admission cases use
+the existing bounded serial/spilling bridge. Reducers themselves may spill when
+an owner is skewed. Floating or order-sensitive aggregate states retain their
+established eligibility restrictions.
+
+Posting scorers share query-owned immutable regex programs and wildcard navigation
+plans across segments and remote routing windows. Regex execution forks private
+DFA state; provider I/O never holds the compilation-cache mutex. The cache admits
+at most 16 programs within 2 MiB, owns syntax bytes, and declines oversized/full
+entries to normal per-consumer compilation. Deadlines and cancellation remain
+authoritative. Compilation and DFA allocation failures propagate instead of
+turning a valid regex into an empty result; DFA columns publish states only after
+all allocations succeed. Fuzzy matching still constructs its inexpensive term
+wrapper with independent execution state.
+
+Regressions exercise both manifest traversal orders, already-marked references,
+one provider GET per indexed data page, dictionary preludes, inconsistent index
+lengths/ordinals, concurrent program reuse, allocation-failure cleanup, hash-owned
+state lifetime, overlapping groups, winning text extrema, ordinals, and the global
+group limit. The real Parquet cold-restart fixture now writes embedded page indexes
+and checks a 2,048-group aggregate alongside ordered result delivery. Provider
+retention qualification and representative archive latency/RSS measurements remain
+deferred; request-count regression evidence is not an archive-scale speedup claim.
+
+
+Qualification (2026-10-16): all 501 full native lake tests (187 shared-engine and
+314 server), 24 focused SQL regressions, and 31 runtime ABI tests passed without
+native failures or leaks. Final reducer sealing and four-column lookahead were
+rechecked with four focused native tests and six typed SQL owner tests. All 50
+real Parquet/Iceberg E2Es passed together in 639.93 seconds, with production disk
+safeguards enabled. The final Debug CLI, source/license boundaries, generated
+error parity, formatting, and lint checks passed. Latest fetched `origin/main`
+`9dd098d773` is included. The final CLI also passed the indexed Parquet
+cold-restart/grouping flow again (12.08 seconds) after the last guards.
+
+
+### Decoded-page hits, global spill exchange, and physical aggregate kernels
+
+Indexed decoded-page entries now retain validated Parquet header evidence under
+an immutable object-version/range/interpretation key. Readers consult that entry
+before encoded I/O or speculative prefetch and reapply their own input, decoded,
+structure, row-count, directory, and cancellation checks. Dictionary dependencies
+remain pinned; dictionary preludes and unindexed files retain bounded header
+discovery. With encoded residency disabled, warm scans decode no pages and fetch
+no indexed data-page payloads, including when asynchronous lookahead is enabled.
+
+Final exact aggregation can transfer unreduced worker spill partition files to
+global hash owners. The existing native block codec and AGS checkpoints cross the
+exchange unchanged; in-memory workers export a compact checkpoint once. This
+removes the serial worker-finalization and partial re-encoding bridge for compatible
+fresh spill streams. All files are sealed and destination capacity is reserved
+before ownership moves. After the first transfer, adoption is infallible. Source
+ordinal bases, semantic key ownership, wide integer cancellation, shared scheduler
+admission, disk quotas, cancellation, and sorted skew fallback are preserved.
+Already consumed or incompatible partition layouts retain the established bridge.
+
+Identity SQL column expressions now retain borrowed native vectors through encoded
+cohort evaluation, projection, and selection. Aggregate kernels dispatch on the
+state/vector pair and consume selections, null masks, and dictionary IDs directly.
+COUNT, integer SUM/AVG, floating SUM/AVG, boolean reductions, and primitive MIN/MAX avoid
+per-row Datum construction. Global unfiltered aggregation uses this path without
+per-row hash probes. Floating transitions preserve source update order, compensated
+sums, SQL NaN ordering, and first-occurrence signed-zero ties. Only winning text
+extrema are copied. Coercions and representations without a proven physical view,
+exact NUMERIC, DISTINCT, pattern sets, and filtered expression cohorts preserve
+their established typed/scalar evaluation and admission paths. Temporary composed
+selections are scoped to the update; retained aggregate state owns its payloads.
+Computed dictionary expressions retain their existing fused dictionary kernels.
+
+Regex and fuzzy posting traversals lease exclusive mutable DFA state from the
+query-owned program cache. Up to four executions per program can retain tables
+between segments; each execution has at most 256 KiB within the shared 2 MiB
+query cache. Traversal and provider I/O never hold the cache mutex. Saturation uses
+private execution, and cache-budget exhaustion retries private execution without
+changing matching results or execution statistics. Actual allocation failures
+propagate. Regex and fuzzy DFA columns publish states only after all allocations
+succeed. Query teardown requires all execution leases to be returned.
+
+Regressions cover decoded-only warm reads and stricter consumers, concurrent and
+sequential pattern state reuse, saturated and exhausted execution pools, mixed
+memory/disk global reducers, transfer without additional writes, ordinal offsets,
+wide integer cancellation, allocation-failure cleanup, physical identity expression
+ownership, selection/null/dictionary kernels, zero-allocation primitive updates,
+winning text ownership, NaN ordering, and global aggregation without hash probes.
+Representative archive latency/RSS benchmarks and live-provider retention
+qualification remain deferred.
+
+
+Qualification (2026-10-16, after merging `origin/main` `b79c65538f`): all 502
+full native lake tests (188 shared-engine and 314 server), 29 focused SQL tests,
+and 31 runtime ABI tests passed with zero native failures or leaks. All 50 real
+Parquet/Iceberg E2Es passed against the final Debug CLI in 626.48 seconds with
+production disk safeguards enabled. Generated error parity, Zig formatting,
+whitespace, licenses, and the Apache boundary (2,066 source files) passed. The
+private error-name table includes main's new promotion-writer fencing error.
+
+
+### Bounded global state, typed expression delivery, and adjacent page envelopes
+
+Global aggregation admits one group independently of input batch length. Fixed
+primitive reducers update that state in windows of at most 256 lanes; variable
+MIN/MAX admission reserves the largest possible winner. Physical descriptors are
+normalized once per batch and reused for admission, semantic key hashes, exact
+typed key lookup, and aggregate updates. The small-budget path avoids per-row
+hash probes without bypassing exact NUMERIC, DISTINCT, pattern, spill, or error
+semantics.
+
+Computed primitive expressions deliver owned typed payloads and separate null
+states through the existing batch reader contract. Their instruction DAG retains
+shared subexpressions and uses shared CPU scheduling for sufficiently large
+cohorts; joined output copies primitive lanes without a Datum delivery matrix.
+INT16/INT32 validation applies only to selected lanes. REAL inputs and each REAL
+instruction retain scalar rounding, overflow, and underflow behavior. Borrowed
+retained columns expose native payload/dictionary views; portable spill blocks
+decode numeric wire lanes once into bounded typed buffers, preserving borrowed
+text and dictionary entries. Complex values retain their exact fallback.
+
+Aggregate FILTER expressions form lazy cohorts. Only surviving physical lanes
+evaluate aggregate inputs. Sparse cohort positions gather group IDs directly
+into bounded native updates; scalar fallback observes SQL NULL elsewhere.
+Keys resolve once, unrelated unfiltered inputs stay native, and
+filtered-out division/coercion errors remain unevaluated. Ordered and DISTINCT
+consumers receive the same logical rows and null semantics as before. Compact
+computed dictionary entries retain their existing encoded dictionary path.
+
+Failed regex/fuzzy executions are removed from the query-owned pool on lease
+return, including failures caused by the parent budget rather than the child.
+Their tables are reclaimed before a private retry starts; the first attempt's
+reader and iterator also close before retry. Later traversals can build and reuse
+a healthy bounded execution when headroom becomes available. Actual allocation
+failures still propagate, and cache pressure does not change matches/statistics.
+
+Parquet prefetch merges only adjacent explicitly planned cold ranges, with zero
+gap and a 2 MiB envelope target. At most four columns plan the current page plus
+one adjacent indexed page each. Filtered/pruning consumers defer future payloads,
+pruned current pages are not prefetched, and decoded hits skip encoded fetches.
+Each exact page cache entry pins a slice of the shared immutable response; its
+cache key retains source version and credential scope. Workers check the
+persistent tier before coalescing only missing adjacent ranges. Cache admission
+charges shared backing once until its final resident alias leaves; pinned aliases
+remain resident and charged, while entry limits independently bound metadata.
+No cache lock covers disk or provider I/O. Member flights let required
+reads wait for an in-flight envelope, cancellation/close joins every owner, and
+shared admission can fall back to smaller individual page jobs. Dictionary and
+unindexed header discovery retain their bounded path. The real Parquet restart
+fixture now also checks mixed computed FILTER cohorts and wide global counts.
+
+These are bounded execution improvements, not an archive-scale latency claim.
+Representative latency/RSS benchmarking and live cloud retention qualification
+remain deferred.
+
+
+Qualification at `512f16a3dd` after merging `origin/main` `ce578d9033` (2026-10-16): all 503
+full native lake tests (189 shared-engine and 314 server), 43 focused SQL
+tests, and 31 runtime ABI tests passed with zero native failures or leaks. All
+50 real Parquet/Iceberg E2Es passed against the final merged Debug CLI in
+632.59 seconds with production disk safeguards enabled. The expanded Parquet
+restart fixture also passed separately. Merge coverage includes compact spill
+arrays, native parameter ownership, and leased array projections. Generated error
+parity, Zig/Python formatting, Python lint, whitespace, license headers, and the
+Apache product boundary (2,073 source files) passed. The private error table
+includes the combined branch/main names; public runtime ABI values remain pinned.
+
+Native execution also carries primitive/dictionary projections across derived
+relations, pushes selections to producers before coercion, and updates aggregate
+FILTER cohorts using only accepted lanes. Group admission uses a bounded census
+of distinct semantic keys and dictionary-tuple reuse, retaining exact equality,
+source ordinals and existing spill fallback. These are internal performance and
+correctness refinements with no new configuration or SQL syntax.
+
+Qualification of the distinct-admission and typed-delivery refinements
+(2026-10-16): all 505 full native lake tests (191 shared-engine and 314 server),
+54 focused SQL tests and 31 runtime ABI tests passed with zero native failures or
+leaks. All 50 real Parquet/Iceberg E2Es passed against the final Debug CLI in
+618.60 seconds. The expanded Parquet restart case covers derived native
+projections feeding grouped FILTER aggregates. Selection/coercion regression,
+persistent-tier prefetch, shared-buffer pin/eviction accounting, distinct-key
+admission under a small quota, and lazy/error-prefix/allocation-failure behavior
+are covered. Zig/Python formatting, Python lint, whitespace, licenses and the
+Apache product boundary (2,073 source files) passed. Current `origin/main`
+`ce578d9033` is included. Archive-scale latency/RSS benchmarking and live-provider
+retention qualification remain deferred.
+
+### Mixed projection delivery and pressure-aware grouping
+
+Derived streaming queries propagate output demand before physical scan planning.
+Unused expressions and their cold scan fields are omitted while schema widths
+and ordinals remain stable. Predicate and named-window input dependencies are
+retained, including scalar-subquery cardinality in unused definitions; ordered,
+aggregate, window, recursive, set and materialized domains conservatively retain
+the positional inputs they need. External projection providers retain their
+existing invocation contract. This is internal planning, with no new SQL syntax.
+
+A derived output batch may combine native primitives, compact dictionaries and
+exact scalar arrays/NUMERIC/JSON-null columns. Speculative encoded evaluation
+owns a separate reclaimable arena: an expression error releases that workspace
+before evaluating the existing scalar error prefix. Unsupported scalar columns
+are evaluated once alongside eligible native outputs. The mixed 49-column
+regression now succeeds under its existing 448 KiB working-memory limit.
+
+Expression kernels gather validated primitive/dictionary payloads from mapped,
+selected and physical-only readers directly into typed kernel lanes. Selection
+is pushed before coercion; SQL null masks, narrow integer checks, REAL rounding,
+nonfinite rules and scalar JSON-null/exact-NUMERIC fallbacks remain authoritative.
+Identity expressions borrow exact column views as well, avoiding full-row scratch
+when an aggregate consumes an array or NUMERIC field.
+
+Grouping admits distinct new state, variable-width winner growth, replacement
+vector/hash capacities and whole-column mixed-extrema/key promotions. Shared
+statement headroom participates in admission. Existing fixed-width groups remain
+batched above half quota; oversized censuses
+or reservations split into smaller prefixes instead of deoptimizing the entire
+input. Partitioned spill ingestion reuses semantic hashes, scatters bounded
+256-row windows and writes the existing native column-block codec, preserving
+per-partition input order, raw/partial markers and source ordinals. Order-sensitive
+and specialized exact aggregate paths retain their existing fallback contracts.
+
+Qualification of mixed projections, capacity-aware group admission and physical
+expression gathers (2026-10-16): the full SQL gate passed 990 tests, with three
+opt-in benchmarks skipped; all 505 native lake tests and the runtime I/O ABI
+gate passed, with zero failures or leaks. Focused final spill validation,
+allocation-failure, mixed cursor and named-window dependency checks also passed.
+All 50 real Parquet/Iceberg E2Es passed against the final Debug CLI in 642.72
+seconds. The expanded Parquet restart case checks mixed exact arrays/native
+outputs and unused-expression pruning. Zig/Python formatting, Python lint,
+whitespace, licenses and the Apache product boundary (2,073 sources) passed.
+Current `origin/main` `ce578d9033` is included. Archive-scale latency/RSS
+benchmarks and live-provider retention qualification remain deferred.
+
+
+### Native scan identities, exact predicate masks and spill reduction
+
+Contiguous Parquet/Iceberg batches carry a shared external identity span.
+The batch count and on-demand row-reference accessor preserve snapshot, file,
+row-group and physical ordinal authority without a reference allocation per
+row. Explicit identities remain available for arbitrary inputs. Slicing, delete
+masks, hydration, pagination, replay and index builders consume the same accessor;
+retained builds clone the shared identity once and preserve the compact span.
+
+Residual scan predicates dispatch once per native column. Dense integer/float
+comparisons use SIMD lanes; selected dictionary entries use a fixed bounded memo.
+SQL NULL, excluded lanes and signed timestamp boundaries remain exact. NUMERIC,
+wide datetime bounds, mixed integer/float comparisons, nonfinite coercion and
+complex values retain the established scalar boundary. Literal coercion stays
+lazy when no nonnull selected lane needs it. Embedded pruning remains advisory.
+
+Native spill ingestion sizes and encodes selected primitive/dictionary columns
+without Datum row reconstruction, using the existing portable block format.
+Compatible raw partition blocks feed typed grouped state atomically; partial AGS
+checkpoints, specialized exact state and sorted skew fallback retain their
+existing representations and order. No borrowed block survives its owning read.
+Declined group censuses use independently bounded workspace and iterative
+reclaim-before-retry windows. Singleton fallback needs no census. Ordinary SQL
+row/cardinality errors share one prefix-delivery classification; cancellation,
+resource and integrity errors remain immediate failures.
+
+Qualification: the full SQL gate passed 997 tests (three opt-in benchmarks
+skipped); native lake integration passed 509 tests and the runtime I/O ABI gate
+passed, with zero failures or leaks. All 50 real Parquet/Iceberg E2Es passed
+against the final Debug CLI in 635.73 seconds, including filtered compact identity
+stability across cold restarts. Focused allocation-failure, scalar-predicate
+parity, mixed spill validation and direct/wrapped allocator pressure checks passed.
+Formatting, Python lint, license headers and the Apache boundary (2,074 sources)
+passed. Latest fetched origin/main `ce578d9033` is included. Representative
+archive-scale latency/RSS and live-provider retention qualification remain deferred.
+
+### Compact physical views and adaptive checkpoint reduction
+
+Native SQL physical views borrow retained packed validity with a bit offset and
+represent contiguous row selections as ranges. Sparse/permuted selections retain
+explicit coordinates. Computed primitive outputs and spill readers share this
+trait; hashing, admission and reduction reuse prepared block columns. Owned replay
+materializes validity once at its ownership boundary. Selected coercion, REAL
+rounding and SQL NULL identity retain their existing validation contracts.
+
+Physical normalization has independently bounded optional workspace before the
+group census. Admission follows immutable parent allocators through the SQL
+synchronization and spill wrappers, preserving shared statement headroom. Declined windows release that workspace and retry smaller inputs;
+actual allocator failures still propagate. Direct native result streams now use
+the same SQL row-error classification as derived projections, preserving valid
+prefixes before invalid casts without retrying resource or control failures.
+
+Compatible AGS v2 checkpoints restore borrowed primitive columns and merge COUNT,
+integer SUM, boolean reductions and eligible extrema after one destination-key
+census. String extrema copy only winning payloads. Every signature and complete
+window is checked before retained mutation; declined suffixes keep their original
+checkpoint and ordinal. NUMERIC, DISTINCT, pattern and order-sensitive states
+retain their established exact/sorted paths. No durable format or ABI changes.
+
+Oversized fixed-state hash partitions may repartition on a discriminating unused
+hash bit. Binary children, at most eight passes, descriptor headroom and disabled
+nested worker fan-out bound resource usage. Identical hashes and unsupported state
+keep sorted skew reduction. All partition staging is sealed and released before
+reduction, preserving workspace for projections and downstream blocking operators.
+The real Parquet restart fixture covers high-cardinality nested aggregation and
+pgwire delivery of a successful row before an invalid text cast.
+
+Qualification of compact physical views, allocator-aware admission, checkpoint
+columns and adaptive radix reduction (2026-10-16): the full SQL gate passed
+1,003 tests (777 shared-engine and 226 server), with three opt-in benchmarks
+skipped. All 510 native lake tests (194 shared-engine and 316 server) and the
+runtime I/O ABI gate passed with zero failures or leaks. All 50 real
+Parquet/Iceberg E2Es passed against the final Debug CLI using two test workers in
+325.57 seconds. Coverage includes direct/wrapped shared-pressure admission,
+packed-validity ownership, partial signatures/truncation, allocation failures,
+repartition progress/skew, descriptor pressure and real restart/error-prefix
+flows. The fixture retries only explicitly retryable, unadmitted index-creation
+catalog conflicts. Formatting, Python lint, whitespace, staged license headers
+and the Apache boundary (2,074 sources) passed. Latest fetched origin/main
+`ce578d9033` is included. Representative archive-scale latency/RSS and
+live-provider retention qualification remain deferred.
+
+
+### Survivor projection and exact spill admission
+
+Scan-level SQL predicates pass an exact residual/delete/dynamic-filter mask
+into Parquet projection. Cursor-owned pages validate framing and retain decompressed wire
+payloads, definition coordinates and dictionary IDs. Projection converts only
+surviving primitive, timestamp and decimal values; strings borrow immutable page
+bytes. Eligible dictionary projections retain their dictionary identities for
+downstream expression/group kernels. Rejected positions remain masked SQL NULL
+placeholders in the original physical coordinate range. Misaligned column pages and later cohorts reuse the
+same validated framing. A partially projected vector never becomes a shared
+full-page cache entry. Broad page-local cohorts, complete cache hits and
+unsupported layouts retain their existing paths. Density uses the projection
+page intersection, even when predicate pages have different boundaries. Retained
+page allocators switch to stable cursor backing after workers join, before scoped
+locking adapters leave scope.
+
+Dynamic scan filters dispatch per primitive column and hash fixed 128-row stack
+windows, avoiding width-by-row Datum arrays. Dictionary memo state is bounded to
+one window. Exact NUMERIC, unsupported coercions and NaN domain bounds retain
+scalar semantics with reusable lane scratch. This applies equally to Parquet and
+Iceberg scans; complete index-driven dynamic joins keep their existing planner.
+
+AGS v2 checkpoint columns now restore exact NUMERIC SUM/AVG coefficients without
+Aggregate/OwnedRow reconstruction. Admission reserves the union of exponent
+ranges for every destination group before mutation. Raw NUMERIC spill blocks use
+the typed key census as well. Adaptive radix reduction includes exact states;
+file, descriptor and shared-workspace headroom constrain additional depth, and
+exact finalization leaves room for downstream delivery and sorting. DISTINCT and
+order-sensitive reducers retain their established exact paths. Wire formats and
+public tuning surfaces are unchanged.
+
+Retry selections have their own optional admission budget, so an oversized view
+can shrink before allocating from statement headroom. Required allocation
+failures still propagate. Vector-overlap qualification waits for archive entry
+and recognizes either lane-entry order. The real Parquet restart fixture also
+checks sparse wide/decimal/nullable projections; existing real Iceberg coverage
+exercises dictionary projections, schema evolution, partition pruning and deletes.
+
+Ancestor quota diagnostics follow scheduler and spill allocator wrappers. Reusable
+pattern executions inspect local admission and their own DFA allocation-failure
+state, so an ancestor's historical quota failure cannot invalidate healthy forks
+after headroom recovers. Failed executions are still discarded and reconstructed.
+Hard overlay and transform-size diagnostics likewise inspect their local budget;
+parent cache pressure remains retryable and can use private ownership. Cancellation
+and provider errors retain their own identity even after quota pressure.
+
+Qualification: the full SQL gate passed 1,009 tests (three opt-in benchmarks
+skipped), all 515 native lake tests and the runtime I/O ABI gate passed with zero
+failures or leaks. Coverage includes retry-view pressure through direct and locked
+allocators, allocation-free dynamic filters, selected nullable/dictionary framing
+and ownership failures, exact coefficient unions, checkpoint truncation, and
+small-budget NUMERIC spill/sort execution, and WAL private fallback/headroom
+recovery. The archive/recent overlap fixture
+passed 10 consecutive focused runs. All 50 real Parquet/Iceberg E2Es passed in
+312.11 seconds against the final Debug CLI; its SHA-256 stayed unchanged across
+the run. Formatting, Python lint, whitespace, staged license headers and the
+Apache boundary (2,076 sources) passed. Latest fetched origin/main `968f037c9a`
+is included. Representative archive-scale latency/RSS and live-provider retention
+qualification remain deferred.

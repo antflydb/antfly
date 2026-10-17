@@ -251,7 +251,7 @@ pub const Replay = struct {
             const values: local.sql_execution_batch.Batch = .{ .reader = .{ .ptr = &capture_batch, .read = CaptureBatch.cell, .read_identity = CaptureBatch.identity, .count = batch.rowCount(), .width = self.columns.len } };
             var begin: usize = 0;
             while (begin < batch.rowCount()) {
-                const external = switch (batch.row_refs[begin]) {
+                const external = switch (batch.rowRef(begin)) {
                     .external => |ref| ref,
                     else => return error.SidecarSourceBindingMismatch,
                 };
@@ -265,7 +265,7 @@ pub const Replay = struct {
                 }
                 var end = begin;
                 while (end < batch.rowCount() and end - begin < 256) : (end += 1) {
-                    const next = switch (batch.row_refs[end]) {
+                    const next = switch (batch.rowRef(end)) {
                         .external => |ref| ref,
                         else => return error.SidecarSourceBindingMismatch,
                     };
@@ -280,7 +280,7 @@ pub const Replay = struct {
                 const groups = try pa.alloc(local.sql_scalar.Datum, selection.len);
                 const positions = try pa.alloc(local.sql_scalar.Datum, selection.len);
                 for (selection, ordinals, groups, positions, begin..) |*selected, *ordinal, *group, *position, index| {
-                    const ref = batch.row_refs[index].external;
+                    const ref = batch.rowRef(index).external;
                     selected.* = index;
                     ordinal.* = self.run.?.size + index - begin;
                     group.* = .{ .value = .{ .integer = ref.row_group_ordinal }, .sql_null = false };
@@ -309,11 +309,12 @@ pub const Replay = struct {
             };
             return if (column.nulls.isNull(row)) 0 else @as(u64, ids[row]) + 2;
         }
-        fn cell(raw: *anyopaque, _: A, row: usize, ordinal: usize) !local.sql_scalar.Datum {
+        fn cell(raw: *anyopaque, a: A, row: usize, ordinal: usize) !local.sql_scalar.Datum {
             const self: *@This() = @ptrCast(@alignCast(raw));
             const column = self.vectors[ordinal];
             if (column.nulls.isNull(row)) return .{};
             return .{ .sql_null = false, .value = switch (column.values) {
+                .decimal128, .encoded => try column.values.jsonAt(a, row),
                 .i64 => |v| .{ .integer = v[row] },
                 .dictionary_i64 => |v| .{ .integer = v.at(row) },
                 .f64 => |v| .{ .float = v[row] },
@@ -458,7 +459,8 @@ test "external lake bounded replay releases files and falls back for oversized s
         var count: usize = 0;
         while (try rows_source.next(a)) |batch| {
             try batch.validate();
-            for (batch.row_refs, 0..) |ref, index| {
+            for (0..batch.rowCount()) |index| {
+                const ref = batch.rowRef(index);
                 try std.testing.expectEqualStrings(source.inventory.files[file].file_id, ref.external.file_id);
                 try std.testing.expectEqualStrings(values[count + index], batch.columns[0].values.bytes[index]);
             }

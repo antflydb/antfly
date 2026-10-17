@@ -415,6 +415,26 @@ pub const ColumnPage = struct {
             for (self.selection) |index| if (index >= self.batch.rowCount()) return error.InvalidSqlBackendResponse;
         }
     }
+    /// Declared NUMERIC reads fixed coefficients directly. Raw callers retain
+    /// the established exact string contract for detected decimal columns.
+    pub fn typedCell(self: ColumnPage, alloc: std.mem.Allocator, row: usize, name: []const u8, numeric: bool) !Row.Cell {
+        if (row >= self.selection.len) return error.InvalidSqlBackendResponse;
+        if (numeric and self.native == null) if (self.batch.findColumn(name)) |column| {
+            const index = self.selection[row];
+            if (index >= self.batch.rowCount() or index >= column.rowCount()) return error.InvalidSqlBackendResponse;
+            if (column.values == .decimal128 and !column.nulls.isNull(index)) {
+                const decimal = column.values.decimal128;
+                @import("../common/decimal128.zig").validateCoefficient(decimal.values[index], decimal.precision, decimal.scale) catch return error.InvalidSqlBackendResponse;
+                var context: @import("numeric_value.zig").Context = .{ .alloc = alloc };
+                var number = try @import("numeric_value.zig").fromScaledInteger(&context, decimal.values[index], @intCast(decimal.scale));
+                errdefer number.deinit();
+                const value = try alloc.create(@import("numeric_value.zig").Value);
+                value.* = number.value;
+                return @import("scalar.zig").Datum.typedNumeric(value);
+            }
+        };
+        return self.cell(alloc, row, name);
+    }
     pub fn cell(self: ColumnPage, alloc: std.mem.Allocator, row: usize, name: []const u8) !Row.Cell {
         if (row >= self.selection.len) return error.InvalidSqlBackendResponse;
         const index = self.selection[row];
@@ -427,10 +447,11 @@ pub const ColumnPage = struct {
             return .{ .value = .null, .sql_null = true };
         }
         if (index >= self.batch.rowCount()) return error.InvalidSqlBackendResponse;
-        if (std.mem.eql(u8, name, "_id")) return .{ .value = .{ .string = try @import("../storage/rowsource/identity.zig").allocId(alloc, self.batch.row_refs[index]) }, .sql_null = false };
+        if (std.mem.eql(u8, name, "_id")) return .{ .value = .{ .string = try @import("../storage/rowsource/identity.zig").allocId(alloc, self.batch.rowRef(index)) }, .sql_null = false };
         const column = self.batch.findColumn(name) orelse return .{ .value = .null, .sql_null = true };
         if (column.nulls.isNull(index)) return .{ .value = .null, .sql_null = true };
         const value: std.json.Value = switch (column.values) {
+            .encoded => |values| try values.at(index),
             .dictionary_i64 => |values| .{ .integer = values.at(index) },
             .dictionary_f64 => |values| .{ .float = values.at(index) },
             .i64 => |values| .{ .integer = values[index] },
@@ -439,6 +460,7 @@ pub const ColumnPage = struct {
             .bytes => |values| .{ .string = values[index] },
             .dictionary_bytes => |values| .{ .string = values.at(index) },
             .json => |values| try std.json.parseFromSliceLeaky(std.json.Value, alloc, values[index], .{ .allocate = .alloc_always, .parse_numbers = false }),
+            .decimal128 => |values| .{ .string = try values.text(alloc, index) },
             .vector_f32 => return error.UnsupportedSqlExecution,
         };
         return .{ .value = value, .sql_null = false };
@@ -451,6 +473,8 @@ pub const Cursor = struct {
     /// True only when this cursor preserves every requested Scan.order key.
     order_satisfied: bool = false,
     /// Snapshot-local optimizer estimates; absent means unknown, never zero.
+    /// Optional estimate after the captured Scan.conditions, never an execution cap.
+    estimated_filtered_rows: ?u64 = null,
     estimated_rows: ?u64 = null,
     estimated_bytes: ?u64 = null,
     ptr: *anyopaque,
@@ -462,13 +486,22 @@ pub const Cursor = struct {
     set_dynamic_filter: ?*const fn (*anyopaque, *const @import("dynamic_filter.zig").Filter) anyerror!bool = null,
     /// Negotiate complete key spooling before building the filter. Absent
     /// means Bloom/domain evidence suffices; do not spill unused exact tuples.
+    /// Planning may also inspect this capability for identity join keys.
+    /// Read captured metadata only; do not start scans or fetch source objects.
     wants_exact_filter: ?*const fn (*anyopaque, []const @import("dynamic_filter.zig").Column) anyerror!bool = null,
     /// Split an unopened pinned scan into disjoint work for exact associative
     /// reducers. Providers may distribute row groups dynamically; child order
     /// is not source order. Children share the snapshot and close before their parent.
     split_scan: ?*const fn (*anyopaque, std.mem.Allocator, usize) anyerror!?[]Cursor = null,
+    /// Release dynamically claimed work when a reducer completes or stops
+    /// early. This does not close the cursor; its owner still calls close().
+    finish_partition: ?*const fn (*anyopaque) void = null,
     /// Ordered, disjoint ranges whose concatenation preserves source order.
     split_ordered: ?*const fn (*anyopaque, std.mem.Allocator, usize) anyerror!?[]Cursor = null,
+    /// Rolling ordered ranges. Consume and close every child before asking for
+    /// the next bounded batch; null is end of source. Later file/footer errors
+    /// are reported only when the caller reaches that batch.
+    split_ordered_batch: ?*const fn (*anyopaque, std.mem.Allocator, usize) anyerror!?[]Cursor = null,
     /// Provider estimate of retained metadata per ordered child. Planning
     /// limits fan-out before cloning a large immutable inventory.
     ordered_split_bytes: usize = 0,
@@ -770,4 +803,18 @@ test "SQL typed array column adapters preserve dimensions and owned index contin
     @memset(&cursor, 'x');
     try std.testing.expectEqualStrings("next", owned.index_cursor.?);
     try std.testing.expectEqual(@as(i32, -3), (try owned.cell("a")).array.?.dimensions[0].lower);
+}
+
+test "lake SQL decimal columns distinguish declared NUMERIC from exact string reads" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const rowsource = @import("../storage/rowsource/types.zig");
+    const page: ColumnPage = .{ .batch = .{ .snapshot = .{ .table_id = "t", .snapshot_id = "s" }, .row_refs = &.{.{ .relational_key = "a" }}, .columns = &.{rowsource.ColumnVector{ .name = "n", .values = .{ .decimal128 = .{ .values = &.{9007199254740993125}, .precision = 22, .scale = 3 } } }} }, .selection = &.{0} };
+    const raw = try page.cell(a, 0, "n");
+    try std.testing.expectEqualStrings("9007199254740993.125", raw.value.string);
+    const native = try page.typedCell(a, 0, "n", true);
+    try std.testing.expect(native.numeric != null);
+    var context: @import("numeric_value.zig").Context = .{ .alloc = a };
+    try std.testing.expectEqualStrings(raw.value.string, try @import("numeric_value.zig").format(&context, native.numeric.?.*));
 }

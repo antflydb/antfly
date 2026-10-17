@@ -28,6 +28,7 @@ pub const ObjectChecksum = types.ObjectChecksum;
 pub const ObjectChecksumAlgorithm = types.ObjectChecksumAlgorithm;
 pub const ObjectChecksumScope = types.ObjectChecksumScope;
 pub const ObjectChecksumType = types.ObjectChecksumType;
+pub const VersionRetention = types.VersionRetention;
 pub const PutOptions = types.PutOptions;
 pub const BucketOptions = types.BucketOptions;
 pub const GetOptions = types.GetOptions;
