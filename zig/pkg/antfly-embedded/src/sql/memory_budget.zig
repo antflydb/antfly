@@ -48,8 +48,19 @@ pub fn allocator(self: *Budget) std.mem.Allocator {
 }
 pub fn isExhausted(self: *Budget) bool {
     self.lock();
-    defer self.mutex.unlock();
-    return self.exhausted or self.admission_exhausted;
+    const exhausted = self.exhausted or self.admission_exhausted;
+    const backing = self.backing;
+    self.mutex.unlock();
+    // A child can be below its own limit when shared parent admission fails.
+    // Preserve genuine allocator OOMs: only known Budget owners carry policy.
+    return exhausted or allocatorExhausted(backing);
+}
+fn allocatorExhausted(a: std.mem.Allocator) bool {
+    if (@import("parallel_scheduler.zig").LockedAllocator.parentAllocator(a)) |parent| return allocatorExhausted(parent);
+    if (@import("spill.zig").Manager.parentAllocator(a)) |parent| return allocatorExhausted(parent);
+    if (a.vtable.alloc != alloc) return false;
+    const parent: *Budget = @ptrCast(@alignCast(a.ptr));
+    return parent.isExhausted();
 }
 /// Conservative region footprint, including intermediate buffers retained by
 /// an enclosing arena. Ordinary reclaiming owners retain peak-live accounting.
@@ -228,4 +239,33 @@ test "SQL memory headroom follows synchronization and spill allocator parents" {
     child.allocator().free(bytes);
     try std.testing.expectEqual(@as(?usize, 512), headroom(locked.allocator()));
     try std.testing.expect(headroom(a) == null);
+}
+
+test "SQL memory budget reports parent admission without misclassifying allocator OOM" {
+    var parent: Budget = .{ .backing = std.testing.allocator, .limit = 32 };
+    var child: Budget = .{ .backing = parent.allocator(), .limit = 128 };
+    const bytes = try child.allocator().alloc(u8, 16);
+    defer child.allocator().free(bytes);
+    try std.testing.expectError(error.OutOfMemory, child.allocator().alloc(u8, 17));
+    try std.testing.expect(child.isExhausted());
+    try std.testing.expect(!child.exhausted);
+    try std.testing.expectEqual(@as(usize, 16), parent.live);
+    var empty: [0]u8 = .{};
+    var fixed = std.heap.FixedBufferAllocator.init(&empty);
+    var allocator_oom: Budget = .{ .backing = fixed.allocator(), .limit = 128 };
+    try std.testing.expectError(error.OutOfMemory, allocator_oom.allocator().alloc(u8, 1));
+    try std.testing.expect(!allocator_oom.isExhausted());
+    // Scheduler and spill wrappers preserve the same parent policy evidence.
+    var locked: @import("parallel_scheduler.zig").LockedAllocator = .{ .backing = parent.allocator() };
+    var manager: @import("spill.zig").Manager = .{ .alloc = locked.allocator(), .io = std.testing.io, .context = undefined, .checkpoint = struct {
+        fn check(_: *anyopaque) !void {}
+    }.check };
+    defer manager.deinit();
+    var wrapped: Budget = .{ .backing = manager.allocator(), .limit = 128 };
+    try std.testing.expectError(error.OutOfMemory, wrapped.allocator().alloc(u8, 17));
+    try std.testing.expect(wrapped.isExhausted());
+    try std.testing.expect(!wrapped.exhausted);
+    locked.backing = fixed.allocator();
+    try std.testing.expectError(error.OutOfMemory, wrapped.allocator().alloc(u8, 1));
+    try std.testing.expect(!wrapped.isExhausted());
 }

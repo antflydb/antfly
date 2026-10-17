@@ -4237,7 +4237,13 @@ pub const DB = struct {
                 if (opts.defer_index_backfill_on_open) try db.core.loadIndexesDeferredBackfill() else try db.core.loadIndexes();
                 profile.load_indexes_ns = elapsedSince(load_indexes_started_ns);
             }
-            if (!openModeRequiresReadOnlyBackends(opts.open_mode)) try finishGraphMergeImport(&db, null);
+            if (!openModeRequiresReadOnlyBackends(opts.open_mode)) {
+                for (db.core.index_manager.graph_indexes.items) |entry| if (entry.ttl_duration_ns != 0) {
+                    try db.core.index_manager.aggregateAuthoritativeReaderVersion(db.core.store, resolver_catalog_mod.graph_expiration_namespace_reader_version);
+                    break;
+                };
+                try finishGraphMergeImport(&db, null);
+            }
             // Validate the physical snapshot while the opened generation is
             // still untouched by replay and background workers. Status can
             // then retain this proof as live writes advance past the durable
@@ -25254,12 +25260,17 @@ pub const DB = struct {
         defer guard.deinit();
         try self.lockApplyForPortableRuntime();
         defer self.core.unlockApply();
+        // Match the other catalog writers' lock order and retain publication
+        // ownership until durable bytes and their cached format agree.
+        self.core.index_manager.catalog_mutex.lockExclusive();
+        defer self.core.index_manager.catalog_mutex.unlockExclusive();
         var txn = try self.core.store.beginWriteTxn();
         errdefer txn.abort();
         try self.requireOnlineArtifactCatalogMutableWithContextLocked(&txn, context);
         try self.requireArtifactReconcileUnfenced(&txn, context);
-        try self.core.index_manager.alignRowDerivedArtifactCatalog(&txn, command.catalogs, configs);
+        const stamp = try self.core.index_manager.alignRowDerivedArtifactCatalogNoLock(&txn, command.catalogs, configs);
         try txn.commit();
+        self.core.index_manager.publishCatalogReaderStamp(stamp);
         self.core.index_manager.invalidateWritePlanSnapshot();
     }
 
@@ -53133,13 +53144,7 @@ fn saveAppliedSequencesBatchLockedContext(
             // Only an already-certified empty publication may carry its zero
             // count across a source-only native commit. Ordinary native
             // ingest keeps the count-sidecar optimization.
-            if (ctx.index_manager.denseIndex(update.index_name)) |entry| {
-                const checkpoint = ctx.index_manager.denseProjectionCheckpointMetadata(update.index_name) orelse return error.InvalidDerivedApplyState;
-                if (entry.certifiedEmptyNativeCheckpoint(checkpoint)) |certified| {
-                    try apply_state.saveProjectionCheckpointWithSidecar(ctx.alloc, ctx.index_manager.checkpointIo(), ctx.store, ctx.applied_sequence_checkpoint_path, update.index_name, certified);
-                    _ = entry.validateServingCertificate(certified);
-                }
-            }
+            try ctx.index_manager.preserveCertifiedEmptyDenseCheckpoint(ctx.alloc, ctx.store, ctx.applied_sequence_checkpoint_path, update.index_name);
         } else {
             generic_updates.appendAssumeCapacity(update);
         }
@@ -110467,6 +110472,54 @@ test "db source-only batch retains a certified empty dense generation" {
     return error.IndexNotFound;
 }
 
+test "db source-only watermark retains a certified empty dense generation" {
+    const alloc = std.testing.allocator;
+    var directory = try TestDirectory.init("native-empty-watermark-certificate");
+    defer directory.cleanup();
+    var gated = GateDenseEmbedder{ .allowed_successes = .init(0) };
+    var db = try DB.open(alloc, directory.path(), .{
+        .start_index_workers = false,
+        .start_optional_runtime_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+        .enrichment = .{ .dense_embedder = gated.interface() },
+    });
+    defer db.close();
+    const cfg: types.IndexConfig = .{
+        .name = "dense_idx",
+        .kind = .dense_vector,
+        .coverage_generation = 33,
+        .config_json =
+        \\{"field":"body","dims":3,"embedding_name":"dense_idx","publication_policy":"progressive","generator":{"kind":"dense_embedding","source_field":"body","embedding_name":"dense_idx"}}
+        ,
+    };
+    try std.testing.expectEqual(@as(?u128, null), try db.admitManagedIndex(cfg));
+    const before = try db.core.loadProjectionCheckpoint(alloc, cfg.name);
+    try std.testing.expectEqual(@as(?u64, 0), before.published_count);
+    try db.batch(.{ .writes = &.{.{ .key = "source", .value = "{\"body\":\"pending embedding\"}" }}, .sync_level = .write });
+    // A sibling's activation can cover a source-only native window through
+    // the generic watermark callback while its producer remains pending.
+    try db.core.saveAppliedSequence(cfg.name, before.applied_sequence + 1);
+    const after = try db.core.loadProjectionCheckpoint(alloc, cfg.name);
+    try std.testing.expectEqual(before.applied_sequence + 1, after.applied_sequence);
+    try std.testing.expectEqual(@as(?u64, 0), after.published_count);
+    try std.testing.expect(try db.progressiveManagedGenerationIsQueryable(alloc, cfg.name));
+    const stats = try db.stats(alloc);
+    defer types.freeDBStats(alloc, stats);
+    var found = false;
+    for (stats.indexes) |item| if (std.mem.eql(u8, item.name, cfg.name)) {
+        found = true;
+        try std.testing.expect(item.serving_snapshot_ready);
+    };
+    try std.testing.expect(found);
+    const entry = db.core.denseIndex(cfg.name) orelse return error.IndexNotFound;
+    entry.verified_serving_certificate = null;
+    try db.batch(.{ .writes = &.{.{ .key = "another", .value = "{\"body\":\"still pending\"}" }}, .sync_level = .write });
+    try db.core.saveAppliedSequence(cfg.name, after.applied_sequence + 1);
+    const uncertified = try db.core.loadProjectionCheckpoint(alloc, cfg.name);
+    try std.testing.expectEqual(@as(?u64, null), uncertified.published_count);
+    try std.testing.expect(!try db.progressiveManagedGenerationIsQueryable(alloc, cfg.name));
+}
+
 test "db empty inline dense generation finalizes without scanning primary documents" {
     const alloc = std.testing.allocator;
 
@@ -115191,6 +115244,77 @@ test "db graph ttl direct cleanup cannot delete a replaced artifact" {
     var edge = try enrichment_artifact_codec.decodeGraphEdgeAlloc(alloc, artifact);
     defer edge.deinit(alloc);
     try std.testing.expectEqual(@as(f64, 3), edge.weight);
+}
+
+test "db graph ttl migration cold writer fences legacy expiry without changing readonly files" {
+    const alloc = std.testing.allocator;
+    const resolver_catalog = @import("catalog/resolver_catalog.zig");
+    const migration = @import("maintenance/graph_ttl_migration.zig");
+    var path_tmp = try TestDirectory.init("db-graph-ttl-legacy-namespace");
+    defer path_tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    const resolution = try internal_keys.resolutionArtifactKeyAlloc(scratch, "doc:a", "resolver");
+    var promotion: std.ArrayList(u8) = .empty;
+    try promotion.appendSlice(scratch, &internal_keys.promoted_keys_state_prefix);
+    try internal_keys.appendEncodedComponent(&promotion, scratch, resolution);
+    var deadline: u64 = 0;
+    {
+        var db = try DB.open(alloc, path_tmp.path(), .{ .start_optional_runtimes = false });
+        defer db.close();
+        try db.addIndex(.{ .name = "g", .kind = .graph, .config_json = "{\"ttl\":{\"duration\":\"1h\"}}" });
+        try db.batch(.{ .writes = &.{.{ .key = "doc:a", .value = "{\"_edges\":{\"g\":{\"links\":[{\"target\":\"doc:b\"}]}}}" }}, .sync_level = .full_index });
+        const rows = try db.core.store.scanPrefix(alloc, &internal_keys.graph_edge_expiration_index_prefix);
+        defer docstore_mod.DocStore.freeResults(alloc, rows);
+        try std.testing.expectEqual(@as(usize, 1), rows.len);
+        deadline = try graph_edge_ttl_expiration.deadlineFromKey(rows[0].key);
+        const legacy = try scratch.dupe(u8, rows[0].key);
+        @memcpy(legacy[0..internal_keys.legacy_graph_edge_expiration_index_prefix.len], &internal_keys.legacy_graph_edge_expiration_index_prefix);
+        // Reconstruct the old writer's durable representation, including the
+        // mixed family and pre-migration reader fence. No worker is running.
+        var txn = try db.core.store.beginWriteTxn();
+        errdefer txn.abort();
+        try txn.put(legacy, rows[0].value);
+        try txn.delete(rows[0].key);
+        try txn.put(promotion.items, "promotion state");
+        try txn.put(resolver_catalog.minimum_reader_key, "3");
+        try txn.delete("\x00\x00__metadata__:resolvers");
+        try txn.delete(migration.progress_key);
+        try txn.commit();
+    }
+    {
+        var db = try DB.open(alloc, path_tmp.path(), .{ .open_mode = .query_readonly, .start_optional_runtimes = false });
+        defer db.close();
+        const floor = try db.core.store.get(alloc, resolver_catalog.minimum_reader_key);
+        defer alloc.free(floor);
+        try std.testing.expectEqualStrings("3", floor);
+        const rows = try db.core.store.scanPrefix(alloc, &internal_keys.legacy_graph_edge_expiration_index_prefix);
+        defer docstore_mod.DocStore.freeResults(alloc, rows);
+        try std.testing.expectEqual(@as(usize, 2), rows.len);
+        try std.testing.expectError(error.NotFound, db.core.store.get(alloc, migration.progress_key));
+    }
+    {
+        var db = try DB.open(alloc, path_tmp.path(), .{ .start_optional_runtimes = false });
+        defer db.close();
+        {
+            var read = try db.core.store.beginReadTxn();
+            defer read.abort();
+            try std.testing.expectError(error.UnsupportedDatabaseReaderVersion, resolver_catalog.readMinimumReaderVersion(&read, 3));
+        }
+        var clock = platform_clock.ManualClock{};
+        clock.setRealtimeNs(deadline + 1);
+        try initStoppedTtlRuntimeForTest(&db, .{ .enabled = true, .grace_period_ns = 0, .clock = clock.clock() });
+        try db.ttl_runtime.?.runOnce();
+        try std.testing.expectEqual(@as(u64, 1), db.ttl_runtime.?.stats().expired_graph_artifacts);
+        try std.testing.expectEqual(@as(u64, 0), db.ttl_runtime.?.stats().error_count);
+        const preserved = try db.core.store.get(alloc, promotion.items);
+        defer alloc.free(preserved);
+        try std.testing.expectEqualStrings("promotion state", preserved);
+        const edges = try db.getEdges(alloc, "g", "doc:a", "links", .out);
+        defer graph_mod.GraphIndex.freeEdges(alloc, edges);
+        try std.testing.expectEqual(@as(usize, 0), edges.len);
+    }
 }
 
 test "db graph ttl due index rebuild resumes after reopen" {
@@ -134026,6 +134150,174 @@ test "db ordered artifact inventory producer pages resume after restart without 
         try std.testing.expectEqual(@as(u64, 1), (try obligations.load(&read)).?.pending_documents);
         try std.testing.expectError(error.ArtifactCatalogDrift, obligations.requireDrained(&read, authority));
     }
+}
+
+test "db ordered artifact inventory row reconciliation publishes envelopes and preserves reader floors" {
+    const alloc = std.testing.allocator;
+    const inventory = @import("artifact_inventory.zig");
+    var tmp = try TestDirectory.init("row-inventory-envelope");
+    defer tmp.cleanup();
+    const Check = struct {
+        fn ready(db: *DB, command: inventory.Command) !void {
+            var read = try db.core.store.beginReadTxn();
+            defer read.abort();
+            try std.testing.expectEqual(@as(u32, 4), try resolver_catalog_mod.readMinimumReaderVersion(&read, 4));
+            try std.testing.expectEqualStrings(command.catalogs.resolvers, (try inventory.catalogs(&read)).resolvers);
+            try std.testing.expect((try inventory.status(std.testing.allocator, &read, command.namespace)).ready);
+            try std.testing.expect(try db.core.index_manager.matchesArtifactInventory(command.catalogs));
+            var plan = try db.core.index_manager.acquireWritePlanSnapshot();
+            defer plan.release();
+            try std.testing.expect(plan.plan().matchesArtifactInventory(command.catalogs));
+        }
+    };
+    var expected: ?inventory.Catalogs = null;
+    defer if (expected) |*catalogs| catalogs.deinit(alloc);
+    var committed: ?inventory.Command = null;
+    {
+        var db = try DB.open(alloc, tmp.path(), .{ .start_optional_runtimes = false });
+        defer db.close();
+        try db.addIndex(.{ .name = "text", .kind = .full_text, .config_json = "{}" });
+        var old = try db.core.index_manager.acquireWritePlanSnapshot();
+        defer old.release();
+        {
+            var read = try db.core.store.beginReadTxn();
+            defer read.abort();
+            expected = try inventory.copyCatalogs(alloc, &read);
+        }
+        const envelope = try resolver_catalog_mod.versionedCatalog(alloc, "[]", 4);
+        alloc.free(expected.?.resolvers);
+        expected.?.resolvers = envelope;
+        const command: inventory.Command = .{
+            .namespace = @import("online_source_contract.zig").namespaceBytes(db.core.identity_namespace),
+            .binding = .{ .epoch = 1, .digest = expected.?.digest(), .semantic_digest = try expected.?.semanticDigest(alloc) },
+            .catalogs = expected.?,
+        };
+        const request: types.BatchRequest = .{ .artifact_catalog = command };
+        const receipt: OrderedApplyReceipt = .{ .term = 1, .index = 1 };
+        try db.reconcileReplicatedArtifactAdmission(request, receipt);
+        // The production caller completes this reconciliation with its
+        // compound source/merge admission. Acknowledge only the catalog side
+        // in this fixture; a standalone catalog mutation cannot bypass an intent.
+        {
+            var ack = try db.core.store.beginWriteTxn();
+            errdefer ack.abort();
+            try inventory.stageOrdered(alloc, &ack, command, receipt.index);
+            try @import("artifact_reconcile_intent.zig").clear(alloc, &ack, command, receipt.index);
+            try ack.commit();
+        }
+        try Check.ready(&db, command);
+        try std.testing.expect(!old.plan().matchesArtifactInventory(command.catalogs));
+        committed = command;
+        // A later, otherwise valid row-only recipe may not erase the permanent
+        // reader fence merely because it has no resolver definitions.
+        var legacy = command;
+        legacy.previous = command.binding;
+        legacy.binding.epoch = 2;
+        legacy.catalogs.resolvers = "[]";
+        legacy.binding.digest = legacy.catalogs.digest();
+        legacy.binding.semantic_digest = try legacy.catalogs.semanticDigest(alloc);
+        try std.testing.expectError(error.ArtifactCatalogDrift, db.reconcileReplicatedArtifactAdmission(.{ .artifact_catalog = legacy }, .{ .term = 1, .index = 2 }));
+        try Check.ready(&db, command);
+        {
+            var cleanup = try db.core.store.beginWriteTxn();
+            errdefer cleanup.abort();
+            try @import("artifact_reconcile_intent.zig").clear(alloc, &cleanup, legacy, 2);
+            try cleanup.commit();
+        }
+    }
+    var reopened = try DB.open(alloc, tmp.path(), .{ .open_mode = .query_readonly });
+    defer reopened.close();
+    try Check.ready(&reopened, committed.?);
+}
+
+test "db ordered artifact inventory reader epoch upgrade refreshes digest and immutable plans" {
+    const alloc = std.testing.allocator;
+    const inventory = @import("artifact_inventory.zig");
+    var tmp = try TestDirectory.init("reader-upgrade-inventory");
+    defer tmp.cleanup();
+    var db = try DB.open(alloc, tmp.path(), .{ .start_optional_runtimes = false });
+    defer db.close();
+    // Establish a certified old catalog and retain its immutable foreground view.
+    const before = before: {
+        var txn = try db.core.store.beginWriteTxn();
+        errdefer txn.abort();
+        try inventory.refresh(&txn);
+        const binding = try inventory.local(&txn);
+        try txn.commit();
+        break :before binding;
+    };
+    var old = try db.core.index_manager.acquireWritePlanSnapshot();
+    defer old.release();
+    try db.core.index_manager.aggregateAuthoritativeReaderVersion(db.core.store, 4);
+    var read = try db.core.store.beginReadTxn();
+    defer read.abort();
+    const after = try inventory.local(&read);
+    try std.testing.expectEqual(before.epoch + 1, after.epoch);
+    const catalogs = try inventory.catalogs(&read);
+    try std.testing.expectEqualStrings("{\"version\":4,\"resolvers\":[]}", catalogs.resolvers);
+    try std.testing.expect(try db.core.index_manager.matchesArtifactInventory(catalogs));
+    var current = try db.core.index_manager.acquireWritePlanSnapshot();
+    defer current.release();
+    try std.testing.expect(current.plan() != old.plan());
+    try std.testing.expect(current.plan().matchesArtifactInventory(catalogs));
+    try std.testing.expect(!old.plan().matchesArtifactInventory(catalogs));
+    // The old plan remains valid for its pinned generation; a no-op upgrade
+    // neither advances the inventory epoch nor rebuilds the new plan.
+    try std.testing.expect(old.plan().matchesArtifactInventory(old.plan().artifact_catalogs.?));
+    try db.core.index_manager.aggregateAuthoritativeReaderVersion(db.core.store, 4);
+    var again = try db.core.index_manager.acquireWritePlanSnapshot();
+    defer again.release();
+    try std.testing.expect(again.plan() == current.plan());
+    var latest = try db.core.store.beginReadTxn();
+    defer latest.abort();
+    try std.testing.expectEqual(after.epoch, (try inventory.local(&latest)).epoch);
+}
+
+test "db ordered artifact inventory graph TTL definitions retain reader envelope across mutations and reopen" {
+    const alloc = std.testing.allocator;
+    const inventory = @import("artifact_inventory.zig");
+    var tmp = try TestDirectory.init("ttl-inventory-envelope");
+    defer tmp.cleanup();
+    const Check = struct {
+        fn loaded(db: *DB) !void {
+            var read = try db.core.store.beginReadTxn();
+            defer read.abort();
+            _ = try inventory.local(&read);
+            const catalogs = try inventory.catalogs(&read);
+            // Shard transition admission consumes both the exact binding and
+            // its definition identity, not just loaded-index matching.
+            const command: inventory.Command = .{
+                .namespace = @splat(7),
+                .binding = .{ .epoch = 1, .digest = catalogs.digest(), .semantic_digest = try catalogs.semanticDigest(std.testing.allocator) },
+                .catalogs = catalogs,
+            };
+            try command.validate();
+            try std.testing.expectEqual(@as(u32, 4), try resolver_catalog_mod.catalogReaderVersion(std.testing.allocator, catalogs.resolvers));
+            try std.testing.expect(try db.core.index_manager.matchesArtifactInventory(catalogs));
+            var plan = try db.core.index_manager.acquireWritePlanSnapshot();
+            defer plan.release();
+            try std.testing.expect(plan.plan().matchesArtifactInventory(catalogs));
+        }
+    };
+    {
+        var db = try DB.open(alloc, tmp.path(), .{ .start_optional_runtimes = false });
+        defer db.close();
+        try db.addIndex(.{ .name = "g", .kind = .graph, .config_json = "{\"ttl\":{\"duration\":\"1h\"}}" });
+        try Check.loaded(&db);
+        try db.addEnrichment(.{ .name = "relations", .kind = .asset, .field = "body" });
+        try Check.loaded(&db);
+        try std.testing.expect(try db.deleteIndex("g"));
+        // Removing the last TTL index cannot erase a permanent format fence.
+        try Check.loaded(&db);
+    }
+    {
+        var db = try DB.open(alloc, tmp.path(), .{ .start_optional_runtimes = false });
+        defer db.close();
+        try Check.loaded(&db);
+    }
+    var readonly = try DB.open(alloc, tmp.path(), .{ .open_mode = .query_readonly });
+    defer readonly.close();
+    try Check.loaded(&readonly);
 }
 
 test "db ordered artifact inventory obsolete producer work is bounded and preserves pinned readers" {

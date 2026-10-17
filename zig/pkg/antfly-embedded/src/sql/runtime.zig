@@ -162,7 +162,7 @@ pub fn execute(alloc: std.mem.Allocator, backend: catalog.Backend, compiled: *co
     const arena = state.arena.allocator();
     statement_backend.parameter_fallback_types = try parameterFallbackTypesNative(arena, parameters, limits.parameter_cells);
     result.output = runBound(state.budget.allocator(), arena, statement_backend, compiled, parameters, limits, null) catch |err| {
-        if (err == error.OutOfMemory and state.budget.exhausted) return error.SqlWorkingMemoryLimitExceeded;
+        if (err == error.OutOfMemory and state.budget.isExhausted()) return error.SqlWorkingMemoryLimitExceeded;
         return err;
     };
     return result;
@@ -254,7 +254,7 @@ pub const Context = struct {
     statement_capture: ?*@import("mutation_capture.zig") = null,
     returning_rows: []const catalog.Row = &.{},
     returning_cursor: ?*@import("result_cursor.zig").Cursor = null,
-    returning_layout: ?catalog.Row.TypedLayout = null,
+    returning_layout: ?*const catalog.Row.TypedLayout = null,
     /// Typed values borrowed from the active Apply frame, not from input rows.
     /// Their lifetime covers this invocation, including empty global grouping.
     invocation_constants: []const Datum = &.{},
@@ -1430,7 +1430,7 @@ pub const Context = struct {
             defer page.deinit();
             if (page.rows.len > self.limits.page_rows) return error.InvalidSqlBackendResponse;
             if (page.rows.len > self.limits.scan_rows -| visited) return error.SqlProgramLimitExceeded;
-            var retained_layout: ?catalog.Row.TypedLayout = null;
+            var retained_layout: ?*const catalog.Row.TypedLayout = null;
             // Grow once per bounded native page. Arena-backed geometric growth
             // otherwise retains every superseded per-row staging buffer.
             try mutations.ensureUnusedCapacity(self.arena, @min(page.rows.len, self.limits.mutation_rows - mutations.items.len));
@@ -1645,7 +1645,7 @@ pub const Context = struct {
     pub const ReturningImages = struct {
         table: catalog.Table,
         projection: @import("document_row.zig").Projection,
-        layout: ?catalog.Row.TypedLayout,
+        layout: ?*const catalog.Row.TypedLayout,
 
         pub fn init(a: std.mem.Allocator, table: catalog.Table, fields: ?[]const []const u8) !ReturningImages {
             const names = fields orelse blk: {
@@ -3683,6 +3683,16 @@ test "SQL retained cursors close on completion early limit cancellation and writ
     provider.cancel_after_page = true;
     try std.testing.expectError(error.Cancelled, execute(std.testing.allocator, provider.iface(), &count, &.{}, .{ .page_rows = 1 }));
     try std.testing.expectEqual(@as(usize, 5), provider.closes);
+}
+
+test "SQL memory quota reports shared parent admission as a working limit" {
+    var backend: TestBackend = .{ .row_count = 4096 };
+    var compiled = try compiler.compile(std.testing.allocator, "SELECT id FROM things", .{});
+    defer compiled.deinit();
+    var parent: MemoryBudget = .{ .backing = std.testing.allocator, .limit = 64 * 1024 };
+    try std.testing.expectError(error.SqlWorkingMemoryLimitExceeded, execute(parent.allocator(), backend.iface(), &compiled, &.{}, .{ .retained_bytes = 4 * 1024 * 1024 }));
+    try std.testing.expect(parent.isExhausted());
+    try std.testing.expectEqual(@as(usize, 0), parent.live);
 }
 
 test "SQL memory quota rejects allocations before backend work" {

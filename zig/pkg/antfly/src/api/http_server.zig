@@ -16483,6 +16483,15 @@ pub const ApiHttpServer = struct {
         }
         const config = self.cfg.node_config;
         const Hooks = struct {
+            fn read(raw: *anyopaque, a: std.mem.Allocator, table_id: u64) !?metadata_table_manager.TableRecord {
+                const server: *ApiHttpServer = @ptrCast(@alignCast(raw));
+                var snapshot = (try server.source.linearizableSnapshot(.{ .cancellation = .{ .ptr = server, .is_cancelled_fn = canceled } })) orelse return error.MetadataSourceUnavailable;
+                defer server.source.freeAdminSnapshot(&snapshot);
+                for (snapshot.tables) |current| if (current.table_id == table_id)
+                    return try metadata_table_manager.cloneTable(a, current);
+                return null;
+            }
+
             fn replace(raw: *anyopaque, before: metadata_table_manager.TableRecord, after: metadata_table_manager.TableRecord) !void {
                 const server: *ApiHttpServer = @ptrCast(@alignCast(raw));
                 _ = try server.source.replaceTableDefinitionStamped(before, after);
@@ -16541,7 +16550,7 @@ pub const ApiHttpServer = struct {
                 context = reader_lease.?.readContext();
             }
         }
-        try @import("lake_index_coordinator.zig").reconcile(a, self.embedding_provider_runtime.io, table, &source, &store, .{ .ptr = self, .replace = Hooks.replace }, context, cancel, .{ .ptr = self, .now_ms = Hooks.now }, .{ .lease_ms = lease_ms, .embedding_options = .{ .antfly_provider = self.antfly_provider, .io = self.embedding_provider_runtime.io, .bounded_http_request = true, .deadline_ns = context.deadline_ns, .cancellation = cancel, .secret_store = self.cfg.secret_store, .remote_content = self.cfg.remote_content, .inference_api_url = self.configuredInferenceAPIURL(), .inference_api_key = self.cfg.inference_api_key, .provider_runtime = &self.embedding_provider_runtime, .source_table = table.name } });
+        try @import("lake_index_coordinator.zig").reconcile(a, self.embedding_provider_runtime.io, table, &source, &store, .{ .ptr = self, .replace = Hooks.replace, .read = Hooks.read }, context, cancel, .{ .ptr = self, .now_ms = Hooks.now }, .{ .lease_ms = lease_ms, .embedding_options = .{ .antfly_provider = self.antfly_provider, .io = self.embedding_provider_runtime.io, .bounded_http_request = true, .deadline_ns = context.deadline_ns, .cancellation = cancel, .secret_store = self.cfg.secret_store, .remote_content = self.cfg.remote_content, .inference_api_url = self.configuredInferenceAPIURL(), .inference_api_key = self.cfg.inference_api_key, .provider_runtime = &self.embedding_provider_runtime, .source_table = table.name } });
         @import("lake_index_navigation_warming.zig").warmPublication(a, self, table) catch |err| {
             std.log.debug("native lake startup navigation warming deferred table={s} err={s}", .{ table.name, @errorName(err) });
         };

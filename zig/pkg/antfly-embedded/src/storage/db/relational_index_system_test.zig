@@ -3143,7 +3143,7 @@ test "relational index system query lease typed point hydration retains nulls nu
                     try std.testing.expect(!row.?.typed_cells.?.values[0].sql_null);
                 }
             } else {
-                var source_layout: ?@import("../../sql/catalog.zig").Row.TypedLayout = null;
+                var source_layout: ?*const @import("../../sql/catalog.zig").Row.TypedLayout = null;
                 for (ids) |id| {
                     const row = (try points.lookupSqlRowWithLayout(out, id, &source_layout)).?;
                     const values = try out.dupe(@import("../../sql/catalog.zig").Row.Cell, row.typed_cells.?.values);

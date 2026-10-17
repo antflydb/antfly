@@ -1112,6 +1112,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .filters = &.{
             "antfly client pkg compiles",
             "personal connections",
+            "query builder transport",
             "get index response timeout bounds the complete HTTP request",
             "list indexes response timeout bounds readiness preflight",
             "SQL client preserves typed parameters receipts and forbids replay",
@@ -2076,15 +2077,16 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     test_imports.configure(b, secret_backend_test_mod, true, true);
     secret_backend_test_mod.addImport("antfly_openapi_specs", antfly_imports.embedded_openapi);
     const secret_backend_tests = b.addTest(.{
+        .name = "secret-backends-tests",
         .root_module = secret_backend_test_mod,
         // ReleaseSafe peaks above the aggregate estimates on both platforms:
         // 12.88 GB measured on x86_64-linux in the VOPR qualification lane,
-        // above 10 GiB on macOS. Debug keeps the conservative default so the
-        // unit lanes retain their tighter scheduler claim.
-        .max_rss = @as(usize, switch (target.result.os.tag) {
+        // above 10 GiB on macOS. Native Darwin Debug has its own measured
+        // floor; other compilation profiles retain these authored claims.
+        .max_rss = @import("runtime_memory.zig").testCompileMaxRss("secret-backends-tests", b.graph.host.result, target.result, optimize, @as(usize, switch (target.result.os.tag) {
             .macos => 13,
             else => if (optimize == .debug) 7 else 14,
-        }) * 1024 * 1024 * 1024,
+        }) * 1024 * 1024 * 1024),
         .filters = &.{"secret backend"},
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
@@ -2240,9 +2242,9 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
 
     const raft_unit_default_filters = [_][]const u8{ "raft.", "trace files preserve overlapping producers" };
     const raft_unit_tests = b.addTest(.{
+        .name = "raft-unit-tests",
         .root_module = antfly_test_mod,
-        // The broad server Raft fixture closure peaks at 11.06 GB on macOS.
-        .max_rss = if (target.result.os.tag == .macos) 12 * 1024 * 1024 * 1024 else 0,
+        .max_rss = @import("runtime_memory.zig").testCompileMaxRss("raft-unit-tests", b.graph.host.result, target.result, optimize, if (target.result.os.tag == .macos) 12 * 1024 * 1024 * 1024 else 0),
         .filters = selectTestFilters(b, &raft_unit_default_filters),
     });
     const run_raft_unit_tests = addFilteredTestRunArtifact(b, raft_unit_tests);
@@ -2693,7 +2695,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     lake_integration_mod.addImport("antfly_openapi_specs", antfly_imports.embedded_openapi);
     const lake_integration_tests = b.addTest(.{
         .root_module = lake_integration_mod,
-        .filters = &.{ "lake SQL", "external lake" },
+        .filters = selectTestFilters(b, &.{ "lake SQL", "external lake" }),
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
     b.step("lake-integration-test", "Run public lake binding and SQL cursor integration tests").dependOn(&addFilteredTestRunArtifact(b, lake_integration_tests).step);
@@ -2967,6 +2969,15 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         },
     });
     const lib_storage_test_step = b.step("antfly-storage-test", "Run local and server storage tests");
+    const graph_ttl_migration_tests = b.addTest(.{
+        .name = "graph-ttl-migration-tests",
+        .root_module = antfly_test_mod,
+        .filters = selectTestFilters(b, &.{ "graph ttl migration", "db graph ttl shared GC" }),
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("graph-ttl-migration-test", "Run bounded graph expiry namespace migration and reader fences")
+        .dependOn(&addFilteredTestRunArtifact(b, graph_ttl_migration_tests).step);
+
     const coordinated_read_set_tests = b.addTest(.{
         .root_module = antfly_test_mod,
         .filters = &.{"relational index system coordinated read set"},
