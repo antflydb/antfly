@@ -25,8 +25,11 @@ const Datum = scalar.Datum;
 const Json = std.json.Value;
 
 fn addRow(context: anytype, bound: *const binding.Bound, grouped: anytype, alloc: std.mem.Allocator, row: catalog.Row) !void {
+    return addWeightedRow(context, bound, grouped, alloc, row, 1);
+}
+fn addWeightedRow(context: anytype, bound: *const binding.Bound, grouped: anytype, alloc: std.mem.Allocator, row: catalog.Row, weight: u64) !void {
     const cells = try bound.input.cells(alloc, row);
-    return addCells(context, bound, grouped, alloc, cells, row.multiplicity);
+    return addCells(context, bound, grouped, alloc, cells, weight);
 }
 
 fn addCells(context: anytype, bound: *const binding.Bound, grouped: anytype, alloc: std.mem.Allocator, cells: []const Datum, weight: u64) !void {
@@ -426,6 +429,7 @@ pub fn execute(context: anytype, statement: ast.Select) !@import("runtime.zig").
             const page = try scan.page(context, arena.allocator(), table, .{ .fields = fields[0..field_count], .primary_key = predicates.primary_key, .conditions = predicates.terms.items, .after = after, .limit = context.limits.page_rows });
             defer page.deinit();
             if (page.rows.len > context.limits.page_rows) return error.InvalidSqlBackendResponse;
+            if (page.multiplicities) |weights| if (!weighted or weights.len != page.rows.len) return error.InvalidSqlBackendResponse;
             if (visited + page.rows.len > context.limits.scan_rows) return error.SqlProgramLimitExceeded;
             if (external) {
                 visited += page.rows.len;
@@ -438,11 +442,11 @@ pub fn execute(context: anytype, statement: ast.Select) !@import("runtime.zig").
                     try addRows(context, bound, &collector, scratch, cells);
                     first += cells.len;
                 }
-            } else for (page.rows) |row| {
+            } else for (page.rows, 0..) |row, row_index| {
                 try context.checkpoint();
                 visited += 1;
                 if (visited > context.limits.scan_rows) return error.SqlProgramLimitExceeded;
-                try addRow(context, bound, &collector, arena.allocator(), row);
+                try addWeightedRow(context, bound, &collector, arena.allocator(), row, if (page.multiplicities) |weights| weights[row_index] else 1);
             }
             const next = page.after orelse break;
             if (!scan.retained(context)) return error.SqlStatementSnapshotRequired;

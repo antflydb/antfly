@@ -2198,6 +2198,8 @@ fn Engine(comptime Context: type) type {
                 var page = try cursor.next(cursor.ptr, a, limit);
                 defer page.deinit();
                 if (page.rows.len > limit or page.rows.len > self.engine.context.limits.scan_rows -| self.engine.visited) return error.InvalidSqlBackendResponse;
+                const weights = page.multiplicities orelse return error.InvalidSqlBackendResponse;
+                if (weights.len != page.rows.len) return error.InvalidSqlBackendResponse;
                 self.engine.visited += page.rows.len;
                 const names = try a.alloc([]const u8, self.iterator.node.columns.len);
                 for (self.iterator.node.columns, names) |column, *name| name.* = column.internal;
@@ -2211,9 +2213,8 @@ fn Engine(comptime Context: type) type {
                     }
                     self.ordinal += 1;
                     out.* = try catalog.Row.fromDatums(a, try std.fmt.allocPrint(a, "{d}", .{self.ordinal}), layout, values);
-                    out.multiplicity = row.multiplicity;
                 }
-                return .{ .rows = rows, .after = if (page.after) |after| try a.dupe(u8, after) else null };
+                return .{ .rows = rows, .multiplicities = try a.dupe(u64, weights), .after = if (page.after) |after| try a.dupe(u8, after) else null };
             }
             fn countRows(ptr: *anyopaque) !?u64 {
                 const self: *Adapter = @ptrCast(@alignCast(ptr));

@@ -464,6 +464,11 @@ const OwnedRead = struct {
         self.native_adapter.shared_receipt_wait_budget = null;
         self.authority.request.read_receipt_budget = null;
         self.stream = opened.?;
+        // Future lazy graph opens borrow the stream-owned canonical frame,
+        // rather than the request's transient native cell slice.
+        if (self.stream.parameter_invocation) |invocation| if (invocation.frame) |frame| {
+            self.native_adapter.graph_parameter_cells = frame.values;
+        };
         errdefer self.stream.close();
         if (self.session_id) |id_hex| if (self.range_guards.tables.len != 0) {
             const id = try @import("distributed_txn.zig").parseTxnIdHex(id_hex);

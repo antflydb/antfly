@@ -225,8 +225,6 @@ pub const Scan = struct {
     limit: u32,
 };
 pub const Row = struct {
-    /// Internal bag weight, enabled only by an aggregate consumer.
-    multiplicity: u64 = 1,
     id: []const u8,
     version: u64,
     value: std.json.Value,
@@ -389,6 +387,9 @@ pub const Row = struct {
 };
 pub const Page = struct {
     rows: []const Row,
+    /// Optional bag weights, negotiated by aggregate consumers before pulling.
+    /// Ordinary SQL rows carry no per-row storage overhead.
+    multiplicities: ?[]const u64 = null,
     owned_arena: ?std.heap.ArenaAllocator = null,
     storage_page: ?@import("../storage/relational_read_view.zig").View.Page = null,
     /// Exclusive native continuation; null proves exhaustion. Implementations

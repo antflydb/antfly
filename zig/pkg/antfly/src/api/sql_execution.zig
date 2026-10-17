@@ -1663,6 +1663,16 @@ pub const Adapter = struct {
             try self.validate(a);
             return page;
         }
+        fn enableWeights(ptr: *anyopaque) !bool {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            const enable = self.child.enable_weights orelse return false;
+            var arena = std.heap.ArenaAllocator.init(self.a);
+            defer arena.deinit();
+            try self.validate(arena.allocator());
+            const enabled = try enable(self.child.ptr);
+            try self.validate(arena.allocator());
+            return enabled;
+        }
         fn countRows(ptr: *anyopaque) !?u64 {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             const count_rows = self.child.count_rows orelse return null;
@@ -1838,7 +1848,7 @@ pub const Adapter = struct {
             errdefer child.close(child.ptr);
             const wrapper = try a.create(GraphStatementCursor);
             wrapper.* = .{ .a = a, .adapter = self, .table = request.table, .child = child, .owner = owner };
-            out.* = .{ .ptr = wrapper, .next = GraphStatementCursor.next, .close = GraphStatementCursor.close, .count_rows = if (child.count_rows != null) GraphStatementCursor.countRows else null };
+            out.* = .{ .ptr = wrapper, .next = GraphStatementCursor.next, .close = GraphStatementCursor.close, .count_rows = if (child.count_rows != null) GraphStatementCursor.countRows else null, .enable_weights = if (child.enable_weights != null) GraphStatementCursor.enableWeights else null };
             owner.opened += 1;
         }
         // All allocations through the local arena must finish before its
@@ -4098,7 +4108,7 @@ test "lake SQL GRAPH_TABLE shared graph joins release every provider allocation"
     try std.testing.expectEqual(fake.captures, fake.releases);
 }
 
-test "graph arguments borrow native SQL scalars without materializing unrelated parameters" {
+test "SQL pgwire native graph arguments borrow scalars without materializing unrelated parameters" {
     const scalar = @import("antfly_local_sources").sql_scalar;
     const numeric = @import("antfly_local_sources").sql_numeric_value;
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);

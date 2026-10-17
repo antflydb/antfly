@@ -371,6 +371,7 @@ pub const Cursor = struct {
         // row_goal is advisory: reduce page size, never truncate the source.
         const page_limit: u32 = @intCast(@max(1, @min(limit, self.request.row_goal orelse limit)));
         var output: std.ArrayList(catalog.Row) = .empty;
+        var weights: std.ArrayList(u64) = .empty;
         const names = try owned.alloc([]const u8, self.request.fields.len);
         for (self.request.fields, names) |name, *out| out.* = try owned.dupe(u8, name);
         const layout = try catalog.Row.TypedLayout.init(owned, names);
@@ -434,15 +435,12 @@ pub const Cursor = struct {
                 if (!accepted) continue;
                 const cells = try owned.alloc(scalar.Datum, self.request.fields.len);
                 for (self.request.fields, cells) |field, *out| out.* = try @import("operators.zig").cloneDatum(owned, try row.cell(field));
-                var typed = try catalog.Row.fromDatums(owned, try owned.dupe(u8, row_id), layout, cells);
-                if (self.stream) |stream| if (stream.weighted) {
-                    typed.multiplicity = stream.last_weights.items[row_index];
-                };
-                try output.append(owned, typed);
+                try output.append(owned, try catalog.Row.fromDatums(owned, try owned.dupe(u8, row_id), layout, cells));
+                if (self.stream) |stream| if (stream.weighted) try weights.append(owned, stream.last_weights.items[row_index]);
             }
         }
         const more = if (self.empty) false else if (self.stream) |stream| !stream.done else self.position < self.result.?.rows.len;
-        return .{ .rows = try output.toOwnedSlice(owned), .owned_arena = arena, .after = if (more) try std.fmt.allocPrint(owned, "{s}{d}", .{ if (self.optimized) "g:" else "", self.position }) else null };
+        return .{ .rows = try output.toOwnedSlice(owned), .multiplicities = if (self.stream != null and self.stream.?.weighted) try weights.toOwnedSlice(owned) else null, .owned_arena = arena, .after = if (more) try std.fmt.allocPrint(owned, "{s}{d}", .{ if (self.optimized) "g:" else "", self.position }) else null };
     }
 
     fn close(ptr: *anyopaque) void {
