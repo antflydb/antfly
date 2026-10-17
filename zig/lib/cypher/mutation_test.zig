@@ -1309,3 +1309,85 @@ test "pair indexes track postimage updates deletion parallel bags incoming edges
         try std.testing.expectEqual(@as(i64, 1), result.rows[0][2].integer);
     }
 }
+
+test "write read phases pull bounded native pair pages without capturing parallel bags" {
+    const Host = struct {
+        fn commit(_: *anyopaque, _: A, _: []const b.Mutation) !void {}
+        fn between(ptr: *anyopaque, a: A, _: root.catalog.Relationship, _: v.Identity, _: v.Identity, _: root.ast.Direction, _: []const b.PropertyFilter, after: ?[]const u8, limit: usize, max_examined: usize) !b.Page(*const v.Relationship) {
+            const all = Fixture.self(ptr).relationships;
+            const offset = if (after) |encoded| try std.fmt.parseUnsigned(usize, encoded, 10) else 0;
+            const end = offset + @min(limit, all.len - offset);
+            if (end - offset > max_examined) return error.CypherEdgeBudgetExceeded;
+            return .{ .items = try a.dupe(*const v.Relationship, all[offset..end]), .examined = end - offset, .next = if (end < all.len) try std.fmt.allocPrint(a, "{d}", .{end}) else null };
+        }
+    };
+    var fixture = Fixture.init();
+    defer fixture.arena.deinit();
+    const a = fixture.arena.allocator();
+    const first: v.Node = .{ .identity = .{ .table = "people", .key = "a" }, .labels = &.{"Person"}, .properties = &.{.{ .name = "age", .value = .{ .integer = 1 } }} };
+    const second: v.Node = .{ .identity = .{ .table = "people", .key = "b" }, .labels = &.{"Person"}, .properties = &.{.{ .name = "age", .value = .{ .integer = 2 } }} };
+    fixture.nodes = &.{ &first, &second };
+    const edges = try a.alloc(*const v.Relationship, 1000);
+    for (edges, 0..) |*edge, index| {
+        const value = try a.create(v.Relationship);
+        value.* = .{ .identity = .{ .table = "people", .key = try std.fmt.allocPrint(a, "e{d}", .{index}) }, .index = "links", .type = "KNOWS", .source = first.identity, .target = second.identity };
+        edge.* = value;
+    }
+    fixture.relationships = edges;
+    var callbacks = fixture.backend().vtable.*;
+    callbacks.expand_between = Host.between;
+    var overlay: root.transaction.Overlay = .{ .base = .{ .ptr = &fixture, .vtable = &callbacks }, .host = .{ .ptr = &fixture, .new_identity = Fixture.identity, .commit = Host.commit }, .lazy = true };
+    var diagnostic: root.compiler.Diagnostic = .{};
+    var compiled = try root.compiler.compile(std.testing.allocator, "MATCH (a:Person {age:1}),(b:Person {age:2}) CREATE (:Person) WITH a,b MATCH (a)-[:KNOWS]->(b) RETURN a.age LIMIT 1", .{}, &diagnostic);
+    defer compiled.deinit();
+    var result = try root.runtime.execute(std.testing.allocator, overlay.backend(), graph, &compiled, &.{}, .{ .explored_edges = 1, .intermediate_states = 500 });
+    defer result.deinit();
+    try std.testing.expectEqual(@as(i64, 1), result.rows[0][0].integer);
+    try std.testing.expectEqual(@as(usize, 1), result.stats.explored_edges);
+    try std.testing.expectEqual(@as(usize, 1), overlay.relationships.items.len);
+}
+
+test "native pair pages merge clean document replacements across producer retirement and restoration" {
+    const Host = struct {
+        fn commit(_: *anyopaque, _: A, _: []const b.Mutation) !void {}
+        fn between(ptr: *anyopaque, a: A, mapping: root.catalog.Relationship, identity: v.Identity, _: v.Identity, direction: root.ast.Direction, _: []const b.PropertyFilter, after: ?[]const u8, limit: usize, _: usize) !b.Page(*const v.Relationship) {
+            return Fixture.expand(ptr, a, mapping, identity, direction, after, limit);
+        }
+        fn project(_: *anyopaque, a: A, node: *const v.Node) ![]const *const v.Relationship {
+            if ((v.Value{ .node = node }).property("age").integer == 0) return &.{};
+            const edge = try a.create(v.Relationship);
+            edge.* = .{ .identity = .{ .table = "people", .key = "field" }, .index = "links", .type = "KNOWS", .source = node.identity, .target = .{ .table = "people", .key = "b" }, .ownership = .field, .producer = node.identity };
+            return a.dupe(*const v.Relationship, &.{edge});
+        }
+    };
+    var fixture = Fixture.init();
+    defer fixture.arena.deinit();
+    const a = fixture.arena.allocator();
+    var producer: v.Node = .{ .identity = .{ .table = "people", .key = "a" }, .properties = &.{.{ .name = "age", .value = .{ .integer = 1 } }} };
+    const target: v.Node = .{ .identity = .{ .table = "people", .key = "b" } };
+    fixture.nodes = &.{ &producer, &target };
+    fixture.relationships = try Host.project(&fixture, a, &producer);
+    var callbacks = fixture.backend().vtable.*;
+    callbacks.expand_between = Host.between;
+    callbacks.document_relationships = Host.project;
+    var overlay: root.transaction.Overlay = .{ .base = .{ .ptr = &fixture, .vtable = &callbacks }, .host = .{ .ptr = &fixture, .new_identity = Fixture.identity, .commit = Host.commit }, .lazy = true };
+    const backend = overlay.backend();
+    try backend.vtable.bind(backend.ptr, a, graph);
+    try backend.vtable.begin.?(backend.ptr);
+    defer backend.vtable.rollback.?(backend.ptr);
+    producer.properties = &.{.{ .name = "age", .value = .{ .integer = 0 } }};
+    try overlay.stageReadDocument(a, producer.identity, &producer);
+    for ([_]i64{ 1, 0, 1 }) |age| {
+        producer.properties = try a.dupe(v.Entry, &.{.{ .name = "age", .value = .{ .integer = age } }});
+        try overlay.stageReadDocument(a, producer.identity, &producer);
+        var after: ?[]const u8 = null;
+        var count: usize = 0;
+        while (true) {
+            const page = try backend.vtable.expand_between.?(backend.ptr, a, graph.relationships[0], producer.identity, target.identity, .out, &.{}, after, 1, 10);
+            count += page.items.len;
+            after = page.next;
+            if (after == null) break;
+        }
+        try std.testing.expectEqual(@as(usize, if (age == 0) 0 else 1), count);
+    }
+}

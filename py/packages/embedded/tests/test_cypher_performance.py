@@ -1101,6 +1101,17 @@ def test_all_paths_count_uses_dag_states_for_native_and_sql(graph_db):
     )
     assert [int(cell) for cell in aggregate["rows"][0]] == [total, 6, 17, sum(range(6, size))]
     assert time.monotonic() - start < 5
+    # Pure scalar programs preserve multiplicities, including lazy branches,
+    # Boolean conditions and builtin calls that cannot use parallel execution.
+    start = time.monotonic()
+    calculated = db.sql(
+        f"SELECT sum(CASE WHEN q.score>0 THEN q.score ELSE 1/(q.score-q.score) END),"
+        f"min(abs(q.score)),max(coalesce(q.score,0)),sum(DISTINCT abs(q.score)) "
+        f"FROM GRAPH_TABLE(g MATCH {sql_pattern} COLUMNS(b.score AS score)) q "
+        f"WHERE q.score IN (6,7,8,9,10,11,12,13,14,15,16,17) AND (q.score>0 OR q.score IS NULL)"
+    )
+    assert [int(cell) for cell in calculated["rows"][0]] == [total, 6, 17, sum(range(6, size))]
+    assert time.monotonic() - start < 5
 
 
 def test_all_path_product_states_preserve_endpoint_constraints_and_bags(graph_db):
@@ -1283,3 +1294,117 @@ def test_bound_endpoint_read_and_count_seek_native_hub_pairs(graph_db):
             )
             assert result["rows"] == expected
             assert result["stats"]["explored_edges"] <= 2
+
+
+def test_disjoint_direction_domains_reduce_trails_without_reusing_relationships(graph_db):
+    from math import comb
+
+    db = graph_db
+    db.graph_catalog_json(
+        {
+            "action": "put",
+            "name": "disjoint",
+            "definition": {
+                "labels": [{"name": "D", "table": "docs"}],
+                "relationships": [
+                    {
+                        "name": kind,
+                        "index": "links",
+                        "source_label": "D",
+                        "target_label": "D",
+                        "stored_type": kind.lower(),
+                    }
+                    for kind in ("R", "S")
+                ],
+            },
+        }
+    )
+    size = 16
+    patterns = [f"(n{i}:D {{id:'n{i}',score:{i}}})" for i in range(size)]
+    patterns += [f"(n{i})-[:{kind}]->(n{j})" for kind in ("R", "S") for i in range(size) for j in range(i + 1, size)]
+    db.cypher_json("disjoint", {"query": "CREATE " + ",".join(patterns)})
+    expected = sum(comb(peak, 3) ** 2 for peak in range(3, size))
+    for mode in ("", "REPEATABLE ELEMENTS "):
+        result = db.cypher_json(
+            "disjoint",
+            {
+                "query": f"MATCH {mode}(a:D)-[:R*3..3]->()<-[:S*3..3]-(b:D) RETURN count(*)",
+                "limits": {"intermediate_states": 30000, "explored_edges": 2500, "memory_bytes": 4 << 20},
+            },
+        )
+        assert result["rows"] == [[{"type": "integer", "value": str(expected)}]]
+    # A mutation is a clause barrier, not a reason to enumerate the following
+    # read phase's route bag. All preceding effects must still be committed.
+    written = db.cypher_json(
+        "disjoint",
+        {
+            "query": "CREATE (:D {id:'marker'}) WITH 1 AS ignored MATCH (a:D)-[:R*6..6]->(b:D) RETURN count(*)",
+            "limits": {"intermediate_states": 30000, "explored_edges": 3000, "memory_bytes": 4 << 20},
+        },
+    )
+    assert written["rows"] == [[{"type": "integer", "value": str(comb(size, 7))}]]
+    assert db.sql("SELECT count(*) FROM docs WHERE id='marker'")["rows"] == [["1"]]
+
+
+def test_write_read_phases_pull_parallel_pair_pages_and_preserve_postimages(graph_db):
+    db = graph_db
+    first, second = [
+        cell["value"]
+        for cell in db.cypher_json(
+            "g",
+            {
+                "query": "CREATE (a:D {id:'a',score:1}),(b:D {id:'b',score:2}) "
+                "RETURN antfly.documentKey(a),antfly.documentKey(b)"
+            },
+        )["rows"][0]
+    ]
+    prefix = "MATCH (a:D),(b:D) WHERE antfly.documentKey(a)=$first AND antfly.documentKey(b)=$second "
+    params = {"first": first, "second": second}
+    db.cypher_json(
+        "g",
+        {
+            "query": prefix + "UNWIND range(0,999) AS slot CREATE (a)-[:R {slot:slot}]->(b)",
+            "parameters": params,
+        },
+    )
+    result = db.cypher_json(
+        "g",
+        {
+            "query": prefix + "CREATE (:D {id:'marker'}) WITH a,b MATCH (a)-[:R]->(b) RETURN a.id LIMIT 1",
+            "parameters": params,
+            "limits": {"explored_edges": 10, "intermediate_states": 5000, "memory_bytes": 1 << 20},
+        },
+    )
+    assert result["rows"] == [[{"type": "string", "value": "a"}]]
+    assert result["stats"]["explored_edges"] == 1
+    # Read-only phases must refresh aliases after SET, carry all rows into
+    # subsequent writes and avoid observing cached preimages across barriers.
+    updated = db.cypher_json(
+        "g",
+        {
+            "query": prefix + "SET a.score=9 WITH a,b MATCH (a)-[r:R]->(b) WITH a,b,r LIMIT 2 "
+            "SET r.slot=2000 WITH DISTINCT a,b MATCH (a)-[r:R {slot:2000}]->(b) RETURN a.score,count(r)",
+            "parameters": params,
+        },
+    )
+    assert updated["rows"] == [[{"type": "integer", "value": "9"}, {"type": "integer", "value": "2"}]]
+    refreshed = db.cypher_json(
+        "g",
+        {
+            "query": prefix + "SET a.score=10 WITH a,b MATCH (c:D {score:a.score}) WITH a,b,c LIMIT 1 "
+            "SET c.score=11 WITH c MATCH (d:D {score:c.score}) RETURN d.id,d.score",
+            "parameters": params,
+        },
+    )
+    assert refreshed["rows"] == [[{"type": "string", "value": "a"}, {"type": "integer", "value": "11"}]]
+    reused = db.cypher_json(
+        "g",
+        {
+            "query": prefix + "MATCH (a)-[r:R]->(b) WITH a,b,count(r) AS before "
+            "CREATE (a)-[:R {slot:2000}]->(b) WITH a,b,before "
+            "MATCH (a)-[r:R {slot:2000}]->(b) RETURN before,count(r)",
+            "parameters": params,
+            "limits": {"explored_edges": 1100},
+        },
+    )
+    assert reused["rows"] == [[{"type": "integer", "value": "1000"}, {"type": "integer", "value": "3"}]]

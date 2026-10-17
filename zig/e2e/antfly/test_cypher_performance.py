@@ -407,6 +407,27 @@ def test_authenticated_cypher_property_plans_and_sql_overlays(monkeypatch):
         )
         assert weighted_sql["rows"] == [["497250", "6", "17", "138"]], weighted_sql
         assert time.monotonic() - start < 10
+        start = time.monotonic()
+        computed_sql = call(
+            "/sql",
+            {
+                "statement": f"SELECT sum(CASE WHEN q.score>0 THEN q.score ELSE 1/(q.score-q.score) END),"
+                f"min(abs(q.score)),max(coalesce(q.score,0)),sum(DISTINCT abs(q.score)) "
+                f"FROM GRAPH_TABLE({hops} MATCH {path} COLUMNS(b.score AS score)) q "
+                f"WHERE q.score>0 AND (q.score<18 OR q.score IS NULL)"
+            },
+        )
+        assert computed_sql["rows"] == [["497250", "6", "17", "138"]], computed_sql
+        assert time.monotonic() - start < 10
+        phase = call(
+            f"/graphs/{hops}/query",
+            {
+                "query": "CREATE (:H {id:'read_phase_marker'}) WITH 1 AS ignored "
+                "MATCH (a:H)-[:R*6..6]->(b:H) RETURN count(*)",
+                "limits": {"intermediate_states": 100000, "explored_edges": 5000},
+            },
+        )
+        assert phase["rows"] == [[{"type": "integer", "value": "31824"}]], phase
         comma = call(
             "/sql",
             {

@@ -284,6 +284,101 @@ pub const Program = struct {
     constant_pool: ?*ConstantPool = null,
     constant_inputs: std.AutoHashMapUnmanaged(u32, Datum) = .empty,
 
+    /// Re-evaluating this program for the same input row has the same value
+    /// and no observable effects within one statement. CASE/Boolean laziness
+    /// stays in the ordinary evaluator; compression only changes multiplicity.
+    /// Decision calls and consumable pattern cursors require ordinary rows.
+    /// current_setting reads the invocation's pinned immutable settings view.
+    pub fn repeatable(self: Program) bool {
+        for (self.instructions) |instruction| switch (instruction.operation) {
+            .literal, .column, .parameter, .unary, .binary, .cast, .case_when, .in_list => {},
+            .call => |call| switch (call.function) {
+                .ai_decide, .ai_choice, .ai_score, .ai_probability, .@"$pattern_quantified" => return false,
+                .abs,
+                .lower,
+                .upper,
+                .length,
+                .octet_length,
+                .concat,
+                .coalesce,
+                .nullif,
+                .greatest,
+                .least,
+                .ceil,
+                .floor,
+                .round,
+                .sqrt,
+                .power,
+                .mod,
+                .substring,
+                .trim,
+                .ltrim,
+                .rtrim,
+                .replace,
+                .starts_with,
+                .date_part,
+                .date_trunc,
+                .to_timestamp,
+                .current_setting,
+                .@"$single",
+                .trunc,
+                .sign,
+                .to_jsonb,
+                .jsonb_build_object,
+                .jsonb_extract_path_text,
+                .concat_ws,
+                .bit_length,
+                .strpos,
+                .jsonb_typeof,
+                .lpad,
+                .rpad,
+                .repeat,
+                .reverse,
+                .left,
+                .right,
+                .split_part,
+                .translate,
+                .overlay,
+                .ascii,
+                .chr,
+                .@"$array",
+                .@"$array_quantified",
+                .cardinality,
+                .array_ndims,
+                .array_length,
+                .array_lower,
+                .array_upper,
+                .@"$array_pattern_quantified",
+                .@"$contains",
+                .@"$overlaps",
+                .array_to_string,
+                .jsonb_exists,
+                .string_to_array,
+                .@"$like_escape",
+                .jsonb_set,
+                .array_position,
+                .array_positions,
+                .array_remove,
+                .array_replace,
+                .array_append,
+                .array_prepend,
+                .array_cat,
+                .jsonb_exists_any,
+                .jsonb_exists_all,
+                .regexp_like,
+                .regexp_count,
+                .regexp_instr,
+                .regexp_substr,
+                .regexp_replace,
+                .jsonb_array_length,
+                .initcap,
+                .jsonb_extract_path,
+                => {},
+            },
+        };
+        return true;
+    }
+
     fn literalInstruction(self: *const Program, index: u32, earlier: []const bool) bool {
         return switch (self.instructions[index].operation) {
             .literal => true,
@@ -5640,4 +5735,19 @@ test "SQL strpos rejects invalid UTF8 and bounds adversarial substring work" {
     try std.testing.expectError(error.SqlTypeMismatch, program.evaluate(alloc, &.{}, &.{ .{ .string = &invalid }, .{ .string = "x" } }, .{}));
     try std.testing.expectError(error.SqlTypeMismatch, program.evaluate(alloc, &.{}, &.{ .{ .string = "x" }, .{ .string = &invalid } }, .{}));
     try std.testing.expectError(error.SqlProgramLimitExceeded, program.evaluate(alloc, &.{}, &.{ .{ .string = "aaaaaaaaaaaaab" }, .{ .string = "aaaaab" } }, .{ .pattern_steps = 24 }));
+}
+
+test "SQL scalar repeatability includes lazy pure programs and excludes external calls" {
+    for ([_][]const u8{
+        "CASE WHEN score>0 AND score IN (1,2,3) THEN abs(score) ELSE 1/(score-score) END",
+        "coalesce(nullif(score,0),7)",
+        "length(lower(concat('x',CAST(score AS TEXT))))",
+        "ai_score('refund','Severity','[\"low\",\"high\"]','local')",
+    }, [_]bool{ true, true, true, false }) |text, expected| {
+        var compiled = try @import("compiler.zig").compileScalar(std.testing.allocator, text, .{});
+        defer compiled.deinit();
+        var program = try bind(std.testing.allocator, compiled.expression, &.{.{ .name = "score", .type = .integer }}, &.{}, .{});
+        defer program.deinit();
+        try std.testing.expectEqual(expected, program.repeatable());
+    }
 }

@@ -1297,6 +1297,16 @@ charging physical reads again. Their route
 enumeration remains combinatorial when uniqueness requires it; neither vertex
 compression nor early deduplication may discard valid qualifying trails.
 
+Read-only MATCH/projection pipelines inside write statements use the same
+streaming operators. Every write remains a materialization barrier; read caches
+are scoped to one pipeline and cannot survive a write. Entity expressions still
+refresh through the statement postimage and policy projection. Native bound-pair
+overlays pull opaque base pages on demand, merge staged pair postings (including
+document-derived replacements) in a separate phase, and reuse complete captures
+for later reads. Partial captures do
+not drain parallel relationship bags merely to satisfy LIMIT. Hosts without
+native pair seeks retain the once-per-adjacency fallback index.
+
 Eligible ALL-path endpoint reductions discover authorized adjacency from sparse
 (pattern edge, hop, identity) states. Rejected intermediate node predicates leave
 the branches behind those nodes unopened. Finite bounds and a DAG proof permit prefix
@@ -1306,7 +1316,10 @@ topological pass; cyclic segments retain exact traversal. Repeatable walks admit
 product states directly. Pattern labels, directions, relationship types,
 constant properties and parallel-edge multiplicities remain exact. Edge patterns
 sharing a mapping/direction domain reuse one capture; mixed types and directions
-use separate cached domains and a union proof for route uniqueness. Rebound
+use separate cached domains. Trail reductions partition domains by overlapping
+physical mapping sets and prove each component acyclic: disjoint relationship
+types can revisit a node across segments without reusing a relationship.
+Node-simple reductions retain the whole-graph acyclicity proof. Rebound
 route aliases, repeated node aliases, path-sensitive constraints and unproven cyclic
 trails retain exact enumeration, reusing captured adjacency where applicable.
 Intermediate counts saturate above the result range, so only qualifying endpoint
@@ -1318,7 +1331,11 @@ and deterministic SQL inputs qualify. Multiplicities reach SQL reducers through
 transparent scan adapters: checked wide integer and exact NUMERIC states, NULLs,
 DISTINCT, grouping, filters and spill retain their SQL behavior. Floating SUM/AVG,
 ordered aggregates, observable source ordinals, route-sensitive expressions and
-nontransparent relational operators retain ordinary rows. The cursor buffers
+nontransparent relational operators retain ordinary rows. Scalar repeatability is
+checked independently of parallel execution support: CASE, Boolean expressions,
+IN lists and pure builtins retain weights and their ordinary lazy evaluation.
+External decisions and consumable pattern cursors require ordinary rows. Pinned
+statement settings remain stable inputs. The cursor buffers
 endpoint contributions for one anchor, never the complete result or route bag.
 
 Endpoint-local predicates, grouping keys, COUNT/SUM/AVG/MIN/MAX and their

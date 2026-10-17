@@ -1134,7 +1134,6 @@ const Engine = struct {
         }
     };
     fn streamMatchProjection(self: *Engine, input: []const Row, operation: ast.Match, projection: ast.Projection, middle: []const ast.Clause, match_span: ast.Span, projection_span: ast.Span) anyerror!?[]const Row {
-        if (!self.cache_reads) return null;
         // The row pipeline nests only within the statement's stack allowance.
         // Longer clause sequences retain the iterative general executor.
         if (middle.len > self.limits.recursion_depth -| self.recursion) return null;
@@ -1167,6 +1166,18 @@ const Engine = struct {
             if (p.order.len != 0 or p.skip != null or p.limit != null) return null;
             for (p.items) |item| if (aggregates(item.expression) or @import("expressions.zig").containsPattern(item.expression)) return null;
             if (p.predicate) |predicate| if (@import("expressions.zig").containsPattern(predicate)) return null;
+        }
+        // This pipeline contains only reads and row-local expressions. Writes
+        // remain barriers in run(); no entity cache may cross such a barrier.
+        // In particular, a statement containing CREATE/SET can still reduce a
+        // subsequent MATCH without materializing its complete route bag.
+        const previous_cache = self.cache_reads;
+        const previous_reads = self.read_nodes;
+        if (!previous_cache) self.read_nodes = .empty;
+        self.cache_reads = true;
+        defer {
+            self.cache_reads = previous_cache;
+            if (!previous_cache) self.read_nodes = previous_reads;
         }
         var calls: std.ArrayList(*const ast.Expr) = .empty;
         if (grouped) {
@@ -2341,7 +2352,12 @@ const Engine = struct {
                 };
             }
         }
-        if (!exact_weights or (mode != .repeatable and !try self.lowerAcyclic(&graph))) {
+        const compressible = exact_weights and switch (mode) {
+            .repeatable => true,
+            .node_simple => try self.lowerAcyclic(&graph),
+            .relationship_simple => try self.lowerTrailAcyclic(&graph),
+        };
+        if (!compressible) {
             if (self.weighted_sink != null) return false;
             const previous = self.lower_graph;
             self.lower_graph = &graph;
@@ -2384,6 +2400,12 @@ const Engine = struct {
             .binary => |binary_expression| endpointExpression(binary_expression.left, path, row) and endpointExpression(binary_expression.right, path, row),
             .comparison => |comparison| blk: {
                 for (comparison.operands) |operand| if (!endpointExpression(operand, path, row)) break :blk false;
+                break :blk true;
+            },
+            .list => |items| blk: {
+                // SQL IN pushdown constructs a list predicate in the graph
+                // plan. Its endpoint-local values preserve the same bag.
+                for (items) |item| if (!endpointExpression(item, path, row)) break :blk false;
                 break :blk true;
             },
             .call => |scalar_call| blk: {
@@ -2621,6 +2643,37 @@ const Engine = struct {
         return if (queue.items.len == graph.nodes.items.len) maximum else null;
     }
     fn lowerAcyclic(self: *Engine, graph: *const LowerGraph) !bool {
+        return self.lowerAcyclicMappings(graph, null);
+    }
+    // A relationship can be reused only inside domains selecting the same
+    // physical mapping. Prove acyclicity per connected component of overlapping
+    // mapping sets. Disjoint components can revisit nodes, but cannot reuse an
+    // edge; node-simple paths deliberately retain the whole-graph proof.
+    fn lowerTrailAcyclic(self: *Engine, graph: *const LowerGraph) !bool {
+        var components: [64]u64 = @splat(0);
+        for (graph.domains) |domain| {
+            var selected: u64 = 0;
+            for (self.graph.relationships, 0..) |mapping, index| {
+                try self.state();
+                if (domain.types.len == 0 or for (domain.types) |name| {
+                    if (std.mem.eql(u8, name, mapping.name)) break true;
+                } else false) selected |= @as(u64, 1) << @intCast(index);
+            }
+            var joined = selected;
+            for (components, 0..) |component, index| {
+                if (selected & (@as(u64, 1) << @intCast(index)) != 0) joined |= component;
+            }
+            for (&components, 0..) |*component, index| {
+                if (joined & (@as(u64, 1) << @intCast(index)) != 0) component.* = joined;
+            }
+        }
+        for (components, 0..) |component, index| {
+            if (component != 0 and @ctz(component) == index)
+                if (!try self.lowerAcyclicMappings(graph, component)) return false;
+        }
+        return true;
+    }
+    fn lowerAcyclicMappings(self: *Engine, graph: *const LowerGraph, mappings: ?u64) !bool {
         var scratch = std.heap.ArenaAllocator.init(self.scratch_allocator);
         defer scratch.deinit();
         const a = scratch.allocator();
@@ -2629,6 +2682,7 @@ const Engine = struct {
         for (graph.nodes.items) |node| {
             try chargeWork(self, 1 + node.arcs.items.len);
             for (node.arcs.items) |arc| {
+                if (mappings) |mask| if (mask & (@as(u64, 1) << @intCast(arc.mapping)) == 0) continue;
                 if (!graph.qualified or arc.eligible) indegree[arc.target] += 1;
             }
         }
@@ -2641,6 +2695,7 @@ const Engine = struct {
             try self.state();
             for (graph.nodes.items[queue.items[head]].arcs.items) |arc| {
                 if (graph.qualified and !arc.eligible) continue;
+                if (mappings) |mask| if (mask & (@as(u64, 1) << @intCast(arc.mapping)) == 0) continue;
                 indegree[arc.target] -= 1;
                 if (indegree[arc.target] == 0) try queue.append(a, arc.target);
             }

@@ -1698,6 +1698,8 @@ test "mixed domains and unbounded DAG reductions preserve exact path bags" {
         "(a:Document)-[:CITES*0..2]->()-[:MENTIONS*0..1]->(b)",
         "(a:Document)-[:CITES|MENTIONS*0..1]->()-[:CITES*0..2]->(b)",
         "(a:Document)-[:CITES*0..1]->()<-[:CITES*0..1]-(b)",
+        "(a:Document)-[:CITES*0..2]->()<-[:MENTIONS*0..1]-(b)",
+        "(a:Document)-[:CITES*0..1]->()-[:CITES|MENTIONS*0..1]->()<-[:MENTIONS*0..1]-(b)",
         "(a:Document)-[:CITES*0..]->(b)",
         "(a:Document)-[:CITES*1..]->()-[:MENTIONS*0..]->(b)",
     }) |pattern| {
@@ -1716,7 +1718,7 @@ test "mixed domains and unbounded DAG reductions preserve exact path bags" {
         defer exact.deinit();
         var result = try runtime.execute(a, backend, graph, &compiled, &.{}, .{});
         defer result.deinit();
-        if (!dag and std.mem.indexOf(u8, pattern, "CITES|MENTIONS") != null)
+        if (!dag and std.mem.eql(u8, pattern, "(a:Document)-[:CITES|MENTIONS*0..1]->()-[:CITES*0..2]->(b)"))
             try std.testing.expect(result.stats.explored_edges <= 13);
         var reference = try runtime.execute(a, backend, graph, &exact, &.{}, .{});
         defer reference.deinit();
@@ -1738,7 +1740,7 @@ test "weighted cursor negotiates endpoint bags and falls back for cyclic trails"
         defer arena.deinit();
         const a = arena.allocator();
         var diagnostic: c.Diagnostic = .{};
-        var compiled = try c.compile(a, "MATCH (a:Document)-[:CITES*0..3]->(b:Document) RETURN b.rank AS r", .{}, &diagnostic);
+        var compiled = try c.compile(a, "MATCH (a:Document)-[:CITES*0..3]->(b:Document) WHERE b.rank IN [1,2,3] RETURN b.rank AS r", .{}, &diagnostic);
         defer compiled.deinit();
         var fixture: Fixture = .{};
         const base = fixture.backend();
@@ -1812,5 +1814,47 @@ test "bound pair reads and counts use seeks through owner RPC and pull cursors" 
         var total: usize = 0;
         while (!cursor.done) total += (try cursor.next(a, 1)).len;
         try std.testing.expectEqual(@as(usize, 2), total);
+    }
+}
+
+test "domain uniqueness distinguishes disjoint trails overlapping domains and node-simple paths" {
+    const Domains = struct {
+        fn expand(ptr: *anyopaque, a: std.mem.Allocator, mapping: catalog.Relationship, identity: v.Identity, direction: c.ast.Direction, after: ?[]const u8, limit: usize) !b.Page(*const v.Relationship) {
+            var physical = mapping;
+            physical.name = "CITES";
+            const page = try Fixture.expand(ptr, a, physical, identity, direction, after, limit);
+            var out: std.ArrayList(*const v.Relationship) = .empty;
+            for (page.items) |value| {
+                if (std.mem.eql(u8, value.identity.key, "ba")) continue;
+                const copy = try a.create(v.Relationship);
+                copy.* = value.*;
+                copy.type = mapping.name;
+                copy.identity.key = try std.fmt.allocPrint(a, "{s}:{s}", .{ mapping.name, value.identity.key });
+                try out.append(a, copy);
+            }
+            return .{ .items = out.items };
+        }
+    };
+    const domains: catalog.Graph = .{ .name = "domains", .incarnation = 1, .revision = 1, .labels = &.{.{ .name = "Document", .table = "docs" }}, .relationships = &.{
+        .{ .name = "CITES", .index = "links", .stored_type = "r", .source_label = "Document", .target_label = "Document" },
+        .{ .name = "MENTIONS", .index = "links", .stored_type = "s", .source_label = "Document", .target_label = "Document" },
+    } };
+    for ([_][]const u8{ "CITES", "CITES|MENTIONS" }, [_][3]i64{ .{ 4, 0, 4 }, .{ 6, 0, 8 } }) |types, counts| {
+        for ([_]c.ast.PathMode{ .relationship_simple, .node_simple, .repeatable }, counts) |mode, expected| {
+            var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+            defer arena.deinit();
+            const a = arena.allocator();
+            var diagnostic: c.Diagnostic = .{};
+            const tail = if (std.mem.eql(u8, types, "CITES")) "MENTIONS" else "CITES";
+            var compiled = try c.compile(a, try std.fmt.allocPrint(a, "MATCH (a:Document {{id:'a'}})-[:{s}]->()<-[:{s}]-(b:Document) RETURN count(*)", .{ types, tail }), .{}, &diagnostic);
+            defer compiled.deinit();
+            @constCast(compiled.query.clauses)[0].operation.match.mode = mode;
+            var fixture: Fixture = .{};
+            var callbacks = fixture.backend().vtable.*;
+            callbacks.expand = Domains.expand;
+            var result = try runtime.execute(a, .{ .ptr = &fixture, .vtable = &callbacks }, domains, &compiled, &.{}, .{});
+            defer result.deinit();
+            try std.testing.expectEqual(expected, result.rows[0][0].integer);
+        }
     }
 }

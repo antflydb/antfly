@@ -77,7 +77,7 @@ pub const Overlay = struct {
             }
         };
     };
-    const PairBucket = struct { positions: Positions = .empty, properties: std.StringHashMapUnmanaged(StagedIndex) = .empty };
+    const PairBucket = struct { positions: Positions = .empty, staged: Positions = .empty, properties: std.StringHashMapUnmanaged(StagedIndex) = .empty };
     const Adjacency = struct {
         peer: ?v.Identity = null,
         identity: v.Identity,
@@ -111,6 +111,7 @@ pub const Overlay = struct {
         if (self.pair_keys.fetchRemove(position)) |old| {
             const bucket = self.pairs.getPtr(old.value).?;
             _ = bucket.positions.swapRemove(position);
+            _ = bucket.staged.swapRemove(position);
             var indexes = bucket.properties.valueIterator();
             while (indexes.next()) |index| try self.pairProperty(index, position, true);
         }
@@ -121,13 +122,14 @@ pub const Overlay = struct {
         const entry = try self.pairs.getOrPut(a, pair);
         if (!entry.found_existing) entry.value_ptr.* = .{};
         try entry.value_ptr.positions.put(a, position, {});
+        if (self.lazy and relationship.isStaged()) try entry.value_ptr.staged.put(a, position, {});
         try self.pair_keys.put(a, position, pair);
         var indexes = entry.value_ptr.properties.valueIterator();
         while (indexes.next()) |index| try self.pairProperty(index, position, false);
     }
-    fn pairCandidates(self: *Overlay, _: A, pair: Pair, filters: []const b.PropertyFilter) ![]const usize {
+    fn pairCandidates(self: *Overlay, _: A, pair: Pair, filters: []const b.PropertyFilter, staged_only: bool) ![]const usize {
         const bucket = self.pairs.getPtr(pair) orelse return &.{};
-        var best: []const usize = bucket.positions.keys();
+        var best: []const usize = if (staged_only) bucket.staged.keys() else bucket.positions.keys();
         for (filters) |filter| {
             if (filter.op != .eq) continue;
             const hash = (try self.scalarHash(filter.value)) orelse continue;
@@ -156,6 +158,14 @@ pub const Overlay = struct {
         }
         var examined: usize = 0;
         const adjacency: Adjacency = .{ .peer = if (self.base.vtable.expand_between != null) peer else null, .identity = identity, .index = mapping.index, .type = mapping.name, .direction = direction };
+        // A retained pair scan is a pull cursor, not an adjacency barrier.
+        // Completed captures can reuse the postings; partial captures retain
+        // their opaque native continuation until their staged phase ends.
+        if (self.lazy and self.base.vtable.expand_between != null) {
+            if ((after != null and std.mem.startsWith(u8, after.?, "{")) or
+                !self.captured_adjacency.contains(adjacency))
+                return self.lazyPairExpand(a, mapping, identity, peer, direction, filters, after, limit, max_examined, adjacency);
+        }
         if (self.lazy and !self.captured_adjacency.contains(adjacency)) {
             // Native stores without a pair seek are indexed once per retained
             // adjacency domain. Staged edges join the same postings incrementally.
@@ -167,28 +177,14 @@ pub const Overlay = struct {
             defer cursor_bytes.deinit(cursor_allocator);
             while (true) {
                 _ = scratch.reset(.retain_capacity);
-                const page = if (self.base.vtable.expand_between) |between|
-                    try between(self.base.ptr, scratch.allocator(), mapping, identity, peer, direction, &.{}, cursor, @min(128, @max(1, max_examined -| examined)), max_examined -| examined)
-                else
-                    try self.lazyExpand(scratch.allocator(), mapping, identity, direction, cursor, @min(128, @max(1, max_examined -| examined)));
-                if (self.base.vtable.expand_between != null) for (page.items) |value| {
-                    if (self.findRelationship(.{ .identity = value.identity, .index = value.index }) != null) continue;
-                    if (value.ownership == .field) {
-                        if (try value.producingDocument(scratch.allocator())) |producer| if (self.replaced_producers.contains(producer)) continue;
-                    }
-                    try self.capacity();
-                    const copy = @constCast((try (v.Value{ .relationship = value }).clone(self.alloc.?)).relationship);
-                    try self.appendRelationship(self.alloc.?, .{ .value = copy, .from_base = true });
-                };
+                const page = try self.lazyExpand(scratch.allocator(), mapping, identity, direction, cursor, @min(128, @max(1, max_examined -| examined)));
                 const count = page.examined orelse page.items.len;
                 if (count > @min(self.max_edges, max_examined) -| examined) return error.CypherEdgeBudgetExceeded;
                 examined += count;
                 // lazyExpand has retained native identities and pair postings.
                 const next = page.next orelse break;
-                if (self.base.vtable.expand_between == null) {
-                    const continuation = try std.json.parseFromSliceLeaky(LazyCursor, scratch.allocator(), next, .{});
-                    if (continuation.staged) break;
-                }
+                const continuation = try std.json.parseFromSliceLeaky(LazyCursor, scratch.allocator(), next, .{});
+                if (continuation.staged) break;
                 if (examined == max_examined) return error.CypherEdgeBudgetExceeded;
                 cursor_bytes.clearRetainingCapacity();
                 try cursor_bytes.appendSlice(cursor_allocator, next);
@@ -197,20 +193,59 @@ pub const Overlay = struct {
             const retained = self.alloc.?;
             try self.captured_adjacency.put(retained, .{ .peer = if (adjacency.peer) |value| .{ .table = try retained.dupe(u8, value.table), .key = try retained.dupe(u8, value.key) } else null, .identity = .{ .table = try retained.dupe(u8, identity.table), .key = try retained.dupe(u8, identity.key) }, .index = try retained.dupe(u8, mapping.index), .type = try retained.dupe(u8, mapping.name), .direction = direction }, {});
         }
-        const outgoing = if (direction != .in) try self.pairCandidates(a, .{ .source = identity, .target = peer, .index = mapping.index, .type = mapping.name }, filters) else &.{};
-        const incoming = if (direction != .out and (!identity.eql(peer) or direction == .in)) try self.pairCandidates(a, .{ .source = peer, .target = identity, .index = mapping.index, .type = mapping.name }, filters) else &.{};
-        const count = outgoing.len + incoming.len;
         const offset = if (after) |encoded| try std.fmt.parseUnsigned(usize, encoded, 10) else 0;
+        return self.pairPage(a, mapping, identity, peer, direction, filters, offset, limit, max_examined, false, examined);
+    }
+    fn pairPage(self: *Overlay, a: A, mapping: c.Relationship, identity: v.Identity, peer: v.Identity, direction: ast.Direction, filters: []const b.PropertyFilter, offset: usize, limit: usize, max_examined: usize, staged_only: bool, captured_examined: usize) !b.Page(*const v.Relationship) {
+        const outgoing = if (direction != .in) try self.pairCandidates(a, .{ .source = identity, .target = peer, .index = mapping.index, .type = mapping.name }, filters, staged_only) else &.{};
+        const incoming = if (direction != .out and (!identity.eql(peer) or direction == .in)) try self.pairCandidates(a, .{ .source = peer, .target = identity, .index = mapping.index, .type = mapping.name }, filters, staged_only) else &.{};
+        const count = outgoing.len + incoming.len;
         if (offset > count) return error.CypherInvalidBackendCursor;
-        const end = offset + @min(limit, count - offset);
+        if (offset < count and max_examined <= captured_examined) return error.CypherEdgeBudgetExceeded;
+        const end = offset + @min(@min(limit, max_examined -| captured_examined), count - offset);
         var output: std.ArrayList(*const v.Relationship) = .empty;
         for (offset..end) |candidate| {
             const position = if (candidate < outgoing.len) outgoing[candidate] else incoming[candidate - outgoing.len];
             try self.charge(1);
             const relationship = self.relationships.items[position];
+            if (staged_only and !relationship.isStaged()) continue;
             if (!relationship.deleted and try self.producerVisible(a, relationship.value)) try output.append(a, relationship.value);
         }
-        return .{ .items = try output.toOwnedSlice(a), .examined = examined + end - offset, .next = if (end < count) try std.fmt.allocPrint(a, "{d}", .{end}) else null };
+        return .{ .items = try output.toOwnedSlice(a), .examined = captured_examined + end - offset, .next = if (end < count)
+            if (staged_only) try std.json.Stringify.valueAlloc(a, LazyCursor{ .staged = true, .offset = end }, .{}) else try std.fmt.allocPrint(a, "{d}", .{end})
+        else
+            null };
+    }
+    fn lazyPairExpand(self: *Overlay, a: A, mapping: c.Relationship, identity: v.Identity, peer: v.Identity, direction: ast.Direction, filters: []const b.PropertyFilter, after: ?[]const u8, limit: usize, max_examined: usize, adjacency: Adjacency) !b.Page(*const v.Relationship) {
+        const cursor = if (after) |encoded| try std.json.parseFromSliceLeaky(LazyCursor, a, encoded, .{}) else LazyCursor{};
+        if (cursor.staged) return self.pairPage(a, mapping, identity, peer, direction, filters, cursor.offset, limit, max_examined, true, 0);
+        var scratch = std.heap.ArenaAllocator.init(b.reclaimingAllocator(a));
+        defer scratch.deinit();
+        const temporary = scratch.allocator();
+        // Capture an unfiltered prefix so a completed capture is reusable for
+        // every property residual, including subsequent staged replacements.
+        const page = try self.base.vtable.expand_between.?(self.base.ptr, temporary, mapping, identity, peer, direction, &.{}, cursor.native, limit, max_examined);
+        const examined = page.examined orelse page.items.len;
+        if (examined > max_examined) return error.CypherEdgeBudgetExceeded;
+        var output: std.ArrayList(*const v.Relationship) = .empty;
+        for (page.items) |value| {
+            if (value.ownership == .field) {
+                if (try value.producingDocument(temporary)) |producer| if (self.replaced_producers.contains(producer)) continue;
+            }
+            const item = if (self.findRelationship(.{ .identity = value.identity, .index = value.index })) |cached| cached else blk: {
+                try self.capacity();
+                const retained = self.alloc.?;
+                const copy = @constCast((try (v.Value{ .relationship = value }).clone(retained)).relationship);
+                try self.appendRelationship(retained, .{ .value = copy, .from_base = true });
+                break :blk self.findRelationship(.{ .identity = value.identity, .index = value.index }).?;
+            };
+            if (!item.isStaged() and !item.deleted and try self.producerVisible(a, item.value)) try output.append(a, item.value);
+        }
+        if (page.next == null) {
+            const retained = self.alloc.?;
+            try self.captured_adjacency.put(retained, .{ .peer = .{ .table = try retained.dupe(u8, peer.table), .key = try retained.dupe(u8, peer.key) }, .identity = .{ .table = try retained.dupe(u8, identity.table), .key = try retained.dupe(u8, identity.key) }, .index = try retained.dupe(u8, adjacency.index), .type = try retained.dupe(u8, adjacency.type), .direction = direction }, {});
+        }
+        return .{ .items = try output.toOwnedSlice(a), .examined = examined, .next = try std.json.Stringify.valueAlloc(a, LazyCursor{ .staged = page.next == null, .native = page.next }, .{}) };
     }
     const Positions = std.AutoArrayHashMapUnmanaged(usize, void);
     const StagedIndex = struct {
@@ -314,7 +349,19 @@ pub const Overlay = struct {
     }
     const Reference = struct { position: usize, version: usize };
     const Node = struct { value: *v.Node, deleted: bool = false, created: bool = false, dirty: bool = false, projection_cached: bool = false, projected: ?*const v.Node = null };
-    const Relationship = struct { value: *v.Relationship, deleted: bool = false, created: bool = false, dirty: bool = false, version: usize = 0, from_base: bool = false };
+    const Relationship = struct {
+        value: *v.Relationship,
+        deleted: bool = false,
+        created: bool = false,
+        dirty: bool = false,
+        version: usize = 0,
+        from_base: bool = false,
+        fn isStaged(self: @This()) bool {
+            // Document projections are staged effects too, even though they
+            // are persisted by their producing row rather than an edge write.
+            return !self.from_base or self.dirty or self.created;
+        }
+    };
     const plain_vtable: b.Backend.VTable = .{ .bind = bind, .checkpoint = checkpoint, .scan = scan, .scan_where = scanWhere, .get = get, .get_many = getMany, .get_relationship = getRelationship, .expand = expand, .expand_between = expandBetween, .search = search, .set_work = setWork, .set_read_fields = setReadFields, .begin = begin, .startup_work = startupWork, .mutate = mutate, .commit = commit, .rollback = rollback, .new_identity = newIdentity };
     const projecting_vtable: b.Backend.VTable = projected: {
         var value = plain_vtable;
@@ -626,7 +673,7 @@ pub const Overlay = struct {
                 // Staged replacements are emitted only in the staged phase.
                 // This also lets hosts install exact tombstones without first
                 // enumerating the native adjacency that they mask.
-                if (!item.dirty and !item.created and !item.deleted and try self.producerVisible(a, item.value)) try found.append(a, item.value);
+                if (!item.isStaged() and !item.deleted and try self.producerVisible(a, item.value)) try found.append(a, item.value);
             }
             return .{ .items = try found.toOwnedSlice(a), .next = try std.json.Stringify.valueAlloc(a, LazyCursor{ .staged = page.next == null, .native = page.next }, .{}), .examined = page.examined orelse page.items.len };
         }
@@ -636,7 +683,7 @@ pub const Overlay = struct {
         for (references[cursor.offset..end]) |reference| {
             try self.charge(1);
             const item = self.currentReference(reference) orelse continue;
-            if ((item.from_base and !item.dirty and !item.created) or item.deleted or !std.mem.eql(u8, item.value.type, mapping.name) or !std.mem.eql(u8, item.value.index, mapping.index)) continue;
+            if (!item.isStaged() or item.deleted or !std.mem.eql(u8, item.value.type, mapping.name) or !std.mem.eql(u8, item.value.index, mapping.index)) continue;
             if (!((direction != .in and item.value.source.eql(identity)) or (direction != .out and item.value.target.eql(identity)))) continue;
             if (try self.producerVisible(a, item.value)) try found.append(a, item.value);
         }
