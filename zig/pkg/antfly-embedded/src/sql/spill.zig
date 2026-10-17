@@ -249,7 +249,7 @@ pub const File = struct {
         try self.awaitWrite();
         try self.manager.check();
         if (self.run_store == null and self.manager.async_writes and self.write_buffer.len >= 4096 and self.write_len >= self.write_buffer.len / 2) {
-            const job = self.prepareAsync() orelse {
+            const job = (try self.prepareAsync()) orelse {
                 try self.writePhysical(self.write_buffer[0..self.write_len], self.write_start);
                 self.manager.increment("write_calls", 1);
                 self.write_len = 0;
@@ -272,14 +272,21 @@ pub const File = struct {
         self.manager.increment("write_calls", 1);
         self.write_len = 0;
     }
-    fn prepareAsync(self: *File) ?*WriteJob {
-        if (self.spare.len == 0) self.spare = self.manager.allocator().alloc(u8, self.write_buffer.len) catch return null;
-        if (self.write_job) |job| return job;
-        const job = self.manager.allocator().create(WriteJob) catch {
+    fn prepareAsync(self: *File) !?*WriteJob {
+        // Async buffering is optional. A known quota denial falls back before
+        // touching the parent budget; actual allocator failures propagate.
+        const required = (if (self.spare.len == 0) self.write_buffer.len else @as(usize, 0)) +
+            (if (self.write_job == null) @sizeOf(WriteJob) else @as(usize, 0));
+        if (@import("memory_budget.zig").headroom(self.manager.alloc)) |available|
+            if (required > available) return null;
+        const fresh = self.spare.len == 0;
+        if (fresh) self.spare = try self.manager.allocator().alloc(u8, self.write_buffer.len);
+        errdefer if (fresh) {
             self.manager.allocator().free(self.spare);
             self.spare = &.{};
-            return null;
         };
+        if (self.write_job) |job| return job;
+        const job = try self.manager.allocator().create(WriteJob);
         self.write_job = job;
         return job;
     }
@@ -391,22 +398,26 @@ pub const File = struct {
         self.closed = true;
     }
     pub fn append(self: *File, row: Row, link: u64) !u64 {
+        return self.appendWithPressure(row, link, null);
+    }
+    pub fn appendWithPressure(self: *File, row: Row, link: u64, pressure: ?*CachePressure) !u64 {
         try self.manager.check();
+        const a = if (pressure) |scope| scope.allocator() else self.manager.allocator();
         var bytes: std.ArrayList(u8) = .empty;
-        defer bytes.deinit(self.manager.allocator());
-        var encoder: Encoder = .{ .manager = self.manager, .a = self.manager.allocator(), .bytes = &bytes, .limit = self.manager.max_record_bytes };
+        defer bytes.deinit(a);
+        var encoder: Encoder = .{ .manager = self.manager, .a = a, .bytes = &bytes, .limit = self.manager.max_record_bytes };
         try encoder.word(row.ordinal);
         try encoder.cells(row.values);
         try encoder.cells(row.keys);
         var compressed: ?[]u8 = null;
-        defer if (compressed) |value| self.manager.allocator().free(value);
+        defer if (compressed) |value| a.free(value);
         // Avoid codec work on short or apparently incompressible records.
         // Compression is an existing Snappy block format, never a new codec.
         if (self.manager.compression == .snappy and bytes.items.len >= 4096) {
             const sample = bytes.items[0..@min(bytes.items.len, 1024)];
             var repeated: usize = 0;
             for (sample[1..], sample[0 .. sample.len - 1]) |x, y| repeated += @intFromBool(x == y);
-            if (repeated > sample.len / 4) compressed = try snappy.encode(self.manager.allocator(), bytes.items);
+            if (repeated > sample.len / 4) compressed = try snappy.encode(a, bytes.items);
         }
         const compressed_record = compressed != null and compressed.?.len + 32 < bytes.items.len;
         const stored = if (compressed_record) compressed.? else bytes.items;
@@ -419,6 +430,7 @@ pub const File = struct {
         std.mem.writeInt(u64, frame[8..16], std.hash.Wyhash.hash(0, bytes.items), .little);
         std.mem.writeInt(u64, frame[16..24], link, .little);
         const offset = self.size;
+        if (pressure) |scope| if (self.write_buffer.len == 0) scope.prepare(@max(1, self.buffer_bytes orelse self.manager.buffer_bytes));
         try self.bufferedWrite(&frame, offset);
         try self.bufferedWrite(stored, offset + frame_bytes);
         self.manager.increment("compressed_records", @intFromBool(compressed_record));
@@ -725,12 +737,19 @@ pub fn materializeFrozenJson(a: Allocator, value: @import("execution_batch.zig")
     if (decoder.position != value.bytes.len) return error.InvalidSqlSpill;
     return Datum.json(result);
 }
+/// Write an already validated frozen value without a DOM or text buffer.
+/// Writer failures remain writer failures; callers own quota/error mapping.
+pub fn writeFrozenJson(writer: *std.Io.Writer, value: @import("execution_batch.zig").FrozenJson) !void {
+    var scratch = std.heap.FixedBufferAllocator.init(&.{});
+    var json: std.json.Stringify = .{ .writer = writer };
+    var decoder: Decoder = .{ .a = scratch.allocator(), .bytes = value.bytes };
+    _ = try decoder.walkJson(0, &json);
+    if (decoder.position != value.bytes.len) return error.InvalidSqlSpill;
+}
 pub fn frozenJsonText(a: Allocator, value: @import("execution_batch.zig").FrozenJson) ![]const u8 {
     var output: std.Io.Writer.Allocating = .init(a);
     defer output.deinit();
-    var json: std.json.Stringify = .{ .writer = &output.writer };
-    var decoder: Decoder = .{ .a = a, .bytes = value.bytes };
-    _ = decoder.walkJson(0, &json) catch |err| return if (err == error.WriteFailed) error.OutOfMemory else err;
+    writeFrozenJson(&output.writer, value) catch |err| return if (err == error.WriteFailed) error.OutOfMemory else err;
     return output.toOwnedSlice();
 }
 /// Scalar consumers can construct incompatible native tags during validation.
@@ -1126,6 +1145,14 @@ pub const CachePressure = struct {
     manager: *Manager,
     context: *anyopaque,
     evict: *const fn (*anyopaque) bool,
+    /// The optional payload owner may be published during the operation.
+    pub fn forPayloads(manager: *Manager, payloads: *?*JoinPayloads) CachePressure {
+        return .{ .manager = manager, .context = @ptrCast(payloads), .evict = evictPayloads };
+    }
+    fn evictPayloads(raw: *anyopaque) bool {
+        const owner: *?*JoinPayloads = @ptrCast(@alignCast(raw));
+        return if (owner.*) |payloads| payloads.evictOne() else false;
+    }
     pub fn prepare(self: *CachePressure, growth: usize) void {
         while (@import("memory_budget.zig").headroom(self.manager.alloc)) |available| {
             if (growth <= available or !self.evict(self.context)) break;
@@ -5476,4 +5503,29 @@ test "SQL native scalar payload reuse precedes serialization and preserves exact
     defer block.release();
     try std.testing.expectEqual(@as(u8, 'x'), (try block.cell(0, 0)).value.string[0]);
     std.debug.print("SPILL_SCALAR_REUSE repeated_rows=64 encoded_pages=1\n", .{});
+}
+
+test "SQL native async spill fallback preserves parent admission and reports genuine allocator failures" {
+    const Fixture = struct {
+        fn check(_: *anyopaque) !void {}
+        fn run(a: Allocator, measure: bool) !void {
+            var budget: @import("memory_budget.zig") = .{ .backing = a, .limit = 56000 };
+            defer std.debug.assert(budget.live == 0);
+            var dummy: u8 = 0;
+            var manager: Manager = .{ .alloc = budget.allocator(), .io = std.testing.io, .context = &dummy, .checkpoint = check, .compression = .snappy, .async_writes = true };
+            defer manager.deinit();
+            var payloads = try JoinPayloads.init(&manager);
+            defer payloads.close();
+            var body: [12000]u8 = @splat('x');
+            for (0..20) |index| {
+                body[0] = @intCast('a' + index);
+                _ = try payloads.appendBatch(.{ .rows = &.{&.{Datum.json(.{ .string = &body })}} });
+            }
+            try payloads.file.flush();
+            try std.testing.expect(!budget.isExhausted());
+            if (measure) std.debug.print("SPILL_ASYNC_ADMISSION rows=20 limit={d} peak={d} exhausted={}\n", .{ budget.limit, budget.peak, budget.exhausted });
+        }
+    };
+    try Fixture.run(std.testing.allocator, true);
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Fixture.run, .{false});
 }

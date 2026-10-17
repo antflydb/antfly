@@ -42,8 +42,21 @@ pub const Cursor = struct {
         index: usize = 0,
         values: []const @import("scalar.zig").Datum = &.{},
         typed: ?*const @import("typed_store.zig").Store = null,
-        fn cell(self: Location, column: usize) !@import("scalar.zig").Datum {
-            return if (self.block) |block| block.cell(self.index, column) else if (self.typed) |typed| typed.cell(typed.a, self.index, column) else self.values[column];
+        fn cell(self: Location, a: std.mem.Allocator, column: usize) !@import("scalar.zig").Datum {
+            return if (self.block) |block| block.cell(self.index, column) else if (self.typed) |typed| typed.cell(a, self.index, column) else self.values[column];
+        }
+        fn frozen(self: Location, column: usize) !?@import("execution_batch.zig").FrozenJson {
+            if (self.block) |block| return if (block.encoded) |encoded| encoded.frozenJson(self.index, column, false) else null;
+            return if (self.typed) |typed| typed.frozenJson(self.index, column) else null;
+        }
+        fn json(self: Location, column: usize) !?[]const u8 {
+            if (self.block) |block| return if (block.encoded) |encoded| encoded.encodedJson(self.index, column, false) else null;
+            return if (self.typed) |typed| typed.encodedJson(self.index, column) else null;
+        }
+        fn bytes(self: Location, a: std.mem.Allocator, column: usize) !usize {
+            if (try self.frozen(column)) |value| return value.bytes.len;
+            if (try self.json(column)) |text| return text.len;
+            return @import("operators.zig").datumBytes(try self.cell(a, column));
         }
     };
     pub const Lease = struct {
@@ -104,51 +117,79 @@ pub const Cursor = struct {
                         if (existing) block.release() else {
                             blocks[held] = block;
                             held += 1;
-                            leased_bytes +|= block.arena.queryCapacity() +| @sizeOf(@import("spill.zig").Sequential.OwnedBlock);
+                            leased_bytes +|= block.retainedBytes() +| @sizeOf(@import("spill.zig").Sequential.OwnedBlock);
                         }
                     }
                 } else rows[count_rows] = .{ .values = self.sorted_rows[self.sorted_offset + self.index].values };
-                for (0..self.width) |column| bytes +|= try @import("operators.zig").datumBytes(try rows[count_rows].cell(column));
+                for (0..self.width) |column| bytes +|= try rows[count_rows].bytes(a, column);
                 self.index += 1;
                 count_rows += 1;
                 if (bytes >= byte_limit or leased_bytes >= byte_limit) break;
             }
             const View = struct {
                 rows: []const Location,
-                fn cell(raw: *anyopaque, _: std.mem.Allocator, row: usize, column: usize) anyerror!@import("scalar.zig").Datum {
+                shared: bool,
+                fn cell(raw: *anyopaque, alloc: std.mem.Allocator, row: usize, column: usize) anyerror!@import("scalar.zig").Datum {
                     const view: *@This() = @ptrCast(@alignCast(raw));
-                    return view.rows[row].cell(column);
+                    return view.rows[row].cell(alloc, column);
+                }
+                fn frozen(raw: *anyopaque, row: usize, column: usize) anyerror!?@import("execution_batch.zig").FrozenJson {
+                    const view: *@This() = @ptrCast(@alignCast(raw));
+                    return view.rows[row].frozen(column);
+                }
+                fn json(raw: *anyopaque, row: usize, column: usize) anyerror!?[]const u8 {
+                    const view: *@This() = @ptrCast(@alignCast(raw));
+                    return view.rows[row].json(column);
+                }
+                fn identity(raw: *anyopaque, row: usize, column: usize) anyerror!?u64 {
+                    const view: *@This() = @ptrCast(@alignCast(raw));
+                    if (!view.shared) return null;
+                    const location = view.rows[row];
+                    if (location.block) |block| return if (block.encoded) |encoded| encoded.dictionaryIdentity(location.index, column, false) else null;
+                    return if (location.typed) |typed| typed.dictionaryId(location.index, column) else null;
+                }
+                fn dictionary(raw: *anyopaque, alloc: std.mem.Allocator, column: usize) anyerror!?@import("execution_batch.zig").Batch {
+                    const view: *@This() = @ptrCast(@alignCast(raw));
+                    if (!view.shared) return null;
+                    const first = view.rows[0];
+                    const Batch = @import("execution_batch.zig").Batch;
+                    const source = try alloc.create(Batch);
+                    source.* = if (first.block) |block| try block.batch(alloc, false) else if (first.typed) |typed| .{ .retained = .{ .store = typed, .count = typed.len } } else return null;
+                    const selection = try alloc.alloc(usize, view.rows.len);
+                    for (selection, view.rows) |*index, location| index.* = location.index;
+                    const selected = try source.select(alloc, selection);
+                    return selected.dictionaryColumn(alloc, column);
                 }
             };
             const view = try a.create(View);
-            view.* = .{ .rows = rows[0..count_rows] };
+            const first = rows[0];
+            const shared = for (rows[0..count_rows]) |row| {
+                if (row.block != first.block or row.typed != first.typed) break false;
+            } else first.block != null or first.typed != null;
+            view.* = .{ .rows = rows[0..count_rows], .shared = shared };
             _ = self.refs.fetchAdd(1, .monotonic);
-            return .{ .values = .{ .reader = .{ .ptr = view, .read = View.cell, .count = count_rows, .width = self.width } }, .blocks = blocks[0..held], .owner = self };
+            return .{ .values = .{ .reader = .{ .ptr = view, .read = View.cell, .read_frozen = View.frozen, .read_json = View.json, .read_identity = View.identity, .read_dictionary = View.dictionary, .count = count_rows, .width = self.width } }, .blocks = blocks[0..held], .owner = self };
         }
         try self.loadBlock();
         const block = self.block.?;
+        const Batch = @import("execution_batch.zig").Batch;
+        const source = try a.create(Batch);
+        source.* = try block.batch(a, false);
         const begin = self.index - self.block_begin;
         var end = begin;
         var bytes: usize = 0;
         while (end < block.count() and end - begin < maximum) {
-            for (0..self.width) |column| bytes +|= try @import("operators.zig").datumBytes(try block.cell(end, column));
+            for (0..self.width) |column| bytes +|= try source.cellBytes(a, end, column);
             end += 1;
             if (bytes >= byte_limit) break;
         }
-        const View = struct {
-            block: *@import("spill.zig").Sequential.OwnedBlock,
-            begin: usize,
-            fn cell(raw: *anyopaque, _: std.mem.Allocator, row: usize, column: usize) anyerror!@import("scalar.zig").Datum {
-                const view: *@This() = @ptrCast(@alignCast(raw));
-                return view.block.cell(view.begin + row, column);
-            }
-        };
-        const view = try a.create(View);
-        view.* = .{ .block = block, .begin = begin };
+        const selection = try a.alloc(usize, end - begin);
+        for (selection, begin..) |*position, index| position.* = index;
+        const selected = try source.select(a, selection);
         block.retain();
         _ = self.refs.fetchAdd(1, .monotonic);
         self.index += end - begin;
-        return .{ .values = .{ .reader = .{ .ptr = view, .read = View.cell, .count = end - begin, .width = self.width } }, .block = block, .owner = self };
+        return .{ .values = selected, .block = block, .owner = self };
     }
     fn loadBlock(self: *Cursor) !void {
         if (self.block) |block| {
@@ -743,4 +784,55 @@ test "SQL blocking leases survive subsequent pulls for sorted and sequential wid
         try std.testing.expectEqualStrings(&payload, first_value.value.string);
         try std.testing.expectEqualStrings(&payload, (try first.values.cell(a, 0, 1)).value.string);
     }
+}
+
+test "SQL blocking native leases size frozen JSON without DOM expansion and preserve dictionary selections" {
+    const Fixture = struct {
+        fn check(_: *anyopaque) !void {}
+        fn run(a: std.mem.Allocator, cardinality: usize, measure: bool) !void {
+            const spill = @import("spill.zig");
+            const Datum = @import("scalar.zig").Datum;
+            var source = std.heap.ArenaAllocator.init(a);
+            defer source.deinit();
+            const sa = source.allocator();
+            var dummy: u8 = 0;
+            var manager: spill.Manager = .{ .alloc = a, .io = std.testing.io, .context = &dummy, .checkpoint = check, .compression = .none, .async_writes = false };
+            defer manager.deinit();
+            const cursor = try Cursor.create(a, &manager, 2);
+            defer cursor.close();
+            cursor.rows.block_bytes = 1024 * 1024;
+            var array = std.json.Array.init(sa);
+            for (0..cardinality) |index| try array.append(.{ .integer = @intCast(index) });
+            const datum = Datum.json(.{ .array = array });
+            const row = &.{ datum, Datum.json(.{ .string = "repeated dictionary body" }) };
+            // More rows make the physical string dictionary worthwhile.
+            const rows = try sa.alloc([]const Datum, 8);
+            const keys = try sa.alloc([]const Datum, 8);
+            const ordinals = try sa.alloc(u64, 8);
+            for (rows, keys, ordinals, 0..) |*r, *k, *o, index| {
+                r.* = row;
+                k.* = &.{};
+                o.* = index;
+            }
+            try cursor.rows.appendBatch(.{ .rows = rows }, .{ .rows = keys }, ordinals);
+            try cursor.loadBlock();
+            const block = cursor.block.?;
+            const before = block.retainedBytes();
+            const first = try cursor.nextLease(sa, 2, 1024 * 1024);
+            defer first.deinit();
+            try std.testing.expect((try first.values.frozenJson(0, 0)) != null);
+            const dictionary = (try first.values.dictionaryColumn(sa, 1)).?;
+            try std.testing.expectEqual(@as(usize, 2), dictionary.len());
+            try std.testing.expectEqualStrings("repeated dictionary body", (try dictionary.cell(sa, 1, 0)).value.string);
+            const after = block.retainedBytes();
+            try std.testing.expectEqual(before, after);
+            const next = try cursor.nextLease(sa, 6, 1024 * 1024);
+            defer next.deinit();
+            try std.testing.expect((try first.values.frozenJson(1, 0)) != null);
+            try std.testing.expect((try next.values.frozenJson(0, 0)) != null);
+            if (measure) std.debug.print("BLOCKING_FROZEN_LEASE rows={d} elements={d} before={d} after={d}\n", .{ first.values.len(), cardinality, before, after });
+        }
+    };
+    try Fixture.run(std.testing.allocator, 4096, true);
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Fixture.run, .{ @as(usize, 16), false });
 }

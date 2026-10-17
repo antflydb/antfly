@@ -437,6 +437,21 @@ lease. Server SQL column cursors and transport reencoding forward the optional
 encoded accessor. Sequential spill sizing uses encoded byte lengths and reclaims
 scalar fallback scratch after each row.
 
+Blocking-result leases also size and select frozen columns without scalar access.
+Sorted views preserve per-cell frozen capabilities, and expose dictionary IDs
+only when their rows share one backing block/store. Page leases pin that backing
+through subsequent pulls. Pgwire carries frozen handles to the bounded DataRow
+writer; text JSON is streamed directly into the frame, with the existing JSONB
+version byte for binary results. Scrollable cursor stores copy frozen bytes at
+their ownership boundary, retaining no producer pointers or temporary text.
+
+Spill cache pressure covers payload preparation, key serialization, and required
+writer buffers. Cohort identity maps and selection views retire before key
+emission. Immutable array sizing is memoized within the producer lease; each
+row's keys still receive independent admission. Optional async writer buffers
+check known parent headroom before allocation. A quota denial uses synchronous
+I/O without marking the parent exhausted; genuine allocator failures propagate.
+
 Directory leases stay with the existing 64-document metadata window across
 small payload pulls, and retire at page completion or a changed ID window.
 Sorted range cohorts in linked values continue from the last touched page;

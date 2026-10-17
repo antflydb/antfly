@@ -770,10 +770,11 @@ pub const HashJoin = struct {
     /// and avoiding a second file / extra reads for ordinary narrow joins.
     fn writeDiskRecord(manager: *@import("spill.zig").Manager, file: *@import("spill.zig").File, payloads: *?*@import("spill.zig").JoinPayloads, values: @import("execution_batch.zig").Batch, keys: []const Datum, ordinal: u64, link: u64, inline_budget: usize) !u64 {
         if (ordinal >= native_payload_bit) return error.SqlProgramLimitExceeded;
-        var arena = std.heap.ArenaAllocator.init(manager.allocator());
+        var pressure = @import("spill.zig").CachePressure.forPayloads(manager, payloads);
+        var arena = std.heap.ArenaAllocator.init(pressure.allocator());
         defer arena.deinit();
         if (try nativeRowBytes(values, 0, keys, inline_budget, arena.allocator()) == null)
-            return file.append(.{ .values = try values.row(arena.allocator(), 0), .keys = keys, .ordinal = ordinal }, link);
+            return file.appendWithPressure(.{ .values = try values.row(arena.allocator(), 0), .keys = keys, .ordinal = ordinal }, link, &pressure);
         if (payloads.* == null) {
             const owner = try manager.allocator().create(@import("spill.zig").JoinPayloads);
             errdefer manager.allocator().destroy(owner);
@@ -782,75 +783,102 @@ pub const HashJoin = struct {
         }
         const payload = try payloads.*.?.appendBatch(values);
         if (payload >= native_payload_bit) return error.SqlProgramLimitExceeded;
-        return file.append(.{ .values = &.{ Datum.json(.{ .integer = @intCast(values.width()) }), Datum.json(.{ .integer = 0 }) }, .keys = keys, .ordinal = payload | native_payload_bit }, link);
+        return file.appendWithPressure(.{ .values = &.{ Datum.json(.{ .integer = @intCast(values.width()) }), Datum.json(.{ .integer = 0 }) }, .keys = keys, .ordinal = payload | native_payload_bit }, link, &pressure);
     }
     /// Include boxed decoding, wire storage and arena growth in the inline
     /// choice. Payloads that exceed that allowance use the manager-owned lane.
-    fn nativeRowBytes(values: @import("execution_batch.zig").Batch, row: usize, keys: []const Datum, inline_budget: usize, a: Allocator) !?usize {
-        var native = false;
-        var retained: usize = 0;
-        var decoded: usize = 0;
-        for (keys) |key| decoded +|= try datumBytes(key);
-        for (0..values.width()) |column| {
-            if (try values.frozenJson(row, column)) |frozen| {
-                native = true;
-                retained +|= frozen.bytes.len +| 32;
-            } else if (try values.encodedJson(row, column)) |text| {
-                native = true;
-                retained +|= text.len +| 32;
-            } else {
-                const cell = try values.cell(a, row, column);
-                decoded +|= try datumBytes(cell);
-                retained +|= if (cell.array != null or cell.numeric != null or cell.patterns != null) try datumBytes(cell) else try @import("typed_store.zig").retainedCellBytes(cell);
+    const PayloadEstimate = struct {
+        native: bool = false,
+        retained: usize = 0,
+        decoded: usize = 0,
+        fn init(values: @import("execution_batch.zig").Batch, row: usize, a: Allocator) !PayloadEstimate {
+            var result: PayloadEstimate = .{};
+            for (0..values.width()) |column| {
+                if (try values.frozenJson(row, column)) |frozen| {
+                    result.native = true;
+                    result.retained +|= frozen.bytes.len +| 32;
+                } else if (try values.encodedJson(row, column)) |text| {
+                    result.native = true;
+                    result.retained +|= text.len +| 32;
+                } else {
+                    const cell = try values.cell(a, row, column);
+                    const size = try datumBytes(cell);
+                    result.decoded +|= size;
+                    result.retained +|= if (cell.array != null or cell.numeric != null or cell.patterns != null) size else try @import("typed_store.zig").retainedCellBytes(cell);
+                }
             }
+            return result;
         }
-        return if (native or retained > 1024 or decoded *| 2 +| 2048 > inline_budget) retained +| 64 else null;
+        fn recordBytes(self: PayloadEstimate, keys: []const Datum, inline_budget: usize) !?usize {
+            var decoded = self.decoded;
+            for (keys) |key| decoded +|= try datumBytes(key);
+            return if (self.native or self.retained > 1024 or decoded *| 2 +| 2048 > inline_budget) self.retained +| 64 else null;
+        }
+    };
+    fn nativeRowBytes(values: @import("execution_batch.zig").Batch, row: usize, keys: []const Datum, inline_budget: usize, a: Allocator) !?usize {
+        return (try PayloadEstimate.init(values, row, a)).recordBytes(keys, inline_budget);
     }
     const PayloadIdentity = [16]struct { kind: u64 = 0, first: u64 = 0, second: u64 = 0 };
-    /// Physical identity is valid only within this immutable producer lease.
-    /// Unsupported compound DOMs decline sharing; no pointer keys persist.
-    fn payloadIdentity(values: @import("execution_batch.zig").Batch, row: usize, a: Allocator) !?PayloadIdentity {
-        if (values.width() > 16) return null;
+    const PayloadDescription = struct { identity: ?PayloadIdentity, estimate: ?PayloadEstimate };
+    /// Inspect cheap cells once while collecting lease-local identities. Array
+    /// walks wait until a memo miss; ordinary inline rows need no second read.
+    /// Unsupported DOMs still receive normal sizing without an identity key.
+    fn describePayload(values: @import("execution_batch.zig").Batch, row: usize, a: Allocator) !PayloadDescription {
+        if (values.width() > 16) return .{ .identity = null, .estimate = try PayloadEstimate.init(values, row, a) };
         var result: PayloadIdentity = @splat(.{});
+        var identifiable = true;
+        var estimate: ?PayloadEstimate = .{};
         for (result[0..values.width()], 0..) |*part, column| {
             if (try values.frozenJson(row, column)) |frozen| {
                 part.* = .{ .kind = if (frozen.lossless_text) 1 else 2, .first = @intFromPtr(frozen.bytes.ptr), .second = frozen.bytes.len };
+                if (estimate) |*size| {
+                    size.native = true;
+                    size.retained +|= frozen.bytes.len +| 32;
+                }
             } else if (try values.encodedJson(row, column)) |text| {
                 part.* = .{ .kind = 3, .first = @intFromPtr(text.ptr), .second = text.len };
+                if (estimate) |*size| {
+                    size.native = true;
+                    size.retained +|= text.len +| 32;
+                }
             } else {
                 const cell = try values.cell(a, row, column);
+                if (cell.array != null) {
+                    estimate = null;
+                } else if (estimate) |*size| {
+                    const decoded = try datumBytes(cell);
+                    size.decoded +|= decoded;
+                    size.retained +|= if (cell.numeric != null or cell.patterns != null) decoded else try @import("typed_store.zig").retainedCellBytes(cell);
+                }
                 if (cell.sql_null) {
-                    if (cell.value != .null or cell.array != null or cell.numeric != null or cell.patterns != null) return null;
+                    if (cell.value != .null or cell.array != null or cell.numeric != null or cell.patterns != null) identifiable = false;
                     part.kind = 4;
-                    continue;
-                }
-                if (cell.array) |value| {
-                    if (cell.value != .null or cell.numeric != null or cell.patterns != null) return null;
+                } else if (cell.array) |value| {
+                    if (cell.value != .null or cell.numeric != null or cell.patterns != null) identifiable = false;
                     part.* = .{ .kind = 5, .first = @intFromPtr(value) };
-                    continue;
-                }
-                if (cell.numeric) |value| {
-                    if (cell.value != .null or cell.patterns != null) return null;
+                } else if (cell.numeric) |value| {
+                    if (cell.value != .null or cell.patterns != null) identifiable = false;
                     part.* = .{ .kind = 6, .first = @intFromPtr(value) };
-                    continue;
-                }
-                if (cell.patterns) |value| {
-                    if (cell.value != .null) return null;
+                } else if (cell.patterns) |value| {
+                    if (cell.value != .null) identifiable = false;
                     part.* = .{ .kind = 7, .first = @intFromPtr(value) };
-                    continue;
+                } else {
+                    part.* = switch (cell.value) {
+                        .null => .{ .kind = 8 },
+                        .bool => |value| .{ .kind = 9, .first = @intFromBool(value) },
+                        .integer => |value| .{ .kind = 10, .first = @bitCast(value) },
+                        .float => |value| .{ .kind = 11, .first = @bitCast(value) },
+                        .string => |value| .{ .kind = 12, .first = @intFromPtr(value.ptr), .second = value.len },
+                        .number_string => |value| .{ .kind = 13, .first = @intFromPtr(value.ptr), .second = value.len },
+                        else => blk: {
+                            identifiable = false;
+                            break :blk .{};
+                        },
+                    };
                 }
-                part.* = switch (cell.value) {
-                    .null => .{ .kind = 8 },
-                    .bool => |value| .{ .kind = 9, .first = @intFromBool(value) },
-                    .integer => |value| .{ .kind = 10, .first = @bitCast(value) },
-                    .float => |value| .{ .kind = 11, .first = @bitCast(value) },
-                    .string => |value| .{ .kind = 12, .first = @intFromPtr(value.ptr), .second = value.len },
-                    .number_string => |value| .{ .kind = 13, .first = @intFromPtr(value.ptr), .second = value.len },
-                    else => return null,
-                };
             }
         }
-        return result;
+        return .{ .identity = if (identifiable) result else null, .estimate = estimate };
     }
     /// One bounded producer cohort. Native rows share immutable payload pages;
     /// narrow rows keep the single-file path. Only page offsets and lane IDs
@@ -859,10 +887,12 @@ pub const HashJoin = struct {
         const Payloads = @import("spill.zig").JoinPayloads;
         if (values.len() == 0 or values.len() > Payloads.page_rows or keys.len != values.len()) return error.InvalidSqlBackendResponse;
         if (ordinal >= native_payload_bit or values.len() > native_payload_bit - ordinal) return error.SqlProgramLimitExceeded;
-        var arena = std.heap.ArenaAllocator.init(manager.allocator());
+        var pressure = @import("spill.zig").CachePressure.forPayloads(manager, payloads);
+        var arena = std.heap.ArenaAllocator.init(pressure.allocator());
         defer arena.deinit();
         const a = arena.allocator();
-        var identities: std.AutoHashMapUnmanaged(PayloadIdentity, usize) = .empty;
+        const Memo = struct { estimate: PayloadEstimate, native: ?usize = null };
+        var identities: std.AutoHashMapUnmanaged(PayloadIdentity, Memo) = .empty;
         var native: [Payloads.page_rows]?usize = @splat(null);
         var positions: [Payloads.page_rows]usize = undefined;
         var costs: [Payloads.page_rows]usize = undefined;
@@ -871,14 +901,19 @@ pub const HashJoin = struct {
         var unique: usize = 0;
         for (keys, 0..) |key, row| {
             if (key.len > 256 or key.len != keys[0].len) return error.InvalidSqlBackendResponse;
-            if (try nativeRowBytes(values, row, key, inline_budget, a)) |bytes| {
-                if (try payloadIdentity(values, row, a)) |identity| {
-                    const entry = try identities.getOrPut(a, identity);
-                    if (entry.found_existing) {
-                        native[row] = entry.value_ptr.*;
+            const description = try describePayload(values, row, a);
+            const identity = description.identity;
+            const memo = if (identity) |id| identities.get(id) else null;
+            const estimate = if (memo) |entry| entry.estimate else description.estimate orelse try PayloadEstimate.init(values, row, a);
+            if (try estimate.recordBytes(key, inline_budget)) |bytes| {
+                if (identity) |id| {
+                    const entry = try identities.getOrPut(a, id);
+                    if (!entry.found_existing) entry.value_ptr.* = .{ .estimate = estimate };
+                    if (entry.value_ptr.native) |prior| {
+                        native[row] = prior;
                         continue;
                     }
-                    entry.value_ptr.* = unique;
+                    entry.value_ptr.native = unique;
                 }
                 positions[unique] = row;
                 costs[unique] = bytes;
@@ -907,7 +942,10 @@ pub const HashJoin = struct {
             for (refs[begin..end], 0..) |*ref, row| ref.* = .{ .offset = offset, .row = row };
             begin = end;
         }
-        var row_scratch = std.heap.ArenaAllocator.init(manager.allocator());
+        // Only physical page/lane refs survive into key emission. Retire the
+        // identity map and selection views before allocating key wire buffers.
+        _ = arena.reset(.free_all);
+        var row_scratch = std.heap.ArenaAllocator.init(pressure.allocator());
         defer row_scratch.deinit();
         for (keys, 0..) |key, row| {
             _ = row_scratch.reset(.{ .retain_with_limit = 8192 });
@@ -916,8 +954,8 @@ pub const HashJoin = struct {
             const link = if (hashed != null) heads[bucket] else @import("spill.zig").none;
             const offset = if (native[row]) |id| blk: {
                 const ref = refs[id];
-                break :blk try file.append(.{ .values = &.{ Datum.json(.{ .integer = @intCast(values.width()) }), Datum.json(.{ .integer = @intCast(ref.row) }) }, .keys = key, .ordinal = ref.offset | native_payload_bit }, link);
-            } else try file.append(.{ .values = try values.row(row_scratch.allocator(), row), .keys = key, .ordinal = ordinal + row }, link);
+                break :blk try file.appendWithPressure(.{ .values = &.{ Datum.json(.{ .integer = @intCast(values.width()) }), Datum.json(.{ .integer = @intCast(ref.row) }) }, .keys = key, .ordinal = ref.offset | native_payload_bit }, link, &pressure);
+            } else try file.appendWithPressure(.{ .values = try values.row(row_scratch.allocator(), row), .keys = key, .ordinal = ordinal + row }, link, &pressure);
             if (hashed != null) heads[bucket] = offset;
         }
     }
@@ -3495,4 +3533,115 @@ test "SQL native payload read cache uses actual allocations under statement size
             try Fixture.run(std.testing.allocator, quota, compressed, true, true);
         try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Fixture.run, .{ @as(usize, 2 * 1024 * 1024), compressed, false, false });
     }
+}
+
+test "SQL native spill keys share cache pressure across scalar and cohort writes" {
+    const Fixture = struct {
+        fn check(_: *anyopaque) !void {}
+        fn run(a: Allocator, batch: bool, key_bytes: usize, count: usize, measure: bool) !void {
+            var budget: MemoryBudget = .{ .backing = a, .limit = 65536 };
+            defer std.debug.assert(budget.live == 0);
+            var dummy: u8 = 0;
+            var manager: @import("spill.zig").Manager = .{ .alloc = budget.allocator(), .io = std.testing.io, .context = &dummy, .checkpoint = check, .compression = .none, .async_writes = false };
+            defer manager.deinit();
+            const join = try HashJoin.create(budget.allocator(), .{ .bytes = 8192, .spill = &manager });
+            defer join.deinit();
+            try join.startSpill();
+            var source = std.heap.ArenaAllocator.init(a);
+            defer source.deinit();
+            const sa = source.allocator();
+            const rows = try sa.alloc([]const Datum, count);
+            const keys = try sa.alloc([]const Datum, count);
+            const key = try sa.alloc(u8, key_bytes);
+            @memset(key, 'k');
+            for (rows, keys, 0..) |*row, *keys_, index| {
+                const body = try sa.alloc(u8, 12000);
+                @memset(body, 'x');
+                body[0] = @intCast('a' + index);
+                const cells = try sa.alloc(Datum, 1);
+                cells[0] = Datum.json(.{ .string = body });
+                row.* = cells;
+                const key_cells = try sa.alloc(Datum, 1);
+                key_cells[0] = Datum.json(.{ .string = key });
+                keys_.* = key_cells;
+                if (!batch) try join.add(cells, key_cells);
+            }
+            if (batch) try join.addBatch(sa, .{ .rows = rows }, keys);
+            try std.testing.expectEqual(count, join.row_count);
+            try std.testing.expect(!budget.isExhausted());
+            if (measure) std.debug.print("SPILL_KEY_ADMISSION batch={} rows={d} key={d} limit={d} peak={d}\n", .{ batch, count, key_bytes, budget.limit, budget.peak });
+        }
+    };
+    for ([_]bool{ false, true }) |batch| {
+        for ([_]usize{ 16384, 24000 }) |key_bytes| try Fixture.run(std.testing.allocator, batch, key_bytes, 10, true);
+        try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Fixture.run, .{ batch, @as(usize, 16384), @as(usize, 3), false });
+    }
+}
+
+test "SQL native cohort sizing reuses immutable array estimates and validates each key" {
+    const Fixture = struct {
+        array: *@import("array_value.zig").Value,
+        reads: usize = 0,
+        fn read(raw: *anyopaque, _: Allocator, _: usize, _: usize) !Datum {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.reads += 1;
+            return Datum.typedArray(self.array);
+        }
+        fn check(_: *anyopaque) !void {}
+        fn run(a: Allocator, count: usize, cardinality: usize, measure: bool) !void {
+            var source = std.heap.ArenaAllocator.init(a);
+            defer source.deinit();
+            const sa = source.allocator();
+            const elements = try sa.alloc(Datum, cardinality);
+            for (elements, 0..) |*element, index| element.* = Datum.json(.{ .integer = @intCast(index) });
+            var array = try @import("array_value.zig").Value.init(.int64, &.{.{ .length = @intCast(cardinality) }}, elements, .{});
+            var fixture: @This() = .{ .array = &array };
+            var dummy: u8 = 0;
+            var manager: @import("spill.zig").Manager = .{ .alloc = a, .io = std.testing.io, .context = &dummy, .checkpoint = check, .compression = .none, .async_writes = false };
+            defer manager.deinit();
+            const join = try HashJoin.create(a, .{ .bytes = 8192, .spill = &manager });
+            defer join.deinit();
+            try join.startSpill();
+            const keys = try sa.alloc([]const Datum, count);
+            for (keys) |*key| key.* = &.{Datum.json(.{ .integer = 1 })};
+            try join.addBatch(sa, .{ .reader = .{ .ptr = &fixture, .read = read, .count = count, .width = 1 } }, keys);
+            try std.testing.expectEqual(count + 2, fixture.reads);
+            try std.testing.expectEqual(@as(usize, 1), join.disk_values.?.encoded_pages);
+            if (measure) std.debug.print("SPILL_ARRAY_SIZING rows={d} elements={d} cell_reads={d} encoded_pages=1\n", .{ count, cardinality, fixture.reads });
+            // Payload memoization cannot skip per-row key admission.
+            const estimate = try HashJoin.PayloadEstimate.init(.{ .rows = &.{&.{Datum.json(.{ .integer = 1 })}} }, 0, sa);
+            try std.testing.expect(try estimate.recordBytes(&.{Datum.json(.{ .integer = 1 })}, 8192) == null);
+            var body: [8192]u8 = @splat('k');
+            try std.testing.expect(try estimate.recordBytes(&.{Datum.json(.{ .string = &body })}, 8192) != null);
+        }
+    };
+    try Fixture.run(std.testing.allocator, 64, 8192, true);
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Fixture.run, .{ @as(usize, 3), @as(usize, 128), false });
+}
+
+test "SQL native spill classification keeps ordinary inline rows on one sizing read" {
+    const Reader = struct {
+        reads: usize = 0,
+        fn cell(raw: *anyopaque, _: Allocator, _: usize, _: usize) !Datum {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.reads += 1;
+            return Datum.json(.{ .integer = 7 });
+        }
+        fn check(_: *anyopaque) !void {}
+    };
+    const a = std.testing.allocator;
+    var source = std.heap.ArenaAllocator.init(a);
+    defer source.deinit();
+    var dummy: u8 = 0;
+    var manager: @import("spill.zig").Manager = .{ .alloc = a, .io = std.testing.io, .context = &dummy, .checkpoint = Reader.check, .async_writes = false };
+    defer manager.deinit();
+    const join = try HashJoin.create(a, .{ .bytes = 8192, .spill = &manager });
+    defer join.deinit();
+    try join.startSpill();
+    var reader: Reader = .{};
+    var keys: [64][]const Datum = undefined;
+    for (&keys) |*key| key.* = &.{Datum.json(.{ .integer = 1 })};
+    try join.addBatch(source.allocator(), .{ .reader = .{ .ptr = &reader, .read = Reader.cell, .count = 64, .width = 1 } }, &keys);
+    try std.testing.expect(join.disk_values == null);
+    try std.testing.expectEqual(@as(usize, 128), reader.reads);
 }

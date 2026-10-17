@@ -21,7 +21,7 @@ const Budget = @import("budget.zig").Budget;
 // A page owns its prepared payloads. Type tags live once per column; scalar
 // cells remain plain JSON values and native cells retain compact pointers.
 const ColumnPayload = union(enum) {
-    json: struct { values: []std.json.Value, nulls: []bool, encoded: []?[]const u8 },
+    json: struct { values: []std.json.Value, nulls: []bool, encoded: []?[]const u8, frozen: []?@import("antfly_local_sources").sql_execution_batch.FrozenJson },
     array: []?*const @import("antfly_local_sources").sql_array_value.Value,
     numeric: []?*const @import("antfly_local_sources").sql_numeric_value.Value,
 };
@@ -71,7 +71,7 @@ pub const Store = struct {
         }
         const index = row - page.begin;
         return switch (page.columns[column]) {
-            .json => |data| if (data.encoded.len != 0 and data.encoded[index] != null) .{ .json_bytes = data.encoded[index], .sql_null = false } else .{ .value = data.values[index], .sql_null = data.nulls[index] },
+            .json => |data| if (data.frozen.len != 0 and data.frozen[index] != null) .{ .frozen_json = data.frozen[index], .sql_null = false } else if (data.encoded.len != 0 and data.encoded[index] != null) .{ .json_bytes = data.encoded[index], .sql_null = false } else .{ .value = data.values[index], .sql_null = data.nulls[index] },
             .array => |values| if (values[index]) |value| .{ .array = value, .sql_null = false } else .{ .sql_null = true },
             .numeric => |values| if (values[index]) |value| .{ .numeric = value, .sql_null = false } else .{ .sql_null = true },
         };
@@ -103,15 +103,23 @@ pub const Store = struct {
         const sources = @import("antfly_local_sources");
         for (definitions, page.columns) |definition, *payload| {
             _ = try @import("values.zig").columnOid(definition);
-            payload.* = if (definition.type == .array) .{ .array = try a.alloc(?*const sources.sql_array_value.Value, count) } else if (definition.type == .number and definition.element_type == .numeric) .{ .numeric = try a.alloc(?*const sources.sql_numeric_value.Value, count) } else .{ .json = .{ .values = try a.alloc(std.json.Value, count), .nulls = try a.alloc(bool, count), .encoded = if (definition.type == .json) try a.alloc(?[]const u8, count) else &.{} } };
+            payload.* = if (definition.type == .array) .{ .array = try a.alloc(?*const sources.sql_array_value.Value, count) } else if (definition.type == .number and definition.element_type == .numeric) .{ .numeric = try a.alloc(?*const sources.sql_numeric_value.Value, count) } else .{ .json = .{ .values = try a.alloc(std.json.Value, count), .nulls = try a.alloc(bool, count), .encoded = if (definition.type == .json) try a.alloc(?[]const u8, count) else &.{}, .frozen = if (definition.type == .json) try a.alloc(?sources.sql_execution_batch.FrozenJson, count) else &.{} } };
         }
         for (0..count) |row| for (definitions, page.columns, 0..) |definition, *payload, column| {
             const value = try result.cell(a, row, column);
-            if (value.sql_null and (value.value != .null or value.array != null or value.numeric != null or value.json_bytes != null)) return error.InvalidResult;
+            if (value.sql_null and (value.value != .null or value.array != null or value.numeric != null or value.json_bytes != null or value.frozen_json != null)) return error.InvalidResult;
+            if (value.frozen_json != null and (definition.type != .json or value.value != .null or value.array != null or value.numeric != null or value.json_bytes != null)) return error.InvalidResult;
             switch (payload.*) {
                 .json => |data| {
                     if (value.array != null or value.numeric != null) return error.InvalidResult;
-                    if (value.json_bytes) |bytes| {
+                    if (data.frozen.len != 0) data.frozen[row] = null;
+                    if (value.frozen_json) |frozen| {
+                        var owned = frozen;
+                        owned.bytes = try a.dupe(u8, frozen.bytes);
+                        data.frozen[row] = owned;
+                        data.encoded[row] = null;
+                        data.values[row] = .null;
+                    } else if (value.json_bytes) |bytes| {
                         if (definition.type != .json or value.value != .null) return error.InvalidResult;
                         data.encoded[row] = try a.dupe(u8, bytes);
                         data.values[row] = .null;
@@ -364,6 +372,44 @@ test "pgwire encoded JSONB spool owns bytes and preserves SQL and JSON nulls on 
             try std.testing.expectEqualStrings("{\"x\":1}", (try store.cell(0, 0)).json_bytes.?);
             try std.testing.expect(!(try store.cell(1, 0)).sql_null);
             try std.testing.expect((try store.cell(2, 0)).sql_null);
+        }
+    };
+    try Fixture.run(std.testing.allocator);
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Fixture.run, .{});
+}
+
+test "pgwire cursor spool owns frozen JSON leases and unwinds allocation failures" {
+    const Fixture = struct {
+        value: @import("antfly_local_sources").sql_execution_batch.FrozenJson,
+        fn read(raw: *anyopaque, _: std.mem.Allocator, row: usize, _: usize) !backend.Cell {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            return if (row == 0) .{ .frozen_json = self.value, .sql_null = false } else .{ .sql_null = true };
+        }
+        fn run(a: std.mem.Allocator) !void {
+            var budget: Budget = .{ .child = a, .limit = 1 << 20 };
+            defer std.debug.assert(budget.used == 0);
+            var store = Store.init(&budget);
+            defer store.deinit();
+            const sources = @import("antfly_local_sources");
+            {
+                var arena = std.heap.ArenaAllocator.init(a);
+                defer arena.deinit();
+                const sa = arena.allocator();
+                const root = try std.json.parseFromSliceLeaky(std.json.Value, sa, "{\"x\":[9007199254740993,true,null]}", .{ .parse_numbers = false });
+                const wire = try sources.sql_spill.encodeColumnarBlockVersionAlloc(sa, &.{.{ .values = &.{sources.sql_scalar.Datum.json(root)}, .keys = &.{}, .ordinal = 0 }}, 1 << 20, .v2);
+                const block = try sources.sql_spill.decodeColumnarBlockForForwarding(sa, a, wire, 1 << 20);
+                defer block.deinit();
+                var fixture: @This() = .{ .value = (try block.frozenJson(0, 0, false)).? };
+                try store.append(.{ .columns = &.{.{ .name = "j", .type = .json }}, .cells = .{ .context = &fixture, .count = 2, .width = 1, .read = read }, .command_tag = "SELECT" }, 2);
+            }
+            const cell = try store.cell(0, 0);
+            try std.testing.expect(cell.frozen_json != null);
+            try std.testing.expect((try store.cell(1, 0)).sql_null);
+            var output: [128]u8 = undefined;
+            var writer: std.Io.Writer = .fixed(&output);
+            var scratch = std.heap.FixedBufferAllocator.init(&.{});
+            try @import("values.zig").encodeCellInto(scratch.allocator(), &writer, .{ .name = "j", .type = .json }, 0, cell, output.len);
+            try std.testing.expectEqualStrings("{\"x\":[9007199254740993,true,null]}", writer.buffered());
         }
     };
     try Fixture.run(std.testing.allocator);

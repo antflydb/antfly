@@ -586,7 +586,7 @@ const OwnedRead = struct {
             const self: *@This() = @ptrCast(@alignCast(raw));
             if (try self.page.values.frozenJson(row, column)) |value| {
                 if (self.page.columns[column].type != .json) return error.InvalidSqlBackendResponse;
-                return .{ .json_bytes = try @import("antfly_local_sources").sql_spill.frozenJsonText(alloc, value), .sql_null = false };
+                return .{ .frozen_json = value, .sql_null = false };
             }
             if (try self.page.values.encodedJson(row, column)) |bytes| {
                 if (self.page.columns[column].type != .json) return error.InvalidSqlBackendResponse;
@@ -1809,10 +1809,18 @@ test "SQL pgwire native frozen JSON renders exact numbers without scalar deliver
                         .exhausted = true,
                     } };
                     defer owner.page.deinit();
-                    const cell = try OwnedRead.PageOwner.cell(&owner, alloc, 0, 0);
-                    try std.testing.expect(!cell.sql_null and cell.value == .null);
+                    var scratch = std.heap.FixedBufferAllocator.init(&.{});
+                    const cell = try OwnedRead.PageOwner.cell(&owner, scratch.allocator(), 0, 0);
+                    try std.testing.expect(!cell.sql_null and cell.value == .null and cell.json_bytes == null and cell.frozen_json != null);
                     const expected = try std.json.Stringify.valueAlloc(alloc, root, .{});
-                    try std.testing.expectEqualStrings(expected, cell.json_bytes.?);
+                    for ([_]u16{ 0, 1 }) |format| {
+                        var buffer: [256]u8 = undefined;
+                        var output: std.Io.Writer = .fixed(&buffer);
+                        try wire_values.encodeCellInto(scratch.allocator(), &output, .{ .name = "j", .type = .json }, format, cell, buffer.len);
+                        const prefix: usize = @intFromBool(format == 1);
+                        if (prefix != 0) try std.testing.expectEqual(@as(u8, 1), output.buffered()[0]);
+                        try std.testing.expectEqualStrings(expected, output.buffered()[prefix..]);
+                    }
                 }
             }
         }
