@@ -1117,6 +1117,63 @@ fn decodeColumnarBlockMode(a: Allocator, cache_backing: ?Allocator, bytes: []con
 /// Random-access hash chains
 /// keep File's independently framed records. Logical offsets here are row
 /// ordinals; readers consume blocks in order and may restart at ordinal zero.
+/// Random-access native payloads for hash chains. The chain's separate small
+/// key record owns the link/matched flag; failed key comparisons never read
+/// this file. Offsets are physical, so reverse chains do not replay prefixes.
+pub const JoinPayloads = struct {
+    file: File,
+    pub fn init(manager: *Manager) !JoinPayloads {
+        var file = try manager.create();
+        file.buffer_bytes = @min(4096, manager.buffer_bytes);
+        return .{ .file = file };
+    }
+    pub fn close(self: *JoinPayloads) void {
+        self.file.close();
+    }
+    pub fn append(self: *JoinPayloads, values: @import("execution_batch.zig").Batch, ordinal: u64) !u64 {
+        if (values.len() != 1) return error.InvalidSqlSpill;
+        var arena = std.heap.ArenaAllocator.init(self.file.manager.allocator());
+        defer arena.deinit();
+        const wire = try encodeColumnarBatchVersionAlloc(arena.allocator(), values, &.{ordinal}, self.file.manager.max_record_bytes, .v2);
+        const compressed = if (self.file.manager.compression == .snappy and wire.len >= 1024) try snappy.encode(arena.allocator(), wire) else null;
+        const use_compressed = compressed != null and compressed.?.len + 32 < wire.len;
+        const stored = if (use_compressed) compressed.? else wire;
+        var header: [17]u8 = undefined;
+        header[16] = @intFromBool(use_compressed);
+        std.mem.writeInt(u64, header[0..8], stored.len, .little);
+        std.mem.writeInt(u64, header[8..16], std.hash.Wyhash.hash(0, wire), .little);
+        const offset = self.file.size;
+        try self.file.writeRaw(offset, &header);
+        try self.file.writeRaw(offset + header.len, stored);
+        self.file.manager.increment("compressed_records", @intFromBool(use_compressed));
+        return offset;
+    }
+    pub fn read(self: *JoinPayloads, offset: u64) !*Sequential.OwnedBlock {
+        var header: [17]u8 = undefined;
+        try self.file.readRaw(offset, &header);
+        const length = std.mem.readInt(u64, header[0..8], .little);
+        if (header[16] > 1 or length > self.file.manager.max_record_bytes or length > self.file.size -| (offset + header.len)) return error.InvalidSqlSpill;
+        const a = self.file.manager.allocator();
+        const owner = try a.create(Sequential.OwnedBlock);
+        owner.* = .{ .a = a, .arena = .init(a) };
+        errdefer owner.release();
+        const encoded = try owner.arena.allocator().alloc(u8, @intCast(length));
+        try self.file.readRaw(offset + header.len, encoded);
+        const wire = if (header[16] == 1) blk: {
+            const decoded_len = snappy.decodedLen(encoded) catch return error.InvalidSqlSpill;
+            if (decoded_len > self.file.manager.max_record_bytes) return error.InvalidSqlSpill;
+            break :blk snappy.decode(owner.arena.allocator(), encoded) catch |err| switch (err) {
+                error.OutOfMemory => return err,
+                else => return error.InvalidSqlSpill,
+            };
+        } else encoded;
+        if (std.hash.Wyhash.hash(0, wire) != std.mem.readInt(u64, header[8..16], .little)) return error.InvalidSqlSpill;
+        owner.encoded = try decodeColumnarBlockForForwarding(owner.arena.allocator(), a, wire, self.file.manager.max_record_bytes);
+        if (owner.count() != 1) return error.InvalidSqlSpill;
+        return owner;
+    }
+};
+
 pub const Sequential = struct {
     file: File,
     size: u64 = 0,
@@ -5101,4 +5158,46 @@ test "SQL borrowed compact blocks retire lazy scalar cache allocations" {
     };
     try Fixture.run(std.testing.allocator);
     try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Fixture.run, .{});
+}
+
+test "SQL native chain payloads retain physical offsets validate corruption and cancellation" {
+    const Hook = struct {
+        fn check(raw: *anyopaque) !void {
+            const canceled: *bool = @ptrCast(@alignCast(raw));
+            if (canceled.*) return error.QueryCanceled;
+        }
+    };
+    for ([_]bool{ false, true }) |compressed| {
+        const a = std.testing.allocator;
+        var canceled = false;
+        var manager: Manager = .{ .alloc = a, .io = std.testing.io, .context = &canceled, .checkpoint = Hook.check, .compression = if (compressed) .snappy else .none, .async_writes = false };
+        defer manager.deinit();
+        var file = try JoinPayloads.init(&manager);
+        defer file.close();
+        var text: [8192]u8 = @splat('x');
+        const row = [_]Datum{Datum.json(.{ .string = &text })};
+        const first = try file.append(.{ .rows = &.{&row} }, 7);
+        const second = try file.append(.{ .rows = &.{&row} }, 11);
+        @memset(&text, 'y');
+        const later = try file.read(second);
+        defer later.release();
+        const earlier = try file.read(first);
+        defer earlier.release();
+        try std.testing.expectEqual(@as(u64, 11), later.ordinal(0));
+        try std.testing.expectEqual(@as(u64, 7), earlier.ordinal(0));
+        try std.testing.expectEqual(@as(u8, 'x'), (try earlier.cell(0, 0)).value.string[0]);
+        try std.testing.expectEqual(@as(u8, 'x'), (try later.cell(0, 0)).value.string[0]);
+        canceled = true;
+        try std.testing.expectError(error.QueryCanceled, file.read(first));
+        canceled = false;
+        var header: [17]u8 = undefined;
+        try file.file.readRaw(first, &header);
+        try std.testing.expectEqual(@intFromBool(compressed), header[16]);
+        try file.file.writeRaw(first + 16, &.{2});
+        try std.testing.expectError(error.InvalidSqlSpill, file.read(first));
+        try file.file.writeRaw(first + 16, header[16..17]);
+        header[8] ^= 1;
+        try file.file.writeRaw(first + 8, header[8..16]);
+        try std.testing.expectError(error.InvalidSqlSpill, file.read(first));
+    }
 }

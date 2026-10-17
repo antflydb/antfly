@@ -547,16 +547,17 @@ pub const Store = struct {
     // values avoid dictionary metadata; large fan-out rows share bytes/cache.
     json_payloads: std.HashMapUnmanaged(JsonKey, *JsonPayload, JsonKeyContext, 80) = .empty,
     const JsonKey = struct { representation: u8, bytes: []const u8, hash: u64 };
-    /// A memo belongs to one immutable producer lease, and is discarded before
-    /// another pull. Admission and retention may share it; borrowed addresses
+    /// A memo belongs to one destination store and immutable producer lease,
+    /// and is discarded before another pull. Admission and retention may share it; borrowed addresses
     /// must never become persistent keys in the destination store.
     pub const JsonLease = struct {
         a: A,
         identities: std.AutoHashMapUnmanaged(Identity, Resolution) = .empty,
         // Local counters make hash work measurable without global test hooks.
         hashed_bytes: usize = 0,
+        generation: usize = 0,
         const Identity = struct { address: usize, len: usize, representation: u8 };
-        const Resolution = struct { key: JsonKey, owned: ?*JsonPayload, estimated: bool = false };
+        const Resolution = struct { key: JsonKey, owned: ?*JsonPayload, estimated: usize = 0 };
         pub fn init(a: A) JsonLease {
             return .{ .a = @import("memory_budget.zig").reclaimingAllocator(a) };
         }
@@ -708,8 +709,9 @@ pub const Store = struct {
         defer lease.deinit();
         return self.batchAppendBytesLeased(a, batch, maximum, &lease);
     }
-    /// Reuse this memo only for this candidate's admission followed by append;
-    /// prefix retries need a fresh memo because their counted set differs.
+    /// Resolutions survive retries within one producer lease. Each estimate
+    /// gets a separate counting generation so declined prefixes cannot hide
+    /// payload bytes in a later attempt.
     pub fn batchAppendBytesLeased(self: *const Store, a: A, batch: @import("execution_batch.zig").Batch, maximum: usize, lease: *JsonLease) !usize {
         var region = std.heap.ArenaAllocator.init(@import("memory_budget.zig").reclaimingAllocator(a));
         defer region.deinit();
@@ -717,6 +719,12 @@ pub const Store = struct {
         var incoming: std.HashMapUnmanaged(JsonKey, void, JsonKeyContext, 80) = .empty;
         var cell_region = std.heap.ArenaAllocator.init(work);
         defer cell_region.deinit();
+        lease.generation +%= 1;
+        if (lease.generation == 0) {
+            var entries = lease.identities.valueIterator();
+            while (entries.next()) |entry| entry.estimated = 0;
+            lease.generation = 1;
+        }
         var bytes: usize = 0;
         for (0..batch.width()) |column| for (0..batch.len()) |index| {
             const payload: ?JsonPayload = if (try batch.frozenJson(index, column)) |frozen|
@@ -731,8 +739,10 @@ pub const Store = struct {
                 const source = if (native.frozen) |frozen| frozen.bytes else native.text.?;
                 if (source.len >= 256) {
                     const resolved = try lease.resolve(self, native);
-                    if (resolved.owned != null or resolved.estimated) continue;
-                    resolved.estimated = true;
+                    if (resolved.estimated == lease.generation) continue;
+                    resolved.estimated = lease.generation;
+                    if (resolved.owned == null) resolved.owned = self.json_payloads.get(resolved.key);
+                    if (resolved.owned != null) continue;
                     const entry = try incoming.getOrPut(work, resolved.key);
                     if (entry.found_existing) continue;
                 }
@@ -1339,6 +1349,9 @@ test "SQL native JSON lease hashes each body once across admission and retention
             var lease = Store.JsonLease.init(a);
             defer lease.deinit();
             const estimate = try store.batchAppendBytesLeased(a, batch, std.math.maxInt(usize), &lease);
+            for (0..3) |_| try std.testing.expectEqual(estimate, try store.batchAppendBytesLeased(a, batch, std.math.maxInt(usize), &lease));
+            lease.generation = std.math.maxInt(usize);
+            try std.testing.expectEqual(estimate, try store.batchAppendBytesLeased(a, batch, std.math.maxInt(usize), &lease));
             const length = if (fixture.frozen) |frozen| frozen.bytes.len else text.len;
             try std.testing.expectEqual(length, lease.hashed_bytes);
             try store.appendBatchLeased(batch, &lease);

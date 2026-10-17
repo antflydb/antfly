@@ -85,6 +85,7 @@ pub const Join = struct {
     evaluation: ?Evaluation = null,
     output: ?*@import("parallel_output.zig").Pipe = null,
     native_pipe_view: ?@import("parallel_output.zig").Pipe.View = null,
+    native_disk_leases: std.ArrayList(*spill.Sequential.OwnedBlock) = .empty,
     output_task: ?@import("parallel_scheduler.zig").Task(anyerror!bool) = null,
     parallel_partitions_completed: usize = 0,
     prepared: [8]?*Join = @splat(null),
@@ -103,19 +104,28 @@ pub const Join = struct {
         return true;
     }
     fn spoolPartition(self: *Join, file: *@import("parallel_output.zig").Pipe) !void {
-        const evaluation = self.evaluation.?;
         var arena = std.heap.ArenaAllocator.init(self.a);
         defer arena.deinit();
         while (true) {
-            _ = arena.reset(.retain_capacity);
+            _ = arena.reset(.{ .retain_with_limit = 64 * 1024 });
             const a = arena.allocator();
-            const pair = try self.nextNativePair(true) orelse break;
-            var view: NativeRows = .{ .rows = &.{pair}, .evaluation = evaluation };
-            if (!try self.acceptNative(a, &view, pair.match)) continue;
-            const keys = [_]Datum{ Datum.json(.{ .bool = pair.left != null }), Datum.json(.{ .bool = pair.right != null }) };
-            // The queue owns one encoded copy before the next probe can retire
-            // its input block. Byte accounting also consumes native lengths.
-            try file.appendBatch(view.batch(), .{ .rows = &.{&keys} }, &.{0});
+            var failure: ?anyerror = null;
+            const batch = try self.nextBatch(a, 64, &failure);
+            if (batch.len() != 0) {
+                const view: *NativeRows = @ptrCast(@alignCast(batch.reader.ptr));
+                var keys: [64][2]Datum = undefined;
+                var key_rows: [64][]const Datum = undefined;
+                var ordinals: [64]u64 = @splat(0);
+                for (view.rows, 0..) |pair, row| {
+                    keys[row] = .{ Datum.json(.{ .bool = pair.left != null }), Datum.json(.{ .bool = pair.right != null }) };
+                    key_rows[row] = &keys[row];
+                }
+                // The queue copies a bounded cohort before the next pull can
+                // release its source block or accepted native disk leases.
+                try file.appendBatch(batch, .{ .rows = key_rows[0..batch.len()] }, ordinals[0..batch.len()]);
+            }
+            if (failure) |err| return err;
+            if (batch.len() == 0) break;
         }
     }
     fn nextOutput(self: *Join) !?Pair {
@@ -346,6 +356,7 @@ pub const Join = struct {
         if (self.active_join) |owner| owner.close();
         self.closeInputs();
         if (self.output) |pipe| pipe.close();
+        self.native_disk_leases.deinit(self.a);
         self.scalar_row.deinit(self.a);
         self.scratch.deinit();
         self.candidate.deinit();
@@ -353,7 +364,12 @@ pub const Join = struct {
         self.a.free(self.filter);
         self.a.destroy(self);
     }
+    fn releaseNativeDiskLeases(self: *Join) void {
+        for (self.native_disk_leases.items) |block| block.release();
+        self.native_disk_leases.clearRetainingCapacity();
+    }
     fn closeInputs(self: *Join) void {
+        self.releaseNativeDiskLeases();
         if (self.native_pipe_view) |view| view.deinit();
         self.native_pipe_view = null;
         if (self.probe_input) |*block| block.deinit();
@@ -582,6 +598,7 @@ pub const Join = struct {
             probe: *const spill.Sequential.OwnedBlock,
             build: *const @import("typed_store.zig").Store,
             values: []const Datum,
+            disk: operators.HashJoin.Match.NativeMatch,
         },
         index: usize = 0,
         width: usize,
@@ -590,6 +607,7 @@ pub const Join = struct {
             return switch (self.source) {
                 .probe => |block| block.cell(self.index, column),
                 .build => |store| store.cell(a, self.index, column),
+                .disk => |native| (try native.block()).cell(0, column),
                 .values => |values| if (column < values.len) values[column] else error.InvalidSqlBackendResponse,
             };
         }
@@ -598,6 +616,7 @@ pub const Join = struct {
             return switch (self.source) {
                 .probe => |block| if (block.encoded) |encoded| encoded.encodedJson(self.index, column, false) else null,
                 .build => |store| store.encodedJson(self.index, column),
+                .disk => |native| if ((try native.block()).encoded) |encoded| encoded.encodedJson(0, column, false) else null,
                 .values => null,
             };
         }
@@ -606,6 +625,7 @@ pub const Join = struct {
             return switch (self.source) {
                 .probe => |block| if (block.encoded) |encoded| encoded.frozenJson(self.index, column, false) else null,
                 .build => |store| store.frozenJson(self.index, column),
+                .disk => |native| if ((try native.block()).encoded) |encoded| encoded.frozenJson(0, column, false) else null,
                 .values => null,
             };
         }
@@ -614,7 +634,20 @@ pub const Join = struct {
             for (values, 0..) |*value, column| value.* = try self.cell(a, column);
             return values;
         }
-        fn retain(self: NativeRow, a: A) !NativeRow {
+        fn retain(self: NativeRow, a: A, owner: *Join) !NativeRow {
+            if (self.source == .disk) {
+                const block = try self.source.disk.block();
+                var pinned = false;
+                for (owner.native_disk_leases.items) |existing| if (existing == block) {
+                    pinned = true;
+                    break;
+                };
+                if (!pinned) {
+                    try owner.native_disk_leases.append(owner.a, block);
+                    block.retain();
+                }
+                return .{ .source = .{ .probe = block }, .width = self.width };
+            }
             // Disk-chain matches borrow the decoder until the next candidate.
             // Copy only accepted fallback rows, including nested payloads.
             if (self.source == .values) {
@@ -625,6 +658,7 @@ pub const Join = struct {
             return self;
         }
         fn build(match: operators.HashJoin.Match) NativeRow {
+            if (match.native) |native| return .{ .source = .{ .disk = native }, .width = native.width };
             return if (match.owner) |owner|
                 .{ .source = .{ .build = &owner.value_columns }, .index = match.index, .width = owner.entries.items[match.index].width }
             else
@@ -635,10 +669,10 @@ pub const Join = struct {
         left: ?NativeRow,
         right: ?NativeRow,
         match: ?usize = null,
-        fn append(self: NativePair, a: A, rows: *std.ArrayList(NativePair)) !void {
+        fn append(self: NativePair, a: A, rows: *std.ArrayList(NativePair), owner: *Join) !void {
             try rows.append(a, .{
-                .left = if (self.left) |left| try left.retain(a) else null,
-                .right = if (self.right) |right| try right.retain(a) else null,
+                .left = if (self.left) |left| try left.retain(a, owner) else null,
+                .right = if (self.right) |right| try right.retain(a, owner) else null,
                 .match = self.match,
             });
         }
@@ -693,6 +727,7 @@ pub const Join = struct {
     /// Borrow one probe cohort and build partition until the next pull. Workers
     /// copy encoded values only at the bounded queue's ownership boundary.
     pub fn nextBatch(self: *Join, a: A, maximum: usize, failure: ?*?anyerror) anyerror!Batch {
+        self.releaseNativeDiskLeases();
         if (self.native_pipe_view) |view| view.deinit();
         self.native_pipe_view = null;
         if (maximum == 0) return .{ .rows = &.{} };
@@ -741,8 +776,9 @@ pub const Join = struct {
             };
             if (!accepted) continue;
             const batch = candidate.batch();
-            var cost: usize = 0;
-            for (0..batch.width()) |column| cost +|= batch.cellBytes(scratch, 0, column) catch |err| {
+            var cost: usize = @sizeOf(NativePair);
+            const copied = if (pair.right) |right| right.source == .values or right.source == .disk else false;
+            for (0..if (copied) batch.width() else 0) |column| cost +|= batch.cellBytes(scratch, 0, column) catch |err| {
                 if (failure) |out| {
                     out.* = err;
                     break;
@@ -750,7 +786,7 @@ pub const Join = struct {
                 return err;
             };
             if (failure) |out| if (out.* != null) break;
-            pair.append(a, &rows) catch |err| {
+            pair.append(a, &rows, self) catch |err| {
                 if (failure) |out| {
                     out.* = err;
                     break;
@@ -766,6 +802,7 @@ pub const Join = struct {
         return view.batch();
     }
     pub fn next(self: *Join) anyerror!?Pair {
+        self.releaseNativeDiskLeases();
         try self.finishInputs();
         if (self.parallel_builds) return self.nextParallel();
         _ = self.candidate.reset(.{ .retain_with_limit = @min(8192, self.limits.bytes / 32) });
