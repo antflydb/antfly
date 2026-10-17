@@ -1467,3 +1467,68 @@ def test_presence_reductions_do_not_enumerate_or_require_exact_path_counts(graph
     assert db.sql(f"SELECT min(q.score),count(*),sum(q.score-61),sum(CAST(q.score AS NUMERIC)) FROM {relation}")[
         "rows"
     ] == [["62", str(2**62), str(2**62), str(62 * 2**62)]]
+
+
+def test_pure_endpoint_expressions_keep_compressed_bags(graph_db):
+    db = graph_db
+    size = 16
+    patterns = [f"(n{i}:D {{id:'n{i}',score:{i}}})" for i in range(size)]
+    patterns += [f"(n{i})-[:R]->(n{j})" for i in range(size) for j in range(i + 1, size)]
+    db.cypher_json("g", {"query": "CREATE " + ",".join(patterns)})
+    for expression in (
+        "CASE WHEN b.score>0 THEN b.score ELSE 1/0 END",
+        "reduce(total=0,x IN [b.score] | total+x)",
+        "[x IN [b.score] WHERE x>0 | x][0]",
+        "toInteger(toString(b.score))",
+    ):
+        result = db.cypher_json(
+            "g",
+            {
+                "query": f"MATCH (a:D)-[:R*6..6]->(b:D) RETURN min({expression})",
+                "limits": {"explored_edges": 120, "intermediate_states": 15000},
+            },
+        )
+        assert result["rows"] == [[{"type": "integer", "value": "6"}]]
+    distinct = db.cypher_json(
+        "g",
+        {
+            "query": "MATCH (a:D)-[:R*6..6]->(b:D) RETURN DISTINCT b{.score} AS endpoint ORDER BY endpoint",
+            "limits": {"explored_edges": 120, "intermediate_states": 15000},
+        },
+    )
+    assert [row[0]["value"]["score"]["value"] for row in distinct["rows"]] == [str(i) for i in range(6, size)]
+    path = "(a IS D)" + "".join(f"-[r{i} IS R]->(m{i} IS D)" for i in range(5)) + "-[r5 IS R]->(b IS D)"
+    # Moving a pure CASE into GRAPH_TABLE COLUMNS must keep SQL weights.
+    import time
+
+    start = time.monotonic()
+    result = db.sql(
+        f"SELECT min(CAST(q.score AS BIGINT)) FROM GRAPH_TABLE(g MATCH {path} "
+        "COLUMNS(CASE WHEN b.score>0 THEN b.score ELSE 1/0 END AS score)) q"
+    )
+    assert result["rows"] == [["6"]]
+    assert time.monotonic() - start < 5
+
+
+def test_multi_anchor_reductions_share_work_across_bounded_batches(graph_db):
+    db = graph_db
+    size = 200  # Cross both the native scan page and anchor batch boundaries.
+    patterns = [f"(n{i}:D {{id:'n{i}',score:{i}}})" for i in range(size)]
+    patterns += [f"(n{i})-[:R]->(n{i + 1})" for i in range(size - 1)]
+    db.cypher_json("g", {"query": "CREATE " + ",".join(patterns)})
+    for bounds in ("1..", f"1..{size}", "0.."):
+        zero = bounds == "0.."
+        result = db.cypher_json(
+            "g",
+            {
+                "query": f"MATCH (a:D)-[:R*{bounds}]->(b:D) RETURN count(*),sum(b.score),min(b.score),max(b.score)",
+                "limits": {"explored_edges": size - 1, "intermediate_states": 100000, "memory_bytes": 8 << 20},
+            },
+        )
+        assert [cell["value"] for cell in result["rows"][0]] == [
+            str(size * (size - 1) // 2 + (size if zero else 0)),
+            str(sum(i * (i + (1 if zero else 0)) for i in range(size))),
+            "0" if zero else "1",
+            str(size - 1),
+        ]
+        assert result["stats"]["explored_edges"] == size - 1

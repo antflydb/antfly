@@ -1607,6 +1607,12 @@ test "weighted endpoint reductions agree with exact cyclic and acyclic route bag
         }
     };
     for ([_]bool{ false, true }) |acyclic| for ([_][]const u8{ "", "REPEATABLE ELEMENTS ", "DIFFERENT RELATIONSHIPS " }) |mode| for ([_][]const u8{
+        "RETURN min(CASE WHEN b.rank>0 THEN b.rank ELSE 1/0 END)",
+        "RETURN DISTINCT b{.rank, title:toLower(b.title)} ORDER BY b{.rank, title:toLower(b.title)}",
+        "RETURN sum(reduce(total=0,x IN [b.rank,b.rank] | total+x))",
+        "RETURN DISTINCT [a IN [b.rank] WHERE a>0 | {value:a}] AS value ORDER BY value",
+        "RETURN min(size([x IN [b.rank,b.rank][0..1] | x]))",
+        "RETURN min(CASE WHEN a.rank>0 THEN a.rank ELSE b.rank END)",
         "RETURN DISTINCT b.rank AS endpoint ORDER BY endpoint",
         "RETURN DISTINCT b.rank ORDER BY b.rank",
         "RETURN count(b),count(b.missing),count(*)",
@@ -1922,4 +1928,108 @@ test "DISTINCT ordering resolves projected expressions without exposing discarde
         defer compiled.deinit();
         try std.testing.expectError(error.UnboundCypherVariable, @import("binder.zig").validate(std.testing.allocator, graph, compiled.query));
     }
+}
+
+test "multi-root DAG reductions share physical pages and preserve zero-hop bags" {
+    const Dag = struct {
+        fn expand(ptr: *anyopaque, a: std.mem.Allocator, mapping: catalog.Relationship, identity: v.Identity, direction: c.ast.Direction, after: ?[]const u8, limit: usize) !b.Page(*const v.Relationship) {
+            const page = try Fixture.expand(ptr, a, mapping, identity, direction, after, limit);
+            var output: std.ArrayList(*const v.Relationship) = .empty;
+            for (page.items) |relationship| if (!std.mem.eql(u8, relationship.identity.key, "ba")) try output.append(a, relationship);
+            return .{ .items = output.items };
+        }
+    };
+    for ([_][]const u8{
+        "(a:Document)-[:CITES*0..]->(b:Document)",
+        "(a:Document)-[:CITES*1..]->(b:Document)",
+        "(a:Document)-[:CITES*2..]->(b:Document)",
+        "(a:Document)-[:CITES*0..3]->(b:Document)",
+        "(a:Document)-[:CITES*1..3]->(b:Document)",
+        "(a:Document)-[:CITES]->(middle:Document)-[:CITES]->(b:Document)",
+        "(a:Document)-[:CITES*0..1]->(middle:Document)-[:CITES*0..1]->(b:Document)",
+    }) |pattern| for ([_][]const u8{
+        "RETURN count(*),sum(b.rank),avg(b.rank),min(b.rank),max(b.rank)",
+        "RETURN a.rank,b.rank,count(*) ORDER BY a.rank,b.rank",
+        "WHERE b.rank>=2 RETURN count(*),sum(b.rank)",
+        "RETURN DISTINCT b{.rank} AS node ORDER BY node",
+    }) |tail| {
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const split = std.mem.indexOf(u8, tail, "RETURN").?;
+        const text = try std.fmt.allocPrint(a, "MATCH {s} {s}", .{ pattern, tail });
+        const exact = try std.fmt.allocPrint(a, "MATCH {s} {s} UNWIND [1] AS ignored {s}", .{ pattern, tail[0..split], tail[split..] });
+        var diagnostic: c.Diagnostic = .{};
+        var compiled = try c.compile(a, text, .{}, &diagnostic);
+        defer compiled.deinit();
+        var reference = try c.compile(a, exact, .{}, &diagnostic);
+        defer reference.deinit();
+        var fixture: Fixture = .{};
+        var callbacks = fixture.backend().vtable.*;
+        callbacks.expand = Dag.expand;
+        const backend: b.Backend = .{ .ptr = &fixture, .vtable = &callbacks };
+        var result = try runtime.execute(a, backend, graph, &compiled, &.{}, .{ .explored_edges = 3 });
+        defer result.deinit();
+        var expected = try runtime.execute(a, backend, graph, &reference, &.{}, .{});
+        defer expected.deinit();
+        try std.testing.expectEqual(expected.rows.len, result.rows.len);
+        for (expected.rows, result.rows) |expected_row, actual_row| {
+            try std.testing.expectEqual(expected_row.len, actual_row.len);
+            for (expected_row, actual_row) |expected_cell, actual_cell| {
+                if (expected_cell == .number) {
+                    try std.testing.expectApproxEqAbs(expected_cell.number, actual_cell.number, 1e-12);
+                } else try std.testing.expectEqualStrings(try std.json.Stringify.valueAlloc(a, expected_cell, .{}), try std.json.Stringify.valueAlloc(a, actual_cell, .{}));
+            }
+        }
+        try std.testing.expect(result.stats.explored_edges <= 3);
+    };
+}
+
+test "soft graph cache and anchor admission failure retain exact fallback" {
+    const Large = struct {
+        const payload: [100 << 10]u8 = @splat('x');
+        fn scan(ptr: *anyopaque, a: std.mem.Allocator, table: []const u8, after: ?[]const u8, limit: usize) !b.Page(*const v.Node) {
+            var page = try Fixture.scan(ptr, a, table, after, limit);
+            const nodes = try a.alloc(*const v.Node, page.items.len);
+            for (page.items, nodes) |node, *out| {
+                // Retain the first root, then fail admission on the next one.
+                // Flushing that prefix must neither lose nor repeat its paths.
+                if (std.mem.eql(u8, node.identity.key, "a")) {
+                    out.* = node;
+                    continue;
+                }
+                const owned = try a.create(v.Node);
+                owned.* = node.*;
+                const properties = try a.alloc(v.Entry, node.properties.len + 1);
+                @memcpy(properties[0..node.properties.len], node.properties);
+                properties[node.properties.len] = .{ .name = "payload", .value = .{ .string = &payload } };
+                owned.properties = properties;
+                out.* = owned;
+            }
+            page.items = nodes;
+            return page;
+        }
+        fn expand(ptr: *anyopaque, a: std.mem.Allocator, mapping: catalog.Relationship, identity: v.Identity, direction: c.ast.Direction, after: ?[]const u8, limit: usize) !b.Page(*const v.Relationship) {
+            const page = try Fixture.expand(ptr, a, mapping, identity, direction, after, limit);
+            var output: std.ArrayList(*const v.Relationship) = .empty;
+            for (page.items) |relationship| {
+                if (std.mem.eql(u8, relationship.identity.key, "ba")) continue;
+                const owned = try a.create(v.Relationship);
+                owned.* = relationship.*;
+                owned.properties = &.{.{ .name = "payload", .value = .{ .string = &payload } }};
+                try output.append(a, owned);
+            }
+            return .{ .items = output.items };
+        }
+    };
+    var fixture: Fixture = .{};
+    var callbacks = fixture.backend().vtable.*;
+    callbacks.scan = Large.scan;
+    callbacks.expand = Large.expand;
+    var diagnostic: c.Diagnostic = .{};
+    var compiled = try c.compile(std.testing.allocator, "MATCH (a:Document)-[:CITES*0..]->(b:Document) RETURN count(*)", .{}, &diagnostic);
+    defer compiled.deinit();
+    var result = try runtime.execute(std.testing.allocator, .{ .ptr = &fixture, .vtable = &callbacks }, graph, &compiled, &.{}, .{ .memory_bytes = 1 << 20 });
+    defer result.deinit();
+    try std.testing.expectEqual(@as(i64, 8), result.rows[0][0].integer);
 }

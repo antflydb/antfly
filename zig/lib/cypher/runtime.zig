@@ -114,6 +114,7 @@ pub const NodeCursor = struct {
     weighted: bool = false,
     multiplicity: Multiplicity = .exact,
     weighted_arena: std.heap.ArenaAllocator,
+    adjacency_cache: Engine.AdjacencyCache,
     pending: std.ArrayList(struct { row: Row, weight: u64 }) = .empty,
     pending_position: usize = 0,
     last_weights: std.ArrayList(u64) = .empty,
@@ -189,8 +190,9 @@ pub const NodeCursor = struct {
         const columns = try a.alloc([]const u8, projection.items.len);
         for (owned_query.clauses[1].operation.project.value.items, columns) |item, *out| out.* = item.alias orelse try engine.expressionName(item.expression);
         const fields = try @import("read_fields.zig").required(a, owned_query, graph);
-        self.* = .{ .backing = allocator, .budget = budget, .arena = arena, .engine = engine, .query = owned_query, .original_match = owned_query.clauses[0].operation.match, .weighted_arena = .init(budget.allocator()), .fields = fields, .columns = columns };
+        self.* = .{ .backing = allocator, .budget = budget, .arena = arena, .engine = engine, .query = owned_query, .original_match = owned_query.clauses[0].operation.match, .weighted_arena = .init(budget.allocator()), .adjacency_cache = .{ .budget = .{ .backing = budget.allocator(), .limit = @min(8 << 20, limits.memory_bytes / 16) } }, .fields = fields, .columns = columns };
         arena_moved = true;
+        engine.adjacency_cache = &self.adjacency_cache;
         engine.a = self.arena.allocator();
         engine.values.a = engine.a;
         engine.strings.a = engine.a;
@@ -665,6 +667,7 @@ pub const NodeCursor = struct {
         while (self.frames.items.len != 0) self.popFrame();
         self.frames.deinit(budget.allocator());
         self.weighted_arena.deinit();
+        self.adjacency_cache.deinit();
         self.engine.regex.deinit();
         self.arena.deinit();
         allocator.destroy(budget);
@@ -796,6 +799,8 @@ const Engine = struct {
     count_endpoints: bool = false,
     weighted_sink: ?struct { ptr: *anyopaque, emit: *const fn (*anyopaque, Row, u64) anyerror!void, multiplicity: Multiplicity } = null,
     lower_graph: ?*LowerGraph = null,
+    anchor_batch: ?*AnchorBatch = null,
+    adjacency_cache: ?*AdjacencyCache = null,
     interior: ?*const Interior = null,
     cache_reads: bool = false,
     read_only: bool = false,
@@ -1285,6 +1290,11 @@ const Engine = struct {
             self.lookups = saved_lookups;
             self.lookup = saved_lookup;
         }
+        var adjacency_cache: AdjacencyCache = .{ .budget = .{ .backing = self.scratch_allocator, .limit = @min(8 << 20, self.limits.memory_bytes / 16) } };
+        defer adjacency_cache.deinit();
+        const saved_adjacency = self.adjacency_cache;
+        self.adjacency_cache = &adjacency_cache;
+        defer self.adjacency_cache = saved_adjacency;
         const previous_fold = self.stream_fold;
         const previous_predicate = self.stream_predicate;
         const previous_aliases = self.match_aliases;
@@ -1324,10 +1334,16 @@ const Engine = struct {
             const accepted_before = fold.accepted;
             var count_paths: u64 = 0;
             self.shortest_count = if (count_shortest) &count_paths else null;
+            var batch: AnchorBatch = .{ .path = path, .input = .{ .row = row }, .mode = operation.mode, .budget = .{ .backing = self.scratch_allocator, .limit = @min(8 << 20, self.limits.memory_bytes / 16) } };
+            defer if (batch.arena) |*arena| arena.deinit();
+            const saved_batch = self.anchor_batch;
+            self.anchor_batch = if ((count_shortest or count_endpoints) and try self.batchEligible(path, row, operation, projection)) &batch else null;
+            defer self.anchor_batch = saved_batch;
             self.joinPath(.{ .row = row }, operation, 0, &ignored) catch |err| switch (err) {
                 error.CypherStreamComplete => break :produce,
                 else => return err,
             };
+            try batch.flush(self, &ignored);
             if (operation.optional and fold.accepted == accepted_before) {
                 var extended = row;
                 for (self.match_aliases) |alias| if (lookup(extended, alias) == null) {
@@ -2201,6 +2217,9 @@ const Engine = struct {
     // Acyclicity proves that merging prefixes preserves both trail and simple
     // path uniqueness. Otherwise retain adjacency and enumerate exact histories.
     fn countAllPath(self: *Engine, input: MatchState, path: ast.Path, mode: ast.PathMode, start: *const v.Node, output: *std.ArrayList(MatchState)) anyerror!bool {
+        return self.countAllPaths(input, path, mode, &.{start}, output);
+    }
+    fn countAllPaths(self: *Engine, input: MatchState, path: ast.Path, mode: ast.PathMode, starts: []const *const v.Node, output: *std.ArrayList(MatchState)) anyerror!bool {
         if (path.edges.len == 0 or input.used.len != 0 or input.constraints.len != 0 or path.execution_prefix) return false;
         // A bound single-hop endpoint admits a physical pair seek instead of
         // discovering the anchor's complete reachable adjacency.
@@ -2245,8 +2264,13 @@ const Engine = struct {
         const capture_edge = domains.items[0];
         const capture_path: ast.Path = .{ .span = path.span, .alias = null, .nodes = &.{ path.nodes[0], path.nodes[path.nodes.len - 1] }, .edges = &.{capture_edge} };
         var graph: LowerGraph = .{ .input = input, .path = capture_path, .domains = domains.items, .qualified = true };
-        try graph.positions.put(self.a, start.identity, 0);
-        try graph.nodes.append(self.a, .{ .node = start, .depth = 0 });
+        for (starts) |start| {
+            const entry = try graph.positions.getOrPut(self.a, start.identity);
+            if (!entry.found_existing) {
+                entry.value_ptr.* = graph.nodes.items.len;
+                try graph.nodes.append(self.a, .{ .node = start, .depth = 0 });
+            }
+        }
         const Counts = std.AutoHashMapUnmanaged(usize, u64);
         var current: Counts = .empty;
         var next: Counts = .empty;
@@ -2254,19 +2278,23 @@ const Engine = struct {
         defer current.deinit(self.a);
         defer next.deinit(self.a);
         defer endpoints.deinit(self.a);
-        try current.put(self.a, 0, 1);
+        for (starts) |start| {
+            const entry = try current.getOrPut(self.a, graph.positions.get(start.identity).?);
+            entry.value_ptr.* = mergePathWays(if (entry.found_existing) entry.value_ptr.* else 0, 1);
+        }
         var effective_maximum: usize = 0;
         for (path.edges, 0..) |edge, edge_index| {
             if (current.count() == 0) return true;
             const domain = edge_domains[edge_index];
+            var topological: ?[]const usize = null;
             const upper = edge.max_hops orelse blk: {
                 // Discover only the authorized, property-qualified closure of
                 // this segment. A topological proof supplies a finite bound;
                 // cyclic trails keep their exact relationship histories.
                 var pending: std.ArrayList(usize) = .empty;
                 var seen: std.AutoHashMapUnmanaged(usize, void) = .empty;
-                var starts = current.keyIterator();
-                while (starts.next()) |index| {
+                var roots = current.keyIterator();
+                while (roots.next()) |index| {
                     try seen.put(self.a, index.*, {});
                     try pending.append(self.a, index.*);
                 }
@@ -2282,20 +2310,63 @@ const Engine = struct {
                     }
                 }
                 const depth = try self.lowerDomainDepth(&graph, domain, edge, &current);
-                if (depth == null or depth.? > self.limits.path_depth) {
-                    if (self.weighted_sink != null) return false;
+                if (depth == null or depth.?.maximum > self.limits.path_depth) {
+                    if (self.weighted_sink != null or starts.len != 1) return false;
                     const previous = self.lower_graph;
                     self.lower_graph = &graph;
                     defer self.lower_graph = previous;
-                    try self.pathStep(input, path, mode, 0, &.{start}, &.{}, output);
+                    var resumed = input;
+                    resumed.row = (try self.bind(input.row, path.nodes[0].alias, .{ .node = starts[0] })).?;
+                    try self.pathStep(resumed, path, mode, 0, &.{starts[0]}, &.{}, output);
                     return true;
                 }
-                break :blk depth.?;
+                topological = depth.?.order;
+                break :blk depth.?.maximum;
             };
             effective_maximum = std.math.add(usize, effective_maximum, upper) catch return false;
             if (effective_maximum > self.limits.path_depth) return false;
+            if (topological == null and path.edges.len == 1 and starts.len > 1 and edge.min_hops <= 1 and upper >= starts.len) {
+                // A wide, long-range batch often covers an entire DAG. Probe
+                // only nodes reachable within the requested upper bound. If
+                // its longest captured route fits, the same linear reduction
+                // is exact for bounded ranges too; otherwise retain hop states.
+                var head: usize = 0;
+                while (head < graph.nodes.items.len) : (head += 1) {
+                    if (graph.nodes.items[head].depth >= upper) continue;
+                    _ = try self.loadLowerDomain(&graph, head, domain);
+                }
+                if (try self.lowerDomainDepth(&graph, domain, edge, &current)) |proof| {
+                    if (proof.maximum <= upper) topological = proof.order;
+                }
+            }
             try chargeWork(self, endpoints.capacity());
             endpoints.clearRetainingCapacity();
+            if (topological != null and edge.min_hops <= 1) {
+                // Sum every allowed DAG length in one topological pass. Keep
+                // positive-length arrivals separate from root seeds: subtracting
+                // a zero-hop seed after saturation could hide COUNT overflow.
+                const reached = try self.a.alloc(u64, graph.nodes.items.len);
+                @memset(reached, 0);
+                for (topological.?) |index| {
+                    try self.state();
+                    const seed = current.get(index) orelse 0;
+                    const ways = mergePathWays(reached[index], seed);
+                    const accepted = if (edge.min_hops == 0) ways else reached[index];
+                    const node = graph.nodes.items[index].node;
+                    if (accepted != 0 and try self.nodeMatches(node, path.nodes[edge_index + 1]) and
+                        boundNodeMatches(node, path.nodes[edge_index + 1], input.row) and try self.constantProperties(.{ .node = node }, path.nodes[edge_index + 1].properties, input.row))
+                        try endpoints.put(self.a, index, accepted);
+                    if (ways == 0) continue;
+                    if (graph.nodes.items[index].domains.get(domain)) |range| for (graph.nodes.items[index].arcs.items[range.first..range.last]) |*arc| {
+                        try self.state();
+                        if (!try self.constantProperties(.{ .relationship = arc.relationship }, edge.properties, input.row)) continue;
+                        arc.eligible = true;
+                        reached[arc.target] = mergePathWays(reached[arc.target], ways);
+                    };
+                }
+                std.mem.swap(Counts, &current, &endpoints);
+                continue;
+            }
             var hop: usize = 0;
             while (current.count() != 0 and hop <= upper) : (hop += 1) {
                 // Hash-table iteration and clearing consume work even after a
@@ -2368,11 +2439,13 @@ const Engine = struct {
             .relationship_simple => try self.lowerTrailAcyclic(&graph),
         };
         if (!compressible) {
-            if (self.weighted_sink != null) return false;
+            if (self.weighted_sink != null or starts.len != 1) return false;
             const previous = self.lower_graph;
             self.lower_graph = &graph;
             defer self.lower_graph = previous;
-            try self.pathStep(input, path, mode, 0, &.{start}, &.{}, output);
+            var resumed = input;
+            resumed.row = (try self.bind(input.row, path.nodes[0].alias, .{ .node = starts[0] })).?;
+            try self.pathStep(resumed, path, mode, 0, &.{starts[0]}, &.{}, output);
             return true;
         }
         var counts = current.iterator();
@@ -2397,37 +2470,18 @@ const Engine = struct {
         }
         return true;
     }
+    const EndpointScope = struct {
+        path: ast.Path,
+        row: Row,
+        include_start: bool = true,
+        pub fn permits(self: @This(), name: []const u8) bool {
+            for ([_]?[]const u8{ if (self.include_start) self.path.nodes[0].alias else null, self.path.nodes[self.path.nodes.len - 1].alias }) |alias|
+                if (alias) |endpoint| if (std.mem.eql(u8, endpoint, name)) return true;
+            return lookup(self.row, name) != null;
+        }
+    };
     fn endpointExpression(expression: *const ast.Expr, path: ast.Path, row: Row) bool {
-        return switch (expression.value) {
-            .literal, .parameter => true,
-            .variable => |name| blk: {
-                for ([_]?[]const u8{ path.nodes[0].alias, path.nodes[path.nodes.len - 1].alias }) |alias| if (alias) |endpoint| if (std.mem.eql(u8, endpoint, name)) break :blk true;
-                break :blk lookup(row, name) != null;
-            },
-            .property => |property| endpointExpression(property.base, path, row),
-            .index => |index| endpointExpression(index.base, path, row) and endpointExpression(index.index, path, row),
-            .unary => |unary| endpointExpression(unary.operand, path, row),
-            .binary => |binary_expression| endpointExpression(binary_expression.left, path, row) and endpointExpression(binary_expression.right, path, row),
-            .comparison => |comparison| blk: {
-                for (comparison.operands) |operand| if (!endpointExpression(operand, path, row)) break :blk false;
-                break :blk true;
-            },
-            .list => |items| blk: {
-                // SQL IN pushdown constructs a list predicate in the graph
-                // plan. Its endpoint-local values preserve the same bag.
-                for (items) |item| if (!endpointExpression(item, path, row)) break :blk false;
-                break :blk true;
-            },
-            .call => |scalar_call| blk: {
-                const safe = for ([_][]const u8{ "count", "sum", "avg", "min", "max", "id", "labels", "properties", "keys", "size", "coalesce", "abs", "toInteger", "toFloat", "toString" }) |name| {
-                    if (std.ascii.eqlIgnoreCase(name, scalar_call.name)) break true;
-                } else false;
-                if (!safe) break :blk false;
-                for (scalar_call.args) |argument| if (!endpointExpression(argument, path, row)) break :blk false;
-                break :blk true;
-            },
-            else => false,
-        };
+        return @import("expressions.zig").rowLocal(expression, EndpointScope{ .path = path, .row = row });
     }
     fn sameTypeSet(left: []const []const u8, right: []const []const u8) bool {
         for (left) |name| {
@@ -2460,7 +2514,71 @@ const Engine = struct {
         for (properties) |entry| if ((try self.values.equal(entity.property(entry.name), self.constant(entry.value, row).?)) != true) return false;
         return true;
     }
+    // Batches bound retention and preserve fallback: a declined uniqueness or
+    // exact-weight proof resumes the original per-anchor operator, before any
+    // compressed row was emitted. Roots are owned independently of scan pages.
+    const AnchorBatch = struct {
+        path: ast.Path,
+        input: MatchState,
+        mode: ast.PathMode,
+        budget: Budget,
+        arena: ?std.heap.ArenaAllocator = null,
+        nodes: std.ArrayList(*const v.Node) = .empty,
+        disabled: bool = false,
+        fn flush(self: *@This(), engine: *Engine, output: *std.ArrayList(MatchState)) anyerror!void {
+            if (self.nodes.items.len == 0) return;
+            const previous = engine.anchor_batch;
+            engine.anchor_batch = null;
+            defer engine.anchor_batch = previous;
+            if (!try engine.countAllPaths(self.input, self.path, self.mode, self.nodes.items, output)) {
+                for (self.nodes.items) |node| {
+                    const row = (try engine.bind(self.input.row, self.path.nodes[0].alias, .{ .node = node })).?;
+                    try engine.startPath(.{ .row = row }, self.path, self.mode, node, output);
+                }
+            }
+            self.arena.?.deinit();
+            self.arena = null;
+            self.nodes = .empty;
+        }
+        fn append(self: *@This(), node: *const v.Node) !void {
+            if (self.arena == null) self.arena = .init(self.budget.allocator());
+            const a = self.arena.?.allocator();
+            const owned = (try (v.Value{ .node = node }).clone(a)).node;
+            try self.nodes.append(a, owned);
+        }
+    };
+    fn batchEligible(self: *Engine, path: ast.Path, row: Row, operation: ast.Match, projection: ast.Projection) !bool {
+        if (path.selector != .all or path.edges.len == 0 or path.execution_prefix or path.execution_reversed) return false;
+        if (path.nodes[0].alias) |alias| if (lookup(row, alias) != null) return false;
+        for (path.nodes) |node| for (node.properties) |entry| if (self.constant(entry.value, row) == null) return false;
+        for (path.edges) |edge| for (edge.properties) |entry| if (self.constant(entry.value, row) == null) return false;
+        const score = try self.anchorScore(path.nodes[0], operation.predicate, row);
+        for (path.nodes[1..]) |node| if (try self.anchorScore(node, operation.predicate, row) > score) return false;
+        const independent: EndpointScope = .{ .path = path, .row = row, .include_start = false };
+        if (operation.predicate) |predicate| if (!@import("expressions.zig").rowLocal(predicate, independent)) return false;
+        for (projection.items) |item| if (!@import("expressions.zig").rowLocal(item.expression, independent)) return false;
+        // Ordering uses projected aliases. The projection dependency check
+        // already proves those values independent of the root.
+        var shape = row;
+        for (projection.items) |item| if (item.alias) |alias| {
+            shape = try self.replace(shape, alias, .null);
+        };
+        for (projection.order) |order| if (!@import("expressions.zig").rowLocal(order.expression, EndpointScope{ .path = path, .row = shape, .include_start = false })) return false;
+        return true;
+    }
     fn startPath(self: *Engine, input: MatchState, path: ast.Path, mode: ast.PathMode, node: *const v.Node, output: *std.ArrayList(MatchState)) anyerror!void {
+        if (self.anchor_batch) |batch| {
+            if (!batch.disabled and path.nodes.ptr == batch.path.nodes.ptr and input.used.len == 0 and input.constraints.len == 0) {
+                batch.append(node) catch |err| {
+                    if (err != error.OutOfMemory or !batch.budget.exhausted) return err;
+                    batch.disabled = true;
+                    try batch.flush(self, output);
+                    return self.startPath(input, path, mode, node, output);
+                };
+                if (batch.nodes.items.len == 128) try batch.flush(self, output);
+                return;
+            }
+        }
         if ((self.shortest_count != null or self.count_endpoints) and path.selector == .all and try self.countAllPath(input, path, mode, node, output)) return;
         if (!self.shortest_fast or path.selector == .all or path.edges.len != 1 or input.used.len != 0 or input.constraints.len != 0) {
             return self.pathStep(input, path, mode, 0, &.{node}, &.{}, output);
@@ -2581,6 +2699,55 @@ const Engine = struct {
         try graph.nodes.items[position].domains.put(self.a, domain, range);
         return range;
     }
+    const AdjacencyCache = struct {
+        const Page = backend_mod.Page(*const v.Relationship);
+        const Key = struct { mapping: usize, node: v.Identity, direction: ast.Direction, cursor: ?[]const u8 };
+        const Context = struct {
+            pub fn hash(_: @This(), key: Key) u64 {
+                var hasher = std.hash.Wyhash.init((v.Identity.Context{}).hash(key.node));
+                std.hash.autoHash(&hasher, key.mapping);
+                std.hash.autoHash(&hasher, key.direction);
+                std.hash.autoHash(&hasher, key.cursor != null);
+                if (key.cursor) |cursor| hasher.update(cursor);
+                return hasher.final();
+            }
+            pub fn eql(_: @This(), left: Key, right: Key) bool {
+                return left.mapping == right.mapping and left.direction == right.direction and left.node.eql(right.node) and
+                    (if (left.cursor) |cursor| right.cursor != null and std.mem.eql(u8, cursor, right.cursor.?) else right.cursor == null);
+            }
+        };
+        budget: Budget,
+        arena: ?std.heap.ArenaAllocator = null,
+        pages: std.HashMapUnmanaged(Key, Page, Context, std.hash_map.default_max_load_percentage) = .empty,
+        disabled: bool = false,
+        fn put(self: *@This(), key: Key, page: Page) !void {
+            if (self.arena == null) self.arena = .init(self.budget.allocator());
+            const a = self.arena.?.allocator();
+            const items = try a.alloc(*const v.Relationship, page.items.len);
+            for (page.items, items) |relationship, *out| out.* = (try (v.Value{ .relationship = relationship }).clone(a)).relationship;
+            const owned: Key = .{ .mapping = key.mapping, .direction = key.direction, .node = .{ .table = try a.dupe(u8, key.node.table), .key = try a.dupe(u8, key.node.key) }, .cursor = if (key.cursor) |cursor| try a.dupe(u8, cursor) else null };
+            try self.pages.put(a, owned, .{ .items = items, .next = if (page.next) |next| try a.dupe(u8, next) else null });
+        }
+        fn deinit(self: *@This()) void {
+            if (self.arena) |*arena| arena.deinit();
+        }
+    };
+    fn lowerPage(self: *Engine, mapping: usize, node: v.Identity, direction: ast.Direction, cursor: ?[]const u8) !backend_mod.Page(*const v.Relationship) {
+        try self.checkpoint();
+        const key: AdjacencyCache.Key = .{ .mapping = mapping, .node = node, .direction = direction, .cursor = cursor };
+        if (self.adjacency_cache) |cache| if (cache.pages.get(key)) |page| return page;
+        const page = try self.backend.vtable.expand(self.backend.ptr, self.a, self.graph.relationships[mapping], node, direction, cursor, 128);
+        try self.accountEdges(page);
+        if (self.adjacency_cache) |cache| if (!cache.disabled) {
+            cache.put(key, page) catch |err| {
+                if (err != error.OutOfMemory or !cache.budget.exhausted) return err;
+                // Existing captures may borrow cached relationships. Keep their
+                // storage alive and stop admission rather than evicting it.
+                cache.disabled = true;
+            };
+        };
+        return page;
+    }
     fn loadLowerAdjacency(self: *Engine, graph: *LowerGraph, position: usize, edge: ast.Edge) !void {
         const current = graph.nodes.items[position];
         for (self.graph.relationships, 0..) |mapping, mapping_index| {
@@ -2594,8 +2761,7 @@ const Engine = struct {
             if (!outgoing and !incoming) continue;
             var cursor: ?[]const u8 = null;
             while (true) {
-                const page = try self.backend.vtable.expand(self.backend.ptr, self.a, mapping, current.node.identity, edge.direction, cursor, 128);
-                try self.accountEdges(page);
+                const page = try self.lowerPage(mapping_index, current.node.identity, edge.direction, cursor);
                 try self.prefetchEndpoints(page.items, current.node.identity, outgoing, incoming);
                 for (page.items) |relationship| {
                     try self.state();
@@ -2619,7 +2785,7 @@ const Engine = struct {
             }
         }
     }
-    fn lowerDomainDepth(self: *Engine, graph: *const LowerGraph, domain: usize, edge: ast.Edge, starts: *const std.AutoHashMapUnmanaged(usize, u64)) !?usize {
+    fn lowerDomainDepth(self: *Engine, graph: *const LowerGraph, domain: usize, edge: ast.Edge, starts: *const std.AutoHashMapUnmanaged(usize, u64)) !?struct { maximum: usize, order: []const usize } {
         const degree = try self.a.alloc(usize, graph.nodes.items.len);
         const depth = try self.a.alloc(?usize, graph.nodes.items.len);
         @memset(degree, 0);
@@ -2650,7 +2816,7 @@ const Engine = struct {
                 if (degree[arc.target] == 0) try queue.append(self.a, arc.target);
             };
         }
-        return if (queue.items.len == graph.nodes.items.len) maximum else null;
+        return if (queue.items.len == graph.nodes.items.len) .{ .maximum = maximum, .order = queue.items } else null;
     }
     fn lowerAcyclic(self: *Engine, graph: *const LowerGraph) !bool {
         return self.lowerAcyclicMappings(graph, null);

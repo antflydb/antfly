@@ -229,6 +229,76 @@ pub fn unshadowed(expr: *const ast.Expr, locals: ?*const Local) bool {
     }
     return true;
 }
+/// Conservative repeatability and free-variable analysis. Lexical bindings are
+/// local to their body; graph subqueries never qualify. This inspects CASE and
+/// coalesce without evaluating either branch, preserving lazy errors.
+pub fn rowLocal(expr: *const ast.Expr, context: anytype) bool {
+    return rowLocalScoped(expr, context, null);
+}
+fn permitted(name: []const u8, context: anytype, locals: ?*const Local) bool {
+    var current = locals;
+    while (current) |local| : (current = local.parent) {
+        if (std.mem.eql(u8, name, local.name)) return true;
+    }
+    return context.permits(name);
+}
+fn rowLocalScoped(expr: *const ast.Expr, context: anytype, locals: ?*const Local) bool {
+    return switch (expr.value) {
+        .literal, .parameter => true,
+        .variable => |name| permitted(name, context, locals),
+        .exists, .pattern_comprehension => false,
+        .property => |p| rowLocalScoped(p.base, context, locals),
+        .index => |i| rowLocalScoped(i.base, context, locals) and rowLocalScoped(i.index, context, locals),
+        .slice => |s| rowLocalScoped(s.base, context, locals) and optionalLocal(s.start, context, locals) and optionalLocal(s.end, context, locals),
+        .unary => |u| rowLocalScoped(u.operand, context, locals),
+        .binary => |b| rowLocalScoped(b.left, context, locals) and rowLocalScoped(b.right, context, locals),
+        .comparison => |c| allLocal(c.operands, context, locals),
+        .call => |c| blk: {
+            const safe = if (@import("functions.zig").lookup(c.name)) |signature| signature.repeatable else std.ascii.eqlIgnoreCase(c.name, "count") or std.ascii.eqlIgnoreCase(c.name, "sum") or
+                std.ascii.eqlIgnoreCase(c.name, "avg") or std.ascii.eqlIgnoreCase(c.name, "min") or std.ascii.eqlIgnoreCase(c.name, "max");
+            break :blk safe and allLocal(c.args, context, locals);
+        },
+        .list => |items| allLocal(items, context, locals),
+        .comprehension => |c| blk: {
+            const local: Local = .{ .name = c.alias, .parent = locals };
+            break :blk rowLocalScoped(c.input, context, locals) and optionalLocal(c.predicate, context, &local) and optionalLocal(c.projection, context, &local);
+        },
+        .list_predicate => |c| blk: {
+            const local: Local = .{ .name = c.alias, .parent = locals };
+            break :blk rowLocalScoped(c.input, context, locals) and rowLocalScoped(c.predicate, context, &local);
+        },
+        .reduce => |r| blk: {
+            const accumulator: Local = .{ .name = r.accumulator, .parent = locals };
+            const local: Local = .{ .name = r.alias, .parent = &accumulator };
+            break :blk rowLocalScoped(r.initial, context, locals) and rowLocalScoped(r.input, context, locals) and rowLocalScoped(r.projection, context, &local);
+        },
+        .map => |entries| blk: {
+            for (entries) |entry| if (!rowLocalScoped(entry.value, context, locals)) break :blk false;
+            break :blk true;
+        },
+        .map_projection => |p| blk: {
+            if (!rowLocalScoped(p.base, context, locals)) break :blk false;
+            for (p.items) |item| switch (item) {
+                .entry => |entry| if (!rowLocalScoped(entry.value, context, locals)) break :blk false,
+                .variable => |name| if (!permitted(name, context, locals)) break :blk false,
+                .property, .all => {},
+            };
+            break :blk true;
+        },
+        .case_when => |c| blk: {
+            if (!optionalLocal(c.operand, context, locals) or !optionalLocal(c.otherwise, context, locals)) break :blk false;
+            for (c.branches) |branch| if (!rowLocalScoped(branch.condition, context, locals) or !rowLocalScoped(branch.value, context, locals)) break :blk false;
+            break :blk true;
+        },
+    };
+}
+fn optionalLocal(expr: ?*const ast.Expr, context: anytype, locals: ?*const Local) bool {
+    return if (expr) |value| rowLocalScoped(value, context, locals) else true;
+}
+fn allLocal(items: []const *const ast.Expr, context: anytype, locals: ?*const Local) bool {
+    for (items) |item| if (!rowLocalScoped(item, context, locals)) return false;
+    return true;
+}
 fn references(expr: *const ast.Expr, name: []const u8) bool {
     return switch (expr.value) {
         .literal, .parameter => false,

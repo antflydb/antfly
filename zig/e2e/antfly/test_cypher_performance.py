@@ -332,6 +332,17 @@ def test_authenticated_cypher_property_plans_and_sql_overlays(monkeypatch):
         )
         assert len(pulled["rows"]) == 1, pulled
         call("/sql", {"statement": f"CREATE INDEX {hops}_score ON {hops}(score)"})
+        # Publication precedes asynchronous backfill. Prove READY use before
+        # timing the selective interior plan, as for the earlier property seeks.
+        ready = call(
+            f"/graphs/{hops}/query",
+            {
+                "query": "MATCH (n:H) WHERE n.score=9 RETURN n.score",
+                "limits": {"scanned_anchors": 1},
+            },
+            wait_for_index=True,
+        )
+        assert ready["rows"] == [[{"type": "integer", "value": "9"}]], ready
         interior = call(
             "/sql",
             {
@@ -429,6 +440,35 @@ def test_authenticated_cypher_property_plans_and_sql_overlays(monkeypatch):
         assert distinct_endpoints["rows"] == [
             [{"type": "integer", "value": str(i)}] for i in range(6, 18)
         ], distinct_endpoints
+        pure_endpoint = call(
+            f"/graphs/{hops}/query",
+            {
+                "query": "MATCH (a:H)-[:R*6..6]->(b:H) RETURN min(CASE WHEN b.score>0 THEN b.score ELSE 1/0 END)",
+                "limits": {"explored_edges": 153, "intermediate_states": 20000},
+            },
+        )
+        assert pure_endpoint["rows"] == [[{"type": "integer", "value": "6"}]], (
+            pure_endpoint
+        )
+        for bounds, expected in (("1..", 2**18 - 19), ("0..", 2**18 - 1)):
+            all_lengths = call(
+                f"/graphs/{hops}/query",
+                {
+                    "query": f"MATCH (a:H)-[:R*{bounds}]->(b:H) RETURN count(*)",
+                    "limits": {"explored_edges": 153, "intermediate_states": 20000},
+                },
+            )
+            assert all_lengths["rows"] == [
+                [{"type": "integer", "value": str(expected)}]
+            ], all_lengths
+        pure_columns = call(
+            "/sql",
+            {
+                "statement": f"SELECT min(CAST(q.score AS BIGINT)) FROM GRAPH_TABLE({hops} MATCH {path} "
+                "COLUMNS(CASE WHEN b.score>0 THEN b.score ELSE 1/0 END AS score)) q"
+            },
+        )
+        assert pure_columns["rows"] == [["6"]], pure_columns
         phase = call(
             f"/graphs/{hops}/query",
             {

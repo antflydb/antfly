@@ -1344,6 +1344,27 @@ therefore do not force those consumers back into route enumeration. Mixing in a
 bag-sensitive COUNT/SUM/AVG requests exact weights through every scan adapter,
 including authenticated owner cursors; unsupported consumers keep ordinary rows.
 
+Read phases share a bounded, quota-accounted cache of raw adjacency pages across
+anchors. Cache keys include mapping, direction, identity and continuation; each
+capture still applies its own property residuals and uniqueness proof. Admission
+stops when the cache allowance fills, retaining borrowed pages until phase end.
+Cache hits retain authorization/cancellation checkpoints and logical work charges.
+Writes separate read phases, so neither staged nor durable mutations reuse stale
+adjacency. SQL weighted cursors own the same cache for their immutable read cut.
+
+For path patterns whose consumer does not observe the starting node, native
+reductions combine at most 128 starting nodes per batch. Pure endpoint
+expressions use scope-aware dependency analysis, including CASE, map projections,
+slices, comprehensions and reduce; scalar functions explicitly opt into repeatability.
+Root-dependent predicates/grouping and selective reverse anchors keep their ordinary
+plans. A declined proof resumes each original anchor before emitting compressed rows;
+soft batch allocation failure flushes retained roots and disables admission.
+Unbounded DAG segments with lower bound zero or one sum all path lengths in one
+topological pass, keeping positive-length arrivals separate from zero-hop seeds to
+preserve saturated overflow checks. Long bounded ranges on wide anchor batches
+can use the same reduction when a bounded closure proof shows every captured
+route fits the upper bound; other ranges retain the product-state reducer.
+
 Endpoint-local predicates, grouping keys, COUNT/SUM/AVG/MIN/MAX and their
 DISTINCT variants consume weighted endpoint rows from those same states.
 Endpoint-only RETURN DISTINCT also reduces the path product states directly,
