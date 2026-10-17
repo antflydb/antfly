@@ -42043,6 +42043,27 @@ fn consumerTests() type {
             }));
         }
 
+        test "raft index owner observation crosses the compiled storage boundary" {
+            const a = std.testing.allocator;
+            const contract = @import("antfly_local_sources").storage_db_relational_index_raft_contract;
+            var directory = try @import("antfly_local_sources").common_test_directory.TestDirectory.init("compiled-raft-index-observer");
+            defer directory.cleanup();
+            const identity: contract.Identity = .{ .id = @splat(1), .plan_digest = @splat(2), .owner_digest = @splat(3), .ordinal = 0, .namespace = .{ .table_id = 101, .shard_id = 11, .range_id = 12 }, .owner_group_id = 11 };
+            const schema_json =
+                \\{"version":1,"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"integer"}},"additionalProperties":false}}}}
+            ;
+            // Empty relational tables still have a metadata-authoritative
+            // schema/catalog. A raw unprovisioned directory has no durable
+            // identity and must not be mistaken for an admitted owner.
+            var owner = try kernel_owner_client.Owner.open(.{ .path = .fromSlice(directory.path()), .table_name = .fromSlice("items"), .group_id = 11, .has_identity_namespace = 1, .identity_table_id = 101, .identity_shard_id = 11, .identity_range_id = 12, .schema_json = .fromSlice(schema_json) });
+            defer owner.deinit();
+            const result = try owner.raftIndexOwnerObservation(a, "items", identity, .{});
+            try result.validate(identity);
+            try std.testing.expect(result.binding == null and result.applied == null and result.fenced == null and result.reserved == null);
+            try std.testing.expectError(error.InvalidArgument, owner.raftIndexOwnerObservation(a, "other", identity, .{}));
+            try std.testing.expectError(error.DeadlineExceeded, owner.raftIndexOwnerObservation(a, "items", identity, .{ .execution_deadline_ns = 0 }));
+        }
+
         test "raft index owner controls require their decoder but cannot bypass metadata admission" {
             const Command = @typeInfo(@FieldType(antfly.db.types.BatchRequest, "relational_index_owner_control")).optional.child;
             // Intentionally invalid: capability classification and generic-route

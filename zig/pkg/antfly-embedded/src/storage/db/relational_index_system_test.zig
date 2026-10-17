@@ -279,7 +279,17 @@ test "relational index system Raft owner controls commit authentic phase cuts at
 
     // A real durable predecessor must resolve before a drained-fence receipt.
     const transaction = try db.beginTransaction(1);
-    try db.applyCommittedRaftIndexOwnerControl(&admission, 11, .{ .term = 1, .index = 10 });
+    {
+        var pinned = try db.core.store.beginReadTxn();
+        defer pinned.abort();
+        try db.applyCommittedRaftIndexOwnerControl(&admission, 11, .{ .term = 1, .index = 10 });
+        const old = try raft.observe(&pinned, identity);
+        try std.testing.expect(old.binding == null and old.fenced == null and old.reserved == null);
+        try std.testing.expectEqual(@as(u64, 1), old.applied.?.raft.index);
+        const current = try db.raftIndexOwnerObservation(11, identity);
+        try std.testing.expectEqualDeep(binding, current.binding.?);
+        try std.testing.expectEqual(@as(u64, 10), current.applied.?.raft.index);
+    }
     try std.testing.expectEqualDeep(binding, (try db.raftIndexOwnerState(11, identity)).?);
     foreign_identity = identity;
     foreign_identity.plan_digest[0] ^= 1;
@@ -343,6 +353,7 @@ test "relational index system Raft owner controls commit authentic phase cuts at
         try db.core.store.putBatch(&.{.{ .key = &cut_key, .value = corrupt }}, &.{});
         try std.testing.expectError(error.InvalidControlReceiptPosition, db.raftIndexOwnerReceipt(11, binding, .reserved));
         try std.testing.expectError(error.InvalidControlReceiptPosition, db.raftIndexOwnerState(11, identity));
+        try std.testing.expectError(error.InvalidControlReceiptPosition, db.raftIndexOwnerObservation(11, identity));
         try db.core.store.putBatch(&.{.{ .key = &cut_key, .value = saved }}, &.{});
         try std.testing.expectEqualDeep(reserved, (try db.raftIndexOwnerReceipt(11, binding, .reserved)).?);
     }

@@ -29,13 +29,13 @@ const physical = @import("relational_index_catalog.zig");
 const authority = @import("../source_authority.zig");
 const receipts = @import("apply_receipts.zig");
 const publication = @import("relational_index_publication_progress.zig");
-const positions = @import("receipt_position.zig");
 const Entry = receipts.OrderedApplyReceipt;
 
 const contract = @import("relational_index_raft_contract.zig");
 pub const Effect = contract.Effect;
 pub const Command = contract.Command;
 pub const Identity = contract.Identity;
+pub const Observation = contract.Observation;
 pub const validateBatchRequest = contract.validateBatchRequest;
 pub const Admission = @import("relational_index_cancellation_intent.zig").Intent;
 pub const prefix = jobs.key ++ ":raft:";
@@ -61,14 +61,7 @@ fn context(binding: jobs.Binding) ![32]u8 {
     return hash(&try original.encode());
 }
 fn evidence(binding: jobs.Binding, effect: Effect, entry: Entry) ![32]u8 {
-    var digest = std.crypto.hash.Blake3.init(.{});
-    digest.update("antfly:index-owner-raft-effect:v1");
-    digest.update(&try context(binding));
-    digest.update(&.{@backingInt(effect)});
-    digest.update(&try (positions.Position{ .raft = .{ .term = entry.term, .index = entry.index } }).encode());
-    var result: [32]u8 = undefined;
-    digest.final(&result);
-    return result;
+    return contract.effectEvidence(binding, effect, .{ .raft = .{ .term = entry.term, .index = entry.index } });
 }
 fn optional(txn: anytype, name: []const u8) !?[]const u8 {
     return txn.get(name) catch |err| {
@@ -140,10 +133,10 @@ fn currentState(txn: anytype, binding: jobs.Binding) !jobs.Binding {
     try inputs.require(txn, current.inputs_digest);
     if (current.phase == .installed) return error.PrivateIndexPublicationRequired;
     const schema = (try optional(txn, @import("../schema.zig").schema_key)) orelse return error.RelationalIndexCatalogSchemaMismatch;
-    if (!std.mem.eql(u8, &hash(schema), &binding.schema_before)) return error.RelationalIndexCatalogSchemaMismatch;
+    if (schema.len > inputs.max_schema_bytes or !std.mem.eql(u8, &hash(schema), &binding.schema_before)) return error.RelationalIndexCatalogSchemaMismatch;
     const integrity = (try optional(txn, catalog.key)) orelse return error.IntegrityCatalogChanged;
     const expected = if (current.phase == .reserved) binding.integrity_reserved else binding.integrity_before;
-    if (!std.mem.eql(u8, &hash(integrity), &expected)) return error.IntegrityCatalogChanged;
+    if (integrity.len > catalog.max_catalog_bytes or !std.mem.eql(u8, &hash(integrity), &expected)) return error.IntegrityCatalogChanged;
     const head = if (try optional(txn, physical.head_key)) |bytes| try physical.Head.decode(bytes) else null;
     const expected_head = if (current.phase == .reserved) binding.physical_reserved else binding.physical_before;
     if (expected_head) |value| {
@@ -176,6 +169,10 @@ pub fn receipt(txn: anytype, binding: jobs.Binding, effect: Effect) !?publicatio
     const current = try currentState(txn, binding);
     if (effect == .reserved and current.phase != .reserved) return null;
     const cut = (try loadCut(txn, binding, effect)) orelse return null;
+    return logicalReceipt(binding, effect, cut);
+}
+
+fn logicalReceipt(binding: jobs.Binding, effect: Effect, cut: Cut) publication.Receipt {
     return .{
         .owner = .{ .plan_id = binding.id, .plan_digest = binding.plan_digest, .ordinal = binding.ordinal, .group_id = binding.fence.owner_group_id, .namespace = binding.fence.namespace, .authority = .raft, .fence_digest = binding.owner_digest },
         .action = if (effect == .fenced) .fenced else .reserved,
@@ -184,6 +181,18 @@ pub fn receipt(txn: anytype, binding: jobs.Binding, effect: Effect) !?publicatio
         .reservation_digest = binding.integrity_reserved,
         .evidence_digest = cut.evidence,
     };
+}
+
+pub fn observe(txn: anytype, expected: Identity) !Observation {
+    const binding = try inspect(txn, expected);
+    const applied = try marker(txn);
+    var result: Observation = .{ .format_version = 1, .binding = binding, .applied = if (applied) |entry| .{ .raft = .{ .term = entry.term, .index = entry.index } } else null };
+    if (binding) |value| {
+        if (try loadCut(txn, value, .fenced)) |cut| result.fenced = logicalReceipt(value, .fenced, cut);
+        if (try loadCut(txn, value, .reserved)) |cut| result.reserved = logicalReceipt(value, .reserved, cut);
+    }
+    try result.validate(expected);
+    return result;
 }
 fn stageCut(txn: anytype, binding: jobs.Binding, effect: Effect, entry: Entry) !Cut {
     var bytes: [120]u8 = @splat(0);

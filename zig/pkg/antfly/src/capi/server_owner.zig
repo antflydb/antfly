@@ -4041,6 +4041,44 @@ pub fn storageOwnerReplicatedBatchAtRaftEntryJson(
     return .ok;
 }
 
+/// Read-only facts from one owner snapshot. The actual group comes from the
+/// handle; identity, cancellation and bounds cannot select an apply position.
+pub fn storageOwnerRaftIndexObservationJson(
+    owner: ?*anyopaque,
+    request: *const kernel_owner_abi.RaftIndexOwnerObservationRequest,
+    out_response: *kernel_owner_abi.OwnedBytes,
+    out_failure: *kernel_owner_abi.FailureIdentity,
+) callconv(.c) kernel_owner_abi.Status {
+    out_response.* = .{};
+    out_failure.* = .{};
+    const Failure = struct {
+        fn result(err: anyerror, out: *kernel_owner_abi.FailureIdentity) kernel_owner_abi.Status {
+            out.* = kernel_error_identity.failureFromError(err, .storage_owner, kernel_owner_abi.abi_version, kernel_owner_abi.RaftIndexOwnerObservationRequest.operation);
+            return out.status;
+        }
+    };
+    if (request.version != kernel_owner_abi.abi_version or request.control.version != kernel_owner_abi.abi_version) return Failure.result(error.InvalidAbiVersion, out_failure);
+    const contract = @import("antfly_local_sources").storage_db_relational_index_raft_contract;
+    if (request.identity_json.ptr == null or request.identity_json.len == 0 or request.identity_json.len > contract.Identity.max_json_bytes or
+        request.control.has_execution_deadline > 1 or request.control._reserved0 != 0 or !std.mem.allEqual(u8, &request.control._reserved1, 0) or
+        request.control.table_name.len != 0 or request.control.request_json.len != 0) return Failure.result(error.InvalidArgument, out_failure);
+    const context: @import("antfly_local_sources").api_operation.RequestContext = .{ .deadline_ns = if (request.control.has_execution_deadline != 0) request.control.execution_deadline_ns else null, .cancellation = ownerQueryCancellation(&request.control) };
+    context.ensureActive() catch |err| return Failure.result(err, out_failure);
+    const handle = asHandle(owner) orelse return Failure.result(error.InvalidArgument, out_failure);
+    _ = storageOwnerTableName(handle, request.table_name) orelse return Failure.result(error.InvalidArgument, out_failure);
+    var parsed = std.json.parseFromSlice(contract.Identity, handle.alloc, request.identity_json.slice(), .{ .ignore_unknown_fields = false }) catch |err|
+        return Failure.result(if (err == error.OutOfMemory) err else error.InvalidArgument, out_failure);
+    defer parsed.deinit();
+    const result = handle.db.raftIndexOwnerObservation(handle.storage_owner_group_id, parsed.value) catch |err| return Failure.result(err, out_failure);
+    context.ensureActive() catch |err| return Failure.result(err, out_failure);
+    var response = BoundedOwnerJsonResponse(contract.Observation.max_json_bytes).init() catch |err| return Failure.result(err, out_failure);
+    defer response.deinit();
+    const used = response.encode(result) catch |err| return Failure.result(err, out_failure);
+    context.ensureActive() catch |err| return Failure.result(err, out_failure);
+    out_response.* = response.detach(used);
+    return .ok;
+}
+
 /// No ordinary-batch decoding or caller-selected replay position enters this
 /// boundary. Metadata permission is independently checked by the server worker;
 /// durable local job/catalog checks remain authoritative for each storage effect.
@@ -4398,30 +4436,43 @@ fn nativeIndexValidationStatus(err: anyerror) kernel_owner_abi.Status {
     });
 }
 
-const NativeIndexResponse = struct {
-    buffer: ?[]u8,
+const NativeIndexResponse = BoundedOwnerJsonResponse(@import("antfly_local_sources").storage_db_relational_index_owner_control.max_response_bytes);
 
-    fn init() !NativeIndexResponse {
-        return .{ .buffer = try std.heap.c_allocator.alloc(u8, @import("antfly_local_sources").storage_db_relational_index_owner_control.max_response_bytes) };
-    }
+fn BoundedOwnerJsonResponse(comptime max_bytes: usize) type {
+    return struct {
+        buffer: ?[]u8,
 
-    fn deinit(self: *NativeIndexResponse) void {
-        if (self.buffer) |buffer| std.heap.c_allocator.free(buffer);
-        self.* = undefined;
-    }
+        fn init() !@This() {
+            return .{ .buffer = try std.heap.c_allocator.alloc(u8, max_bytes) };
+        }
 
-    fn finish(self: *NativeIndexResponse, outcome: anytype, out_response: *kernel_owner_abi.OwnedBytes) kernel_owner_abi.Status {
-        const buffer = self.buffer.?;
-        var writer: std.Io.Writer = .fixed(buffer);
-        std.json.Stringify.value(outcome, .{}, &writer) catch |err| return storageOwnerStatusFromError(err);
-        // The C allocator guarantees in-place shrink, unlike general allocators.
-        const resized = std.heap.c_allocator.resize(buffer, writer.end);
-        std.debug.assert(resized);
-        out_response.* = .{ .ptr = buffer.ptr, .len = writer.end };
-        self.buffer = null;
-        return .ok;
-    }
-};
+        fn deinit(self: *@This()) void {
+            if (self.buffer) |buffer| std.heap.c_allocator.free(buffer);
+            self.* = undefined;
+        }
+
+        fn encode(self: *@This(), outcome: anytype) !usize {
+            var writer: std.Io.Writer = .fixed(self.buffer.?);
+            try std.json.Stringify.value(outcome, .{}, &writer);
+            return writer.end;
+        }
+
+        fn detach(self: *@This(), used: usize) kernel_owner_abi.OwnedBytes {
+            const buffer = self.buffer.?;
+            // The C allocator guarantees in-place shrink, unlike general allocators.
+            const resized = std.heap.c_allocator.resize(buffer, used);
+            std.debug.assert(resized);
+            self.buffer = null;
+            return .{ .ptr = buffer.ptr, .len = used };
+        }
+
+        fn finish(self: *@This(), outcome: anytype, out_response: *kernel_owner_abi.OwnedBytes) kernel_owner_abi.Status {
+            const used = self.encode(outcome) catch |err| return storageOwnerStatusFromError(err);
+            out_response.* = self.detach(used);
+            return .ok;
+        }
+    };
+}
 
 fn applyNativeIndexPreparedResponse(handle: anytype, prepared: anytype, out_response: *kernel_owner_abi.OwnedBytes) kernel_owner_abi.Status {
     var response = NativeIndexResponse.init() catch |err| return storageOwnerStatusFromError(err);

@@ -1318,6 +1318,138 @@ test "storage owner native index receipt snapshot guards every durable outbox fo
     }
 }
 
+test "storage owner Raft index observations preserve coherent cuts and reject caller positions" {
+    const a = std.testing.allocator;
+    const local = @import("antfly_local_sources");
+    const contract = local.storage_db_relational_index_raft_contract;
+    const before =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"integer"},"email":{"type":"string"}},"additionalProperties":false}}}}
+    ;
+    const after =
+        \\{"version":2,"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"integer"},"email":{"type":"string"}},"additionalProperties":false}}},"relational_indexes":[{"name":"email_idx","keys":[{"column":"email"}]}],"unique_constraints":[{"name":"email_idx","origin":"index","columns":["email"]}]}
+    ;
+    var directory = try TestDirectory.init("raft-index-observation-capi");
+    defer directory.cleanup();
+    var handle: Handle = .{ .alloc = a, .db = try db_mod.DB.open(a, directory.path(), .{ .start_optional_runtimes = false, .primary_backend = .{ .lsm = .{} }, .online_source_authority = .raft, .identity_namespace = .{ .table_id = 101, .shard_id = 11, .range_id = 12 } }), .storage_owner_table_name = @constCast("items"), .storage_owner_group_id = 11 };
+    defer handle.db.close();
+    const id = try registerTestHandle(&handle);
+    defer unregisterTestHandle(id);
+    try handle.db.setSchemaJson(a, before);
+    var schema = try local.schema_mod.parseValidatedTableSchema(a, before);
+    defer schema.deinit(a);
+    var prior = try local.schema_relational_declarations.compileCatalog(a, schema, 101, null);
+    defer prior.deinit();
+    try handle.db.core.store.putBatch(&.{.{ .key = local.storage_db_relational_integrity_catalog.key, .value = prior.value }}, &.{});
+    var candidate = try local.storage_db_relational_index_candidate.Candidate.prepare(a, 101, before, after, prior.value, "email_idx");
+    defer candidate.deinit();
+    // Supplied-entry storage/ABI qualification, not metadata authorization or
+    // consensus. Physical binding and cuts are nevertheless real store state.
+    const header: contract.Admission = .{ .id = @splat(1), .plan_digest = @splat(2), .owner_digest = @splat(3), .ordinal = 0, .fence = .{ .role = .index_build, .transition_id = 7, .attempt = 1, .owner_group_id = 11, .peer_group_id = 11, .namespace = handle.db.core.identity_namespace, .catalog_digest = local.storage_db_relational_index_inputs.digest(prior.value) }, .candidate_digest = local.storage_db_relational_index_inputs.digest(candidate.next.value), .reservation_digest = local.storage_db_relational_index_inputs.digest(candidate.reservation.value) };
+    const identity: contract.Identity = .{ .id = header.id, .plan_digest = header.plan_digest, .owner_digest = header.owner_digest, .ordinal = header.ordinal, .namespace = header.fence.namespace, .owner_group_id = 11 };
+    const encoded = try std.json.Stringify.valueAlloc(a, identity, .{});
+    defer a.free(encoded);
+    const request: kernel_owner_abi.RaftIndexOwnerObservationRequest = .{ .table_name = .fromSlice("items"), .identity_json = .fromSlice(encoded) };
+    const Read = struct {
+        fn run(owner: ?*anyopaque, req: kernel_owner_abi.RaftIndexOwnerObservationRequest, expected: contract.Identity) !contract.Observation {
+            var response: kernel_owner_abi.OwnedBytes = .{};
+            var failure: kernel_owner_abi.FailureIdentity = .{};
+            const status = server_api.storageOwnerRaftIndexObservationJson(owner, &req, &response, &failure);
+            defer freeRawBuffer(response.ptr, response.len);
+            try std.testing.expectEqual(kernel_owner_abi.Status.ok, status);
+            try kernel_error_identity.validateFailureEnvelope(status, &failure, kernel_owner_abi.abi_version);
+            try std.testing.expect(response.len <= contract.Observation.max_json_bytes);
+            var parsed = try std.json.parseFromSlice(contract.Observation, std.testing.allocator, response.slice(), .{ .ignore_unknown_fields = false });
+            defer parsed.deinit();
+            try parsed.value.validate(expected);
+            return parsed.value;
+        }
+        fn reject(owner: ?*anyopaque, req: kernel_owner_abi.RaftIndexOwnerObservationRequest, name: []const u8) !void {
+            var response: kernel_owner_abi.OwnedBytes = .{};
+            var failure: kernel_owner_abi.FailureIdentity = .{};
+            const status = server_api.storageOwnerRaftIndexObservationJson(owner, &req, &response, &failure);
+            defer freeRawBuffer(response.ptr, response.len);
+            try std.testing.expect(status != .ok);
+            try kernel_error_identity.validateFailureEnvelope(status, &failure, kernel_owner_abi.abi_version);
+            try std.testing.expectEqualStrings(name, failure.errorName());
+            try std.testing.expect(response.ptr == null and response.len == 0);
+        }
+    };
+    const empty = try Read.run(id, request, identity);
+    try std.testing.expect(empty.binding == null and empty.applied == null and empty.fenced == null and empty.reserved == null);
+    var bad = request;
+    bad.version = 0;
+    bad.identity_json = .{ .ptr = @ptrFromInt(1), .len = std.math.maxInt(u64) };
+    try Read.reject(null, bad, "InvalidAbiVersion");
+    bad = request;
+    bad.identity_json = .{ .ptr = @ptrFromInt(1), .len = contract.Identity.max_json_bytes + 1 };
+    try Read.reject(id, bad, "InvalidArgument");
+    bad = request;
+    bad.table_name = .fromSlice("other");
+    try Read.reject(id, bad, "InvalidArgument");
+    bad = request;
+    bad.control = .{ .has_execution_deadline = 1, .execution_deadline_ns = 0 };
+    try Read.reject(id, bad, "DeadlineExceeded");
+    const Cancel = struct {
+        calls: usize = 0,
+        at: usize,
+        fn check(ptr: ?*anyopaque) callconv(.c) u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr.?));
+            self.calls += 1;
+            return @intFromBool(self.calls >= self.at);
+        }
+    };
+    for ([_]usize{ 1, 2, 3 }) |at| {
+        var cancel: Cancel = .{ .at = at };
+        bad = request;
+        bad.control.cancellation_ctx = &cancel;
+        bad.control.cancellation_fn = Cancel.check;
+        try Read.reject(id, bad, "Canceled");
+    }
+    const caller_position = try std.fmt.allocPrint(a, "{s},\"applied\":{{\"raft\":{{\"term\":7,\"index\":9}}}}}}", .{encoded[0 .. encoded.len - 1]});
+    defer a.free(caller_position);
+    var caller_tree = try std.json.parseFromSlice(std.json.Value, a, caller_position, .{});
+    defer caller_tree.deinit();
+    bad = request;
+    bad.identity_json = .fromSlice(caller_position);
+    try Read.reject(id, bad, "InvalidArgument");
+    try std.testing.expect(try handle.db.orderedApplyReceipt() == null);
+    var admission = try handle.db.prepareRaftIndexOwnerAdmission(header, candidate.inputs.bytes);
+    defer admission.deinit();
+    try handle.db.applyCommittedRaftIndexOwnerControl(&admission, 11, .{ .term = 1, .index = 1 });
+    const admitted = try Read.run(id, request, identity);
+    try std.testing.expectEqualDeep(admission.command.binding, admitted.binding.?);
+    try std.testing.expect(admitted.fenced == null and admitted.reserved == null);
+    for ([_]contract.Effect{ .fenced, .reserved }, 0..) |effect, ordinal| {
+        var prepared = try handle.db.prepareRaftIndexOwnerControl(.{ .effect = effect, .binding = admission.command.binding });
+        defer prepared.deinit();
+        try handle.db.applyCommittedRaftIndexOwnerControl(&prepared, 11, .{ .term = 2, .index = ordinal + 2 });
+    }
+    const observed = try Read.run(id, request, identity);
+    try std.testing.expectEqual(.reserved, observed.binding.?.phase);
+    try std.testing.expectEqual(@as(u64, 2), observed.fenced.?.position.raft.index);
+    try std.testing.expectEqual(@as(u64, 3), observed.reserved.?.position.raft.index);
+    try std.testing.expectEqualDeep(observed.reserved.?.position, observed.applied.?);
+    var altered = observed;
+    altered.applied = .{ .native = .{ .namespace = identity.namespace, .sequence = 3 } };
+    try std.testing.expectError(error.InvalidControlReceiptPosition, altered.validate(identity));
+    altered = observed;
+    altered.fenced = null;
+    try std.testing.expectError(error.InvalidControlReceiptPosition, altered.validate(identity));
+    altered = observed;
+    altered.reserved.?.position = observed.fenced.?.position;
+    try std.testing.expectError(error.InvalidControlReceiptPosition, altered.validate(identity));
+    altered = observed;
+    altered.reserved.?.evidence_digest[0] ^= 1;
+    try std.testing.expectError(error.InvalidControlReceiptPosition, altered.validate(identity));
+    var retry = try handle.db.prepareRaftIndexOwnerControl(.{ .effect = .reserved, .binding = admission.command.binding });
+    defer retry.deinit();
+    try handle.db.applyCommittedRaftIndexOwnerControl(&retry, 11, .{ .term = 3, .index = 4 });
+    const recovered = try Read.run(id, request, identity);
+    try std.testing.expectEqualDeep(observed.reserved, recovered.reserved);
+    try std.testing.expectEqualDeep(observed.fenced, recovered.fenced);
+    try std.testing.expectEqual(@as(u64, 4), recovered.applied.?.raft.index);
+}
+
 test "storage owner native index raw admission and bounded controls preserve local allocation and committed proofs" {
     const a = std.testing.allocator;
     const local = @import("antfly_local_sources");

@@ -8142,13 +8142,24 @@ pub const DB = struct {
     /// independently obtained metadata identity. No physical index allocation
     /// or mutation.
     pub fn raftIndexOwnerState(self: *DB, owner_group: u64, expected: RaftIndexOwnerControl.Identity) !?@import("relational_index_owner_job.zig").Binding {
+        try self.requireRaftIndexOwnerIdentity(owner_group, expected);
+        var txn = try self.core.store.beginReadTxn();
+        defer txn.abort();
+        return RaftIndexOwnerControl.inspect(&txn, expected);
+    }
+
+    pub fn raftIndexOwnerObservation(self: *DB, owner_group: u64, expected: RaftIndexOwnerControl.Identity) !RaftIndexOwnerControl.Observation {
+        try self.requireRaftIndexOwnerIdentity(owner_group, expected);
+        var txn = try self.core.store.beginReadTxn();
+        defer txn.abort();
+        return RaftIndexOwnerControl.observe(&txn, expected);
+    }
+
+    fn requireRaftIndexOwnerIdentity(self: *DB, owner_group: u64, expected: RaftIndexOwnerControl.Identity) !void {
         if (self.local_execution.restore_staging_required.load(.acquire)) return error.RestoreStagingScopeChanged;
         try expected.validate();
         if (owner_group == 0 or owner_group != expected.owner_group_id) return error.PrivateIndexOwnerJobChanged;
         if (!expected.namespace.eql(self.core.identity_namespace)) return error.IdentityNamespaceMismatch;
-        var txn = try self.core.store.beginReadTxn();
-        defer txn.abort();
-        return RaftIndexOwnerControl.inspect(&txn, expected);
     }
 
     /// Recovery reads the original committed phase cut; it never uses the

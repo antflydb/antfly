@@ -630,6 +630,28 @@ pub const Owner = struct {
         return response;
     }
 
+    pub fn raftIndexOwnerObservation(self: *Owner, alloc: std.mem.Allocator, table_name: []const u8, identity: @import("antfly_local_sources").storage_db_relational_index_raft_contract.Identity, options: QueryOptions) !@import("antfly_local_sources").storage_db_relational_index_raft_contract.Observation {
+        const contract = @import("antfly_local_sources").storage_db_relational_index_raft_contract;
+        try identity.validate();
+        const encoded = try std.json.Stringify.valueAlloc(alloc, identity, .{});
+        defer alloc.free(encoded);
+        var response: Response = .{};
+        defer response.deinit();
+        var failure: abi.FailureIdentity = .{};
+        const status = abi.antfly_storage_owner_raft_index_observation_json(self.handle, &.{
+            .table_name = .fromSlice(table_name),
+            .identity_json = .fromSlice(encoded),
+            .control = controlledRequest("", "", options.execution_deadline_ns, options.cancellation_ctx, options.cancellation_fn),
+        }, &response.buffer, &failure);
+        if (status != .ok and (failure.boundary != .storage_owner or failure.operation != abi.RaftIndexOwnerObservationRequest.operation)) return error.InvalidBoundaryFailureIdentity;
+        try acceptStorageOwnerFailure(status, failure, "Raft index owner observation");
+        if (response.bytes().len == 0 or response.bytes().len > contract.Observation.max_json_bytes) return error.InvalidPrivateIndexOwnerJob;
+        var parsed = try std.json.parseFromSlice(contract.Observation, alloc, response.bytes(), .{ .ignore_unknown_fields = false });
+        defer parsed.deinit();
+        try parsed.value.validate(identity);
+        return parsed.value;
+    }
+
     pub fn nativeIndexOwnerStateJson(self: *Owner, table_name: []const u8, identity_json: []const u8) !Response {
         var response: Response = .{};
         try statusToError(abi.antfly_storage_owner_native_index_control_json(self.handle, &.{

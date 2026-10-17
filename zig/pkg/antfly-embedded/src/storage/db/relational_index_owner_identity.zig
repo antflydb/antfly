@@ -19,6 +19,7 @@ const std = @import("std");
 /// Metadata's immutable owner identity, without physical allocation choices or
 /// schema-sized inputs. Status is information, never publication permission.
 pub const Identity = struct {
+    pub const max_json_bytes = 4096;
     id: [16]u8,
     plan_digest: [32]u8,
     owner_digest: [32]u8,

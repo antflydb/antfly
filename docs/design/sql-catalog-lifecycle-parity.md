@@ -10497,3 +10497,64 @@ Raft snapshot companion, 51/51 steps, without skips/failures/leaks, in
 `/private/tmp/antfly-sql-raft-index-owner-inspection-full-debug.log`.
 Source boundary and generated control catalog checks
 pass; the Apache boundary now covers 2,068 source files.
+
+### Coherent compiled-owner Raft observations (read-only)
+
+The compiled storage boundary now exposes a typed read-only observation of one
+Raft owner's binding, original fence/reservation receipts and apply watermark.
+These values come from one read transaction; the trusted opaque handle supplies
+the actual group. The observer checks namespace/authority, catalogs, immutable
+inputs and durable cuts before returning. It neither selects physical index IDs
+nor changes a job, allocates an index, signs progress or supplies metadata permission.
+An unprovisioned directory without durable identity fails closed; an empty
+relational table with its metadata-authoritative schema is a valid owner.
+
+The response contract requires its version and validates exact identity,
+authority, phase/action, catalog digests, original-position evidence and ordering
+against the same watermark. The evidence hash is shared with retained-cut storage
+without changing its encoding; it detects inconsistent data, but does not
+authenticate a caller or prove commit by itself. Native positions cannot substitute for Raft
+positions. Schema/catalog lengths are checked before hashing their bounded
+private-job preimages.
+
+The ABI admits at most 4 KiB of identity JSON and 32 KiB of response. It rejects
+unknown input fields and caller-supplied positions, preserves typed failure
+identity and checks cancellation/deadlines before and after read and after
+serialization. The typed client validates the failure boundary/operation and the
+decoded observation before releasing the response buffer. Native controls and
+Raft reads share the bounded JSON response mechanism; allocation is capped before
+serialization, and native controls retain their pre-commit response allocation.
+
+Real-store tests cover no-job/admitted/fenced/reserved states, original cuts after
+later-term retries, incoherent/native positions, missing cuts, tampered evidence,
+caller-position rejection and cancellation at all three checkpoints. A read
+transaction pinned before admission still observes the old absence and watermark
+after admission commits, while a fresh read observes the new job. Corrupt retained
+cuts also reject observation rather than becoming absence or an ACK.
+The separately compiled-provider test exercises typed reads on a provisioned empty
+table, wrong-table/deadline failures and the unchanged generic proposal guard.
+These are storage/ABI contracts, not network consensus or complete SQL qualification.
+
+The preparation bridge and authenticated receiver remain unfinished. They must
+obtain the physical allocation from the actual owner, pin/recheck leader and root
+scope, independently fetch metadata permission and propose through the durable
+all-member capability barrier. Full source/build/claims/install/cancel/standby
+processing and distributed fault qualification are still required before opening
+the public Raft admission guard. No standalone reporter namespace or retirement
+activation is enabled. Original dispositions remain 531 implemented / 132 rejected
+/ 113 superseded / 810 unresolved.
+
+Debug checkpoint evidence: seven ABI contracts, 52/52 steps, no
+skips/failures/leaks in
+`/private/tmp/antfly-sql-raft-index-observation-capi-final-debug.log`; two compiled
+consumer/provider contracts, 91/91 steps, no skips/failures/leaks in
+`/private/tmp/antfly-sql-raft-index-observation-compiled-final-debug.log`; focused
+snapshot/inspection contract, 51/51 steps in
+`/private/tmp/antfly-sql-raft-index-observation-snapshot-debug.log`; the full index
+system suite passes 274 tests plus its snapshot companion, 51/51 steps, no
+skips/failures/leaks in
+`/private/tmp/antfly-sql-raft-index-observation-full-system-debug.log`.
+Licensing, the 2,068-source Apache boundary, generated control catalog and immutable
+original inventory audits pass. Three verified inactive worktree-local test-cache
+entries (about 2.2 GiB) were removed for build headroom; they are rebuildable. Source,
+test logs and user data were preserved.
