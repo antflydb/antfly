@@ -159,10 +159,10 @@ pub const rules: []const @import("unit_test_ownership.zig").Rule = &.{
             "api.openapi_contract.test.metadata openapi module generates extractor surface for routed endpoints",
             "api.query.consumerTests.Suite.test.",
             "metadata.storage.raft_apply_store.test.",
-            "storage.db.query.document_authority.test.",
-            "storage.db.query.graph_exec.test.",
-            "storage.db.query.search_exec.test.public graph metric borrowed wire",
-            "storage.db.types.test.",
+            // The storage collection owns physical source tests, including
+            // borrowed-wire helpers imported by this protocol consumer. Keep
+            // focused graph targets intact; only the aggregate skips them.
+            "storage.",
         },
     },
     .{
@@ -652,7 +652,7 @@ pub const rules: []const @import("unit_test_ownership.zig").Rule = &.{
     },
     .{
         .source = "pkg/antfly/src/root.zig",
-        .artifact = "test",
+        .artifact = "api-auth-tests",
         .selection = "storage migration job observation preserves admitted and unpublished catalog state",
         .skip = &.{
             "api.http_server.test.api http server cluster backup succeeds after load balanced metadata timeout retry",
