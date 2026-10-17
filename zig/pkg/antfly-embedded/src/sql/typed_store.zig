@@ -564,6 +564,12 @@ pub const Store = struct {
         pub fn deinit(self: *JsonLease) void {
             self.identities.deinit(self.a);
         }
+        /// A flush retires destination ownership, but producer identities and
+        /// their hashes remain valid until the current immutable batch ends.
+        pub fn forgetOwned(self: *JsonLease) void {
+            var entries = self.identities.valueIterator();
+            while (entries.next()) |entry| entry.owned = null;
+        }
         fn resolve(self: *JsonLease, store: *const Store, payload: JsonPayload) !*Resolution {
             const bytes = if (payload.frozen) |value| value.bytes else payload.text.?;
             const representation: u8 = if (payload.frozen) |value| (if (value.lossless_text) @as(u8, 3) else 2) else 1;
@@ -681,24 +687,24 @@ pub const Store = struct {
         return .{ .dictionary = .{ .values = try a.realloc(values, used), .indices = indices } };
     }
     pub fn appendBytes(self: *const Store, values: []const Datum) !usize {
-        // Estimate retained column storage, not a reconstructed Datum row.
-        // Callers reserve growth headroom separately; the allocator remains
-        // the authority for actual admission, including representation changes.
         var bytes: usize = if (self.initialized) 0 else columnMetadataBytes(values.len);
-        for (values, 0..) |value, index| {
-            var repeated = false;
-            if (!value.sql_null and index < self.columns.len) {
-                const column = self.columns[index];
-                if (column.values == .strings and value.value == .string) repeated = column.values.strings.lookup.contains(value.value.string);
-                if (column.values == .decimals and value.value == .number_string) repeated = column.values.decimals.lookup.contains(value.value.number_string);
-                if (!repeated) {
-                    if (column.values == .strings and value.value == .string) bytes +|= column.values.strings.growthBytes(1);
-                    if (column.values == .decimals and value.value == .number_string) bytes +|= column.values.decimals.growthBytes(1);
-                }
+        for (values, 0..) |value, column| bytes +|= try self.cellAppendBytes(column, value);
+        return bytes;
+    }
+    fn cellAppendBytes(self: *const Store, index: usize, value: Datum) !usize {
+        var bytes: usize = 0;
+        var repeated = false;
+        if (!value.sql_null and index < self.columns.len) {
+            const column = self.columns[index];
+            if (column.values == .strings and value.value == .string) repeated = column.values.strings.flat == null and column.values.strings.lookup.contains(value.value.string);
+            if (column.values == .decimals and value.value == .number_string) repeated = column.values.decimals.flat == null and column.values.decimals.lookup.contains(value.value.number_string);
+            if (!repeated) {
+                if (column.values == .strings and value.value == .string) bytes +|= column.values.strings.growthBytes(1);
+                if (column.values == .decimals and value.value == .number_string) bytes +|= column.values.decimals.growthBytes(1);
             }
-            bytes +|= if (repeated) @sizeOf(u32) + 1 else try retainedCellBytes(value);
-            if (repeated and value.patterns != null) bytes +|= @sizeOf(?*scalar.PatternSet);
         }
+        bytes +|= if (repeated) @sizeOf(u32) + 1 else try retainedCellBytes(value);
+        if (repeated and value.patterns != null) bytes +|= @sizeOf(?*scalar.PatternSet);
         return bytes;
     }
     /// Estimate only new native JSON bodies, including duplicates within this
@@ -749,7 +755,7 @@ pub const Store = struct {
                 bytes +|= source.len +| @sizeOf(JsonPayload) +| 64;
             } else {
                 _ = cell_region.reset(.retain_capacity);
-                bytes +|= try @import("operators.zig").datumBytes(try batch.cell(cell_region.allocator(), index, column));
+                bytes +|= try self.cellAppendBytes(column, try batch.cell(cell_region.allocator(), index, column));
             }
             // Reject before temporary identity state can outgrow admission.
             if (bytes > maximum) return bytes;

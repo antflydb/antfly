@@ -105,10 +105,10 @@ pub const Cursor = struct {
             while (count_rows < capacity) {
                 if (top.external) |sort| {
                     while (self.sorted_offset != 0) : (self.sorted_offset -= 1) {
-                        const skipped = (try sort.nextLeased()) orelse return error.InvalidSqlSpill;
-                        skipped.release();
+                        if (!try sort.skip()) return error.InvalidSqlSpill;
                     }
                     const lease = (try sort.nextLeased()) orelse return error.InvalidSqlSpill;
+                    if (lease.key_block) |keys| keys.release();
                     rows[count_rows] = .{ .block = lease.block, .index = lease.index, .values = lease.row.values, .typed = lease.values };
                     if (lease.block) |block| {
                         const existing = for (blocks[0..held]) |prior| {
@@ -120,7 +120,10 @@ pub const Cursor = struct {
                             leased_bytes +|= block.retainedBytes() +| @sizeOf(@import("spill.zig").Sequential.OwnedBlock);
                         }
                     }
-                } else rows[count_rows] = .{ .values = self.sorted_rows[self.sorted_offset + self.index].values };
+                } else {
+                    const position = self.sorted_offset + self.index;
+                    rows[count_rows] = if (top.nativeStore(position)) |typed| .{ .typed = typed, .index = 0 } else .{ .values = self.sorted_rows[position].values };
+                }
                 for (0..self.width) |column| bytes +|= try rows[count_rows].bytes(a, column);
                 self.index += 1;
                 count_rows += 1;
@@ -292,7 +295,7 @@ pub const Cursor = struct {
         const owned = try self.a.create(@import("operators.zig").TopK);
         errdefer self.a.destroy(owned);
         // Finish before moving: memory rows borrow the heap's stable arenas.
-        const memory_rows = if (top.external == null) try top.finish(self.a) else &.{};
+        const memory_rows = if (top.external == null) try top.finishNative(self.a) else &.{};
         owned.* = top.*;
         top.* = .{ .alloc = top.alloc, .entries = &.{}, .orders = &.{}, .max_bytes = 0, .retained_bytes = 0 };
         self.sorted = owned;
@@ -308,15 +311,12 @@ pub const Cursor = struct {
         if (self.replay_failed) return error.InvalidSqlBackendResponse;
         if (self.sorted) |top| {
             if (top.external) |sort| {
-                var scratch = std.heap.ArenaAllocator.init(self.a);
-                defer scratch.deinit();
                 while (self.sorted_offset != 0) : (self.sorted_offset -= 1) {
-                    _ = scratch.reset(.free_all);
-                    _ = (try sort.nextValues(scratch.allocator())) orelse return error.InvalidSqlSpill;
+                    if (!try sort.skip()) return error.InvalidSqlSpill;
                 }
                 return (try sort.nextValues(a)) orelse error.InvalidSqlSpill;
             }
-            return self.sorted_rows[self.sorted_offset + self.index];
+            return top.scalarRow(self.sorted_offset + self.index);
         }
         if (self.memory) |memory| {
             if (self.memory_reader == null) {
@@ -430,7 +430,7 @@ pub const Cursor = struct {
         pub fn next(self: *ReplayReader) !?[]const @import("scalar.zig").Datum {
             if (self.index == self.owner.count()) return null;
             const values = switch (self.storage) {
-                .sorted => self.owner.sorted_rows[self.owner.sorted_offset + self.index].values,
+                .sorted => (try self.owner.sorted.?.scalarRow(self.owner.sorted_offset + self.index)).values,
                 .memory => |reader| (try reader.next()) orelse return error.InvalidSqlBackendResponse,
                 .disk => |*reader| (try reader.readCurrent(self.index)).row.values,
             };
@@ -455,10 +455,27 @@ pub const Cursor = struct {
                 },
                 .sorted => blk: {
                     const count_rows = @min(maximum, self.owner.count() - self.index);
-                    const rows = try a.alloc([]const @import("scalar.zig").Datum, count_rows);
-                    for (rows, self.owner.sorted_rows[self.owner.sorted_offset + self.index ..][0..count_rows]) |*row, stored| row.* = stored.values;
+                    const View = struct {
+                        top: *@import("operators.zig").TopK,
+                        begin: usize,
+                        fn cell(raw: *anyopaque, alloc: std.mem.Allocator, row: usize, column: usize) anyerror!@import("scalar.zig").Datum {
+                            const self_: *@This() = @ptrCast(@alignCast(raw));
+                            const position = self_.begin + row;
+                            return if (self_.top.nativeStore(position)) |store| store.cell(alloc, 0, column) else self_.top.entries[position].row.values[column];
+                        }
+                        fn frozen(raw: *anyopaque, row: usize, column: usize) anyerror!?@import("execution_batch.zig").FrozenJson {
+                            const self_: *@This() = @ptrCast(@alignCast(raw));
+                            return if (self_.top.nativeStore(self_.begin + row)) |store| store.frozenJson(0, column) else null;
+                        }
+                        fn json(raw: *anyopaque, row: usize, column: usize) anyerror!?[]const u8 {
+                            const self_: *@This() = @ptrCast(@alignCast(raw));
+                            return if (self_.top.nativeStore(self_.begin + row)) |store| store.encodedJson(0, column) else null;
+                        }
+                    };
+                    const view = try a.create(View);
+                    view.* = .{ .top = self.owner.sorted.?, .begin = self.owner.sorted_offset + self.index };
                     self.index += count_rows;
-                    break :blk .{ .rows = rows };
+                    break :blk .{ .reader = .{ .ptr = view, .read = View.cell, .read_frozen = View.frozen, .read_json = View.json, .count = count_rows, .width = self.owner.width } };
                 },
             };
         }
@@ -845,4 +862,66 @@ test "SQL blocking native leases size frozen JSON without DOM expansion and pres
     };
     try Fixture.run(std.testing.allocator, 4096, true);
     try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Fixture.run, .{ @as(usize, 16), false });
+}
+
+test "SQL native sorted heap leases and replay preserve frozen rows after producer retirement" {
+    const Fixture = struct {
+        fn check(_: *anyopaque) !void {}
+        fn run(a: std.mem.Allocator, elements: usize) !void {
+            const spill = @import("spill.zig");
+            const Datum = @import("scalar.zig").Datum;
+            const Reader = struct {
+                block: *spill.ColumnarBlock,
+                fn cell(raw: *anyopaque, _: std.mem.Allocator, row: usize, column: usize) anyerror!Datum {
+                    const self: *@This() = @ptrCast(@alignCast(raw));
+                    return self.block.cell(row, column);
+                }
+                fn frozen(raw: *anyopaque, row: usize, column: usize) anyerror!?@import("execution_batch.zig").FrozenJson {
+                    const self: *@This() = @ptrCast(@alignCast(raw));
+                    return self.block.frozenJson(row, column, false);
+                }
+            };
+            var token: u8 = 0;
+            var manager: spill.Manager = .{ .alloc = a, .io = std.testing.io, .context = &token, .checkpoint = check };
+            defer manager.deinit();
+            const cursor = try Cursor.create(a, &manager, 1);
+            defer cursor.close();
+            var top = try @import("operators.zig").TopK.initWithSpill(a, 2, &.{.{}}, 1024 * 1024, &manager);
+            defer top.deinit();
+            {
+                var source = std.heap.ArenaAllocator.init(a);
+                defer source.deinit();
+                const sa = source.allocator();
+                var array = std.json.Array.init(sa);
+                for (0..elements) |index| try array.append(.{ .integer = @intCast(index) });
+                const wire = try spill.encodeColumnarBlockVersionAlloc(sa, &.{.{ .values = &.{Datum.json(.{ .array = array })}, .keys = &.{}, .ordinal = 0 }}, 1024 * 1024, .v2);
+                var block = try spill.decodeColumnarBlockForForwarding(sa, a, wire, 1024 * 1024);
+                defer block.deinit();
+                var reader: Reader = .{ .block = &block };
+                for (0..8) |index| {
+                    const key = Datum.json(.{ .integer = @intCast(8 - index) });
+                    try top.addBatch(sa, .{ .reader = .{ .ptr = &reader, .read = Reader.cell, .read_frozen = Reader.frozen, .count = 1, .width = 1 } }, &.{&.{key}}, &.{index});
+                }
+                try std.testing.expect(top.external == null);
+                try Cursor.takeSorted(cursor, &top, 0, 2, false);
+            }
+            var scratch = std.heap.ArenaAllocator.init(a);
+            defer scratch.deinit();
+            const reader = try cursor.openReplayReader();
+            defer reader.close();
+            const batch = try reader.nextBatch(scratch.allocator(), 2);
+            for (0..2) |index| try std.testing.expect((try batch.frozenJson(index, 0)) != null);
+            // A forward transport lease can coexist with an independent replay.
+            const lease = try cursor.nextLease(scratch.allocator(), 2, 1024 * 1024);
+            defer lease.deinit();
+            try std.testing.expect((try lease.values.frozenJson(1, 0)) != null);
+            reader.rewind();
+            const values = (try reader.next()).?;
+            try std.testing.expectEqual(elements, values[0].value.array.items.len);
+            try std.testing.expectEqual(@as(i64, @intCast(elements - 1)), values[0].value.array.items[elements - 1].integer);
+            try std.testing.expectEqual(@as(u64, 0), manager.written_bytes);
+        }
+    };
+    try Fixture.run(std.testing.allocator, 4096);
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Fixture.run, .{@as(usize, 16)});
 }

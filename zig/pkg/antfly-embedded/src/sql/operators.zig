@@ -51,9 +51,33 @@ pub fn compareRows(left: Row, right: Row, orders: []const Order) !std.math.Order
     return std.math.order(left.ordinal, right.ordinal);
 }
 
+// Stable owner: column stores and lazy caches must never borrow a movable
+// heap-entry arena. Its child budget measures all retained vector capacity.
+const NativeRow = struct {
+    budget: MemoryBudget,
+    store: @import("typed_store.zig").Store,
+    fn create(a: Allocator, batch: @import("execution_batch.zig").Batch) !*NativeRow {
+        const self = try a.create(NativeRow);
+        self.budget = .{ .backing = a, .limit = std.math.maxInt(usize) };
+        self.store = .init(self.budget.allocator());
+        errdefer {
+            self.store.deinit();
+            a.destroy(self);
+        }
+        try self.store.appendBatch(batch);
+        return self;
+    }
+    fn deinit(self: *NativeRow) void {
+        const a = self.budget.backing;
+        self.store.deinit();
+        std.debug.assert(self.budget.live == 0);
+        a.destroy(self);
+    }
+};
 const OwnedRow = struct {
     arena: std.heap.ArenaAllocator,
     row: Row,
+    native: ?*NativeRow = null,
 
     fn cloneInto(arena: *std.heap.ArenaAllocator, row: Row) !Row {
         const owned = arena.allocator();
@@ -72,11 +96,12 @@ const OwnedRow = struct {
     }
 
     pub fn deinit(self: *OwnedRow) void {
+        if (self.native) |owner| owner.deinit();
         self.arena.deinit();
     }
 
     fn allocatedBytes(self: OwnedRow) usize {
-        return arenaBytes(&self.arena);
+        return arenaBytes(&self.arena) +| if (self.native) |owner| owner.budget.live +| @sizeOf(NativeRow) else @as(usize, 0);
     }
 };
 
@@ -153,7 +178,9 @@ pub const TopK = struct {
         errdefer sort.deinit();
         while (self.released < self.count) {
             const entry = &self.entries[self.released];
-            try sort.add(entry.row);
+            if (entry.native) |native| {
+                try sort.addBatch(.{ .retained = .{ .store = &native.store, .count = 1 } }, &.{entry.row.keys}, &.{entry.row.ordinal});
+            } else try sort.add(entry.row);
             self.retained_bytes -= entry.allocatedBytes();
             entry.deinit();
             self.released += 1;
@@ -179,20 +206,23 @@ pub const TopK = struct {
             var emitted: usize = 0;
             while (index < self.capacity) : (index += 1) {
                 _ = arena.reset(.free_all);
-                const row = (try sort.next(arena.allocator())) orelse break;
-                if (index < offset) continue;
+                if (index < offset) {
+                    if (!try sort.skip()) break;
+                    continue;
+                }
                 if (emitted == limit) {
-                    if (implicit) return error.SqlResultTooLarge;
+                    if (implicit and try sort.skip()) return error.SqlResultTooLarge;
                     break;
                 }
+                const row = (try sort.next(arena.allocator())) orelse break;
                 try sink.append(sink.ptr, row.values);
                 emitted += 1;
             }
         } else {
-            const rows = try self.finish(arena.allocator());
+            const rows = try self.finishNative(arena.allocator());
             const begin = @min(offset, rows.len);
             if (implicit and rows.len - begin > limit) return error.SqlResultTooLarge;
-            for (rows[begin..][0..@min(limit, rows.len - begin)]) |row| try sink.append(sink.ptr, row.values);
+            for (begin..begin + @min(limit, rows.len - begin)) |index| try sink.append(sink.ptr, (try self.scalarRow(index)).values);
         }
     }
     pub fn finishPage(self: *TopK, alloc: Allocator, offset: usize, limit: usize) ![]const Row {
@@ -202,7 +232,7 @@ pub const TopK = struct {
             defer arena.deinit();
             for (0..@min(offset, self.capacity)) |_| {
                 _ = arena.reset(.free_all);
-                if ((try sort.next(arena.allocator())) == null) return &.{};
+                if (!try sort.skip()) return &.{};
             }
             var rows: std.ArrayList(Row) = .empty;
             for (0..@min(limit, self.capacity -| offset)) |_| {
@@ -211,10 +241,12 @@ pub const TopK = struct {
             }
             return rows.toOwnedSlice(alloc);
         }
-        const rows = try self.finish(alloc);
+        const rows = try self.finishNative(alloc);
         const begin = @min(offset, rows.len);
         for (0..begin) |index| self.releaseFinishedRow(index);
-        return rows[begin..][0..@min(limit, rows.len - begin)];
+        const page = @constCast(rows[begin..][0..@min(limit, rows.len - begin)]);
+        for (page, begin..) |*row, index| row.* = try self.scalarRow(index);
+        return page;
     }
     pub fn deinit(self: *TopK) void {
         if (self.external) |sort| {
@@ -261,8 +293,37 @@ pub const TopK = struct {
             if (self.capacity == 0 or (self.count == self.capacity and (try self.compare(row, self.entries[0].row)) != .lt)) continue;
             // Reject losers before reading payload cells. A small LIMIT keeps
             // its bounded heap rather than sorting the complete input on disk.
-            row.values = try batch.row(a, index);
-            self.retainInMemory(row) catch |err| try self.spillCandidate(row, err);
+            var native_payload = false;
+            for (0..batch.width()) |column| {
+                if (try batch.frozenJson(index, column) != null or try batch.encodedJson(index, column) != null) {
+                    native_payload = true;
+                    break;
+                }
+            }
+            if (native_payload) {
+                const selected = try batch.select(a, &.{index});
+                var estimate: usize = @sizeOf(NativeRow) +| @import("typed_store.zig").columnMetadataBytes(batch.width()) +| 2048;
+                for (0..batch.width()) |column| estimate +|= try batch.cellBytes(a, index, column);
+                for (row.keys) |key| estimate +|= try datumBytes(key);
+                const room = MemoryBudget.headroom(self.alloc) orelse std.math.maxInt(usize);
+                const displaced = if (self.count == self.capacity and self.count != 0) self.entries[0].allocatedBytes() else @as(usize, 0);
+                // The old winner remains live until publication; parent
+                // headroom covers both, while the heap cap covers survivors.
+                if (estimate > self.max_bytes -| (self.retained_bytes -| displaced) or estimate +| estimate / 2 +| 4096 > room) {
+                    if (self.spill_manager == null) return error.SqlProgramLimitExceeded;
+                    try self.startSpill();
+                    try self.external.?.addBatch(selected, keys[index..][0..1], ordinals[index..][0..1]);
+                    continue;
+                }
+                self.retainNative(selected, row) catch |err| {
+                    if (err != error.SqlProgramLimitExceeded or self.spill_manager == null) return err;
+                    try self.startSpill();
+                    try self.external.?.addBatch(selected, keys[index..][0..1], ordinals[index..][0..1]);
+                };
+            } else {
+                row.values = try batch.row(a, index);
+                self.retainInMemory(row) catch |err| try self.spillCandidate(row, err);
+            }
         }
     }
     fn addInMemory(self: *TopK, row: Row) !void {
@@ -276,6 +337,29 @@ pub const TopK = struct {
         };
         if (self.count == self.capacity and (try self.compare(row, self.entries[0].row)) != .lt) return;
         return self.retainInMemory(row);
+    }
+    fn retainNative(self: *TopK, batch: @import("execution_batch.zig").Batch, row: Row) !void {
+        try self.growEntries();
+        var owned: OwnedRow = .{ .arena = .init(self.alloc), .row = row };
+        errdefer owned.deinit();
+        const a = owned.arena.allocator();
+        const keys = try a.alloc(Datum, row.keys.len);
+        for (keys, row.keys) |*out, key| out.* = try cloneDatum(a, key);
+        owned.row.keys = keys;
+        owned.native = try NativeRow.create(self.alloc, batch);
+        try self.publish(owned);
+    }
+    pub fn nativeStore(self: *const TopK, index: usize) ?*const @import("typed_store.zig").Store {
+        return if (self.entries[index].native) |owner| &owner.store else null;
+    }
+    pub fn scalarRow(self: *TopK, index: usize) !Row {
+        const entry = &self.entries[index];
+        if (entry.native) |native| if (entry.row.values.len == 0) {
+            const before = entry.allocatedBytes();
+            defer self.retained_bytes +|= entry.allocatedBytes() -| before;
+            entry.row.values = try native.store.row(entry.arena.allocator(), 0);
+        };
+        return entry.row;
     }
     fn retainInMemory(self: *TopK, row: Row) !void {
         try self.growEntries();
@@ -293,8 +377,12 @@ pub const TopK = struct {
         }
         const cloned = try OwnedRow.cloneInto(&candidate_arena, row);
         const owned: OwnedRow = .{ .arena = candidate_arena, .row = cloned };
+        return self.publish(owned);
+    }
+    fn publish(self: *TopK, owned: OwnedRow) !void {
         const bytes = owned.allocatedBytes();
-        if (bytes > self.max_bytes -| self.retained_bytes) return error.SqlProgramLimitExceeded;
+        const displaced_bytes = if (self.count == self.capacity and self.count != 0) self.entries[0].allocatedBytes() else @as(usize, 0);
+        if (bytes > self.max_bytes -| (self.retained_bytes -| displaced_bytes)) return error.SqlProgramLimitExceeded;
         self.copied_rows += 1;
         if (self.count < self.entries.len) {
             var index = self.count;
@@ -329,6 +417,7 @@ pub const TopK = struct {
                 index = child;
             }
             self.retained_bytes -= self.entries[0].allocatedBytes();
+            if (self.entries[0].native) |native| native.deinit();
             var displaced = self.entries[0].arena;
             index = 0;
             for (path[0..path_count]) |child| {
@@ -339,6 +428,7 @@ pub const TopK = struct {
             self.retained_bytes += bytes;
             _ = displaced.reset(.retain_capacity);
             if (self.retained_bytes +| arenaBytes(&displaced) <= self.max_bytes) {
+                if (self.scratch) |*previous| previous.deinit();
                 self.scratch = displaced;
             } else displaced.deinit();
         }
@@ -357,6 +447,11 @@ pub const TopK = struct {
     /// Returns rows in requested order, with original ordinal as a stable tie
     /// breaker. Returned cell data remains owned by this operator until deinit.
     pub fn finish(self: *TopK, alloc: Allocator) ![]const Row {
+        const rows = try self.finishNative(alloc);
+        for (@constCast(rows), 0..) |*row, index| row.* = try self.scalarRow(index);
+        return rows;
+    }
+    pub fn finishNative(self: *TopK, alloc: Allocator) ![]const Row {
         if (self.released != 0) return error.InvalidSqlBackendResponse;
         if (!self.finished) {
             var end = self.count;
@@ -3741,4 +3836,58 @@ test "SQL native small limit rejects batch losers without reading payloads" {
     try std.testing.expectEqual(@as(usize, 3), top.comparisons);
     const result = try top.finish(arena.allocator());
     try std.testing.expectEqual(@as(i64, 99), result[0].values[0].value.integer);
+}
+
+test "SQL native small heap retains frozen JSON within parent quotas" {
+    const Reader = struct {
+        block: *@import("spill.zig").ColumnarBlock,
+        fn read(raw: *anyopaque, _: Allocator, row: usize, column: usize) anyerror!Datum {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            return self.block.cell(row, column);
+        }
+        fn frozen(raw: *anyopaque, row: usize, column: usize) anyerror!?@import("execution_batch.zig").FrozenJson {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            return self.block.frozenJson(row, column, false);
+        }
+        fn check(_: *anyopaque) !void {}
+    };
+    const a = std.testing.allocator;
+    for ([_]usize{ 131072, 262144 }) |quota| {
+        const elements: usize = 4096;
+        var input = std.heap.ArenaAllocator.init(a);
+        defer input.deinit();
+        const ia = input.allocator();
+        var array = std.json.Array.init(ia);
+        for (0..elements) |i| try array.append(.{ .integer = @intCast(i) });
+        const spill = @import("spill.zig");
+        const wire = try spill.encodeColumnarBlockVersionAlloc(ia, &.{.{ .values = &.{Datum.json(.{ .array = array })}, .keys = &.{}, .ordinal = 0 }}, 8 << 20, .v2);
+        var budget: MemoryBudget = .{ .backing = a, .limit = quota };
+        defer std.debug.assert(budget.live == 0);
+        var block = try spill.decodeColumnarBlockForForwarding(ia, budget.allocator(), wire, 8 << 20);
+        defer block.deinit();
+        var reader: Reader = .{ .block = &block };
+        var dummy: u8 = 0;
+        var manager: spill.Manager = .{ .alloc = budget.allocator(), .io = std.testing.io, .context = &dummy, .checkpoint = Reader.check, .compression = .none, .async_writes = false, .buffer_bytes = 128, .max_record_bytes = quota };
+        defer manager.deinit();
+        var top = try TopK.initWithSpill(budget.allocator(), 1, &.{.{}}, quota, &manager);
+        defer top.deinit();
+        var work = std.heap.ArenaAllocator.init(budget.allocator());
+        defer work.deinit();
+        for (0..12) |i| {
+            _ = work.reset(.free_all);
+            const key = Datum.json(.{ .integer = @intCast(12 - i) });
+            try top.addBatch(work.allocator(), .{ .reader = .{ .ptr = &reader, .read = Reader.read, .read_frozen = Reader.frozen, .count = 1, .width = 1 } }, &.{&.{key}}, &.{i});
+        }
+        try std.testing.expect(top.external == null);
+        const rows = try top.finishNative(work.allocator());
+        try std.testing.expectEqual(@as(usize, 1), rows.len);
+        try std.testing.expectEqual(@as(i64, 1), rows[0].keys[0].value.integer);
+        const frozen = (try top.nativeStore(0).?.frozenJson(0, 0)).?;
+        _ = frozen;
+        try std.testing.expectEqual(@as(u64, 0), manager.written_bytes);
+        // An empty selected window must not expand its skipped winner.
+        const empty = try top.finishPage(work.allocator(), 1, 0);
+        try std.testing.expectEqual(@as(usize, 0), empty.len);
+        std.debug.print("NATIVE_TOPK quota={d} peak={d} wire={d} replacements=11\n", .{ quota, budget.peak, wire.len });
+    }
 }
