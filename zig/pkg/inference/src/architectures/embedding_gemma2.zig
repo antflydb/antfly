@@ -286,6 +286,18 @@ fn normLastUse(cb: *const ComputeBackend, layer: usize, suffix: []const u8, inpu
     return rmsNormLastUse(cb, input, w, dim, eps);
 }
 
+fn normResidual(cb: *const ComputeBackend, layer: usize, suffix: []const u8, input: *?CT, residual: CT, dim: usize, eps: f32, output_scale: f32) !CT {
+    const w = try weight(cb, layer, suffix);
+    defer cb.free(w);
+    if (try cb.rmsNormResidual(input.*.?, w, residual, dim, eps, 1, output_scale)) |result| return finishLastUse(cb, input, result);
+    const normalized = try rmsNormLastUse(cb, input, w, dim, eps);
+    defer cb.free(normalized);
+    const sum = try cb.add(residual, normalized);
+    if (output_scale == 1) return sum;
+    defer cb.free(sum);
+    return scaled(cb, sum, output_scale);
+}
+
 fn linear(cb: *const ComputeBackend, layer: usize, suffix: []const u8, input: CT, rows: usize, in_dim: usize, out_dim: usize) !CT {
     const w = try weight(cb, layer, suffix);
     defer cb.free(w);
@@ -656,9 +668,7 @@ fn encoderLayer(cb: *const ComputeBackend, allocator: std.mem.Allocator, cfg: Co
     defer cb.free(n);
     var attn: ?CT = try attention(cb, allocator, cfg, n, vis, batch, seq, layer);
     defer if (attn) |value| cb.free(value);
-    const an = try normLastUse(cb, layer, "post_attention_layernorm.weight", &attn, h, cfg.rms_norm_eps);
-    defer cb.free(an);
-    const residual = try cb.add(input, an);
+    const residual = try normResidual(cb, layer, "post_attention_layernorm.weight", &attn, input, h, cfg.rms_norm_eps, 1);
     defer cb.free(residual);
     attention_region.deinit();
     var ffn_region = if (profile) try cb.decoderRuntimePushComputeRegion(.ffn) else ops.DecoderRuntimeComputeRegionScope{};
@@ -693,9 +703,7 @@ fn encoderLayer(cb: *const ComputeBackend, allocator: std.mem.Allocator, cfg: Co
         break :blk try linear(cb, layer, "mlp.down_proj.weight", product, rows, cfg.intermediate_size, h);
     };
     defer if (down) |value| cb.free(value);
-    const dn = try normLastUse(cb, layer, "post_feedforward_layernorm.weight", &down, h, cfg.rms_norm_eps);
-    defer cb.free(dn);
-    const ffn = try cb.add(residual, dn);
+    const ffn = try normResidual(cb, layer, "post_feedforward_layernorm.weight", &down, residual, h, cfg.rms_norm_eps, 1);
     defer cb.free(ffn);
     ffn_region.deinit();
     var ple_region = if (profile) try cb.decoderRuntimePushComputeRegion(.ple) else ops.DecoderRuntimeComputeRegionScope{};
@@ -714,22 +722,20 @@ fn encoderLayer(cb: *const ComputeBackend, allocator: std.mem.Allocator, cfg: Co
     defer cb.free(ple);
     var pg: ?CT = try linear(cb, layer, "ple_block.per_layer_input_gate.weight", ffn, rows, h, cfg.per_layer_input_dim);
     defer if (pg) |value| cb.free(value);
-    const pga = try geluLastUse(cb, &pg);
-    defer cb.free(pga);
-    const pp = try cb.multiply(pga, ple);
+    const pp = (try cb.activationMultiply(pg.?, ple, .gelu)) orelse blk: {
+        const pga = try geluLastUse(cb, &pg);
+        defer cb.free(pga);
+        break :blk try cb.multiply(pga, ple);
+    };
     defer cb.free(pp);
     var po: ?CT = try linear(cb, layer, "ple_block.per_layer_projection.weight", pp, rows, cfg.per_layer_input_dim, h);
     defer if (po) |value| cb.free(value);
-    const pon = try normLastUse(cb, layer, "ple_block.post_per_layer_input_norm.weight", &po, h, cfg.rms_norm_eps);
-    defer cb.free(pon);
-    const output = try cb.add(ffn, pon);
-    defer cb.free(output);
     const scalar = try weight(cb, layer, "layer_scalar");
     defer cb.free(scalar);
     const value = try cb.toFloat32(scalar, allocator);
     defer allocator.free(value);
     if (value.len != 1 or !std.math.isFinite(value[0])) return error.InvalidEmbeddingGemma2Weight;
-    const result = try scaled(cb, output, value[0]);
+    const result = try normResidual(cb, layer, "ple_block.post_per_layer_input_norm.weight", &po, ffn, h, cfg.rms_norm_eps, value[0]);
     errdefer cb.free(result);
     ple_region.deinit();
     if (comptime @import("build_options").enable_metal) {

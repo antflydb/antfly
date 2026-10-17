@@ -121,6 +121,13 @@ then batches distinct KV heads for dense key envelopes. Partial envelopes
 encode one QK/PV pair per KV head, avoiding padded RHS batch strides and K/V
 expansion. Range/window masking stays exact. Query packing and score/output
 storage are bounded by the current tile; padded tail rows are not multiplied.
+Automatic dispatch uses the visible key envelope: at most 32 keys uses Flash;
+bounded local envelopes through 1536 keys use GEMM even above 512 total rows.
+Global 512-wide heads retain GEMM when the workspace fits. The 1536-key bound
+covers the maximum 512-query tile plus both 512-key windows. Explicit Flash
+and GEMM/tile overrides are reserved for qualification; workspace limits still
+apply. This avoids making a long cohort of short items inherit the wrong
+strategy from its total row count.
 
 Audio relative-position inputs, query scales, normalization ones and completed
 per-layer relative-key projections are cached as immutable model constants.
@@ -130,6 +137,26 @@ storage and waits for completion; failed copies are not published. Cancellation
 releases the consumer's handle; completed snapshots remain reusable on retry.
 Warm device execution performs no scale readback. Audio pressure reclamation and model
 unload release these constants alongside prepared weights.
+
+Backbone post-normalization/residual epilogues use one backend operation,
+including the final per-layer output scale. PLE GELU and multiplication share
+one activation operation. Audio uses the same post-normalization/residual
+primitive, with its residual weight applied before addition, and combines
+scalar output clipping with SiLU. CPU uses portable Zig SIMD; Metal uses
+precise F32 kernels. The operation contract preserves normalization, weight,
+scale, addition and final-scale order. Unsupported backends retain the
+separate-operation path. Model-owned scalar clamp metadata is bounded to 256
+entries with keys of at most 192 bytes, owns no request tensors, and is released
+on model teardown. Mutable compute contexts do not publish it.
+
+Cold Metal packed projections populate the final owned F32 snapshot directly
+from mixed BF16/F32 checkpoint segments. No combined host F32 matrix or
+per-segment F32 staging is retained. Shared storage is used on unified-memory
+devices; other Metal devices blit that same generated staging buffer directly
+to private storage, avoiding a second shared upload allocation.
+Publication remains atomic: failed preparation preserves any previous slot,
+and the existing class/admission limits charge the final allocation.
+
 
 ## MP4/MOV and fragmented input
 

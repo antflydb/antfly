@@ -94,6 +94,10 @@ pub const SegmentAttentionGrouped = struct {
     num_kv_heads: usize,
     score_scale: f32,
     workspace_limit_bytes: usize = 256 * 1024 * 1024,
+    /// Qualification overrides still obey workspace/capability limits. Normal
+    /// serving uses automatic; Native ignores the Metal strategy preference.
+    metal_strategy: enum { automatic, gemm, flash } = .automatic,
+    metal_query_tile: ?usize = null,
     control: ?@import("../execution_control.zig").InferenceExecutionControl = null,
 };
 
@@ -2019,6 +2023,15 @@ pub const ComputeBackend = struct {
         /// Y = rms_norm(input, weight, dim, eps) * scalar[0] + residual.
         /// Backends may fuse Gemma-style post-norm residual epilogues.
         rmsNormAddMultiplyScalarTensor: ?*const fn (ctx: *anyopaque, input: CT, weight: CT, residual: CT, scalar: CT, dim: usize, eps: f32) anyerror!?CT = null,
+
+        /// Y = (residual + (rms_norm(input, weight) * norm_scale)) * output_scale.
+        /// Scales are applied after normalization in this exact order; no FMA
+        /// contraction or reassociation is permitted by this contract.
+        rmsNormResidual: ?*const fn (ctx: *anyopaque, input: CT, weight: CT, residual: CT, dim: usize, eps: f32, norm_scale: f32, output_scale: f32) anyerror!?CT = null,
+        /// Immutable, bounded scalar metadata owned by the loaded model.
+        modelScalarBounds: ?*const fn (ctx: *anyopaque, key: []const u8, value: ?[4]?f32) anyerror!?[4]?f32 = null,
+        /// Y = silu(clamp(input, min_value, max_value)).
+        clampSilu: ?*const fn (ctx: *anyopaque, input: CT, min_value: ?f32, max_value: ?f32) anyerror!?CT = null,
 
         /// Y = rms_norm(input, weight, dim, eps) + residual.
         /// Backends may fuse Gemma-style post-norm residual epilogues when no
@@ -4664,6 +4677,32 @@ pub const ComputeBackend = struct {
     pub fn rmsNormAddMultiplyScalarTensor(self: *const ComputeBackend, input: CT, weight: CT, residual: CT, scalar: CT, dim: usize, eps: f32) !?CT {
         const op = self.vtable.rmsNormAddMultiplyScalarTensor orelse return null;
         return op(self.ptr, input, weight, residual, scalar, dim, eps);
+    }
+
+    pub fn rmsNormResidual(self: *const ComputeBackend, input: CT, weight: CT, residual: CT, dim: usize, eps: f32, norm_scale: f32, output_scale: f32) !?CT {
+        try self.checkExecutionControl();
+        const op = self.vtable.rmsNormResidual orelse return null;
+        const result = try op(self.ptr, input, weight, residual, dim, eps, norm_scale, output_scale);
+        errdefer if (result) |tensor| self.free(tensor);
+        try self.checkExecutionControl();
+        return result;
+    }
+
+    pub fn modelScalarBounds(self: *const ComputeBackend, key: []const u8, value: ?[4]?f32) !?[4]?f32 {
+        try self.checkExecutionControl();
+        const op = self.vtable.modelScalarBounds orelse return null;
+        const result = try op(self.ptr, key, value);
+        try self.checkExecutionControl();
+        return result;
+    }
+
+    pub fn clampSilu(self: *const ComputeBackend, input: CT, min_value: ?f32, max_value: ?f32) !?CT {
+        try self.checkExecutionControl();
+        const op = self.vtable.clampSilu orelse return null;
+        const result = try op(self.ptr, input, min_value, max_value);
+        errdefer if (result) |tensor| self.free(tensor);
+        try self.checkExecutionControl();
+        return result;
     }
 
     pub fn rmsNormAddTensor(self: *const ComputeBackend, input: CT, weight: CT, residual: CT, dim: usize, eps: f32) !?CT {

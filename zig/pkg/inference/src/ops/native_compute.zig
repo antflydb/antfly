@@ -860,6 +860,7 @@ pub const LazyWeightEntry = struct {
 };
 
 pub const WeightStore = struct {
+    scalar_bounds: @import("../models/embedding_gemma2_weight_cache.zig").ScalarBoundsCache = .{},
     allocator: std.mem.Allocator,
     resident_weights: std.StringHashMapUnmanaged(LoadedWeight),
     lazy_weights: std.StringHashMapUnmanaged(LazyWeightEntry),
@@ -4592,6 +4593,7 @@ pub fn stopPrefetchWorker(data: *WeightStore) void {
 /// Stops the worker and retires borrowed guards. Call before destroying
 /// lazy_weights, whose entries still refer to this queue's Io and mutex.
 pub fn deinitPrefetchQueue(data: *WeightStore) void {
+    data.scalar_bounds.deinit(data.allocator);
     // Stop before releasing any cache state the worker can access.
     if (data.prefetch_initialized) data.prefetch.stop();
     deinitEmbeddingGemma2F32Cache(data);
@@ -5062,6 +5064,9 @@ pub const vtable_impl = ComputeBackend.VTable{
     .geglu = &gegluOp,
     .gegluBackward = &gegluBackwardOp,
     .rmsNorm = &rmsNormOp,
+    .rmsNormResidual = &rmsNormResidualOp,
+    .modelScalarBounds = &modelScalarBoundsOp,
+    .clampSilu = &clampSiluOp,
     .multiplyScalar = &multiplyScalarOp,
     .reshape2d = &reshape2dOp,
     .rmsNormConsumeInput = &rmsNormConsumeInputOp,
@@ -36134,6 +36139,35 @@ fn embeddingHeadPrepareOp(ctx: *anyopaque, input: CT, weight: ?CT, gather: ?CT, 
     return self.withLogicalShape(tensor, &.{ @intCast(p.rows * p.heads), @intCast(p.dim) });
 }
 
+fn modelScalarBoundsOp(ctx: *anyopaque, key: []const u8, value: ?[4]?f32) anyerror!?[4]?f32 {
+    const self: *NativeCompute = @ptrCast(@alignCast(ctx));
+    if (!self.cache_embeddinggemma2_bf16_weights) return null;
+    return self.data.scalar_bounds.access(self.data.allocator, key, value);
+}
+
+fn rmsNormResidualOp(ctx: *anyopaque, input: CT, weight: CT, residual: CT, dim: usize, eps: f32, norm_scale: f32, output_scale: f32) anyerror!?CT {
+    const self: *NativeCompute = @ptrCast(@alignCast(ctx));
+    defer maybeDiscardMappedWeightAfterUse(self, weight);
+    const x = getData(input);
+    const w = getData(weight);
+    const res = getData(residual);
+    if (dim == 0 or x.len == 0 or x.len % dim != 0 or w.len != dim or res.len != x.len) return error.InvalidTensorShape;
+    const output = try self.allocator.alloc(f32, x.len);
+    activations_mod.rmsNormResidual(output, x, w, res, dim, eps, norm_scale, output_scale);
+    const result = try self.makeOwnedBuf(output);
+    errdefer freeTensor(self, result);
+    return propagateLogicalShapeLike(self, result, input);
+}
+
+fn clampSiluOp(ctx: *anyopaque, input: CT, min_value: ?f32, max_value: ?f32) anyerror!?CT {
+    const self: *NativeCompute = @ptrCast(@alignCast(ctx));
+    const output = try self.allocator.alloc(f32, getData(input).len);
+    activations_mod.clampSilu(output, getData(input), min_value, max_value);
+    const result = try self.makeOwnedBuf(output);
+    errdefer freeTensor(self, result);
+    return propagateLogicalShapeLike(self, result, input);
+}
+
 fn rmsNormOp(ctx: *anyopaque, input: CT, weight: CT, dim: usize, eps: f32) anyerror!CT {
     const self: *NativeCompute = @ptrCast(@alignCast(ctx));
     defer maybeDiscardMappedWeightAfterUse(self, weight);
@@ -53735,4 +53769,83 @@ test "embeddinggemma2 prepared constant cancellation releases consumers and perm
     const result = (try cb.modelConstant(key, null)).?;
     defer cb.free(result);
     try std.testing.expectEqualSlices(f32, &.{ 1, 2, 3, 4 }, getData(result));
+}
+
+test "embeddinggemma2 fused norm residual and clamp SiLU preserve tails scales and inputs" {
+    const a = std.testing.allocator;
+    var store = WeightStore{ .allocator = a, .resident_weights = .empty, .lazy_weights = .empty };
+    defer deinitPrefetchQueue(&store);
+    var compute = NativeCompute.init(a, &store, null);
+    defer compute.deinit();
+    compute.cache_embeddinggemma2_bf16_weights = true;
+    const cb = compute.computeBackend();
+    for ([_]usize{ 7, 256, 513, 1536 }) |dim| {
+        const rows = 3;
+        const x = try a.alloc(f32, rows * dim);
+        defer a.free(x);
+        const res = try a.alloc(f32, x.len);
+        defer a.free(res);
+        const w = try a.alloc(f32, dim);
+        defer a.free(w);
+        for (x, res, 0..) |*v, *r, i| {
+            v.* = @sin(@as(f32, @floatFromInt(i)) * 0.13);
+            r.* = @cos(@as(f32, @floatFromInt(i)) * 0.07);
+        }
+        for (w, 0..) |*v, i| v.* = 0.3 + @as(f32, @floatFromInt(i % 13)) * 0.05;
+        const xc = try cb.fromFloat32Shape(x, &.{ rows, @intCast(dim) });
+        defer cb.free(xc);
+        const rc = try cb.fromFloat32Shape(res, &.{ rows, @intCast(dim) });
+        defer cb.free(rc);
+        const wc = try cb.fromFloat32Shape(w, &.{@intCast(dim)});
+        defer cb.free(wc);
+        for ([_][2]f32{ .{ 1, 1 }, .{ 0.5, -0.7 }, .{ 0, 2 } }) |scales| {
+            const fused = (try cb.rmsNormResidual(xc, wc, rc, dim, 1e-6, scales[0], scales[1])).?;
+            defer cb.free(fused);
+            try std.testing.expect((try cb.tensorShapeMatches(fused, &.{ rows, @intCast(dim) })).?);
+            const actual = getData(fused);
+            for (0..rows) |r| {
+                var sum: f64 = 0;
+                for (x[r * dim ..][0..dim]) |v| sum += @as(f64, v) * v;
+                const inv = 1 / @sqrt(sum / @as(f64, @floatFromInt(dim)) + 1e-6);
+                for (0..dim) |c| {
+                    const i = r * dim + c;
+                    const expected: f32 = @floatCast((res[i] + @as(f64, x[i]) * inv * w[c] * scales[0]) * scales[1]);
+                    try std.testing.expectApproxEqAbs(expected, actual[i], 2e-6);
+                }
+            }
+        }
+        const clamped = (try cb.clampSilu(xc, -0.25, 0.6)).?;
+        defer cb.free(clamped);
+        for (getData(clamped), x) |v, src| {
+            const t: f64 = @min(@max(src, -0.25), 0.6);
+            try std.testing.expectApproxEqAbs(@as(f32, @floatCast(t / (1 + @exp(-t)))), v, 2e-6);
+        }
+        try std.testing.expectEqualSlices(f32, x, getData(xc));
+    }
+    const bounds: [4]?f32 = .{ -1, null, null, 2 };
+    try std.testing.expect(try cb.modelScalarBounds("audio.test", null) == null);
+    try std.testing.expectEqual(bounds, (try cb.modelScalarBounds("audio.test", bounds)).?);
+    // First publication wins; subsequent callers cannot change model constants.
+    try std.testing.expectEqual(bounds, (try cb.modelScalarBounds("audio.test", .{ 0, 0, 0, 0 })).?);
+}
+
+test "embeddinggemma2 fused epilogues unwind allocation failures" {
+    const Case = struct {
+        fn run(a: std.mem.Allocator) !void {
+            var store = WeightStore{ .allocator = a, .resident_weights = .empty, .lazy_weights = .empty };
+            defer deinitPrefetchQueue(&store);
+            var compute = NativeCompute.init(a, &store, null);
+            defer compute.deinit();
+            const cb = compute.computeBackend();
+            const x = try cb.fromFloat32Shape(&.{ 1, 2, -1, -2 }, &.{ 2, 2 });
+            defer cb.free(x);
+            const w = try cb.fromFloat32Shape(&.{ 1, 2 }, &.{2});
+            defer cb.free(w);
+            const out = (try cb.rmsNormResidual(x, w, x, 2, 1e-6, 0.5, -1)).?;
+            defer cb.free(out);
+            const activated = (try cb.clampSilu(out, -0.5, 0.5)).?;
+            defer cb.free(activated);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Case.run, .{});
 }

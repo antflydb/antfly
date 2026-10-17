@@ -13635,6 +13635,14 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         try control.control.check();
         const metadata = if (request.metadata) |tensor| try self.residentTrainingTensor(tensor, .i32, .{}) else null;
         const output = (metal_runtime.decoderRuntimeSegmentAttentionGroupedF32Device(self.provider_impl, q, k, v, request.*, metadata, &control, groupedAttentionCheck) catch |err| return control.failure orelse err) orelse return null;
+        // Flash emits one dispatch, so it has no GEMM tile boundary at which
+        // to observe cancellation after encoding. The frame keeps its resource
+        // pins; release our output owner before returning the control error.
+        control.control.check() catch |err| {
+            var cancelled = output;
+            cancelled.deinit();
+            return err;
+        };
         return try self.ctFromOwnedMetalTensor(output);
     }
 
@@ -15622,6 +15630,32 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         return self.ctFromOwnedMetalTensor(try entry.value_ptr.retainedCopy());
     }
 
+    fn modelScalarBoundsOp(ctx: *anyopaque, key: []const u8, value: ?[4]?f32) anyerror!?[4]?f32 {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        if (!self.require_f32_linears or self.shared_provider_lease_io == null) return null;
+        return self.data.scalar_bounds.access(self.data.allocator, key, value);
+    }
+
+    fn clampSiluOp(ctx: *anyopaque, input: CT, min_value: ?f32, max_value: ?f32) anyerror!?CT {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        if (disableRuntimeElementwise()) return null;
+        var x = (try self.gemma4AudioDeviceOperand(input)) orelse return null;
+        defer x.deinit();
+        const result = (try metal_runtime.decoderRuntimeClampSilu(self.provider_impl, x, min_value, max_value)) orelse return null;
+        return self.ctFromOwnedMetalTensor(result);
+    }
+
+    fn rmsNormResidualOp(ctx: *anyopaque, input: CT, weight: CT, residual: CT, dim: usize, eps: f32, norm_scale: f32, output_scale: f32) anyerror!?CT {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        if (!self.require_f32_linears or disableRuntimeElementwise()) return null;
+        const x = denseDeviceF32(input) orelse return null;
+        const res = denseDeviceF32(residual) orelse return null;
+        if (dim == 0 or x.elemCount() == 0 or x.elemCount() % dim != 0 or x.elemCount() != res.elemCount() or bufElemCount(toBuf(weight)) != dim) return error.InvalidTensorShape;
+        const slot = (try self.ensureDynamicRmsNormSlot(weight, dim)) orelse return null;
+        const result = (try metal_runtime.decoderRuntimeRmsNormResidual(self.provider_impl, x, res, slot, dim, eps, norm_scale, output_scale)) orelse return null;
+        return self.ctFromOwnedMetalTensor(result);
+    }
+
     fn rmsNormAddTensorOp(
         ctx: *anyopaque,
         input: CT,
@@ -17037,6 +17071,34 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         return .{ .slot = entry.slot, .first = first, .width = width, .in_dim = entry.in_dim };
     }
 
+    const PackedProjectionFill = struct {
+        weights: []const CT,
+        fn fill(context: ?*anyopaque, output: [*c]f32, count: usize) callconv(.c) c_int {
+            const self: *const PackedProjectionFill = @ptrCast(@alignCast(context orelse return -1));
+            var offset: usize = 0;
+            for (self.weights) |weight| {
+                const entry = toBuf(weight).lazy_entry orelse return -1;
+                const source = if (entry.host_loaded) |*item| &item.tensor else return -1;
+                const n = std.math.mul(usize, @intCast(source.shape[0]), @intCast(source.shape[1])) catch return -1;
+                if (offset > count or n > count - offset) return -1;
+                const target = output[offset..][0..n];
+                switch (source.dtype) {
+                    .bf16 => {
+                        if (source.data.len != n * 2) return -1;
+                        @import("../backends/tensor.zig").widenBf16LittleEndian(source.data, target);
+                    },
+                    .f32 => {
+                        if (source.data.len != n * 4) return -1;
+                        @memcpy(std.mem.sliceAsBytes(target), source.data);
+                    },
+                    else => return -1,
+                }
+                offset += n;
+            }
+            return if (offset == count) 0 else -1;
+        }
+    };
+
     fn packedMediaLinearsSlot(self: *MetalCompute, weights: []const CT, in_dim: usize, widths: []const usize) !?usize {
         if (!self.require_f32_linears or self.shared_provider_lease_io == null) return null;
         const policy = @import("../models/embedding_gemma2_weight_cache.zig");
@@ -17094,22 +17156,19 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         const owned_name = try owner.dupe(u8, name);
         defer if (!committed) owner.free(owned_name);
         try provider.embeddinggemma2_linear_cache.ensureUnusedCapacity(owner, 1);
-        const data = try self.allocator.alloc(f32, out_dim * in_dim);
-        defer self.allocator.free(data);
-        var offset: usize = 0;
-        for (weights, widths) |weight, width| {
-            const values = try toFloat32Op(self, weight, self.allocator);
-            defer self.allocator.free(values);
-            if (values.len != in_dim * width) return error.InvalidTensorShape;
-            @memcpy(data[offset..][0 .. in_dim * width], values);
-            offset += in_dim * width;
-        }
-        const combined_weight = try fromFloat32ShapeOp(self, data, &.{ @intCast(out_dim), @intCast(in_dim) });
-        defer freeOp(self, combined_weight);
-        const bias = try self.cachedZeroBiasBuf(out_dim);
-        defer freeOp(self, bias);
+        const bias = try self.allocator.alloc(f32, out_dim);
+        defer self.allocator.free(bias);
+        @memset(bias, 0);
+        var fill = PackedProjectionFill{ .weights = weights };
+        const runtime = provider.raw_decode_runtime orelse return null;
         defer if (!committed) metal_runtime.clearRawLinearSlot(provider, slot);
-        if (!(try self.prepareLinearWithF32Storage(&.{ .slot = slot, .weight = combined_weight, .bias = bias, .in_dim = in_dim, .out_dim = out_dim, .prefer_f32_mps_fallback = true }, .owned_shared_if_unified))) return null;
+        if (metal_runtime.termite_metal_decode_runtime_prepare_linear_generated_f32(runtime, slot, bias.ptr, in_dim, out_dim, 1, &fill, PackedProjectionFill.fill) != 0) return null;
+        if (metal_runtime.termite_metal_decode_runtime_prefer_linear_mps(runtime, slot) != 0) return null;
+        provider.raw_linear_slot_kinds[slot] = .dense;
+        provider.raw_linear_slots_prepared[slot] = true;
+        provider.raw_linear_slot_in_dims[slot] = in_dim;
+        provider.raw_linear_slot_out_dims[slot] = out_dim;
+        self.timing_stats.decoder_runtime_prepare_linear_calls += 1;
         var projection_widths: [3]usize = @splat(0);
         @memcpy(projection_widths[0..widths.len], widths);
         provider.embeddinggemma2_linear_cache.putAssumeCapacityNoClobber(owned_name, .{ .slot = slot, .in_dim = in_dim, .out_dim = out_dim, .bytes = bytes, .projection_widths = projection_widths });
@@ -33216,6 +33275,9 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         vt.channelLayerNormRelu = channelLayerNormReluOp;
         vt.gemma4AudioLocalAttention = gemma4AudioLocalAttentionOp;
         vt.rmsNormAddTensor = rmsNormAddTensorOp;
+        vt.rmsNormResidual = rmsNormResidualOp;
+        vt.modelScalarBounds = modelScalarBoundsOp;
+        vt.clampSilu = clampSiluOp;
         vt.layerNorm = layerNormOp;
         // The inherited NativeCompute op would read a MetalCompute tensor as
         // its own; the interpreter falls back to layerNorm without it.
@@ -42825,16 +42887,17 @@ test "metal_compute: embeddinggemma2 grouped tile cancellation and wrapping OOM 
     const Cancel = struct {
         checks: usize = 0,
         timeout: bool = false,
+        cancel_after: usize = 4,
         fn check(ctx: ?*anyopaque) anyerror!void {
             const self: *@This() = @ptrCast(@alignCast(ctx.?));
             self.checks += 1;
-            if (self.checks >= 4) return if (self.timeout) error.Timeout else error.Cancelled;
+            if (self.checks >= self.cancel_after) return if (self.timeout) error.Timeout else error.Cancelled;
         }
     };
     var cancel: Cancel = .{};
     // A global head and 513 rows cross a tile boundary for every admitted
     // query tile (128/256/512) at the fourth control check.
-    var request = ops.SegmentAttentionGrouped{ .visibility = .{ .ranges = ranges, .query_positions = qp, .key_positions = kp, .queries = rows, .keys = keys, .num_heads = heads, .head_dim = d }, .num_kv_heads = kv, .score_scale = 1, .control = .{ .ptr = &cancel, .check_fn = Cancel.check } };
+    var request = ops.SegmentAttentionGrouped{ .visibility = .{ .ranges = ranges, .query_positions = qp, .key_positions = kp, .queries = rows, .keys = keys, .num_heads = heads, .head_dim = d }, .num_kv_heads = kv, .score_scale = 1, .metal_strategy = .gemm, .control = .{ .ptr = &cancel, .check_fn = Cancel.check } };
     try std.testing.expect(try cb.decoderRuntimeBeginFrame());
     try std.testing.expectError(error.Cancelled, cb.vtable.segmentAttentionGrouped.?(cb.ptr, qc, kc, vc, &request));
     try std.testing.expectEqual(@as(usize, 4), cancel.checks);
@@ -42848,6 +42911,22 @@ test "metal_compute: embeddinggemma2 grouped tile cancellation and wrapping OOM 
     try std.testing.expectEqual(@as(usize, 4), cancel.checks);
     try cb.decoderRuntimeCancelFrame();
     try std.testing.expectEqual(@as(u64, 0), metal_runtime_mod.runtimeMemorySnapshot(compute.provider_impl.raw_decode_runtime).frame_retained_bytes);
+    // Flash/automatic tiny envelopes finish encoding before the third check.
+    // Both errors must release the unwrapped output and drain on cancellation.
+    inline for (.{ .flash, .automatic }) |strategy| {
+        request.metal_strategy = strategy;
+        for ([_]bool{ false, true }) |timeout| {
+            cancel = .{ .timeout = timeout, .cancel_after = 3 };
+            try std.testing.expect(try cb.decoderRuntimeBeginFrame());
+            try std.testing.expectError(if (timeout) error.Timeout else error.Cancelled, cb.vtable.segmentAttentionGrouped.?(cb.ptr, qc, kc, vc, &request));
+            try std.testing.expectEqual(@as(usize, 3), cancel.checks);
+            try cb.decoderRuntimeCancelFrame();
+            const memory = metal_runtime_mod.runtimeMemorySnapshot(compute.provider_impl.raw_decode_runtime);
+            try std.testing.expectEqual(@as(u64, 0), memory.frame_retained_bytes);
+            try std.testing.expectEqual(@as(u64, 0), memory.scratch_pool_pending_slots);
+        }
+    }
+    request.metal_strategy = .gemm;
     request.control = null;
     // Force host allocation failure when wrapping the completed device result;
     // queued users retain their buffer pins until frame cancellation drains.
@@ -43496,10 +43575,16 @@ test "embeddinggemma2 Metal canonical row views reuse packed snapshot across geo
         defer store.tier_cache.?.deinitAdmission();
         defer store.lazy_weights.deinit(a);
         var values: [3][128 * 64]f32 = undefined;
+        var half: [128 * 64]u16 = @splat(0x3e80);
         for (&values, names, widths, &shapes, 0..) |*data, name, width, *shape, i| {
             @memset(data, @as(f32, @floatFromInt(i + 1)) * 0.125);
             try addLegacyGlinerMpsTestWeight(&store, name, data[0 .. width * 64], shape);
         }
+        // The canonical parent accepts mixed source dtypes without a combined
+        // host F32 staging matrix. The middle projection is BF16 0.25.
+        const middle = store.lazy_weights.getPtr(names[1]).?;
+        middle.host_loaded.?.tensor.data = std.mem.sliceAsBytes(half[0 .. widths[1] * 64]);
+        middle.host_loaded.?.tensor.dtype = .bf16;
         initPrefetchQueue(&store, a);
         defer deinitPrefetchQueue(&store);
         defer deinitSharedNativeProvider(&store);
@@ -43553,6 +43638,10 @@ test "embeddinggemma2 Metal canonical row views reuse packed snapshot across geo
             try std.testing.expectEqual(@as(usize, 1), compute.provider_impl.embeddinggemma2_linear_cache.count());
             try std.testing.expectEqual(@as(usize, bytes), compute.provider_impl.embeddinggemma2_linear_cache_bytes);
             try std.testing.expectEqual(@as(usize, 0), compute.dynamic_linear_slots.count());
+            if (rows == 1) {
+                @memset(std.mem.asBytes(&values), 0);
+                @memset(&half, 0);
+            }
         }
     }
 }

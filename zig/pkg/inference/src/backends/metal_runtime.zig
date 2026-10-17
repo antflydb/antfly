@@ -3133,6 +3133,14 @@ pub fn decoderRuntimeEmbeddingHeadPrepare(self: anytype, input: MetalTensor, wei
 }
 pub extern fn termite_metal_decode_runtime_embedding_head_prepare(runtime: ?*RawMetalDecodeRuntime, input: ?*anyopaque, input_offset: usize, weight: ?*anyopaque, weight_offset: usize, gather: ?*anyopaque, gather_offset: usize, output: ?*anyopaque, output_offset: usize, p: *const @import("../ops/ops.zig").EmbeddingHeadParams) c_int;
 
+// Select by work per item rather than total cohort rows. Tiny envelopes
+// avoid multiple MPS transitions; bounded local envelopes benefit from GEMM
+// even for long inputs. 1536 = max query tile (512) + two 512-key windows.
+// Global 512-wide heads retain GEMM when its workspace can be admitted.
+fn embeddingGemma2GroupedGemmPreferred(head_dim: usize, key_envelope: usize) bool {
+    return key_envelope > 32 and (head_dim == 512 or key_envelope <= 1536);
+}
+
 pub fn decoderRuntimeSegmentAttentionGroupedF32Device(self: anytype, q: MetalTensor, k: MetalTensor, v: MetalTensor, grouped: anytype, metadata: ?MetalTensor, check_ctx: ?*anyopaque, check_fn: *const fn (?*anyopaque) callconv(.c) c_int) !?MetalTensor {
     const runtime = self.raw_decode_runtime orelse return null;
     const r = grouped.visibility;
@@ -3144,13 +3152,21 @@ pub fn decoderRuntimeSegmentAttentionGroupedF32Device(self: anytype, q: MetalTen
     const hidden = try std.math.mul(usize, r.num_heads, r.head_dim);
     const kv_hidden = try std.math.mul(usize, grouped.num_kv_heads, r.head_dim);
     if (q.elemCount() != r.queries * hidden or k.elemCount() != r.keys * kv_hidden or v.elemCount() != r.keys * kv_hidden) return error.InvalidTensorShape;
-    const tile = @min(r.queries, try embeddingGemma2QueryTile(r.queries));
+    const requested_tile = grouped.metal_query_tile orelse try embeddingGemma2QueryTile(r.queries);
+    if (requested_tile != 128 and requested_tile != 256 and requested_tile != 512) return error.InvalidEmbeddingGemma2QueryTile;
+    const tile = @min(r.queries, requested_tile);
     const score_stride = groupedScoreStride(r.ranges, tile);
     const score_values = try std.math.mul(usize, try std.math.mul(usize, tile, score_stride), r.num_heads);
     const score_bytes = try std.math.mul(usize, score_values, @sizeOf(f32));
     const packed_values = try std.math.add(usize, try std.math.mul(usize, tile, hidden), try std.math.mul(usize, try std.math.mul(usize, r.keys, kv_hidden), 2));
     const workspace_bytes = try std.math.add(usize, score_bytes, try std.math.mul(usize, try std.math.add(usize, packed_values, try std.math.mul(usize, tile, hidden)), @sizeOf(f32)));
-    const gemm = (r.head_dim == 512 or r.queries <= 512) and workspace_bytes <= @min(grouped.workspace_limit_bytes, 256 * 1024 * 1024) and !@import("antfly_platform").env.getenvBool("TERMITE_METAL_EMBEDDINGGEMMA2_DISABLE_GEMM_ATTENTION");
+    const within_budget = workspace_bytes <= @min(grouped.workspace_limit_bytes, 256 * 1024 * 1024);
+    if (grouped.metal_strategy == .gemm and !within_budget) return null;
+    const gemm = switch (grouped.metal_strategy) {
+        .flash => false,
+        .gemm => within_budget,
+        .automatic => embeddingGemma2GroupedGemmPreferred(r.head_dim, score_stride) and within_budget and !@import("antfly_platform").env.getenvBool("TERMITE_METAL_EMBEDDINGGEMMA2_DISABLE_GEMM_ATTENTION"),
+    };
     var scores: ?MetalTensor = if (gemm) try MetalTensor.deviceAllocate(runtime, workspace_bytes, .private, &.{@intCast(workspace_bytes / @sizeOf(f32))}) else null;
     defer if (scores) |*value| value.deinit();
     var output = try MetalTensor.deviceAllocate(runtime, r.queries * hidden * @sizeOf(f32), .private, &.{ @intCast(r.queries), @intCast(hidden) });
@@ -10300,6 +10316,29 @@ pub fn decoderRuntimeApplyScale(
 /// Gemma 4 audio encoder device ops. Each takes device-resident f32 inputs,
 /// allocates the output and returns null when the runtime cannot run the
 /// kernel so the caller keeps its host path.
+pub fn decoderRuntimeRmsNormResidual(self: anytype, input: MetalTensor, residual: MetalTensor, slot: usize, dim: usize, eps: f32, norm_scale: f32, output_scale: f32) !?MetalTensor {
+    const runtime = self.raw_decode_runtime orelse return null;
+    if (!input.isDevice() or !residual.isDevice() or input.elemCount() != residual.elemCount() or dim == 0 or input.elemCount() % dim != 0) return null;
+    var output = try MetalTensor.deviceAllocate(runtime, input.elemCount() * @sizeOf(f32), .private, input.shape());
+    errdefer output.deinit();
+    const rc = termite_metal_decode_runtime_norm_residual_device(runtime, input.deviceHandle(), input.deviceByteOffset(), slot, residual.deviceHandle(), residual.deviceByteOffset(), input.elemCount() / dim, dim, eps, norm_scale, output_scale, output.deviceHandle(), output.deviceByteOffset());
+    return finishDeviceOutput(&output, rc);
+}
+
+pub extern fn termite_metal_decode_runtime_norm_residual_device(runtime: ?*RawMetalDecodeRuntime, input: ?*anyopaque, input_offset: usize, slot: usize, residual: ?*anyopaque, residual_offset: usize, rows: usize, dim: usize, eps: f32, norm_scale: f32, output_scale: f32, output: ?*anyopaque, output_offset: usize) c_int;
+
+pub fn decoderRuntimeClampSilu(self: anytype, input: MetalTensor, min_value: ?f32, max_value: ?f32) !?MetalTensor {
+    const runtime = self.raw_decode_runtime orelse return null;
+    if (!input.isDevice() or input.elemCount() == 0) return null;
+    var output = try MetalTensor.deviceAllocate(runtime, input.elemCount() * @sizeOf(f32), .private, input.shape());
+    errdefer output.deinit();
+    const flags: u32 = @as(u32, @intFromBool(min_value != null)) | (@as(u32, @intFromBool(max_value != null)) << 1);
+    const rc = termite_metal_decode_runtime_clamp_silu_device(runtime, input.deviceHandle(), input.deviceByteOffset(), input.elemCount(), flags, min_value orelse 0, max_value orelse 0, output.deviceHandle(), output.deviceByteOffset());
+    return finishDeviceOutput(&output, rc);
+}
+
+pub extern fn termite_metal_decode_runtime_clamp_silu_device(runtime: ?*RawMetalDecodeRuntime, input: ?*anyopaque, input_offset: usize, total: usize, flags: u32, lo: f32, hi: f32, output: ?*anyopaque, output_offset: usize) c_int;
+
 pub fn decoderRuntimeGemma4AudioClamp(self: anytype, input: MetalTensor, min_value: ?f32, max_value: ?f32) !?MetalTensor {
     const runtime = self.raw_decode_runtime orelse return null;
     if (termite_metal_decode_runtime_ready(runtime) == 0) return null;
@@ -11011,6 +11050,8 @@ pub fn decoderRuntimeApplyRmsNormLinear(self: anytype, request: anytype) !?Metal
 fn widenBf16OwnedSnapshot(bytes: [*c]const u8, output: [*c]f32, elements: usize) callconv(.c) void {
     @import("tensor.zig").widenBf16LittleEndian(bytes[0 .. elements * 2], output[0..elements]);
 }
+
+pub extern fn termite_metal_decode_runtime_prepare_linear_generated_f32(runtime: ?*RawMetalDecodeRuntime, slot: usize, bias: [*c]const f32, in_dim: usize, out_dim: usize, shared_if_unified: c_int, context: ?*anyopaque, fill: *const fn (?*anyopaque, [*c]f32, usize) callconv(.c) c_int) c_int;
 
 pub const OwnedF32SlotStorage = enum { private, owned_shared_if_unified };
 
@@ -49265,4 +49306,100 @@ test "Metal Gemma4 clustered head selects F32 BF16 F16 Q8 candidates with offset
     const runtime = termite_metal_decode_runtime_create() orelse return error.SkipZigTest;
     defer termite_metal_decode_runtime_destroy(runtime);
     try std.testing.expectEqual(@as(c_int, 0), termite_metal_decode_runtime_mtp_cluster_head_test(runtime));
+}
+
+test "embeddinggemma2 Metal fused residual and clamp SiLU match independent F64 in frames" {
+    if (!build_options.enable_metal or !metalDeviceAvailable()) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var provider = try @import("metal_native_provider.zig").MetalNativeProvider.create();
+    defer provider.deinitOwned();
+    const runtime = provider.raw_decode_runtime orelse return error.SkipZigTest;
+    for ([_][2]usize{ .{ 1, 7 }, .{ 17, 513 }, .{ 257, 512 }, .{ 3, 1536 } }) |shape| {
+        const rows = shape[0];
+        const dim = shape[1];
+        const x = try a.alloc(f32, rows * dim);
+        defer a.free(x);
+        const res = try a.alloc(f32, x.len);
+        defer a.free(res);
+        const w = try a.alloc(f32, dim);
+        defer a.free(w);
+        for (x, res, 0..) |*v, *r, i| {
+            v.* = @sin(@as(f32, @floatFromInt(i)) * 0.13);
+            r.* = @cos(@as(f32, @floatFromInt(i)) * 0.07);
+        }
+        for (w, 0..) |*v, i| v.* = 0.3 + @as(f32, @floatFromInt(i % 13)) * 0.05;
+        var xc = try testDeviceTensorFromSlice(runtime, x, &.{ @intCast(rows), @intCast(dim) });
+        defer xc.deinit();
+        var rc = try testDeviceTensorFromSlice(runtime, res, &.{ @intCast(rows), @intCast(dim) });
+        defer rc.deinit();
+        var wc = MetalTensor.borrowed(w.ptr, w.len, &.{@intCast(dim)});
+        defer wc.deinit();
+        try std.testing.expect(try decoderRuntimePrepareRmsNorm(&provider, .{ .slot = @as(usize, 0), .weight = wc, .hidden_size = dim, .owned_f32_slot_storage = OwnedF32SlotStorage.owned_shared_if_unified }));
+        defer clearRawRmsNormSlot(&provider, 0);
+        for ([_][2]f32{ .{ 1, 1 }, .{ 0.5, -0.7 }, .{ 0, 2 } }) |scales| {
+            try beginFrame(runtime);
+            errdefer cancelFrame(runtime) catch {};
+            var out = (try decoderRuntimeRmsNormResidual(&provider, xc, rc, 0, dim, 1e-6, scales[0], scales[1])) orelse return error.UnexpectedNull;
+            defer out.deinit();
+            try submitFrame(runtime);
+            try waitFrame(runtime);
+            const actual = try out.toHostSlice();
+            for (0..rows) |r| {
+                var sum: f64 = 0;
+                for (x[r * dim ..][0..dim]) |v| sum += @as(f64, v) * v;
+                const inv = 1 / @sqrt(sum / @as(f64, @floatFromInt(dim)) + 1e-6);
+                for (0..dim) |col| {
+                    const i = r * dim + col;
+                    const expected: f32 = @floatCast((res[i] + @as(f64, x[i]) * inv * w[col] * scales[0]) * scales[1]);
+                    try std.testing.expectApproxEqAbs(expected, actual[i], 3e-6);
+                }
+            }
+        }
+        var clamped = (try decoderRuntimeClampSilu(&provider, xc, -0.25, 0.6)) orelse return error.UnexpectedNull;
+        defer clamped.deinit();
+        for (try clamped.toHostSlice(), x) |v, src| {
+            const t: f64 = @min(@max(src, -0.25), 0.6);
+            try std.testing.expectApproxEqAbs(@as(f32, @floatCast(t / (1 + @exp(-t)))), v, 2e-6);
+        }
+        const memory = runtimeMemorySnapshot(runtime);
+        try std.testing.expectEqual(@as(u64, 0), memory.frame_retained_bytes);
+        try std.testing.expectEqual(@as(u64, 0), memory.scratch_pool_pending_slots);
+    }
+}
+
+test "embeddinggemma2 generated Metal weight snapshot rejects partial replacement atomically" {
+    if (!build_options.enable_metal or !metalDeviceAvailable()) return error.SkipZigTest;
+    var provider = try @import("metal_native_provider.zig").MetalNativeProvider.create();
+    defer provider.deinitOwned();
+    const runtime = provider.raw_decode_runtime orelse return error.SkipZigTest;
+    const Fill = struct {
+        value: f32,
+        reject: bool = false,
+        fn fill(ctx: ?*anyopaque, output: [*c]f32, count: usize) callconv(.c) c_int {
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            @memset(output[0..count], self.value);
+            return if (self.reject) -1 else 0;
+        }
+    };
+    for ([_]c_int{ 0, 1 }) |shared_if_unified| {
+        var fill = Fill{ .value = 0.25 };
+        var bias: [8]f32 = @splat(0);
+        defer clearRawLinearSlot(&provider, 0);
+        try std.testing.expectEqual(@as(c_int, 0), termite_metal_decode_runtime_prepare_linear_generated_f32(runtime, 0, &bias, 8, 8, shared_if_unified, &fill, Fill.fill));
+        try std.testing.expectEqual(@as(c_int, 0), termite_metal_decode_runtime_prefer_linear_mps(runtime, 0));
+        provider.raw_linear_slot_kinds[0] = .dense;
+        provider.raw_linear_slots_prepared[0] = true;
+        provider.raw_linear_slot_in_dims[0] = 8;
+        provider.raw_linear_slot_out_dims[0] = 8;
+        const before = runtimeMemorySnapshot(runtime);
+        fill.value = 99;
+        fill.reject = true;
+        try std.testing.expect(termite_metal_decode_runtime_prepare_linear_generated_f32(runtime, 0, &bias, 8, 8, shared_if_unified, &fill, Fill.fill) != 0);
+        try std.testing.expectEqual(before.dense_linear_bytes, runtimeMemorySnapshot(runtime).dense_linear_bytes);
+        var input = try testDeviceTensorFromSlice(runtime, &@as([16]f32, @splat(1)), &.{ 2, 8 });
+        defer input.deinit();
+        var output = (try decoderRuntimeApplyLinearRows(&provider, 0, input, 0, 8)) orelse return error.UnexpectedNull;
+        defer output.deinit();
+        for (try output.toHostSlice()) |value| try std.testing.expectApproxEqAbs(@as(f32, 2), value, 1e-6);
+    }
 }

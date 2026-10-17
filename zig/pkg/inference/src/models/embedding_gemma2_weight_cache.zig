@@ -136,3 +136,48 @@ test "embeddinggemma2 canonical projection groups preserve unequal KV and reject
     try std.testing.expect(projectionGroup("other.layers.0.mlp.gate_proj.weight") == null);
     try std.testing.expect(projectionGroup("language_model.layers.0.self_attn.o_proj.weight") == null);
 }
+
+/// Scalar checkpoint metadata survives compute wrappers, never owns request
+/// tensors, and is bounded independently of the large prepared-weight cache.
+pub const ScalarBoundsCache = struct {
+    entries: std.StringHashMapUnmanaged([4]?f32) = .empty,
+    mutex: std.atomic.Mutex = .unlocked,
+
+    pub fn access(self: *ScalarBoundsCache, a: std.mem.Allocator, key: []const u8, value: ?[4]?f32) !?[4]?f32 {
+        @import("antfly_platform").sync.lockYielding(&self.mutex);
+        defer self.mutex.unlock();
+        if (self.entries.get(key)) |entry| return entry;
+        const bounds = value orelse return null;
+        if (self.entries.count() >= 256 or key.len > 192) return null;
+        const name = try a.dupe(u8, key);
+        errdefer a.free(name);
+        try self.entries.put(a, name, bounds);
+        return bounds;
+    }
+
+    pub fn deinit(self: *ScalarBoundsCache, a: std.mem.Allocator) void {
+        var it = self.entries.keyIterator();
+        while (it.next()) |key| a.free(key.*);
+        self.entries.deinit(a);
+        self.entries = .empty;
+    }
+};
+
+test "embeddinggemma2 scalar metadata owns keys and unwinds failed publication" {
+    const Case = struct {
+        fn run(a: std.mem.Allocator) !void {
+            var cache = ScalarBoundsCache{};
+            defer cache.deinit(a);
+            var name = [_]u8{ 'a', 'u', 'd', 'i', 'o' };
+            const bounds: [4]?f32 = .{ -1, null, null, std.math.inf(f32) };
+            _ = try cache.access(a, &name, bounds);
+            @memset(&name, 0);
+            try std.testing.expectEqual(bounds, (try cache.access(a, "audio", null)).?);
+            try std.testing.expectEqual(bounds, (try cache.access(a, "audio", .{ 0, 0, 0, 0 })).?);
+            var other = ScalarBoundsCache{};
+            defer other.deinit(a);
+            try std.testing.expect(try other.access(a, "audio", null) == null);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Case.run, .{});
+}

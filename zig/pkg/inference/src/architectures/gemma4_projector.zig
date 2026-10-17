@@ -2402,9 +2402,12 @@ fn audioLayer(
     if (store.gguf == null and layer == 0) try embeddingGemma2StageTensor(cb, allocator, "audio_0_self_attn", attn);
     audioProfileMark(.attn_out);
     const attn_post = try projectorVectorWeightCt(cb, allocator, store, try fmt(&buf, "a.blk.{d}.attn_post_norm.weight", .{layer}), cfg.audio_hidden);
-    const attn_normed = try cb.rmsNorm(attn, attn_post, cfg.audio_hidden, cfg.layer_norm_eps);
-    defer cb.free(attn_normed);
-    const res_attn = try cb.add(ff1, attn_normed);
+    const fused_residual = if (store.gguf == null) try cb.rmsNormResidual(attn, attn_post, ff1, cfg.audio_hidden, cfg.layer_norm_eps, 1, 1) else null;
+    const res_attn = fused_residual orelse blk: {
+        const attn_normed = try cb.rmsNorm(attn, attn_post, cfg.audio_hidden, cfg.layer_norm_eps);
+        defer cb.free(attn_normed);
+        break :blk try cb.add(ff1, attn_normed);
+    };
     defer cb.free(res_attn);
     audioProfileMark(.norms);
 
@@ -2437,13 +2440,19 @@ fn audioFeedForward(
     const norm_w = try projectorVectorWeightCt(cb, allocator, store, try fmt(&buf, "a.blk.{d}.ffn_norm{s}.weight", .{ layer, suffix }), cfg.audio_hidden);
     const normed = try cb.rmsNorm(input, norm_w, cfg.audio_hidden, cfg.layer_norm_eps);
     defer cb.free(normed);
-    const up = try linearNoBiasMaybeClipped(cb, allocator, store, normed, try fmt(&buf, "a.blk.{d}.ffn_up{s}", .{ layer, suffix }), rows, cfg.audio_hidden, cfg.intermediate_size);
-    defer cb.free(up);
-    const activated = try cb.silu(up);
+    const up_name = try fmt(&buf, "a.blk.{d}.ffn_up{s}", .{ layer, suffix });
+    const activated = if (store.gguf == null)
+        try linearNoBiasMaybeClippedInternal(cb, allocator, store, normed, up_name, rows, cfg.audio_hidden, cfg.intermediate_size, true)
+    else blk: {
+        const up = try linearNoBiasMaybeClipped(cb, allocator, store, normed, up_name, rows, cfg.audio_hidden, cfg.intermediate_size);
+        defer cb.free(up);
+        break :blk try cb.silu(up);
+    };
     defer cb.free(activated);
     const down = try linearNoBiasMaybeClipped(cb, allocator, store, activated, try fmt(&buf, "a.blk.{d}.ffn_down{s}", .{ layer, suffix }), rows, cfg.intermediate_size, cfg.audio_hidden);
     defer cb.free(down);
     const post_w = try projectorVectorWeightCt(cb, allocator, store, try fmt(&buf, "a.blk.{d}.ffn_post_norm{s}.weight", .{ layer, suffix }), cfg.audio_hidden);
+    if (store.gguf == null and !audioHostOps().scale) if (try cb.rmsNormResidual(down, post_w, input, cfg.audio_hidden, cfg.layer_norm_eps, cfg.residual_weight, 1)) |fused| return fused;
     const post = try cb.rmsNorm(down, post_w, cfg.audio_hidden, cfg.layer_norm_eps);
     defer cb.free(post);
     const scaled = try scaleRows(cb, allocator, post, rows, cfg.audio_hidden, cfg.residual_weight);
@@ -4388,7 +4397,11 @@ pub fn loadWeightCt(
     return cb.fromFloat32Shape(tensor.data, shape);
 }
 
-fn linearNoBiasMaybeClipped(
+fn linearNoBiasMaybeClipped(cb: *const ComputeBackend, allocator: std.mem.Allocator, store: *ProjectorWeights, input: CT, prefix: []const u8, rows: usize, in_dim: usize, out_dim: usize) !CT {
+    return linearNoBiasMaybeClippedInternal(cb, allocator, store, input, prefix, rows, in_dim, out_dim, false);
+}
+
+fn linearNoBiasMaybeClippedInternal(
     cb: *const ComputeBackend,
     allocator: std.mem.Allocator,
     store: *ProjectorWeights,
@@ -4397,13 +4410,22 @@ fn linearNoBiasMaybeClipped(
     rows: usize,
     in_dim: usize,
     out_dim: usize,
+    silu_output: bool,
 ) !CT {
     const weight_name = try std.fmt.allocPrint(allocator, "{s}.weight", .{prefix});
     defer allocator.free(weight_name);
     if (!audioHostOps().clamp) {
         if (if (store.owner) |owner| try owner.clampSpec(prefix) else null) |spec| {
-            return linearNoBiasScalarClipped(cb, allocator, store, input, weight_name, spec, rows, in_dim, out_dim);
+            return linearNoBiasScalarClipped(cb, allocator, store, input, weight_name, spec, rows, in_dim, out_dim, silu_output);
         }
+    }
+    if (!audioHostOps().clamp and store.gguf == null) {
+        if (try cb.modelScalarBounds(weight_name, null)) |bounds| return linearNoBiasScalarClipped(cb, allocator, store, input, weight_name, .{
+            .input_min = bounds[0],
+            .input_max = bounds[1],
+            .output_min = bounds[2],
+            .output_max = bounds[3],
+        }, rows, in_dim, out_dim, silu_output);
     }
     const input_min_name = try std.fmt.allocPrint(allocator, "{s}.input_min", .{prefix});
     defer allocator.free(input_min_name);
@@ -4429,12 +4451,17 @@ fn linearNoBiasMaybeClipped(
         (output_min == null or output_min.?.data.len == 1) and
         (output_max == null or output_max.?.data.len == 1))
     {
+        const bounds: [4]?f32 = .{ if (input_min) |t| t.data[0] else null, if (input_max) |t| t.data[0] else null, if (output_min) |t| t.data[0] else null, if (output_max) |t| t.data[0] else null };
+        if (store.gguf == null) _ = cb.modelScalarBounds(weight_name, bounds) catch |err| switch (err) {
+            error.OutOfMemory => null,
+            else => return err,
+        };
         return linearNoBiasScalarClipped(cb, allocator, store, input, weight_name, .{
-            .input_min = if (input_min) |t| t.data[0] else null,
-            .input_max = if (input_max) |t| t.data[0] else null,
-            .output_min = if (output_min) |t| t.data[0] else null,
-            .output_max = if (output_max) |t| t.data[0] else null,
-        }, rows, in_dim, out_dim);
+            .input_min = bounds[0],
+            .input_max = bounds[1],
+            .output_min = bounds[2],
+            .output_max = bounds[3],
+        }, rows, in_dim, out_dim, silu_output);
     }
     var linear_input = input;
     var free_linear_input = false;
@@ -4462,6 +4489,11 @@ fn linearNoBiasMaybeClipped(
         output = clipped_output;
     }
 
+    if (silu_output) {
+        const result = try cb.silu(output);
+        cb.free(output);
+        return result;
+    }
     return output;
 }
 
@@ -4478,6 +4510,7 @@ fn linearNoBiasScalarClipped(
     rows: usize,
     in_dim: usize,
     out_dim: usize,
+    silu_output: bool,
 ) !CT {
     var linear_input = input;
     var free_linear_input = false;
@@ -4489,9 +4522,22 @@ fn linearNoBiasScalarClipped(
 
     const weight = try projectorLinearWeightCt(cb, allocator, store, weight_name, in_dim, out_dim);
     const output = try cb.linearNoBias(linear_input, weight, rows, in_dim, out_dim);
+    errdefer cb.free(output);
+    if (silu_output) {
+        if (!audioHostOps().clamp) if (try cb.clampSilu(output, spec.output_min, spec.output_max)) |fused| {
+            cb.free(output);
+            return fused;
+        };
+        const clamped = if (spec.clipsOutput()) try clampScalarCt(cb, allocator, output, rows, out_dim, spec.output_min, spec.output_max) else output;
+        defer if (clamped != output) cb.free(clamped);
+        const result = try cb.silu(clamped);
+        cb.free(output);
+        return result;
+    }
     if (!spec.clipsOutput()) return output;
-    defer cb.free(output);
-    return clampScalarCt(cb, allocator, output, rows, out_dim, spec.output_min, spec.output_max);
+    const result = try clampScalarCt(cb, allocator, output, rows, out_dim, spec.output_min, spec.output_max);
+    cb.free(output);
+    return result;
 }
 
 fn clampScalarCt(

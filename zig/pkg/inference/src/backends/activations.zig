@@ -321,6 +321,24 @@ pub fn silu(data: []f32) void {
     }
 }
 
+pub fn clampSilu(output: []f32, input: []const f32, min_value: ?f32, max_value: ?f32) void {
+    @setFloatMode(.strict);
+    const one: F32xN = @splat(1);
+    var i: usize = 0;
+    while (i + VEC_LEN <= input.len) : (i += VEC_LEN) {
+        var v: F32xN = input[i..][0..VEC_LEN].*;
+        if (min_value) |lo| v = @max(v, @as(F32xN, @splat(lo)));
+        if (max_value) |hi| v = @min(v, @as(F32xN, @splat(hi)));
+        output[i..][0..VEC_LEN].* = v / (one + expVec(-v));
+    }
+    while (i < input.len) : (i += 1) {
+        var v = input[i];
+        if (min_value) |lo| v = @max(v, lo);
+        if (max_value) |hi| v = @min(v, hi);
+        output[i] = v / (1 + @exp(-v));
+    }
+}
+
 /// Quick GELU activation: x * sigmoid(1.702 * x)
 /// Faster approximation used by CLIP and some other models.
 pub fn quickGelu(data: []f32) void {
@@ -357,6 +375,26 @@ pub fn rmsNorm(data: []f32, weight: []const f32, dim: usize, eps: f32) void {
         while (i < dim) : (i += 1) {
             row[i] = row[i] * inv_rms * weight[i];
         }
+    }
+}
+
+/// Fused post-norm residual epilogue. Keep the reduction and multiplication
+/// order identical to rmsNorm, followed by separate scale/add/scale passes.
+pub fn rmsNormResidual(output: []f32, input: []const f32, weight: []const f32, residual: []const f32, dim: usize, eps: f32, norm_scale: f32, output_scale: f32) void {
+    @setFloatMode(.strict);
+    for (0..input.len / dim) |r| {
+        const row = input[r * dim ..][0..dim];
+        const inv: F32xN = @splat(1.0 / @sqrt(vectorDotSelf(row) / @as(f32, @floatFromInt(dim)) + eps));
+        const ns: F32xN = @splat(norm_scale);
+        const os: F32xN = @splat(output_scale);
+        var i: usize = 0;
+        while (i + VEC_LEN <= dim) : (i += VEC_LEN) {
+            const v: F32xN = row[i..][0..VEC_LEN].*;
+            const w: F32xN = weight[i..][0..VEC_LEN].*;
+            const res: F32xN = residual[r * dim + i ..][0..VEC_LEN].*;
+            output[r * dim + i ..][0..VEC_LEN].* = (res + ((v * inv) * w) * ns) * os;
+        }
+        while (i < dim) : (i += 1) output[r * dim + i] = (residual[r * dim + i] + ((row[i] * inv[0]) * weight[i]) * norm_scale) * output_scale;
     }
 }
 
