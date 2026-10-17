@@ -97,11 +97,18 @@ test "native index owner adapter inspects cold native ownership and rejects fore
         .projection_identity = @splat(13),
     };
     var physical_root: u128 = 0;
+    const SchemaRootGeneration = struct {
+        fn read(ptr: *anyopaque, _: u64) u64 {
+            return @as(*const u64, @ptrCast(@alignCast(ptr))).*;
+        }
+    };
+    var accepted_root_generation: u64 = 11;
     // Repeat from a fully closed source: neither the decoded status nor the
     // native mode proof may depend on a retained process-local job or lease.
     for (0..2) |_| {
         var owners = kernel_owner_source.ProvisionedKernelOwnerSource.init(alloc, root, catalog.source(), read_gate.alreadyReadSafeBarrier());
         owners.online_source_authority = .native;
+        owners.group_visible_root_generation = .{ .ptr = &accepted_root_generation, .visible_root_generation_for_group = SchemaRootGeneration.read };
         defer owners.deinit();
         var state = try owners.nativeIndexOwnerState(alloc, 7501, "items", identity, .{});
         defer state.deinit();
@@ -112,13 +119,43 @@ test "native index owner adapter inspects cold native ownership and rejects fore
         var rooted = try owners.nativeIndexOwnerReceiptAtRoot(alloc, 7501, "items", .{ .identity = identity, .effect = .fenced }, .{});
         defer rooted.deinit();
         try std.testing.expect(rooted.outcome.value == null);
-        try std.testing.expectEqual(table_reads.backend_current_root_generation, rooted.root_generation);
+        try std.testing.expectEqual(accepted_root_generation, rooted.root_generation);
         const schema = try owners.nativeSchemaOwnerObservationAtRoot(7501, "items", schema_binding, .{});
         try schema.observation.validateFor(schema_binding);
         try std.testing.expect(schema.observation.header == null and !schema.observation.replication_pending);
-        try std.testing.expectEqual(table_reads.backend_current_root_generation, schema.root_generation);
+        try std.testing.expectEqual(accepted_root_generation, schema.root_generation);
         if (physical_root != 0) try std.testing.expectEqual(physical_root, schema.observation.physical_root_incarnation);
         physical_root = schema.observation.physical_root_incarnation;
+        // Valid synthetic signing data deliberately cannot turn a real
+        // empty owner observation into a receipt. This is not enrollment or
+        // positive metadata/publication evidence.
+        const attestation = @import("../metadata/schema_validation_attestation.zig");
+        const pair = try std.crypto.sign.Ed25519.KeyPair.generateDeterministic(@splat(9));
+        const signing_root: local.storage_db_root_signing_identity.State = .{ .seed = @splat(9), .root_incarnation = 7, .public_key = pair.public_key.toBytes() };
+        const signing_identity: @import("../metadata/store_root_enrollment.zig").Identity = .{
+            .metadata_incarnation = "61616161616161616161616161616161".*,
+            .node_id = 2,
+            .store_id = 3,
+            .root_incarnation = signing_root.root_incarnation,
+            .public_key = signing_root.public_key,
+        };
+        const native_binding: @import("../metadata/standalone_native_owner.zig").Binding = .{
+            .metadata_incarnation = signing_identity.metadata_incarnation,
+            .node_id = signing_identity.node_id,
+            .store_id = signing_identity.store_id,
+            .root_incarnation = signing_identity.root_incarnation,
+        };
+        const signing_scope: attestation.NativeScope = .{
+            .metadata_incarnation = signing_identity.metadata_incarnation,
+            .binding_digest = try attestation.bindingDigest(schema_binding),
+            .signing = .{ .identity = signing_identity, .reporter_incarnation = 4, .binding_digest = try native_binding.digest() },
+            .root_generation = schema.root_generation,
+            .physical_root_incarnation = schema.observation.physical_root_incarnation,
+        };
+        try std.testing.expectError(error.SchemaValidationJobRequired, owners.attestNativeSchemaOwnerAtRoot(7501, "items", schema_binding, signing_scope, signing_root, .{}));
+        var stale_scope = signing_scope;
+        stale_scope.physical_root_incarnation += 1;
+        try std.testing.expectError(error.SchemaValidationRuntimeRecoveryRequired, owners.attestNativeSchemaOwnerAtRoot(7501, "items", schema_binding, stale_scope, signing_root, .{}));
         var foreign_schema = schema_binding;
         foreign_schema.fence.namespace.range_id += 1;
         try std.testing.expectError(error.IdentityNamespaceMismatch, owners.nativeSchemaOwnerObservationAtRoot(7501, "items", foreign_schema, .{}));

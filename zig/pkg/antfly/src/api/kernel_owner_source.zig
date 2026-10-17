@@ -94,6 +94,7 @@ test "native index owner adapter rejects cancellation deadline and foreign group
         try std.testing.expectError(expected, source.raftIndexOwnerPreparationAtRoot(std.testing.allocator, 7, "rows", undefined, "manifest", context));
         try std.testing.expectError(expected, source.nativeIndexOwnerState(std.testing.allocator, 7, "rows", identity, context));
         try std.testing.expectError(expected, source.nativeSchemaOwnerObservationAtRoot(7, "rows", undefined, context));
+        try std.testing.expectError(expected, source.attestNativeSchemaOwnerAtRoot(7, "rows", undefined, undefined, undefined, context));
         try std.testing.expectError(expected, source.readNativeIndexClaimSourceAtRoot(std.testing.allocator, 7, "rows", identity, context));
         try std.testing.expectError(expected, source.nativeIndexOwnerReceipt(std.testing.allocator, 7, "rows", .{ .identity = identity, .effect = .fenced }, context));
         try std.testing.expectError(expected, source.nativeIndexOwnerReceiptAtRoot(std.testing.allocator, 7, "rows", .{ .identity = identity, .effect = .fenced }, context));
@@ -3650,10 +3651,8 @@ pub const ProvisionedKernelOwnerSource = struct {
         return lease;
     }
 
-    pub const RootedNativeSchemaOwnerObservation = struct {
-        root_generation: u64,
-        observation: @import("antfly_local_sources").storage_db_relational_schema_owner_control.Observation,
-    };
+    const SchemaAttestation = @import("../metadata/schema_validation_attestation.zig");
+    pub const RootedNativeSchemaOwnerObservation = SchemaAttestation.RootedObservation;
 
     /// Facts and generation come from the same applying lease. The receiver
     /// still independently obtains metadata permission, enrollment and current
@@ -3664,6 +3663,32 @@ pub const ProvisionedKernelOwnerSource = struct {
         if (binding.authority != .native or binding.fence.owner_group_id != group_id) return error.SchemaValidationJobChanged;
         var lease = try self.acquireBoundOwner(group_id, table_name, binding.fence.namespace, context);
         defer lease.deinit();
+        return observeSchemaAtLease(&lease, table_name, binding, context);
+    }
+
+    /// The receiver supplies a scope fetched independently from metadata and
+    /// its already-loaded private root key, never from an ordinary request.
+    /// Possession/signature is not enrollment or permission to publish. The
+    /// metadata ACK transaction must independently revalidate both authorities.
+    pub fn attestNativeSchemaOwnerAtRoot(self: *ProvisionedKernelOwnerSource, group_id: u64, table_name: []const u8, binding: @import("antfly_local_sources").storage_db_relational_nullability_job.Binding, expected: SchemaAttestation.NativeScope, root: @import("antfly_local_sources").storage_db_root_signing_identity.State, context: request_operation.RequestContext) !SchemaAttestation.Result {
+        try context.ensureActive();
+        try expected.requireBinding(binding);
+        if (binding.fence.owner_group_id != group_id) return error.SchemaValidationJobChanged;
+        var lease = try self.acquireBoundOwner(group_id, table_name, binding.fence.namespace, context);
+        defer lease.deinit();
+        const observed = try observeSchemaAtLease(&lease, table_name, binding, context);
+        try expected.require(observed);
+        if (observed.observation.header == null) return error.SchemaValidationJobRequired;
+        if (observed.observation.replication_pending) return .{ .pending = observed };
+        try context.ensureActive();
+        const signed = try SchemaAttestation.SignedNativeObservation.sign(observed, expected, root);
+        try context.ensureActive();
+        return .{ .signed = signed };
+    }
+
+    /// Callers retain this exact lease through signing, so a later route
+    /// lookup cannot substitute the provenance of another physical owner.
+    fn observeSchemaAtLease(lease: *Lease, table_name: []const u8, binding: @import("antfly_local_sources").storage_db_relational_nullability_job.Binding, context: request_operation.RequestContext) !RootedNativeSchemaOwnerObservation {
         const normalized = try platformDeadlineContext(context);
         var cancellation = normalized.cancellation;
         const result = try lease.owner().nativeSchemaOwnerObservation(table_name, binding, .{

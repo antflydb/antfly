@@ -717,24 +717,7 @@ pub const ClaimRoutes = struct {
 };
 /// Fixed-size authority observed in the permission transaction. This is not
 /// enrollment or a lease: metadata independently revalidates every ACK.
-pub const NativeSigningView = struct {
-    identity: @import("store_root_enrollment.zig").Identity,
-    reporter_incarnation: u64,
-    binding_digest: [32]u8,
-
-    pub fn validate(self: NativeSigningView, metadata_incarnation: local.metadata_incarnation.MetadataClusterIncarnation) !void {
-        self.identity.validate() catch return error.InvalidCatalogRecord;
-        if (self.reporter_incarnation == 0 or !std.mem.eql(u8, &metadata_incarnation, &self.identity.metadata_incarnation))
-            return error.InvalidCatalogRecord;
-        const binding: @import("standalone_native_owner.zig").Binding = .{
-            .metadata_incarnation = self.identity.metadata_incarnation,
-            .node_id = self.identity.node_id,
-            .store_id = self.identity.store_id,
-            .root_incarnation = self.identity.root_incarnation,
-        };
-        if (!std.mem.eql(u8, &try binding.digest(), &self.binding_digest)) return error.InvalidCatalogRecord;
-    }
-};
+pub const NativeSigningView = @import("store_root_attestation.zig").NativeView;
 
 /// Fixed-size enrolled reporter/placement facts from the permission read.
 /// Neither this view nor a status report is a current Raft leader lease.

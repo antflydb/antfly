@@ -322,7 +322,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     index_owner_ack_step.dependOn(&addFilteredTestRunArtifact(b, index_owner_ack_http_tests).step);
     const owner_authority_tests = b.addTest(.{
         .root_module = metadata_unit_baseline_mods[8],
-        .filters = &.{ "runtime status", "store observer durable projection includes", "relational index publication authenticated owner ACKs" },
+        .filters = &.{ "runtime status", "store observer durable projection includes", "relational index publication authenticated owner ACKs", "store root attestation", "schema validation attestation" },
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
     const owner_authority_step = b.step("antfly-native-owner-authority-test", "Verify durable source observations, wire profiles and root receipt authority");

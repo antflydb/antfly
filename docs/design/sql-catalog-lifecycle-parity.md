@@ -11450,3 +11450,76 @@ ABI archives and earlier test outputs were removed for build headroom; source,
 logs, current verified outputs and other worktrees were retained. All removed
 files are regenerable build artifacts; no broad cache/repository cleanup ran.
 The full Debug SQL gate for this observation checkpoint is tracked separately.
+
+That full Debug SQL gate passes 896 portable and 234 native tests, four
+existing opt-in benchmarks skipped, and 21/21 build steps in
+`/private/tmp/antfly-sql-native-schema-observation-full-debug.log`.
+
+### Domain-separated schema owner attestations
+
+Root proof construction and the native signing-view checks are now shared
+between index and schema owners. Index proofs preserve their exact original
+domains, field order, authority tags and byte preimages. Schema observations
+use distinct signing and accepted-evidence domains; neither protocol accepts
+the other's signature even with the same root key and logical digest.
+
+A native schema signing scope binds the complete schema-job binding digest,
+metadata incarnation, enrolled identity/key, native ownership binding,
+reporter incarnation, accepted runtime root generation and physical DB root
+incarnation. These are independent identities, not interchangeable counters.
+Generation zero remains a permissible observation of an unconfigured legacy
+root, but cannot authorize attestation. The scope must come from an independent
+metadata permission read; the data structure and its validation alone grant
+neither enrollment nor permission. ACK acceptance must recheck current durable
+authority, not trust a previously obtained read view as a lease.
+
+The serving adapter retains the same actual owner lease through observation
+and signing. A missing job cannot be signed; replication debt returns explicitly
+unsigned pending progress. The body commits the checked job header, actual
+native clock and physical root, without carrying a private seed or caller-set
+success summary. A stable logical-progress digest is distinct from physical
+re-attestation: observing a later real native clock does not mint another
+logical phase receipt. Fixed-field JSON round trips return owned values and
+signed bodies have a bounded wire budget. Hashing is streaming and does not
+allocate another serialized copy per signature.
+
+This closes only the native physical-evidence layer. It does not activate a
+public producer or implement metadata plan admission/ACK acceptance, current
+enrollment and cohort checks, root adoption, capability barriers, ordered Raft
+schema controls, all-owner publication or coordinated fence release. These
+remain required. Before activation, qualification must also cover installed
+owners reopened against a predecessor metadata descriptor, and layout-preserving
+publication's read-layout/full-text index-version semantics. The existing
+lower-version owner-open fast path is not itself proof of deferred public
+catalog admission. No original source case is reclassified for cryptographic
+component coverage or a negative empty-owner fixture.
+
+The final combined Debug authority/publication/source gate passes 115 tests,
+zero skips/leaks and 111/111 build steps in
+`/private/tmp/antfly-sql-schema-attestation-headroom-debug.log`. This includes
+exact legacy index preimage/signature/commitment checks for both native and
+Raft authorities, cross-protocol replay rejection, changed body/chain/reporter,
+wrong key/binding/root/generation, generation-zero rejection, unsigned pending
+and absent-job rejection, owned signed JSON round trips, and the existing
+metadata index publication/ACK regressions. Crypto fixtures deliberately do
+not claim an actual validated row scan or metadata acceptance. Real compiled
+source coverage checks cold root scope, missing-job signing rejection, stale
+physical roots and cancellation before owner acquisition; it does not yet
+qualify positive end-to-end schema publication.
+
+The initial synthetic fencing header used a noncanonical empty cursor digest;
+the fixture now uses the required empty digest and the validator is unchanged.
+The real source fixture initially supplied its default generation zero as a
+signing scope. Rejection was correct: the signing fixture now provides an
+explicit visible/accepted generation, while zero-generation rejection remains
+covered. An intermediate combined build exhausted disk before tests. After
+that build was confirmed terminal, about 9 GiB of specifically inspected
+obsolete ABI compiler archives/objects were reclaimed across this checkpoint.
+Source, logs, current verified outputs and other worktrees were preserved;
+all removed outputs can be rebuilt. No broad repository cleanup ran.
+
+Formatting, compilation ownership, Apache boundary (2,072 sources), license
+and inventory checks pass. Inventory remains 531 implemented / 132 rejected /
+113 superseded / 810 unresolved. The full Debug SQL gate for this attestation
+checkpoint is tracked separately; the prior pinned-observation gate above
+already passed all 1,130 SQL tests.
