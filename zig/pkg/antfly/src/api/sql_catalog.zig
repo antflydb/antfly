@@ -35,6 +35,50 @@ fn newReceipt(alloc: std.mem.Allocator, target: domain.Target, table_id: u64, ve
 const RelationAdmission = struct { table: domain.ResolvedTable, guard: domain.RelationMutationGuard };
 const SearchPath = @import("../pgwire/search_path.zig").Path;
 
+/// Prior read-layout retirement is deterministic maintenance, but it changes
+/// the exact table-record CAS image. Wait before preparing/submitting the next
+/// DDL, using only this already-authorized owner (never re-run search_path).
+/// No mutation is replayed, and per-poll scratch cannot accumulate schemas.
+fn waitPriorSchemaFinalization(server: *server_mod.ApiHttpServer, context: operation.RequestContext, result_alloc: std.mem.Allocator, scratch_backing: std.mem.Allocator, initial: RelationAdmission) !RelationAdmission {
+    try context.ensureActive();
+    const definition = initial.table.query_definition orelse return error.InvalidSqlBackendResponse;
+    if (definition.storage_engine != .local or definition.read_schema_json.len == 0) return initial;
+    const time = @import("antfly_platform").time;
+    // Caller deadlines may use an Io clock with a different origin. Translate
+    // once before combining them with the native-monotonic readiness budget.
+    var bounded = try context.platformDeadline();
+    const deadline = @min(bounded.deadline_ns orelse std.math.maxInt(u64), time.monotonicNs() +| 5 * std.time.ns_per_s);
+    bounded.deadline_ns = deadline;
+    const lookup: domain.ResolveMany = .{ .relations = &.{initial.guard.target}, .include_query_definitions = true };
+    while (time.monotonicNs() < deadline) {
+        try context.ensureActive();
+        var scratch = std.heap.ArenaAllocator.init(scratch_backing);
+        defer scratch.deinit();
+        const a = scratch.allocator();
+        const bytes = try server.source.systemCatalog(a, bounded, .{ .resolve_many = lookup });
+        const observed = try std.json.parseFromSliceLeaky(domain.ResolvedMany, a, bytes, .{ .allocate = .alloc_always });
+        try observed.validateRelations(lookup);
+        const current = observed.relations[0] orelse return error.CatalogGenerationChanged;
+        if (!std.mem.eql(u8, &observed.relation_epoch.?.incarnation, &initial.guard.incarnation) or
+            !current.owner.eql(initial.guard.owner) or
+            !std.mem.eql(u8, current.logical_table, initial.guard.logical_table) or
+            !std.mem.eql(u8, current.table.name, initial.table.name))
+            return error.CatalogGenerationChanged;
+        const current_definition = current.table.query_definition orelse return error.InvalidSqlBackendResponse;
+        if (current_definition.storage_engine != definition.storage_engine or
+            !std.mem.eql(u8, current_definition.schema_json, definition.schema_json))
+            return error.CatalogGenerationChanged;
+        try context.ensureActive();
+        if (current_definition.read_schema_json.len == 0)
+            return .{ .table = try current.table.clone(result_alloc), .guard = initial.guard };
+        const io = server.sharedApiIo() orelse return error.CatalogPublicationProofPending;
+        const remaining = deadline -| time.monotonicNs();
+        if (remaining == 0) break;
+        try io.sleep(.fromNanoseconds(@min(remaining, 10 * std.time.ns_per_ms)), .awake);
+    }
+    return error.CatalogPublicationProofPending;
+}
+
 fn prepareGeneratedAddition(server: *server_mod.ApiHttpServer, context: operation.RequestContext, alloc: std.mem.Allocator, schema: std.json.Value, ddl: @import("antfly_local_sources").sql_ast.CatalogDdl, guard: *domain.RelationMutationGuard) !?std.json.Value {
     try context.ensureActive();
     var candidate = (try @import("antfly_local_sources").sql_schema_ddl.prepareGeneratedAddition(alloc, schema, ddl)) orelse return null;
@@ -178,7 +222,7 @@ fn alterSchema(server: *server_mod.ApiHttpServer, identity: ?server_mod.Authenti
     var arena = std.heap.ArenaAllocator.init(allocators.scratch);
     defer arena.deinit();
     const a = arena.allocator();
-    const captured = admission orelse blk: {
+    const initially_captured = admission orelse blk: {
         const use_path = ddl.name.namespace == null and ddl.name.database == null and path != null;
         const namespaces = if (use_path) path.?.len else 1;
         if (namespaces == 0) return error.TableNotFound;
@@ -218,13 +262,14 @@ fn alterSchema(server: *server_mod.ApiHttpServer, identity: ?server_mod.Authenti
             },
         };
     };
+    var captured = initially_captured;
     const target: domain.Target = .{
         .database = captured.guard.target.database,
         .namespace = captured.guard.target.namespace,
         .table = captured.guard.logical_table,
     };
-    const table = captured.table;
-    const definition = table.query_definition orelse return error.InvalidSqlBackendResponse;
+    var table = captured.table;
+    var definition = table.query_definition orelse return error.InvalidSqlBackendResponse;
     var parsed = try @import("antfly_local_sources").schema_mod.parseValidatedTableSchema(a, definition.schema_json);
     defer parsed.deinit(a);
     const native = try @import("antfly_local_sources").schema_mod.deriveRuntimeTableSchema(a, parsed);
@@ -237,18 +282,34 @@ fn alterSchema(server: *server_mod.ApiHttpServer, identity: ?server_mod.Authenti
             else => return error.ExternalLakeReadOnly,
         }
     }
+    // Active schema/owner identity must remain identical while only the
+    // previous read layout retires. Reuse the already validated active schema.
+    captured = try waitPriorSchemaFinalization(server, context, a, allocators.scratch, captured);
+    table = captured.table;
+    definition = table.query_definition orelse return error.InvalidSqlBackendResponse;
     var schema = try std.json.parseFromSliceLeaky(std.json.Value, a, definition.schema_json, .{ .parse_numbers = false });
     var guard = captured.guard;
-    if (try prepareGeneratedAddition(server, context, a, schema, ddl, &guard)) |candidate| {
+    var preparation_context = context;
+    const Checkpoint = struct {
+        fn check(raw: ?*anyopaque) anyerror!void {
+            const request: *const operation.RequestContext = @ptrCast(@alignCast(raw.?));
+            try request.ensureActive();
+        }
+    };
+    var row_validation_required = false;
+    if (ddl.schema_change != null and ddl.schema_change.? == .set_nullability) {
+        const change = ddl.schema_change.?.set_nullability;
+        const prepared = try @import("antfly_local_sources").schema_column_nullability.prepareBorrowed(&arena, schema, &.{.{
+            .column = change.column,
+            .nullable = change.nullable,
+        }}, .{ .checkpoint = Checkpoint.check, .checkpoint_context = &preparation_context });
+        if (prepared.summary.changed == 0) return .{};
+        if (prepared.summary.changed != 1) return error.InvalidSqlBackendResponse;
+        schema = prepared.schema;
+        row_validation_required = prepared.summary.tightened != 0;
+    } else if (try prepareGeneratedAddition(server, context, a, schema, ddl, &guard)) |candidate| {
         schema = candidate;
     } else {
-        var preparation_context = context;
-        const Checkpoint = struct {
-            fn check(raw: ?*anyopaque) anyerror!void {
-                const request: *const operation.RequestContext = @ptrCast(@alignCast(raw.?));
-                try request.ensureActive();
-            }
-        };
         if (!try @import("antfly_local_sources").sql_schema_ddl.applyWithLimits(a, &schema, ddl, .{ .checkpoint = Checkpoint.check, .checkpoint_context = &preparation_context })) return .{};
     }
     _ = schema.object.swapRemove("version");
@@ -292,7 +353,7 @@ fn alterSchema(server: *server_mod.ApiHttpServer, identity: ?server_mod.Authenti
         .create_index => |index| if (index.unique) return beginIndex(server, context, allocators, target, guard, index.name, updated),
         .add_column => |column| if (!column.nullable or column.default_expression != null or column.generated_expression != null)
             return rewriteSchema(server, identity, context, alloc, target, table.name, table.table_id, native.version, updated, if (column.default_expression != null) &.{column.name} else &.{}, null),
-        .set_nullability => |column| if (!column.nullable)
+        .set_nullability => if (row_validation_required)
             return rewriteSchema(server, identity, context, alloc, target, table.name, table.table_id, native.version, updated, &.{}, null),
         .add_unique => |constraint| if (constraint.primary)
             return rewriteSchema(server, identity, context, alloc, target, table.name, table.table_id, native.version, updated, &.{}, if (guard.constraint_name_admission != null) guard else null),
@@ -1080,6 +1141,9 @@ test "SQL catalog ALTER submits native schema CAS without client generations" {
         earlier_wrong_kind: bool = false,
         path_lookup: bool = false,
         index_exists: bool = false,
+        pending_read_schema: bool = false,
+        finalization_seen: bool = false,
+        foreign_finalized_owner: bool = false,
         fn status(_: *anyopaque) !@import("../metadata/api.zig").MetadataStatus {
             return .{ .metadata_group_id = 1, .metrics = .{} };
         }
@@ -1105,12 +1169,22 @@ test "SQL catalog ALTER submits native schema CAS without client generations" {
                 const stride: usize = if (self.table_lookup) 1 else 2;
                 try std.testing.expectEqual(stride * @as(usize, if (self.path_lookup) 2 else 1), call.resolve_many.relations.len);
                 try std.testing.expectEqualStrings("items", call.resolve_many.relations[0].name);
-                const table: @import("../metadata/table_manager.zig").TableRecord = .{ .table_id = 17, .name = "table:immutable-17", .schema_json = "{\"version\":7,\"storage_mode\":\"relational\",\"default_type\":\"row\",\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"integer\"}},\"additionalProperties\":false}}}}" };
+                var table: @import("../metadata/table_manager.zig").TableRecord = .{ .table_id = 17, .name = "table:immutable-17", .schema_json = "{\"version\":7,\"storage_mode\":\"relational\",\"default_type\":\"row\",\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"integer\"}},\"additionalProperties\":false}}}}" };
+                const pending = self.pending_read_schema;
+                self.pending_read_schema = false;
+                if (self.foreign_finalized_owner and self.finalization_seen) {
+                    table.table_id = 18;
+                    table.name = "table:immutable-18";
+                }
+                if (pending) {
+                    table.read_schema_json = "{\"version\":6}";
+                    self.finalization_seen = true;
+                }
                 var resolved = domain.ResolvedTable.fromTable(table);
                 resolved.query_definition = domain.QueryDefinition.fromTable(table);
                 var relations: [4]?domain.ResolvedRelation = @splat(null);
                 const selected: usize = if (self.path_lookup) stride else 0;
-                const table_owner: domain.ResolvedRelation = .{ .table = resolved, .logical_table = "items", .owner = .{ .table_id = 17, .schema_version = 7, .schema_digest = @splat(1), .kind = .table } };
+                const table_owner: domain.ResolvedRelation = .{ .table = resolved, .logical_table = "items", .owner = .{ .table_id = table.table_id, .schema_version = 7, .schema_digest = @splat(1), .kind = .table } };
                 var index_owner = table_owner;
                 index_owner.owner.kind = .index;
                 relations[selected] = if (self.wrong_kind) index_owner else table_owner;
@@ -1242,6 +1316,36 @@ test "SQL catalog ALTER submits native schema CAS without client generations" {
     const relaxed_outcome = try execute(&server, null, .{}, "default", "public", alloc, .{ .catalog_ddl = relaxed.statement.catalog_ddl });
     try std.testing.expectEqual(catalog.MutationOutcome.committed, relaxed_outcome.mutation_outcome);
     try std.testing.expectEqual(@as(usize, 8), source.updates);
+    // A prior migration may finalize between capture and CAS preparation.
+    // Refresh the same owner before issuing exactly one mutation, rather than
+    // discovering an uncertain outcome and replaying an admitted ALTER.
+    const finalization_reads = source.resolutions;
+    const finalization_attempts = source.mutation_attempts;
+    source.pending_read_schema = true;
+    const ShiftedClock = struct {
+        fn now(_: ?*anyopaque, _: std.Io.Clock) std.Io.Timestamp {
+            return .{ .nanoseconds = 10 };
+        }
+    };
+    var clock_vtable = std.testing.io.vtable.*;
+    clock_vtable.now = ShiftedClock.now;
+    const shifted_io: std.Io = .{ .userdata = std.testing.io.userdata, .vtable = &clock_vtable };
+    const shifted_context: operation.RequestContext = .{
+        .deadline_ns = 10 + std.time.ns_per_s,
+        .deadline_io = @import("antfly_runtime_abi").io_abi.Borrow.init(&shifted_io),
+    };
+    // A deadline from another clock origin retains its remaining budget; it
+    // must not look expired to the native-monotonic readiness loop.
+    _ = try execute(&server, null, shifted_context, "default", "public", alloc, guarded_input);
+    try std.testing.expectEqual(finalization_reads + 2, source.resolutions);
+    try std.testing.expectEqual(finalization_attempts + 1, source.mutation_attempts);
+    try std.testing.expectEqual(@as(usize, 9), source.updates);
+    source.pending_read_schema = true;
+    source.finalization_seen = false;
+    source.foreign_finalized_owner = true;
+    try std.testing.expectError(error.CatalogGenerationChanged, execute(&server, null, .{}, "default", "public", alloc, guarded_input));
+    try std.testing.expectEqual(finalization_attempts + 1, source.mutation_attempts);
+    try std.testing.expectEqual(@as(usize, 9), source.updates);
 }
 
 test "SQL catalog regular UNIQUE admits an owned private build without publishing through schema CAS" {

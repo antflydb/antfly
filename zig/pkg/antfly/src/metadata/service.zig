@@ -621,8 +621,8 @@ fn replaceTableDefinitionGuardedWithContextReceipt(
     // proves the published logical state. Any other supersession remains
     // ambiguous; never turn it back into a replayable conflict.
     std.log.warn(
-        "table definition mutation applied but exact replacement is no longer projected table={s} table_id={} term={} index={}",
-        .{ expected.name, expected.table_id, receipt.term, receipt.index },
+        "table definition mutation applied but exact replacement is no longer projected table={s} table_id={} term={} index={} same_prior_schema={} prior_read_bytes={} current_read_bytes={} proposed_read_bytes={} same_proposed_indexes={}",
+        .{ expected.name, expected.table_id, receipt.term, receipt.index, std.mem.eql(u8, current.schema_json, expected.schema_json), expected.read_schema_json.len, current.read_schema_json.len, replacement.read_schema_json.len, std.mem.eql(u8, current.indexes_json, replacement.indexes_json) },
     );
     return error.MetadataMutationOutcomeUnknown;
 }

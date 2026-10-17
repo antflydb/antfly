@@ -10848,3 +10848,51 @@ The remaining performant shape is a durable validation-only schema publication:
 Both dispositions remain unresolved with explicit partial evidence. Totals
 remain 531 implemented / 132 rejected / 113 superseded / 810 unresolved. No
 validation-only performance win or complete distributed activation is claimed.
+
+### Shared nullability preparation and stable predecessor admission
+
+The nullability declaration transform now lives in the Apache schema layer,
+without a SQL-parser dependency. Its independent transition verifier rejects
+unrelated type, modifier, default, column or index changes; schema versions,
+owner authority and existing-row validity are deliberately separate contracts.
+The SQL adapter uses the same copy-on-write constructor directly. Only edited
+map paths and the required-column vector are request-owned; untouched values
+are borrowed read-only from the pinned predecessor. This removes the previous
+whole-schema serialization/reparse copies from nullability preparation.
+Allocation-failure and cancellation coverage accompany a fixed-scratch test:
+a schema containing an unrelated 128 KiB payload can be prepared and verified
+with 32 KiB of scratch. This is a memory-bound assertion, not a throughput
+benchmark or validation-only row-scan qualification.
+
+Mounted default-lifecycle validation also exposed an ambiguous CAS acknowledgement
+while a prior read layout was being retired. The adapter now waits before
+submission for that maintenance to settle, refreshing only the already
+authorized point owner. A changed incarnation, owner, physical name or active
+schema aborts admission; search-path resolution is not repeated. Each poll
+releases its own backing-allocator scratch, the wait observes cancellation and
+a bounded deadline after translating the caller's Io clock, and a ready result
+is cloned into the request lifetime.
+The deterministic companion verifies exactly one mutation after readiness and
+zero mutations after owner replacement. Unknown admitted outcomes still cannot
+be replayed or upgraded to success from a newer schema version.
+
+This preparation/readiness checkpoint does not activate validation-only schema
+publication. The original distributed no-copy validation requirements above
+remain open, and no original disposition is reclassified.
+
+The shared constructor passes the complete Debug SQL gate: 885 portable plus
+234 native tests, with only the four existing opt-in benchmarks skipped
+(`/private/tmp/antfly-sql-nullability-cow-full-debug.log`). All 17 PostgreSQL
+catalog-lifecycle oracle tests pass
+(`/private/tmp/antfly-sql-nullability-cow-postgres.log`). Source-boundary,
+generated control-catalog, license, inventory and formatting checks pass.
+GC was previewed only. Roughly 8.2 GiB of explicitly validated obsolete local
+test binaries/objects were removed during this preparation cycle; source,
+user data, logs, other worktrees and current validation artifacts were retained.
+The first final clock-regression build exhausted disk space before test
+execution (`/private/tmp/antfly-sql-nullability-cow-clock-final-debug.log`);
+the unchanged gate was retried after the narrowly scoped cleanup.
+That final retry passes all seven mounted nullability/default lifecycle and
+strict acknowledgement/admission companions, including the shifted-clock
+regression, with zero skips or leaks and 80/80 build steps
+(`/private/tmp/antfly-sql-nullability-cow-clock-retry-debug.log`).

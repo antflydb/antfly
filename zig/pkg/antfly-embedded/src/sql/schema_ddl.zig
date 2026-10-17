@@ -21,6 +21,7 @@ const Value = std.json.Value;
 
 test {
     _ = @import("schema_expression.zig");
+    _ = @import("../schema/column_nullability.zig");
 }
 
 fn value(alloc: std.mem.Allocator, input: anytype) !Value {
@@ -168,77 +169,7 @@ fn requirePrimaryColumns(alloc: std.mem.Allocator, schema: *Value, columns: []co
     }
 }
 
-fn setColumnNullability(alloc: std.mem.Allocator, schema: Value, row: *Value, properties: Value, column_name: []const u8, nullable: bool) !bool {
-    const property = properties.object.getPtr(column_name) orelse return error.UndefinedColumn;
-    if (property.* != .object) return error.InvalidSqlBackendResponse;
-    // Do not override a shared referenced definition with an ignored sibling.
-    if (property.object.contains("$ref")) return error.UnsupportedSqlShape;
-    if (nullable) if (schema.object.get("unique_constraints")) |constraints| {
-        if (constraints != .array) return error.InvalidSqlBackendResponse;
-        for (constraints.array.items) |constraint| {
-            if (constraint != .object) return error.InvalidSqlBackendResponse;
-            const primary = constraint.object.get("primary") orelse continue;
-            if (primary != .bool) return error.InvalidSqlBackendResponse;
-            if (!primary.bool) continue;
-            const columns = constraint.object.get("columns") orelse return error.InvalidSqlBackendResponse;
-            if (columns != .array) return error.InvalidSqlBackendResponse;
-            for (columns.array.items) |column| {
-                if (column != .string) return error.InvalidSqlBackendResponse;
-                if (std.mem.eql(u8, column.string, column_name)) return error.SqlPrimaryKeyNotNull;
-            }
-        }
-    };
-    // Presence and explicit SQL NULL admission are independent schema bits.
-    // Keep the original type/format/modifier and remove only a null union arm.
-    const kind = property.object.get("type") orelse return error.UnsupportedSqlShape;
-    var union_null = false;
-    var nonnull_type: ?Value = null;
-    switch (kind) {
-        .array => |kinds| {
-            for (kinds.items) |entry| {
-                if (entry != .string) return error.InvalidSqlBackendResponse;
-                if (std.mem.eql(u8, entry.string, "null")) {
-                    union_null = true;
-                } else {
-                    if (nonnull_type != null) return error.UnsupportedSqlShape;
-                    nonnull_type = entry;
-                }
-            }
-            if (nonnull_type == null) return error.UnsupportedSqlShape;
-        },
-        .string => |name| if (std.mem.eql(u8, name, "null")) {
-            return error.UnsupportedSqlShape;
-        },
-        else => return error.InvalidSqlBackendResponse,
-    }
-    const flag = property.object.get("nullable");
-    if (flag != null and flag.? != .bool) return error.InvalidSqlBackendResponse;
-    const allows_null = union_null or (if (flag) |v| v.bool else false);
-    var required_index: ?usize = null;
-    if (row.object.getPtr("required")) |required| {
-        if (required.* != .array) return error.InvalidSqlBackendResponse;
-        for (required.array.items, 0..) |entry, i| {
-            if (entry != .string) return error.InvalidSqlBackendResponse;
-            if (std.mem.eql(u8, entry.string, column_name)) {
-                required_index = i;
-                break;
-            }
-        }
-    }
-    if (nullable and required_index == null and allows_null) return false;
-    if (!nullable and required_index != null and !allows_null) return false;
-    // Adding a row-level required list can relocate row map slots; finish all
-    // nested property work before that insertion, then reacquire as needed.
-    if (!nullable and kind == .array) try property.object.put(alloc, "type", nonnull_type.?);
-    try property.object.put(alloc, "nullable", .{ .bool = nullable });
-    if (nullable) {
-        if (required_index) |i| _ = row.object.getPtr("required").?.array.orderedRemove(i);
-    } else if (required_index == null) {
-        const required = try list(row, alloc, "required");
-        try required.append(.{ .string = try alloc.dupe(u8, column_name) });
-    }
-    return true;
-}
+const setColumnNullability = @import("../schema/column_nullability.zig").setColumn;
 
 pub fn apply(alloc: std.mem.Allocator, schema: *Value, ddl: ast.CatalogDdl) !bool {
     return applyWithLimits(alloc, schema, ddl, .{});

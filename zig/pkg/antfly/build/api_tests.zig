@@ -2170,6 +2170,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "mounted SQL regular unique index build failure is atomic",
             "mounted SQL original column defaults preserve old rows and recover future mutation semantics",
             "schema publication acknowledgement accepts only exact deterministic finalization",
+            "SQL catalog ALTER submits native schema CAS without client generations",
             "table definition stamp distinguishes rejection from post-admission ambiguity",
             "SQL unknown mutation keeps native reconciliation receipt without allocation",
             "SQL default lifecycle retries only definite read admission",
@@ -2217,7 +2218,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     sql_default_lifecycle_run.addArg("--require-no-skips");
     const sql_default_lifecycle_step = b.step("antfly-api-sql-default-lifecycle-test", "Run original default DDL with real owner propagation, complete postimages and restart");
     sql_default_lifecycle_step.dependOn(&sql_default_lifecycle_run.step);
-    const sql_schema_ack_run = addFilteredTestRunArtifactWithRuntimeFilters(b, sql_owner_lifecycle_tests, &.{ "schema publication acknowledgement accepts only exact deterministic finalization", "table definition stamp distinguishes rejection from post-admission ambiguity", "SQL unknown mutation keeps native reconciliation receipt without allocation", "SQL default lifecycle retries only definite read admission" });
+    const sql_schema_ack_run = addFilteredTestRunArtifactWithRuntimeFilters(b, sql_owner_lifecycle_tests, &.{ "schema publication acknowledgement accepts only exact deterministic finalization", "SQL catalog ALTER submits native schema CAS without client generations", "table definition stamp distinguishes rejection from post-admission ambiguity", "SQL unknown mutation keeps native reconciliation receipt without allocation", "SQL default lifecycle retries only definite read admission" });
     sql_schema_ack_run.addArg("--require-no-skips");
     sql_default_lifecycle_step.dependOn(&sql_schema_ack_run.step);
     const sql_table_creation_run = addFilteredTestRunArtifactWithRuntimeFilters(b, sql_owner_lifecycle_tests, &.{"mounted SQL original generated and casted tables own creation enforcement and restart"});
