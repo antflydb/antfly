@@ -27,6 +27,7 @@ pub const Config = struct {
     tables: []const Table,
     principals: []const []const u8 = &.{},
     page_size: usize = 128,
+    prefetch: bool = true,
     max_response_bytes: usize = 32 * 1024 * 1024,
     max_page_memory: usize = 64 * 1024 * 1024,
 };
@@ -92,69 +93,25 @@ fn scan(search: anytype, http: *httpx.Client, config: Config, table: Table, coun
     defer search.a.free(name);
     const url = try std.fmt.allocPrint(search.a, "{s}/tables/{s}/query", .{ std.mem.trimEnd(u8, config.endpoint, "/"), name });
     defer search.a.free(url);
+    var filters = std.heap.ArenaAllocator.init(search.a);
+    defer filters.deinit();
+    const filter_arena = filters.allocator();
+    const user_filter: ?std.json.Value = if (search.options.table_filter) |raw| (try std.json.parseFromSlice(std.json.Value, filter_arena, raw, .{ .allocate = .alloc_always })).value else null;
+    const filter = try candidateFilter(filter_arena, search, table, user_filter);
+    var fetcher = Fetch{ .a = search.a, .io = search.io, .options = search.options, .limits = &search.limits, .config = config, .url = url, .document_field = table.document_field, .filter = filter, .http = http };
+    defer search.summary.index_requests += fetcher.summary.index_requests;
+    const overlap = config.prefetch and !search.options.quiet and search.options.max_count == std.math.maxInt(usize);
+    if (overlap) fetcher.thread = try std.Thread.spawn(.{}, Fetch.worker, .{&fetcher});
+    defer fetcher.finish();
     var page_size = config.page_size;
-    pages: while (!search.stopped()) {
-        var memory = @import("antfly_regex").Budget{ .backing = search.a, .limit = config.max_page_memory };
-        var page = std.heap.ArenaAllocator.init(memory.allocator());
-        defer page.deinit();
-        const a = page.allocator();
-        const user_filter: ?std.json.Value = if (search.options.table_filter) |raw| (try std.json.parseFromSlice(std.json.Value, a, raw, .{ .allocate = .alloc_always })).value else null;
-        const filter = try candidateFilter(a, search, table, user_filter);
-        const body = try std.json.Stringify.valueAlloc(a, .{ .query = .{ .match_all = .{} }, .filter_query = filter, .fields = [_][]const u8{table.document_field}, .order_by = .{.{ .field = "_id", .desc = false }}, .limit = page_size, .search_after = cursor, .remote_snapshot = snapshot, .timeout_ms = search.options.timeout_ms }, .{ .emit_null_optional_fields = false });
-        const auth = if (search.options.table_token) |token| try std.fmt.allocPrint(a, "Bearer {s}", .{token}) else null;
-        const headers: ?[]const [2][]const u8 = if (auth) |value| &.{.{ "Authorization", value }} else null;
-        var attempt: usize = 0;
-        const parsed = retry: while (true) {
-            if (search.stopped()) return error.Canceled;
-            if (!Limits.reserve(&search.limits.requests, 1, search.options.max_requests)) return error.RequestBudgetExceeded;
-            search.summary.index_requests += 1;
-            var response = http.post(url, .{ .json = body, .headers = headers, .timeout_ms = search.options.timeout_ms, .max_response_size = config.max_response_bytes, .max_retries = 0, .follow_redirects = false, .cookies_enabled = false, .cancellation = httpx.CancellationToken.fromAtomic(&search.limits.cancel) }) catch |err| {
-                if (err == error.ResponseTooLarge and page_size > 1) {
-                    page_size = @max(1, page_size / 2);
-                    continue :pages;
-                }
-                if (err == error.OutOfMemory or err == error.Canceled or err == error.ResponseTooLarge or attempt >= search.options.retries) return err;
-                try backoff(search, attempt, 0);
-                attempt += 1;
-                continue;
-            };
-            defer response.deinit();
-            const status = response.status.code;
-            if (status == 413 and page_size > 1) {
-                page_size = @max(1, page_size / 2);
-                continue :pages;
-            }
-            if (status == 409) return error.IndexSnapshotExpired;
-            if (status == 401 or status == 403) return error.IndexAuthorizationFailed;
-            if (!response.ok()) {
-                if ((status != 429 and status != 408 and status < 500) or attempt >= search.options.retries) return error.IndexQueryFailed;
-                const delay = if (response.header("retry-after")) |raw| @import("http_date.zig").retryMilliseconds(raw, std.Io.Clock.real.now(search.io).toSeconds(), 30000) orelse 0 else 0;
-                try backoff(search, attempt, delay);
-                attempt += 1;
-                continue;
-            }
-            const decoded = std.json.parseFromSlice(std.json.Value, a, response.body orelse return error.EmptyIndexResponse, .{ .allocate = .alloc_always }) catch |err| {
-                if (memory.denied and page_size > 1) {
-                    page_size = @max(1, page_size / 2);
-                    continue :pages;
-                }
-                return if (memory.denied) error.IndexPageMemoryExceeded else err;
-            };
-            const envelope = document.field(decoded.value, "responses") orelse return error.InvalidIndexResponse;
-            if (envelope != .array or envelope.array.items.len != 1) return error.InvalidIndexResponse;
-            const result_status = document.integer(document.field(envelope.array.items[0], "status")) orelse return error.InvalidIndexResponse;
-            if (result_status == 413 and page_size > 1) {
-                page_size = @max(1, page_size / 2);
-                continue :pages;
-            }
-            if ((result_status == 408 or result_status == 429 or result_status >= 500) and attempt < search.options.retries) {
-                const delay = if (response.header("retry-after")) |raw| @import("http_date.zig").retryMilliseconds(raw, std.Io.Clock.real.now(search.io).toSeconds(), 30000) orelse 0 else 0;
-                try backoff(search, attempt, delay);
-                attempt += 1;
-                continue;
-            }
-            break :retry decoded;
-        };
+    var pending = false;
+    while (!search.stopped()) {
+        const loaded = if (pending) try fetcher.take() else try fetcher.load(.{ .cursor = cursor, .snapshot = snapshot, .page_size = page_size });
+        pending = false;
+        defer loaded.deinit(search.a);
+        const a = loaded.arena.allocator();
+        const parsed = loaded.parsed;
+        page_size = loaded.page_size;
         const responses = document.field(parsed.value, "responses") orelse return error.InvalidIndexResponse;
         if (responses != .array or responses.array.items.len != 1) return error.InvalidIndexResponse;
         const result = responses.array.items[0];
@@ -170,15 +127,38 @@ fn scan(search: anytype, http: *httpx.Client, config: Config, table: Table, coun
         if (hits != .array or hits.array.items.len > page_size) return error.InvalidIndexResponse;
         var next_cursor: ?[]const std.json.Value = null;
         for (hits.array.items) |hit| {
-            if (search.stopped()) return;
-            if (count.* >= search.options.max_index_documents) return error.IndexDocumentBudgetExceeded;
-            count.* += 1;
             const id = try document.string(hit, "_id");
             if (last_id) |previous| if (std.mem.order(u8, id, previous) != .gt) return error.InvalidIndexCursor;
             last_id = id;
             const sort = document.field(hit, "_sort") orelse return error.InvalidIndexCursor;
             if (sort != .array or sort.array.items.len != 1 or sort.array.items[0] != .string or !std.mem.eql(u8, sort.array.items[0].string, id)) return error.InvalidIndexCursor;
             next_cursor = sort.array.items;
+        }
+        const has_next = hits.array.items.len == page_size;
+        if (loaded.memory.peak < config.max_page_memory / 4) page_size = @min(config.page_size, page_size * 2);
+        if (has_next) {
+            // Copy only continuation state. Recycle every previous page before
+            // receiving the next; no document corpus accumulates in memory.
+            var fresh = std.heap.ArenaAllocator.init(search.a);
+            errdefer fresh.deinit();
+            const sa = fresh.allocator();
+            const encoded = try std.json.Stringify.valueAlloc(a, next_cursor orelse return error.InvalidIndexCursor, .{});
+            cursor = (try std.json.parseFromSlice([]const std.json.Value, sa, encoded, .{ .allocate = .alloc_always })).value;
+            snapshot = try sa.dupe(u8, current_snapshot);
+            last_id = try sa.dupe(u8, last_id.?);
+            // url/name must remain alive independently of continuation storage.
+            state.deinit();
+            state = fresh;
+        }
+        if (overlap and has_next and count.* + hits.array.items.len < search.options.max_index_documents) {
+            fetcher.submit(.{ .cursor = cursor, .snapshot = snapshot, .page_size = page_size });
+            pending = true;
+        }
+        for (hits.array.items) |hit| {
+            if (search.stopped()) return;
+            if (count.* >= search.options.max_index_documents) return error.IndexDocumentBudgetExceeded;
+            count.* += 1;
+            const id = try document.string(hit, "_id");
             const source = document.field(hit, "_source") orelse return error.InvalidIndexResponse;
             const value = document.at(source, table.document_field) orelse return error.MissingGrepDocument;
             const doc = try document.Document.parse(value, table.name, id, current_snapshot, std.Io.Clock.real.now(search.io).toSeconds());
@@ -192,22 +172,161 @@ fn scan(search: anytype, http: *httpx.Client, config: Config, table: Table, coun
             }
             search.indexDocument(doc) catch |err| try search.reportError(doc.path, err);
         }
-        if (hits.array.items.len < page_size) return;
-        if (memory.peak < config.max_page_memory / 4) page_size = @min(config.page_size, page_size * 2);
-        // Copy only continuation state. Recycle every previous page before
-        // receiving the next; no document corpus accumulates in memory.
-        var fresh = std.heap.ArenaAllocator.init(search.a);
-        errdefer fresh.deinit();
-        const sa = fresh.allocator();
-        const encoded = try std.json.Stringify.valueAlloc(a, next_cursor orelse return error.InvalidIndexCursor, .{});
-        cursor = (try std.json.parseFromSlice([]const std.json.Value, sa, encoded, .{ .allocate = .alloc_always })).value;
-        snapshot = try sa.dupe(u8, current_snapshot);
-        last_id = try sa.dupe(u8, last_id.?);
-        // url/name must remain alive independently of continuation storage.
-        state.deinit();
-        state = fresh;
+        if (!has_next) return;
     }
 }
+const Page = struct {
+    memory: @import("antfly_regex").Budget,
+    arena: std.heap.ArenaAllocator,
+    parsed: std.json.Parsed(std.json.Value),
+    page_size: usize,
+    fn deinit(self: *Page, a: A) void {
+        self.arena.deinit();
+        a.destroy(self);
+    }
+};
+/// One demand-driven producer, one outstanding page, no corpus accumulation.
+/// Continuation storage outlives each outstanding request; pages own their JSON.
+const Fetch = struct {
+    a: A,
+    io: std.Io,
+    options: *const @import("options.zig").Options,
+    limits: *Limits,
+    config: Config,
+    url: []const u8,
+    document_field: []const u8,
+    filter: ?std.json.Value,
+    http: *httpx.Client,
+    summary: struct { index_requests: usize = 0 } = .{},
+    cancel: std.atomic.Value(bool) = .init(false),
+    mutex: std.Io.Mutex = .init,
+    ready: std.Io.Condition = .init,
+    thread: ?std.Thread = null,
+    job: ?Request = null,
+    complete: bool = false,
+    result: ?*Page = null,
+    failure: ?anyerror = null,
+    const Request = struct { cursor: ?[]const std.json.Value, snapshot: ?[]const u8, page_size: usize };
+    fn stopped(self: *Fetch) bool {
+        return self.cancel.load(.acquire) or self.limits.cancel.load(.acquire);
+    }
+    fn cancelled(raw: *const anyopaque) bool {
+        const self: *Fetch = @ptrCast(@alignCast(@constCast(raw)));
+        return self.stopped();
+    }
+    fn submit(self: *Fetch, request: Request) void {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        self.job = request;
+        self.complete = false;
+        self.ready.signal(self.io);
+    }
+    fn take(self: *Fetch) !*Page {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        while (!self.complete) self.ready.waitUncancelable(self.io, &self.mutex);
+        if (self.failure) |err| return err;
+        const result = self.result.?;
+        self.result = null;
+        return result;
+    }
+    fn worker(self: *Fetch) void {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        while (true) {
+            while (self.job == null and !self.stopped()) self.ready.waitUncancelable(self.io, &self.mutex);
+            if (self.stopped()) return;
+            const request = self.job.?;
+            self.job = null;
+            self.mutex.unlock(self.io);
+            const result = self.load(request);
+            self.mutex.lockUncancelable(self.io);
+            if (result) |page| self.result = page else |err| self.failure = err;
+            self.complete = true;
+            self.ready.broadcast(self.io);
+        }
+    }
+    fn finish(self: *Fetch) void {
+        self.cancel.store(true, .release);
+        self.mutex.lockUncancelable(self.io);
+        self.ready.broadcast(self.io);
+        self.mutex.unlock(self.io);
+        if (self.thread) |thread| thread.join();
+        if (self.result) |page| page.deinit(self.a);
+    }
+    fn load(self: *Fetch, request: Request) !*Page {
+        var size = request.page_size;
+        const page_size = &size;
+        resize: while (true) {
+            const page = try self.a.create(Page);
+            page.* = .{ .memory = .{ .backing = self.a, .limit = self.config.max_page_memory }, .arena = undefined, .parsed = undefined, .page_size = undefined };
+            page.arena = std.heap.ArenaAllocator.init(page.memory.allocator());
+            var retained = false;
+            defer if (!retained) page.deinit(self.a);
+            const a = page.arena.allocator();
+            const memory = &page.memory;
+            const body = try std.json.Stringify.valueAlloc(a, .{ .query = .{ .match_all = .{} }, .filter_query = self.filter, .fields = [_][]const u8{self.document_field}, .order_by = .{.{ .field = "_id", .desc = false }}, .limit = page_size.*, .search_after = request.cursor, .remote_snapshot = request.snapshot, .timeout_ms = self.options.timeout_ms }, .{ .emit_null_optional_fields = false });
+            const auth = if (self.options.table_token) |token| try std.fmt.allocPrint(a, "Bearer {s}", .{token}) else null;
+            const headers: ?[]const [2][]const u8 = if (auth) |value| &.{.{ "Authorization", value }} else null;
+            var attempt: usize = 0;
+            const parsed = retry: while (true) {
+                if (self.stopped()) return error.Canceled;
+                if (!Limits.reserve(&self.limits.requests, 1, self.options.max_requests)) return error.RequestBudgetExceeded;
+                self.summary.index_requests += 1;
+                var response = self.http.post(self.url, .{ .json = body, .headers = headers, .timeout_ms = self.options.timeout_ms, .max_response_size = self.config.max_response_bytes, .max_retries = 0, .follow_redirects = false, .cookies_enabled = false, .cancellation = httpx.CancellationToken.fromCallback(self, Fetch.cancelled) }) catch |err| {
+                    if (err == error.ResponseTooLarge and page_size.* > 1) {
+                        page_size.* = @max(1, page_size.* / 2);
+                        continue :resize;
+                    }
+                    if (err == error.OutOfMemory or err == error.Canceled or err == error.ResponseTooLarge or attempt >= self.options.retries) return err;
+                    try backoff(self, attempt, 0);
+                    attempt += 1;
+                    continue;
+                };
+                defer response.deinit();
+                const status = response.status.code;
+                if (status == 413 and page_size.* > 1) {
+                    page_size.* = @max(1, page_size.* / 2);
+                    continue :resize;
+                }
+                if (status == 409) return error.IndexSnapshotExpired;
+                if (status == 401 or status == 403) return error.IndexAuthorizationFailed;
+                if (!response.ok()) {
+                    if ((status != 429 and status != 408 and status < 500) or attempt >= self.options.retries) return error.IndexQueryFailed;
+                    const delay = if (response.header("retry-after")) |raw| @import("http_date.zig").retryMilliseconds(raw, std.Io.Clock.real.now(self.io).toSeconds(), 30000) orelse 0 else 0;
+                    try backoff(self, attempt, delay);
+                    attempt += 1;
+                    continue;
+                }
+                const decoded = std.json.parseFromSlice(std.json.Value, a, response.body orelse return error.EmptyIndexResponse, .{ .allocate = .alloc_always }) catch |err| {
+                    if (memory.denied and page_size.* > 1) {
+                        page_size.* = @max(1, page_size.* / 2);
+                        continue :resize;
+                    }
+                    return if (memory.denied) error.IndexPageMemoryExceeded else err;
+                };
+                const envelope = document.field(decoded.value, "responses") orelse return error.InvalidIndexResponse;
+                if (envelope != .array or envelope.array.items.len != 1) return error.InvalidIndexResponse;
+                const result_status = document.integer(document.field(envelope.array.items[0], "status")) orelse return error.InvalidIndexResponse;
+                if (result_status == 413 and page_size.* > 1) {
+                    page_size.* = @max(1, page_size.* / 2);
+                    continue :resize;
+                }
+                if ((result_status == 408 or result_status == 429 or result_status >= 500) and attempt < self.options.retries) {
+                    const delay = if (response.header("retry-after")) |raw| @import("http_date.zig").retryMilliseconds(raw, std.Io.Clock.real.now(self.io).toSeconds(), 30000) orelse 0 else 0;
+                    try backoff(self, attempt, delay);
+                    attempt += 1;
+                    continue;
+                }
+                break :retry decoded;
+            };
+            page.parsed = parsed;
+            page.page_size = size;
+            retained = true;
+            return page;
+        }
+    }
+};
 fn backoff(search: anytype, attempt: usize, requested: u64) !void {
     var remaining = @min(@as(u64, 30000), @max(requested, search.options.retry_base_ms *| (@as(u64, 1) << @intCast(@min(attempt, 8)))));
     while (remaining > 0) {

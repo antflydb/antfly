@@ -84,6 +84,11 @@
       "type": "integer",
       "minimum": 4096,
       "maximum": 1073741824
+    },
+    "prefetch": {
+      "type": "boolean",
+      "default": true,
+      "description": "Overlap one retained-snapshot page with local processing. At most two decoded pages are live; quiet and finite per-file match limits use sequential retrieval."
     }
   }
 }

@@ -19313,6 +19313,13 @@ export interface components {
         };
         /** @description Supply exactly one of input (single text) or inputs (Antfly batch extension). Question names must be unique. Single text and named question arrays follow OpenAI Decisions conventions; local models support text input and string choice values. Request bodies are bounded at 16 MiB. */
         InferenceDecideRequest: {
+            /**
+             * @description Explicit shared-context transport version. Requires batched inputs and contexts; unknown versions are rejected.
+             * @enum {integer}
+             */
+            context_version?: 1;
+            /** @description Shared immutable context strings referenced by context_index. Requires context_version 1. Total expanded input bytes are limited to 16 MiB. */
+            contexts?: string[];
             model: string;
             /** @description Pin the exact EmbeddingGemma 2 assets and embedding recipe. */
             model_identity?: string;
@@ -21149,6 +21156,8 @@ export interface components {
         DecisionInput: {
             id?: string;
             input: string;
+            /** @description Index into request contexts. Requires context_version 1. Effective input is context, newline, then input; the 1 MiB input limit applies after expansion. */
+            context_index?: number;
         };
         /** @description Explicit windowing for qualified boundary decision models. Span and embedding decision models reject window mode. Omission preserves rejection of over-limit text. */
         InferenceDecideLongDocument: {

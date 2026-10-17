@@ -127,7 +127,7 @@ pub const Search = struct {
         defer if (self.pipeline) |pool| pool.context.mutex.unlock(self.io);
         self.summary.errors += 1;
         self.summary.complete = false;
-        if (err == error.RegionBudgetExceeded or err == error.RequestBudgetExceeded or err == error.SourceBudgetExceeded or err == error.PendingOutputBudgetExceeded or err == error.IndexDocumentBudgetExceeded) {
+        if (err == error.RegionBudgetExceeded or err == error.RequestBudgetExceeded or err == error.SourceBudgetExceeded or err == error.PendingOutputBudgetExceeded or err == error.OutputBudgetExceeded or err == error.IndexDocumentBudgetExceeded) {
             self.stop = true;
             if (self.shared_limits) |limits| limits.cancel.store(true, .monotonic);
         }
@@ -368,6 +368,8 @@ pub const Search = struct {
         queue: Queue,
         threads: []std.Thread,
         started: usize = 0,
+        growing: bool = false,
+        growth_failed: bool = false,
         fn start(root: *Search) !*Pipeline {
             const jobs = root.fileJobs();
             const self = try root.a.create(Pipeline);
@@ -390,19 +392,30 @@ pub const Search = struct {
         }
         fn submit(self: *Pipeline, task: Task) !bool {
             const root = self.context.search;
-            // Growth and enqueue share the queue lock: steady-state producers
-            // pay exactly one lock, without a second scheduling mutex per file.
             self.queue.mutex.lockUncancelable(root.io);
-            defer self.queue.mutex.unlock(root.io);
             while (self.queue.count == self.queue.slots.len and !self.queue.closed) self.queue.writable.waitUncancelable(root.io, &self.queue.mutex);
-            if (self.queue.closed) return false;
-            if (self.started < self.threads.len and self.queue.count >= self.started * 2) {
-                self.threads[self.started] = try std.Thread.spawn(.{}, Parallel.worker, .{&self.context});
-                self.started += 1;
+            if (self.queue.closed) {
+                self.queue.mutex.unlock(root.io);
+                return false;
             }
+            // Reserve a single growth operation. Publish the task before thread
+            // creation so existing consumers can keep draining the queue.
+            const grow = !self.growing and !self.growth_failed and self.started < self.threads.len and self.queue.count >= self.started * 2;
+            if (grow) self.growing = true;
             self.queue.slots[(self.queue.head + self.queue.count) % self.queue.slots.len] = task;
             self.queue.count += 1;
             self.queue.readable.signal(root.io);
+            self.queue.mutex.unlock(root.io);
+            if (grow) {
+                const thread = std.Thread.spawn(.{}, Parallel.worker, .{&self.context}) catch null;
+                self.queue.mutex.lockUncancelable(root.io);
+                defer self.queue.mutex.unlock(root.io);
+                if (thread) |worker| {
+                    self.threads[self.started] = worker;
+                    self.started += 1;
+                } else self.growth_failed = true;
+                self.growing = false;
+            }
             return true;
         }
         fn finish(self: *Pipeline) !void {
@@ -601,10 +614,11 @@ pub const Search = struct {
     }
     fn fileJobs(self: *const Search) usize {
         const requested = @max(1, self.options.jobs);
-        // Profiles of cheap existence scans show filesystem contention above
-        // this point. Keep full concurrency for CPU-heavy matchers and always
+        // Literal and literal-union scans saturate filesystem/output bandwidth
+        // before CPU-heavy regexes. Keep their measured eight-worker ceiling
+        // across output modes; retain full concurrency for regexes and always
         // honor an explicitly selected worker count.
-        if (self.options.ask == null and self.options.jobs_auto and (self.options.files_with_matches or self.options.files_without_match) and !self.options.json and !self.options.stats and self.matcher.isLiteralSearch()) return @min(8, requested);
+        if (self.options.ask == null and self.options.jobs_auto and self.matcher.isLiteralSearch()) return @min(8, requested);
         return requested;
     }
     pub fn discoveryStopped(self: *Search) bool {
@@ -1833,6 +1847,7 @@ pub const Search = struct {
             // independent line evidence even when the coarse region rejected it.
             var target_count: usize = 0;
             const contexts = try ba.alloc([]const u8, n);
+            const context_hashes = try ba.alloc([32]u8, n);
             const starts = try ba.alloc(usize, n + 1);
             for (regions.items[offset..][0..n], scores, 0..) |region, score, i| {
                 starts[i] = target_count;
@@ -1847,6 +1862,7 @@ pub const Search = struct {
                 const count = region.end - region.start;
                 self.summary.regions_considered += count;
                 contexts[i] = try std.fmt.allocPrint(ba, "File: {s}\nCONTEXT region lines {d}-{d}:\n{s}\n", .{ path_name, region.start + 1, region.end, bytes[lines[region.start].start..lines[region.end - 1].end] });
+                std.crypto.hash.sha2.Sha256.hash(contexts[i], &context_hashes[i], .{});
                 target_count += count;
             }
             starts[n] = target_count;
@@ -1877,7 +1893,7 @@ pub const Search = struct {
                     while (flat >= starts[region_index + 1]) region_index += 1;
                     const region = regions.items[offset + region_index];
                     const j = region.start + flat - starts[region_index];
-                    target.* = .{ .id = try std.fmt.allocPrint(ta, "refine-{d}-{d}", .{ offset + region_index, j }), .input = try std.fmt.allocPrint(ta, "TARGET {d}: {s}\n", .{ j + 1, bytes[lines[j].start..lines[j].end] }), .context = contexts[region_index] };
+                    target.* = .{ .id = try std.fmt.allocPrint(ta, "refine-{d}-{d}", .{ offset + region_index, j }), .input = try std.fmt.allocPrint(ta, "TARGET {d}: {s}\n", .{ j + 1, bytes[lines[j].start..lines[j].end] }), .context = contexts[region_index], .context_hash = context_hashes[region_index] };
                 }
                 self.decider.stage = .line;
                 self.decider.search(targets, line_scores[target_offset..][0..m]) catch |err| {
@@ -1889,14 +1905,12 @@ pub const Search = struct {
             for (regions.items[offset..][0..n], scores, 0..) |region, score, i| {
                 if (!std.math.isFinite(score)) continue;
                 const fine_scores = line_scores[starts[i]..starts[i + 1]];
-                var any = false;
                 for (fine_scores, region.start..) |p, j| {
                     if (std.math.isFinite(p)) self.summary.regions_evaluated += 1;
                     if (p >= 0) self.best_probability = @max(self.best_probability, p);
-                    if (p >= 0 and ((p >= self.options.threshold) != self.options.invert)) any = true;
                     if (self.evidence) |evidence| evidence.line_scores[j] = if (std.math.isNan(evidence.line_scores[j])) p else @max(evidence.line_scores[j], p);
                 }
-                const fine = fine_scores.len > 0 and (any or failure != null);
+                const fine = fine_scores.len > 0;
                 for (region.start..region.end, 0..) |j, k| {
                     const p = if (fine) fine_scores[k] else score;
                     if (p >= 0 and ((p >= self.options.threshold) != self.options.invert)) {

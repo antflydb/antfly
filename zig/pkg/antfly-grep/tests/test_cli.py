@@ -77,6 +77,10 @@ class DecisionHandler(BaseHTTPRequestHandler):
             self.end_headers()
             return
         mode = self.server.index_mode
+        if body.get("search_after"):
+            self.server.index_next.set()
+            if mode == "blocked-prefetch":
+                self.server.index_release.wait(5)
         if mode == "retry" and len(self.server.index_requests) == 1:
             self.send_response(429)
             self.send_header("Retry-After", "Sun, 06 Nov 1994 08:49:37 GMT")
@@ -161,6 +165,15 @@ class DecisionHandler(BaseHTTPRequestHandler):
         self.server.requests.append(
             (self.path, self.headers.get("Authorization"), body)
         )
+        if body.get("context_version") == 1:
+            body = json.loads(json.dumps(body))
+            for item in body["inputs"]:
+                if "context_index" in item:
+                    item["input"] = (
+                        body["contexts"][item["context_index"]] + "\n" + item["input"]
+                    )
+        if self.server.mode == "prefetch":
+            self.server.prefetch_seen = self.server.index_next.wait(2)
         if "state" in body:
             encoded = json.dumps(
                 {
@@ -227,6 +240,14 @@ class DecisionHandler(BaseHTTPRequestHandler):
                     ],
                 }
             )
+        if self.server.mode in ("reject_lines", "accept_lines", "reject_line_policy"):
+            for row in data:
+                refined = body["inputs"][row["input_index"]]["id"].startswith("refine-")
+                row["answers"][0]["probability"] = (
+                    (0.9 if refined else 0.1)
+                    if self.server.mode == "accept_lines"
+                    else (0.1 if refined else 0.9)
+                )
         if self.server.mode == "reject_blocks":
             for row in data:
                 if body["inputs"][row["input_index"]]["id"].startswith("region-"):
@@ -243,6 +264,17 @@ class DecisionHandler(BaseHTTPRequestHandler):
             row["answers"] = [
                 {**prototype, "name": q["name"]} for q in body["questions"]
             ]
+        if self.server.mode == "reject_line_policy":
+            for row in data:
+                for answer in row["answers"]:
+                    answer["probability"] = (
+                        0.1
+                        if answer["name"].startswith("include_")
+                        and body["inputs"][row["input_index"]]["id"].startswith(
+                            "refine-"
+                        )
+                        else 0.9
+                    )
         if self.server.mode == "duplicate":
             data[-1]["input_index"] = 0
         if self.server.mode == "similarity":
@@ -928,6 +960,9 @@ class CliTests(unittest.TestCase):
         self.env["XDG_CONFIG_HOME"] = str(self.root / "config")
         self.server.requests = []
         self.server.index_requests = []
+        self.server.index_next = threading.Event()
+        self.server.index_release = threading.Event()
+        self.server.prefetch_seen = False
         self.server.index_documents = []
         self.server.index_mode = "ok"
         self.server.mode = "ok"
@@ -3603,6 +3638,95 @@ class CliTests(unittest.TestCase):
         )
         self.assertGreaterEqual(self.server.peak, 2)
         self.assertLessEqual(self.server.peak, 4)
+
+    def test_completed_negative_refinement_does_not_restore_region(self):
+        self.write(
+            "negative.py", "def retry():\n    unrelated = 1\n    return unrelated\n"
+        )
+        for mode, extra in (
+            ("reject_lines", []),
+            ("accept_lines", ["-v"]),
+            ("reject_line_policy", ["--only", "allowed"]),
+        ):
+            with self.subTest(mode=mode):
+                self.server.mode = mode
+                result = self.raw_cli(
+                    *self.decision_args(),
+                    "--no-cache",
+                    "--refine",
+                    "--json",
+                    *extra,
+                    "negative.py",
+                    code=1,
+                )
+                self.assertFalse(
+                    any(
+                        json.loads(line)["type"] == "match"
+                        for line in result.stdout.splitlines()
+                    )
+                )
+
+    def test_indexed_prefetch_overlaps_decisions_and_preserves_output(self):
+        docs = [self.indexed_doc(f"f{i}.txt", "STOP retry\n") for i in range(3)]
+        config = self.table_config(docs, prefetch=True)
+        self.server.mode = "prefetch"
+        parallel = self.raw_cli(
+            *self.decision_args(), "--no-cache", "--table-config", config
+        )
+        self.assertTrue(self.server.prefetch_seen)
+        self.server.mode = "ok"
+        config = self.table_config(docs, prefetch=False)
+        sequential = self.raw_cli(
+            *self.decision_args(), "--no-cache", "--table-config", config
+        )
+        self.assertEqual(parallel.stdout, sequential.stdout)
+
+    def test_indexed_prefetch_cancels_blocked_request_on_output_limit(self):
+        config = self.table_config([self.indexed_doc(f"f{i}.txt") for i in range(3)])
+        self.server.mode = "prefetch"
+        self.server.index_mode = "blocked-prefetch"
+        start = time.monotonic()
+        try:
+            self.raw_cli(
+                *self.decision_args(),
+                "--no-cache",
+                "--table-config",
+                config,
+                "--max-output-bytes=1",
+                "--timeout-ms=10000",
+                code=2,
+            )
+            self.assertTrue(self.server.index_next.is_set())
+            self.assertLess(time.monotonic() - start, 3)
+        finally:
+            self.server.index_release.set()
+
+    def test_indexed_quiet_does_not_prefetch(self):
+        config = self.table_config([self.indexed_doc(f"f{i}.txt") for i in range(3)])
+        self.raw_cli("--table-config", config, "-q", "STOP")
+        self.assertEqual(len(self.server.index_requests), 1)
+
+    def test_shared_decision_context_matches_legacy(self):
+        self.write(
+            "context.py",
+            "def retry():\n    unrelated = 1\n    # STOP retries\n    return unrelated\n",
+        )
+        args = [*self.decision_args(), "--no-cache", "--refine", "context.py"]
+        legacy = self.raw_cli(*args)
+        self.server.requests.clear()
+        shared = self.raw_cli(*args, "--decision-context=shared-v1")
+        self.assertEqual(shared.stdout, legacy.stdout)
+        batches = [
+            body
+            for _, _, body in self.server.requests
+            if any(x["id"].startswith("refine-") for x in body.get("inputs", []))
+        ]
+        self.assertTrue(batches)
+        body = batches[0]
+        self.assertEqual(body["context_version"], 1)
+        self.assertEqual(len(body["contexts"]), 1)
+        self.assertEqual({x["context_index"] for x in body["inputs"]}, {0})
+        self.assertTrue(all("CONTEXT region" not in x["input"] for x in body["inputs"]))
 
     def test_declaration_regions_refine_to_independently_scored_lines(self):
         self.write(

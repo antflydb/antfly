@@ -16,6 +16,10 @@
 const std = @import("std");
 
 pub fn add(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.lang.Optimize) void {
+    return addConfigured(b, target, optimize, b.option([]const u8, "antfly-version", "Release version") orelse "0.1.0-dev", b.option(bool, "strip", "Strip grep debug information for release archives") orelse false);
+}
+
+pub fn addConfigured(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.lang.Optimize, release_version: []const u8, strip: bool) void {
     const fst = b.createModule(.{ .root_source_file = b.path("lib/fst/src/mod.zig"), .target = target, .optimize = optimize });
     const regex = b.createModule(.{ .root_source_file = b.path("lib/regex/src/mod.zig"), .target = target, .optimize = optimize });
     regex.addImport("antfly_fst", fst);
@@ -47,9 +51,9 @@ pub fn add(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.lang.O
     const main = b.createModule(.{ .root_source_file = b.path("pkg/antfly-grep/src/main.zig"), .target = target, .optimize = optimize });
     main.addImport("antfly-grep", lib);
     const version = b.addOptions();
-    version.addOption([]const u8, "version", b.option([]const u8, "antfly-version", "Release version") orelse "0.1.0-dev");
+    version.addOption([]const u8, "version", release_version);
     main.addImport("grep_build_options", version.createModule());
-    main.strip = b.option(bool, "strip", "Strip grep debug information for release archives") orelse false;
+    main.strip = strip;
     main.link_libc = true;
     lib.link_libc = true;
     const exe = b.addExecutable(.{ .name = "antfly-grep", .root_module = main });
@@ -91,11 +95,12 @@ pub fn add(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.lang.O
     harden_mod.addImport("antfly_regex", harden_regex);
     harden_mod.addImport("antfly_syntax", harden_syntax);
     harden_mod.addImport("antfly_compress", harden_compress);
-    const fuzz_target = b.option(enum { regex, parsers, dictionaries }, "grep-fuzz-target", "Select one coverage-guided hardening target");
+    const fuzz_target = b.option(enum { regex, parsers, dictionaries, codecs }, "grep-fuzz-target", "Select one coverage-guided hardening target");
     const fuzz_filters: []const []const u8 = if (fuzz_target) |value| switch (value) {
         .regex => &.{"coverage fuzz regex"},
         .parsers => &.{"coverage fuzz pinned"},
         .dictionaries => &.{"coverage fuzz dictionaries"},
+        .codecs => &.{"coverage fuzz bzip2"},
     } else &.{};
     const harden = b.addTest(.{ .name = "antfly-grep-harden-test", .root_module = harden_mod, .filters = fuzz_filters });
     b.step("grep-harden-build", "Build portable hardening test executable without running it").dependOn(&b.addInstallArtifact(harden, .{}).step);

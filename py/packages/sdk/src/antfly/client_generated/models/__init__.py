@@ -791,6 +791,7 @@ from .inference_credentials import InferenceCredentials
 from .inference_decide_long_document import InferenceDecideLongDocument
 from .inference_decide_long_document_mode import InferenceDecideLongDocumentMode
 from .inference_decide_request import InferenceDecideRequest
+from .inference_decide_request_context_version import InferenceDecideRequestContextVersion
 from .inference_decide_response import InferenceDecideResponse
 from .inference_dictate_request import InferenceDictateRequest
 from .inference_dictate_response import InferenceDictateResponse
@@ -2296,6 +2297,7 @@ __all__ = (
     "InferenceDecideLongDocument",
     "InferenceDecideLongDocumentMode",
     "InferenceDecideRequest",
+    "InferenceDecideRequestContextVersion",
     "InferenceDecideResponse",
     "InferenceDictateRequest",
     "InferenceDictateResponse",

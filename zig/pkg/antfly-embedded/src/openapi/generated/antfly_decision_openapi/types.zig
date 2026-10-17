@@ -325,6 +325,10 @@ pub const DecideQuestion = union(enum) {
 
 /// Supply exactly one of input (single text) or inputs (Antfly batch extension). Question names must be unique. Single text and named question arrays follow OpenAI Decisions conventions; local models support text input and string choice values. Request bodies are bounded at 16 MiB.
 pub const DecideRequest = struct {
+    /// Explicit shared-context transport version. Requires batched inputs and contexts; unknown versions are rejected.
+    context_version: ?i64 = null,
+    /// Shared immutable context strings referenced by context_index. Requires context_version 1. Total expanded input bytes are limited to 16 MiB.
+    contexts: ?[]const []const u8 = null,
     model: []const u8,
     /// Pin the exact EmbeddingGemma 2 assets and embedding recipe.
     model_identity: ?[]const u8 = null,
@@ -336,6 +340,8 @@ pub const DecideRequest = struct {
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "context_version", "context_version", true },
+        .{ "contexts", "contexts", true },
         .{ "model", "model", false },
         .{ "model_identity", "model_identity", true },
         .{ "input", "input", true },
@@ -355,6 +361,14 @@ pub const DecideRequest = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        if (self.context_version) |value| {
+            try jw.objectField("context_version");
+            try jw.write(value);
+        }
+        if (self.contexts) |value| {
+            try jw.objectField("contexts");
+            try jw.write(value);
+        }
         try jw.objectField("model");
         try jw.write(self.model);
         if (self.model_identity) |value| {
@@ -515,11 +529,14 @@ pub const DecisionChoiceProbability = struct {
 pub const DecisionInput = struct {
     id: ?[]const u8 = null,
     input: []const u8,
+    /// Index into request contexts. Requires context_version 1. Effective input is context, newline, then input; the 1 MiB input limit applies after expansion.
+    context_index: ?i64 = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
         .{ "id", "id", true },
         .{ "input", "input", false },
+        .{ "context_index", "context_index", true },
     };
 
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
@@ -538,6 +555,10 @@ pub const DecisionInput = struct {
         }
         try jw.objectField("input");
         try jw.write(self.input);
+        if (self.context_index) |value| {
+            try jw.objectField("context_index");
+            try jw.write(value);
+        }
         try jw.endObject();
     }
 };

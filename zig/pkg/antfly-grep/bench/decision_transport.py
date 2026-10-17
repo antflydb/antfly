@@ -38,6 +38,14 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("binary", type=Path)
     parser.add_argument("--baseline", type=Path, required=True)
+    parser.add_argument(
+        "--backend", choices=("typesafe", "decision"), default="typesafe"
+    )
+    parser.add_argument(
+        "--cache",
+        action="store_true",
+        help="Warm and measure disk-cache hits instead of provider requests",
+    )
     parser.add_argument("--lines", type=int, default=512)
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--rounds", type=int, default=3)
@@ -61,18 +69,39 @@ def main():
                 self.server.requests.append(
                     {
                         "bytes": len(raw),
-                        "state_bytes": len(body["state"].encode()),
-                        "questions": len(body["questions"]),
+                        "state_bytes": len(body.get("state", "").encode())
+                        + sum(len(x.encode()) for x in body.get("contexts", [])),
+                        "questions": len(body["questions"])
+                        * len(body.get("inputs", [None])),
                     }
                 )
-            encoded = json.dumps(
-                {
+            if args.backend == "typesafe":
+                response = {
                     "answers": {
                         name: {"type": "noul", "noul": 0.9}
                         for name in body["questions"]
                     }
                 }
-            ).encode()
+            else:
+                response = {
+                    "data": [
+                        {
+                            "input_index": i,
+                            "id": item["id"],
+                            "answers": [
+                                {
+                                    "name": q["name"],
+                                    "type": "predicate",
+                                    "decision_method": "typed",
+                                    "probability": 0.9,
+                                }
+                                for q in body["questions"]
+                            ],
+                        }
+                        for i, item in enumerate(body["inputs"])
+                    ]
+                }
+            encoded = json.dumps(response).encode()
             self.send_response(200)
             self.send_header("Content-Length", str(len(encoded)))
             self.end_headers()
@@ -92,9 +121,10 @@ def main():
         f"let value_{i:04} = process_request({i});\n" for i in range(args.lines)
     )
     report = {
-        "evaluation": "synthetic_typesafe_transport_fixture",
+        "evaluation": f"synthetic_{args.backend}_transport_fixture",
         "limitations": "Constant scores; no model quality, provider tokens, or actual cost measured.",
         "platform": platform.platform(),
+        "cache": args.cache,
         "source_sha256": hashlib.sha256(source.encode()).hexdigest(),
         "source_bytes": len(source.encode()),
         "lines": args.lines,
@@ -114,7 +144,7 @@ def main():
                     "sha256": hashlib.sha256(binary.read_bytes()).hexdigest(),
                     "runs": [],
                 }
-            for round_index in range(args.rounds):
+            for round_index in range(-1 if args.cache else 0, args.rounds):
                 order = list(binaries) if round_index % 2 == 0 else reversed(binaries)
                 for name in order:
                     with server.lock:
@@ -126,13 +156,22 @@ def main():
                             "--ask",
                             "find request processing",
                             "--backend",
-                            "typesafe",
+                            "typesafe" if args.backend == "typesafe" else "http",
+                            *(
+                                ["--decision-context=shared-v1"]
+                                if args.backend == "decision" and name == "antfly-grep"
+                                else []
+                            ),
                             "--model",
                             "fixture",
                             "--endpoint",
                             f"http://127.0.0.1:{server.server_port}/decisions",
                             "--broad",
-                            "--no-cache",
+                            *(
+                                ["--cache-dir", str(root / (name + "-cache"))]
+                                if args.cache
+                                else ["--no-cache"]
+                            ),
                             "--no-config",
                             "--refine",
                             "--chunk-lines",
@@ -160,6 +199,8 @@ def main():
                         )
                     with server.lock:
                         requests = server.requests.copy()
+                    if round_index < 0:
+                        continue
                     report["binaries"][name]["runs"].append(
                         {
                             "seconds": elapsed,

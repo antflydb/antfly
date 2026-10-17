@@ -75,7 +75,7 @@ def main():
         },
         "campaigns": {},
     }
-    for target in ("regex", "parsers", "dictionaries"):
+    for target in ("regex", "parsers", "dictionaries", "codecs"):
         cmd = [
             args.zig,
             "build",

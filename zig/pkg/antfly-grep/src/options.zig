@@ -161,6 +161,7 @@ pub const Options = struct {
     endpoint: []const u8 = "http://127.0.0.1:8090/decisions",
     model: ?[]const u8 = null,
     backend: enum { http, local, typesafe } = .http,
+    decision_context: enum { legacy, shared_v1 } = .legacy,
     models_dir: ?[]const u8 = null,
     library_path: ?[]const u8 = null,
     provider_name: []const u8 = "antfly",
@@ -554,7 +555,7 @@ pub const Options = struct {
                     if (self.retries > 10) return error.InvalidNumber;
                 } else if (std.mem.eql(u8, name, "--engine")) {
                     self.engine = std.meta.stringToEnum(@TypeOf(self.engine), value) orelse return error.InvalidEngine;
-                } else if (std.mem.eql(u8, name, "--backend")) self.backend = if (std.mem.eql(u8, value, "local")) .local else if (std.mem.eql(u8, value, "typesafe")) .typesafe else if (std.mem.eql(u8, value, "http") or std.mem.eql(u8, value, "antfly")) .http else return error.UnsupportedBackend else if (std.mem.eql(u8, name, "--models-dir")) self.models_dir = value else if (std.mem.eql(u8, name, "--library")) self.library_path = value else if (std.mem.eql(u8, name, "--replace")) self.replacement = value else if (std.mem.eql(u8, name, "--threads") or std.mem.eql(u8, name, "--concurrency")) self.jobs = try number(value) else if (std.mem.eql(u8, name, "--max-filesize")) {
+                } else if (std.mem.eql(u8, name, "--decision-context")) self.decision_context = if (std.mem.eql(u8, value, "shared-v1")) .shared_v1 else if (std.mem.eql(u8, value, "legacy")) .legacy else return error.InvalidDecisionContext else if (std.mem.eql(u8, name, "--backend")) self.backend = if (std.mem.eql(u8, value, "local")) .local else if (std.mem.eql(u8, value, "typesafe")) .typesafe else if (std.mem.eql(u8, value, "http") or std.mem.eql(u8, value, "antfly")) .http else return error.UnsupportedBackend else if (std.mem.eql(u8, name, "--models-dir")) self.models_dir = value else if (std.mem.eql(u8, name, "--library")) self.library_path = value else if (std.mem.eql(u8, name, "--replace")) self.replacement = value else if (std.mem.eql(u8, name, "--threads") or std.mem.eql(u8, name, "--concurrency")) self.jobs = try number(value) else if (std.mem.eql(u8, name, "--max-filesize")) {
                     self.max_file_bytes = try size(value);
                     self.skip_oversize = true;
                 } else if (std.mem.eql(u8, name, "--table-config")) self.table_config = value else if (std.mem.eql(u8, name, "--table")) try self.tables.append(a, value) else if (std.mem.eql(u8, name, "--table-filter")) self.table_filter = value else if (std.mem.eql(u8, name, "--max-index-documents")) self.max_index_documents = try number(value) else if (std.mem.eql(u8, name, "--max-pending-output")) self.max_pending_output = try number(value) else if (std.mem.eql(u8, name, "--cache-ttl")) self.cache_ttl_seconds = try number(value) else if (std.mem.eql(u8, name, "--max-columns")) self.max_columns = unlimited(try number(value)) else if (std.mem.eql(u8, name, "--max-depth")) self.max_depth = try number(value) else if (std.mem.eql(u8, name, "--max-requests")) self.max_requests = try number(value) else if (std.mem.eql(u8, name, "--max-source-bytes")) {

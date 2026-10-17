@@ -49,7 +49,7 @@
         "bench/results/followup-relevance-fixture.json",
         "bench/results/followup-typesafe-transport.json"
       ],
-      "limits": "Labeled pinned production-source and synthetic fixture evaluations verify pipeline precision/recall and independent-line discovery, not live-model quality. Request/token/cost accounting supports explicit provider evaluations. Shared Typesafe context and bounded cross-region line batches reduce transport/request overhead without skipping independent targets; fixture byte savings are not provider token-cost measurements."
+      "limits": "Labeled pinned production-source and synthetic fixture evaluations verify pipeline precision/recall and independent-line discovery, not live-model quality. Request/token/cost accounting supports explicit provider evaluations. Shared Typesafe and opt-in versioned Decision API contexts, per-region cache digests, and bounded cross-region line batches reduce transport/request overhead without skipping independent targets; fixture byte savings are not provider token-cost measurements. Completed negative line refinements do not fall back to coarse scores."
     },
     {
       "area": "Decision budgets, cache, retries and cancellation",
@@ -68,7 +68,7 @@
         "tests/test_cli.py",
         "../../e2e/antfly/test_grep_indexed.py"
       ],
-      "limits": "Explicit ID ordering from page one; native-server pagination, concurrent writes, actual cursor expiry, large region lists, API-key revocation and opt-in certified-trigram candidates with legacy fallback. Snapshot-bound cursors and request/document/source/output budgets remain required. No connector ingestion or direct remote-file downloads. Proven regex substrings and bounded literal unions support conservative candidate pushdown. Transient per-table statuses inside HTTP 200 envelopes retry the same snapshot/cursor."
+      "limits": "Explicit ID ordering from page one; native-server pagination, concurrent writes, actual cursor expiry, large region lists, API-key revocation and opt-in certified-trigram candidates with legacy fallback. Snapshot-bound cursors and request/document/source/output budgets remain required. No connector ingestion or direct remote-file downloads. Proven regex substrings and bounded literal unions support conservative candidate pushdown. Transient per-table statuses inside HTTP 200 envelopes retry the same snapshot/cursor. Optional bounded prefetch overlaps one page with processing, preserves connection reuse across tables, and cancels on terminal budgets; quiet and finite match limits remain sequential."
     },
     {
       "area": "Unified local/indexed results",

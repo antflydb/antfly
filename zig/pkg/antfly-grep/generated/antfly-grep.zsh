@@ -27,6 +27,7 @@ _arguments -s \
  '--count-matches[count-matches]' \
  '--crlf[crlf]' \
  '--debug[debug]' \
+ '--decision-context[decision-context]:value:(legacy shared-v1)' \
  '--dfa-size-limit[dfa-size-limit]:value:' \
  '--dictionary[dictionary]:value:_files' \
  '--dictionary-format[dictionary-format]:value:(auto raw brotli brotli-google)' \

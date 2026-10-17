@@ -24,6 +24,7 @@ pub const Input = struct {
     id: []const u8,
     input: []const u8,
     context: []const u8 = "",
+    context_hash: ?[32]u8 = null,
     pub fn jsonStringify(self: Input, json: *std.json.Stringify) !void {
         try json.beginObject();
         try json.objectField("id");
@@ -170,10 +171,15 @@ pub const Client = struct {
         if (failure) |err| return err;
     }
     fn key(self: *Client, input: Input) [64]u8 {
+        var context_hash = input.context_hash orelse blk: {
+            var digest: [32]u8 = undefined;
+            std.crypto.hash.sha2.Sha256.hash(input.context, &digest, .{});
+            break :blk digest;
+        };
         var hash = std.crypto.hash.sha2.Sha256.init(.{});
         // Include credential scope, endpoint, model and complete effective
         // question and input. Cached scores contain no source text or token.
-        for ([_][]const u8{ "antfly-grep-decisions-v4", self.options.endpoint, self.options.model.?, self.options.token orelse "", @tagName(self.options.backend), self.options.models_dir orelse "", self.options.library_path orelse "", self.query orelse self.options.ask.?, @tagName(self.stage), if (self.options.broad) "broad" else "direct", input.context, input.input }) |part| {
+        for ([_][]const u8{ "antfly-grep-decisions-v5", self.options.endpoint, self.options.model.?, self.options.token orelse "", @tagName(self.options.backend), self.options.models_dir orelse "", self.options.library_path orelse "", self.query orelse self.options.ask.?, @tagName(self.stage), if (self.options.broad) "broad" else "direct", &context_hash, input.input }) |part| {
             var len: [8]u8 = undefined;
             std.mem.writeInt(u64, &len, part.len, .little);
             hash.update(&len);
@@ -246,8 +252,8 @@ pub const Client = struct {
                         if (split == input.input.len or split == 0) return err;
                         split += 1;
                         if (split == input.input.len) return err;
-                        const left = Input{ .id = input.id, .input = input.input[0..split], .context = input.context };
-                        const right = Input{ .id = input.id, .input = input.input[split..], .context = input.context };
+                        const left = Input{ .id = input.id, .input = input.input[0..split], .context = input.context, .context_hash = input.context_hash };
+                        const right = Input{ .id = input.id, .input = input.input[split..], .context = input.context, .context_hash = input.context_hash };
                         var scores: [2]f64 = @splat(std.math.nan(f64));
                         self.request(&.{left}, scores[0..1]) catch |failure| {
                             return failure;
@@ -315,7 +321,7 @@ pub const Client = struct {
         // entire expanded request (including JSON escaping and shared state).
         var body_budget = @import("antfly_regex").Budget{ .backing = self.a, .limit = 32 * 1024 * 1024 };
         const body_a = body_budget.allocator();
-        const body = (if (self.options.backend == .typesafe) typesafeBody(body_a, inputs, questions, self.options.model.?) else std.json.Stringify.valueAlloc(body_a, .{ .model = self.options.model.?, .inputs = inputs, .questions = questions }, .{})) catch |err| {
+        const body = (if (self.options.backend == .typesafe) typesafeBody(body_a, inputs, questions, self.options.model.?) else if (self.options.decision_context == .shared_v1) sharedBody(body_a, inputs, questions, self.options.model.?) else std.json.Stringify.valueAlloc(body_a, .{ .model = self.options.model.?, .inputs = inputs, .questions = questions }, .{})) catch |err| {
             return if (body_budget.denied) error.DecisionRequestTooLarge else err;
         };
         defer body_a.free(body);
@@ -368,6 +374,28 @@ pub const Client = struct {
         }
     }
 };
+/// Versioned opt-in transport; IDs/answer indexes and effective input bytes
+/// are identical to legacy requests. Intern immutable borrowed slices once.
+fn sharedBody(a: Allocator, inputs: []const Input, questions: anytype, model: []const u8) ![]u8 {
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    const WireInput = struct { id: []const u8, input: []const u8, context_index: ?usize };
+    const wire = try scratch.alloc(WireInput, inputs.len);
+    var contexts: std.ArrayList([]const u8) = .empty;
+    var indexes: std.AutoHashMap(struct { address: usize, len: usize }, usize) = .init(scratch);
+    for (inputs, wire) |input, *out| {
+        out.* = .{ .id = input.id, .input = input.input, .context_index = null };
+        if (input.context.len == 0) continue;
+        const entry = try indexes.getOrPut(.{ .address = @intFromPtr(input.context.ptr), .len = input.context.len });
+        if (!entry.found_existing) {
+            entry.value_ptr.* = contexts.items.len;
+            try contexts.append(scratch, input.context);
+        }
+        out.context_index = entry.value_ptr.*;
+    }
+    return std.json.Stringify.valueAlloc(a, .{ .model = model, .context_version = 1, .contexts = contexts.items, .inputs = wire, .questions = questions }, .{ .emit_null_optional_fields = false });
+}
 fn typesafeBody(a: Allocator, inputs: []const Input, questions: anytype, model: []const u8) ![]u8 {
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
@@ -493,4 +521,20 @@ test "decision answers are identity checked and can arrive reordered" {
     try parseProbabilities(p.value, &.{ .{ .id = "a", .input = "A" }, .{ .id = "b", .input = "B" } }, &probabilities);
     try std.testing.expectEqual(@as(f64, 0.9), probabilities[1]);
     try std.testing.expectError(error.InvalidDecisionResponse, parseProbabilities(p.value, &.{ .{ .id = "wrong", .input = "A" }, .{ .id = "b", .input = "B" } }, &probabilities));
+}
+
+test "prehashed shared contexts preserve cache identity and credential scope" {
+    var options = Options{ .ask = "question", .model = "fixture" };
+    var client = Client{ .a = std.testing.allocator, .io = undefined, .http = undefined, .options = &options };
+    const input = Input{ .id = "line", .input = "TARGET", .context = "immutable region" };
+    const expected = client.key(input);
+    var hashed = input;
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(input.context, &digest, .{});
+    hashed.context_hash = digest;
+    try std.testing.expectEqual(expected, client.key(hashed));
+    hashed.input = "different target";
+    try std.testing.expect(!std.mem.eql(u8, &expected, &client.key(hashed)));
+    options.token = "different credential scope";
+    try std.testing.expect(!std.mem.eql(u8, &expected, &client.key(input)));
 }

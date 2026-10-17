@@ -184,7 +184,9 @@ Go generic invocations retain call syntax; conversion and macro candidates carry
 explicit kinds in JSON. Macro expansion and semantic type resolution require
 information beyond syntax. See `zig/lib/syntax/README.md` for pins and conformance. Unsupported or incomplete syntax falls back to bounded chunks.
 
-Line discovery evaluates lines even inside rejected blocks. `--no-refine`
+Line discovery evaluates lines even inside rejected blocks. Completed line judgments
+control selection even when every line is rejected; accepted region scores remain
+separate evidence. `--no-refine`
 retains accepted regions instead. `--broad` bypasses directory/file pruning and
 asks about broader relationships. Rich `ask` output reports separate preview,
 region, and line scores, declarations, calls, reading leads, and explicit excerpt
@@ -261,7 +263,12 @@ antfly-grep --table-config tables.json --sort path -l 'retry' ./src
 `ANTFLY_GREP_TABLE_CONFIG` can supply the configuration path. With no explicit
 filesystem paths, table searches do not read stdin or implicitly walk the current
 directory. Repeated `--table` selects configured aliases; omitted selectors scan
-all configured tables. `--table-filter JSON` passes an additional Antfly query
+all configured tables. The default `prefetch: true` overlaps one retained-snapshot page
+with matching/decisions using one persistent producer. At most two decoded pages are
+live (each bounded by `max_page_memory`, plus bounded HTTP response buffers). Set
+`prefetch: false` for sequential retrieval. Quiet searches and finite per-file match
+limits disable speculation; document/request limits and cancellation remain enforced.
+`--table-filter JSON` passes an additional Antfly query
 filter before pagination. Filters, globs, file types, counts, replacements,
 context, quiet mode and lexical/decision output share their local implementations.
 Git ignore files describe local worktrees; indexed searches use explicit path/type
@@ -292,8 +299,7 @@ snapshots fail explicitly and retain earlier results; scans never restart silent
 or switch to an approximate candidate set. Transport/429/5xx retries use bounded
 backoff and Retry-After, including HTTP dates. Oversized/rejected pages shrink around the same cursor and recover gradually
 without duplicating processed documents. Compiled matchers, scratch, models and
-HTTP connections are reused across documents. Pages are released after processing;
-only cursor state survives. `max_page_memory` separately caps JSON expansion and
+HTTP connections are reused across documents. Pages are released after processing; only continuation state and at most one prefetched page survive. `max_page_memory` separately caps JSON expansion and
 page allocations (64 MiB by default), including array capacities and temporary
 growth. Response bytes, requests, scanned documents, source
 bytes and output have explicit limits. `--max-index-documents` defaults to 100000;
@@ -612,7 +618,7 @@ A bounded directory lookahead (128 entries / 8 KiB of names) avoids opening
 missing ignore files without a second directory scan. Overflow retains the
 original ignore loader and streams the remaining entries. Path prefixes and
 64–256 KiB file buffers are reused; ordinary discovered files avoid redundant
-metadata calls. Automatic case-sensitive literal file-existence scans use at
+metadata calls. Automatic literal and literal-union scans use at
 most eight scan workers to limit filesystem contention; explicit `-j` values
 remain authoritative. Plain file lists bypass file scans and batch up to 64 names /
 8 KiB per worker. Line buffering, JSON, sorted lists, metadata filters and finite
@@ -780,7 +786,16 @@ line evidence. Typesafe requests share each immutable region context once in
 `state`. Decision API serialization preserves the existing `inputs` wire format
 and writes context directly into JSON without a temporary joined string. JSON
 serialization uses a 32 MiB allocation budget and a 16 MiB payload limit; oversized
-batches split through the existing retry path. Cache keys include context and broad/direct prompt mode. Fixture request bytes are recorded
+batches split through the existing retry path. `--decision-context shared-v1` opts
+ordinary Decision API requests into the versioned `context_version: 1` format: each
+immutable context is sent once in `contexts`, with `context_index` on targets.
+Supporting Antfly decision servers validate references and bound expanded inputs to 1
+MiB each and 16 MiB total; effective input bytes and answer identities equal legacy
+requests. The default `legacy` mode supports existing endpoints; an unsupported shared
+version fails explicitly. This reduces transport bytes, not model input tokens. Cache v5
+hashes each immutable region once and includes its digest alongside target text,
+credential/question scope, and broad/direct mode; older cache entries become misses.
+Fixture request bytes are recorded
 separately from provider token usage; fixture results do not establish model
 quality or actual provider cost.
 

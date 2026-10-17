@@ -73,6 +73,7 @@ const help =
     \\      --debug / --trace      Search/discovery diagnostics
     \\
     \\      --ask QUESTION        Judge source regions using Antfly decisions
+    \\      --decision-context shared-v1  Share context with supporting Decision APIs
     \\      --backend local       In-process native libantfly inference
     \\      --library PATH        Native inference shared library
     \\      --models-dir PATH     Local model directory

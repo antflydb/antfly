@@ -47,6 +47,7 @@ const Bits = struct {
     }
 };
 const Table = struct {
+    primary: [1024]u16 = @splat(0),
     counts: [21]u16 = @splat(0),
     first: [21]u32 = @splat(0),
     offsets: [21]usize = @splat(0),
@@ -68,12 +69,29 @@ const Table = struct {
             t.offsets[n] = offset;
             for (lengths, 0..) |len, i| if (len == n) {
                 t.symbols[offset] = @intCast(i);
+                if (n <= 10) {
+                    const shift: u4 = @intCast(10 - n);
+                    const start = (code + offset - t.offsets[n]) << shift;
+                    @memset(t.primary[start..][0 .. @as(usize, 1) << shift], @as(u16, @intCast((n << 9) | i)));
+                }
                 offset += 1;
             };
         }
         return t;
     }
     fn symbol(self: *const Table, bits: *Bits) E!usize {
+        // Every valid coded block has a following 80-bit trailer, so bounded
+        // lookahead cannot require bytes beyond a valid stream's end.
+        // Very short codes already resolve with one cheap canonical probe;
+        // reserve the lookup for tables whose decoding pays for lookahead.
+        if (self.minimum >= 5) {
+            try bits.ensure(10);
+            const entry = self.primary[@intCast(bits.peek(10))];
+            if (entry != 0) {
+                bits.remaining -= @intCast(entry >> 9);
+                return entry & 511;
+            }
+        }
         var code: u32 = @intCast(try bits.read(self.minimum));
         var n = self.minimum;
         while (true) : (n += 1) {
@@ -337,4 +355,32 @@ fn fourEqual(bytes: []const u8) ?usize {
         if (bytes[at] == bytes[at + 1] and bytes[at] == bytes[at + 2] and bytes[at] == bytes[at + 3]) return at;
     }
     return null;
+}
+
+test "primary Huffman lookup and long-code fallback agree with canonical codes" {
+    var lengths: [21]u8 = undefined;
+    for (lengths[0..19], 1..) |*len, n| len.* = @intCast(n);
+    lengths[19] = 20;
+    lengths[20] = 20;
+    const table = try Table.init(&lengths);
+    for (lengths, 0..) |len, expected| {
+        const code = table.first[len] + @as(u32, @intCast(expected - table.offsets[len]));
+        var encoded: [8]u8 = @splat(0);
+        std.mem.writeInt(u64, &encoded, @as(u64, code) << @intCast(64 - len), .big);
+        var input = std.Io.Reader.fixed(&encoded);
+        var bits = Bits{ .input = &input };
+        try std.testing.expectEqual(expected, try table.symbol(&bits));
+    }
+    const mixed = try Table.init(&.{ 8, 9, 10, 11, 20 });
+    for ([_]u8{ 8, 9, 10, 11, 20 }, 0..) |len, expected| {
+        var encoded: [8]u8 = @splat(0);
+        std.mem.writeInt(u64, &encoded, @as(u64, mixed.first[len]) << @intCast(64 - len), .big);
+        var reader = std.Io.Reader.fixed(&encoded);
+        var lookahead = Bits{ .input = &reader };
+        try std.testing.expectEqual(expected, try mixed.symbol(&lookahead));
+    }
+    const invalid = try Table.init(&.{ 2, 2 });
+    var input = std.Io.Reader.fixed(&.{ 0xff, 0xff, 0xff, 0xff });
+    var bits = Bits{ .input = &input };
+    try std.testing.expectError(error.InvalidBzip2, invalid.symbol(&bits));
 }
