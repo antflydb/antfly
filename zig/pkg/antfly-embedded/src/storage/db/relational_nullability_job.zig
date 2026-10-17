@@ -221,7 +221,8 @@ pub const Binding = struct {
         try result.requireCurrent(txn);
         return result;
     }
-    fn requireCandidate(self: Binding, candidate: *const Candidate) !void {
+    pub fn requireCandidate(self: Binding, candidate: *const Candidate) !void {
+        try self.validate();
         const parts = try Candidate.parts(candidate.inputs);
         if (self.before_version != candidate.before_version or self.after_version != candidate.after_version or
             self.columns != candidate.plan.names.len or !eq(self.projection_identity, candidate.plan.identity) or
@@ -381,6 +382,15 @@ fn workHeader(txn: anytype, binding: Binding) !Header {
     const facts = try @import("table_catalog.zig").Catalog.decode((try optional(txn, @import("table_catalog.zig").key)) orelse return error.SchemaValidationJobChanged);
     if (facts.storage_mode != .relational or facts.active_schema_version != binding.before_version or
         !eq(binding.physical_catalog, try digestAt(txn, physical.head_key))) return error.SchemaValidationJobChanged;
+    return header;
+}
+
+/// Preparation guard, not permission to install or release a schema. The
+/// publication participant must recheck this exact ready cut under apply.
+pub fn requireReady(txn: anytype, binding: Binding) !Header {
+    const header = try workHeader(txn, binding);
+    if (header.phase != .ready) return error.SchemaValidationNotReady;
+    try binding.requireCurrent(txn);
     return header;
 }
 

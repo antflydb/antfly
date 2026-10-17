@@ -276,6 +276,99 @@ test "relational index system nullability job failure scope corruption and trans
     try @import("antfly_platform").allocator.checkAllAllocationFailures(alloc, Rollback.run, .{ &database, next_binding, &prepared });
 }
 
+test "relational index system nullability job reserves its entire metadata family" {
+    const F = NullabilityJobFixture;
+    const controller = @import("relational_index_catalog.zig").Controller;
+    var directory = try @import("../../common/test_directory.zig").TestDirectory.init("nullability-job-reserved");
+    defer directory.cleanup();
+    var database = try db_mod.DB.open(alloc, directory.path(), F.options);
+    defer database.close();
+    try database.setSchemaJson(alloc, F.before);
+    for ([_][]const u8{ F.job.key, F.job.inputs_key, F.job.cursor_key, F.job.key ++ ":future-receipt" }) |reserved_key| {
+        const before_rejected_mutations = try F.clock(&database);
+        try std.testing.expectError(error.ReservedRelationalIndexMetadataKey, controller.validateExtraMetadata(&.{.{ .key = reserved_key, .value = "forged" }}, &.{}));
+        try std.testing.expectError(error.ReservedRelationalIndexMetadataKey, controller.validateExtraMetadata(&.{}, &.{reserved_key}));
+        try std.testing.expectError(error.ReservedRelationalIndexMetadataKey, database.batch(.{ .writes = &.{.{ .key = reserved_key, .value = "forged" }} }));
+        try std.testing.expectError(error.ReservedRelationalIndexMetadataKey, database.batch(.{ .deletes = &.{reserved_key} }));
+        try std.testing.expectEqual(before_rejected_mutations, try F.clock(&database));
+        const transaction = try database.beginTransaction(100);
+        // Transaction ingress already rejects the complete protected internal
+        // family, before the ordinary mutation reservation check.
+        try std.testing.expectError(error.InvalidIntegrityOperation, database.writeTransaction(transaction, .{ .writes = &.{.{ .key = reserved_key, .value = "forged" }} }));
+        try database.abortTransaction(transaction, 200);
+        try std.testing.expectError(error.ReservedRelationalIndexMetadataKey, database.core.prepareSchemaMetadata(database.core.schema.?, &.{.{ .key = reserved_key, .value = "forged" }}));
+    }
+    var read = try database.core.store.beginReadTxn();
+    defer read.abort();
+    try std.testing.expect(try F.job.load(&read) == null);
+    try std.testing.expect((try database.relationalTopologyStatus()).fence == null);
+}
+
+test "relational index system nullability job prepares a compatible epoch without index or row replacement" {
+    const F = NullabilityJobFixture;
+    const api = @import("../../schema/mod.zig");
+    for ([_]bool{ false, true }) |indexed| {
+        const prefix = "{{\"relational_indexes\":[{{\"name\":\"by_n\",\"keys\":[{{\"column\":\"n\"}}]}}],{s}";
+        const before = if (indexed) try std.fmt.allocPrint(alloc, prefix, .{F.before[1..]}) else try alloc.dupe(u8, F.before);
+        defer alloc.free(before);
+        const after = if (indexed) try std.fmt.allocPrint(alloc, prefix, .{F.after[1..]}) else try alloc.dupe(u8, F.after);
+        defer alloc.free(after);
+        var directory = try @import("../../common/test_directory.zig").TestDirectory.init("nullability-compatible-epoch");
+        defer directory.cleanup();
+        var database = try db_mod.DB.open(alloc, directory.path(), F.options);
+        defer database.close();
+        try database.setSchemaJson(alloc, before);
+        try database.batch(.{ .writes = &.{.{ .key = "a", .value = "{\"n\":1}" }} });
+        const primary = try internal.relationalRowKeyAlloc(alloc, "a");
+        defer alloc.free(primary);
+        const original = try database.core.store.get(alloc, primary);
+        defer alloc.free(original);
+        const predecessor = try database.core.store.get(alloc, @import("relational_integrity_catalog.zig").key);
+        defer alloc.free(predecessor);
+        var candidate = try F.job.Candidate.init(alloc, F.namespace.table_id, before, after, predecessor, &.{"n"}, .{});
+        defer candidate.deinit();
+        const binding = try F.binding(&database, &candidate, 31);
+        _ = try F.apply(&database, &candidate, binding, .begin);
+        var definition = try api.PreparedSchemaDefinition.init(alloc, after);
+        defer definition.deinit(alloc);
+        const versioned = try api.versionedSchemaKeyAlloc(alloc, binding.after_version);
+        defer alloc.free(versioned);
+        const writes = [_]docstore.KVPair{ .{ .key = "\x00\x00__metadata__:schema_json", .value = after }, .{ .key = versioned, .value = after } };
+        try std.testing.expectError(error.SchemaValidationNotReady, database.core.prepareSchemaMetadataValidatedNullability(definition.runtime_schema, &writes, binding, &candidate));
+        _ = try F.apply(&database, &candidate, binding, .freeze);
+        var page = try F.job.PreparedPage.prepare(alloc, database.core, binding, .{}, .{});
+        defer page.deinit();
+        const validated = try F.page(&database, &page);
+        try std.testing.expectEqual(F.job.Phase.ready, validated.phase);
+        try std.testing.expectError(error.SchemaValidationJobChanged, database.core.prepareSchemaMetadataValidatedNullability(definition.runtime_schema, writes[0..1], binding, &candidate));
+        const duplicate_writes = [_]docstore.KVPair{ writes[0], writes[0], writes[1] };
+        try std.testing.expectError(error.SchemaValidationJobChanged, database.core.prepareSchemaMetadataValidatedNullability(definition.runtime_schema, &duplicate_writes, binding, &candidate));
+        const wrong_public = [_]docstore.KVPair{ writes[0], .{ .key = versioned, .value = before } };
+        try std.testing.expectError(error.SchemaValidationJobChanged, database.core.prepareSchemaMetadataValidatedNullability(definition.runtime_schema, &wrong_public, binding, &candidate));
+        var prepared = try database.core.prepareSchemaMetadataValidatedNullability(definition.runtime_schema, &writes, binding, &candidate);
+        defer prepared.deinit();
+        try std.testing.expectEqualDeep(binding, prepared.validated_nullability.?.binding);
+        try std.testing.expectEqualDeep(try validated.digest(), prepared.validated_nullability.?.ready_digest);
+        if (indexed) {
+            const previous_index = prepared.base_relational_indexes.?.plan.boundIndexes()[0];
+            const next_index = prepared.relational_indexes.?.plan.boundIndexes()[0];
+            try std.testing.expectEqual(previous_index.id(), next_index.id());
+            try std.testing.expectEqual(@as(usize, 0), prepared.relational_indexes.?.metadata.retired.len);
+            try std.testing.expectEqual(@as(u32, 2), prepared.relational_indexes.?.plan.schemaView().version());
+        } else {
+            try std.testing.expect(prepared.base_relational_indexes == null);
+            try std.testing.expect(prepared.relational_indexes == null);
+        }
+        try std.testing.expectError(error.SchemaValidationPublicationRequired, database.core.commitPreparedSchemaMetadata(&prepared, &writes, &.{}, null));
+        _ = try F.apply(&database, &candidate, binding, .cancel);
+        try std.testing.expectError(error.SchemaValidationPublicationRequired, database.core.commitPreparedSchemaMetadata(&prepared, &writes, &.{}, null));
+        const actual = try database.core.store.get(alloc, primary);
+        defer alloc.free(actual);
+        try std.testing.expectEqualSlices(u8, original, actual);
+        try std.testing.expectEqual(@as(u32, 1), database.core.schema.?.version);
+    }
+}
+
 const NullabilityScanFixture = struct {
     const validation = @import("relational_nullability.zig");
     fn open(database: *db_mod.DB, a: std.mem.Allocator, request: rows.Request, now_ns: u64) !rows.Reader {

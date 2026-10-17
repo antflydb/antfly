@@ -11083,3 +11083,50 @@ four existing opt-in benchmarks skipped and 21/21 build steps in
 control-catalog, Apache boundary (2,071 sources), license and inventory checks
 pass. GC was previewed only; nothing was deleted. Inventory remains
 531 implemented / 132 rejected / 113 superseded / 810 unresolved.
+
+### Index-preserving schema preparation boundary
+
+The shared schema compiler now has a validation-only preparation entry point.
+It requires an exact ready owner job, its immutable candidate, both active and
+versioned public schema writes, the pinned predecessor epoch and the unchanged
+physical catalog. It independently compares the prepared native schema and
+integrity catalog to the candidate. It then verifies each ordered index's
+name, physical generation/slot and complete tuple/cover/predicate comparison
+fingerprint, rejecting additions, retirements or replacement requirements.
+Runtime snapshot fingerprints deliberately include schema version, so they
+must not be used to decide physical index compatibility. The successor plan
+pins its new epoch while reusing the physical IDs.
+
+The prepared object records the exact ready-header digest. Ordinary schema
+commit refuses it even if cancellation has since removed the owner fence.
+This is not yet an installed receipt or an authenticated metadata decision;
+the dedicated transactional installer and coordinated publication remain open.
+The public tightening path and all capability advertisements are unchanged.
+
+The entire validation-job key family, including future colon-separated
+receipt slots, is now reserved at shared ordinary-mutation and schema-extra
+admission. Transaction ingress already protects those internal keys with its
+earlier `InvalidIntegrityOperation` guard. Private staging remains inside the
+caller-owned storage transaction; raw public mutations cannot forge, delete
+or advance job headers, immutable inputs or cursors. The first native test
+attempt expected the later reservation error at transaction ingress and was
+corrected to assert its existing earlier rejection; no guard was weakened.
+
+The final native Debug job gate passes all four tests with zero skips/leaks
+and 51/51 build steps in
+`/private/tmp/antfly-sql-nullability-compatible-preparation-final-debug.log`.
+Both indexed and unindexed preparations are covered, including wrong or
+duplicate public writes, pre-readiness rejection, stable physical IDs, an
+epoch-2 executable plan, unchanged epoch-1 primary bytes and ordinary commit
+rejection before and after cancellation. This is evidence for preparation,
+not for distributed installation, publication or original-case completion.
+
+The complete Debug SQL gate also passes 896 portable plus 234 native tests,
+with only four opt-in benchmarks skipped, zero failures/leaks and 21/21 build
+steps in `/private/tmp/antfly-sql-nullability-compatible-full-debug.log`.
+Formatting, source/control-catalog, Apache boundary (2,071 sources), license
+and inventory checks pass; dispositions remain 531 implemented / 132 rejected /
+113 superseded / 810 unresolved. About 430 MiB of explicitly inspected inactive,
+superseded test binaries/objects were removed from this worktree's cache for
+verification headroom. Current verified artifacts, all logs, source and other
+worktrees were retained; these deleted build outputs can be regenerated.

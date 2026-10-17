@@ -94,6 +94,10 @@ pub const PreparedSchemaMetadata = struct {
     reserved_index: ?@import("relational_index_owner_job.zig").Binding = null,
     reserved_public_schema_digest: ?[32]u8 = null,
     reserved_activation: ?@import("relational_integrity_activation.zig").PreparedIndexPublication = null,
+    validated_nullability: ?struct {
+        binding: @import("relational_nullability_job.zig").Binding,
+        ready_digest: [32]u8,
+    } = null,
     combined_writes: []docstore_mod.KVPair,
 
     fn init(
@@ -1339,6 +1343,62 @@ pub const DBCore = struct {
         return self.prepareSchemaMetadataMode(table_schema, metadata_writes, false, expected_version, null);
     }
 
+    /// Compile a ready validation-only successor without rebuilding physical
+    /// indexes. This does not authorize publication: a dedicated authenticated
+    /// installer must recheck the ready cut and join its durable owner effect.
+    /// Ordinary commit rejects this preparation even after cancellation.
+    pub fn prepareSchemaMetadataValidatedNullability(
+        self: *DBCore,
+        table_schema: schema_mod.TableSchema,
+        metadata_writes: []const docstore_mod.KVPair,
+        binding: @import("relational_nullability_job.zig").Binding,
+        candidate: *const @import("relational_nullability_job.zig").Candidate,
+    ) !PreparedSchemaMetadata {
+        const job = @import("relational_nullability_job.zig");
+        try binding.requireCandidate(candidate);
+        if (!binding.fence.namespace.eql(self.identity_namespace)) return error.IdentityNamespaceMismatch;
+        const ready_cut = blk: {
+            var txn = try self.store.beginReadTxn();
+            defer txn.abort();
+            break :blk try job.requireReady(&txn, binding);
+        };
+        const versioned = try public_schema_mod.versionedSchemaKeyAlloc(self.alloc, binding.after_version);
+        defer self.alloc.free(versioned);
+        var active_public = false;
+        var versioned_public = false;
+        for (metadata_writes) |write| {
+            const active = std.mem.eql(u8, write.key, public_schema_json_key);
+            const historical = std.mem.eql(u8, write.key, versioned);
+            if (!active and !historical) continue;
+            if ((active and active_public) or (historical and versioned_public) or
+                !std.mem.eql(u8, &job.hash(write.value), &binding.after_public)) return error.SchemaValidationJobChanged;
+            active_public = active_public or active;
+            versioned_public = versioned_public or historical;
+        }
+        if (!active_public or !versioned_public) return error.SchemaValidationJobChanged;
+        var prepared = try self.prepareSchemaMetadataAtVersion(table_schema, metadata_writes, binding.before_version);
+        errdefer prepared.deinit();
+        if (!std.mem.eql(u8, prepared.encoded, candidate.native_after) or !prepared.generated_semantics_match or
+            !std.mem.eql(u8, (prepared.integrity_catalog orelse return error.IntegrityCatalogChanged).value, candidate.catalog_after))
+            return error.SchemaValidationJobChanged;
+        if (prepared.base_relational_indexes) |base| {
+            const head = base.head.encode();
+            const successor = prepared.relational_indexes orelse return error.SchemaValidationIndexRewriteRequired;
+            if (!std.mem.eql(u8, &job.hash(&head), &binding.physical_catalog) or successor.metadata.retired.len != 0 or
+                base.plan.boundIndexes().len != successor.plan.boundIndexes().len) return error.SchemaValidationIndexRewriteRequired;
+            // Snapshot fingerprints intentionally include the schema epoch.
+            // Physical identity/comparison must agree, not the runtime pin.
+            for (base.plan.boundIndexes(), successor.plan.boundIndexes()) |old, next| {
+                if (!std.meta.eql(old.id(), next.id()) or !std.mem.eql(u8, old.name, next.name) or
+                    !std.mem.eql(u8, &old.tuple.fingerprint, &next.tuple.fingerprint)) return error.SchemaValidationIndexRewriteRequired;
+            }
+        } else if (prepared.relational_indexes != null or !std.mem.eql(u8, &job.hash(""), &binding.physical_catalog)) {
+            return error.SchemaValidationIndexRewriteRequired;
+        }
+        prepared.validated_nullability = .{ .binding = binding, .ready_digest = try ready_cut.digest() };
+        return prepared;
+    }
+
     /// Only the private, metadata-authenticated child generation installer may
     /// prepare a changed FK catalog. Ordinary schema publication remains
     /// fail-closed until parent owners have durably accepted the successor.
@@ -1658,6 +1718,7 @@ pub const DBCore = struct {
     ) !bool {
         // A reserved candidate is not ordinary DDL authority, even if its
         // fence disappears between preparation and commit.
+        if (prepared.validated_nullability != null) return error.SchemaValidationPublicationRequired;
         if (comptime @TypeOf(installation) == @TypeOf(null)) {
             if (prepared.reserved_index != null) return error.PrivateIndexPublicationRequired;
         } else if (prepared.reserved_index == null or child_fence != null or rehydrate_only) return error.PrivateIndexPublicationRequired;
