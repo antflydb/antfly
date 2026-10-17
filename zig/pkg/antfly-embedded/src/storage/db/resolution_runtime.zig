@@ -2440,14 +2440,30 @@ fn clearReresolveCursor(store: *backend_erased.Store, key: []const u8) !void {
     try txn.commit();
 }
 
-fn hasReresolveCursor(store: *backend_erased.Store, key: []const u8) !bool {
-    var txn = try store.beginRead();
-    defer txn.abort();
-    _ = txn.get(key) catch |err| switch (err) {
-        error.NotFound => return false,
-        else => return err,
-    };
-    return true;
+/// Check both durable backfill namespaces in one committed view. Cold startup
+/// must observe cursor-only debt without constructing workers or scanning the
+/// document corpus, even when the replay watermarks already match.
+pub fn hasDurableReresolveBacklog(store: anytype) !bool {
+    // getManySorted requires lexical order (repair precedes resume).
+    const keys = [_][]const u8{ resolver_catalog.reresolve_repair_resume_key, resolver_catalog.reresolve_resume_key };
+    var values: [keys.len]?[]const u8 = @splat(null);
+    if (comptime @hasDecl(@typeInfo(@TypeOf(store)).pointer.child, "readManyConsistent")) {
+        var txn = try store.readManyConsistent(&keys, &values);
+        defer txn.abort();
+        return values[0] != null or values[1] != null;
+    } else {
+        var probe = try store.beginProbe();
+        if (probe.vtable.get_many_sorted_is_atomic) {
+            defer probe.abort();
+            try probe.getManySorted(&keys, &values);
+        } else {
+            probe.abort();
+            var txn = try store.beginRead();
+            defer txn.abort();
+            try txn.getManySorted(&keys, &values);
+        }
+        return values[0] != null or values[1] != null;
+    }
 }
 
 pub fn initRuntimeStore(alloc: Allocator, store: anytype) !RuntimeStoreHandle {
@@ -2544,8 +2560,7 @@ pub const ResolutionRuntime = struct {
             .replay_progress = try loadReplayProgress(alloc, &store_handle.store, applied),
             .target_sequence = .init(target),
             .shutdown_flag = .init(false),
-            .backfill_pending = .init((try hasReresolveCursor(&store_handle.store, resolver_catalog.reresolve_resume_key)) or
-                (try hasReresolveCursor(&store_handle.store, resolver_catalog.reresolve_repair_resume_key))),
+            .backfill_pending = .init(try hasDurableReresolveBacklog(&store_handle.store)),
             .worker_started = .init(false),
             .future = null,
         };
@@ -2855,8 +2870,7 @@ pub const ResolutionRuntime = struct {
         if (comptime @import("../engine_selection.zig").enabled) return @import("antfly_source_root").antfly_sources.storage_engine.call("resolutionHasReresolveBacklog", .{self});
         lockMutex(&self.catch_up_mutex);
         defer self.catch_up_mutex.unlock();
-        return (try hasReresolveCursor(&self.store_handle.store, resolver_catalog.reresolve_resume_key)) or
-            (try hasReresolveCursor(&self.store_handle.store, resolver_catalog.reresolve_repair_resume_key));
+        return try hasDurableReresolveBacklog(&self.store_handle.store);
     }
 
     /// Enqueue one bounded window of existing extraction artifacts for

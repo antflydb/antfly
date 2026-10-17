@@ -31,8 +31,14 @@ pub fn main(init: std.process.Init) !void {
     if (worker_args.next()) |command_name| {
         if (std.mem.eql(u8, command_name, "inference")) {
             if (worker_args.next()) |operation| {
-                if (std.mem.eql(u8, operation, "_worker"))
+                if (std.mem.eql(u8, operation, "_worker")) {
+                    const engine = @import("antfly_inference_engine");
+                    // Native products own inference in the provider archive.
+                    // Calling the host implementation here compiles a second
+                    // runtime (including exported codecs) into this image.
+                    if (engine.enabled) return engine.runCommand(.worker, init, &.{}, "");
                     return @import("antfly_inference_host").worker_module.runChild(init.gpa, init.io);
+                }
             }
         }
     }

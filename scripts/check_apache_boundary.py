@@ -73,6 +73,10 @@ SOURCE_MODULES = {
     "root": tuple(SOURCE_ROOT + name for name in ENTRYPOINTS) + PACKAGE_ENTRYPOINTS,
     "antfly_local_sources": ("zig/pkg/antfly-embedded/src/source_catalog.zig",),
     "antfly_inference_host": ("zig/pkg/inference/src/host/host.zig",),
+    "antfly_inference_engine": ("zig/pkg/inference/src/host/engine.zig",),
+    "engine_options": (),
+    "engine_errors": ("zig/pkg/inference/src/host/engine_errors.zig",),
+    "engine_memory": ("zig/lib/runtime/src/runtime_memory_abi.zig",),
     "sql_parser": ("zig/lib/sql/root.zig",),
     "antfly_public_server_openapi": (
         "zig/pkg/antfly-server-api/src/openapi/generated/antfly_public_server_openapi/root.zig",
