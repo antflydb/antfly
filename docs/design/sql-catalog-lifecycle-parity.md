@@ -11196,3 +11196,61 @@ pass. Totals remain 531 implemented / 132 rejected / 113 superseded /
 local test binaries/objects were removed for verification headroom; logs,
 source, current verified outputs and other worktrees were retained. These
 build outputs can be regenerated; no repository-wide destructive GC ran.
+
+### Independently executed, bounded validation replay
+
+Owner/standby integration cannot replay a primary's elapsed-time stopping
+decision. The shared physical iterator now has a separate checked replay
+entry point: it re-executes a bounded recorded prefix without a time cutoff,
+while retaining record/output limits and cancellation checkpoints. It compares
+the actual cursor, physical-family and row counts, first violation and more/EOF
+result before changing the reader's continuation or terminal state. A mismatch
+or cancellation cannot consume a prefix. Normal queries and primary validation
+still use their existing time slices.
+
+EOF needs a distinct rule: reading exactly N records only proves a prefix,
+not absence of N+1. A claimed EOF permits one additional bounded probe; a
+nonterminal command stops at its exact recorded record count. Zero-record EOF
+pages are supported, while zero-progress nonterminal commands and over-budget
+assertions are rejected before execution. Replay does not disable deadlines:
+the independently supplied operation control remains checked during the scan.
+
+`PageCommand` binds the exact owner job and predecessor-header digest to this
+boundary. Its bounded ASVP v1 frame uses canonical fixed-field JSON metadata,
+raw binary cursor bytes, checked lengths and a physical checksum. Arbitrary
+cursor bytes do not round-trip through JSON strings or base64. Decoding borrows
+only the cursor from the input frame; it neither authenticates a source nor
+certifies success. `PreparedPage.replay` reopens the fenced source cut, verifies
+its immutable candidate and independently executes the command before returning
+an owned page that the existing transaction helper may stage. Caller-supplied
+success fields alone are still never accepted by the write helper.
+
+This completes the bounded read-verification prerequisite, not the real owner
+command/outbox/standby or deterministic Raft apply adapters. Admission and
+installation replay adapters, signed receipts, metadata capability barriers
+and coordinated publication/release remain required before public activation. Topology protocol
+stays 54 and public SET NOT NULL retains its guarded rewrite. No original
+disposition is reclassified.
+
+Verification: the final six native job tests pass with zero skips/leaks and
+51/51 build steps in `/private/tmp/antfly-sql-nullability-replay-final-debug.log`.
+Two independently populated LSM roots use different flush thresholds and
+reversed batch input order; replay of each encoded prefix produces identical
+durable progress. Coverage includes binary cursors, orphan/empty families,
+zero-record EOF, forged EOF/count/violation claims, concealed real NULLs,
+stale predecessors, physical checksum corruption, cancellation after prefix
+inspection, allocation-failure rollback and duplicate failure-page apply with
+no clock advance. The original page can be destroyed before command replay.
+The combined physical-scan/job gate passes eight tests and 60/60 build steps
+in `/private/tmp/antfly-sql-nullability-deterministic-replay-retry-debug.log`.
+Initial local-variable shadowing errors were corrected before these passes.
+
+The complete Debug SQL gate passes 896 portable plus 234 native tests, with
+only four existing opt-in benchmarks skipped and 21/21 build steps in
+`/private/tmp/antfly-sql-nullability-replay-full-debug.log`. Formatting,
+control-catalog, Apache boundary (2,071 sources), license and inventory checks
+pass. Inventory stays 531 implemented / 132 rejected / 113 superseded /
+810 unresolved. About 830 MiB of explicitly inspected inactive, superseded
+test binaries/objects were removed from this worktree's cache for headroom;
+current verified outputs, logs, source, unrelated changes and other worktrees
+were retained. These build outputs can be regenerated; no global GC ran.

@@ -144,6 +144,24 @@ pub const NullabilityPage = struct {
 
 pub const NullabilityResume = struct { projection_identity: [32]u8, after: []const u8 };
 
+/// A bounded replay assertion, never proof of coverage by itself. The reader
+/// independently visits the prefix and compares every field before advancing.
+pub const NullabilityReplayBoundary = struct {
+    records_examined: usize,
+    rows_examined: usize,
+    violation_column: ?usize,
+    after: []const u8,
+    more: bool,
+
+    pub fn validate(self: @This()) !void {
+        if (self.records_examined > 65_536 or self.rows_examined > self.records_examined or
+            (self.more and self.records_examined == 0) or (!self.more and self.records_examined >= 65_536) or
+            self.after.len > row_cursor_codec.max_key_bytes or
+            (self.violation_column != null and (self.violation_column.? >= nullability.max_columns or self.rows_examined == 0 or !self.more)))
+            return error.InvalidNullabilityReplay;
+    }
+};
+
 test "relational rows snapshot exact point successor comparison handles descending suffixes without allocation" {
     try std.testing.expect(Reader.exclusiveSuccessor("abc", "abd"));
     try std.testing.expect(Reader.exclusiveSuccessor("abc\xff\xff", "abd"));
@@ -211,6 +229,15 @@ pub const Reader = struct {
         rows_examined: usize = 0,
         violation_column: ?usize = null,
         after: []const u8 = "",
+        replay: ?NullabilityReplayBoundary = null,
+
+        fn verify(self: *const @This(), record_count: usize, more: bool) !void {
+            if (self.replay) |expected| {
+                if (record_count != expected.records_examined or self.rows_examined != expected.rows_examined or
+                    self.violation_column != expected.violation_column or more != expected.more or
+                    !std.mem.eql(u8, self.after, expected.after)) return error.InvalidNullabilityReplay;
+            }
+        }
     };
 
     const SourceBinding = struct {
@@ -796,6 +823,25 @@ pub const Reader = struct {
     /// Time limits slice read preparation only; replicated progress must bind
     /// its exact cursor/count, not recompute a wall-time stopping decision.
     pub fn nextNullabilityPage(self: *Reader, alloc: Allocator, io: ?std.Io, budget: Budget, plan: *const nullability.Plan, control: nullability.Control) !NullabilityPage {
+        return self.nextNullabilityPageMode(alloc, io, budget, plan, control, null);
+    }
+
+    /// Re-execute a recorded prefix without a wall-time stopping decision.
+    /// Record limits and cancellation stay active. EOF claims permit one extra
+    /// bounded probe; stopping at N records alone cannot certify EOF after N.
+    pub fn nextNullabilityReplayPage(self: *Reader, alloc: Allocator, io: ?std.Io, expected: NullabilityReplayBoundary, plan: *const nullability.Plan, control: nullability.Control) !NullabilityPage {
+        try expected.validate();
+        if (expected.violation_column) |column| if (column >= plan.names.len) return error.InvalidNullabilityReplay;
+        if (expected.after.len != 0 and (!internal.isRelationalRowKey(expected.after) or
+            std.mem.order(u8, expected.after, self.owned_lower) == .lt or std.mem.order(u8, expected.after, self.owned_upper) != .lt))
+            return error.InvalidNullabilityReplay;
+        const record_limit = expected.records_examined + @intFromBool(!expected.more);
+        // The normal budget remains structurally valid, but its time field is
+        // deliberately ignored only by this independently checked replay.
+        return self.nextNullabilityPageMode(alloc, io, .{ .records = record_limit, .output_bytes = 2 * row_cursor_codec.max_key_bytes, .time_ns = 1 }, plan, control, expected);
+    }
+
+    fn nextNullabilityPageMode(self: *Reader, alloc: Allocator, io: ?std.Io, budget: Budget, plan: *const nullability.Plan, control: nullability.Control, replay: ?NullabilityReplayBoundary) !NullabilityPage {
         try control.ensureActive();
         try budget.validate();
         try self.requireNullabilityProjection(plan, control);
@@ -803,7 +849,7 @@ pub const Reader = struct {
         if (self.nullability_projection) |identity| {
             if (!std.mem.eql(u8, &identity, &plan.identity)) return error.InvalidNullabilityProjection;
         } else if (self.after.items.len != 0 or self.done) return error.InvalidNullabilityProjection;
-        var visit: NullabilityVisit = .{ .plan = plan, .control = control };
+        var visit: NullabilityVisit = .{ .plan = plan, .control = control, .replay = replay };
         var bounded = budget;
         bounded.rows = 1;
         const page = try self.nextPageFormat(alloc, io, bounded, true, &visit);
@@ -852,6 +898,7 @@ pub const Reader = struct {
         if (self.done) {
             if (validation) |visit| {
                 visit.after = try arena.allocator().dupe(u8, self.after.items);
+                try visit.verify(0, false);
                 try visit.control.ensureActive();
             }
             result.arena = arena;
@@ -872,7 +919,8 @@ pub const Reader = struct {
         const start = if (self.after.items.len == 0) self.lower else if (self.index != null) self.after.items else try internal.documentPrefixSuccessor(alloc, &successor, self.after.items);
         var entry = try cursor.seekAtOrAfter(start);
         var exhausted = true;
-        const started = time.monotonicNs();
+        const time_sliced = if (validation) |visit| visit.replay == null else true;
+        const started = if (time_sliced) time.monotonicNs() else 0;
         while (entry) |kv| : (entry = if (self.index != null) try cursor.next() else try cursor.seekAtOrAfter(try internal.documentPrefixSuccessor(alloc, &successor, continuation.items))) {
             if (io) |runtime_io| try runtime_io.checkCancel();
             if (validation) |visit| try visit.control.ensureActive();
@@ -927,7 +975,7 @@ pub const Reader = struct {
                     // work, but cannot force a scan through every artifact.
                     continuation.clearRetainingCapacity();
                     try continuation.appendSlice(alloc, continuation_key);
-                    if (result.records_examined >= budget.records or time.monotonicNs() - started >= budget.time_ns) {
+                    if (result.records_examined >= budget.records or (time_sliced and time.monotonicNs() - started >= budget.time_ns)) {
                         exhausted = false;
                         break;
                     }
@@ -1002,7 +1050,7 @@ pub const Reader = struct {
             }
             continuation.clearRetainingCapacity();
             try continuation.appendSlice(alloc, continuation_key);
-            if (output.items.len >= budget.rows or (budget.target_bytes != 0 and result.output_bytes >= budget.target_bytes) or result.records_examined >= budget.records or time.monotonicNs() - started >= budget.time_ns) {
+            if (output.items.len >= budget.rows or (budget.target_bytes != 0 and result.output_bytes >= budget.target_bytes) or result.records_examined >= budget.records or (time_sliced and time.monotonicNs() - started >= budget.time_ns)) {
                 exhausted = false;
                 break;
             }
@@ -1012,6 +1060,7 @@ pub const Reader = struct {
         if (validation) |visit| {
             if (continuation.items.len > row_cursor_codec.max_key_bytes) return error.InvalidNullabilityProjection;
             visit.after = try page.dupe(u8, continuation.items);
+            try visit.verify(result.records_examined, !exhausted);
             try visit.control.ensureActive();
             if (io) |runtime_io| try runtime_io.checkCancel();
         }

@@ -522,9 +522,68 @@ pub fn stageFrozen(a: A, txn: anytype, manager: *transactions.TxnManager, bindin
     return header;
 }
 
-/// Trusted local read preparation, not a serializable success assertion.
-/// A Raft adapter must independently prepare/verify bounded work from its
-/// committed command; accepting caller-supplied page fields is not supported.
+/// Bounded transport command. Cursor bytes remain binary rather than passing
+/// through JSON/UTF-8. Decoding is structural only: replay must independently
+/// execute the prefix before any result is eligible for transactional apply.
+pub const PageCommand = struct {
+    binding: Binding,
+    expected: Digest,
+    boundary: rows.NullabilityReplayBoundary,
+    pub const max_wire_bytes = 48 + max_header + max_cursor;
+    const Descriptor = struct {
+        binding: Binding,
+        expected: Digest,
+        records: usize,
+        rows: usize,
+        violation: ?usize,
+        more: bool,
+    };
+    pub fn validate(self: @This()) !void {
+        try self.binding.validate();
+        try self.boundary.validate();
+        if (std.mem.allEqual(u8, &self.expected, 0) or
+            (self.boundary.violation_column != null and self.boundary.violation_column.? >= self.binding.columns)) return error.InvalidSchemaValidationPageCommand;
+    }
+    pub fn encode(self: @This(), a: A) ![]u8 {
+        try self.validate();
+        const descriptor: Descriptor = .{ .binding = self.binding, .expected = self.expected, .records = self.boundary.records_examined, .rows = self.boundary.rows_examined, .violation = self.boundary.violation_column, .more = self.boundary.more };
+        var buffer: [max_header]u8 = undefined;
+        var writer = std.Io.Writer.fixed(&buffer);
+        try std.json.Stringify.value(descriptor, .{}, &writer);
+        const metadata = writer.buffered();
+        const bytes = try a.alloc(u8, 48 + metadata.len + self.boundary.after.len);
+        @memcpy(bytes[0..8], "ASVP\x01\x00\x00\x00");
+        std.mem.writeInt(u32, bytes[8..12], @intCast(metadata.len), .little);
+        std.mem.writeInt(u32, bytes[12..16], @intCast(self.boundary.after.len), .little);
+        @memcpy(bytes[16..][0..metadata.len], metadata);
+        @memcpy(bytes[16 + metadata.len ..][0..self.boundary.after.len], self.boundary.after);
+        @memcpy(bytes[bytes.len - 32 ..], &hash(bytes[0 .. bytes.len - 32]));
+        return bytes;
+    }
+    /// The returned cursor borrows bytes. All descriptor fields are owned
+    /// values; no JSON parser allocation or request arena escapes this call.
+    pub fn decode(bytes: []const u8) !@This() {
+        if (bytes.len < 48 or bytes.len > max_wire_bytes or !std.mem.eql(u8, bytes[0..8], "ASVP\x01\x00\x00\x00") or
+            !eq(hash(bytes[0 .. bytes.len - 32]), bytes[bytes.len - 32 ..][0..32].*)) return error.InvalidSchemaValidationPageCommand;
+        const metadata_len: usize = std.mem.readInt(u32, bytes[8..12], .little);
+        const cursor_len: usize = std.mem.readInt(u32, bytes[12..16], .little);
+        if (metadata_len == 0 or metadata_len > max_header or cursor_len > max_cursor or metadata_len + cursor_len != bytes.len - 48)
+            return error.InvalidSchemaValidationPageCommand;
+        var buffer: [64 * 1024]u8 = undefined;
+        var scratch = std.heap.FixedBufferAllocator.init(&buffer);
+        const descriptor = std.json.parseFromSliceLeaky(Descriptor, scratch.allocator(), bytes[16..][0..metadata_len], .{}) catch return error.InvalidSchemaValidationPageCommand;
+        var canonical: [max_header]u8 = undefined;
+        var writer = std.Io.Writer.fixed(&canonical);
+        try std.json.Stringify.value(descriptor, .{}, &writer);
+        if (!std.mem.eql(u8, writer.buffered(), bytes[16..][0..metadata_len])) return error.InvalidSchemaValidationPageCommand;
+        const result: @This() = .{ .binding = descriptor.binding, .expected = descriptor.expected, .boundary = .{ .records_examined = descriptor.records, .rows_examined = descriptor.rows, .violation_column = descriptor.violation, .more = descriptor.more, .after = bytes[16 + metadata_len ..][0..cursor_len] } };
+        try result.validate();
+        return result;
+    }
+};
+
+/// Trusted independently executed read preparation. Encoded page claims alone
+/// are never accepted by stagePage; transport receivers must use replay.
 pub const PreparedPage = struct {
     page: rows.NullabilityPage,
     expected: Header,
@@ -533,6 +592,20 @@ pub const PreparedPage = struct {
         self.* = undefined;
     }
     pub fn prepare(a: A, core: anytype, binding: Binding, budget: rows.Budget, control: projection.Control) !PreparedPage {
+        return prepareMode(a, core, binding, budget, control, null);
+    }
+    /// Own the result before releasing the decoded command's backing bytes.
+    /// No wall-time limit participates in the replicated stopping decision.
+    pub fn replay(a: A, core: anytype, command_value: PageCommand, control: projection.Control) !PreparedPage {
+        try command_value.validate();
+        return prepareMode(a, core, command_value.binding, .{}, control, command_value);
+    }
+    /// The cursor borrows this prepared page. encode owns its output, allowing
+    /// transport/recovery to discard the original page before replay.
+    pub fn command(self: *const PreparedPage) !PageCommand {
+        return .{ .binding = self.expected.binding, .expected = try self.expected.digest(), .boundary = .{ .records_examined = self.page.page.records_examined, .rows_examined = self.page.rows_examined, .violation_column = self.page.violation_column, .after = self.page.after, .more = self.page.page.more } };
+    }
+    fn prepareMode(a: A, core: anytype, binding: Binding, budget: rows.Budget, control: projection.Control, replay_command: ?PageCommand) !PreparedPage {
         try control.ensureActive();
         var reader = blk: {
             core.lockApplyShared();
@@ -545,6 +618,7 @@ pub const PreparedPage = struct {
         const header = try workHeader(&reader.read, binding);
         try binding.requireCurrent(&reader.read);
         if (header.phase != .scanning) return error.SchemaValidationJobChanged;
+        if (replay_command) |expected| if (!eq(try header.digest(), expected.expected)) return error.SchemaValidationJobChanged;
         const raw_cursor = (try optional(&reader.read, cursor_key)) orelse return error.InvalidSchemaValidationJob;
         if (raw_cursor.len > max_cursor or !eq(hash(raw_cursor), header.cursor_digest)) return error.InvalidSchemaValidationJob;
         const cursor = try a.dupe(u8, raw_cursor);
@@ -552,7 +626,10 @@ pub const PreparedPage = struct {
         var candidate = try Candidate.load(a, &reader.read, binding, control);
         defer candidate.deinit();
         try reader.resumeNullabilityScan(&candidate.plan, .{ .projection_identity = binding.projection_identity, .after = cursor }, control);
-        const page = try reader.nextNullabilityPage(a, null, budget, &candidate.plan, control);
+        const page = if (replay_command) |expected|
+            try reader.nextNullabilityReplayPage(a, null, expected.boundary, &candidate.plan, control)
+        else
+            try reader.nextNullabilityPage(a, null, budget, &candidate.plan, control);
         return .{ .page = page, .expected = header };
     }
     fn effect(self: *const PreparedPage) !Digest {

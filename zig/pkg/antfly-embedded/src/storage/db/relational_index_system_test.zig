@@ -234,9 +234,20 @@ test "relational index system nullability job failure scope corruption and trans
     var failed = try F.job.PreparedPage.prepare(alloc, database.core, expected, .{}, .{});
     defer failed.deinit();
     try std.testing.expectEqual(@as(?usize, 0), failed.page.violation_column);
+    const failure_wire = try (try failed.command()).encode(alloc);
+    defer alloc.free(failure_wire);
+    const failure_command = try F.job.PageCommand.decode(failure_wire);
+    var concealed_null = failure_command;
+    concealed_null.boundary.violation_column = null;
+    try std.testing.expectError(error.InvalidNullabilityReplay, F.job.PreparedPage.replay(alloc, database.core, concealed_null, .{}));
+    var replayed_failure = try F.job.PreparedPage.replay(alloc, database.core, failure_command, .{});
+    defer replayed_failure.deinit();
     const result = try F.page(&database, &failed);
     try std.testing.expectEqual(F.job.Phase.failed, result.phase);
     try std.testing.expectEqual(@as(?u16, 0), result.failure_column);
+    const failed_clock = try F.clock(&database);
+    try std.testing.expectEqualDeep(result, try F.page(&database, &replayed_failure));
+    try std.testing.expectEqual(failed_clock, try F.clock(&database));
     try std.testing.expectError(error.IntegrityTopologyBusy, database.batch(.{ .writes = &.{.{ .key = "a", .value = "{\"n\":1}" }} }));
     const encoded = try result.encode(alloc);
     defer alloc.free(encoded);
@@ -537,6 +548,130 @@ test "relational index system nullability job installation joins schema catalog 
         }
         try std.testing.expectError(error.IntegrityTopologyBusy, database.batch(.{ .writes = &.{.{ .key = "c", .value = "{\"n\":3}" }} }));
     }
+}
+
+test "relational index system nullability job replay independently verifies bounded binary prefixes across distinct LSM roots" {
+    const F = NullabilityJobFixture;
+    var first_dir = try @import("../../common/test_directory.zig").TestDirectory.init("nullability-page-origin");
+    defer first_dir.cleanup();
+    var second_dir = try @import("../../common/test_directory.zig").TestDirectory.init("nullability-page-peer");
+    defer second_dir.cleanup();
+    var primary_db = try db_mod.DB.open(alloc, first_dir.path(), F.options);
+    defer primary_db.close();
+    var peer_options = F.options;
+    peer_options.primary_backend = .{ .lsm = .{ .flush_threshold = 4096 } };
+    var peer_db = try db_mod.DB.open(alloc, second_dir.path(), peer_options);
+    defer peer_db.close();
+    try primary_db.setSchemaJson(alloc, F.before);
+    try peer_db.setSchemaJson(alloc, F.before);
+    const writes = [_]db_mod.types.BatchWrite{ .{ .key = "a", .value = "{\"n\":1}" }, .{ .key = "b", .value = "{\"n\":2}" }, .{ .key = "c", .value = "{\"n\":3}" } };
+    var reversed = writes;
+    std.mem.reverse(db_mod.types.BatchWrite, &reversed);
+    try primary_db.batch(.{ .timestamp_ns = 100, .writes = &writes });
+    try peer_db.batch(.{ .timestamp_ns = 100, .writes = &reversed });
+    // Binary physical cursor and a bounded empty family. The replica has a
+    // different flush threshold and reverse input insertion order.
+    const orphan = try internal.ttlKeyAlloc(alloc, "orphan-\xff");
+    defer alloc.free(orphan);
+    const stamp: [8]u8 = @splat(0);
+    try primary_db.core.store.put(orphan, &stamp);
+    try peer_db.core.store.put(orphan, &stamp);
+    var first_candidate = try F.candidate(&primary_db);
+    defer first_candidate.deinit();
+    var second_candidate = try F.candidate(&peer_db);
+    defer second_candidate.deinit();
+    const binding = try F.binding(&primary_db, &first_candidate, 51);
+    try std.testing.expectEqualDeep(binding, try F.binding(&peer_db, &second_candidate, 51));
+    _ = try F.apply(&primary_db, &first_candidate, binding, .begin);
+    _ = try F.apply(&peer_db, &second_candidate, binding, .begin);
+    const frozen = try F.apply(&primary_db, &first_candidate, binding, .freeze);
+    try std.testing.expectEqualDeep(frozen, try F.apply(&peer_db, &second_candidate, binding, .freeze));
+    var binary_cursor_seen = false;
+    var eof_page_seen = false;
+    for (0..8) |turn| {
+        var prepared = try F.job.PreparedPage.prepare(alloc, primary_db.core, binding, .{ .records = 2, .time_ns = std.time.ns_per_s }, .{});
+        var prepared_live = true;
+        defer if (prepared_live) prepared.deinit();
+        const encoded_command = try (try prepared.command()).encode(alloc);
+        defer alloc.free(encoded_command);
+        const decoded_command = try F.job.PageCommand.decode(encoded_command);
+        if (std.mem.indexOfScalar(u8, decoded_command.boundary.after, 255) != null) binary_cursor_seen = true;
+        if (!decoded_command.boundary.more and decoded_command.boundary.records_examined == 0) eof_page_seen = true;
+        encoded_command[encoded_command.len - 1] ^= 1;
+        try std.testing.expectError(error.InvalidSchemaValidationPageCommand, F.job.PageCommand.decode(encoded_command));
+        encoded_command[encoded_command.len - 1] ^= 1;
+        if (turn == 0) {
+            const old = try F.current(&peer_db);
+            const clock_before = try F.clock(&peer_db);
+            var forged_eof = decoded_command;
+            forged_eof.boundary.more = false;
+            try std.testing.expectError(error.InvalidNullabilityReplay, F.job.PreparedPage.replay(alloc, peer_db.core, forged_eof, .{}));
+            var forged_count = decoded_command;
+            forged_count.boundary.rows_examined = 0;
+            try std.testing.expectError(error.InvalidNullabilityReplay, F.job.PreparedPage.replay(alloc, peer_db.core, forged_count, .{}));
+            var forged_violation = decoded_command;
+            forged_violation.boundary.violation_column = 0;
+            try std.testing.expectError(error.InvalidNullabilityReplay, F.job.PreparedPage.replay(alloc, peer_db.core, forged_violation, .{}));
+            var stale = decoded_command;
+            stale.expected[0] ^= 1;
+            try std.testing.expectError(error.SchemaValidationJobChanged, F.job.PreparedPage.replay(alloc, peer_db.core, stale, .{}));
+            try std.testing.expectEqualDeep(old, try F.current(&peer_db));
+            try std.testing.expectEqual(clock_before, try F.clock(&peer_db));
+            {
+                var reader = try NullabilityScanFixture.open(&peer_db, alloc, .{}, 0);
+                defer reader.deinit();
+                var plan = try NullabilityScanFixture.projection(&reader, &.{"n"});
+                defer plan.deinit();
+                const Cancel = struct {
+                    calls: usize = 0,
+                    fn check(raw: ?*anyopaque) !void {
+                        const self: *@This() = @ptrCast(@alignCast(raw.?));
+                        self.calls += 1;
+                        if (self.calls == 9) return error.Canceled;
+                    }
+                };
+                var cancellation: Cancel = .{};
+                try std.testing.expectError(error.Canceled, reader.nextNullabilityReplayPage(alloc, null, decoded_command.boundary, &plan, .{ .context = &cancellation, .checkpoint = Cancel.check }));
+                try std.testing.expectError(error.InvalidNullabilityReplay, reader.nextNullabilityReplayPage(alloc, null, forged_eof.boundary, &plan, .{}));
+                try std.testing.expectEqual(@as(usize, 0), reader.after.items.len);
+                try std.testing.expect(!reader.done and !reader.nullability_failed and reader.nullability_projection == null);
+                var verified = try reader.nextNullabilityReplayPage(alloc, null, decoded_command.boundary, &plan, .{});
+                defer verified.deinit();
+                // Replay's normal time budget is deliberately 1ns; it must
+                // still execute this whole recorded two-family prefix.
+                try std.testing.expectEqual(@as(usize, 2), verified.rows_examined);
+                try std.testing.expectEqualSlices(u8, decoded_command.boundary.after, verified.after);
+            }
+            const ReplayFaults = struct {
+                fn run(a: std.mem.Allocator, database: *db_mod.DB, command_value: F.job.PageCommand) !void {
+                    var vtable = a.vtable.*;
+                    vtable.resize = std.mem.Allocator.noResize;
+                    vtable.remap = std.mem.Allocator.noRemap;
+                    const deterministic: std.mem.Allocator = .{ .ptr = a.ptr, .vtable = &vtable };
+                    var replayed = try F.job.PreparedPage.replay(deterministic, database.core, command_value, .{});
+                    defer replayed.deinit();
+                    try std.testing.expectEqual(command_value.boundary.rows_examined, replayed.page.rows_examined);
+                }
+            };
+            try @import("antfly_platform").allocator.checkAllAllocationFailures(alloc, ReplayFaults.run, .{ &peer_db, decoded_command });
+            try std.testing.expectEqualDeep(old, try F.current(&peer_db));
+            try std.testing.expectEqual(clock_before, try F.clock(&peer_db));
+        }
+        const advanced = try F.page(&primary_db, &prepared);
+        prepared.deinit();
+        prepared_live = false;
+        // The transport bytes own the cursor; no original page or parser
+        // arena survives to accidentally substitute for replica verification.
+        var replayed = try F.job.PreparedPage.replay(alloc, peer_db.core, decoded_command, .{});
+        defer replayed.deinit();
+        try std.testing.expectEqualDeep(advanced, try F.page(&peer_db, &replayed));
+        if (advanced.phase == .ready) {
+            try std.testing.expectEqual(@as(u64, 3), advanced.rows_scanned);
+            try std.testing.expectEqual(@as(u64, 4), advanced.records);
+            break;
+        }
+    } else return error.ReplayedValidationDidNotComplete;
+    try std.testing.expect(binary_cursor_seen and eof_page_seen);
 }
 
 const NullabilityScanFixture = struct {
