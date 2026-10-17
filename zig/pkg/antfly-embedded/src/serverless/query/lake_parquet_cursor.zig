@@ -585,7 +585,7 @@ pub const Cursor = struct {
                 inline .dictionary_i64, .dictionary_f64 => |values, tag| @unionInit(types.ColumnValues, @tagName(tag), .{ .values = values.values, .indices = values.indices[begin..][0..count] }),
                 inline else => |values, tag| @unionInit(types.ColumnValues, @tagName(tag), values[begin..][0..count]),
             };
-            if (decoded.nulls.bytes.len != 0) vector.nulls.bytes = decoded.nulls.bytes[begin..][0..count];
+            vector.nulls = decoded.nulls.slice(begin, count);
             try vectors.append(a, vector);
         }
         return .{ .snapshot = binding.snapshot(), .external_span = .{ .first = first.external, .count = count }, .columns = vectors.items };

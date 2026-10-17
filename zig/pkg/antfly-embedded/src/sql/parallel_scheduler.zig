@@ -23,6 +23,11 @@ const A = std.mem.Allocator;
 pub const LockedAllocator = struct {
     backing: A,
     mutex: std.atomic.Mutex = .unlocked,
+    /// Immutable parent identity for admission through this synchronizing wrapper.
+    pub fn parentAllocator(a: std.mem.Allocator) ?std.mem.Allocator {
+        if (a.vtable.alloc != allocate) return null;
+        return @as(*LockedAllocator, @ptrCast(@alignCast(a.ptr))).backing;
+    }
     pub fn allocator(self: *LockedAllocator) A {
         return .{ .ptr = self, .vtable = &.{ .alloc = allocate, .resize = resize, .remap = remap, .free = free } };
     }

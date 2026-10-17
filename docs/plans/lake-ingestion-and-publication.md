@@ -1679,3 +1679,49 @@ parity, mixed spill validation and direct/wrapped allocator pressure checks pass
 Formatting, Python lint, license headers and the Apache boundary (2,074 sources)
 passed. Latest fetched origin/main `ce578d9033` is included. Representative
 archive-scale latency/RSS and live-provider retention qualification remain deferred.
+
+### Compact physical views and adaptive checkpoint reduction
+
+Native SQL physical views borrow retained packed validity with a bit offset and
+represent contiguous row selections as ranges. Sparse/permuted selections retain
+explicit coordinates. Computed primitive outputs and spill readers share this
+trait; hashing, admission and reduction reuse prepared block columns. Owned replay
+materializes validity once at its ownership boundary. Selected coercion, REAL
+rounding and SQL NULL identity retain their existing validation contracts.
+
+Physical normalization has independently bounded optional workspace before the
+group census. Admission follows immutable parent allocators through the SQL
+synchronization and spill wrappers, preserving shared statement headroom. Declined windows release that workspace and retry smaller inputs;
+actual allocator failures still propagate. Direct native result streams now use
+the same SQL row-error classification as derived projections, preserving valid
+prefixes before invalid casts without retrying resource or control failures.
+
+Compatible AGS v2 checkpoints restore borrowed primitive columns and merge COUNT,
+integer SUM, boolean reductions and eligible extrema after one destination-key
+census. String extrema copy only winning payloads. Every signature and complete
+window is checked before retained mutation; declined suffixes keep their original
+checkpoint and ordinal. NUMERIC, DISTINCT, pattern and order-sensitive states
+retain their established exact/sorted paths. No durable format or ABI changes.
+
+Oversized fixed-state hash partitions may repartition on a discriminating unused
+hash bit. Binary children, at most eight passes, descriptor headroom and disabled
+nested worker fan-out bound resource usage. Identical hashes and unsupported state
+keep sorted skew reduction. All partition staging is sealed and released before
+reduction, preserving workspace for projections and downstream blocking operators.
+The real Parquet restart fixture covers high-cardinality nested aggregation and
+pgwire delivery of a successful row before an invalid text cast.
+
+Qualification of compact physical views, allocator-aware admission, checkpoint
+columns and adaptive radix reduction (2026-10-16): the full SQL gate passed
+1,003 tests (777 shared-engine and 226 server), with three opt-in benchmarks
+skipped. All 510 native lake tests (194 shared-engine and 316 server) and the
+runtime I/O ABI gate passed with zero failures or leaks. All 50 real
+Parquet/Iceberg E2Es passed against the final Debug CLI using two test workers in
+325.57 seconds. Coverage includes direct/wrapped shared-pressure admission,
+packed-validity ownership, partial signatures/truncation, allocation failures,
+repartition progress/skew, descriptor pressure and real restart/error-prefix
+flows. The fixture retries only explicitly retryable, unadmitted index-creation
+catalog conflicts. Formatting, Python lint, whitespace, staged license headers
+and the Apache boundary (2,074 sources) passed. Latest fetched origin/main
+`ce578d9033` is included. Representative archive-scale latency/RSS and
+live-provider retention qualification remain deferred.

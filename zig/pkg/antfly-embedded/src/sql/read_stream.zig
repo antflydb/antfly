@@ -1204,9 +1204,9 @@ pub const Stream = struct {
             if (page.selection.len > wanted) return error.InvalidSqlBackendResponse;
             if (page.selection.len != 0) try self.admitRows(page.selection.len) else if (page.after != null) try self.admitEmptyPage();
             const before = pending.len();
-            const bytes = self.appendColumnPage(pending, a, page) catch |err| switch (err) {
-                error.SqlDivisionByZero, error.SqlNumericOutOfRange, error.SqlTypeMismatch, error.SqlProgramLimitExceeded, error.InvalidSqlDateTime, error.SqlCardinalityViolation => if (pending.len() == before) try self.appendScalarColumnPage(pending, a, page) else return err,
-                else => return err,
+            const bytes = self.appendColumnPage(pending, a, page) catch |err| blk: {
+                if (!@import("errors.zig").isRowEvaluationError(err) or pending.len() != before) return err;
+                break :blk try self.appendScalarColumnPage(pending, a, page);
             };
             output_bytes +|= bytes;
             self.exhausted = self.remaining == 0 or page.after == null;
@@ -2712,4 +2712,24 @@ test "SQL pull stream reuses proven provider order and stops before scanning a l
     try std.testing.expect(fixture.offset <= 16);
     try std.testing.expectEqual(@as(usize, 1), fixture.opened);
     try std.testing.expectEqual(@as(usize, 1), fixture.closed);
+}
+
+test "SQL direct native invalid cast preserves successful prefixes" {
+    const a = std.testing.allocator;
+    for ([_]bool{true}) |native| {
+        var fixture: Fixture = .{ .count = 2 };
+        var backend = fixture.backend();
+        var vtable = backend.vtable.*;
+        if (native) vtable.open_scan = NativeColumns.open;
+        backend.vtable = &vtable;
+        var compiled = try compiler.compile(a, "SELECT CAST(CASE WHEN n=0 THEN '1' ELSE 'bad' END AS BIGINT) FROM docs", .{});
+        defer compiled.deinit();
+        const stream = (try Stream.open(a, backend, &compiled, &.{}, .{ .execution_batch_rows = 1024, .page_rows = 256 })).?;
+        defer stream.close();
+        var first = try stream.next(2);
+        defer first.deinit();
+        try std.testing.expectEqual(@as(usize, 1), first.output.rows.len);
+        try std.testing.expectEqual(@as(i64, 1), first.output.rows[0][0].integer);
+        try std.testing.expectError(error.SqlInvalidTextRepresentation, stream.next(2));
+    }
 }

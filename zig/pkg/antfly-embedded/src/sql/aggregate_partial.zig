@@ -229,6 +229,54 @@ pub fn cell(a: A, state: operators.Aggregate) !Datum {
     return Datum.json(.{ .string = try encoder.bytes.toOwnedSlice(a) });
 }
 
+/// Borrowed primitive checkpoint lanes. The AGS wire version and signature are
+/// identical to scalar restore; extrema borrow their winning payload until merge.
+pub const Fixed = struct { count: u64, sum: i128, boolean: bool, selected: Datum };
+pub fn fixedEligible(spec: operators.AggregateSpec) bool {
+    return !spec.distinct and operators.exactMergeable(spec) and spec.input_element != .numeric and spec.kind != .pattern_set;
+}
+pub fn decodeFixed(value: Datum, spec: operators.AggregateSpec) !?Fixed {
+    if (!fixedEligible(spec)) return null;
+    if (value.sql_null or value.value != .string or value.patterns != null or value.array != null or value.numeric != null) return error.InvalidSqlSpill;
+    var decoder: Decoder = .{ .a = undefined, .bytes = value.value.string };
+    if (!std.mem.eql(u8, try decoder.raw(4), magic)) return error.InvalidSqlSpill;
+    const signature = try decoder.raw(5);
+    if (signature[0] != kindId(spec.kind) or signature[1] != typeId(spec.input_type) or signature[2] != 0 or signature[3] > 1 or signature[4] != elementId(spec.input_element)) return error.InvalidSqlSpill;
+    const count = try decoder.integer(u64);
+    if (count > std.math.maxInt(i64)) return error.InvalidSqlSpill;
+    const sum = try decoder.integer(i128);
+    for (0..3) |_| {
+        const number: f64 = @bitCast(try decoder.integer(u64));
+        if (!std.math.isFinite(number)) return error.InvalidSqlSpill;
+    }
+    if (try decoder.integer(u8) != 0) return error.InvalidSqlSpill;
+    const selected: Datum = switch (try decoder.integer(u8)) {
+        0 => .{},
+        2 => blk: {
+            const boolean = try decoder.integer(u8);
+            if (boolean > 1) return error.InvalidSqlSpill;
+            break :blk Datum.json(.{ .bool = boolean == 1 });
+        },
+        3 => Datum.json(.{ .integer = try decoder.integer(i64) }),
+        5 => Datum.json(.{ .string = try decoder.text() }),
+        else => return null,
+    };
+    if (selected.sql_null) {
+        if ((spec.kind == .min or spec.kind == .max) and count != 0) return error.InvalidSqlSpill;
+    } else {
+        if ((spec.kind != .min and spec.kind != .max) or count == 0) return error.InvalidSqlSpill;
+        const valid = switch (spec.input_type orelse .json) {
+            .integer => selected.value == .integer,
+            .boolean => selected.value == .bool,
+            .string => selected.value == .string,
+            else => false,
+        };
+        if (!valid) return error.InvalidSqlSpill;
+    }
+    if (try decoder.integer(u64) != 0 or try decoder.integer(u64) != std.math.maxInt(u64) or decoder.position != decoder.bytes.len) return error.InvalidSqlSpill;
+    return .{ .count = count, .sum = sum, .boolean = signature[3] == 1, .selected = selected };
+}
+
 pub fn decode(a: A, value: Datum, spec: operators.AggregateSpec) !operators.Aggregate {
     if (value.sql_null or value.patterns != null or value.value != .string) return error.InvalidSqlSpill;
     var scratch = std.heap.ArenaAllocator.init(a);
@@ -626,4 +674,27 @@ test "external lake partial readers share signature validation across typed lazy
     group.state_reader = null;
     try std.testing.expectEqual(@as(u64, 4), (try read(a, group, 0, spec)).count);
     try std.testing.expectError(error.InvalidSqlBackendResponse, read(a, group, 1, spec));
+}
+
+test "SQL partial primitive checkpoint lanes validate signatures truncation and exact state" {
+    const a = std.testing.allocator;
+    const specs = [_]operators.AggregateSpec{ .{ .kind = .count }, .{ .kind = .sum, .input_type = .integer }, .{ .kind = .min, .input_type = .integer }, .{ .kind = .max, .input_type = .boolean }, .{ .kind = .min, .input_type = .string }, .{ .kind = .bool_and, .input_type = .boolean } };
+    const values = [_]Datum{ Datum.json(.{ .integer = 1 }), Datum.json(.{ .integer = std.math.maxInt(i64) }), Datum.json(.{ .integer = -99 }), Datum.json(.{ .bool = true }), Datum.json(.{ .string = "borrowed" }), Datum.json(.{ .bool = false }) };
+    for (specs, values) |spec, value| {
+        var state = try operators.Aggregate.initTyped(a, spec.kind, spec.input_type, spec.input_element);
+        defer state.deinit();
+        try state.update(value);
+        try state.update(value);
+        const encoded = try cell(a, state);
+        defer a.free(encoded.value.string);
+        const lane = (try decodeFixed(encoded, spec)).?;
+        try std.testing.expectEqual(state.count, lane.count);
+        try std.testing.expectEqual(state.integer_sum, lane.sum);
+        try std.testing.expectEqual(state.boolean, lane.boolean);
+        if (state.selected) |selected| try std.testing.expectEqualDeep(selected.row.values[0], lane.selected);
+        for (0..encoded.value.string.len) |end| try std.testing.expectError(error.InvalidSqlSpill, decodeFixed(Datum.json(.{ .string = encoded.value.string[0..end] }), spec));
+        var wrong = spec;
+        wrong.input_type = .json;
+        if (fixedEligible(wrong) and spec.input_type != .json) try std.testing.expectError(error.InvalidSqlSpill, decodeFixed(encoded, wrong));
+    }
 }

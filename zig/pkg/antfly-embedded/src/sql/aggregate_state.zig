@@ -194,7 +194,7 @@ pub const Column = struct {
             else => false,
         };
         if (compatible) return 0;
-        for (physical.selection, 0..) |row, lane| if (!physical.vector.nulls.isNull(row)) return self.updateGrowth(try physical.cell(lane), additional);
+        for (0..physical.len()) |lane| if (!physical.vector.nulls.isNull(physical.rowAt(lane))) return self.updateGrowth(try physical.cell(lane), additional);
         return 0;
     }
     pub fn numericGrowth(self: *const Column, index: ?usize, weight: i32, length: usize) usize {
@@ -368,8 +368,7 @@ pub const Column = struct {
                 id.* = ids[position];
             }
             if (physical) |native| {
-                var view = native;
-                view.selection = native.selection[begin..][0..length];
+                const view = native.slice(begin, begin + length);
                 if (try self.updatePhysical(a, selected_ids[0..length], view)) {
                     begin += length;
                     continue;
@@ -391,7 +390,7 @@ pub const Column = struct {
     /// Dispatch once per state/vector pair. Nulls and selections stay physical;
     /// dictionary IDs are gathered directly without creating Datum arrays.
     pub fn updatePhysical(self: *Column, a: A, ids: []const usize, physical: @import("execution_batch.zig").PhysicalColumn) !bool {
-        if (physical.selection.len != ids.len) return error.InvalidSqlBackendResponse;
+        if (physical.len() != ids.len) return error.InvalidSqlBackendResponse;
         const compatible = switch (self.values) {
             .counts => true,
             .integers => physical.kind == .integer,
@@ -404,11 +403,13 @@ pub const Column = struct {
         try physical.validate();
         const vector = physical.vector;
         switch (self.values) {
-            .counts => |*states| for (ids, physical.selection) |id, row| {
+            .counts => |*states| for (ids, 0..) |id, lane| {
+                const row = physical.rowAt(lane);
                 if (!vector.nulls.isNull(row)) states.items[id] = try mergedCount(states.items[id], 1);
             },
             .integers => |*states| switch (vector.values) {
-                inline .i64, .dictionary_i64 => |values| for (ids, physical.selection) |id, row| {
+                inline .i64, .dictionary_i64 => |values| for (ids, 0..) |id, lane| {
+                    const row = physical.rowAt(lane);
                     if (vector.nulls.isNull(row)) continue;
                     const value = physicalValue(values, row);
                     const state = &states.items[id];
@@ -421,7 +422,8 @@ pub const Column = struct {
                 else => unreachable,
             },
             .numbers => |*states| switch (vector.values) {
-                inline .i64, .dictionary_i64, .f64, .dictionary_f64 => |values| for (ids, physical.selection) |id, row| {
+                inline .i64, .dictionary_i64, .f64, .dictionary_f64 => |values| for (ids, 0..) |id, lane| {
+                    const row = physical.rowAt(lane);
                     if (vector.nulls.isNull(row)) continue;
                     const native = physicalValue(values, row);
                     const value: f64 = if (@TypeOf(native) == i64) @floatFromInt(native) else native;
@@ -446,7 +448,8 @@ pub const Column = struct {
                 },
                 else => unreachable,
             },
-            .booleans => |*states| for (ids, physical.selection) |id, row| {
+            .booleans => |*states| for (ids, 0..) |id, lane| {
+                const row = physical.rowAt(lane);
                 if (vector.nulls.isNull(row)) continue;
                 const value = vector.values.bool[row];
                 const state = &states.items[id];
@@ -461,7 +464,8 @@ pub const Column = struct {
                 state.count = count;
             },
             .bytes => |*states| switch (vector.values) {
-                inline .bytes, .dictionary_bytes => |values| for (ids, physical.selection) |id, row| {
+                inline .bytes, .dictionary_bytes => |values| for (ids, 0..) |id, lane| {
+                    const row = physical.rowAt(lane);
                     if (vector.nulls.isNull(row)) continue;
                     const value = physicalValue(values, row);
                     const state = &states.items[id];
@@ -478,6 +482,39 @@ pub const Column = struct {
             else => unreachable,
         }
         return true;
+    }
+    /// Merge one validated AGS column after a shared destination-key census.
+    pub fn mergeFixedBatch(self: *Column, a: A, ids: []const usize, states: []const @import("aggregate_partial.zig").Fixed) !void {
+        if (ids.len != states.len) return error.InvalidSqlBackendResponse;
+        switch (self.values) {
+            .counts => |*target| for (ids, states) |id, from| {
+                target.items[id] = try mergedCount(target.items[id], from.count);
+            },
+            .integers => |*target| for (ids, states) |id, from| {
+                const to = &target.items[id];
+                const count = try mergedCount(to.count, from.count);
+                if (self.spec.kind == .sum) to.sum = std.math.add(i128, to.sum, from.sum) catch return error.SqlNumericOutOfRange else if (from.count != 0 and (to.count == 0 or (if (self.spec.kind == .min) from.selected.value.integer < to.selected else from.selected.value.integer > to.selected))) to.selected = from.selected.value.integer;
+                to.count = count;
+            },
+            .booleans => |*target| for (ids, states) |id, from| {
+                const to = &target.items[id];
+                const count = try mergedCount(to.count, from.count);
+                const value = if (self.spec.kind == .min or self.spec.kind == .max) if (from.count == 0) false else from.selected.value.bool else from.boolean;
+                if (from.count != 0) to.value = if (to.count == 0) value else if (self.spec.kind == .bool_and or self.spec.kind == .min) to.value and value else to.value or value;
+                to.count = count;
+            },
+            .bytes => |*target| for (ids, states) |id, from| {
+                const to = &target.items[id];
+                const count = try mergedCount(to.count, from.count);
+                if (from.count != 0 and (to.count == 0 or std.mem.order(u8, from.selected.value.string, to.value.?) == (if (self.spec.kind == .min) std.math.Order.lt else .gt))) {
+                    const owned = try a.dupe(u8, from.selected.value.string);
+                    if (to.value) |old| a.free(old);
+                    to.value = owned;
+                }
+                to.count = count;
+            },
+            else => return error.InvalidSqlBackendResponse,
+        }
     }
     /// Merge compact partial vectors directly after resolving destination IDs.
     /// Typed states need no Aggregate snapshots, cloned reducers or OwnedRows.

@@ -243,7 +243,7 @@ fn slice(columns: []rows.ColumnVector, batch: rows.ColumnBatch, begin: usize, en
     if (columns.len != batch.columns.len) return error.RowSourceColumnLengthMismatch;
     for (columns, batch.columns) |*column, original| {
         column.* = original;
-        if (original.nulls.bytes.len != 0) column.nulls.bytes = original.nulls.bytes[begin..end];
+        column.nulls = original.nulls.slice(begin, end - begin);
         column.values = switch (original.values) {
             inline .dictionary_bytes, .dictionary_i64, .dictionary_f64 => |dictionary, tag| @unionInit(rows.ColumnValues, @tagName(tag), .{ .values = dictionary.values, .indices = dictionary.indices[begin..end] }),
             inline else => |values, tag| @unionInit(rows.ColumnValues, @tagName(tag), values[begin..end]),

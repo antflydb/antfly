@@ -23,18 +23,46 @@ const A = std.mem.Allocator;
 /// proves scalar boundary coercion is an identity; unsupported coercions decline.
 pub const PhysicalColumn = struct {
     vector: @import("../storage/rowsource/types.zig").ColumnVector,
-    selection: []const usize,
+    selection: []const usize = &.{},
+    /// Contiguous borrowed coordinates need no per-lane identity array.
+    range: ?struct { begin: usize = 0, count: usize } = null,
     kind: @import("ast.zig").ColumnType,
     element: ?@import("array_value.zig").ElementType = null,
-    pub fn select(self: @This(), a: A, selected: []const usize) !@This() {
-        const rows = try a.alloc(usize, selected.len);
-        errdefer a.free(rows);
-        for (rows, selected) |*row, index| {
-            if (index >= self.selection.len) return error.InvalidSqlBackendResponse;
-            row.* = self.selection[index];
-        }
+    pub fn len(self: @This()) usize {
+        return if (self.range) |span| span.count else self.selection.len;
+    }
+    pub fn rowAt(self: @This(), index: usize) usize {
+        std.debug.assert(index < self.len());
+        return if (self.range) |span| span.begin + index else self.selection[index];
+    }
+    pub fn slice(self: @This(), begin: usize, end: usize) @This() {
+        std.debug.assert(begin <= end and end <= self.len());
         var view = self;
-        view.selection = rows;
+        if (self.range) |span| view.range = .{ .begin = span.begin + begin, .count = end - begin } else view.selection = self.selection[begin..end];
+        return view;
+    }
+    pub fn select(self: @This(), a: A, selected: []const usize) !@This() {
+        for (selected) |index| if (index >= self.len()) return error.InvalidSqlBackendResponse;
+        var view = self;
+        view.range = null;
+        if (selected.len == 0) {
+            view.selection = &.{};
+            return view;
+        }
+        const first = self.rowAt(selected[0]);
+        const contiguous = for (selected, 0..) |index, lane| {
+            if (self.rowAt(index) != first +| lane) break false;
+        } else true;
+        if (contiguous) {
+            view.selection = &.{};
+            view.range = .{ .begin = first, .count = selected.len };
+        } else if (self.range != null and self.range.?.begin == 0) {
+            view.selection = selected;
+        } else {
+            const rows = try a.alloc(usize, selected.len);
+            for (rows, selected) |*out, index| out.* = self.rowAt(index);
+            view.selection = rows;
+        }
         return view;
     }
     /// Normalize only selected lanes; excluded payloads remain lazy. Narrow
@@ -54,15 +82,13 @@ pub const PhysicalColumn = struct {
         view.element = element_;
         try view.validate();
         if (element_ == .float32) {
-            const values = try a.alloc(f64, self.selection.len);
+            const values = try a.alloc(f64, self.len());
             errdefer a.free(values);
             const nulls = try a.alloc(u8, values.len);
             errdefer a.free(nulls);
-            const selection = try a.alloc(usize, values.len);
-            errdefer a.free(selection);
-            for (self.selection, values, nulls, selection, 0..) |row, *value, *flag, *index, i| {
+            for (values, nulls, 0..) |*value, *flag, i| {
+                const row = self.rowAt(i);
                 flag.* = @intFromBool(self.vector.nulls.isNull(row));
-                index.* = i;
                 const number = if (flag.* != 0) 0 else switch (self.vector.values) {
                     .f64 => |v| v[row],
                     .dictionary_f64 => |v| v.at(row),
@@ -71,13 +97,14 @@ pub const PhysicalColumn = struct {
                 value.* = try @import("builtin_cast.zig").floatValue(f32, .{ .float = number });
             }
             view.vector = .{ .name = self.vector.name, .values = .{ .f64 = values }, .nulls = .{ .bytes = nulls } };
-            view.selection = selection;
+            view.selection = &.{};
+            view.range = .{ .count = values.len };
         }
         return view;
     }
     pub fn cell(self: @This(), index: usize) !scalar.Datum {
-        if (index >= self.selection.len) return error.InvalidSqlBackendResponse;
-        const row = self.selection[index];
+        if (index >= self.len()) return error.InvalidSqlBackendResponse;
+        const row = self.rowAt(index);
         if (self.vector.nulls.isNull(row)) return .{};
         return scalar.Datum.json(switch (self.vector.values) {
             .i64 => |v| .{ .integer = v[row] },
@@ -91,7 +118,7 @@ pub const PhysicalColumn = struct {
         });
     }
     pub fn bytes(self: @This(), index: usize) !usize {
-        const row_index = self.selection[index];
+        const row_index = self.rowAt(index);
         if (self.vector.nulls.isNull(row_index)) return @sizeOf(scalar.Datum);
         return @sizeOf(scalar.Datum) + switch (self.vector.values) {
             .bytes => |v| v[row_index].len,
@@ -100,7 +127,7 @@ pub const PhysicalColumn = struct {
         };
     }
     pub fn dictionaryIdentity(self: @This(), index: usize) ?u64 {
-        const row_index = self.selection[index];
+        const row_index = self.rowAt(index);
         if (self.vector.nulls.isNull(row_index)) return 0;
         return switch (self.vector.values) {
             inline .dictionary_i64, .dictionary_f64, .dictionary_bytes => |v| @as(u64, v.indices[row_index]) + 1,
@@ -115,8 +142,11 @@ pub const PhysicalColumn = struct {
             .bytes, .dictionary_bytes => self.kind == .string,
             else => false,
         };
-        if (!compatible or (self.vector.nulls.bytes.len != 0 and self.vector.nulls.bytes.len != self.vector.rowCount())) return error.InvalidSqlBackendResponse;
-        for (self.selection) |row| {
+        if (!compatible or (self.range != null and self.selection.len != 0)) return error.InvalidSqlBackendResponse;
+        self.vector.nulls.validate(self.vector.rowCount()) catch return error.InvalidSqlBackendResponse;
+        if (self.range) |span| if (span.begin > self.vector.rowCount() or span.count > self.vector.rowCount() - span.begin) return error.InvalidSqlBackendResponse;
+        for (0..self.len()) |lane| {
+            const row = self.rowAt(lane);
             if (row >= self.vector.rowCount()) return error.InvalidSqlBackendResponse;
             if (self.vector.nulls.isNull(row)) continue;
             switch (self.vector.values) {
@@ -253,6 +283,32 @@ pub const Batch = union(enum) {
         const view = try a.create(View);
         view.* = .{ .columns = columns };
         return .{ .reader = .{ .ptr = view, .read = View.read, .read_physical_selected = View.physical, .read_dictionary = View.dictionary, .read_identity = View.identity, .width = columns.len, .count = count } };
+    }
+    /// Normalize a stable reader once; borrowed views are reused by hashing,
+    /// admission and reduction until the enclosing block/window is released.
+    pub fn preparePhysical(self: *const Batch, a: A) !Batch {
+        const View = struct {
+            source: *const Batch,
+            columns: []const ?PhysicalColumn,
+            fn read(raw: *anyopaque, alloc: A, row_index: usize, column: usize) !scalar.Datum {
+                const view: *@This() = @ptrCast(@alignCast(raw));
+                return view.source.cell(alloc, row_index, column);
+            }
+            fn physical(raw: *anyopaque, alloc: A, column: usize, selection: ?[]const usize) !?PhysicalColumn {
+                const view: *@This() = @ptrCast(@alignCast(raw));
+                const native = view.columns[column] orelse return null;
+                return if (selection) |indices| try native.select(alloc, indices) else native;
+            }
+            fn identity(raw: *anyopaque, row_index: usize, column: usize) !?u64 {
+                const view: *@This() = @ptrCast(@alignCast(raw));
+                return if (view.columns[column]) |native| native.dictionaryIdentity(row_index) else view.source.dictionaryIdentity(row_index, column);
+            }
+        };
+        const columns = try a.alloc(?PhysicalColumn, self.width());
+        for (columns, 0..) |*column, index| column.* = try self.physicalColumn(a, index);
+        const view = try a.create(View);
+        view.* = .{ .source = self, .columns = columns };
+        return .{ .reader = .{ .ptr = view, .count = self.len(), .width = self.width(), .read = View.read, .read_physical_selected = View.physical, .read_identity = View.identity } };
     }
     fn selectedRows(a: A, rows: []const usize, selection: ?[]const usize) ![]const usize {
         const indices = selection orelse return rows;
@@ -606,4 +662,32 @@ test "SQL physical views compose selections before coercion" {
         try physical.validate();
         try std.testing.expectEqual(@as(i64, 1), (try physical.cell(0)).value.integer);
     }
+}
+
+test "SQL physical retained views borrow packed nulls and compact selected ranges" {
+    const a = std.testing.allocator;
+    var store = @import("typed_store.zig").Store.init(a);
+    defer store.deinit();
+    for (0..130) |row_index| _ = try store.append(&.{if (row_index == 64) scalar.Datum{} else scalar.Datum.json(.{ .integer = @intCast(row_index) })});
+    var no_memory: @import("memory_budget.zig") = .{ .backing = a, .limit = 0 };
+    const view = (try store.physicalColumn(no_memory.allocator(), 0, 63, 4)).?;
+    try view.validate();
+    try std.testing.expect(view.range != null and view.selection.len == 0 and view.vector.nulls.bits != null);
+    try std.testing.expect((try view.cell(1)).sql_null);
+    const owned_nulls = try view.vector.nulls.dupeBytes(a, 4);
+    defer a.free(owned_nulls);
+    try std.testing.expectEqualSlices(u8, &.{ 0, 1, 0, 0 }, owned_nulls);
+    const selected = try view.select(no_memory.allocator(), &.{ 3, 1, 0, 1 });
+    try selected.validate();
+    try std.testing.expect((try selected.cell(1)).sql_null and (try selected.cell(3)).sql_null);
+    try std.testing.expectEqual(@as(i64, 66), (try selected.cell(0)).value.integer);
+    const part = view.slice(1, 3);
+    try std.testing.expect((try part.cell(0)).sql_null);
+    try std.testing.expectEqual(@as(usize, 0), no_memory.live);
+    var invalid = view;
+    invalid.range = .{ .begin = 4, .count = 1 };
+    try std.testing.expectError(error.InvalidSqlBackendResponse, invalid.validate());
+    invalid = view;
+    invalid.vector.nulls.bits.?.offset = 192;
+    try std.testing.expectError(error.InvalidSqlBackendResponse, invalid.validate());
 }

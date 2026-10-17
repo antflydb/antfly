@@ -55,7 +55,7 @@ const Vector = struct {
     /// Selection and SQL NULL stay separate from primitive lanes; no Datum
     /// array or JSON tags are constructed for physical readers.
     pub fn fillPhysical(self: Vector, physical: @import("execution_batch.zig").PhysicalColumn) !bool {
-        if (physical.selection.len != self.states.len) return error.InvalidSqlBackendResponse;
+        if (physical.len() != self.states.len) return error.InvalidSqlBackendResponse;
         const compatible = switch (physical.vector.values) {
             .i64, .dictionary_i64 => self.kind == .integer or self.kind == .number,
             .f64, .dictionary_f64 => self.kind == .number,
@@ -65,7 +65,8 @@ const Vector = struct {
         };
         if (!compatible) return false;
         try physical.validate();
-        for (physical.selection, 0..) |source, row| {
+        for (0..physical.len()) |row| {
+            const source = physical.rowAt(row);
             self.states[row] = if (physical.vector.nulls.isNull(source)) .sql_null else .value;
             if (self.states[row] != .value) continue;
             switch (physical.vector.values) {
@@ -111,7 +112,6 @@ const Vector = struct {
 pub const Encoded = struct {
     vector: Vector,
     nulls: []u8,
-    selection: []usize,
     type: scalar.Type,
     json_null: bool = false,
     fn allocate(a: A, kind_: Kind, count: usize, type_: scalar.Type) !*Encoded {
@@ -124,9 +124,7 @@ pub const Encoded = struct {
         errdefer a.free(states);
         const nulls = try a.alloc(u8, count);
         errdefer a.free(nulls);
-        const selection = try a.alloc(usize, count);
-        for (selection, 0..) |*row, index| row.* = index;
-        self.* = .{ .vector = .{ .kind = kind_, .payload = payload, .states = states }, .nulls = nulls, .selection = selection, .type = type_ };
+        self.* = .{ .vector = .{ .kind = kind_, .payload = payload, .states = states }, .nulls = nulls, .type = type_ };
         return self;
     }
     fn copy(self: *Encoded, source: Vector, begin: usize) void {
@@ -180,14 +178,13 @@ pub const Encoded = struct {
             .boolean => .{ .bool = self.vector.booleans() },
             .string => .{ .bytes = self.vector.strings() },
             .none => unreachable,
-        } }, .selection = self.selection, .kind = self.type.kind.?, .element = self.type.element_type };
+        } }, .range = .{ .count = self.vector.states.len }, .kind = self.type.kind.?, .element = self.type.element_type };
     }
     pub fn destroy(raw: *anyopaque, a: A) void {
         const self: *Encoded = @ptrCast(@alignCast(raw));
         a.free(self.vector.payload);
         a.free(self.vector.states);
         a.free(self.nulls);
-        a.free(self.selection);
         a.destroy(self);
     }
     pub fn batch(self: *Encoded) @import("execution_batch.zig").Batch {

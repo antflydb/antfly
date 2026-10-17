@@ -65,6 +65,11 @@ pub const Manager = struct {
         while (!self.allocation_mutex.tryLock()) std.atomic.spinLoopHint();
     }
     /// Independent partition files share a statement arena and memory budget.
+    /// Immutable parent identity for admission through this synchronizing wrapper.
+    pub fn parentAllocator(a: std.mem.Allocator) ?std.mem.Allocator {
+        if (a.vtable.alloc != allocate) return null;
+        return @as(*Manager, @ptrCast(@alignCast(a.ptr))).alloc;
+    }
     pub fn allocator(self: *Manager) Allocator {
         return .{ .ptr = self, .vtable = &.{ .alloc = allocate, .resize = resizeAllocation, .remap = remapAllocation, .free = freeAllocation } };
     }
@@ -103,6 +108,11 @@ pub const Manager = struct {
         if (bytes > self.max_bytes -| self.live_bytes) return error.SqlProgramLimitExceeded;
         self.live_bytes += bytes;
         self.peak_bytes = @max(self.peak_bytes, self.live_bytes);
+    }
+    pub fn fileHeadroom(self: *Manager) usize {
+        self.lock();
+        defer self.mutex.unlock();
+        return 64 - self.files;
     }
     pub fn admissionStats(self: *Manager) struct { peak_files: usize, peak_bytes: u64, max_bytes: u64 } {
         self.lock();
@@ -937,8 +947,7 @@ pub const Sequential = struct {
         const selected = try batch.select(encoder.a, positions[0 .. end - begin]);
         for (0..batch.width()) |column| {
             if (physical_columns[column]) |view| {
-                var native = view;
-                native.selection = view.selection[begin..end];
+                const native = view.slice(begin, end);
                 try encodeNativeColumn(encoder, native);
                 continue;
             }
@@ -976,7 +985,8 @@ pub const Sequential = struct {
         var present: usize = 0;
         var expanded: usize = 0;
         var compact: usize = 0;
-        for (view.selection, 0..) |row, lane| {
+        for (0..view.len()) |lane| {
+            const row = view.rowAt(lane);
             if (view.vector.nulls.isNull(row)) continue;
             const value = values[if (dictionary_indices) |ids| ids[row] else row];
             const hash = if (T == []const u8) std.hash.Wyhash.hash(0, value) else std.hash.Wyhash.hash(0, std.mem.asBytes(&value));
@@ -994,12 +1004,12 @@ pub const Sequential = struct {
         }
         const encoded_dictionary = present != 0 and compact +| present *| 2 +| 9 < expanded;
         try encoder.append(&.{if (encoded_dictionary) 6 else kind_});
-        for (0..(view.selection.len + 3) / 4) |group| {
+        for (0..(view.len() + 3) / 4) |group| {
             var flags: u8 = 0;
             for (0..4) |lane| {
                 const index = group * 4 + lane;
-                if (index >= view.selection.len) break;
-                if (view.vector.nulls.isNull(view.selection[index])) flags |= @as(u8, 1) << @as(u3, @intCast(lane * 2));
+                if (index >= view.len()) break;
+                if (view.vector.nulls.isNull(view.rowAt(index))) flags |= @as(u8, 1) << @as(u3, @intCast(lane * 2));
             }
             try encoder.append(&.{flags});
         }
@@ -1007,17 +1017,21 @@ pub const Sequential = struct {
             try encoder.append(&.{kind_});
             try encoder.word(unique);
             for (entries[0..unique]) |value| try nativeWord(encoder, T, value);
-            for (view.selection, 0..) |row, lane| if (!view.vector.nulls.isNull(row)) {
+            for (0..view.len()) |lane| {
+                const row = view.rowAt(lane);
+                if (view.vector.nulls.isNull(row)) continue;
                 var bytes: [2]u8 = undefined;
                 std.mem.writeInt(u16, &bytes, indices[lane], .little);
                 try encoder.append(&bytes);
-            };
-        } else for (view.selection) |row| if (!view.vector.nulls.isNull(row)) {
+            }
+        } else for (0..view.len()) |lane| {
+            const row = view.rowAt(lane);
+            if (view.vector.nulls.isNull(row)) continue;
             try nativeWord(encoder, T, values[if (dictionary_indices) |ids| ids[row] else row]);
-        };
+        }
     }
     fn encodeNativeColumn(encoder: *Encoder, view: @import("execution_batch.zig").PhysicalColumn) !void {
-        if (view.selection.len > 256) return error.InvalidSqlSpill;
+        if (view.len() > 256) return error.InvalidSqlSpill;
         switch (view.vector.values) {
             .i64 => |v| try encodeNativeValues(encoder, i64, view, v, null, 2),
             .f64 => |v| try encodeNativeValues(encoder, f64, view, v, null, 3),
@@ -1536,9 +1550,7 @@ pub const Sequential = struct {
                     var block = view.block.*;
                     if (view.keys) block.encoded = .{ .values = encoded.keys, .keys = &.{}, .ordinals = encoded.ordinals };
                     const vector = try block.columnVector(alloc, column, kind_);
-                    const selection = try alloc.alloc(usize, encoded.count());
-                    for (selection, 0..) |*row_index, index| row_index.* = index;
-                    return .{ .vector = vector, .selection = selection, .kind = switch (kind_) {
+                    return .{ .vector = vector, .range = .{ .count = encoded.count() }, .kind = switch (kind_) {
                         .bool => .boolean,
                         .i64 => .integer,
                         .f64 => .number,

@@ -153,7 +153,30 @@ pub const NullBitmap = struct {
     /// One byte per row for now. Zero means present, non-zero means null.
     bytes: []const u8 = &.{},
 
+    /// Borrowed retained-store validity, with a bit offset for sliced columns.
+    bits: ?struct { words: []const u64, offset: usize = 0 } = null,
+    pub fn validate(self: NullBitmap, count: usize) !void {
+        if (self.bits) |bits| {
+            if (self.bytes.len != 0 or bits.offset > bits.words.len *| 64 or count > bits.words.len *| 64 - bits.offset) return error.RowSourceNullBitmapLengthMismatch;
+        } else if (self.bytes.len != 0 and self.bytes.len != count) return error.RowSourceNullBitmapLengthMismatch;
+    }
+    pub fn slice(self: NullBitmap, begin: usize, count: usize) NullBitmap {
+        if (self.bits) |bits| return .{ .bits = .{ .words = bits.words, .offset = bits.offset + begin } };
+        return .{ .bytes = if (self.bytes.len == 0) &.{} else self.bytes[begin..][0..count] };
+    }
+    /// Owning row-source boundaries materialize borrowed validity once.
+    pub fn dupeBytes(self: NullBitmap, a: Allocator, count: usize) ![]u8 {
+        try self.validate(count);
+        if (self.bits == null) return a.dupe(u8, self.bytes);
+        const bytes = try a.alloc(u8, count);
+        for (bytes, 0..) |*byte, row| byte.* = @intFromBool(self.isNull(row));
+        return bytes;
+    }
     pub fn isNull(self: NullBitmap, row: usize) bool {
+        if (self.bits) |bits| {
+            const index = bits.offset + row;
+            return index / 64 < bits.words.len and bits.words[index / 64] & (@as(u64, 1) << @as(u6, @intCast(index % 64))) != 0;
+        }
         return self.bytes.len > row and self.bytes[row] != 0;
     }
 };
@@ -225,9 +248,7 @@ pub fn validateColumns(columns: []const ColumnVector, row_count: usize) !void {
             else => {},
         }
         if (column.rowCount() != row_count) return error.RowSourceColumnLengthMismatch;
-        if (column.nulls.bytes.len != 0 and column.nulls.bytes.len != row_count) {
-            return error.RowSourceNullBitmapLengthMismatch;
-        }
+        try column.nulls.validate(row_count);
     }
 }
 

@@ -1168,7 +1168,7 @@ test "SQL physical computed vectors share parallel scheduling and typed delivery
     defer freeEncodedMany(a, outputs);
     const physical = (try outputs[0].?.physicalColumn(ca, 0)).?;
     try physical.validate();
-    try std.testing.expectEqual(refs.len, physical.selection.len);
+    try std.testing.expectEqual(refs.len, physical.len());
     for (integers, physical.vector.values.i64) |input, output| try std.testing.expectEqual(input * 3, output);
 }
 

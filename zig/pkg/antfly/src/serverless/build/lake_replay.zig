@@ -157,7 +157,7 @@ const OwnedBatch = struct {
 fn cloneColumnAlloc(alloc: Allocator, column: rowsource.ColumnVector) !rowsource.ColumnVector {
     const name = try alloc.dupe(u8, column.name);
     errdefer alloc.free(name);
-    const nulls = try alloc.dupe(u8, column.nulls.bytes);
+    const nulls = try column.nulls.dupeBytes(alloc, column.rowCount());
     errdefer alloc.free(nulls);
     return .{
         .name = name,
@@ -313,4 +313,19 @@ fn compactReplayScenario(a: Allocator) !void {
 test "external lake compact replay owns shared identity once and unwinds failures" {
     try compactReplayScenario(std.testing.allocator);
     try std.testing.checkAllAllocationFailures(std.testing.allocator, compactReplayScenario, .{});
+}
+
+fn packedReplayScenario(a: Allocator) !void {
+    var flags = [_]u64{2};
+    const batch: rowsource.ColumnBatch = .{ .snapshot = .{ .table_id = "source", .snapshot_id = "snapshot" }, .external_span = .{ .first = .{ .source_id = "source", .snapshot_id = "snapshot", .file_id = "file", .row_group_ordinal = 0, .row_ordinal = 0 }, .count = 2 }, .columns = &.{.{ .name = "n", .values = .{ .i64 = &.{ 10, 20 } }, .nulls = .{ .bits = .{ .words = &flags } } }} };
+    var owned = try OwnedBatch.cloneAlloc(a, batch);
+    defer owned.deinit(a);
+    flags[0] = 0;
+    try std.testing.expect(owned.batch.columns[0].nulls.bits == null);
+    try std.testing.expectEqualSlices(u8, &.{ 0, 1 }, owned.batch.columns[0].nulls.bytes);
+    try std.testing.expect(@import("lake_build_limits.zig").estimateBatchBytes(batch) == @import("lake_build_limits.zig").estimateBatchBytes(owned.batch));
+}
+test "external lake compact replay owns packed validity and charges materialization" {
+    try packedReplayScenario(std.testing.allocator);
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, packedReplayScenario, .{});
 }

@@ -121,16 +121,31 @@ def test_parquet_attachment_survives_restart_and_streams_over_pgwire(
     try:
 
         def request(method, path, payload=None):
-            try:
-                response = requests.request(
-                    method,
-                    server.api_url + path,
-                    json=payload,
-                    auth=("admin", AUTH_BOOTSTRAP_PASSWORD),
-                    timeout=60,
-                )
-            except requests.RequestException as exc:
-                pytest.fail(f"{exc}\n{server.debug_logs()}")
+            deadline = time.monotonic() + 30
+            while True:
+                try:
+                    response = requests.request(
+                        method,
+                        server.api_url + path,
+                        json=payload,
+                        auth=("admin", AUTH_BOOTSTRAP_PASSWORD),
+                        timeout=60,
+                    )
+                except requests.RequestException as exc:
+                    pytest.fail(f"{exc}\n{server.debug_logs()}")
+                # Background publication may win the catalog CAS before this
+                # index creation is admitted. Replay only that explicit conflict.
+                if (
+                    method == "POST"
+                    and "/indexes/" in path
+                    and response.status_code == 409
+                    and response.json().get("error") == "table_mutation_conflict"
+                    and response.json().get("retryable") is True
+                    and time.monotonic() < deadline
+                ):
+                    time.sleep(0.1)
+                    continue
+                break
             assert response.ok, (
                 response.text + "\n" + server.log_path.read_text()[-8000:]
             )
@@ -5582,6 +5597,35 @@ def test_published_parquet_skewed_files_share_row_groups_and_stream_in_order(tmp
                         f"SELECT amount FROM skew_scan LIMIT {total}", size=137
                     )
                 ]
+            delivered = []
+            with (
+                psycopg.connect(
+                    host="127.0.0.1",
+                    port=server.pgwire_port,
+                    user="admin",
+                    password=AUTH_BOOTSTRAP_PASSWORD,
+                    dbname="default",
+                    sslmode="disable",
+                    autocommit=True,
+                ) as connection,
+                connection.cursor() as cursor,
+                pytest.raises(psycopg.errors.InvalidTextRepresentation),
+            ):
+                delivered.extend(
+                    row[0]
+                    for row in cursor.stream(
+                        f"SELECT CAST(CASE WHEN amount = {order[0]} THEN '1' ELSE 'bad' END AS BIGINT) FROM skew_scan LIMIT 2",
+                        size=1,
+                    )
+                )
+            assert delivered == [1]
+            assert call(
+                "POST",
+                "/sql",
+                {
+                    "statement": "SELECT COUNT(*), SUM(total) FROM (SELECT amount, SUM(amount + 1) AS total FROM skew_scan GROUP BY amount) groups"
+                },
+            )["rows"] == [[str(total), str(sum(expected) + total)]]
             assert sorted(order) == expected
             if first_order is None:
                 first_order = order

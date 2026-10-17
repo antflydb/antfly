@@ -61,6 +61,8 @@ pub fn footprint(self: *Budget) usize {
 /// Live headroom of this allocator's budget chain, when known. Unknown backing
 /// allocators provide no extra bound; they never imply unlimited admission.
 pub fn headroom(a: std.mem.Allocator) ?usize {
+    if (@import("parallel_scheduler.zig").LockedAllocator.parentAllocator(a)) |parent| return headroom(parent);
+    if (@import("spill.zig").Manager.parentAllocator(a)) |parent| return headroom(parent);
     if (a.vtable.alloc != alloc) return null;
     const self: *Budget = @ptrCast(@alignCast(a.ptr));
     self.lock();
@@ -207,4 +209,23 @@ test "SQL memory budget rejects before allocation and reclaims page capacity" {
     a.free(second);
     try std.testing.expectEqual(@as(usize, 0), budget.live);
     try std.testing.expectEqual(@as(usize, 128), budget.peak);
+}
+
+test "SQL memory headroom follows synchronization and spill allocator parents" {
+    const a = std.testing.allocator;
+    var parent: Budget = .{ .backing = a, .limit = 1024 };
+    var locked: @import("parallel_scheduler.zig").LockedAllocator = .{ .backing = parent.allocator() };
+    var manager: @import("spill.zig").Manager = .{ .alloc = locked.allocator(), .io = std.testing.io, .context = undefined, .checkpoint = struct {
+        fn check(_: *anyopaque) !void {}
+    }.check };
+    defer manager.deinit();
+    const reservation = try parent.allocator().alloc(u8, 512);
+    defer parent.allocator().free(reservation);
+    try std.testing.expectEqual(@as(?usize, 512), headroom(manager.allocator()));
+    var child: Budget = .{ .backing = manager.allocator(), .limit = 2048 };
+    const bytes = try child.allocator().alloc(u8, 128);
+    try std.testing.expectEqual(@as(?usize, 384), headroom(child.allocator()));
+    child.allocator().free(bytes);
+    try std.testing.expectEqual(@as(?usize, 512), headroom(locked.allocator()));
+    try std.testing.expect(headroom(a) == null);
 }
