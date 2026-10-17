@@ -40,6 +40,20 @@ var bindings: std.ArrayList(Binding) = .empty;
 var storage_provider: ?*std.Build.Step.Compile = null;
 var storage_dependencies: []const *std.Build.Step.Compile = &.{};
 const StorageVisit = struct { module: *std.Build.Module, testing: bool };
+const LocalProvider = struct { consumer: *std.Build.Module, provider: *std.Build.Step.Compile };
+var local_providers: std.ArrayList(LocalProvider) = .empty;
+
+/// A source-level owner fixture may compile a provider in its final image.
+/// Do not also import that provider's archive through a storage dependency.
+/// Registration applies only to this final module, never to sibling images.
+pub fn registerLocalProvider(consumer: *std.Build.Module, provider: *std.Build.Step.Compile) void {
+    local_providers.append(consumer.owner.allocator, .{ .consumer = consumer, .provider = provider }) catch @panic("OOM");
+}
+
+fn providesLocally(consumer: *std.Build.Module, provider: *std.Build.Step.Compile) bool {
+    for (local_providers.items) |local| if (local.consumer == consumer and local.provider == provider) return true;
+    return false;
+}
 
 pub fn registerStorageProvider(provider: *std.Build.Step.Compile, dependencies: []const *std.Build.Step.Compile) void {
     storage_provider = provider;
@@ -134,6 +148,7 @@ fn attachStorageFinalLinks(b: *std.Build, step: *std.Build.Step, provider: *std.
             // Private engine calls resolve in the final image. Keep provider
             // dependencies here, not on static owners' codegen prerequisites.
             if (linked) for (storage_dependencies) |dependency| {
+                if (providesLocally(artifact.root_module, dependency)) continue;
                 var found = false;
                 for (artifact.root_module.link_objects.items) |input| {
                     if (input == .other_step and input.other_step == dependency) found = true;

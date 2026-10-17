@@ -312,6 +312,10 @@ export fn antfly_second(_: c_int) void {}
 extern fn antfly_first() c_int;
 pub fn main() !void { if (antfly_first() != 42) return error.InvalidEngine; }
 """)
+        (local / "native_local.zig").write_text(
+            (local / "native.zig").read_text()
+            + '\ncomptime { _ = @import("local_compute"); }\n'
+        )
         (local / "browser.zig").write_text("export fn browser() u32 { return 7; }\n")
         (local / "source_test.zig").write_text("""
 extern fn antfly_first() c_int;
@@ -368,6 +372,12 @@ pub fn build(b: *std.Build) void {
     native_mod.addOptions("storage_engine_options", opts);
     const native = b.addExecutable(.{ .name = "native-caller", .root_module = native_mod });
     b.getInstallStep().dependOn(&b.addInstallArtifact(native, .{}).step);
+    const local_mod = b.createModule(.{ .root_source_file = b.path("pkg/antfly-embedded/src/native_local.zig"), .target = target, .optimize = .debug });
+    local_mod.addOptions("storage_engine_options", opts);
+    local_mod.addImport("local_compute", dep_mod);
+    sources.registerLocalProvider(local_mod, dep);
+    const local_exe = b.addExecutable(.{ .name = "local-provider-caller", .root_module = local_mod });
+    b.getInstallStep().dependOn(&b.addInstallArtifact(local_exe, .{}).step);
     const shared_mod = b.createModule(.{ .target = target, .optimize = .debug, .pic = true });
     const shared = library.addWithStorageOwner(b, shared_mod, &.{dep}, engine);
     b.getInstallStep().dependOn(shared.install);
@@ -405,6 +415,7 @@ pub fn build(b: *std.Build) void {
     sources.finalize(b); sources.finalize(b);
     if(native.use_llvm != true) @panic("native final link differs from provider callback backend");
     if(count(native_mod, engine) != 1 or count(native_mod, dep) != 1) @panic("native final link lost or duplicated a private provider");
+    if(count(local_mod, engine) != 1 or count(local_mod, dep) != 0) @panic("local provider also inherited its archive");
     if(count(consumer_mod, engine) != 0 or count(consumer_mod, dep) != 0) @panic("shared-library consumer inherited a private engine");
     if(count(browser_mod, engine) != 0 or count(browser_mod, dep) != 0) @panic("browser inherited a native provider");
     if(count(test_link_mod, engine) != 0 or count(test_link_mod, dep) != 0) @panic("direct source tests inherited a shared engine");

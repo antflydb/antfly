@@ -221,8 +221,9 @@ pub fn addRuntime(b: *std.Build, options: AddRuntimeOptions) AddRuntimeResult {
             .use_llvm = @import("../../../build_support/embedded/shared_library.zig").llvmBackend(target.result),
             .max_rss = compile_max_rss,
         });
-        if (unit == .inference and production_antfly_imports.shared_inference_core)
-            role_artifact.root_module.linkLibrary(options.native_inference);
+        // Final images select their inference provider. Source-level owner
+        // fixtures compile it locally; production images link the archive.
+        // Keep that choice off this shared adapter's transitive link graph.
         const runtime_unit_step = b.step(
             b.fmt("runtime-unit-{s}", .{@tagName(unit)}),
             b.fmt("Build only the {s} runtime library unit", .{@tagName(unit)}),
@@ -296,6 +297,7 @@ pub fn addRuntime(b: *std.Build, options: AddRuntimeOptions) AddRuntimeResult {
     linked_inference_abi_integration.root_module.linkLibrary(
         runtime_library_artifacts[@backingInt(RuntimeLibraryUnit.inference)].?,
     );
+    if (production_antfly_imports.shared_inference_core) linked_inference_abi_integration_mod.linkLibrary(options.native_inference);
     const run_linked_inference_abi_integration = b.addRunArtifact(linked_inference_abi_integration);
 
     for (runtime_library_link_order) |unit| {
@@ -340,6 +342,7 @@ pub fn addRuntime(b: *std.Build, options: AddRuntimeOptions) AddRuntimeResult {
             },
             .inference => {
                 role_exe.root_module.linkLibrary(runtime_library_artifacts[@backingInt(RuntimeLibraryUnit.inference)].?);
+                if (production_antfly_imports.shared_inference_core) role_exe.root_module.linkLibrary(options.native_inference);
             },
             .standalone => {
                 role_exe.root_module.linkLibrary(runtime_library_artifacts[@backingInt(RuntimeLibraryUnit.distributed)].?);

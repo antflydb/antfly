@@ -28,6 +28,8 @@ import pytest
 import test_auth as auth
 from conftest import (
     DEFAULT_ANTFLY_BIN,
+    _data_command,
+    _metadata_command,
     _standalone_stateful_command,
     resolve_binary_path,
 )
@@ -83,20 +85,43 @@ def test_mcp_session_does_not_replace_request_authentication(auth_api):
     assert all(entry["name"] != table for entry in auth_api.get("/tables"))
 
 
-def test_fresh_authenticated_server_requires_bootstrap_password(tmp_path):
+@pytest.mark.parametrize("role", ["standalone", "metadata", "data"])
+@pytest.mark.parametrize("bootstrap_password", [None, "short"])
+def test_fresh_authenticated_server_requires_bootstrap_password(
+    tmp_path, role, bootstrap_password
+):
     binary = resolve_binary_path(os.environ.get("ANTFLY_BIN", str(DEFAULT_ANTFLY_BIN)))
     if not Path(binary).exists():
         pytest.skip(f"antfly binary not found: {binary}")
     env = os.environ.copy()
-    env.pop("ANTFLY_BOOTSTRAP_ADMIN_PASSWORD", None)
-    command = _standalone_stateful_command(
-        binary, host="127.0.0.1", port=0, root=tmp_path
-    )
+    if bootstrap_password is None:
+        env.pop("ANTFLY_BOOTSTRAP_ADMIN_PASSWORD", None)
+    else:
+        env["ANTFLY_BOOTSTRAP_ADMIN_PASSWORD"] = bootstrap_password
+    if role == "standalone":
+        command = _standalone_stateful_command(
+            binary, host="127.0.0.1", port=0, root=tmp_path
+        )
+    elif role == "metadata":
+        command = _metadata_command(
+            binary, host="127.0.0.1", raft_port=0, admin_port=0, root=tmp_path
+        )
+    else:
+        command = _data_command(
+            binary,
+            host="127.0.0.1",
+            port=0,
+            raft_port=0,
+            metadata_admin_base_uri="http://127.0.0.1:1",
+            root=tmp_path,
+        )
     command.extend(["--auth", "true"])
     result = subprocess.run(
         command, env=env, capture_output=True, text=True, timeout=30, check=False
     )
-    assert result.returncode != 0
+    # A panic during error cleanup also exits nonzero and used to hide leaked
+    # auth-store handles. Credential rejection must unwind and exit normally.
+    assert result.returncode == 1, result.stdout + result.stderr
     assert "ANTFLY_BOOTSTRAP_ADMIN_PASSWORD" in result.stderr
 
 

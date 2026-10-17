@@ -1203,31 +1203,32 @@ pub fn runFromIterator(
     }
 
     var auth_backend: ?LegacyAuthBackend = null;
+    defer if (comptime !linked_storage) if (auth_backend) |*backend| backend.close();
     var auth_runtime: ?antfly.storage_backend_erased.NamespaceStore = null;
+    defer if (auth_runtime) |*runtime| runtime.deinit();
     var kernel_auth_users_store: ?antfly.storage_backend_erased.Store = null;
+    defer if (kernel_auth_users_store) |*store| store.deinit();
     var kernel_auth_casbin_store: ?antfly.storage_backend_erased.Store = null;
+    defer if (kernel_auth_casbin_store) |*store| store.deinit();
     var kernel_auth_users_runtime: ?antfly.storage_backend_erased.NamespaceStore = null;
+    defer if (kernel_auth_users_runtime) |*runtime| runtime.deinit();
     var kernel_auth_casbin_runtime: ?antfly.storage_backend_erased.NamespaceStore = null;
+    defer if (kernel_auth_casbin_runtime) |*runtime| runtime.deinit();
     var auth_user_store: ?antfly.usermgr.StorageUserStore = null;
     var auth_casbin_store: ?antfly.usermgr.StorageCasbinAdapter = null;
     var user_manager: ?antfly.usermgr.UserManager = null;
+    defer if (user_manager) |*manager| manager.deinit();
     if (auth_enabled) {
         if (comptime linked_storage) {
             kernel_auth_users_store = try storage_kernel_context.?.systemStore(alloc, "system/auth-users");
-            errdefer kernel_auth_users_store.?.deinit();
             kernel_auth_casbin_store = try storage_kernel_context.?.systemStore(alloc, "system/auth-casbin");
-            errdefer kernel_auth_casbin_store.?.deinit();
             kernel_auth_users_runtime = try kernel_owner_client.singleNamespaceStore(alloc, &kernel_auth_users_store.?, "usermgr_users");
-            errdefer kernel_auth_users_runtime.?.deinit();
             kernel_auth_casbin_runtime = try kernel_owner_client.singleNamespaceStore(alloc, &kernel_auth_casbin_store.?, "usermgr_casbin");
-            errdefer kernel_auth_casbin_runtime.?.deinit();
             auth_user_store = antfly.usermgr.StorageUserStore.init(alloc, kernel_auth_users_runtime.?);
             auth_casbin_store = antfly.usermgr.StorageCasbinAdapter.init(alloc, kernel_auth_casbin_runtime.?);
         } else {
             auth_backend = try antfly.lsm_backend.BackendHandle.open(alloc, resolved.auth_store_root_dir, .{});
-            errdefer if (auth_backend) |*backend| backend.close();
             auth_runtime = try auth_backend.?.backend.runtimeNamespaceStore(alloc);
-            errdefer if (auth_runtime) |*runtime| runtime.deinit();
             auth_user_store = antfly.usermgr.StorageUserStore.init(alloc, auth_runtime.?);
             auth_casbin_store = antfly.usermgr.StorageCasbinAdapter.init(alloc, auth_runtime.?);
         }
@@ -1237,19 +1238,11 @@ pub fn runFromIterator(
             auth_user_store.?.iface(),
             try antfly.usermgr.initDefaultEnforcer(alloc, auth_casbin_store.?.iface()),
         );
-        errdefer if (user_manager) |*manager| manager.deinit();
         antfly.usermgr.ensureDefaultAdminUser(&user_manager.?, init.environ_map.get("ANTFLY_BOOTSTRAP_ADMIN_PASSWORD")) catch |err| {
             std.log.err("auth bootstrap failed: set ANTFLY_BOOTSTRAP_ADMIN_PASSWORD to a unique password of 12 to 72 bytes for a new admin or to replace legacy admin:admin credentials", .{});
             return err;
         };
     }
-    defer if (comptime !linked_storage) if (auth_backend) |*backend| backend.close();
-    defer if (auth_runtime) |*runtime| runtime.deinit();
-    defer if (kernel_auth_users_store) |*store| store.deinit();
-    defer if (kernel_auth_casbin_store) |*store| store.deinit();
-    defer if (kernel_auth_users_runtime) |*runtime| runtime.deinit();
-    defer if (kernel_auth_casbin_runtime) |*runtime| runtime.deinit();
-    defer if (user_manager) |*manager| manager.deinit();
 
     const trusted_principal_issuer = try resolveTrustedPrincipalIssuer(
         alloc,
