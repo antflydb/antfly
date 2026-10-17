@@ -46,6 +46,8 @@ class CopyOutTest(unittest.TestCase):
                     with db.cursor().copy(profile["sql"]) as stream:
                         actual = b"".join(bytes(block) for block in stream)
                     self.assertEqual(bytes.fromhex(profile["hex"]), actual)
+            with db.cursor().copy("COPY (SELECT 'a' AS x,'b' AS x) TO STDOUT (FORMAT csv, FORCE_QUOTE(x))") as stream:
+                self.assertEqual(b'"a",b\n', b"".join(bytes(block) for block in stream))
             originals = {entry["id"]: entry for entry in json.loads((FIXTURES / "sql_parity_inventory.json").read_text())["entries"]}
             for case_id, profile_index in (("sql-0373", 2), ("sql-0374", 0), ("sql-0383", 5), ("sql-0378", 0)):
                 with self.subTest(original=case_id):

@@ -84,6 +84,15 @@ test "pgwire COPY validates force columns and enforces per-field allocation boun
     var arena: std.heap.ArenaAllocator = .init(allocator);
     defer arena.deinit();
     const columns: []const backend.Column = &.{.{ .name = "s", .type = .string }};
+    {
+        var duplicate = try Encoder.init(allocator, arena.allocator(), &.{ .{ .name = "x", .type = .string }, .{ .name = "x", .type = .string } }, .{ .format = .csv, .force_quote_columns = &.{"x"} }, 64);
+        defer duplicate.deinit();
+        var bytes: std.Io.Writer.Allocating = .init(allocator);
+        defer bytes.deinit();
+        const row: backend.Result = .{ .columns = duplicate.columns, .rows = &.{&.{ .{ .string = "a" }, .{ .string = "b" } }}, .command_tag = "SELECT" };
+        try duplicate.row(arena.allocator(), &bytes.writer, row, 0);
+        try std.testing.expectEqualStrings("\"a\",b\n", bytes.written());
+    }
     try std.testing.expectError(error.UnknownColumn, Encoder.init(allocator, arena.allocator(), columns, .{ .format = .csv, .force_quote_columns = &.{"missing"} }, 64));
     var encoder = try Encoder.init(allocator, arena.allocator(), columns, .{}, 3);
     defer encoder.deinit();
@@ -113,6 +122,9 @@ pub const Encoder = struct {
             for (columns, 0..) |column, index| if (std.mem.eql(u8, column.name, column_name)) {
                 force[index] = true;
                 found = true;
+                // PostgreSQL resolves named COPY options to the first output
+                // attribute even when a query repeats that attribute label.
+                break;
             };
             if (!found) return error.UnknownColumn;
         }
