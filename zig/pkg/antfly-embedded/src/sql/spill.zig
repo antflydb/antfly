@@ -1060,10 +1060,13 @@ pub fn encodeColumnarBatchVersionAlloc(a: Allocator, values: @import("execution_
 /// Output capacity belongs to output_alloc; scratch never enters that owner.
 /// On failure the initialized output prefix is restored; capacity may grow.
 pub fn appendColumnarBatchVersion(output_alloc: Allocator, scratch: Allocator, bytes: *std.ArrayList(u8), values: @import("execution_batch.zig").Batch, ordinals: []const u64, max_bytes: usize, version: ColumnarVersion) !void {
+    return appendColumnarBatchVersionMode(output_alloc, scratch, bytes, values, ordinals, max_bytes, version, null);
+}
+fn appendColumnarBatchVersionMode(output_alloc: Allocator, scratch: Allocator, bytes: *std.ArrayList(u8), values: @import("execution_batch.zig").Batch, ordinals: []const u64, max_bytes: usize, version: ColumnarVersion, manager: ?*Manager) !void {
     if (values.len() == 0 or values.len() > 256 or values.width() > 1024 or ordinals.len != values.len()) return error.InvalidSqlSpill;
     const start = bytes.items.len;
     errdefer bytes.shrinkRetainingCapacity(start);
-    var encoder: Encoder = .{ .compact_arrays = version == .v2, .a = output_alloc, .scratch = @import("memory_budget.zig").reclaimingAllocator(scratch), .bytes = bytes, .base = start, .limit = max_bytes };
+    var encoder: Encoder = .{ .manager = manager, .compact_arrays = version == .v2, .a = output_alloc, .scratch = @import("memory_budget.zig").reclaimingAllocator(scratch), .bytes = bytes, .base = start, .limit = max_bytes };
     try encoder.append(if (version == .v1) columnar_v1_magic else columnar_v2_magic);
     try encoder.word(values.len());
     try encoder.word(values.width());
@@ -1091,12 +1094,15 @@ pub fn decodeColumnarBlockForForwarding(a: Allocator, cache_backing: Allocator, 
     return decodeColumnarBlockMode(a, cache_backing, bytes, max_bytes, .forwarding);
 }
 fn decodeColumnarBlockMode(a: Allocator, cache_backing: ?Allocator, bytes: []const u8, max_bytes: usize, consumption: JsonConsumption) !ColumnarBlock {
+    return decodeColumnarBlockManaged(a, cache_backing, bytes, max_bytes, consumption, null);
+}
+fn decodeColumnarBlockManaged(a: Allocator, cache_backing: ?Allocator, bytes: []const u8, max_bytes: usize, consumption: JsonConsumption, manager: ?*Manager) !ColumnarBlock {
     if (bytes.len > max_bytes or bytes.len < columnar_v1_magic.len) return error.InvalidSqlSpill;
     const compact = std.mem.startsWith(u8, bytes, columnar_v2_magic);
     if (!compact and !std.mem.startsWith(u8, bytes, columnar_v1_magic)) return error.InvalidSqlSpill;
     var json_scratch: JsonScratch = .{ .a = @import("memory_budget.zig").reclaimingAllocator(a) };
     defer json_scratch.deinit();
-    var decoder: Decoder = .{ .json_consumption = consumption, .json_scratch = &json_scratch, .lazy_json = cache_backing != null, .cache_backing = cache_backing, .borrow_compact = true, .compact_arrays = compact, .a = a, .bytes = bytes, .position = columnar_v1_magic.len };
+    var decoder: Decoder = .{ .manager = manager, .json_consumption = consumption, .json_scratch = &json_scratch, .lazy_json = cache_backing != null, .cache_backing = cache_backing, .borrow_compact = true, .compact_arrays = compact, .a = a, .bytes = bytes, .position = columnar_v1_magic.len };
     errdefer if (decoder.json_owner) |owner| owner.deinit();
     const count = try decoder.count();
     const width = try decoder.count();
@@ -1112,40 +1118,63 @@ fn decodeColumnarBlockMode(a: Allocator, cache_backing: ?Allocator, bytes: []con
     return .{ .values = values, .keys = keys, .ordinals = ordinals, .json_owner = decoder.json_owner };
 }
 
-/// Sequential native runs use typed column blocks when multiple rows fit;
-/// wide rows retain the compact record framing without extra staging copies.
-/// Random-access hash chains
-/// keep File's independently framed records. Logical offsets here are row
-/// ordinals; readers consume blocks in order and may restart at ordinal zero.
 /// Random-access native payloads for hash chains. The chain's separate small
 /// key record owns the link/matched flag; failed key comparisons never read
 /// this file. Offsets are physical, so reverse chains do not replay prefixes.
 pub const JoinPayloads = struct {
+    // Exact, canonical page bytes own their keys. Cache metadata and bytes are
+    // bounded independently of relation cardinality, with no borrowed keys.
+    const Cached = struct { bytes: []u8, offset: u64, hash: u64 };
+    pub const page_bytes = 16 * 1024;
+    pub const page_rows = 64;
     file: File,
+    recent: [4]?Cached = @splat(null),
+    next_recent: usize = 0,
     pub fn init(manager: *Manager) !JoinPayloads {
         var file = try manager.create();
         file.buffer_bytes = @min(4096, manager.buffer_bytes);
         return .{ .file = file };
     }
     pub fn close(self: *JoinPayloads) void {
+        for (self.recent) |entry| if (entry) |cached| self.file.manager.allocator().free(cached.bytes);
         self.file.close();
     }
-    pub fn append(self: *JoinPayloads, values: @import("execution_batch.zig").Batch, ordinal: u64) !u64 {
-        if (values.len() != 1) return error.InvalidSqlSpill;
-        var arena = std.heap.ArenaAllocator.init(self.file.manager.allocator());
+    /// Ordinals belong to the separate key chain. Canonical zero ordinals let
+    /// identical payload pages share storage even across producer leases.
+    pub fn appendBatch(self: *JoinPayloads, values: @import("execution_batch.zig").Batch) !u64 {
+        if (values.len() == 0 or values.len() > page_rows) return error.InvalidSqlSpill;
+        const manager = self.file.manager;
+        try manager.check();
+        var arena = std.heap.ArenaAllocator.init(manager.allocator());
         defer arena.deinit();
-        const wire = try encodeColumnarBatchVersionAlloc(arena.allocator(), values, &.{ordinal}, self.file.manager.max_record_bytes, .v2);
+        var output: std.ArrayList(u8) = .empty;
+        const temporary = @import("memory_budget.zig").reclaimingAllocator(arena.allocator());
+        defer output.deinit(temporary);
+        const ordinals: [page_rows]u64 = @splat(0);
+        try appendColumnarBatchVersionMode(temporary, temporary, &output, values, ordinals[0..values.len()], manager.max_record_bytes, .v2, manager);
+        const wire = output.items;
+        const hash = std.hash.Wyhash.hash(0, wire);
+        for (self.recent) |entry| if (entry) |cached| {
+            if (cached.hash == hash and std.mem.eql(u8, cached.bytes, wire)) return cached.offset;
+        };
+        const remembered = if (wire.len <= page_bytes) try manager.allocator().dupe(u8, wire) else null;
+        errdefer if (remembered) |bytes| manager.allocator().free(bytes);
         const compressed = if (self.file.manager.compression == .snappy and wire.len >= 1024) try snappy.encode(arena.allocator(), wire) else null;
         const use_compressed = compressed != null and compressed.?.len + 32 < wire.len;
         const stored = if (use_compressed) compressed.? else wire;
         var header: [17]u8 = undefined;
         header[16] = @intFromBool(use_compressed);
         std.mem.writeInt(u64, header[0..8], stored.len, .little);
-        std.mem.writeInt(u64, header[8..16], std.hash.Wyhash.hash(0, wire), .little);
+        std.mem.writeInt(u64, header[8..16], hash, .little);
         const offset = self.file.size;
         try self.file.writeRaw(offset, &header);
         try self.file.writeRaw(offset + header.len, stored);
         self.file.manager.increment("compressed_records", @intFromBool(use_compressed));
+        if (remembered) |bytes| {
+            if (self.recent[self.next_recent]) |old| manager.allocator().free(old.bytes);
+            self.recent[self.next_recent] = .{ .bytes = bytes, .offset = offset, .hash = hash };
+            self.next_recent = (self.next_recent + 1) % self.recent.len;
+        }
         return offset;
     }
     pub fn read(self: *JoinPayloads, offset: u64) !*Sequential.OwnedBlock {
@@ -1157,19 +1186,25 @@ pub const JoinPayloads = struct {
         const owner = try a.create(Sequential.OwnedBlock);
         owner.* = .{ .a = a, .arena = .init(a) };
         errdefer owner.release();
-        const encoded = try owner.arena.allocator().alloc(u8, @intCast(length));
-        try self.file.readRaw(offset + header.len, encoded);
         const wire = if (header[16] == 1) blk: {
+            // Compressed input is decode scratch, not retained page storage.
+            const encoded = try a.alloc(u8, @intCast(length));
+            defer a.free(encoded);
+            try self.file.readRaw(offset + header.len, encoded);
             const decoded_len = snappy.decodedLen(encoded) catch return error.InvalidSqlSpill;
             if (decoded_len > self.file.manager.max_record_bytes) return error.InvalidSqlSpill;
             break :blk snappy.decode(owner.arena.allocator(), encoded) catch |err| switch (err) {
                 error.OutOfMemory => return err,
                 else => return error.InvalidSqlSpill,
             };
-        } else encoded;
+        } else blk: {
+            const encoded = try owner.arena.allocator().alloc(u8, @intCast(length));
+            try self.file.readRaw(offset + header.len, encoded);
+            break :blk encoded;
+        };
         if (std.hash.Wyhash.hash(0, wire) != std.mem.readInt(u64, header[8..16], .little)) return error.InvalidSqlSpill;
-        owner.encoded = try decodeColumnarBlockForForwarding(owner.arena.allocator(), a, wire, self.file.manager.max_record_bytes);
-        if (owner.count() != 1) return error.InvalidSqlSpill;
+        owner.encoded = try decodeColumnarBlockManaged(owner.arena.allocator(), a, wire, self.file.manager.max_record_bytes, .forwarding, self.file.manager);
+        if (owner.count() == 0 or owner.count() > page_rows) return error.InvalidSqlSpill;
         return owner;
     }
 };
@@ -1950,6 +1985,18 @@ pub const Sequential = struct {
         rows: []const Row = &.{},
         encoded: ?ColumnarBlock = null,
         refs: std.atomic.Value(usize) = .init(1),
+        /// Include separately owned lazy DOM/text caches in retention policy.
+        /// The page's immutable metadata arena has one owner; cache publication
+        /// synchronizes through JsonOwner just as scalar/text access does.
+        pub fn retainedBytes(self: *const OwnedBlock) usize {
+            var bytes = self.arena.queryCapacity();
+            if (self.encoded) |encoded| if (encoded.json_owner) |owner| {
+                while (!owner.mutex.tryLock()) std.atomic.spinLoopHint();
+                defer owner.mutex.unlock();
+                bytes +|= owner.arena.queryCapacity();
+            };
+            return bytes;
+        }
         pub fn count(self: *const OwnedBlock) usize {
             return if (self.encoded) |v| v.ordinals.len else self.rows.len;
         }
@@ -5176,17 +5223,20 @@ test "SQL native chain payloads retain physical offsets validate corruption and 
         defer file.close();
         var text: [8192]u8 = @splat('x');
         const row = [_]Datum{Datum.json(.{ .string = &text })};
-        const first = try file.append(.{ .rows = &.{&row} }, 7);
-        const second = try file.append(.{ .rows = &.{&row} }, 11);
+        const first = try file.appendBatch(.{ .rows = &.{&row} });
+        try std.testing.expectEqual(first, try file.appendBatch(.{ .rows = &.{&row} }));
+        text[0] = 'z';
+        const second = try file.appendBatch(.{ .rows = &.{&row} });
+        try std.testing.expect(first != second);
         @memset(&text, 'y');
         const later = try file.read(second);
         defer later.release();
         const earlier = try file.read(first);
         defer earlier.release();
-        try std.testing.expectEqual(@as(u64, 11), later.ordinal(0));
-        try std.testing.expectEqual(@as(u64, 7), earlier.ordinal(0));
+        try std.testing.expectEqual(@as(u64, 0), later.ordinal(0));
+        try std.testing.expectEqual(@as(u64, 0), earlier.ordinal(0));
         try std.testing.expectEqual(@as(u8, 'x'), (try earlier.cell(0, 0)).value.string[0]);
-        try std.testing.expectEqual(@as(u8, 'x'), (try later.cell(0, 0)).value.string[0]);
+        try std.testing.expectEqual(@as(u8, 'z'), (try later.cell(0, 0)).value.string[0]);
         canceled = true;
         try std.testing.expectError(error.QueryCanceled, file.read(first));
         canceled = false;
@@ -5200,4 +5250,30 @@ test "SQL native chain payloads retain physical offsets validate corruption and 
         try file.file.writeRaw(first + 8, header[8..16]);
         try std.testing.expectError(error.InvalidSqlSpill, file.read(first));
     }
+}
+
+test "SQL native payload pages enforce statement array limits on write and read" {
+    const Hook = struct {
+        fn check(_: *anyopaque) !void {}
+    };
+    const a = std.testing.allocator;
+    var dummy: u8 = 0;
+    var manager: Manager = .{ .alloc = a, .io = std.testing.io, .context = &dummy, .checkpoint = Hook.check, .async_writes = false };
+    defer manager.deinit();
+    var file = try JoinPayloads.init(&manager);
+    defer file.close();
+    const arrays = @import("array_value.zig");
+    const elements: [32]Datum = @splat(.{});
+    const array = try arrays.Value.init(.int32, &.{.{ .length = 32 }}, &elements, .{});
+    const values = [_]Datum{Datum.typedArray(&array)};
+    manager.array_limits.elements = 16;
+    try std.testing.expectError(error.SqlProgramLimitExceeded, file.appendBatch(.{ .rows = &.{&values} }));
+    try std.testing.expectEqual(@as(u64, 0), file.file.size);
+    manager.array_limits.elements = 32;
+    const offset = try file.appendBatch(.{ .rows = &.{&values} });
+    const block = try file.read(offset);
+    defer block.release();
+    try std.testing.expectEqual(@as(usize, 32), (try block.cell(0, 0)).array.?.cardinality());
+    manager.array_limits.elements = 16;
+    try std.testing.expectError(error.InvalidSqlSpill, file.read(offset));
 }

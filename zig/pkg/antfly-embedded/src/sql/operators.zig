@@ -584,6 +584,8 @@ pub const GroupResult = struct {
 /// Build-side ownership for a streaming hash join. Probe rows remain borrowed
 /// from one native page; only the build relation occupies retained memory.
 pub const HashJoin = struct {
+    const PayloadCache = struct { block: *@import("spill.zig").Sequential.OwnedBlock, offset: u64 };
+
     pub const Limits = struct { rows: usize = 100000, bytes: usize = 8 * 1024 * 1024, spill: ?*@import("spill.zig").Manager = null };
     const Entry = struct { next: ?usize, width: usize, matched: bool = false };
     pub const Match = struct {
@@ -597,9 +599,10 @@ pub const HashJoin = struct {
             join: *HashJoin,
             offset: u64,
             width: usize,
+            row: usize = 0,
             pub fn block(self: @This()) !*@import("spill.zig").Sequential.OwnedBlock {
                 const result = try self.join.diskBlock(self.offset);
-                if (result.width() != self.width) return error.InvalidSqlSpill;
+                if (result.width() != self.width or self.row >= result.count()) return error.InvalidSqlSpill;
                 return result;
             }
         };
@@ -611,7 +614,11 @@ pub const HashJoin = struct {
         }
         /// Keep build payloads encoded when transferring into another operator.
         pub fn valuesBatch(self: Match, alloc: Allocator) !@import("execution_batch.zig").Batch {
-            if (self.native) |native| return (try native.block()).batch(alloc, false);
+            if (self.native) |native| {
+                const source = try alloc.create(@import("execution_batch.zig").Batch);
+                source.* = try (try native.block()).batch(alloc, false);
+                return source.select(alloc, try alloc.dupe(usize, &.{native.row}));
+            }
             if (self.owner) |owner| if (owner.entries.items[self.index].width == owner.value_columns.columns.len)
                 return .{ .retained = .{ .store = &owner.value_columns, .begin = self.index, .count = 1 } };
             const rows = try alloc.alloc([]const Datum, 1);
@@ -622,7 +629,7 @@ pub const HashJoin = struct {
             if (self.native) |native| {
                 const block = try native.block();
                 const values = try alloc.alloc(Datum, block.width());
-                for (values, 0..) |*value, column| value.* = try cloneDatum(alloc, try block.cell(0, column));
+                for (values, 0..) |*value, column| value.* = try cloneDatum(alloc, try block.cell(native.row, column));
                 return values;
             }
             if (self.owner) |owner| return owner.value_columns.rowWidth(alloc, self.index, owner.entries.items[self.index].width);
@@ -684,20 +691,53 @@ pub const HashJoin = struct {
     disk: ?@import("spill.zig").File = null,
     disk_heads: []u64 = &.{},
     disk_values: ?*@import("spill.zig").JoinPayloads = null,
-    disk_payload: ?*@import("spill.zig").Sequential.OwnedBlock = null,
-    disk_payload_offset: u64 = @import("spill.zig").none,
+    disk_payloads: [4]?PayloadCache = @splat(null),
+    next_payload: usize = 0,
     payload_reads: usize = 0,
     disk_arena: std.heap.ArenaAllocator = undefined,
     row_count: usize = 0,
+    fn clearPayloadCache(self: *HashJoin) void {
+        for (&self.disk_payloads) |*entry| {
+            if (entry.*) |cached| cached.block.release();
+            entry.* = null;
+        }
+    }
+    fn trimPayloadCache(self: *HashJoin, keep: u64) void {
+        var live: usize = 0;
+        for (self.disk_payloads) |entry| if (entry) |cached| {
+            live +|= cached.block.retainedBytes();
+        };
+        for (0..self.disk_payloads.len) |step| {
+            const entry = &self.disk_payloads[(self.next_payload + step) % self.disk_payloads.len];
+            if (entry.*) |cached| if (cached.offset != keep and live > 64 * 1024) {
+                live -|= cached.block.retainedBytes();
+                cached.block.release();
+                entry.* = null;
+            };
+        }
+    }
     fn diskBlock(self: *HashJoin, offset: u64) !*@import("spill.zig").Sequential.OwnedBlock {
-        if (self.disk_payload_offset == offset) return self.disk_payload orelse error.InvalidSqlSpill;
-        if (self.disk_payload) |block| block.release();
-        self.disk_payload = null;
-        self.disk_payload_offset = @import("spill.zig").none;
+        self.trimPayloadCache(offset);
+        for (self.disk_payloads) |entry| if (entry) |cached| {
+            if (cached.offset == offset) return cached.block;
+        };
+        // Retain at most four small pages (64 KiB including lazy caches), or one
+        // oversized page. Output leases may pin evicted blocks independently.
         const payloads = self.disk_values orelse return error.InvalidSqlSpill;
+        if (@import("memory_budget.zig").headroom(payloads.file.manager.alloc)) |available| {
+            if (available < payloads.file.manager.max_record_bytes *| 3 +| 64 * 1024) self.clearPayloadCache();
+        }
         const block = try payloads.read(offset);
-        self.disk_payload = block;
-        self.disk_payload_offset = offset;
+        const bytes = block.retainedBytes();
+        var live: usize = bytes;
+        for (self.disk_payloads) |entry| if (entry) |cached| {
+            live +|= cached.block.retainedBytes();
+        };
+        if (live > 64 * 1024) self.clearPayloadCache();
+        const slot = self.next_payload;
+        if (self.disk_payloads[slot]) |old| old.block.release();
+        self.disk_payloads[slot] = .{ .block = block, .offset = offset };
+        self.next_payload = (slot + 1) % self.disk_payloads.len;
         self.payload_reads += 1;
         return block;
     }
@@ -707,48 +747,167 @@ pub const HashJoin = struct {
     fn diskMatch(self: *HashJoin, index: usize, decoded: @import("spill.zig").Decoded) !Match {
         if (decoded.row.ordinal & native_payload_bit == 0)
             return .{ .index = index, .values = decoded.row.values, .keys = decoded.row.keys, .transient = true };
-        if (decoded.row.values.len != 1 or decoded.row.values[0].sql_null or decoded.row.values[0].value != .integer) return error.InvalidSqlSpill;
+        if (decoded.row.values.len != 2 or decoded.row.values[0].sql_null or decoded.row.values[0].value != .integer or decoded.row.values[1].sql_null or decoded.row.values[1].value != .integer) return error.InvalidSqlSpill;
         const width = std.math.cast(usize, decoded.row.values[0].value.integer) orelse return error.InvalidSqlSpill;
-        if (width > 1024) return error.InvalidSqlSpill;
-        return .{ .index = index, .keys = decoded.row.keys, .transient = true, .native = .{ .join = self, .offset = decoded.row.ordinal & ~native_payload_bit, .width = width } };
+        const row = std.math.cast(usize, decoded.row.values[1].value.integer) orelse return error.InvalidSqlSpill;
+        if (width > 1024 or row >= @import("spill.zig").JoinPayloads.page_rows) return error.InvalidSqlSpill;
+        return .{ .index = index, .keys = decoded.row.keys, .transient = true, .native = .{ .join = self, .offset = decoded.row.ordinal & ~native_payload_bit, .width = width, .row = row } };
     }
     /// Tiny scalar rows retain the single-record path. Native JSON and larger
     /// payloads split from the key chain, preserving encoded source capabilities
     /// and avoiding a second file / extra reads for ordinary narrow joins.
-    fn writeDiskRecord(manager: *@import("spill.zig").Manager, file: *@import("spill.zig").File, payloads: *?*@import("spill.zig").JoinPayloads, values: @import("execution_batch.zig").Batch, keys: []const Datum, ordinal: u64, link: u64) !u64 {
+    fn writeDiskRecord(manager: *@import("spill.zig").Manager, file: *@import("spill.zig").File, payloads: *?*@import("spill.zig").JoinPayloads, values: @import("execution_batch.zig").Batch, keys: []const Datum, ordinal: u64, link: u64, inline_budget: usize) !u64 {
         if (ordinal >= native_payload_bit) return error.SqlProgramLimitExceeded;
         var arena = std.heap.ArenaAllocator.init(manager.allocator());
         defer arena.deinit();
-        var native = false;
-        for (0..values.width()) |column| {
-            if (try values.frozenJson(0, column) != null or try values.encodedJson(0, column) != null) {
-                native = true;
-                break;
-            }
-        }
-        const cells: []Datum = if (!native) try arena.allocator().alloc(Datum, values.width()) else &.{};
-        if (!native) {
-            var bytes: usize = 0;
-            for (cells, 0..) |*cell, column| {
-                cell.* = try values.cell(arena.allocator(), 0, column);
-                bytes +|= if (cell.array != null or cell.numeric != null or cell.patterns != null)
-                    try datumBytes(cell.*)
-                else
-                    try @import("typed_store.zig").retainedCellBytes(cell.*);
-            }
-            native = bytes > 1024;
-        }
-        if (!native) return file.append(.{ .values = cells, .keys = keys, .ordinal = ordinal }, link);
+        if (try nativeRowBytes(values, 0, keys, inline_budget, arena.allocator()) == null)
+            return file.append(.{ .values = try values.row(arena.allocator(), 0), .keys = keys, .ordinal = ordinal }, link);
         if (payloads.* == null) {
             const owner = try manager.allocator().create(@import("spill.zig").JoinPayloads);
             errdefer manager.allocator().destroy(owner);
             owner.* = try @import("spill.zig").JoinPayloads.init(manager);
             payloads.* = owner;
         }
-        const native_values: @import("execution_batch.zig").Batch = if (cells.len != 0) .{ .rows = &.{cells} } else values;
-        const payload = try payloads.*.?.append(native_values, ordinal);
+        const payload = try payloads.*.?.appendBatch(values);
         if (payload >= native_payload_bit) return error.SqlProgramLimitExceeded;
-        return file.append(.{ .values = &.{Datum.json(.{ .integer = @intCast(values.width()) })}, .keys = keys, .ordinal = payload | native_payload_bit }, link);
+        return file.append(.{ .values = &.{ Datum.json(.{ .integer = @intCast(values.width()) }), Datum.json(.{ .integer = 0 }) }, .keys = keys, .ordinal = payload | native_payload_bit }, link);
+    }
+    /// Include boxed decoding, wire storage and arena growth in the inline
+    /// choice. Payloads that exceed that allowance use the manager-owned lane.
+    fn nativeRowBytes(values: @import("execution_batch.zig").Batch, row: usize, keys: []const Datum, inline_budget: usize, a: Allocator) !?usize {
+        var native = false;
+        var retained: usize = 0;
+        var decoded: usize = 0;
+        for (keys) |key| decoded +|= try datumBytes(key);
+        for (0..values.width()) |column| {
+            if (try values.frozenJson(row, column)) |frozen| {
+                native = true;
+                retained +|= frozen.bytes.len +| 32;
+            } else if (try values.encodedJson(row, column)) |text| {
+                native = true;
+                retained +|= text.len +| 32;
+            } else {
+                const cell = try values.cell(a, row, column);
+                decoded +|= try datumBytes(cell);
+                retained +|= if (cell.array != null or cell.numeric != null or cell.patterns != null) try datumBytes(cell) else try @import("typed_store.zig").retainedCellBytes(cell);
+            }
+        }
+        return if (native or retained > 1024 or decoded *| 2 +| 2048 > inline_budget) retained +| 64 else null;
+    }
+    const PayloadIdentity = [16]struct { kind: u64 = 0, first: u64 = 0, second: u64 = 0 };
+    /// Physical identity is valid only within this immutable producer lease.
+    /// Unsupported compound DOMs decline sharing; no pointer keys persist.
+    fn payloadIdentity(values: @import("execution_batch.zig").Batch, row: usize, a: Allocator) !?PayloadIdentity {
+        if (values.width() > 16) return null;
+        var result: PayloadIdentity = @splat(.{});
+        for (result[0..values.width()], 0..) |*part, column| {
+            if (try values.frozenJson(row, column)) |frozen| {
+                part.* = .{ .kind = if (frozen.lossless_text) 1 else 2, .first = @intFromPtr(frozen.bytes.ptr), .second = frozen.bytes.len };
+            } else if (try values.encodedJson(row, column)) |text| {
+                part.* = .{ .kind = 3, .first = @intFromPtr(text.ptr), .second = text.len };
+            } else {
+                const cell = try values.cell(a, row, column);
+                if (cell.sql_null) {
+                    if (cell.value != .null or cell.array != null or cell.numeric != null or cell.patterns != null) return null;
+                    part.kind = 4;
+                    continue;
+                }
+                if (cell.array) |value| {
+                    if (cell.value != .null or cell.numeric != null or cell.patterns != null) return null;
+                    part.* = .{ .kind = 5, .first = @intFromPtr(value) };
+                    continue;
+                }
+                if (cell.numeric) |value| {
+                    if (cell.value != .null or cell.patterns != null) return null;
+                    part.* = .{ .kind = 6, .first = @intFromPtr(value) };
+                    continue;
+                }
+                if (cell.patterns) |value| {
+                    if (cell.value != .null) return null;
+                    part.* = .{ .kind = 7, .first = @intFromPtr(value) };
+                    continue;
+                }
+                part.* = switch (cell.value) {
+                    .null => .{ .kind = 8 },
+                    .bool => |value| .{ .kind = 9, .first = @intFromBool(value) },
+                    .integer => |value| .{ .kind = 10, .first = @bitCast(value) },
+                    .float => |value| .{ .kind = 11, .first = @bitCast(value) },
+                    .string => |value| .{ .kind = 12, .first = @intFromPtr(value.ptr), .second = value.len },
+                    .number_string => |value| .{ .kind = 13, .first = @intFromPtr(value.ptr), .second = value.len },
+                    else => return null,
+                };
+            }
+        }
+        return result;
+    }
+    /// One bounded producer cohort. Native rows share immutable payload pages;
+    /// narrow rows keep the single-file path. Only page offsets and lane IDs
+    /// enter key records, so source identities retire before the next pull.
+    fn writeDiskCohort(manager: *@import("spill.zig").Manager, file: *@import("spill.zig").File, payloads: *?*@import("spill.zig").JoinPayloads, heads: []u64, values: @import("execution_batch.zig").Batch, keys: []const []const Datum, ordinal: usize, inline_budget: usize) !void {
+        const Payloads = @import("spill.zig").JoinPayloads;
+        if (values.len() == 0 or values.len() > Payloads.page_rows or keys.len != values.len()) return error.InvalidSqlBackendResponse;
+        if (ordinal >= native_payload_bit or values.len() > native_payload_bit - ordinal) return error.SqlProgramLimitExceeded;
+        var arena = std.heap.ArenaAllocator.init(manager.allocator());
+        defer arena.deinit();
+        const a = arena.allocator();
+        var identities: std.AutoHashMapUnmanaged(PayloadIdentity, usize) = .empty;
+        var native: [Payloads.page_rows]?usize = @splat(null);
+        var positions: [Payloads.page_rows]usize = undefined;
+        var costs: [Payloads.page_rows]usize = undefined;
+        const Ref = struct { offset: u64, row: usize };
+        var refs: [Payloads.page_rows]Ref = undefined;
+        var unique: usize = 0;
+        for (keys, 0..) |key, row| {
+            if (key.len > 256 or key.len != keys[0].len) return error.InvalidSqlBackendResponse;
+            if (try nativeRowBytes(values, row, key, inline_budget, a)) |bytes| {
+                if (try payloadIdentity(values, row, a)) |identity| {
+                    const entry = try identities.getOrPut(a, identity);
+                    if (entry.found_existing) {
+                        native[row] = entry.value_ptr.*;
+                        continue;
+                    }
+                    entry.value_ptr.* = unique;
+                }
+                positions[unique] = row;
+                costs[unique] = bytes;
+                native[row] = unique;
+                unique += 1;
+            }
+        }
+        if (unique != 0 and payloads.* == null) {
+            const owner = try manager.allocator().create(Payloads);
+            errdefer manager.allocator().destroy(owner);
+            owner.* = try Payloads.init(manager);
+            payloads.* = owner;
+        }
+        var begin: usize = 0;
+        while (begin < unique) {
+            var end = begin;
+            var bytes: usize = 64;
+            const target = @min(Payloads.page_bytes, manager.max_record_bytes / 4);
+            while (end < unique) : (end += 1) {
+                if (end != begin and costs[end] > target -| bytes) break;
+                bytes +|= costs[end];
+            }
+            const selected = try values.select(a, positions[begin..end]);
+            const offset = try payloads.*.?.appendBatch(selected);
+            if (offset >= native_payload_bit) return error.SqlProgramLimitExceeded;
+            for (refs[begin..end], 0..) |*ref, row| ref.* = .{ .offset = offset, .row = row };
+            begin = end;
+        }
+        var row_scratch = std.heap.ArenaAllocator.init(manager.allocator());
+        defer row_scratch.deinit();
+        for (keys, 0..) |key, row| {
+            _ = row_scratch.reset(.{ .retain_with_limit = 8192 });
+            const hashed = try keyHash(key);
+            const bucket = if (hashed) |hash| hash & (heads.len - 1) else 0;
+            const link = if (hashed != null) heads[bucket] else @import("spill.zig").none;
+            const offset = if (native[row]) |id| blk: {
+                const ref = refs[id];
+                break :blk try file.append(.{ .values = &.{ Datum.json(.{ .integer = @intCast(values.width()) }), Datum.json(.{ .integer = @intCast(ref.row) }) }, .keys = key, .ordinal = ref.offset | native_payload_bit }, link);
+            } else try file.append(.{ .values = try values.row(row_scratch.allocator(), row), .keys = key, .ordinal = ordinal + row }, link);
+            if (hashed != null) heads[bucket] = offset;
+        }
     }
     fn startSpill(self: *HashJoin) !void {
         const manager = self.limits.spill orelse return error.SqlProgramLimitExceeded;
@@ -764,15 +923,25 @@ pub const HashJoin = struct {
             owner.close();
             manager.allocator().destroy(owner);
         };
-        for (self.entries.items, 0..) |_, ordinal| {
+        var ordinal: usize = 0;
+        while (ordinal < self.entries.items.len) {
             var arena = std.heap.ArenaAllocator.init(self.backing);
             defer arena.deinit();
-            const values = try (Match{ .owner = self, .index = ordinal }).valuesBatch(arena.allocator());
-            const keys = try self.key_columns.row(arena.allocator(), ordinal);
-            const hashed = try keyHash(keys);
-            const bucket = if (hashed) |value| value & (heads.len - 1) else 0;
-            const offset = try writeDiskRecord(manager, &file, &payloads, values, keys, ordinal, if (hashed != null) heads[bucket] else @import("spill.zig").none);
-            if (hashed != null) heads[bucket] = offset;
+            const a = arena.allocator();
+            if (self.entries.items[ordinal].width != self.value_columns.columns.len) {
+                const values = try (Match{ .owner = self, .index = ordinal }).valuesBatch(a);
+                const keys = try self.key_columns.row(a, ordinal);
+                try writeDiskCohort(manager, &file, &payloads, heads, values, &.{keys}, ordinal, self.budget.limit -| heads.len * @sizeOf(u64));
+                ordinal += 1;
+                continue;
+            }
+            var end = ordinal;
+            while (end < self.entries.items.len and end - ordinal < @import("spill.zig").JoinPayloads.page_rows and self.entries.items[end].width == self.value_columns.columns.len) : (end += 1) {}
+            const keys = try a.alloc([]const Datum, end - ordinal);
+            for (keys, ordinal..) |*key, index| key.* = try self.key_columns.row(a, index);
+            const values: @import("execution_batch.zig").Batch = .{ .retained = .{ .store = &self.value_columns, .begin = ordinal, .count = end - ordinal } };
+            try writeDiskCohort(manager, &file, &payloads, heads, values, keys, ordinal, self.budget.limit -| heads.len * @sizeOf(u64));
+            ordinal = end;
         }
         self.value_columns.deinit();
         self.key_columns.deinit();
@@ -791,7 +960,7 @@ pub const HashJoin = struct {
         if (keys.len > 256 or (self.key_count != null and self.key_count.? != keys.len)) return error.InvalidSqlBackendResponse;
         const hashed = try keyHash(keys);
         const bucket = if (hashed) |value| value & (self.disk_heads.len - 1) else 0;
-        const offset = try writeDiskRecord(self.limits.spill.?, &self.disk.?, &self.disk_values, values, keys, self.row_count, if (hashed != null) self.disk_heads[bucket] else @import("spill.zig").none);
+        const offset = try writeDiskRecord(self.limits.spill.?, &self.disk.?, &self.disk_values, values, keys, self.row_count, if (hashed != null) self.disk_heads[bucket] else @import("spill.zig").none, self.budget.limit -| self.disk_heads.len * @sizeOf(u64));
         if (hashed != null) self.disk_heads[bucket] = offset;
         self.key_count = keys.len;
     }
@@ -806,7 +975,7 @@ pub const HashJoin = struct {
     }
     pub fn deinit(self: *HashJoin) void {
         const alloc = self.budget.allocator();
-        if (self.disk_payload) |block| block.release();
+        self.clearPayloadCache();
         if (self.disk_values) |file| {
             file.close();
             self.limits.spill.?.allocator().destroy(file);
@@ -929,11 +1098,17 @@ pub const HashJoin = struct {
             if (self.disk == null) try self.startSpill();
             var region = std.heap.ArenaAllocator.init(@import("memory_budget.zig").reclaimingAllocator(a));
             defer region.deinit();
-            for (keys[begin..], begin..) |key, index| {
+            while (begin < keys.len) {
                 _ = region.reset(.retain_capacity);
-                const selected = try batch.select(region.allocator(), &.{index});
-                try self.appendDiskBatch(selected, key);
-                self.row_count += 1;
+                const end = @min(keys.len, begin + @import("spill.zig").JoinPayloads.page_rows);
+                const positions = try region.allocator().alloc(usize, end - begin);
+                for (positions, begin..) |*position, index| position.* = index;
+                const selected = try batch.select(region.allocator(), positions);
+                if (self.key_count != null and keys[begin].len != self.key_count.?) return error.InvalidSqlBackendResponse;
+                try writeDiskCohort(self.limits.spill.?, &self.disk.?, &self.disk_values, self.disk_heads, selected, keys[begin..end], self.row_count, self.budget.limit -| self.disk_heads.len * @sizeOf(u64));
+                self.key_count = keys[begin].len;
+                self.row_count += end - begin;
+                begin = end;
             }
             return;
         }
@@ -3070,4 +3245,171 @@ test "SQL native chains keep narrow rows inline and mix native payloads" {
     try std.testing.expectEqual(@as(usize, 8), small_values.len);
     try std.testing.expectEqual(@as(i64, 42), small_values[0].value.integer);
     try std.testing.expect((try probe.next()) == null);
+}
+
+test "SQL native spill pages share leased payloads pack distinct lanes and retain evicted blocks" {
+    const Fixture = struct {
+        fn check(_: *anyopaque) !void {}
+        fn run(a: Allocator, repeated: bool, scalar_input: bool, count: usize, measure: bool) !void {
+            const spill = @import("spill.zig");
+            var dummy: u8 = 0;
+            var manager: spill.Manager = .{ .alloc = a, .io = std.testing.io, .context = &dummy, .checkpoint = check, .compression = .none, .async_writes = false };
+            defer manager.deinit();
+            const join = try HashJoin.create(a, .{ .bytes = 8192, .spill = &manager });
+            var live = true;
+            defer if (live) join.deinit();
+            try join.startSpill();
+            const key = Datum.json(.{ .integer = 1 });
+            {
+                var source = std.heap.ArenaAllocator.init(a);
+                defer source.deinit();
+                const sa = source.allocator();
+                const rows = try sa.alloc([]const Datum, count);
+                const keys = try sa.alloc([]const Datum, count);
+                const body_len: usize = if (repeated) 8192 else 1536;
+                const body = try sa.alloc(u8, body_len);
+                @memset(body, 'x');
+                for (rows, keys, 0..) |*row, *keys_, index| {
+                    const bytes = if (repeated) body else try sa.dupe(u8, body);
+                    if (!repeated) bytes[0] = @intCast('a' + index);
+                    const cells = try sa.alloc(Datum, 1);
+                    cells[0] = Datum.json(.{ .string = bytes });
+                    row.* = cells;
+                    keys_.* = &.{key};
+                    if (scalar_input) try join.add(cells, keys_.*);
+                }
+                if (!scalar_input) try join.addBatch(sa, .{ .rows = rows }, keys);
+                // Neither identity keys nor payload bytes may borrow this arena.
+                @memset(body, 'z');
+            }
+            var pinned: ?*spill.Sequential.OwnedBlock = null;
+            var pinned_row: usize = 0;
+            defer if (pinned) |block| block.release();
+            for (0..2) |_| {
+                var probe = try join.probe(&.{key});
+                var seen: usize = 0;
+                while (try probe.next()) |match| {
+                    var arena = std.heap.ArenaAllocator.init(a);
+                    defer arena.deinit();
+                    const batch = try match.valuesBatch(arena.allocator());
+                    try std.testing.expectEqual(@as(usize, 1), batch.len());
+                    const cell = try batch.cell(arena.allocator(), 0, 0);
+                    try std.testing.expectEqual(@as(u8, if (repeated) 'x' else @intCast('a' + count - seen - 1)), cell.value.string[0]);
+                    if (pinned == null) {
+                        pinned_row = match.native.?.row;
+                        pinned = try match.native.?.block();
+                        pinned.?.retain();
+                    }
+                    var cached_bytes: usize = 0;
+                    var cached_pages: usize = 0;
+                    for (join.disk_payloads) |entry| if (entry) |cached| {
+                        cached_pages += 1;
+                        cached_bytes += cached.block.retainedBytes();
+                    };
+                    try std.testing.expect(cached_pages <= 4);
+                    try std.testing.expect(cached_bytes <= 64 * 1024 or cached_pages == 1);
+                    seen += 1;
+                }
+                try std.testing.expectEqual(count, seen);
+            }
+            if (repeated or !scalar_input) try std.testing.expectEqual(@as(usize, 1), join.payload_reads);
+            if (repeated) try std.testing.expect(join.disk_values.?.file.size < 9000);
+            if (measure) std.debug.print("SHARED_SPILL rows={d} repeated={} scalar={} payload_bytes={d} payload_reads={d}\n", .{ count, repeated, scalar_input, join.disk_values.?.file.size, join.payload_reads });
+            // Force eviction; the accepted output lease must still own its page.
+            for (0..6) |index| {
+                var body: [4096]u8 = @splat('q');
+                body[0] = @intCast('A' + index);
+                const offset = try join.disk_values.?.appendBatch(.{ .rows = &.{&.{Datum.json(.{ .string = &body })}} });
+                _ = try join.diskBlock(offset);
+            }
+            join.deinit();
+            live = false;
+            try std.testing.expectEqual(@as(u8, if (repeated) 'x' else @intCast('a' + count - 1)), (try pinned.?.cell(pinned_row, 0)).value.string[0]);
+        }
+    };
+    for ([_]bool{ false, true }) |repeated| for ([_]bool{ false, true }) |scalar_input| {
+        try Fixture.run(std.testing.allocator, repeated, scalar_input, if (repeated) 64 else 8, true);
+        try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Fixture.run, .{ repeated, scalar_input, @as(usize, 3), false });
+    };
+}
+
+test "SQL native spill preserves owner bound patterns and wide rows under tiny budgets" {
+    const Fixture = struct {
+        fn check(_: *anyopaque) !void {}
+        fn run(a: Allocator, width: usize, patterns: bool, compressed: bool) !void {
+            var dummy: u8 = 0;
+            var manager: @import("spill.zig").Manager = .{ .alloc = a, .io = std.testing.io, .context = &dummy, .checkpoint = check, .compression = if (compressed) .snappy else .none, .async_writes = false };
+            defer manager.deinit();
+            const pattern = if (patterns) try @import("pattern_spill.zig").Set.create(&manager) else null;
+            if (pattern) |set| try set.append(Datum.json(.{ .string = "%cat%" }));
+            const join = try HashJoin.create(a, .{ .bytes = 8192, .spill = &manager });
+            defer join.deinit();
+            try join.startSpill();
+            const key = Datum.json(.{ .integer = 1 });
+            const values = try a.alloc(Datum, width);
+            defer a.free(values);
+            @memset(values, Datum.json(.{ .integer = 42 }));
+            const body: [4096]u8 = @splat('x');
+            if (pattern) |set| {
+                values[0] = .{ .sql_null = false, .patterns = &set.interface };
+                values[1] = Datum.json(.{ .string = &body });
+            }
+            try join.add(values, &.{key});
+            var probe = try join.probe(&.{key});
+            const match = (try probe.next()).?;
+            var output = std.heap.ArenaAllocator.init(a);
+            defer output.deinit();
+            const result = try match.materializeValues(output.allocator());
+            try std.testing.expectEqual(width, result.len);
+            if (pattern) |set| {
+                try std.testing.expect(result[0].patterns == &set.interface);
+                var offset: u64 = 0;
+                const item = (try result[0].patterns.?.next(result[0].patterns.?.ptr, output.allocator(), &offset)).?;
+                try std.testing.expectEqualStrings("%cat%", item.value.string);
+                try std.testing.expectEqualStrings(&body, result[1].value.string);
+            } else for (result) |cell| try std.testing.expectEqual(@as(i64, 42), cell.value.integer);
+            try std.testing.expect((try probe.next()) == null);
+        }
+    };
+    for ([_]bool{ false, true }) |compressed| {
+        for ([_]usize{ 8, 32, 64, 100, 128 }) |width| try Fixture.run(std.testing.allocator, width, false, compressed);
+        try Fixture.run(std.testing.allocator, 2, true, compressed);
+    }
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Fixture.run, .{ @as(usize, 64), false, false });
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Fixture.run, .{ @as(usize, 2), true, true });
+}
+
+test "SQL native payload cache eviction includes lazy JSON memory and preserves output leases" {
+    const Hook = struct {
+        fn check(_: *anyopaque) !void {}
+    };
+    const a = std.testing.allocator;
+    var dummy: u8 = 0;
+    var manager: @import("spill.zig").Manager = .{ .alloc = a, .io = std.testing.io, .context = &dummy, .checkpoint = Hook.check, .compression = .none, .async_writes = false };
+    defer manager.deinit();
+    const join = try HashJoin.create(a, .{ .bytes = 8192, .spill = &manager });
+    defer join.deinit();
+    try join.startSpill();
+    {
+        var source = std.heap.ArenaAllocator.init(a);
+        defer source.deinit();
+        const items = try source.allocator().alloc(Json, 2048);
+        for (items, 0..) |*item, i| item.* = .{ .integer = @intCast(i) };
+        try join.add(&.{Datum.json(.{ .array = std.json.Array.fromOwnedSlice(source.allocator(), items) })}, &.{});
+    }
+    var probe = try join.probe(&.{});
+    const match = (try probe.next()).?;
+    const block = try match.native.?.block();
+    block.retain();
+    defer block.release();
+    const cold = block.retainedBytes();
+    const values = try block.cell(0, 0);
+    try std.testing.expectEqual(@as(usize, 2048), values.value.array.items.len);
+    try std.testing.expect(block.retainedBytes() > cold);
+    try std.testing.expect(block.retainedBytes() > 64 * 1024);
+    const next = try join.disk_values.?.appendBatch(.{ .rows = &.{&.{Datum.json(.{ .integer = 1 })}} });
+    _ = try join.diskBlock(next);
+    for (join.disk_payloads) |entry| if (entry) |cached| try std.testing.expect(cached.offset != match.native.?.offset);
+    // Eviction drops only the cache reference, leaving accepted output intact.
+    try std.testing.expectEqual(@as(i64, 2047), (try block.cell(0, 0)).value.array.items[2047].integer);
 }

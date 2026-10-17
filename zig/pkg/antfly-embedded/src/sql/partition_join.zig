@@ -33,7 +33,21 @@ pub const Join = struct {
         flipped: bool = false,
     };
 
+    // Exact summary of admitted build hashes. A split decision never needs a
+    // second payload pass, and children rebuild summaries during repartition.
+    const HashSummary = struct {
+        any: u64 = 0,
+        all: u64 = std.math.maxInt(u64),
+        fn add(self: *@This(), hash: u64) void {
+            self.any |= hash;
+            self.all &= hash;
+        }
+        fn differences(self: @This()) u64 {
+            return self.any ^ self.all;
+        }
+    };
     const Task = struct {
+        hashes: HashSummary = .{},
         build: ?spill.Sequential = null,
         probes: ?spill.Sequential = null,
         used_bits: u64,
@@ -50,6 +64,7 @@ pub const Join = struct {
     limits: operators.HashJoin.Limits,
     partitions: usize,
     workspace_bytes: usize,
+    build_hashes: [16]HashSummary = @splat(.{}),
     build_cost: [16]usize = @splat(0),
     probe_cost: [16]usize = @splat(0),
     outer_left: bool,
@@ -197,7 +212,7 @@ pub const Join = struct {
                 child.evaluation = self.evaluation;
                 child.partitions = 0;
                 child.finished = true;
-                child.active = .{ .build = self.build[index], .probes = self.probes[index], .used_bits = self.partitions - 1 };
+                child.active = .{ .build = self.build[index], .probes = self.probes[index], .used_bits = self.partitions - 1, .hashes = self.build_hashes[index] };
                 self.build[index] = null;
                 self.probes[index] = null;
                 slot.* = child;
@@ -416,6 +431,7 @@ pub const Join = struct {
         if (self.rows[side] >= self.limits.rows) return error.SqlProgramLimitExceeded;
         self.rows[side] += 1;
         const partition: usize = @intCast((hash orelse 0) & (self.partitions - 1));
+        if (build) self.build_hashes[partition].add(hash orelse 0);
         return partition;
     }
     fn inputFile(self: *Join, build: bool, partition: usize) !*spill.Sequential {
@@ -458,6 +474,7 @@ pub const Join = struct {
         for ([_]bool{ true, false }) |build_side| {
             const source = if (build_side) &parent.build else &parent.probes;
             if (source.*) |*file| {
+                file.rewind();
                 var offset: u64 = 0;
                 while (offset < file.size) {
                     try self.manager.check();
@@ -476,6 +493,7 @@ pub const Join = struct {
                         for (key_cells, 0..) |*cell, column| cell.* = try block.keyCell(index, column);
                         const hash = (try operators.HashJoin.keyHash(key_cells)) orelse 0;
                         side.* = hash & bit != 0;
+                        if (build_side) children[@intFromBool(side.*)].hashes.add(hash);
                     }
                     for (&children, 0..) |*child, side| {
                         var count: usize = 0;
@@ -509,7 +527,7 @@ pub const Join = struct {
                     self.active = self.pending[self.pending_count];
                 } else {
                     if (self.partition == self.partitions) return false;
-                    self.active = .{ .build = self.build[self.partition], .probes = self.probes[self.partition], .used_bits = self.partitions - 1 };
+                    self.active = .{ .build = self.build[self.partition], .probes = self.probes[self.partition], .used_bits = self.partitions - 1, .hashes = self.build_hashes[self.partition] };
                     self.build[self.partition] = null;
                     self.probes[self.partition] = null;
                     self.partition += 1;
@@ -523,8 +541,6 @@ pub const Join = struct {
                 build_limits.bytes = @min(build_limits.bytes, available - available / 4);
             }
             self.hash = try operators.HashJoin.create(self.a, build_limits);
-            var hash_union: u64 = 0;
-            var hash_intersection: u64 = std.math.maxInt(u64);
             var repartitioned = false;
             if (self.active.?.build) |*file| {
                 var offset: u64 = 0;
@@ -542,9 +558,6 @@ pub const Join = struct {
                         const row = key_cells[index * block.keyWidth() ..][0..block.keyWidth()];
                         for (row, 0..) |*cell, column| cell.* = try block.keyCell(index, column);
                         key.* = row;
-                        const h = (try operators.HashJoin.keyHash(key.*)) orelse 0;
-                        hash_union |= h;
-                        hash_intersection &= h;
                     }
                     if (skew_fallback) {
                         try self.hash.?.addBatch(self.a, values, keys[0..block.count()]);
@@ -555,33 +568,21 @@ pub const Join = struct {
                     const following = offset + block.count();
                     offset += consumed;
                     if (consumed == block.count()) continue;
-                    // Inspect remaining hashes without copying payloads. A useful
-                    // partition split wins over building a temporary disk chain.
-                    var remaining = following;
-                    while (remaining < file.size) {
-                        const scanned = try file.readBatchBorrowed(remaining, 256);
-                        for (scanned.rows) |row| {
-                            const h = (try operators.HashJoin.keyHash(row.keys)) orelse 0;
-                            hash_union |= h;
-                            hash_intersection &= h;
-                        }
-                        remaining = scanned.following;
-                    }
-                    if (try self.split(hash_union ^ hash_intersection)) {
+                    // Exact ingestion summaries include unread blocks. Do
+                    // not decode/replay payloads merely to choose a split bit.
+                    if (try self.split(self.active.?.hashes.differences())) {
                         self.hash.?.deinit();
                         self.hash = null;
                         repartitioned = true;
                         break;
                     }
                     skew_fallback = true;
-                    // Restore the forward reader after lookahead. This also
-                    // handles admission stopping in the middle of a block.
-                    file.rewind();
-                    var replay: u64 = 0;
-                    while (replay < offset) {
-                        const prior = try file.readBatchBorrowed(replay, @intCast(@min(256, offset - replay)));
-                        replay = prior.following;
-                    }
+                    // The current compact input still owns the declined
+                    // suffix. Transfer it directly and keep the forward cursor.
+                    const positions = try a.alloc(usize, block.count() - consumed);
+                    for (positions, consumed..) |*position, index| position.* = index;
+                    try self.hash.?.addBatch(self.a, try values.select(a, positions), keys[consumed..block.count()]);
+                    offset = following;
                 }
             }
             if (repartitioned) continue;
@@ -607,7 +608,7 @@ pub const Join = struct {
             return switch (self.source) {
                 .probe => |block| block.cell(self.index, column),
                 .build => |store| store.cell(a, self.index, column),
-                .disk => |native| (try native.block()).cell(0, column),
+                .disk => |native| (try native.block()).cell(native.row, column),
                 .values => |values| if (column < values.len) values[column] else error.InvalidSqlBackendResponse,
             };
         }
@@ -616,7 +617,7 @@ pub const Join = struct {
             return switch (self.source) {
                 .probe => |block| if (block.encoded) |encoded| encoded.encodedJson(self.index, column, false) else null,
                 .build => |store| store.encodedJson(self.index, column),
-                .disk => |native| if ((try native.block()).encoded) |encoded| encoded.encodedJson(0, column, false) else null,
+                .disk => |native| if ((try native.block()).encoded) |encoded| encoded.encodedJson(native.row, column, false) else null,
                 .values => null,
             };
         }
@@ -625,7 +626,7 @@ pub const Join = struct {
             return switch (self.source) {
                 .probe => |block| if (block.encoded) |encoded| encoded.frozenJson(self.index, column, false) else null,
                 .build => |store| store.frozenJson(self.index, column),
-                .disk => |native| if ((try native.block()).encoded) |encoded| encoded.frozenJson(0, column, false) else null,
+                .disk => |native| if ((try native.block()).encoded) |encoded| encoded.frozenJson(native.row, column, false) else null,
                 .values => null,
             };
         }
@@ -646,7 +647,7 @@ pub const Join = struct {
                     try owner.native_disk_leases.append(owner.a, block);
                     block.retain();
                 }
-                return .{ .source = .{ .probe = block }, .width = self.width };
+                return .{ .source = .{ .probe = block }, .index = self.source.disk.row, .width = self.width };
             }
             // Disk-chain matches borrow the decoder until the next candidate.
             // Copy only accepted fallback rows, including nested payloads.
@@ -1297,7 +1298,7 @@ test "SQL native partition batches preserve frozen outer rows residuals and reta
                 child.evaluation = join.evaluation;
                 child.partitions = 0;
                 child.finished = true;
-                child.active = .{ .build = join.build[0], .probes = join.probes[0], .used_bits = join.partitions - 1 };
+                child.active = .{ .build = join.build[0], .probes = join.probes[0], .used_bits = join.partitions - 1, .hashes = join.build_hashes[0] };
                 join.build[0] = null;
                 join.probes[0] = null;
                 join.partition = 1;
