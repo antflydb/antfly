@@ -1,6 +1,19 @@
 #!/usr/bin/env python3
 # Copyright 2026 Antfly, Inc.
 # SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """Check the official training RoPE's reference-initialized FP32 constants."""
 
 from __future__ import annotations
@@ -27,7 +40,7 @@ def render(model: Path) -> str:
         "// The official model initializes inv_freq on the CPU in FP32, then copies",
         "// it to CUDA. Recomputing powf on the device changes BF16 rotary coefficients",
         "// at rounding boundaries. Keep those initialization bits in both training",
-        "// directions; serving retains its independently qualified rotary path.",
+        "// directions; training and serving share these official frequency values.",
         "// Reference: Transformers a96730c8c97b8efbf35bbaf7f5da33ec99231a49,",
         "// Torch 2.14.0+cu130, default RoPE, official google/embeddinggemma-2 config.",
         "",

@@ -4869,10 +4869,11 @@ test "EmbeddingGemma2 manifest advertises unified inputs and serving dimensions"
     try std.testing.expect(manifest.normalize);
     try std.testing.expectEqual(@as(u32, 768), manifest.embedding_dimension);
     try std.testing.expectEqual(@as(usize, 8192), manifest.maxTextSequenceLength());
-    try std.testing.expectEqual(@as(usize, 3), manifest.inputs.len);
+    try std.testing.expectEqual(@as(usize, 4), manifest.inputs.len);
     try std.testing.expectEqualStrings("text", manifest.inputs[0]);
     try std.testing.expectEqualStrings("image", manifest.inputs[1]);
     try std.testing.expectEqualStrings("audio", manifest.inputs[2]);
+    try std.testing.expectEqualStrings("video", manifest.inputs[3]);
     try std.testing.expect(!manifest.isLastTokenDecoderEmbedder());
 }
 

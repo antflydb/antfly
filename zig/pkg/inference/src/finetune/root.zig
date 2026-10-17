@@ -101,6 +101,15 @@ pub const runners = @import("runners.zig");
 
 test {
     _ = lora;
+    // The isolated model-training root imports inference_internal as a separate
+    // module, whose tests Zig does not discover. Keep these model-backed tests
+    // reachable from the main inference test root as well.
+    _ = embedding_gemma2_real_autodiff;
+    _ = @import("embedding_gemma2_cuda_encoder.zig");
+    _ = @import("embedding_gemma2_cuda_session.zig");
+    _ = @import("embedding_gemma2_cuda_projection.zig");
+    _ = @import("embedding_gemma2_cuda_attention.zig");
+    _ = @import("embedding_gemma2_cuda_objective.zig");
     _ = command_registry;
     _ = peft;
     _ = graph_bridge;

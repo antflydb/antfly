@@ -1113,7 +1113,40 @@ test "embeddinggemma2 torchvision bicubic matches pinned uint8 pixels" {
     };
     const actual = try preprocessDecodedRectScaledWithResample(a, .{ .data = &pixels, .width = 13, .height = 7, .format = .rgb8 }, 5, 3, .{ 0, 0, 0 }, .{ 1, 1, 1 }, 1, .torchvision_bicubic);
     defer a.free(actual);
-    // PyTorch 2.10.0 / torchvision 0.25.0, CHW uint8 resize, antialias=true.
-    const expected = [_]f32{ 102, 140, 106, 122, 137, 142, 120, 135, 138, 120, 140, 106, 138, 133, 107, 128, 153, 120, 120, 123, 120, 140, 122, 121, 143, 145, 133, 124, 103, 144, 143, 109, 137, 140, 107, 126, 110, 133, 128, 110, 109, 151, 133, 122, 156 };
+    // PyTorch 2.10.0: F.interpolate(CHW uint8[None], size=(3, 5),
+    // mode="bicubic", align_corners=False, antialias=True). Do not cast the
+    // input to float: rounding only the final float output omits the uint8
+    // horizontal intermediate and changes five pixels in this fixture.
+    const expected = [_]f32{ 103, 140, 106, 122, 137, 141, 120, 135, 138, 120, 140, 106, 138, 132, 107, 128, 153, 120, 120, 123, 120, 140, 122, 121, 142, 145, 132, 124, 103, 144, 143, 109, 137, 140, 107, 126, 110, 133, 128, 110, 109, 151, 133, 122, 156 };
     try std.testing.expectEqualSlices(f32, &expected, actual);
+}
+
+test "torchvision bicubic upsampling preserves padded RGBA pixels and allocation cleanup" {
+    const Case = struct {
+        fn run(a: std.mem.Allocator) !void {
+            var pixels: [2 * 16]u8 = @splat(255);
+            for (0..2) |y| for (0..3) |x| for (0..3) |c| {
+                pixels[y * 16 + x * 4 + c] = @intCast((x * 37 + y * 83 + c * 59) % 256);
+            };
+            const actual = try preprocessDecodedRectScaledWithResample(a, .{
+                .data = &pixels,
+                .width = 3,
+                .height = 2,
+                .format = .rgba8,
+                .row_stride_bytes = 16,
+            }, 5, 4, .{ 0, 0, 0 }, .{ 1, 1, 1 }, 1, .torchvision_bicubic);
+            defer a.free(actual);
+            // PyTorch 2.10.0 F.interpolate on the RGB uint8 channels, size=(4, 5),
+            // bicubic, align_corners=False, antialias=True. Includes clipped
+            // negative lobes, vector lanes crossing channels, and scalar tails.
+            const expected = [_]f32{
+                0,   4,   30,  56,  70,  17,  28,  54,  80,  94,  63,  77,  103, 129, 143,
+                87,  101, 127, 153, 167, 49,  63,  89,  115, 129, 73,  87,  113, 139, 153,
+                122, 136, 162, 188, 202, 146, 160, 186, 212, 226, 108, 121, 148, 188, 212,
+                132, 149, 172, 164, 155, 181, 204, 221, 114, 42,  205, 232, 245, 90,  0,
+            };
+            try std.testing.expectEqualSlices(f32, &expected, actual);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Case.run, .{});
 }
