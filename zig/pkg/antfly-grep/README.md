@@ -264,12 +264,12 @@ antfly-grep --table-config tables.json --sort path -l 'retry' ./src
 filesystem paths, table searches do not read stdin or implicitly walk the current
 directory. Repeated `--table` selects configured aliases; omitted selectors scan
 all configured tables. The default `prefetch: true` overlaps one retained-snapshot page
-with matching/decisions using one persistent producer. At most two decoded pages are
+with matching and unlimited-budget decisions using one persistent producer. At most two decoded pages are
 live (each bounded by `max_page_memory`, plus bounded HTTP response buffers). Set
 `prefetch: false` for sequential retrieval. Quiet searches and finite per-file match
-limits disable speculation. Decision searches with explicit `--max-requests` also
-retrieve sequentially so speculative pages cannot displace foreground evaluations,
-including when the explicit value equals the default. Document/request limits and
+limits disable speculation. Decision searches with any finite request budget (including the default 1,000)
+retrieve sequentially so speculative pages cannot displace foreground evaluations.
+Use `--max-requests=unlimited` to opt into overlapping retrieval and decisions. Document/request limits and
 cancellation remain enforced.
 `--table-filter JSON` passes an additional Antfly query
 filter before pagination. Filters, globs, file types, counts, replacements,
@@ -963,9 +963,9 @@ Paired medians against PR head `02c9684b96`:
 | Repetitive bzip2, 16 MiB | 140.70 ms | 107.13 ms | Linux VM, one CPU/worker; rg 105.76 ms |
 | High-entropy bzip2, 16 MiB | 1,264.04 ms | 824.92 ms | Linux VM, one CPU/worker; CPU 965.41 → 815.90 ms |
 
-Default-budget indexed overlap still takes 530.79 ms versus 952.45 ms sequentially
-with identical output and all 17 requests (40 ms simulated latency). Explicit
-request budgets prioritize foreground decisions; the two-request regression
+At the prior head, default-budget indexed overlap took 530.79 ms versus 952.45 ms sequentially
+with identical output and all 17 requests (40 ms simulated latency). Finite
+request budgets now prioritize foreground decisions; the two-request regression
 returns the same 1,000 matching lines whether prefetch is configured on or off.
 
 Raw trials, output hashes, load and RSS appear in `bounded-review-*.json`.
@@ -979,3 +979,104 @@ and discovery at 8.15 → 8.13 ms, approximately unchanged (rg 40.26/12.39 ms).
 Discovery is modestly faster in the first Linux run. No universal
 repository speedup, independent-Linux-hardware result, live encoder speedup,
 model quality or billed-token improvement is claimed.
+
+
+### Prepared discovery, replayed output and persistent decision workers
+
+The current implementation prepares and deduplicates file-type and exclusion
+globs once per discovery root. Literal basenames and dot suffixes use shared
+lookup sets; complex patterns retain the canonical compiled-glob fallback.
+Traversal workers borrow those immutable predicates until they join. Type includes can admit matching hidden filenames, matching
+ripgrep's precedence; hidden parent directories and ignore-file exclusions
+remain effective. Local and indexed filtering use the same prepared predicates.
+
+Ordinary single-record JSON, color and match-only output preflight matches in
+constant memory and replay spans into buffered output. Literal preflight uses
+the bulk counter. Regex preflight validates all occurrences before replay and caches up to 64
+spans for sparse rows, so resource failures are detected before streaming a JSON match record. Output no
+longer retains one match object or a second JSON submatch object per occurrence.
+Adjacent positive matches share highlight ranges; empty matches retain their
+metadata and match-only row behavior without empty color escape sequences.
+Capture-dependent, contextual and multiline rendering retain their required
+existing match data paths.
+
+Unbounded JSON output streams through a 64 KiB writer. Finite output budgets and
+retained/sorted output use an atomic record collector capped by the remaining
+output or pending-output allowance. Oversized records stop serialization before
+allocating the full expanded record, and no partial JSON record is published.
+The collector performs one bounded record allocation instead of serializing and
+copying the entire record twice.
+
+Parallel decision batches use a lazily grown, client-owned worker pool. Workers
+and their HTTP connection pools survive region/refinement waves. At most the
+configured number of workers exist; a wave borrows its input until every selected
+worker acknowledges completion. Partial failures preserve completed scores and
+join safely; spawning failures fall back to available workers or sequential work.
+No queue scales with source or repository size.
+
+All finite request budgets, including the implicit default, keep indexed
+retrieval behind foreground decisions. A request's remaining provider work can
+include refinement, retries and batch splitting, so speculative retrieval cannot
+safely claim its last request slots. `--max-requests=unlimited` explicitly enables
+retrieval/decision overlap, while document, output, timeout and cancellation
+limits still apply. This trades default-budget network overlap for deterministic
+foreground evidence. Generated help and shell tooling include the new value.
+
+`bench/output_pipeline.py` compares match output, every JSON match span, file
+sets, startup-to-first-byte time, CPU and process RSS against a saved binary and
+optional ripgrep. `bench/decision_transport.py --jobs 4` covers repeated worker
+waves; `--keep-alive` also records connection reuse. These are loopback fixtures,
+not measurements of model relevance, encoder speed or billed provider cost.
+
+
+The latest qualification compares the implementation with PR head `f36d2c4b47`.
+Paired medians and executable hashes are in `bench/results/stream-review-*.json`:
+
+| Workload | Before | After | Additional evidence |
+|---|---:|---:|---|
+| All-type discovery, macOS, 1,786 SDK files | 191.10 ms | 8.27 ms | rg 22.03 ms; identical file sets |
+| All-type discovery, Linux VM, two CPUs | 405.72 ms | 32.65 ms | rg 36.28 ms; identical file sets |
+| Dense JSON, macOS, 512 KiB line | 31.37 ms | 24.77 ms | Peak RSS 70.0 → 3.7 MiB; rg 51.12 ms |
+| Dense JSON, Linux VM, two CPUs | 59.52 ms | 43.67 ms | Peak RSS 71.0 → 3.4 MiB; rg 83.30 ms |
+| Dense color, macOS | 14.59 ms | 10.35 ms | Peak RSS 40.0 → 3.6 MiB; rg 17.03 ms |
+| Dense match-only, macOS | 13.03 ms | 9.63 ms | Peak RSS 28.9 → 3.6 MiB; rg 11.77 ms |
+| Dense regex color, macOS | 13.53 ms | 14.26 ms | Peak RSS 40.1 → 3.6 MiB; rg 20.29 ms |
+| Dense regex color, Linux VM, two CPUs | 33.27 ms | 38.83 ms | Peak RSS 42.3 → 3.6 MiB; rg 55.32 ms |
+| Decision HTTP keep-alive, four workers | 237.86 ms | 53.02 ms | Same 513 questions / 65 requests; connections 65 → 5 |
+| Warm decision cache, four workers | 12.42 ms | 10.58 ms | No network requests |
+
+Dense regex replay deliberately exchanges a second matching pass for bounded
+span storage: this run is about 5% slower on macOS and 17% slower in the Linux
+VM than the previous allocation-heavy renderer. Linux match-only measures
+16.21 ms versus rg's 15.20 ms despite improving from 28.96 ms. These results
+do not establish universal throughput superiority. First-result latency, CPU,
+RSS, raw trials and match-equivalence checks are retained in the reports.
+
+The keep-alive fixture also measures request bytes at 10,548,999 → 1,412,265,
+using the existing Typesafe shared-state transport. This is wire payload, not
+provider token billing. HTTP/1 direct, pooled and TLS connections now request
+TCP_NODELAY, matching the existing HTTP/2 socket policy and avoiding delayed-ACK
+stalls across persistent worker waves. Two native socket regressions verify the
+direct and reused pooled connections.
+
+With explicit `--max-requests=unlimited`, the indexed overlap fixture measures
+962.00 → 515.79 ms against sequential retrieval, with identical output and all
+17 requests. Finite budgets deliberately run retrieval behind decisions. The
+1,000-request default regression now returns 50,000 lines with 500 retrievals
+and 500 decisions, regardless of the prefetch setting; the previous speculative
+path consumed 501 retrievals and left only 499 decisions, returning 49,900 lines.
+
+Qualification includes 142 CLI tests on macOS (two skips) and ARM64 Linux (one
+skip), full native grep unit/hardening/tooling targets, five real-server indexed
+integration tests, and 1,000 generated comparisons against ripgrep 15.2.0 /
+PCRE2 10.45 with no differences or timeouts. The five labeled fixture questions
+also retain complete expected results. Fixture scores do not establish model
+relevance or real-provider reliability. License headers, the Apache dependency
+boundary and its 35 checker tests pass.
+
+The Linux measurements execute ARM64 instructions in a two-CPU Linux VM on the
+same ARM64 Mac; they are not independent Linux hardware results. Filesystem
+caches were warm and unrelated builds were active. Full upstream PCRE2/ripgrep
+parity, independent-host cold-cache performance and live-provider quality remain
+outside this qualification. Source and executable identities are recorded in
+[`stream-review-validation.json`](bench/results/stream-review-validation.json).
