@@ -411,6 +411,7 @@ pub const Candidates = struct {
                 } else if (self.target.isDocumentRoot(field.name)) {
                     if (typed != .object) return error.SqlTypeMismatch;
                     object = typed.object;
+                    try json_null_fields.appendSlice(alloc, try self.target.documentRootNulls(alloc, typed));
                 } else {
                     try object.put(alloc, field.path, typed);
                     if (!datum.sql_null and typed == .null and field.type == .json) try json_null_fields.append(alloc, field.path);

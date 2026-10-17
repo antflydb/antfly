@@ -9,7 +9,7 @@ a completion claim. PostgreSQL is the SQL standard and independent test oracle.
 ## Baseline and priorities
 
 The [original inventory](sql/parity-inventory.md) remains authoritative:
-542 implemented / 131 rejected / 125 superseded / 788 unresolved. Counts below
+548 implemented / 131 rejected / 125 superseded / 782 unresolved. Counts below
 are unresolved family pools, not promises that one implementation closes them.
 
 | Priority | Pool | Cases | Shared delivery boundary |
@@ -17,8 +17,29 @@ are unresolved family pools, not promises that one implementation closes them.
 | 1 | DDL, catalog and sessions | 291 | Public relation ownership, schema/index activation and retirement, session lifecycle and recovery |
 | 2 | Source/joined mutations and MERGE/recursion | 126 | Captured source ownership, bounded selection, atomic commit and distributed failure evidence |
 | 3 | Read and query | 113 | Faithful typed fixtures, binding/correlation, endpoint results and diagnostics |
-| 4 | Document writes | 68 | Document-specific schema/index profiles, complete postimages and integrity admission |
+| 4 | Document writes | 62 | Document-specific schema/index profiles, complete postimages and integrity admission |
 | 5 | Historically unsupported writes | 92 | Individual PostgreSQL contract review, implementations or proven required rejections |
+
+## Document conflict delivery (2026-10-17)
+
+Originals `sql-0923`–`sql-0926`, `sql-0939` and `sql-0940` use the existing
+atomic version/digest-fenced conflict path over their source document schemas.
+Property updates preserve undeclared members; root replacements own the assigned
+document instead of retaining discarded old bytes. Compiled cell-demand masks
+avoid decoding unused old/excluded fields. Pure replacements and DO NOTHING
+need no full preimage. Document targetless DO NOTHING uses the physical key;
+property unique arbiters still require relational unique-owner generations.
+
+Scalar and external-decision batches share one postimage installer. Debug gates
+cover every allocation failure, cursor/page retirement, definite races, full
+durable postimages and cold reopen. PostgreSQL independently verifies the six
+unchanged originals, affected/returned rows, labels/types and exact unknown
+JSON numbers. All whole-document write paths now carry explicit JSON-null member
+provenance, distinct from a SQL NULL property assignment that removes a member.
+MERGE provenance has coordinated core coverage; the local-only HTTP provider
+still refuses missing range authority without changing row bytes or fences.
+No additional original IDs are credited for those shared controls. Patch syntax,
+version results, view mappings and the remaining catalog work are still open.
 
 ## Whole-document SQL delivery (2026-10-17)
 
@@ -47,9 +68,9 @@ document mutation controls remain passing. Core tests cover hidden-column
 authority, unchanged narrow projections, typed literal domains and root
 binding across joins/MERGE; these controls do not receive extra original IDs.
 
-This does not activate the legacy patch-function syntax, `_version` results,
-or root ON CONFLICT replacement. The latter rejects explicitly before admission
-until full old/excluded root ownership is implemented. Distributed owner and
+This does not activate the legacy patch-function syntax or `_version` results.
+Root ON CONFLICT ownership is supplied by the conflict delivery above.
+Distributed owner and
 constraint requirements remain enforced by the existing adapters. The remaining
 document contracts, view mappings and broader catalog work are still open.
 

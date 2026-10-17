@@ -325,6 +325,19 @@ pub const Table = struct {
         if (root and fields) return error.UnsupportedSqlShape;
     }
 
+    /// Explicit JSON null members in a whole-document value are JSON datums,
+    /// not SQL NULL property assignments. Names borrow the pinned schema;
+    /// only the compact provenance slice belongs to the preparation arena.
+    pub fn documentRootNulls(self: Table, alloc: std.mem.Allocator, root: std.json.Value) ![]const []const u8 {
+        if (self.storage_mode != .document or root != .object) return error.InvalidSqlBackendResponse;
+        var names: std.ArrayList([]const u8) = .empty;
+        errdefer names.deinit(alloc);
+        for (self.columns) |field| if (field.type == .json) {
+            if (root.object.get(field.path)) |value| if (value == .null) try names.append(alloc, field.path);
+        };
+        return names.toOwnedSlice(alloc);
+    }
+
     pub fn column(self: Table, name: []const u8) !Column {
         for (self.virtualColumns()) |value| if (std.mem.eql(u8, value.name, name)) return value;
         for (self.columns) |value| if (std.mem.eql(u8, value.name, name)) return value;
@@ -420,6 +433,29 @@ test "SQL document root virtual columns preserve narrow storage projections and 
     const invalid: Row = .{ .id = "bad", .version = 1, .value = .null, .document = .null };
     try std.testing.expectError(error.InvalidSqlBackendResponse, invalid.cell("_doc"));
     try std.testing.expectError(error.InvalidSqlBackendResponse, invalid.hasField("_doc"));
+}
+
+test "SQL document root null provenance marks only explicit declared JSON members" {
+    const alloc = std.testing.allocator;
+    var root = try std.json.parseFromSlice(std.json.Value, alloc, "{\"metadata\":null,\"title\":null,\"unknown\":null}", .{});
+    defer root.deinit();
+    const table: Table = .{ .id = 1, .physical_name = "docs", .schema_version = 1, .storage_mode = .document, .columns = &.{
+        .{ .name = "metadata", .path = "metadata", .type = .json },
+        .{ .name = "missing", .path = "missing", .type = .json },
+        .{ .name = "title", .path = "title", .type = .string },
+    } };
+    const fields = try table.documentRootNulls(alloc, root.value);
+    defer alloc.free(fields);
+    try std.testing.expectEqual(@as(usize, 1), fields.len);
+    try std.testing.expectEqualStrings("metadata", fields[0]);
+    const Faults = struct {
+        fn run(a: std.mem.Allocator, definition: Table, value: std.json.Value) !void {
+            const nulls = try definition.documentRootNulls(a, value);
+            defer a.free(nulls);
+            try std.testing.expectEqual(@as(usize, 1), nulls.len);
+        }
+    };
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(alloc, Faults.run, .{ table, root.value });
 }
 
 pub const Scan = struct {

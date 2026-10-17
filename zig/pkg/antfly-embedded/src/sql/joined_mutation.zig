@@ -484,6 +484,7 @@ pub fn execute(execution: anytype, definition_: Bound) !runtime.Output {
                     if (datum.sql_null) return error.SqlNotNullViolation;
                     if (stored != .object) return error.SqlTypeMismatch;
                     object = stored.object;
+                    try json_null_fields.appendSlice(context.arena, try table.documentRootNulls(context.arena, stored));
                 } else try object.put(context.arena, field.path, stored);
                 if (field.type == .json and !datum.sql_null and datum.value == .null) try json_null_fields.append(context.arena, field.path);
             };

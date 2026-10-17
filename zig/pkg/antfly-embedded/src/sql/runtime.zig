@@ -1189,6 +1189,7 @@ pub const Context = struct {
                     if (table_def.isDocumentRoot(column.name)) {
                         if (datum.sql_null or typed != .object) return error.SqlTypeMismatch;
                         object = typed.object;
+                        try json_null_fields.appendSlice(self.arena, try table_def.documentRootNulls(self.arena, typed));
                         continue;
                     }
                     const json_null = column.type == .json and typed == .null and !datum.sql_null;
@@ -1259,6 +1260,7 @@ pub const Context = struct {
                 } else if (table.isDocumentRoot(target.name)) {
                     if (value_.sql_null or typed != .object) return error.SqlTypeMismatch;
                     object = typed.object;
+                    try json_null_fields.appendSlice(self.arena, try table.documentRootNulls(self.arena, typed));
                 } else {
                     if (target.type == .json and !value_.sql_null and typed == .null) try json_null_fields.append(self.arena, target.path);
                     try putField(self.arena, &object, target.path, typed);
@@ -1532,6 +1534,7 @@ pub const Context = struct {
                             if (table_def.isDocumentRoot(bound.column.name)) {
                                 if (assigned_value != .object) return error.SqlTypeMismatch;
                                 copy = assigned_value;
+                                try json_null_fields.appendSlice(self.arena, try table_def.documentRootNulls(self.arena, assigned_value));
                             } else try putField(self.arena, &copy.object, bound.column.path, assigned_value);
                         }
                         document = copy;
@@ -6562,7 +6565,7 @@ test "SQL document root reads replacements and source inserts share typed prepar
         writes: usize = 0,
         last: ?Json = null,
         fn resolve(_: *anyopaque, _: std.mem.Allocator, _: ast.Name, _: catalog.Action) !catalog.Table {
-            return .{ .id = 1, .physical_name = "docs", .schema_version = 1, .storage_mode = .document, .columns = &.{.{ .name = "title", .path = "title", .type = .string }} };
+            return .{ .id = 1, .physical_name = "docs", .schema_version = 1, .storage_mode = .document, .columns = &.{ .{ .name = "title", .path = "title", .type = .string }, .{ .name = "metadata", .path = "metadata", .type = .json } } };
         }
         fn checkpoint(_: *anyopaque) !void {}
         fn open(raw: *anyopaque, a: std.mem.Allocator, _: catalog.Table, request: catalog.Scan) !?catalog.Cursor {
@@ -6597,6 +6600,12 @@ test "SQL document root reads replacements and source inserts share typed prepar
             for (mutations) |mutation| if (mutation.row) |root| {
                 try std.testing.expect(root == .object);
                 try std.testing.expect(!root.object.contains("_doc"));
+                if (root.object.get("metadata")) |value| if (value == .null) {
+                    const marked = for (mutation.json_null_fields) |field| {
+                        if (std.mem.eql(u8, field, "metadata")) break true;
+                    } else false;
+                    try std.testing.expect(marked);
+                };
             };
             return mutations;
         }
@@ -6635,7 +6644,8 @@ test "SQL document root reads replacements and source inserts share typed prepar
         "UPDATE docs d SET _doc='{\"title\":\"joined\"}' FROM (VALUES('doc:a')) s(id) WHERE d._id=s.id RETURNING d._doc",
         "MERGE INTO docs d USING (VALUES('doc:a')) s(id) ON d._id=s.id WHEN MATCHED THEN UPDATE SET _doc='{\"title\":\"merged\"}' RETURNING d._doc",
         "MERGE INTO docs d USING (VALUES('doc:b')) s(id) ON d._id=s.id WHEN NOT MATCHED THEN INSERT (_id,_doc) VALUES(s.id,'{\"title\":\"inserted\"}') RETURNING _doc",
-    }, [_][]const u8{ "after", "before", "after", "joined", "merged", "inserted" }, [_]bool{ false, true, true, false, false, false }) |sql, title, preserves_unknown| {
+        "MERGE INTO docs d USING (VALUES('doc:a')) s(id) ON d._id=s.id WHEN MATCHED THEN UPDATE SET _doc='{\"title\":\"null-merged\",\"metadata\":null}' RETURNING d._doc",
+    }, [_][]const u8{ "after", "before", "after", "joined", "merged", "inserted", "null-merged" }, [_]bool{ false, true, true, false, false, false, false }) |sql, title, preserves_unknown| {
         var fixture: Fixture = .{ .root = root };
         var compiled = try compiler.compile(a, sql, .{});
         defer compiled.deinit();
@@ -6646,11 +6656,13 @@ test "SQL document root reads replacements and source inserts share typed prepar
         try std.testing.expectEqual(@as(usize, 1), result.output.rows.len);
         try std.testing.expect(!fixture.last.?.object.contains("_doc"));
         try std.testing.expectEqualStrings(title, fixture.last.?.object.get("title").?.string);
-        try std.testing.expectEqual(@as(usize, if (preserves_unknown) 2 else 1), fixture.last.?.object.count());
+        const expected_fields: usize = if (preserves_unknown or std.mem.eql(u8, title, "null-merged")) 2 else 1;
+        try std.testing.expectEqual(expected_fields, fixture.last.?.object.count());
         const returned = result.output.rows[0][result.output.rows[0].len - 1];
         try std.testing.expectEqualStrings(title, returned.object.get("title").?.string);
         try std.testing.expectEqual(fixture.last.?.object.count(), returned.object.count());
         if (preserves_unknown) try std.testing.expectEqualStrings("9007199254740993.1250", returned.object.get("unknown").?.object.get("exact").?.number_string);
+        if (std.mem.eql(u8, title, "null-merged")) try std.testing.expect(returned.object.get("metadata").? == .null);
     }
     {
         var fixture: Fixture = .{ .root = root };
@@ -6682,7 +6694,7 @@ test "SQL document root reads replacements and source inserts share typed prepar
         .{ .sql = "INSERT INTO docs (_id,_doc) VALUES ('doc:b',DEFAULT)", .failure = error.SqlNotNullViolation },
         .{ .sql = "UPDATE docs SET _doc='{}',title='mixed' WHERE _id='doc:a'", .failure = error.UnsupportedSqlShape },
         .{ .sql = "UPDATE docs SET _doc='[]' WHERE _id='doc:a'", .failure = error.SqlTypeMismatch },
-        .{ .sql = "INSERT INTO docs (_id,_doc) VALUES ('doc:a','{}') ON CONFLICT(_id) DO UPDATE SET _doc=excluded._doc", .failure = error.UnsupportedSqlShape },
+        .{ .sql = "INSERT INTO docs (_id,_doc) VALUES ('doc:a','{}') ON CONFLICT(_id) DO UPDATE SET _doc=excluded._doc,title='mixed'", .failure = error.UnsupportedSqlShape },
     }) |case| {
         var fixture: Fixture = .{ .root = root };
         var compiled = try compiler.compile(a, case.sql, .{});

@@ -141,5 +141,124 @@ class DocumentRootTest(unittest.TestCase):
             )
 
 
+    def test_original_document_conflicts_preserve_postimages_and_skips(self):
+        originals = {
+            entry["id"]: entry
+            for entry in json.loads(
+                (FIXTURES / "sql_parity_inventory.json").read_text()
+            )["entries"]
+        }
+        with postgres() as db:
+            db.execute(
+                "CREATE TABLE docs(_id text PRIMARY KEY,title text,status text,"
+                "amount bigint,note text,unknown jsonb)"
+            )
+            for identity in (
+                "sql-0923", "sql-0924", "sql-0925", "sql-0926", "sql-0939", "sql-0940"
+            ):
+                source = identity in ("sql-0939", "sql-0940")
+                for seeded in ((True,) if source else (False, True)):
+                    with self.subTest(identity=identity, seeded=seeded):
+                        db.execute("TRUNCATE docs")
+                        if seeded:
+                            db.execute(
+                                "INSERT INTO docs VALUES('doc:a','Before','draft',"
+                                "1,'keep','{\"n\":9007199254740993.1250}')"
+                            )
+                        original = originals[identity]
+                        self.assertEqual([], original["params"])
+                        result = db.execute(original["sql"])
+                        skipped = seeded and identity in (
+                            "sql-0924", "sql-0926", "sql-0939"
+                        )
+                        self.assertEqual(0 if skipped else 1, result.rowcount)
+                        if identity in ("sql-0925", "sql-0926", "sql-0940"):
+                            labels = ["_id"] if identity == "sql-0926" else [
+                                "_id", "note" if identity == "sql-0940" else "title"
+                            ]
+                            self.assertEqual(labels, [field.name for field in result.description])
+                            self.assertEqual([25] * len(labels), [field.type_code for field in result.description])
+                            expected = [] if skipped else [
+                                ("doc:a",) if identity == "sql-0926" else (
+                                    "doc:a",
+                                    "source-conflict" if identity == "sql-0940" else "Launch",
+                                )
+                            ]
+                            self.assertEqual(expected, result.fetchall())
+                        self.assertEqual(
+                            [(
+                                "doc:a", "Before" if seeded and (skipped or source) else "Launch",
+                                "draft" if seeded else None,
+                                1 if seeded else None,
+                                ("source-conflict" if identity == "sql-0940" else "keep") if seeded else None,
+                                "9007199254740993.1250" if seeded else None,
+                            )],
+                            db.execute(
+                                "SELECT _id,title,status,amount,note,unknown->>'n' "
+                                "FROM docs ORDER BY _id"
+                            ).fetchall(),
+                        )
+
+    def test_conflict_roots_distinguish_replacement_merge_and_false_predicate(self):
+        with postgres() as db:
+            db.execute("CREATE TABLE docs(_id text PRIMARY KEY,_doc jsonb NOT NULL)")
+            db.execute(
+                "INSERT INTO docs VALUES('doc:a',"
+                "'{\"title\":\"before\",\"unknown\":true}')"
+            )
+            updated = db.execute(
+                "INSERT INTO docs VALUES('doc:a','{\"title\":\"after\"}') "
+                "ON CONFLICT(_id) DO UPDATE SET _doc=jsonb_set(docs._doc,"
+                "'{title}',excluded._doc->'title',true) RETURNING _doc"
+            ).fetchall()
+            self.assertEqual([({"title": "after", "unknown": True},)], updated)
+            skipped = db.execute(
+                "INSERT INTO docs VALUES('doc:a','{}') ON CONFLICT(_id) "
+                "DO UPDATE SET _doc=excluded._doc WHERE false RETURNING _doc"
+            )
+            self.assertEqual(0, skipped.rowcount)
+            self.assertEqual([], skipped.fetchall())
+            self.assertEqual(
+                [({"title": "after", "unknown": True},)],
+                db.execute("SELECT _doc FROM docs").fetchall(),
+            )
+            self.assertEqual(
+                [({"title": "whole"},)],
+                db.execute(
+                    "INSERT INTO docs VALUES('doc:a','{\"title\":\"whole\"}') "
+                    "ON CONFLICT(_id) DO UPDATE SET _doc=excluded._doc RETURNING _doc"
+                ).fetchall(),
+            )
+
+
+    def test_whole_document_members_keep_json_null_distinct_from_sql_null(self):
+        with postgres() as db:
+            db.execute("CREATE TABLE docs(_id text PRIMARY KEY,_doc jsonb NOT NULL)")
+            db.execute("INSERT INTO docs VALUES('doc:a','{\"metadata\":null}')")
+            self.assertEqual(
+                [],
+                db.execute(
+                    "INSERT INTO docs VALUES('doc:a','{}') ON CONFLICT DO NOTHING RETURNING _doc"
+                ).fetchall(),
+            )
+            for statement in (
+                "SELECT _doc->'metadata' IS NULL,jsonb_typeof(_doc->'metadata') FROM docs",
+                "INSERT INTO docs VALUES('doc:a','{\"metadata\":null}') "
+                "ON CONFLICT(_id) DO UPDATE SET _doc=excluded._doc "
+                "RETURNING _doc->'metadata' IS NULL,jsonb_typeof(_doc->'metadata')",
+                "UPDATE docs SET _doc=jsonb_set(_doc,'{metadata}','null',true) "
+                "RETURNING _doc->'metadata' IS NULL,jsonb_typeof(_doc->'metadata')",
+            ):
+                with self.subTest(statement=statement):
+                    self.assertEqual([(False, "null")], db.execute(statement).fetchall())
+            self.assertEqual(
+                [(True, None)],
+                db.execute(
+                    "UPDATE docs SET _doc=_doc-'metadata' "
+                    "RETURNING _doc->'metadata' IS NULL,jsonb_typeof(_doc->'metadata')"
+                ).fetchall(),
+            )
+
+
 if __name__ == "__main__":
     unittest.main()

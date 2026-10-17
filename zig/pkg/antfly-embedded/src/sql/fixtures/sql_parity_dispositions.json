@@ -2,6 +2,9 @@
   "ledger_format": 1,
   "inventory_sha256": "c203a4dcf0094b75e1d3764e90beebddaf844a9ce604543c0a4dbc0ffe8ae173",
   "gates": {
+    "sql-document-conflict-native-debug": {"command":["zig","build","public-api-parity-test","-Doptimize=Debug","-j1","-Dtest-filter=httpx SQL document conflict originals","-Dtest-filter=httpx SQL document root originals","-Dtest-filter=httpx SQL document campaign verifies exact native mutation and storage outcomes"],"cwd":"zig","timeout_seconds":1800},
+    "sql-document-conflict-unit-debug": {"command":["zig","build","sql-test","-Doptimize=Debug","-j1","-Dtest-filter=SQL conflict","-Dtest-filter=SQL document"],"cwd":"zig","timeout_seconds":1800},
+    "sql-document-conflict-postgres": {"command":["uv","run","--offline","--no-project","--with","psycopg[binary]==3.3.6","python","-m","unittest","discover","-s","scripts","-p","test_sql_document_root.py"],"cwd":".","timeout_seconds":180},
     "sql-document-root-native-debug": {"command":["zig","build","public-api-parity-test","-Doptimize=Debug","-j1","-Dtest-filter=httpx SQL document root originals","-Dtest-filter=httpx SQL document campaign verifies exact native mutation and storage outcomes"],"cwd":"zig","timeout_seconds":1800},
     "sql-document-root-unit-debug": {"command":["zig","build","sql-test","-Doptimize=Debug","-j1","-Dtest-filter=SQL document root","-Dtest-filter=SQL assignment root literals","-Dtest-filter=SQL captured search cursor document root"],"cwd":"zig","timeout_seconds":1800},
     "sql-document-root-postgres": {"command":["uv","run","--offline","--no-project","--with","psycopg[binary]==3.3.6","python","-m","unittest","discover","-s","scripts","-p","test_sql_document_root.py"],"cwd":".","timeout_seconds":180},
@@ -8797,23 +8800,43 @@
     },
     {
       "id": "sql-0923",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "Unchanged original SQL executes through native HTTP over its source document schema. Independent PostgreSQL checks affected and returned rows and full postimages; native controls verify preserved exact JSON, skipped-row versions/digests, and cold reopen.",
+      "evidence": [
+        {"path":"zig/pkg/antfly/src/api/sql_document_root_test.zig","test":"httpx SQL document conflict originals preserve complete postimages skips and cold fences","gate":"sql-document-conflict-native-debug"},
+        {"path":"zig/pkg/antfly-embedded/src/sql/conflict.zig","test":"SQL document conflict ownership unwinds every preparation allocation failure","gate":"sql-document-conflict-unit-debug"},
+        {"path":"zig/pkg/antfly/src/api/sql_document_root_test.zig","test":"httpx SQL document conflict originals preserve complete postimages skips and cold fences","gate":"sql-document-conflict-postgres"}
+      ]
     },
     {
       "id": "sql-0924",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "Unchanged original SQL executes through native HTTP over its source document schema. Independent PostgreSQL checks affected and returned rows and full postimages; native controls verify preserved exact JSON, skipped-row versions/digests, and cold reopen.",
+      "evidence": [
+        {"path":"zig/pkg/antfly/src/api/sql_document_root_test.zig","test":"httpx SQL document conflict originals preserve complete postimages skips and cold fences","gate":"sql-document-conflict-native-debug"},
+        {"path":"zig/pkg/antfly-embedded/src/sql/conflict.zig","test":"SQL document conflict ownership unwinds every preparation allocation failure","gate":"sql-document-conflict-unit-debug"},
+        {"path":"zig/pkg/antfly/src/api/sql_document_root_test.zig","test":"httpx SQL document conflict originals preserve complete postimages skips and cold fences","gate":"sql-document-conflict-postgres"}
+      ]
     },
     {
       "id": "sql-0925",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "Unchanged original SQL executes through native HTTP over its source document schema. Independent PostgreSQL checks affected and returned rows and full postimages; native controls verify preserved exact JSON, skipped-row versions/digests, and cold reopen.",
+      "evidence": [
+        {"path":"zig/pkg/antfly/src/api/sql_document_root_test.zig","test":"httpx SQL document conflict originals preserve complete postimages skips and cold fences","gate":"sql-document-conflict-native-debug"},
+        {"path":"zig/pkg/antfly-embedded/src/sql/conflict.zig","test":"SQL document conflict ownership unwinds every preparation allocation failure","gate":"sql-document-conflict-unit-debug"},
+        {"path":"zig/pkg/antfly/src/api/sql_document_root_test.zig","test":"httpx SQL document conflict originals preserve complete postimages skips and cold fences","gate":"sql-document-conflict-postgres"}
+      ]
     },
     {
       "id": "sql-0926",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "Unchanged original SQL executes through native HTTP over its source document schema. Independent PostgreSQL checks affected and returned rows and full postimages; native controls verify preserved exact JSON, skipped-row versions/digests, and cold reopen.",
+      "evidence": [
+        {"path":"zig/pkg/antfly/src/api/sql_document_root_test.zig","test":"httpx SQL document conflict originals preserve complete postimages skips and cold fences","gate":"sql-document-conflict-native-debug"},
+        {"path":"zig/pkg/antfly-embedded/src/sql/conflict.zig","test":"SQL document conflict ownership unwinds every preparation allocation failure","gate":"sql-document-conflict-unit-debug"},
+        {"path":"zig/pkg/antfly/src/api/sql_document_root_test.zig","test":"httpx SQL document conflict originals preserve complete postimages skips and cold fences","gate":"sql-document-conflict-postgres"}
+      ]
     },
     {
       "id": "sql-0927",
@@ -8877,13 +8900,23 @@
     },
     {
       "id": "sql-0939",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "Unchanged original SQL executes through native HTTP over its source document schema. Independent PostgreSQL checks affected and returned rows and full postimages; native controls verify preserved exact JSON, skipped-row versions/digests, and cold reopen.",
+      "evidence": [
+        {"path":"zig/pkg/antfly/src/api/sql_document_root_test.zig","test":"httpx SQL document conflict originals preserve complete postimages skips and cold fences","gate":"sql-document-conflict-native-debug"},
+        {"path":"zig/pkg/antfly-embedded/src/sql/conflict.zig","test":"SQL document conflict ownership unwinds every preparation allocation failure","gate":"sql-document-conflict-unit-debug"},
+        {"path":"zig/pkg/antfly/src/api/sql_document_root_test.zig","test":"httpx SQL document conflict originals preserve complete postimages skips and cold fences","gate":"sql-document-conflict-postgres"}
+      ]
     },
     {
       "id": "sql-0940",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "Unchanged original SQL executes through native HTTP over its source document schema. Independent PostgreSQL checks affected and returned rows and full postimages; native controls verify preserved exact JSON, skipped-row versions/digests, and cold reopen.",
+      "evidence": [
+        {"path":"zig/pkg/antfly/src/api/sql_document_root_test.zig","test":"httpx SQL document conflict originals preserve complete postimages skips and cold fences","gate":"sql-document-conflict-native-debug"},
+        {"path":"zig/pkg/antfly-embedded/src/sql/conflict.zig","test":"SQL document conflict ownership unwinds every preparation allocation failure","gate":"sql-document-conflict-unit-debug"},
+        {"path":"zig/pkg/antfly/src/api/sql_document_root_test.zig","test":"httpx SQL document conflict originals preserve complete postimages skips and cold fences","gate":"sql-document-conflict-postgres"}
+      ]
     },
     {
       "id": "sql-0941",
