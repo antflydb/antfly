@@ -797,3 +797,39 @@ The bzip2 decoder reuses block workspaces with precise link-buffer capacity,
 separates inverse-BWT traversal from RLE output, and uses SIMD to locate RLE
 escapes before copying ordinary bytes in bulk. Randomized legacy blocks, CRCs,
 output limits and streaming backpressure retain their checked paths.
+
+The follow-up qualification and exact executable/source identities are in
+[`followup-validation.json`](bench/results/followup-validation.json). The native
+macOS runs below compare the saved pre-change binary, current binary, and pinned
+rg on the same corpus. Timings are milliseconds; each report retains all trials.
+
+| Workload | Previous | Current | rg |
+|---|---:|---:|---:|
+| 75-file generated repository: discovery | 4.70 | 4.28 | 7.67 |
+| 75-file generated repository: search | 5.68 | 5.45 | 9.52 |
+| Python SDK: discovery, default workers | 8.65 | 9.43 | 14.02 |
+| Python SDK: search, default workers | 30.75 | 32.78 | 38.95 |
+| Python SDK: search, explicit eight workers | 31.42 | 31.26 | 35.71 |
+| Buffered regex prefix miss | 8.06 | 6.89 | 8.42 |
+| Buffered regex | 6.37 | 6.34 | 6.32 |
+| Unicode folded output | 38.88 | 36.25 | 35.01 |
+| Preprocessing | 29.00 | 29.53 | 29.79 |
+| Repetitive bzip2 (noisy) | 200.13 | 173.32 | 220.12 |
+| High-entropy bzip2 | 591.06 | 598.22 | 678.84 |
+
+The default SDK search is about 7% slower than the saved baseline; the paired
+explicit-eight-worker run is approximately even. Adaptive scheduling is a
+startup/resource tradeoff, not a guarantee that every repository becomes faster.
+The generated 75-file case uses 21 paired rounds, the SDK/output/codec run nine,
+and the explicit-worker run 15. Small differences should be rechecked on the
+intended host and storage.
+
+Bzip2 peak RSS falls from roughly 9.7 to 7.7 MiB on macOS (about 20%) and
+8.6–8.8 to 8.3 MiB on native ARM64 Linux (about 4–6%) versus the saved baseline.
+Throughput is mixed and several Linux timings are highly contended; they do not
+establish general Linux speed guarantees. The Linux final report uses a
+container-local copy of the SDK and two-CPU affinity. The earlier shared-mount
+report, earlier macOS reports, and their original hashes/trials are retained with
+`before-precise`/`overlapped` names to show the allocation regression and timing
+noise that motivated the final workspace shape. No additional JIT expansion was
+justified by these measurements.
