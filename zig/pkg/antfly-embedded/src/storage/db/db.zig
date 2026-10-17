@@ -32044,7 +32044,22 @@ pub const DB = struct {
     fn resolutionStageStats(self: *DB) types.ReplayStageStats {
         if (!self.hasConfiguredResolvers()) return .{};
         if (self.resolution_runtime) |runtime| return runtime.stats();
-        return self.persistedReplayStageStats(resolution_runtime_mod.scope_name, false) catch .{};
+        return self.persistedResolutionStageStats() catch .{
+            .enabled = true,
+            .catch_up_required = true,
+            .blocked = true,
+            .blocked_reason = "resolver_recovery_state_unavailable",
+        };
+    }
+
+    fn persistedResolutionStageStats(self: *DB) !types.ReplayStageStats {
+        var persisted_stage = try self.persistedReplayStageStats(resolution_runtime_mod.scope_name, false);
+        const resources = self.core.batchExecutionResources();
+        if (try resolution_runtime_mod.hasDurableReresolveBacklog(resources.store)) {
+            persisted_stage.enabled = true;
+            persisted_stage.catch_up_required = true;
+        }
+        return persisted_stage;
     }
 
     fn promotionStageStats(self: *DB) types.ReplayStageStats {

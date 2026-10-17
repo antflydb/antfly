@@ -1851,6 +1851,8 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "managed startup catch-up preserves restore repair debt while index load is terminal",
             "managed startup catch-up defers while shared bulk ingest state is active",
             "clean generated startup inspection does not retain a resident writer",
+            "managed startup catch-up retains resolver-only recovery after reopen",
+            "managed startup catch-up retains cursor-only resolver recovery on workerless reopen",
             "managed startup catch-up allocation failure preserves bounded retry",
             "managed startup catch-up quarantines repeated zero progress with bounded backoff",
             "standby HA replay reconciles managed indexes without opening the public write gate",
