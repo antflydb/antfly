@@ -78,7 +78,7 @@ class ReleaseLicenseTests(unittest.TestCase):
             )
             completions = root / "scripts/completions.sh"
             completions.write_text(
-                '#!/bin/sh\nmkdir -p "$1"\n'
+                '#!/bin/sh\nrm -rf "$1"\nmkdir -p "$1"\n'
                 'for shell in bash zsh fish; do echo fixture > "$1/antfly.$shell"; done\n'
             )
             completions.chmod(0o755)

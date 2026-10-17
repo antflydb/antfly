@@ -1,7 +1,7 @@
 {
   "evaluation": "fixture_pipeline",
   "manifest_sha256": "3778f527da11fa7e406a3d00679f89ae0102e7845e550b98bc7f5b2ed75bc1fb",
-  "binary_sha256": "572f676df58259fa4bc3320d016f9b46b14f473a52693049affc1eb3ac72e199",
+  "binary_sha256": "a4c112060eed63d46f145e91dcbff0b76fa681288550cd5202f447f4f4ff137e",
   "model": "fixture",
   "ranking": "CLI file order, then source-line order",
   "token_accounting": "Provider-reported CLI counters; zero may mean omitted usage. Fixture replies omit token usage.",
@@ -33,7 +33,7 @@
       "returned": 1,
       "expected": 1,
       "complete": true,
-      "elapsed_seconds": 0.634455417,
+      "elapsed_seconds": 0.747829416,
       "files": {
         "precision": 1.0,
         "recall": 1.0,
@@ -56,7 +56,7 @@
       "returned": 1,
       "expected": 1,
       "complete": true,
-      "elapsed_seconds": 0.639675,
+      "elapsed_seconds": 0.7367272500000001,
       "files": {
         "precision": 1.0,
         "recall": 1.0,
@@ -79,7 +79,7 @@
       "returned": 2,
       "expected": 2,
       "complete": true,
-      "elapsed_seconds": 0.6221443339999999,
+      "elapsed_seconds": 0.751467791,
       "files": {
         "precision": 1.0,
         "recall": 1.0,
@@ -102,7 +102,7 @@
       "returned": 4,
       "expected": 4,
       "complete": true,
-      "elapsed_seconds": 0.6323601249999999,
+      "elapsed_seconds": 0.7451785000000002,
       "files": {
         "precision": 1.0,
         "recall": 1.0,
@@ -125,7 +125,7 @@
       "returned": 0,
       "expected": 0,
       "complete": true,
-      "elapsed_seconds": 0.6450362919999999,
+      "elapsed_seconds": 0.7463380419999996,
       "files": {
         "precision": 1,
         "recall": 1,

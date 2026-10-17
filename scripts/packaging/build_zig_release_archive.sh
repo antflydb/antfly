@@ -336,10 +336,6 @@ if [ "$product" != inference ]; then
   fi
 fi
 cp "$prefix/bin/$binary_name" "$stage/$binary_name"
-if [ "$product" = server ]; then
-  python3 "$repo_root/scripts/packaging/package_grep_release.py" \
-    --binary "$prefix/bin/antfly-grep" --stage "$stage"
-fi
 if [ "$product" = embedded ]; then
   test -x "$prefix/bin/antfly-inference"
   cp "$prefix/bin/antfly-inference" "$stage/antfly-inference"
@@ -397,6 +393,10 @@ fi
 cp "$repo_root/THIRD_PARTY_NOTICES.md" "$stage/THIRD_PARTY_NOTICES.md"
 if [ "$product" = server ]; then
   "$repo_root/scripts/completions.sh" "$stage/completions"
+  # The server generator recreates its output directory. Stage grep assets
+  # afterwards so both commands' completions survive in the archive.
+  python3 "$repo_root/scripts/packaging/package_grep_release.py" \
+    --binary "$prefix/bin/antfly-grep" --stage "$stage"
 fi
 
 python3 "$repo_root/scripts/packaging/create_reproducible_tar.py" \

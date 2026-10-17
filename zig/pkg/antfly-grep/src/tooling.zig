@@ -134,7 +134,7 @@ pub fn generate(a: std.mem.Allocator, kind: []const u8, help: []const u8) ![]u8 
                 const words = try choices(a, name);
                 defer a.free(words);
                 if (words.len > 0) try output.writer.print(" -f -a '{s}'", .{words}) else if (spec(name)) |value| {
-                    if (value.directory) try output.writer.writeAll(" -a '(__fish_complete_directories)' ");
+                    if (value.directory) try output.writer.writeAll(" -a '(__fish_complete_directories)'");
                 }
             }
             try output.writer.writeByte('\n');
