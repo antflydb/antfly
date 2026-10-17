@@ -50,7 +50,7 @@ Register-ArgumentCompleter -Native -CommandName antfly-grep -ScriptBlock { param
  '--max-output-bytes' { ''.Split(' ',[System.StringSplitOptions]::RemoveEmptyEntries); break }
  '--max-pending-output' { ''.Split(' ',[System.StringSplitOptions]::RemoveEmptyEntries); break }
  '--max-regions' { ''.Split(' ',[System.StringSplitOptions]::RemoveEmptyEntries); break }
- '--max-requests' { ''.Split(' ',[System.StringSplitOptions]::RemoveEmptyEntries); break }
+ '--max-requests' { 'unlimited'.Split(' ',[System.StringSplitOptions]::RemoveEmptyEntries); break }
  '--max-result-files' { ''.Split(' ',[System.StringSplitOptions]::RemoveEmptyEntries); break }
  '--max-source-bytes' { ''.Split(' ',[System.StringSplitOptions]::RemoveEmptyEntries); break }
  '--model' { ''.Split(' ',[System.StringSplitOptions]::RemoveEmptyEntries); break }

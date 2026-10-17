@@ -23,6 +23,7 @@ import os
 import select
 import shutil
 import signal
+import socket
 import subprocess
 import sys
 import tempfile
@@ -38,6 +39,10 @@ NATIVE_LIBRARY = str(Path(sys.argv.pop(1)).resolve())
 
 class DecisionHandler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
+
+    def setup(self):
+        super().setup()
+        self.connection.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
 
     def handle(self):
         try:
@@ -166,6 +171,7 @@ class DecisionHandler(BaseHTTPRequestHandler):
         self.server.requests.append(
             (self.path, self.headers.get("Authorization"), body)
         )
+        self.server.client_ports.append(self.client_address[1])
         if body.get("context_version") == 1:
             body = json.loads(json.dumps(body))
             for item in body["inputs"]:
@@ -960,6 +966,7 @@ class CliTests(unittest.TestCase):
         self.env["HOME"] = str(self.root)
         self.env["XDG_CONFIG_HOME"] = str(self.root / "config")
         self.server.requests = []
+        self.server.client_ports = []
         self.server.index_requests = []
         self.server.index_next = threading.Event()
         self.server.index_release = threading.Event()
@@ -3419,7 +3426,7 @@ class CliTests(unittest.TestCase):
                 actual = self.run_cli(*flags, pattern, "a", code=expected.returncode)
                 self.assertEqual(actual.stdout, expected.stdout)
 
-    def raw_cli(self, *args, input=None, code=0):
+    def raw_cli(self, *args, input=None, code=0, timeout=20):
         result = subprocess.run(
             [BINARY, *args],
             check=False,
@@ -3427,7 +3434,7 @@ class CliTests(unittest.TestCase):
             env=self.env,
             input=input,
             capture_output=True,
-            timeout=20,
+            timeout=timeout,
         )
         self.assertEqual(
             result.returncode, code, result.stderr.decode(errors="replace")
@@ -3667,6 +3674,146 @@ class CliTests(unittest.TestCase):
                     )
                 )
 
+    def test_default_request_budget_keeps_foreground_evidence(self):
+        docs = [
+            self.indexed_doc(f"f{i:04}.txt", "STOP retry\n" * 100) for i in range(501)
+        ]
+        outputs = []
+        for prefetch in (False, True):
+            self.server.requests.clear()
+            self.server.index_requests.clear()
+            config = self.table_config(docs, prefetch=prefetch)
+            self.server.index_documents.sort(key=lambda doc: doc["_id"])
+            result = self.raw_cli(
+                *self.decision_args(),
+                "--no-cache",
+                "--no-refine",
+                "--chunk-lines=2000",
+                "--table-config",
+                config,
+                code=2,
+                timeout=120,
+            )
+            self.assertEqual(len(self.server.requests), 500)
+            self.assertEqual(len(self.server.index_requests), 500)
+            self.assertEqual(len(result.stdout.splitlines()), 50000)
+            outputs.append(result.stdout)
+        self.assertEqual(*outputs)
+
+    def test_types_include_hidden_files_and_keep_directory_and_ignore_rules(self):
+        self.write("visible.py", "hit\n")
+        self.write(".hidden.py", "hit\n")
+        self.write(".hidden-dir/inside.py", "hit\n")
+        self.write("ignored.py", "hit\n")
+        self.write(".gitignore", "ignored.py\n")
+        for threads in ("-j1", "-j4"):
+            result = self.raw_cli("--files", "--type=py", threads, ".")
+            self.assertEqual(
+                set(result.stdout.splitlines()), {b"./visible.py", b"./.hidden.py"}
+            )
+            result = self.raw_cli("--type=py", threads, "hit", ".")
+            self.assertEqual(
+                set(result.stdout.splitlines()),
+                {b"./visible.py:hit", b"./.hidden.py:hit"},
+            )
+            self.assertEqual(
+                self.raw_cli("--files", "--type=all", threads, ".").stdout.count(
+                    b".hidden.py"
+                ),
+                1,
+            )
+        config = self.table_config(
+            [self.indexed_doc(".hidden.py"), self.indexed_doc(".hidden-dir/inside.py")]
+        )
+        result = self.raw_cli("--table-config", config, "--type=py", "STOP")
+        self.assertIn(b".hidden.py", result.stdout)
+        self.assertNotIn(b"inside.py", result.stdout)
+
+    def test_decision_workers_and_connections_survive_batch_waves(self):
+        self.server.delay = 0.003
+        self.write("a", "STOP retry\n" * 64)
+        result = self.raw_cli(
+            *self.decision_args(),
+            "--no-cache",
+            "--unit=line",
+            "--no-refine",
+            "--batch-size=1",
+            "-j4",
+            "a",
+        )
+        self.assertEqual(len(result.stdout.splitlines()), 64)
+        self.assertEqual(len(self.server.requests), 64)
+        self.assertLessEqual(len(set(self.server.client_ports)), 4)
+        self.assertGreaterEqual(self.server.peak, 2)
+
+    def test_persistent_decision_workers_release_after_partial_budget_failure(self):
+        self.write("a", "STOP retry\n" * 64)
+        result = self.raw_cli(
+            *self.decision_args(),
+            "--no-cache",
+            "--unit=line",
+            "--no-refine",
+            "--batch-size=1",
+            "--max-requests=2",
+            "-j4",
+            "--json",
+            "a",
+            code=2,
+        )
+        rows = [json.loads(line) for line in result.stdout.splitlines()]
+        self.assertEqual(sum(row["type"] == "match" for row in rows), 2)
+        self.assertEqual(len(self.server.requests), 2)
+        self.assertFalse(rows[-1]["stats"]["complete"])
+
+    def test_span_replay_preserves_json_color_and_zero_width_output(self):
+        self.write("a", "ab aaaa\n\nlast ab")
+        for pattern in ("a", "a*", "^|$", "a|ab", "[ab]+"):
+            for flags in (
+                ["--json"],
+                ["--color=always"],
+                ["-o", "--color=never"],
+                ["-o", "--column", "--color=always"],
+            ):
+                with self.subTest(pattern=pattern, flags=flags):
+                    result = self.raw_cli(*flags, pattern, "a")
+                    if "--json" in flags:
+                        records = [
+                            json.loads(line) for line in result.stdout.splitlines()
+                        ]
+                        matches = [r for r in records if r["type"] == "match"]
+                        self.assertTrue(matches)
+                        self.assertTrue(all("source" in r for r in matches))
+                    if shutil.which("rg") and "--json" not in flags:
+                        expected = subprocess.run(
+                            ["rg", *flags, pattern, "a"],
+                            cwd=self.root,
+                            capture_output=True,
+                            check=False,
+                        )
+                        self.assertEqual(result.stdout, expected.stdout)
+        # A bare final CR becomes an empty unterminated record under CRLF.
+        # Suppressed terminal-empty spans must not inflate occurrence counters.
+        self.write("bare-cr", b"\r")
+        result = self.raw_cli("--json", "--crlf", "-F", "", "bare-cr")
+        rows = [json.loads(line) for line in result.stdout.splitlines()]
+        end = next(row for row in rows if row["type"] == "end")
+        self.assertEqual(end["data"]["stats"]["matches"], 0)
+        # Binary submatches and finite budgets retain valid JSON framing.
+        self.write("bytes", b"\xff\xff\n")
+        result = self.raw_cli("--json", "--no-unicode", "-o", ".", "bytes")
+        matches = [
+            json.loads(line)
+            for line in result.stdout.splitlines()
+            if json.loads(line)["type"] == "match"
+        ]
+        self.assertEqual(
+            matches[0]["data"]["submatches"][0]["match"], {"bytes": "/w=="}
+        )
+        self.write("dense", "k " * 262144 + "\n")
+        result = self.raw_cli("--json", "--max-output-bytes=1000", "k", "dense", code=2)
+        for line in result.stdout.splitlines():
+            json.loads(line)
+
     def test_explicit_request_budget_prioritizes_decisions_over_prefetch(self):
         docs = [self.indexed_doc(f"f{i}.txt", "STOP retry\n" * 1000) for i in range(2)]
         outputs = []
@@ -3815,7 +3962,11 @@ class CliTests(unittest.TestCase):
         config = self.table_config(docs, prefetch=True)
         self.server.mode = "prefetch"
         parallel = self.raw_cli(
-            *self.decision_args(), "--no-cache", "--table-config", config
+            *self.decision_args(),
+            "--no-cache",
+            "--max-requests=unlimited",
+            "--table-config",
+            config,
         )
         self.assertTrue(self.server.prefetch_seen)
         self.server.mode = "ok"
@@ -3834,6 +3985,7 @@ class CliTests(unittest.TestCase):
             self.raw_cli(
                 *self.decision_args(),
                 "--no-cache",
+                "--max-requests=unlimited",
                 "--table-config",
                 config,
                 "--max-output-bytes=1",

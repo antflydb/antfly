@@ -154,6 +154,7 @@ def main():
                             "--endpoint",
                             f"http://127.0.0.1:{server.server_port}/decisions",
                             "--no-cache",
+                            "--max-requests=unlimited",
                             "--no-config",
                             "-j1",
                         ],

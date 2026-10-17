@@ -25,6 +25,7 @@ import hashlib
 import json
 import os
 import platform
+import socket
 import statistics
 import subprocess
 import tempfile
@@ -49,16 +50,25 @@ def main():
     parser.add_argument("--lines", type=int, default=512)
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--rounds", type=int, default=3)
+    parser.add_argument("--jobs", type=int, default=1)
+    parser.add_argument("--keep-alive", action="store_true")
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
     if (
         not 2 <= args.lines <= 4096
         or not 1 <= args.batch_size <= 128
+        or not 1 <= args.jobs <= 256
         or args.rounds < 1
     ):
         parser.error("lines must be 2..4096, batch-size 1..128, and rounds positive")
 
     class Handler(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1" if args.keep_alive else "HTTP/1.0"
+
+        def setup(self):
+            super().setup()
+            self.connection.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+
         def log_message(self, *_args):
             pass
 
@@ -69,6 +79,7 @@ def main():
                 self.server.requests.append(
                     {
                         "bytes": len(raw),
+                        "client_port": self.client_address[1],
                         "state_bytes": len(body.get("state", "").encode())
                         + sum(len(x.encode()) for x in body.get("contexts", [])),
                         "questions": len(body["questions"])
@@ -125,6 +136,8 @@ def main():
         "limitations": "Constant scores; no model quality, provider tokens, or actual cost measured.",
         "platform": platform.platform(),
         "cache": args.cache,
+        "jobs": args.jobs,
+        "keep_alive": args.keep_alive,
         "source_sha256": hashlib.sha256(source.encode()).hexdigest(),
         "source_bytes": len(source.encode()),
         "lines": args.lines,
@@ -178,7 +191,7 @@ def main():
                             str(args.lines),
                             "--batch-size",
                             str(args.batch_size),
-                            "-j1",
+                            f"-j{args.jobs}",
                             "fixture.txt",
                         ],
                         cwd=root,
@@ -206,6 +219,7 @@ def main():
                             "seconds": elapsed,
                             "output_sha256": digest,
                             "requests": len(requests),
+                            "connections": len({r["client_port"] for r in requests}),
                             "request_bytes": sum(r["bytes"] for r in requests),
                             "state_bytes": sum(r["state_bytes"] for r in requests),
                             "questions": sum(r["questions"] for r in requests),

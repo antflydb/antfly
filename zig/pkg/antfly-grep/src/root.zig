@@ -69,6 +69,7 @@ pub const Search = struct {
     stdout_tty: bool = false,
     input_buffer: ?[]u8 = null,
     raw_line: ?[]const u8 = null,
+    replay_spans: bool = false,
     current_hits: ?[]const @import("matcher.zig").Match = null,
     current_hit_text: []const u8 = "",
     replacement_absolute_start: bool = true,
@@ -679,6 +680,7 @@ pub const Search = struct {
         self.file_started = if (self.options.json) std.Io.Clock.awake.now(self.io) else null;
         self.matcher.failure = null;
         self.current_hits = null;
+        self.replay_spans = false;
         self.binary_mode = false;
         self.binary_stop = false;
         self.binary_offset = null;
@@ -723,6 +725,7 @@ pub const Search = struct {
         local.binary_checked = false;
         local.binary_offset = null;
         local.current_hits = null;
+        local.replay_spans = false;
         local.raw_line = null;
         local.matcher.failure = null;
         local.file_started = std.Io.Clock.awake.now(self.io);
@@ -1160,8 +1163,10 @@ pub const Search = struct {
         var hit_arena = std.heap.ArenaAllocator.init(self.a);
         defer hit_arena.deinit();
         defer self.current_hits = null;
+        defer self.replay_spans = false;
         while (!self.stopped()) {
             self.current_hits = null;
+            self.replay_spans = false;
             _ = hit_arena.reset(.retain_capacity);
             storage.clearRetainingCapacity();
             if (offset >= prefilter_checked_until and !(self.options.stop_on_nonmatch and count > 0) and self.options.ask == null and !self.options.invert and !self.options.passthru and self.options.before == 0 and after == 0) {
@@ -1242,6 +1247,31 @@ pub const Search = struct {
                     self.summary.regions_evaluated += 1;
                     probability = scores[0];
                     matched = scores[0] >= 0 and ((scores[0] >= self.options.threshold) != self.options.invert);
+                } else if (context_limit == 0 and !self.options.invert and self.options.replacement == null and !self.options.vimgrep and (self.options.json or self.options.only_matching or self.color_enabled)) {
+                    self.replay_spans = true;
+                    if (self.matcher.isLiteralSearch()) {
+                        const counted = try self.matcher.count(text, std.math.maxInt(usize), peek != null);
+                        matched = counted.total != 0;
+                        exact_occurrences = counted.total - @intFromBool(counted.terminal_empty);
+                    } else {
+                        var spans = SpanIterator{ .matcher = &self.matcher, .text = text, .terminated = peek != null };
+                        var total: usize = 0;
+                        var small: std.ArrayList(@import("matcher.zig").Match) = .empty;
+                        while (spans.next()) |span| {
+                            if (total < 64) try small.append(hit_arena.allocator(), .{ .span = span, .captures = &.{}, .names = &.{} });
+                            total += 1;
+                        }
+                        if (self.matcher.failure) |err| return err;
+                        // Sparse regex rows reuse their preflight spans. Dense
+                        // rows replay from source with bounded storage instead
+                        // of growing a match array with occurrence count.
+                        if (total <= 64) {
+                            self.current_hits = small.items;
+                            self.current_hit_text = text;
+                        }
+                        matched = spans.found;
+                        exact_occurrences = total;
+                    }
                 } else if (!self.options.json and (self.options.count_matches or (self.options.count and (self.options.only_matching or self.options.stats)) or (self.options.stats and !self.options.only_matching and self.options.replacement == null and !self.color_enabled and !self.options.column and !self.options.vimgrep))) {
                     const limit = if (self.options.quiet or self.options.files_with_matches or self.options.invert) @as(usize, 1) else std.math.maxInt(usize);
                     const counted = try self.matcher.count(text, limit, peek != null);
@@ -1412,6 +1442,7 @@ pub const Search = struct {
         }
     }
     pub fn content(self: *Search, path_name: []const u8, bytes: []const u8) !void {
+        self.replay_spans = false;
         self.current_hits = null;
         if (self.shared_limits) |limits| if (!Limits.reserve(&limits.source_bytes, bytes.len, self.options.max_source_bytes)) return error.SourceBudgetExceeded;
         self.summary.files += 1;
@@ -2053,7 +2084,7 @@ pub const Search = struct {
             // Borrow the scanner's stable spans; rendering changes only the
             // view length, never the backing entries or capture storage.
             hits.items = @constCast(self.current_hits.?);
-        } else if (matched and p == null and !self.options.invert and (self.options.json or self.options.only_matching or self.options.replacement != null or self.color_enabled or self.options.column or self.options.vimgrep)) while (self.matcher.find(text, cursor)) |hit| {
+        } else if (!self.replay_spans and matched and p == null and !self.options.invert and (self.options.json or self.options.only_matching or self.options.replacement != null or self.color_enabled or self.options.column or self.options.vimgrep)) while (self.matcher.find(text, cursor)) |hit| {
             if (hit.span.start == hit.span.end and previous_end != null and previous_end.? == hit.span.end) {
                 cursor = self.matcher.advance(text, hit.span.end);
                 if (cursor > text.len or (!terminated and cursor == text.len)) break;
@@ -2080,13 +2111,7 @@ pub const Search = struct {
             const raw = self.raw_line orelse text;
             const utf8 = std.unicode.utf8ValidateSlice(text);
             const encoded = if (utf8) null else try base64(a, text);
-            const Sub = struct { match: JsonText, start: usize, end: usize };
-            const subs = try a.alloc(Sub, hits.items.len);
-            for (hits.items, 0..) |hit, i| {
-                const part = text[hit.span.start..hit.span.end];
-                const valid = std.unicode.utf8ValidateSlice(part);
-                subs[i] = .{ .match = .{ .text = if (valid) part else null, .bytes = if (valid) null else try base64(a, part) }, .start = hit.span.start, .end = hit.span.end };
-            }
+            const subs = JsonSubmatches{ .matcher = &self.matcher, .text = text, .terminated = terminated, .hits = if (self.replay_spans and self.current_hits == null and matched and p == null and !self.options.invert) null else hits.items };
             const raw_valid = std.unicode.utf8ValidateSlice(raw);
             try self.json(.{ .type = if (matched) "match" else "context", .data = .{ .path = encoded_path, .lines = JsonText{ .text = if (raw_valid) raw else null, .bytes = if (raw_valid) null else try base64(a, raw) }, .line_number = line, .absolute_offset = byte_offset, .submatches = subs }, .path = if (encoded_path.text != null) path_name else null, .path_bytes_base64 = encoded_path.bytes, .line_number = line, .byte_offset = byte_offset, .text = if (utf8) text else null, .bytes_base64 = encoded, .probability = p, .scope = if (p != null and !independent) "region" else "line" });
             return;
@@ -2102,6 +2127,9 @@ pub const Search = struct {
                 try self.write(header.written());
                 self.header_printed = true;
             }
+        }
+        if (self.replay_spans and matched and p == null and !self.options.invert) {
+            return self.emitReplay(path_name, text, line, byte_offset, terminated);
         }
         if (self.options.only_matching and p == null) {
             if (!matched) return;
@@ -2156,6 +2184,183 @@ pub const Search = struct {
             try self.write(output.written());
         }
     }
+    /// The preflight iterator and renderer share zero-width/EOF semantics.
+    /// Captures are never retained: capture-dependent rendering keeps its
+    /// existing source-context path instead of entering replay mode.
+    const SpanIterator = struct {
+        matcher: *Matcher,
+        text: []const u8,
+        terminated: bool,
+        cursor: usize = 0,
+        previous_end: ?usize = null,
+        done: bool = false,
+        found: bool = false,
+        cached: ?[]const @import("matcher.zig").Match = null,
+        cached_index: usize = 0,
+        fn next(self: *SpanIterator) ?@import("matcher.zig").Span {
+            if (self.cached) |hits| {
+                if (self.cached_index == hits.len) return null;
+                const span = hits[self.cached_index].span;
+                self.cached_index += 1;
+                return span;
+            }
+            while (!self.done) {
+                const hit = self.matcher.find(self.text, self.cursor) orelse {
+                    self.done = true;
+                    return null;
+                };
+                self.found = true;
+                const empty = hit.span.start == hit.span.end;
+                const duplicate = empty and self.previous_end != null and self.previous_end.? == hit.span.end;
+                const terminal = !self.terminated and empty and hit.span.start == self.text.len;
+                self.cursor = if (empty) self.matcher.advance(self.text, hit.span.end) else hit.span.end;
+                self.done = self.cursor > self.text.len or (!self.terminated and self.cursor == self.text.len);
+                if (duplicate or terminal) continue;
+                self.previous_end = hit.span.end;
+                return hit.span;
+            }
+            return null;
+        }
+    };
+    const JsonSubmatches = struct {
+        matcher: *Matcher,
+        text: []const u8,
+        terminated: bool,
+        hits: ?[]const @import("matcher.zig").Match,
+        pub fn jsonStringify(self: @This(), json_writer: *std.json.Stringify) !void {
+            try json_writer.beginArray();
+            if (self.hits) |hits| {
+                for (hits) |hit| try self.item(json_writer, hit.span);
+            } else {
+                var spans = SpanIterator{ .matcher = self.matcher, .text = self.text, .terminated = self.terminated };
+                while (spans.next()) |span| try self.item(json_writer, span);
+                if (self.matcher.failure != null) return error.WriteFailed;
+            }
+            try json_writer.endArray();
+        }
+        fn item(self: @This(), json_writer: *std.json.Stringify, span: @import("matcher.zig").Span) !void {
+            const bytes = self.text[span.start..span.end];
+            if (std.unicode.utf8ValidateSlice(bytes)) {
+                try json_writer.write(.{ .match = .{ .text = bytes }, .start = span.start, .end = span.end });
+            } else {
+                // Invalid byte matches are rare; bounded chunks of base64 avoid
+                // a second array proportional to the number of occurrences.
+                try json_writer.beginObject();
+                try json_writer.objectField("match");
+                try json_writer.beginObject();
+                try json_writer.objectField("bytes");
+                try json_writer.beginWriteRaw();
+                try json_writer.writer.writeByte('"');
+                var at: usize = 0;
+                var encoded: [4096]u8 = undefined;
+                while (at < bytes.len) {
+                    const count = @min(bytes.len - at, 3072);
+                    try json_writer.writer.writeAll(std.base64.standard.Encoder.encode(&encoded, bytes[at..][0..count]));
+                    at += count;
+                }
+                try json_writer.writer.writeByte('"');
+                json_writer.endWriteRaw();
+                try json_writer.endObject();
+                try json_writer.objectField("start");
+                try json_writer.write(span.start);
+                try json_writer.objectField("end");
+                try json_writer.write(span.end);
+                try json_writer.endObject();
+            }
+        }
+    };
+    const OutputWriter = struct {
+        search: *Search,
+        writer: std.Io.Writer,
+        failure: ?anyerror = null,
+        fn drain(writer: *std.Io.Writer, slices: []const []const u8, splat: usize) std.Io.Writer.Error!usize {
+            const self: *@This() = @alignCast(@fieldParentPtr("writer", writer));
+            self.search.write(writer.buffer[0..writer.end]) catch |err| {
+                self.failure = err;
+                return error.WriteFailed;
+            };
+            writer.end = 0;
+            var count: usize = 0;
+            for (slices[0 .. slices.len - 1]) |bytes| {
+                self.search.write(bytes) catch |err| {
+                    self.failure = err;
+                    return error.WriteFailed;
+                };
+                count += bytes.len;
+            }
+            for (0..splat) |_| {
+                const bytes = slices[slices.len - 1];
+                self.search.write(bytes) catch |err| {
+                    self.failure = err;
+                    return error.WriteFailed;
+                };
+                count += bytes.len;
+            }
+            return count;
+        }
+    };
+    fn outputError(self: *Search, output: *OutputWriter, fallback: anyerror) anyerror {
+        if (output.failure) |err| return err;
+        if (self.matcher.failure) |err| return err;
+        return fallback;
+    }
+    fn emitReplay(self: *Search, path: []const u8, text: []const u8, line: usize, offset: usize, terminated: bool) !void {
+        var buffer: [65536]u8 = undefined;
+        var output = OutputWriter{ .search = self, .writer = .{ .vtable = &.{ .drain = OutputWriter.drain }, .buffer = &buffer } };
+        self.renderReplay(&output.writer, path, text, line, offset, terminated) catch |err| return self.outputError(&output, err);
+        output.writer.flush() catch |err| return output.failure orelse err;
+    }
+    fn renderReplay(self: *Search, writer: *std.Io.Writer, path: []const u8, text: []const u8, line: usize, offset: usize, terminated: bool) !void {
+        var spans = SpanIterator{ .matcher = &self.matcher, .text = text, .terminated = terminated, .cached = self.current_hits };
+        var hit = spans.next();
+        const delimiter: u8 = if (self.options.null_data) 0 else '\n';
+        if (self.options.only_matching) {
+            if (hit == null) {
+                try self.prefix(writer, path, line, offset, 1, true);
+                try writer.writeAll(text);
+                try writer.writeByte(delimiter);
+            }
+            while (hit) |span| : (hit = spans.next()) {
+                try self.prefix(writer, path, line, offset + span.start, span.start + 1, true);
+                if (self.color_enabled and span.start != span.end) try @import("style.zig").start(writer, self.options, "match");
+                try writer.writeAll(text[span.start..span.end]);
+                if (self.color_enabled and span.start != span.end) try writer.writeAll("\x1b[0m");
+                try writer.writeByte(delimiter);
+            }
+        } else {
+            try self.prefix(writer, path, line, offset, if (hit) |span| span.start + 1 else 1, true);
+            if (text.len > self.options.max_columns) {
+                if (self.options.max_columns_preview) {
+                    try writer.writeAll(text[0..self.options.max_columns]);
+                    try writer.writeAll(" [... omitted end of long line]");
+                } else try writer.writeAll("[Omitted long matching line]");
+                try writer.writeByte('\n');
+                return;
+            }
+            var start: usize = 0;
+            const any = hit != null;
+            while (hit) |span| {
+                hit = spans.next();
+                if (span.start == span.end) continue;
+                var end = span.end;
+                // Adjacent matches share one highlight range; zero-width spans
+                // affect selection/metadata, never terminal escape sequences.
+                while (hit) |next| {
+                    if (next.start != end) break;
+                    end = @max(end, next.end);
+                    hit = spans.next();
+                }
+                try writer.writeAll(text[start..span.start]);
+                if (self.color_enabled) try @import("style.zig").start(writer, self.options, "match");
+                try writer.writeAll(text[span.start..end]);
+                if (self.color_enabled) try writer.writeAll("\x1b[0m");
+                start = end;
+            }
+            try writer.writeAll(if (self.options.trim and !any) std.mem.trimStart(u8, text[start..], " \t") else text[start..]);
+            try writer.writeByte(delimiter);
+        }
+        if (self.matcher.failure) |err| return err;
+    }
     const JsonText = struct {
         text: ?[]const u8,
         bytes: ?[]const u8,
@@ -2184,18 +2389,97 @@ pub const Search = struct {
         try self.json(.{ .type = "end", .data = .{ .path = encoded_path, .binary_offset = self.binary_offset, .stats = stats } });
         self.json_started = false;
     }
+    const AtomicRecord = struct {
+        a: Allocator,
+        bytes: std.ArrayList(u8) = .empty,
+        limit: usize,
+        budget_error: anyerror,
+        writer: std.Io.Writer,
+        failure: ?anyerror = null,
+        fn append(self: *@This(), bytes: []const u8) std.Io.Writer.Error!void {
+            if (bytes.len > self.limit - self.bytes.items.len) {
+                self.failure = self.budget_error;
+                return error.WriteFailed;
+            }
+            const needed = self.bytes.items.len + bytes.len;
+            if (needed > self.bytes.capacity) {
+                const capacity = @min(self.limit, @max(needed, self.bytes.capacity + self.bytes.capacity / 2 + 64));
+                self.bytes.ensureTotalCapacityPrecise(self.a, capacity) catch |err| {
+                    self.failure = err;
+                    return error.WriteFailed;
+                };
+            }
+            self.bytes.appendSliceAssumeCapacity(bytes);
+        }
+        fn drain(writer: *std.Io.Writer, slices: []const []const u8, splat: usize) std.Io.Writer.Error!usize {
+            const self: *@This() = @alignCast(@fieldParentPtr("writer", writer));
+            try self.append(writer.buffer[0..writer.end]);
+            writer.end = 0;
+            var count: usize = 0;
+            for (slices[0 .. slices.len - 1]) |bytes| {
+                try self.append(bytes);
+                count += bytes.len;
+            }
+            for (0..splat) |_| {
+                const bytes = slices[slices.len - 1];
+                try self.append(bytes);
+                count += bytes.len;
+            }
+            return count;
+        }
+    };
+    fn recordError(self: *Search, record: *AtomicRecord, fallback: anyerror) anyerror {
+        const err = record.failure orelse fallback;
+        if (err == error.PendingOutputBudgetExceeded) self.retaining_output = false;
+        return err;
+    }
+    fn encodeJson(self: *Search, value: anytype, writer: *std.Io.Writer) !void {
+        const Envelope = struct {
+            value: @TypeOf(value),
+            source: @TypeOf(self.provenance),
+            pub fn jsonStringify(envelope: @This(), json_writer: *std.json.Stringify) !void {
+                try json_writer.beginObject();
+                inline for (@typeInfo(@FieldType(@This(), "value")).@"struct".field_names) |field_name| {
+                    try json_writer.objectField(field_name);
+                    try json_writer.write(@field(envelope.value, field_name));
+                }
+                if (@hasField(@TypeOf(value), "type") and !std.mem.eql(u8, envelope.value.type, "summary")) {
+                    try json_writer.objectField("result_schema_version");
+                    try json_writer.write(@as(u32, 1));
+                    try json_writer.objectField("source");
+                    try json_writer.write(envelope.source);
+                }
+                try json_writer.endObject();
+            }
+        };
+        try std.json.Stringify.value(Envelope{ .value = value, .source = self.provenance }, .{}, writer);
+        try writer.writeByte('\n');
+    }
     fn json(self: *Search, value: anytype) !void {
-        const encoded = try std.json.Stringify.valueAlloc(self.a, value, .{});
-        defer self.a.free(encoded);
-        if (@hasField(@TypeOf(value), "type") and !std.mem.eql(u8, value.type, "summary")) {
-            const provenance = try std.json.Stringify.valueAlloc(self.a, self.provenance, .{});
-            defer self.a.free(provenance);
-            const framed = try std.fmt.allocPrint(self.a, "{s},\"result_schema_version\":1,\"source\":{s}}}\n", .{ encoded[0 .. encoded.len - 1], provenance });
-            defer self.a.free(framed);
-            try self.write(framed);
+        if (self.options.max_output_bytes == std.math.maxInt(usize) and !self.retaining_output) {
+            var buffer: [65536]u8 = undefined;
+            var output = OutputWriter{ .search = self, .writer = .{ .vtable = &.{ .drain = OutputWriter.drain }, .buffer = &buffer } };
+            self.encodeJson(value, &output.writer) catch |err| return self.outputError(&output, err);
+            output.writer.flush() catch |err| return output.failure orelse err;
         } else {
-            try self.write(encoded);
-            try self.write("\n");
+            // Record-atomic output is bounded by the remaining allowance, not
+            // by the full rendered record. Oversized records stop encoding
+            // before allocating their expanded JSON or publishing any bytes.
+            var limit = self.options.max_output_bytes - self.output_bytes;
+            var budget_error: anyerror = error.OutputBudgetExceeded;
+            if (self.retaining_output) if (self.shared_limits) |limits| {
+                const pending = self.options.max_pending_output -| limits.pending_output.load(.monotonic);
+                if (pending < limit) {
+                    limit = pending;
+                    budget_error = error.PendingOutputBudgetExceeded;
+                }
+            };
+            var buffer: [4096]u8 = undefined;
+            var record = AtomicRecord{ .a = self.a, .limit = limit, .budget_error = budget_error, .writer = .{ .vtable = &.{ .drain = AtomicRecord.drain }, .buffer = &buffer } };
+            defer record.bytes.deinit(self.a);
+            self.encodeJson(value, &record.writer) catch |err| return self.recordError(&record, err);
+            record.writer.flush() catch |err| return self.recordError(&record, err);
+            try self.write(record.bytes.items);
         }
     }
 };

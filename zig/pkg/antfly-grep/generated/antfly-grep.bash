@@ -51,7 +51,7 @@ _antfly_grep() {
  --max-output-bytes) COMPREPLY=(); if [[ -n $prefix ]]; then COMPREPLY=( "${COMPREPLY[@]/#/$prefix}" ); fi; return;;
  --max-pending-output) COMPREPLY=(); if [[ -n $prefix ]]; then COMPREPLY=( "${COMPREPLY[@]/#/$prefix}" ); fi; return;;
  --max-regions) COMPREPLY=(); if [[ -n $prefix ]]; then COMPREPLY=( "${COMPREPLY[@]/#/$prefix}" ); fi; return;;
- --max-requests) COMPREPLY=(); if [[ -n $prefix ]]; then COMPREPLY=( "${COMPREPLY[@]/#/$prefix}" ); fi; return;;
+ --max-requests) COMPREPLY=( $(compgen -W 'unlimited' -- "$cur") ); if [[ -n $prefix ]]; then COMPREPLY=( "${COMPREPLY[@]/#/$prefix}" ); fi; return;;
  --max-result-files) COMPREPLY=(); if [[ -n $prefix ]]; then COMPREPLY=( "${COMPREPLY[@]/#/$prefix}" ); fi; return;;
  --max-source-bytes) COMPREPLY=(); if [[ -n $prefix ]]; then COMPREPLY=( "${COMPREPLY[@]/#/$prefix}" ); fi; return;;
  --model) COMPREPLY=(); if [[ -n $prefix ]]; then COMPREPLY=( "${COMPREPLY[@]/#/$prefix}" ); fi; return;;

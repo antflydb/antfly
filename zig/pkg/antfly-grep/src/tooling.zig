@@ -16,6 +16,7 @@
 const std = @import("std");
 const ValueSpec = struct { name: []const u8, choices: []const u8 = "", path: bool = false, directory: bool = false };
 const values = [_]ValueSpec{
+    .{ .name = "--max-requests", .choices = "unlimited" },
     .{ .name = "--engine", .choices = "default auto pcre2" },
     .{ .name = "--decision-context", .choices = "legacy shared-v1" },
     .{ .name = "--backend", .choices = "http antfly typesafe local" },

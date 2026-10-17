@@ -59,10 +59,12 @@ pub const Client = struct {
     retry_after_ms: u64 = 0,
     input_tokens: usize = 0,
     output_tokens: usize = 0,
+    pool: ?*Pool = null,
     pub fn init(a: Allocator, io: std.Io, options: *const Options) Client {
         return .{ .a = a, .http = httpx.Client.init(a, io), .options = options, .io = io };
     }
     pub fn deinit(self: *Client) void {
+        if (self.pool) |pool| pool.deinit();
         self.http.deinit();
         if (self.local) |*local| local.deinit();
     }
@@ -92,20 +94,96 @@ pub const Client = struct {
             }
             return;
         }
-        var context = Batches{ .client = self, .inputs = inputs, .scores = scores };
-        const n = @min(self.options.jobs, (inputs.len + self.options.batch_size - 1) / self.options.batch_size);
-        const threads = try self.a.alloc(std.Thread, n);
-        defer self.a.free(threads);
-        var started: usize = 0;
-        defer for (threads[0..started]) |thread| thread.join();
-        for (threads) |*thread| {
-            thread.* = try std.Thread.spawn(.{}, Batches.worker, .{&context});
-            started += 1;
-        }
-        for (threads[0..started]) |thread| thread.join();
-        started = 0;
-        if (context.failure) |err| return err;
+        if (self.pool == null) self.pool = try Pool.create(self);
+        try self.pool.?.run(self, inputs, scores);
     }
+    /// Stable worker storage and clients survive batch waves. A wave borrows
+    /// its inputs until all workers acknowledge completion; no work queue grows
+    /// with the repository or source size.
+    const Pool = struct {
+        a: Allocator,
+        io: std.Io,
+        options: *const Options,
+        workers: []Worker,
+        started: usize = 0,
+        generation: usize = 0,
+        active: usize = 0,
+        selected: usize = 0,
+        context: ?*Batches = null,
+        stop: bool = false,
+        mutex: std.Io.Mutex = .init,
+        changed: std.Io.Condition = .init,
+        completed: std.Io.Condition = .init,
+        const Worker = struct { pool: *Pool, index: usize, generation: usize, thread: std.Thread = undefined };
+        fn create(parent: *Client) !*Pool {
+            const pool = try parent.a.create(Pool);
+            errdefer parent.a.destroy(pool);
+            const workers = try parent.a.alloc(Worker, parent.options.jobs);
+            pool.* = .{ .a = parent.a, .io = parent.io, .options = parent.options, .workers = workers };
+            return pool;
+        }
+        fn deinit(self: *Pool) void {
+            self.mutex.lockUncancelable(self.io);
+            self.stop = true;
+            self.changed.broadcast(self.io);
+            self.mutex.unlock(self.io);
+            for (self.workers[0..self.started]) |worker| worker.thread.join();
+            self.a.free(self.workers);
+            self.a.destroy(self);
+        }
+        fn run(self: *Pool, parent: *Client, inputs: []const Input, scores: []f64) !void {
+            const wanted = @min(self.workers.len, (inputs.len + parent.options.batch_size - 1) / parent.options.batch_size);
+            // The caller owns dispatch and waits for the previous wave. Spawn
+            // outside the mutex; new workers start at the previous generation.
+            while (self.started < wanted) {
+                const worker = &self.workers[self.started];
+                worker.* = .{ .pool = self, .index = self.started, .generation = self.generation };
+                worker.thread = std.Thread.spawn(.{}, workerMain, .{worker}) catch break;
+                self.started += 1;
+            }
+            if (self.started == 0) {
+                parent.allow_parallel = false;
+                defer parent.allow_parallel = true;
+                return parent.decideBatches(inputs, scores);
+            }
+            var context = Batches{ .client = parent, .inputs = inputs, .scores = scores };
+            self.mutex.lockUncancelable(self.io);
+            defer self.mutex.unlock(self.io);
+            self.context = &context;
+            self.selected = @min(wanted, self.started);
+            self.active = self.selected;
+            self.generation += 1;
+            self.changed.broadcast(self.io);
+            while (self.active != 0) self.completed.waitUncancelable(self.io, &self.mutex);
+            self.context = null;
+            if (context.failure) |err| return err;
+        }
+        fn workerMain(worker: *Worker) void {
+            const self = worker.pool;
+            var local = Client.init(self.a, self.io, self.options);
+            defer local.deinit();
+            while (true) {
+                self.mutex.lockUncancelable(self.io);
+                while (!self.stop and worker.generation == self.generation) self.changed.waitUncancelable(self.io, &self.mutex);
+                if (self.stop) {
+                    self.mutex.unlock(self.io);
+                    return;
+                }
+                worker.generation = self.generation;
+                if (worker.index >= self.selected) {
+                    self.mutex.unlock(self.io);
+                    continue;
+                }
+                const context = self.context.?;
+                self.mutex.unlock(self.io);
+                context.perform(&local);
+                self.mutex.lockUncancelable(self.io);
+                self.active -= 1;
+                if (self.active == 0) self.completed.signal(self.io);
+                self.mutex.unlock(self.io);
+            }
+        }
+    };
     const Batches = struct {
         client: *Client,
         inputs: []const Input,
@@ -113,10 +191,12 @@ pub const Client = struct {
         index: std.atomic.Value(usize) = .init(0),
         mutex: std.Io.Mutex = .init,
         failure: ?anyerror = null,
-        fn worker(ctx: *Batches) void {
+        fn perform(ctx: *Batches, local: *Client) void {
             const parent = ctx.client;
-            var local = Client.init(parent.a, parent.io, parent.options);
-            defer local.deinit();
+            local.requests = 0;
+            local.input_tokens = 0;
+            local.output_tokens = 0;
+            local.cache_hits = 0;
             local.limits = parent.limits;
             local.query = parent.query;
             local.stage = parent.stage;
@@ -127,7 +207,7 @@ pub const Client = struct {
                 const n = @min(parent.options.batch_size, ctx.inputs.len - start);
                 local.decide(ctx.inputs[start..][0..n], ctx.scores[start..][0..n]) catch |err| {
                     ctx.mutex.lockUncancelable(parent.io);
-                    ctx.failure = err;
+                    if (ctx.failure == null) ctx.failure = err;
                     ctx.mutex.unlock(parent.io);
                     break;
                 };

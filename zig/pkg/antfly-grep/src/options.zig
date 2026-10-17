@@ -138,7 +138,6 @@ pub const Options = struct {
     retries: usize = 3,
     retry_base_ms: u64 = 100,
     max_requests: usize = default_max_requests,
-    request_budget_explicit: bool = false,
     max_source_bytes: usize = std.math.maxInt(usize),
     max_output_bytes: usize = std.math.maxInt(usize),
     exclude: std.ArrayList([]const u8) = .empty,
@@ -561,8 +560,7 @@ pub const Options = struct {
                     self.max_file_bytes = try size(value);
                     self.skip_oversize = true;
                 } else if (std.mem.eql(u8, name, "--table-config")) self.table_config = value else if (std.mem.eql(u8, name, "--table")) try self.tables.append(a, value) else if (std.mem.eql(u8, name, "--table-filter")) self.table_filter = value else if (std.mem.eql(u8, name, "--max-index-documents")) self.max_index_documents = try number(value) else if (std.mem.eql(u8, name, "--max-pending-output")) self.max_pending_output = try number(value) else if (std.mem.eql(u8, name, "--cache-ttl")) self.cache_ttl_seconds = try number(value) else if (std.mem.eql(u8, name, "--max-columns")) self.max_columns = unlimited(try number(value)) else if (std.mem.eql(u8, name, "--max-depth")) self.max_depth = try number(value) else if (std.mem.eql(u8, name, "--max-requests")) {
-                    self.max_requests = try number(value);
-                    self.request_budget_explicit = true;
+                    self.max_requests = if (std.mem.eql(u8, value, "unlimited")) std.math.maxInt(usize) else try number(value);
                 } else if (std.mem.eql(u8, name, "--max-source-bytes")) {
                     if (self.jev_mode) self.source_excerpt_bytes = unlimited(try size(value)) else self.max_source_bytes = unlimited(try size(value));
                 } else if (std.mem.eql(u8, name, "--max-output-bytes")) self.max_output_bytes = unlimited(try size(value)) else if (std.mem.eql(u8, name, "--cache-dir")) self.cache_dir = value else if (std.mem.eql(u8, name, "--base-url")) self.endpoint = value else if (std.mem.eql(u8, name, "--query")) try self.queries.append(a, value) else if (std.mem.eql(u8, name, "--exclude")) try self.exclude.append(a, value) else if (std.mem.eql(u8, name, "--only")) try self.only.append(a, value) else if (std.mem.eql(u8, name, "--not")) try self.not.append(a, value) else if (std.mem.eql(u8, name, "--file")) try self.pattern_files.append(a, value) else if (std.mem.eql(u8, name, "--ignore-file")) try self.ignore_files.append(a, value) else if (std.mem.eql(u8, name, "--type")) try self.types.append(a, value) else if (std.mem.eql(u8, name, "--type-not")) try self.types_not.append(a, value) else if (std.mem.eql(u8, name, "--type-add")) try self.type_add.append(a, value) else if (std.mem.eql(u8, name, "--iglob")) {

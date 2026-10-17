@@ -62,7 +62,7 @@ pub fn start(writer: *std.Io.Writer, o: *const Options, target: []const u8) !voi
             reset = true;
         }
     }
-    if (!reset) try writer.writeAll(if (std.mem.eql(u8, target, "path")) "\x1b[0m\x1b[35m" else if (std.mem.eql(u8, target, "match")) "\x1b[0m\x1b[1m\x1b[31m" else "\x1b[0m\x1b[32m");
+    if (!reset) try writer.writeAll(if (std.mem.eql(u8, target, "path")) "\x1b[0m\x1b[35m" else if (std.mem.eql(u8, target, "match")) "\x1b[0m\x1b[1m\x1b[31m" else if (std.mem.eql(u8, target, "column")) "\x1b[0m" else "\x1b[0m\x1b[32m");
     for (o.colors.items[begin..]) |raw| {
         var parts = std.mem.splitScalar(u8, raw, ':');
         if (!std.mem.eql(u8, parts.next().?, target)) continue;

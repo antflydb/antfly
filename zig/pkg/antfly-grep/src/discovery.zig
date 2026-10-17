@@ -18,6 +18,40 @@ const regex = @import("antfly_regex");
 const Options = @import("options.zig").Options;
 const Allocator = std.mem.Allocator;
 
+/// Most catalog entries are literal basenames or dot suffixes. Match these
+/// through shared immutable sets; retain the canonical compiled glob for every
+/// class, escape, brace or general wildcard instead of approximating it.
+const PreparedTypes = struct {
+    names: std.StringHashMapUnmanaged(void) = .empty,
+    suffixes: std.StringHashMapUnmanaged(void) = .empty,
+    patterns: std.ArrayList(regex.PreparedPattern) = .empty,
+    fn add(self: *@This(), a: Allocator, raw: []const u8) !void {
+        if (std.mem.startsWith(u8, raw, "*.") and std.mem.indexOfAny(u8, raw[1..], "*?[]{}\\") == null) {
+            try self.suffixes.put(a, raw[1..], {});
+        } else if (std.mem.indexOfAny(u8, raw, "*?[]{}\\") == null) {
+            try self.names.put(a, raw, {});
+        } else {
+            var pattern = try glob(a, raw);
+            errdefer pattern.deinit();
+            try self.patterns.append(a, pattern);
+        }
+    }
+    fn matches(self: *const @This(), a: Allocator, basename: []const u8) !bool {
+        if (self.names.contains(basename)) return true;
+        if (self.suffixes.count() != 0) for (basename, 0..) |byte, i| {
+            if (byte == '.' and self.suffixes.contains(basename[i..])) return true;
+        };
+        for (self.patterns.items) |*pattern| if (try pattern.matches(a, basename)) return true;
+        return false;
+    }
+    fn deinit(self: *@This(), a: Allocator) void {
+        self.names.deinit(a);
+        self.suffixes.deinit(a);
+        for (self.patterns.items) |*pattern| pattern.deinit();
+        self.patterns.deinit(a);
+    }
+};
+
 const Rule = struct {
     references: std.atomic.Value(usize) = .init(1),
     base: []const u8,
@@ -99,6 +133,10 @@ pub const Discovery = struct {
     dispatcher: ?*Dispatcher = null,
     overrides: std.ArrayList(Override) = .empty,
     has_include: bool = false,
+    prepared: bool = false,
+    exclusions: std.ArrayList(Override) = .empty,
+    included_types: PreparedTypes = .{},
+    excluded_types: PreparedTypes = .{},
     git_root: ?[]const u8 = null,
     git_directory: ?[]const u8 = null,
     depth: usize = 0,
@@ -123,6 +161,10 @@ pub const Discovery = struct {
         self.rules.deinit(self.a);
         for (self.overrides.items) |*o| o.pattern.deinit();
         self.overrides.deinit(self.a);
+        for (self.exclusions.items) |*entry| entry.pattern.deinit();
+        self.exclusions.deinit(self.a);
+        self.included_types.deinit(self.a);
+        self.excluded_types.deinit(self.a);
         if (self.git_root) |p| self.a.free(p);
         if (self.git_directory) |p| self.a.free(p);
         if (self.cwd) |p| self.a.free(p);
@@ -136,6 +178,27 @@ pub const Discovery = struct {
         }
     }
     pub fn prepareOverrides(self: *Discovery) !void {
+        if (self.prepared) return;
+        // Prepare once per search root. Workers borrow these immutable arrays;
+        // no path dispatch performs catalog expansion or pattern compilation.
+        for (self.options.exclude.items) |raw| {
+            var pattern = try glob(self.a, raw);
+            errdefer pattern.deinit();
+            try self.exclusions.append(self.a, .{ .pattern = pattern, .basename = std.mem.indexOfScalar(u8, raw, '/') == null, .include = false });
+        }
+        inline for (.{ .{ "types", "included_types" }, .{ "types_not", "excluded_types" } }) |pair| {
+            var unique = std.StringHashMap(void).init(self.a);
+            defer unique.deinit();
+            for (@field(self.options, pair[0]).items) |name| {
+                const patterns = try @import("filetypes.zig").globs(self.a, self.options, name);
+                defer self.a.free(patterns);
+                for (patterns) |raw| {
+                    const entry = try unique.getOrPut(raw);
+                    if (entry.found_existing) continue;
+                    try @field(self, pair[1]).add(self.a, raw);
+                }
+            }
+        }
         for (0..2) |pass| {
             for (self.options.glob_order.items) |entry| {
                 if (entry.insensitive != (pass == 1)) continue;
@@ -154,13 +217,10 @@ pub const Discovery = struct {
                 self.has_include = self.has_include or !neg;
             }
         }
+        self.prepared = true;
     }
     pub fn indexedAllowed(self: *Discovery, path: []const u8) !bool {
         if (path.len == 0) return false;
-        if (!self.options.hidden and !self.has_include) {
-            var parts = std.mem.splitScalar(u8, path, '/');
-            while (parts.next()) |part| if (part.len > 0 and part[0] == '.') return false;
-        }
         for (path, 0..) |byte, i| if (byte == '/' and i > 0) {
             if (!try self.allowed(path[0..i], path[0..i], true)) return false;
         };
@@ -451,33 +511,20 @@ pub const Discovery = struct {
             if (!allow) return false;
             ignored = false;
         }
-        if (override == null and !self.options.hidden and std.fs.path.basename(path)[0] == '.') return false;
-        for (self.options.exclude.items) |raw| {
-            var p = try glob(self.a, raw);
-            defer p.deinit();
-            const target = if (std.mem.indexOfScalar(u8, raw, '/') == null) std.fs.path.basename(path) else display;
-            if (try p.matches(self.a, target)) return false;
-        }
+        var type_included = false;
         if (!dir) {
-            var included = self.options.types.items.len == 0;
-            for (self.options.types.items) |name| if (try self.matchesType(name, path)) {
-                included = true;
-                break;
-            };
-            if (!included) return false;
-            for (self.options.types_not.items) |name| if (try self.matchesType(name, path)) return false;
+            type_included = try self.included_types.matches(self.a, std.fs.path.basename(path));
+            if (self.options.types.items.len != 0 and !type_included) return false;
+            if (try self.excluded_types.matches(self.a, std.fs.path.basename(path))) return false;
+        }
+        // Type whitelists admit matching hidden files, but never hidden parent
+        // directories or files rejected by ignore rules.
+        if (override == null and !type_included and !self.options.hidden and std.fs.path.basename(path)[0] == '.') return false;
+        for (self.exclusions.items) |*entry| {
+            const target = if (entry.basename) std.fs.path.basename(path) else display;
+            if (try entry.pattern.matches(self.a, target)) return false;
         }
         return !ignored and (override != null or dir or !self.has_include);
-    }
-    fn matchesType(self: *Discovery, name: []const u8, path: []const u8) !bool {
-        const patterns = try @import("filetypes.zig").globs(self.a, self.options, name);
-        defer self.a.free(patterns);
-        for (patterns) |raw| {
-            var p = try glob(self.a, raw);
-            defer p.deinit();
-            if (try p.matches(self.a, std.fs.path.basename(path))) return true;
-        }
-        return false;
     }
     fn config(self: *Discovery, path: []const u8, base: []const u8) !void {
         {
@@ -802,6 +849,10 @@ fn WalkPool(comptime Context: type) type {
                     .options = source.options,
                     .rules = rules,
                     .overrides = source.overrides,
+                    .prepared = true,
+                    .exclusions = source.exclusions,
+                    .included_types = source.included_types,
+                    .excluded_types = source.excluded_types,
                     .has_include = source.has_include,
                     .git_root = source.git_root,
                     .git_directory = source.git_directory,
@@ -1110,5 +1161,22 @@ test "parallel directory jobs release shared ignore rules on completion and canc
             try d.walkParallel(path, "", &context);
             try std.testing.expectEqual(@as(usize, if (context.cancel) 1 else 150), context.count);
         }
+    }
+}
+
+test "prepared type sets match canonical globs including compound suffixes and fallback" {
+    const a = std.testing.allocator;
+    const patterns = [_][]const u8{ "*.py", "README", "*.tar.gz", "*.[ch]", "{foo,bar}.zz", "foo\\?", "*.É" };
+    var prepared = PreparedTypes{};
+    defer prepared.deinit(a);
+    for (patterns) |raw| try prepared.add(a, raw);
+    for ([_][]const u8{ "a.py", ".hidden.py", "a.PY", "README", "README.md", "archive.tar.gz", ".tar.gz", "x.gz", "x.c", "x.H", "foo.zz", "bar.zz", "baz.zz", "foo?", "fooX", "name.É", "name.é", ".py", "" }) |name| {
+        var expected = false;
+        for (patterns) |raw| {
+            var pattern = try glob(a, raw);
+            defer pattern.deinit();
+            expected = expected or try pattern.matches(a, name);
+        }
+        try std.testing.expectEqual(expected, try prepared.matches(a, name));
     }
 }

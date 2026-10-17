@@ -87,7 +87,7 @@ _arguments -s \
  '--max-output-bytes[max-output-bytes]:value:' \
  '--max-pending-output[max-pending-output]:value:' \
  '--max-regions[max-regions]:value:' \
- '--max-requests[max-requests]:value:' \
+ '--max-requests[max-requests]:value:(unlimited)' \
  '--max-result-files[max-result-files]:value:' \
  '--max-source-bytes[max-source-bytes]:value:' \
  '--messages[messages]' \

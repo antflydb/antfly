@@ -87,7 +87,7 @@ complete -c antfly-grep -l max-index-documents -r
 complete -c antfly-grep -l max-output-bytes -r
 complete -c antfly-grep -l max-pending-output -r
 complete -c antfly-grep -l max-regions -r
-complete -c antfly-grep -l max-requests -r
+complete -c antfly-grep -l max-requests -r -f -a 'unlimited'
 complete -c antfly-grep -l max-result-files -r
 complete -c antfly-grep -l max-source-bytes -r
 complete -c antfly-grep -l messages
