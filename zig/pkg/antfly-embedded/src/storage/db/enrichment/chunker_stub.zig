@@ -115,19 +115,18 @@ pub fn chunkTextWithConfigJsonAndProvider(
     return try chunkTextWithConfigJson(alloc, text, config_json);
 }
 
-/// Reduced storage owners do not link model/media inference. Keep the same
-/// configuration boundary as the full chunker and reject unavailable execution
-/// explicitly; binary/model-aware inputs must never fall back to text windows.
+pub fn freeChunks(alloc: Allocator, chunks: []Chunk) void {
+    for (chunks) |*chunk| chunk.deinit(alloc);
+    alloc.free(chunks);
+}
+
+/// Model-aware chunking belongs to the inference owner. Keep the control-side
+/// interface available without importing its physical implementation.
 pub fn chunkInputWithConfigJsonAndProvider(alloc: Allocator, _: anytype, config_json: []const u8, _: anytype) ![]Chunk {
     var cfg = try chunking_types.parseConfigFromSlice(alloc, config_json);
     defer cfg.deinit(alloc);
     if (cfg.embedding == null or cfg.provider != .antfly) return error.InvalidChunkerConfig;
     return error.UnsupportedPlatform;
-}
-
-pub fn freeChunks(alloc: Allocator, chunks: []Chunk) void {
-    for (chunks) |*chunk| chunk.deinit(alloc);
-    alloc.free(chunks);
 }
 
 fn remapChunkOffsets(sanitized: *const utf8_text.SanitizedText, chunks: []Chunk) void {
@@ -233,6 +232,18 @@ test "chunker stub rejects antfly configured chunking" {
             \\{"provider":"antfly","model":"fixed"}
         ),
     );
+}
+
+test "chunker stub model-aware input retains validation without byte chunk fallback" {
+    try std.testing.expectError(error.UnsupportedPlatform, chunkInputWithConfigJsonAndProvider(std.testing.allocator, {},
+        \\{"provider":"antfly","embedding":{"model":"model"}}
+    , null));
+    try std.testing.expectError(error.InvalidChunkerConfig, chunkInputWithConfigJsonAndProvider(std.testing.allocator, {},
+        \\{"provider":"antfly","model":"fixed"}
+    , null));
+    try std.testing.expectError(error.InvalidChunkerConfig, chunkInputWithConfigJsonAndProvider(std.testing.allocator, {},
+        \\{"provider":"mock","embedding":{"model":"model"}}
+    , null));
 }
 
 test "chunker stub model input preserves config errors and never flattens binary inputs" {

@@ -3601,18 +3601,25 @@ fn jsonNumberKeywordIsLosslessF64(object: std.json.ObjectMap, name: []const u8) 
 }
 
 fn parseAnonymousPropertyKeywords(alloc: std.mem.Allocator, context: SchemaContext, object: std.json.ObjectMap) anyerror!*DocumentProperty {
+    // Commit ownership directly to the existing heap node. Independent local
+    // owners and their cleanup copies otherwise grow every recursive Debug
+    // frame enough to exhaust the serving thread's stack on ordinary schemas.
     const property = try alloc.create(DocumentProperty);
-    errdefer alloc.destroy(property);
+    property.* = .{ .name = "" };
+    errdefer {
+        property.deinit(alloc);
+        alloc.destroy(property);
+    }
 
     const type_spec = if (object.get("type")) |property_type|
         try parseTypeSpec(alloc, property_type, false)
     else
         ParsedTypeSpec{};
-    const field_type = type_spec.field_type;
-    errdefer if (field_type) |owned| alloc.free(owned);
-    const sql_type: ?@import("../common/sql_builtin_type.zig").Type = if (object.get("x-antfly-sql-type")) |value| blk: {
+    property.field_type = type_spec.field_type;
+    property.integer_only = type_spec.integer_only;
+    property.sql_type = if (object.get("x-antfly-sql-type")) |value| blk: {
         if (value != .string) return error.InvalidSchemaUpdateRequest;
-        const physical = field_type orelse return error.InvalidSchemaUpdateRequest;
+        const physical = property.field_type orelse return error.InvalidSchemaUpdateRequest;
         const Type = @import("../common/sql_builtin_type.zig").Type;
         // Array element identity never changes the array envelope into a scalar.
         const kind = if (std.mem.eql(u8, physical, "sql_array"))
@@ -3630,12 +3637,12 @@ fn parseAnonymousPropertyKeywords(alloc: std.mem.Allocator, context: SchemaConte
         if (!matches) return error.InvalidSchemaUpdateRequest;
         break :blk kind;
     } else null;
-    if (field_type) |physical| if (std.mem.eql(u8, physical, "sql_array") and sql_type == null) return error.InvalidSchemaUpdateRequest;
-    const numeric_modifier = if (object.get("x-antfly-sql-numeric-modifier")) |value| blk: {
-        if (sql_type != .numeric) return error.InvalidSchemaUpdateRequest;
+    if (property.field_type) |physical| if (std.mem.eql(u8, physical, "sql_array") and property.sql_type == null) return error.InvalidSchemaUpdateRequest;
+    property.numeric_modifier = if (object.get("x-antfly-sql-numeric-modifier")) |value| blk: {
+        if (property.sql_type != .numeric) return error.InvalidSchemaUpdateRequest;
         break :blk @import("../sql/numeric_storage.zig").modifierFromJson(value) catch return error.InvalidSchemaUpdateRequest;
     } else null;
-    const format = if (object.get("format")) |format_value|
+    property.format = if (object.get("format")) |format_value|
         switch (format_value) {
             .string => |format_string| try alloc.dupe(u8, format_string),
             .null => null,
@@ -3643,51 +3650,48 @@ fn parseAnonymousPropertyKeywords(alloc: std.mem.Allocator, context: SchemaConte
         }
     else
         null;
-    errdefer if (format) |owned| alloc.free(owned);
-    if (sql_type) |kind| if (format) |name| {
+    if (property.sql_type) |kind| if (property.format) |name| {
         if (std.mem.eql(u8, name, "uuid") and kind != .uuid) return error.InvalidSchemaUpdateRequest;
     };
-    const allows_null = type_spec.allows_null or parseNullableFlag(object);
-    const const_value = if (object.get("const")) |const_schema_value|
+    property.allows_null = type_spec.allows_null or parseNullableFlag(object);
+    property.const_value = if (object.get("const")) |const_schema_value|
         try stringifyJsonValue(alloc, const_schema_value)
     else
         null;
-    errdefer if (const_value) |owned| alloc.free(owned);
-    const numeric_constraints = if (context.numeric_domain) try @import("numeric_constraints.zig").Plan.create(alloc, object) else null;
-    errdefer if (numeric_constraints) |plan| plan.deinit();
-    const minimum = if (context.numeric_domain) null else if (object.get("minimum")) |minimum_value|
+    property.numeric_constraints = if (context.numeric_domain) try @import("numeric_constraints.zig").Plan.create(alloc, object) else null;
+    property.minimum = if (context.numeric_domain) null else if (object.get("minimum")) |minimum_value|
         if (minimum_value == .null) null else parseJsonNumber(minimum_value) catch return error.InvalidSchemaUpdateRequest
     else
         null;
-    const minimum_i64 = if (object.get("minimum")) |minimum_value|
+    property.minimum_i64 = if (object.get("minimum")) |minimum_value|
         if (minimum_value == .null) null else exactI64JsonNumber(minimum_value)
     else
         null;
-    const maximum = if (context.numeric_domain) null else if (object.get("maximum")) |maximum_value|
+    property.maximum = if (context.numeric_domain) null else if (object.get("maximum")) |maximum_value|
         if (maximum_value == .null) null else parseJsonNumber(maximum_value) catch return error.InvalidSchemaUpdateRequest
     else
         null;
-    const maximum_i64 = if (object.get("maximum")) |maximum_value|
+    property.maximum_i64 = if (object.get("maximum")) |maximum_value|
         if (maximum_value == .null) null else exactI64JsonNumber(maximum_value)
     else
         null;
-    const exclusive_minimum = if (context.numeric_domain) null else if (object.get("exclusiveMinimum")) |exclusive_minimum_value|
+    property.exclusive_minimum = if (context.numeric_domain) null else if (object.get("exclusiveMinimum")) |exclusive_minimum_value|
         if (exclusive_minimum_value == .null) null else parseJsonNumber(exclusive_minimum_value) catch return error.InvalidSchemaUpdateRequest
     else
         null;
-    const exclusive_minimum_i64 = if (object.get("exclusiveMinimum")) |exclusive_minimum_value|
+    property.exclusive_minimum_i64 = if (object.get("exclusiveMinimum")) |exclusive_minimum_value|
         if (exclusive_minimum_value == .null) null else exactI64JsonNumber(exclusive_minimum_value)
     else
         null;
-    const exclusive_maximum = if (context.numeric_domain) null else if (object.get("exclusiveMaximum")) |exclusive_maximum_value|
+    property.exclusive_maximum = if (context.numeric_domain) null else if (object.get("exclusiveMaximum")) |exclusive_maximum_value|
         if (exclusive_maximum_value == .null) null else parseJsonNumber(exclusive_maximum_value) catch return error.InvalidSchemaUpdateRequest
     else
         null;
-    const exclusive_maximum_i64 = if (object.get("exclusiveMaximum")) |exclusive_maximum_value|
+    property.exclusive_maximum_i64 = if (object.get("exclusiveMaximum")) |exclusive_maximum_value|
         if (exclusive_maximum_value == .null) null else exactI64JsonNumber(exclusive_maximum_value)
     else
         null;
-    const multiple_of = if (context.numeric_domain) null else if (object.get("multipleOf")) |multiple_of_value|
+    property.multiple_of = if (context.numeric_domain) null else if (object.get("multipleOf")) |multiple_of_value|
         if (multiple_of_value == .null) null else blk: {
             const parsed = parseJsonNumber(multiple_of_value) catch return error.InvalidSchemaUpdateRequest;
             if (parsed <= 0) return error.InvalidSchemaUpdateRequest;
@@ -3695,33 +3699,33 @@ fn parseAnonymousPropertyKeywords(alloc: std.mem.Allocator, context: SchemaConte
         }
     else
         null;
-    const numeric_constraints_are_lossless_f64 =
+    property.numeric_constraints_are_lossless_f64 =
         jsonNumberKeywordIsLosslessF64(object, "minimum") and
         jsonNumberKeywordIsLosslessF64(object, "maximum") and
         jsonNumberKeywordIsLosslessF64(object, "exclusiveMinimum") and
         jsonNumberKeywordIsLosslessF64(object, "exclusiveMaximum") and
         jsonNumberKeywordIsLosslessF64(object, "multipleOf");
-    const multiple_of_i64 = if (object.get("multipleOf")) |multiple_of_value|
+    property.multiple_of_i64 = if (object.get("multipleOf")) |multiple_of_value|
         if (multiple_of_value == .null) null else exactPositiveI64JsonNumber(multiple_of_value)
     else
         null;
-    const min_length = if (object.get("minLength")) |min_length_value|
+    property.min_length = if (object.get("minLength")) |min_length_value|
         if (min_length_value == .null) null else exactU64JsonNumber(min_length_value) orelse return error.InvalidSchemaUpdateRequest
     else
         null;
-    const max_length = if (object.get("maxLength")) |max_length_value|
+    property.max_length = if (object.get("maxLength")) |max_length_value|
         if (max_length_value == .null) null else exactU64JsonNumber(max_length_value) orelse return error.InvalidSchemaUpdateRequest
     else
         null;
-    const min_properties = if (object.get("minProperties")) |min_properties_value|
+    property.min_properties = if (object.get("minProperties")) |min_properties_value|
         if (min_properties_value == .null) null else exactU64JsonNumber(min_properties_value) orelse return error.InvalidSchemaUpdateRequest
     else
         null;
-    const max_properties = if (object.get("maxProperties")) |max_properties_value|
+    property.max_properties = if (object.get("maxProperties")) |max_properties_value|
         if (max_properties_value == .null) null else exactU64JsonNumber(max_properties_value) orelse return error.InvalidSchemaUpdateRequest
     else
         null;
-    const pattern = if (object.get("pattern")) |pattern_value|
+    property.pattern = if (object.get("pattern")) |pattern_value|
         switch (pattern_value) {
             .string => |pattern_string| try alloc.dupe(u8, pattern_string),
             .null => null,
@@ -3729,61 +3733,44 @@ fn parseAnonymousPropertyKeywords(alloc: std.mem.Allocator, context: SchemaConte
         }
     else
         null;
-    errdefer if (pattern) |owned| alloc.free(owned);
-    const min_items = if (object.get("minItems")) |min_items_value|
+    property.min_items = if (object.get("minItems")) |min_items_value|
         if (min_items_value == .null) null else exactU64JsonNumber(min_items_value) orelse return error.InvalidSchemaUpdateRequest
     else
         null;
-    const max_items = if (object.get("maxItems")) |max_items_value|
+    property.max_items = if (object.get("maxItems")) |max_items_value|
         if (max_items_value == .null) null else exactU64JsonNumber(max_items_value) orelse return error.InvalidSchemaUpdateRequest
     else
         null;
-    const min_contains = if (object.get("minContains")) |min_contains_value|
+    property.min_contains = if (object.get("minContains")) |min_contains_value|
         if (min_contains_value == .null) null else exactU64JsonNumber(min_contains_value) orelse return error.InvalidSchemaUpdateRequest
     else
         null;
-    const max_contains = if (object.get("maxContains")) |max_contains_value|
+    property.max_contains = if (object.get("maxContains")) |max_contains_value|
         if (max_contains_value == .null) null else exactU64JsonNumber(max_contains_value) orelse return error.InvalidSchemaUpdateRequest
     else
         null;
-    const unique_items = if (object.get("uniqueItems")) |unique_items_value|
+    property.unique_items = if (object.get("uniqueItems")) |unique_items_value|
         if (unique_items_value == .null) false else unique_items_value.bool
     else
         false;
-    const enum_values: [][]const u8 = if (object.get("enum")) |enum_value|
+    property.enum_values = if (object.get("enum")) |enum_value|
         if (enum_value == .array) try parseEnumValues(alloc, enum_value.array) else &[_][]const u8{}
     else
         &[_][]const u8{};
-    errdefer {
-        for (enum_values) |enum_entry| alloc.free(enum_entry);
-        if (enum_values.len > 0) alloc.free(enum_values);
-    }
 
-    const required_fields: [][]const u8 = if (object.get("required")) |required|
+    property.required_fields = if (object.get("required")) |required|
         if (required == .array) try parseRequiredFields(alloc, required.array) else &[_][]const u8{}
     else
         &[_][]const u8{};
-    errdefer {
-        for (required_fields) |field_name| alloc.free(field_name);
-        if (required_fields.len > 0) alloc.free(required_fields);
-    }
-    const antfly_types: [][]const u8 = if (object.get("x-antfly-types")) |types_value|
+    property.antfly_types = if (object.get("x-antfly-types")) |types_value|
         if (types_value == .array) try parseRequiredFields(alloc, types_value.array) else &[_][]const u8{}
     else
         &[_][]const u8{};
-    errdefer {
-        for (antfly_types) |type_name| alloc.free(type_name);
-        if (antfly_types.len > 0) alloc.free(antfly_types);
-    }
-    const antfly_field: ?DynamicTemplate = if (object.get("x-antfly-field")) |field_value|
+    property.antfly_field = if (object.get("x-antfly-field")) |field_value|
         if (field_value == .object) try parseFieldMappingSpec(alloc, "", field_value.object, true) else null
     else
         null;
-    errdefer if (antfly_field) |*field| {
-        var owned = field.*;
-        owned.deinit(alloc);
-    };
-    const analyzer = if (object.get("x-antfly-analyzer")) |analyzer_value|
+    property.analyzer = if (object.get("x-antfly-analyzer")) |analyzer_value|
         switch (analyzer_value) {
             .string => |name| try alloc.dupe(u8, name),
             .null => null,
@@ -3791,8 +3778,7 @@ fn parseAnonymousPropertyKeywords(alloc: std.mem.Allocator, context: SchemaConte
         }
     else
         null;
-    errdefer if (analyzer) |owned| alloc.free(owned);
-    const antfly_index = if (object.get("x-antfly-index")) |index_value|
+    property.antfly_index = if (object.get("x-antfly-index")) |index_value|
         switch (index_value) {
             .bool => |enabled| enabled,
             .null => null,
@@ -3800,26 +3786,15 @@ fn parseAnonymousPropertyKeywords(alloc: std.mem.Allocator, context: SchemaConte
         }
     else
         null;
-    const include_in_all_fields: [][]const u8 = if (object.get("x-antfly-include-in-all")) |include_value|
+    property.include_in_all_fields = if (object.get("x-antfly-include-in-all")) |include_value|
         if (include_value == .array) try parseRequiredFields(alloc, include_value.array) else &[_][]const u8{}
     else
         &[_][]const u8{};
-    errdefer {
-        for (include_in_all_fields) |field_name| alloc.free(field_name);
-        if (include_in_all_fields.len > 0) alloc.free(include_in_all_fields);
-    }
-    const prefix_items: []DocumentProperty = if (object.get("prefixItems")) |prefix_items_value|
+    property.prefix_items = if (object.get("prefixItems")) |prefix_items_value|
         if (prefix_items_value == .array) try parsePropertyVariants(alloc, context, prefix_items_value.array) else &[_]DocumentProperty{}
     else
         &[_]DocumentProperty{};
-    errdefer {
-        for (prefix_items) |prefix_property| {
-            var owned = prefix_property;
-            owned.deinit(alloc);
-        }
-        if (prefix_items.len > 0) alloc.free(prefix_items);
-    }
-    const additional_items_allowed = if (object.get("additionalItems")) |additional_items_value|
+    property.additional_items_allowed = if (object.get("additionalItems")) |additional_items_value|
         switch (additional_items_value) {
             .bool => |allowed| allowed,
             .null, .object => null,
@@ -3827,7 +3802,7 @@ fn parseAnonymousPropertyKeywords(alloc: std.mem.Allocator, context: SchemaConte
         }
     else
         null;
-    const additional_properties_allowed = if (object.get("additionalProperties")) |additional_properties_value|
+    property.additional_properties_allowed = if (object.get("additionalProperties")) |additional_properties_value|
         switch (additional_properties_value) {
             .bool => |allowed| allowed,
             .null, .object => null,
@@ -3835,19 +3810,15 @@ fn parseAnonymousPropertyKeywords(alloc: std.mem.Allocator, context: SchemaConte
         }
     else
         null;
-    const additional_properties_schema = if (object.get("additionalProperties")) |additional_properties_value|
+    property.additional_properties_schema = if (object.get("additionalProperties")) |additional_properties_value|
         if (additional_properties_value == .object) try parseAnonymousProperty(alloc, context, additional_properties_value.object) else null
     else
         null;
-    errdefer if (additional_properties_schema) |owned| {
-        owned.deinit(alloc);
-        alloc.destroy(owned);
-    };
-    const dynamic_infer_types = if (object.get("x-antfly-dynamic-indexing")) |dynamic_indexing_value|
+    property.dynamic_infer_types = if (object.get("x-antfly-dynamic-indexing")) |dynamic_indexing_value|
         try parseDynamicIndexingMode(dynamic_indexing_value)
     else
         false;
-    const unevaluated_properties_allowed = if (object.get("unevaluatedProperties")) |unevaluated_properties_value|
+    property.unevaluated_properties_allowed = if (object.get("unevaluatedProperties")) |unevaluated_properties_value|
         switch (unevaluated_properties_value) {
             .bool => |allowed| allowed,
             .null, .object => null,
@@ -3855,46 +3826,24 @@ fn parseAnonymousPropertyKeywords(alloc: std.mem.Allocator, context: SchemaConte
         }
     else
         null;
-    const unevaluated_properties_schema = if (object.get("unevaluatedProperties")) |unevaluated_properties_value|
+    property.unevaluated_properties_schema = if (object.get("unevaluatedProperties")) |unevaluated_properties_value|
         if (unevaluated_properties_value == .object) try parseAnonymousProperty(alloc, context, unevaluated_properties_value.object) else null
     else
         null;
-    errdefer if (unevaluated_properties_schema) |owned| {
-        owned.deinit(alloc);
-        alloc.destroy(owned);
-    };
-    const pattern_properties = if (object.get("patternProperties")) |pattern_properties_value|
+    property.pattern_properties = if (object.get("patternProperties")) |pattern_properties_value|
         if (pattern_properties_value == .object) try parsePatternProperties(alloc, context, pattern_properties_value.object) else &[_]PatternProperty{}
     else
         &[_]PatternProperty{};
-    errdefer {
-        for (pattern_properties) |pattern_property| {
-            var owned = pattern_property;
-            owned.deinit(alloc);
-        }
-        if (pattern_properties.len > 0) alloc.free(pattern_properties);
-    }
 
-    const child_properties: []DocumentProperty = if (object.get("properties")) |properties_value|
+    property.properties = if (object.get("properties")) |properties_value|
         if (properties_value == .object) try parseDocumentProperties(alloc, context, properties_value.object) else &[_]DocumentProperty{}
     else
         &[_]DocumentProperty{};
-    errdefer {
-        for (child_properties) |child| {
-            var owned = child;
-            owned.deinit(alloc);
-        }
-        if (child_properties.len > 0) alloc.free(child_properties);
-    }
-    const property_names = if (object.get("propertyNames")) |property_names_value|
+    property.property_names = if (object.get("propertyNames")) |property_names_value|
         if (property_names_value == .object) try parseAnonymousProperty(alloc, context, property_names_value.object) else null
     else
         null;
-    errdefer if (property_names) |owned| {
-        owned.deinit(alloc);
-        alloc.destroy(owned);
-    };
-    const dependent_required = blk: {
+    property.dependent_required = blk: {
         var explicit = if (object.get("dependentRequired")) |dependent_required_value|
             if (dependent_required_value == .object) try parseDependentRequired(alloc, dependent_required_value.object) else &[_]DependentRequired{}
         else
@@ -3910,8 +3859,7 @@ fn parseAnonymousPropertyKeywords(alloc: std.mem.Allocator, context: SchemaConte
         legacy = &[_]DependentRequired{};
         break :blk merged;
     };
-    errdefer freeDependentRequiredSlice(alloc, dependent_required);
-    const dependent_schemas = blk: {
+    property.dependent_schemas = blk: {
         var explicit = if (object.get("dependentSchemas")) |dependent_schemas_value|
             if (dependent_schemas_value == .object) try parseDependentSchemas(alloc, context, dependent_schemas_value.object) else &[_]DependentSchema{}
         else
@@ -3927,92 +3875,46 @@ fn parseAnonymousPropertyKeywords(alloc: std.mem.Allocator, context: SchemaConte
         legacy = &[_]DependentSchema{};
         break :blk merged;
     };
-    errdefer freeDependentSchemaSlice(alloc, dependent_schemas);
-    const any_of: []DocumentProperty = if (object.get("anyOf")) |any_of_value|
+    property.any_of = if (object.get("anyOf")) |any_of_value|
         if (any_of_value == .array) try parsePropertyVariants(alloc, context, any_of_value.array) else &[_]DocumentProperty{}
     else
         &[_]DocumentProperty{};
-    errdefer {
-        for (any_of) |child| {
-            var owned = child;
-            owned.deinit(alloc);
-        }
-        if (any_of.len > 0) alloc.free(any_of);
-    }
-    const one_of: []DocumentProperty = if (object.get("oneOf")) |one_of_value|
+    property.one_of = if (object.get("oneOf")) |one_of_value|
         if (one_of_value == .array) try parsePropertyVariants(alloc, context, one_of_value.array) else &[_]DocumentProperty{}
     else
         &[_]DocumentProperty{};
-    errdefer {
-        for (one_of) |child| {
-            var owned = child;
-            owned.deinit(alloc);
-        }
-        if (one_of.len > 0) alloc.free(one_of);
-    }
-    const all_of: []DocumentProperty = if (object.get("allOf")) |all_of_value|
+    property.all_of = if (object.get("allOf")) |all_of_value|
         if (all_of_value == .array) try parsePropertyVariants(alloc, context, all_of_value.array) else &[_]DocumentProperty{}
     else
         &[_]DocumentProperty{};
-    errdefer {
-        for (all_of) |child| {
-            var owned = child;
-            owned.deinit(alloc);
-        }
-        if (all_of.len > 0) alloc.free(all_of);
-    }
-    const not_schema = if (object.get("not")) |not_value|
+    property.not_schema = if (object.get("not")) |not_value|
         if (not_value == .object) try parseAnonymousProperty(alloc, context, not_value.object) else null
     else
         null;
-    errdefer if (not_schema) |owned| {
-        owned.deinit(alloc);
-        alloc.destroy(owned);
-    };
-    const if_schema = if (object.get("if")) |if_value|
+    property.if_schema = if (object.get("if")) |if_value|
         if (if_value == .object) try parseAnonymousProperty(alloc, context, if_value.object) else null
     else
         null;
-    errdefer if (if_schema) |owned| {
-        owned.deinit(alloc);
-        alloc.destroy(owned);
-    };
-    const then_schema = if (object.get("then")) |then_value|
+    property.then_schema = if (object.get("then")) |then_value|
         if (then_value == .object) try parseAnonymousProperty(alloc, context, then_value.object) else null
     else
         null;
-    errdefer if (then_schema) |owned| {
-        owned.deinit(alloc);
-        alloc.destroy(owned);
-    };
-    const else_schema = if (object.get("else")) |else_value|
+    property.else_schema = if (object.get("else")) |else_value|
         if (else_value == .object) try parseAnonymousProperty(alloc, context, else_value.object) else null
     else
         null;
-    errdefer if (else_schema) |owned| {
-        owned.deinit(alloc);
-        alloc.destroy(owned);
-    };
-    const contains_schema = if (object.get("contains")) |contains_value|
+    property.contains_schema = if (object.get("contains")) |contains_value|
         if (contains_value == .object) try parseAnonymousProperty(alloc, context, contains_value.object) else null
     else
         null;
-    errdefer if (contains_schema) |owned| {
-        owned.deinit(alloc);
-        alloc.destroy(owned);
-    };
 
-    const item = if (object.get("items")) |items_value|
+    property.item = if (object.get("items")) |items_value|
         if (items_value == .object) try parseAnonymousProperty(alloc, context, items_value.object) else null
     else if (object.get("additionalItems")) |additional_items_value|
         if (additional_items_value == .object) try parseAnonymousProperty(alloc, context, additional_items_value.object) else null
     else
         null;
-    errdefer if (item) |owned| {
-        owned.deinit(alloc);
-        alloc.destroy(owned);
-    };
-    const unevaluated_items_allowed = if (object.get("unevaluatedItems")) |unevaluated_items_value|
+    property.unevaluated_items_allowed = if (object.get("unevaluatedItems")) |unevaluated_items_value|
         switch (unevaluated_items_value) {
             .bool => |allowed| allowed,
             .null, .object => null,
@@ -4020,114 +3922,82 @@ fn parseAnonymousPropertyKeywords(alloc: std.mem.Allocator, context: SchemaConte
         }
     else
         null;
-    const unevaluated_items_schema = if (object.get("unevaluatedItems")) |unevaluated_items_value|
+    property.unevaluated_items_schema = if (object.get("unevaluatedItems")) |unevaluated_items_value|
         if (unevaluated_items_value == .object) try parseAnonymousProperty(alloc, context, unevaluated_items_value.object) else null
     else
         null;
-    errdefer if (unevaluated_items_schema) |owned| {
-        owned.deinit(alloc);
-        alloc.destroy(owned);
-    };
 
     const array_like = schemaShapeIsArrayLike(
-        field_type,
-        min_items,
-        max_items,
-        prefix_items.len,
-        additional_items_allowed != null,
-        item != null,
-        unevaluated_items_allowed != null,
-        unevaluated_items_schema != null,
-        contains_schema != null,
-        min_contains,
-        max_contains,
-        unique_items,
+        property.field_type,
+        property.min_items,
+        property.max_items,
+        property.prefix_items.len,
+        property.additional_items_allowed != null,
+        property.item != null,
+        property.unevaluated_items_allowed != null,
+        property.unevaluated_items_schema != null,
+        property.contains_schema != null,
+        property.min_contains,
+        property.max_contains,
+        property.unique_items,
     );
     if (array_like) {
-        if (fieldMappingContainsSortable(antfly_field)) return error.InvalidSchemaUpdateRequest;
-        if (documentPropertiesContainSortableMapping(prefix_items)) return error.InvalidSchemaUpdateRequest;
-        if (item) |array_item| {
+        if (fieldMappingContainsSortable(property.antfly_field)) return error.InvalidSchemaUpdateRequest;
+        if (documentPropertiesContainSortableMapping(property.prefix_items)) return error.InvalidSchemaUpdateRequest;
+        if (property.item) |array_item| {
             if (documentPropertyContainsSortableMapping(array_item.*)) return error.InvalidSchemaUpdateRequest;
         }
-        if (contains_schema) |contains_item| {
+        if (property.contains_schema) |contains_item| {
             if (documentPropertyContainsSortableMapping(contains_item.*)) return error.InvalidSchemaUpdateRequest;
         }
-        if (unevaluated_items_schema) |unevaluated_item| {
+        if (property.unevaluated_items_schema) |unevaluated_item| {
             if (documentPropertyContainsSortableMapping(unevaluated_item.*)) return error.InvalidSchemaUpdateRequest;
         }
     }
 
-    if (!array_like and (antfly_index orelse true)) {
-        try validateFieldMappingSchemaCompatibility(field_type, antfly_field);
+    if (!array_like and (property.antfly_index orelse true)) {
+        try validateFieldMappingSchemaCompatibility(property.field_type, property.antfly_field);
     }
 
-    property.* = .{
-        .name = try alloc.dupe(u8, ""),
-        .root_ref = false,
-        .field_type = field_type,
-        .antfly_types = antfly_types,
-        .antfly_field = antfly_field,
-        .analyzer = analyzer,
-        .antfly_index = antfly_index,
-        .integer_only = type_spec.integer_only,
-        .format = format,
-        .sql_type = sql_type,
-        .numeric_modifier = numeric_modifier,
-        .allows_null = allows_null,
-        .const_value = const_value,
-        .minimum = minimum,
-        .minimum_i64 = minimum_i64,
-        .maximum = maximum,
-        .maximum_i64 = maximum_i64,
-        .exclusive_minimum = exclusive_minimum,
-        .exclusive_minimum_i64 = exclusive_minimum_i64,
-        .exclusive_maximum = exclusive_maximum,
-        .exclusive_maximum_i64 = exclusive_maximum_i64,
-        .multiple_of = multiple_of,
-        .multiple_of_i64 = multiple_of_i64,
-        .numeric_constraints_are_lossless_f64 = numeric_constraints_are_lossless_f64,
-        .numeric_constraints = numeric_constraints,
-        .min_length = min_length,
-        .max_length = max_length,
-        .min_properties = min_properties,
-        .max_properties = max_properties,
-        .pattern = pattern,
-        .min_items = min_items,
-        .max_items = max_items,
-        .additional_items_allowed = additional_items_allowed,
-        .min_contains = min_contains,
-        .max_contains = max_contains,
-        .unique_items = unique_items,
-        .enum_values = enum_values,
-        .required_fields = required_fields,
-        .include_in_all_fields = include_in_all_fields,
-        .prefix_items = prefix_items,
-        .properties = child_properties,
-        .pattern_properties = pattern_properties,
-        .additional_properties_allowed = additional_properties_allowed,
-        .additional_properties_schema = additional_properties_schema,
-        .dynamic_infer_types = dynamic_infer_types,
-        .unevaluated_properties_allowed = unevaluated_properties_allowed,
-        .unevaluated_properties_schema = unevaluated_properties_schema,
-        .property_names = property_names,
-        .dependent_required = dependent_required,
-        .dependent_schemas = dependent_schemas,
-        .any_of = any_of,
-        .one_of = one_of,
-        .all_of = all_of,
-        .not_schema = not_schema,
-        .if_schema = if_schema,
-        .then_schema = then_schema,
-        .else_schema = else_schema,
-        .contains_schema = contains_schema,
-        .item = item,
-        .unevaluated_items_allowed = unevaluated_items_allowed,
-        .unevaluated_items_schema = unevaluated_items_schema,
-    };
     if (property.dynamic_infer_types and (!(property.additional_properties_allowed orelse false) or property.additional_properties_schema != null)) {
         return error.InvalidSchemaUpdateRequest;
     }
     return property;
+}
+
+test "relational contract schema parsing uses bounded stack and unwinds partial ownership" {
+    if (@import("builtin").single_threaded) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var input: std.ArrayList(u8) = .empty;
+    defer input.deinit(alloc);
+    try input.appendSlice(alloc, "{\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":");
+    for (0..8) |_| try input.appendSlice(alloc, "{\"type\":\"object\",\"properties\":{\"child\":");
+    try input.appendSlice(alloc, "{\"type\":\"string\",\"enum\":[\"a\",\"b\"],\"minLength\":1,\"pattern\":\".\"}");
+    for (0..8) |_| try input.appendSlice(alloc, "}}");
+    try input.appendSlice(alloc, "}}}");
+    const Probe = struct {
+        input: []const u8,
+        failure: ?anyerror = null,
+
+        fn parse(a: std.mem.Allocator, text: []const u8) !void {
+            var parsed = try parseSchema(a, text);
+            defer parsed.deinit(a);
+            try std.testing.expectEqual(@as(usize, 1), parsed.document_schemas.len);
+        }
+
+        fn run(self: *@This()) void {
+            parse(std.testing.allocator, self.input) catch |err| {
+                self.failure = err;
+            };
+        }
+    };
+    var probe = Probe{ .input = input.items };
+    // Include LLVM Debug's surrounding JSON/cleanup frames in this portable
+    // budget. The former property parser alone used about 276 KiB per level.
+    const thread = try std.Thread.spawn(.{ .stack_size = 1024 * 1024 }, Probe.run, .{&probe});
+    thread.join();
+    if (probe.failure) |err| return err;
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(alloc, Probe.parse, .{input.items});
 }
 
 fn schemaShapeIsArrayLike(
