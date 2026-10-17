@@ -113,6 +113,8 @@ pub const NodeCursor = struct {
     frames: std.ArrayList(*PathFrame) = .empty,
     weighted: bool = false,
     multiplicity: Multiplicity = .exact,
+    weighted_seeds: ?Engine.AnchorBatch = null,
+    fallback_seed: ?usize = null,
     weighted_arena: std.heap.ArenaAllocator,
     adjacency_cache: Engine.AdjacencyCache,
     pending: std.ArrayList(struct { row: Row, weight: u64 }) = .empty,
@@ -133,9 +135,53 @@ pub const NodeCursor = struct {
         for (projection.items) |item| if (!Engine.endpointExpression(item.expression, path, &.{})) return false;
         for (path.nodes) |node| for (node.properties) |entry| if (self.engine.constant(entry.value, &.{}) == null) return false;
         for (path.edges) |edge| for (edge.properties) |entry| if (self.engine.constant(entry.value, &.{}) == null) return false;
+        const planned = try self.engine.reductionPath(path, &.{}, operation, projection);
+        const clauses = try self.engine.a.dupe(ast.Clause, self.query.clauses);
+        clauses[0].operation.match.paths = try self.engine.a.dupe(ast.Path, &.{planned});
+        self.query.clauses = clauses;
+        if (try self.engine.batchEligible(planned, &.{}, operation, projection)) {
+            self.weighted_seeds = .{ .path = planned, .input = .{ .row = &.{} }, .mode = operation.mode, .budget = .{ .backing = self.budget.allocator(), .limit = @min(8 << 20, self.engine.limits.memory_bytes / 16) } };
+        }
         self.weighted = true;
         self.multiplicity = multiplicity;
         return true;
+    }
+    fn tryWeighted(self: *NodeCursor, input: Engine.MatchState, path: ast.Path, starts: []const *const v.Node) !bool {
+        _ = self.weighted_arena.reset(.retain_capacity);
+        self.pending = .empty;
+        self.pending_position = 0;
+        const e = self.engine;
+        e.weighted_sink = .{ .ptr = self, .emit = emitWeighted, .multiplicity = self.multiplicity };
+        e.stream_predicate = self.query.clauses[0].operation.match.predicate;
+        defer {
+            e.weighted_sink = null;
+            e.stream_predicate = null;
+        }
+        var ignored: std.ArrayList(Engine.MatchState) = .empty;
+        return e.countAllPaths(input, path, self.query.clauses[0].operation.match.mode, starts, &ignored);
+    }
+    fn clearSeeds(self: *NodeCursor) void {
+        const seeds = &self.weighted_seeds.?;
+        if (seeds.arena) |*arena| arena.deinit();
+        seeds.arena = null;
+        seeds.nodes = .empty;
+        self.fallback_seed = null;
+    }
+    fn reduceSeeds(self: *NodeCursor) !void {
+        const seeds = &self.weighted_seeds.?;
+        if (seeds.nodes.items.len == 0) {
+            // Admission may have partially cloned the first root. No retained
+            // node can borrow this storage, so release it before ordinary pulls.
+            self.clearSeeds();
+            return;
+        }
+        if (try self.tryWeighted(seeds.input, seeds.path, seeds.nodes.items)) {
+            self.clearSeeds();
+        } else {
+            // Proofs decline before emitting. Retain owned roots until each
+            // ordinary frame has finished, including across caller pulls.
+            self.fallback_seed = 0;
+        }
     }
     fn emitWeighted(ptr: *anyopaque, row: Row, weight: u64) !void {
         const self: *NodeCursor = @ptrCast(@alignCast(ptr));
@@ -294,7 +340,8 @@ pub const NodeCursor = struct {
         while (self.frames.items.len != 0) {
             const frame = self.frames.items[self.frames.items.len - 1];
             const path = self.query.clauses[0].operation.match.paths[frame.path_index];
-            const exhausted_scan = frame.scanning and frame.anchor_position == frame.anchors.len and frame.label == e.graph.labels.len;
+            const exhausted_scan = frame.scanning and frame.anchor_position == frame.anchors.len and frame.label == e.graph.labels.len and
+                (self.weighted_seeds == null or self.weighted_seeds.?.nodes.items.len == 0);
             const exhausted_route = !frame.scanning and frame.edge_index < path.edges.len and frame.endpoint_tried and
                 (frame.mapping == e.graph.relationships.len or (path.edges[frame.edge_index].max_hops != null and frame.hops >= path.edges[frame.edge_index].max_hops.?));
             if (!frame.complete and !exhausted_scan and !exhausted_route) break;
@@ -359,13 +406,26 @@ pub const NodeCursor = struct {
         const operation = self.query.clauses[0].operation.match;
         const path = operation.paths[frame.path_index];
         const pattern = path.nodes[0];
+        if (self.fallback_seed) |position| {
+            const seeds = &self.weighted_seeds.?;
+            if (position < seeds.nodes.items.len) {
+                self.fallback_seed = position + 1;
+                try self.pushAnchor(frame, seeds.nodes.items[position], false);
+                return;
+            }
+            self.clearSeeds();
+        }
         if (frame.anchor_position < frame.anchors.len) {
             const raw = frame.anchors[frame.anchor_position];
             frame.anchor_position += 1;
-            try self.pushAnchor(frame, raw);
+            try self.pushAnchor(frame, raw, true);
             return;
         }
         if (frame.label == e.graph.labels.len) {
+            if (self.weighted_seeds) |seeds| if (seeds.nodes.items.len != 0) {
+                try self.reduceSeeds();
+                return;
+            };
             self.popFrame();
             return;
         }
@@ -407,7 +467,7 @@ pub const NodeCursor = struct {
         frame.anchors = page.items;
         frame.anchor_position = 0;
     }
-    fn pushAnchor(self: *NodeCursor, frame: *PathFrame, raw: *const v.Node) !void {
+    fn pushAnchor(self: *NodeCursor, frame: *PathFrame, raw: *const v.Node, collect: bool) !void {
         const e = self.engine;
         const pattern = self.query.clauses[0].operation.match.paths[frame.path_index].nodes[0];
         var scratch = std.heap.ArenaAllocator.init(self.budget.allocator());
@@ -427,19 +487,22 @@ pub const NodeCursor = struct {
         state.row = row;
         child.state = (try e.constrain(state, value, pattern.properties)) orelse return;
         if (!try e.constraintsMatch(child.state.constraints, row, true)) return;
+        if (collect) if (self.weighted_seeds) |*seeds| if (!seeds.disabled) {
+            seeds.append(value.node) catch |err| {
+                if (err != error.OutOfMemory or !seeds.budget.exhausted) return err;
+                seeds.disabled = true;
+                // This root still belongs to the pinned scan page. Replay it
+                // after flushing the retained prefix, without reading it again.
+                frame.anchor_position -= 1;
+                try self.reduceSeeds();
+                return;
+            };
+            if (seeds.nodes.items.len == 128) try self.reduceSeeds();
+            return;
+        };
         if (self.weighted) {
-            _ = self.weighted_arena.reset(.retain_capacity);
-            self.pending = .empty;
-            self.pending_position = 0;
-            e.weighted_sink = .{ .ptr = self, .emit = emitWeighted, .multiplicity = self.multiplicity };
-            e.stream_predicate = self.query.clauses[0].operation.match.predicate;
-            defer {
-                e.weighted_sink = null;
-                e.stream_predicate = null;
-            }
-            var ignored: std.ArrayList(Engine.MatchState) = .empty;
             const operation = self.query.clauses[0].operation.match;
-            if (try e.countAllPath(child.state, operation.paths[frame.path_index], operation.mode, value.node, &ignored)) return;
+            if (try self.tryWeighted(child.state, operation.paths[frame.path_index], &.{value.node})) return;
         }
         child.path_index = frame.path_index;
         child.nodes = try e.a.dupe(*const v.Node, &.{value.node});
@@ -667,6 +730,7 @@ pub const NodeCursor = struct {
         while (self.frames.items.len != 0) self.popFrame();
         self.frames.deinit(budget.allocator());
         self.weighted_arena.deinit();
+        if (self.weighted_seeds) |*seeds| if (seeds.arena) |*arena| arena.deinit();
         self.adjacency_cache.deinit();
         self.engine.regex.deinit();
         self.arena.deinit();
@@ -1334,12 +1398,15 @@ const Engine = struct {
             const accepted_before = fold.accepted;
             var count_paths: u64 = 0;
             self.shortest_count = if (count_shortest) &count_paths else null;
-            var batch: AnchorBatch = .{ .path = path, .input = .{ .row = row }, .mode = operation.mode, .budget = .{ .backing = self.scratch_allocator, .limit = @min(8 << 20, self.limits.memory_bytes / 16) } };
+            const planned_path = if (count_shortest or count_endpoints) try self.reductionPath(path, row, operation, projection) else path;
+            var planned = operation;
+            if (count_shortest or count_endpoints) planned.paths = &.{planned_path};
+            var batch: AnchorBatch = .{ .path = planned_path, .input = .{ .row = row }, .mode = operation.mode, .budget = .{ .backing = self.scratch_allocator, .limit = @min(8 << 20, self.limits.memory_bytes / 16) } };
             defer if (batch.arena) |*arena| arena.deinit();
             const saved_batch = self.anchor_batch;
-            self.anchor_batch = if ((count_shortest or count_endpoints) and try self.batchEligible(path, row, operation, projection)) &batch else null;
+            self.anchor_batch = if ((count_shortest or count_endpoints) and try self.batchEligible(planned_path, row, planned, projection)) &batch else null;
             defer self.anchor_batch = saved_batch;
-            self.joinPath(.{ .row = row }, operation, 0, &ignored) catch |err| switch (err) {
+            self.joinPath(.{ .row = row }, planned, 0, &ignored) catch |err| switch (err) {
                 error.CypherStreamComplete => break :produce,
                 else => return err,
             };
@@ -2325,7 +2392,7 @@ const Engine = struct {
             };
             effective_maximum = std.math.add(usize, effective_maximum, upper) catch return false;
             if (effective_maximum > self.limits.path_depth) return false;
-            if (topological == null and path.edges.len == 1 and starts.len > 1 and edge.min_hops <= 1 and upper >= starts.len) {
+            if (topological == null and path.edges.len == 1 and starts.len > 1 and upper >= starts.len) {
                 // A wide, long-range batch often covers an entire DAG. Probe
                 // only nodes reachable within the requested upper bound. If
                 // its longest captured route fits, the same linear reduction
@@ -2341,17 +2408,28 @@ const Engine = struct {
             }
             try chargeWork(self, endpoints.capacity());
             endpoints.clearRetainingCapacity();
-            if (topological != null and edge.min_hops <= 1) {
-                // Sum every allowed DAG length in one topological pass. Keep
-                // positive-length arrivals separate from root seeds: subtracting
-                // a zero-hop seed after saturation could hide COUNT overflow.
+            if (topological != null) {
+                // First form exactly the mandatory minimum-hop frontier, then
+                // sum every allowed tail length in one topological pass. Never
+                // subtract short paths from saturated counts: that can conceal
+                // overflow in a qualifying endpoint's bag.
+                if (edge.min_hops > upper) {
+                    current.clearRetainingCapacity();
+                    continue;
+                }
+                var mandatory: usize = 0;
+                while (mandatory < edge.min_hops and current.count() != 0) : (mandatory += 1) {
+                    try chargeWork(self, @as(usize, current.capacity()) + next.capacity());
+                    try self.advanceLower(&graph, domain, edge, &current, &next);
+                    std.mem.swap(Counts, &current, &next);
+                }
                 const reached = try self.a.alloc(u64, graph.nodes.items.len);
                 @memset(reached, 0);
                 for (topological.?) |index| {
                     try self.state();
                     const seed = current.get(index) orelse 0;
                     const ways = mergePathWays(reached[index], seed);
-                    const accepted = if (edge.min_hops == 0) ways else reached[index];
+                    const accepted = ways;
                     const node = graph.nodes.items[index].node;
                     if (accepted != 0 and try self.nodeMatches(node, path.nodes[edge_index + 1]) and
                         boundNodeMatches(node, path.nodes[edge_index + 1], input.row) and try self.constantProperties(.{ .node = node }, path.nodes[edge_index + 1].properties, input.row))
@@ -2386,33 +2464,7 @@ const Engine = struct {
                     }
                 }
                 if (hop == upper) break;
-                next.clearRetainingCapacity();
-                candidates = current.iterator();
-                while (candidates.next()) |candidate| {
-                    const index = candidate.key_ptr.*;
-                    const ways = candidate.value_ptr.*;
-                    // Discover adjacency only for reachable product states.
-                    // In particular, a failed intermediate node predicate must
-                    // not open the arbitrarily large branch behind that node.
-                    const range = try self.loadLowerDomain(&graph, index, domain);
-                    const node = graph.nodes.items[index].node;
-                    for (graph.nodes.items[index].arcs.items[range.first..range.last]) |*arc| {
-                        try self.state();
-                        const relationship = arc.relationship;
-                        const mapping = self.graph.relationships[arc.mapping];
-                        const selected = if (edge.types.len == 0) true else for (edge.types) |name| {
-                            if (std.mem.eql(u8, name, mapping.name)) break true;
-                        } else false;
-                        if (!selected) continue;
-                        const outgoing = edge.direction != .in and relationship.source.eql(node.identity) and try self.graph.admits(node, mapping.source_label, &self.values);
-                        const incoming = edge.direction != .out and relationship.target.eql(node.identity) and try self.graph.admits(node, mapping.target_label, &self.values);
-                        if (!outgoing and !incoming) continue;
-                        if (!try self.constantProperties(.{ .relationship = relationship }, edge.properties, input.row)) continue;
-                        arc.eligible = true;
-                        const entry = try next.getOrPut(self.a, arc.target);
-                        entry.value_ptr.* = mergePathWays(if (entry.found_existing) entry.value_ptr.* else 0, ways);
-                    }
-                }
+                try self.advanceLower(&graph, domain, edge, &current, &next);
                 std.mem.swap(Counts, &current, &next);
             }
             std.mem.swap(Counts, &current, &endpoints);
@@ -2470,6 +2522,35 @@ const Engine = struct {
         }
         return true;
     }
+    fn advanceLower(self: *Engine, graph: *LowerGraph, domain: usize, edge: ast.Edge, current: *std.AutoHashMapUnmanaged(usize, u64), next: *std.AutoHashMapUnmanaged(usize, u64)) !void {
+        next.clearRetainingCapacity();
+        var candidates = current.iterator();
+        while (candidates.next()) |candidate| {
+            const index = candidate.key_ptr.*;
+            const ways = candidate.value_ptr.*;
+            // Discover adjacency only for reachable product states.
+            // In particular, a failed intermediate node predicate must
+            // not open the arbitrarily large branch behind that node.
+            const range = try self.loadLowerDomain(graph, index, domain);
+            const node = graph.nodes.items[index].node;
+            for (graph.nodes.items[index].arcs.items[range.first..range.last]) |*arc| {
+                try self.state();
+                const relationship = arc.relationship;
+                const mapping = self.graph.relationships[arc.mapping];
+                const selected = if (edge.types.len == 0) true else for (edge.types) |name| {
+                    if (std.mem.eql(u8, name, mapping.name)) break true;
+                } else false;
+                if (!selected) continue;
+                const outgoing = edge.direction != .in and relationship.source.eql(node.identity) and try self.graph.admits(node, mapping.source_label, &self.values);
+                const incoming = edge.direction != .out and relationship.target.eql(node.identity) and try self.graph.admits(node, mapping.target_label, &self.values);
+                if (!outgoing and !incoming) continue;
+                if (!try self.constantProperties(.{ .relationship = relationship }, edge.properties, graph.input.row)) continue;
+                arc.eligible = true;
+                const entry = try next.getOrPut(self.a, arc.target);
+                entry.value_ptr.* = mergePathWays(if (entry.found_existing) entry.value_ptr.* else 0, ways);
+            }
+        }
+    }
     const EndpointScope = struct {
         path: ast.Path,
         row: Row,
@@ -2526,7 +2607,11 @@ const Engine = struct {
         nodes: std.ArrayList(*const v.Node) = .empty,
         disabled: bool = false,
         fn flush(self: *@This(), engine: *Engine, output: *std.ArrayList(MatchState)) anyerror!void {
-            if (self.nodes.items.len == 0) return;
+            if (self.nodes.items.len == 0) {
+                if (self.arena) |*arena| arena.deinit();
+                self.arena = null;
+                return;
+            }
             const previous = engine.anchor_batch;
             engine.anchor_batch = null;
             defer engine.anchor_batch = previous;
@@ -2547,8 +2632,40 @@ const Engine = struct {
             try self.nodes.append(a, owned);
         }
     };
+    fn reductionPath(self: *Engine, path: ast.Path, row: Row, operation: ast.Match, projection: ast.Projection) !ast.Path {
+        if (path.selector != .all or path.edges.len == 0 or path.execution_prefix or try self.batchEligible(path, row, operation, projection)) return path;
+        // Without cardinality estimates, equal filter scores do not prove a
+        // different table or label population costs the same to scan. Only
+        // reorient equivalent anchor admissions; selective point/interior
+        // anchors still take precedence through batchEligible below.
+        const first = path.nodes[0];
+        const last = path.nodes[path.nodes.len - 1];
+        if (!sameTypeSet(first.labels, last.labels) or first.properties.len != last.properties.len) return path;
+        for ([_][]const ast.Entry{ first.properties, last.properties }, [_][]const ast.Entry{ last.properties, first.properties }) |properties, other| {
+            for (properties) |entry| {
+                const matched = for (other) |candidate| {
+                    if (std.mem.eql(u8, entry.name, candidate.name) and @import("expressions.zig").same(entry.value, candidate.value)) break true;
+                } else false;
+                if (!matched) return path;
+            }
+        }
+        const nodes = try self.a.dupe(ast.Node, path.nodes);
+        const edges = try self.a.dupe(ast.Edge, path.edges);
+        std.mem.reverse(ast.Node, nodes);
+        std.mem.reverse(ast.Edge, edges);
+        for (edges) |*edge| edge.direction = switch (edge.direction) {
+            .out => .in,
+            .in => .out,
+            .both => .both,
+        };
+        var reversed = path;
+        reversed.nodes = nodes;
+        reversed.edges = edges;
+        reversed.execution_reversed = !path.execution_reversed;
+        return if (try self.batchEligible(reversed, row, operation, projection)) reversed else path;
+    }
     fn batchEligible(self: *Engine, path: ast.Path, row: Row, operation: ast.Match, projection: ast.Projection) !bool {
-        if (path.selector != .all or path.edges.len == 0 or path.execution_prefix or path.execution_reversed) return false;
+        if (path.selector != .all or path.edges.len == 0 or path.execution_prefix) return false;
         if (path.nodes[0].alias) |alias| if (lookup(row, alias) != null) return false;
         for (path.nodes) |node| for (node.properties) |entry| if (self.constant(entry.value, row) == null) return false;
         for (path.edges) |edge| for (edge.properties) |entry| if (self.constant(entry.value, row) == null) return false;
@@ -2563,7 +2680,9 @@ const Engine = struct {
         for (projection.items) |item| if (item.alias) |alias| {
             shape = try self.replace(shape, alias, .null);
         };
-        for (projection.order) |order| if (!@import("expressions.zig").rowLocal(order.expression, EndpointScope{ .path = path, .row = shape, .include_start = false })) return false;
+        const projected: EndpointScope = .{ .path = path, .row = shape, .include_start = false };
+        if (projection.predicate) |predicate| if (!@import("expressions.zig").rowLocal(predicate, projected)) return false;
+        for (projection.order) |order| if (!@import("expressions.zig").rowLocal(order.expression, projected)) return false;
         return true;
     }
     fn startPath(self: *Engine, input: MatchState, path: ast.Path, mode: ast.PathMode, node: *const v.Node, output: *std.ArrayList(MatchState)) anyerror!void {

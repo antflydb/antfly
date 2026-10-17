@@ -450,7 +450,11 @@ def test_authenticated_cypher_property_plans_and_sql_overlays(monkeypatch):
         assert pure_endpoint["rows"] == [[{"type": "integer", "value": "6"}]], (
             pure_endpoint
         )
-        for bounds, expected in (("1..", 2**18 - 19), ("0..", 2**18 - 1)):
+        for bounds, expected in (
+            ("1..", 2**18 - 19),
+            ("2..", 2**18 - 19 - 153),
+            ("0..", 2**18 - 1),
+        ):
             all_lengths = call(
                 f"/graphs/{hops}/query",
                 {
@@ -461,6 +465,17 @@ def test_authenticated_cypher_property_plans_and_sql_overlays(monkeypatch):
             assert all_lengths["rows"] == [
                 [{"type": "integer", "value": str(expected)}]
             ], all_lengths
+        start_only = call(
+            f"/graphs/{hops}/query",
+            {
+                "query": "MATCH (a:H)-[:R*1..]->(b:H) RETURN sum(a.score)",
+                "limits": {"explored_edges": 153, "intermediate_states": 20000},
+            },
+        )
+        expected_start_sum = sum(i * (2 ** (17 - i) - 1) for i in range(18))
+        assert start_only["rows"] == [
+            [{"type": "integer", "value": str(expected_start_sum)}]
+        ], start_only
         pure_columns = call(
             "/sql",
             {

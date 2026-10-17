@@ -1335,8 +1335,13 @@ nontransparent relational operators retain ordinary rows. Scalar repeatability i
 checked independently of parallel execution support: CASE, Boolean expressions,
 IN lists and pure builtins retain weights and their ordinary lazy evaluation.
 External decisions and consumable pattern cursors require ordinary rows. Pinned
-statement settings remain stable inputs. The cursor buffers
-endpoint contributions for one anchor, never the complete result or route bag.
+statement settings remain stable inputs. The cursor buffers endpoint contributions
+for one bounded anchor batch, never the complete result or route bag. It retains
+at most 128 validated, independently owned roots under a soft memory allowance.
+Anchor reads remain narrow so large records cannot force oversized scan pages.
+A declined batch proof replays retained roots through ordinary cursor frames;
+those roots and their scan frame remain pinned across partial pulls. Soft seed
+admission failure flushes the retained prefix and disables batching.
 The negotiation explicitly distinguishes exact multiplicities from presence.
 SQL MIN/MAX, Boolean reductions and DISTINCT aggregates request unit endpoint
 contributions when every reducer is duplicate-insensitive. Saturated path counts
@@ -1356,12 +1361,17 @@ For path patterns whose consumer does not observe the starting node, native
 reductions combine at most 128 starting nodes per batch. Pure endpoint
 expressions use scope-aware dependency analysis, including CASE, map projections,
 slices, comprehensions and reduce; scalar functions explicitly opt into repeatability.
-Root-dependent predicates/grouping and selective reverse anchors keep their ordinary
-plans. A declined proof resumes each original anchor before emitting compressed rows;
+Consumer dependencies participate in traversal orientation: start-only grouping
+or reductions can run backward and combine independent roots when endpoint label
+and property admissions describe the same anchor population. Equal filter scores
+alone cannot justify scanning a different table or label population without cardinality
+estimates. Selective point and interior anchors still take precedence; route-observing
+consumers keep their ordinary plans. A declined proof resumes each original anchor before emitting compressed rows;
 soft batch allocation failure flushes retained roots and disables admission.
-Unbounded DAG segments with lower bound zero or one sum all path lengths in one
-topological pass, keeping positive-length arrivals separate from zero-hop seeds to
-preserve saturated overflow checks. Long bounded ranges on wide anchor batches
+Unbounded DAG segments first form the exact mandatory minimum-hop frontier,
+then sum all remaining path lengths in one topological pass. The same transition
+operator applies relationship properties and multiplicities in both phases; no
+subtraction from saturated counts can conceal a qualifying overflow. Long bounded ranges on wide anchor batches
 can use the same reduction when a bounded closure proof shows every captured
 route fits the upper bound; other ranges retain the product-state reducer.
 

@@ -1512,12 +1512,12 @@ def test_pure_endpoint_expressions_keep_compressed_bags(graph_db):
 
 def test_multi_anchor_reductions_share_work_across_bounded_batches(graph_db):
     db = graph_db
-    size = 200  # Cross both the native scan page and anchor batch boundaries.
+    size = 400  # Cross several scan/batch boundaries and the former work-budget cliff.
     patterns = [f"(n{i}:D {{id:'n{i}',score:{i}}})" for i in range(size)]
     patterns += [f"(n{i})-[:R]->(n{i + 1})" for i in range(size - 1)]
     db.cypher_json("g", {"query": "CREATE " + ",".join(patterns)})
-    for bounds in ("1..", f"1..{size}", "0.."):
-        zero = bounds == "0.."
+    for bounds in ("1..", "2..", "3..", f"1..{size}", f"2..{size}", "0.."):
+        minimum = int(bounds.split("..")[0])
         result = db.cypher_json(
             "g",
             {
@@ -1526,9 +1526,67 @@ def test_multi_anchor_reductions_share_work_across_bounded_batches(graph_db):
             },
         )
         assert [cell["value"] for cell in result["rows"][0]] == [
-            str(size * (size - 1) // 2 + (size if zero else 0)),
-            str(sum(i * (i + (1 if zero else 0)) for i in range(size))),
-            "0" if zero else "1",
+            str((size - minimum) * (size - minimum + 1) // 2),
+            str(sum(i * max(0, i - minimum + 1) for i in range(size))),
+            str(minimum),
             str(size - 1),
         ]
         assert result["stats"]["explored_edges"] == size - 1
+
+    # The planner should make start-only consumers just as efficient as the
+    # equivalent reversed pattern, without opening a less selective anchor.
+    root_sum = db.cypher_json(
+        "g",
+        {
+            "query": "MATCH (a:D)-[:R*1..]->(b:D) RETURN sum(a.score)",
+            "limits": {"explored_edges": size - 1, "intermediate_states": 100000},
+        },
+    )
+    assert root_sum["rows"] == [[{"type": "integer", "value": str(sum(i * (size - i - 1) for i in range(size)))}]]
+    grouped = db.cypher_json(
+        "g",
+        {
+            "query": "MATCH (a:D)-[:R*1..]->(b:D) RETURN a.score,count(*) ORDER BY a.score",
+            "limits": {"explored_edges": size - 1, "intermediate_states": 100000},
+        },
+    )
+    assert [[cell["value"] for cell in row] for row in grouped["rows"]] == [
+        [str(i), str(size - i - 1)] for i in range(size - 1)
+    ]
+
+
+def test_sql_weighted_reductions_batch_starting_nodes(graph_db):
+    db = graph_db
+    size = 400
+    patterns = [f"(n{i}:D {{id:'n{i}',score:{i}}})" for i in range(size)]
+    patterns += [f"(n{i})-[:R]->(n{i + 1})" for i in range(size - 1)]
+    db.cypher_json("g", {"query": "CREATE " + ",".join(patterns)})
+    for hops in (60, 100):
+        path = "(a IS D)" + "-[IS R]->(IS D)" * (hops - 1) + "-[IS R]->(b IS D)"
+        # These fit the ordinary operator ceiling. Per-anchor weighted proofs
+        # used to exceed it even though this chain has only size-hops routes.
+        result = db.sql(
+            "SELECT sum(q.score),count(*),min(q.score),max(q.score),sum(DISTINCT q.score) "
+            f"FROM GRAPH_TABLE(g MATCH {path} COLUMNS(b.score AS score)) q"
+        )
+        total = str(sum(range(hops, size)))
+        assert result["rows"] == [[total, str(size - hops), str(hops), str(size - 1), total]]
+        # Reorient start-only COLUMNS too; the SQL cursor still owns one read cut.
+        result = db.sql(f"SELECT sum(q.score) FROM GRAPH_TABLE(g MATCH {path} COLUMNS(a.score AS score)) q")
+        assert result["rows"] == [[str(sum(range(size - hops)))]]
+
+
+def test_sql_weighted_seed_batches_resume_cyclic_routes(graph_db):
+    db = graph_db
+    size = 129  # One full seed batch plus a tail, and multiple SQL output pages.
+    patterns = [f"(n{i}:D {{id:'n{i}',score:{i}}})" for i in range(size)]
+    for i in range(size):
+        patterns += [f"(n{i})-[:R]->(n{i})", f"(n{i})-[:R]->(n{i})"]
+    db.cypher_json("g", {"query": "CREATE " + ",".join(patterns)})
+    # Each root has two legal trails (distinct parallel self relationships).
+    # Both batch and per-root acyclicity proofs decline before ordinary pulls.
+    result = db.sql(
+        "SELECT sum(q.score),count(*) FROM GRAPH_TABLE(g "
+        "MATCH (a IS D)-[IS R]->(IS D)-[IS R]->(b IS D) COLUMNS(b.score AS score)) q"
+    )
+    assert result["rows"] == [[str(size * (size - 1)), str(2 * size)]]

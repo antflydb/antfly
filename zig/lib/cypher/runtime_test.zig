@@ -1615,6 +1615,8 @@ test "weighted endpoint reductions agree with exact cyclic and acyclic route bag
         "RETURN min(CASE WHEN a.rank>0 THEN a.rank ELSE b.rank END)",
         "RETURN DISTINCT b.rank AS endpoint ORDER BY endpoint",
         "RETURN DISTINCT b.rank ORDER BY b.rank",
+        "RETURN sum(a.rank),min(a.rank),max(a.rank)",
+        "RETURN a.rank,count(*) ORDER BY a.rank",
         "RETURN count(b),count(b.missing),count(*)",
         "WHERE b.rank>=2 RETURN count(b)",
         "RETURN b.rank,count(b),count(b.missing),count(*) ORDER BY b.rank",
@@ -1752,6 +1754,9 @@ test "mixed domains and unbounded DAG reductions preserve exact path bags" {
         "(a:Document)-[:CITES*0..1]->()-[:CITES|MENTIONS*0..1]->()<-[:MENTIONS*0..1]-(b)",
         "(a:Document)-[:CITES*0..]->(b)",
         "(a:Document)-[:CITES*1..]->()-[:MENTIONS*0..]->(b)",
+        "(a:Document)-[:CITES*2..]->(b)",
+        "(a:Document)-[:CITES*3..]->(b)",
+        "(a:Document)-[:CITES*2..]->()<-[:CITES*0..1]-(b)",
     }) |pattern| {
         var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
         defer arena.deinit();
@@ -1778,14 +1783,22 @@ test "mixed domains and unbounded DAG reductions preserve exact path bags" {
 
 test "weighted cursor negotiates endpoint bags and falls back for cyclic trails" {
     const Dag = struct {
-        fn expand(ptr: *anyopaque, a: std.mem.Allocator, mapping: catalog.Relationship, identity: v.Identity, direction: c.ast.Direction, after: ?[]const u8, limit: usize) !b.Page(*const v.Relationship) {
-            const page = try Fixture.expand(ptr, a, mapping, identity, direction, after, limit);
+        fn page(ptr: *anyopaque, a: std.mem.Allocator, mapping: catalog.Relationship, identity: v.Identity, direction: c.ast.Direction, after: ?[]const u8, limit: usize, acyclic: bool) !b.Page(*const v.Relationship) {
+            const all = try Fixture.expand(ptr, a, mapping, identity, direction, null, 128);
             var out: std.ArrayList(*const v.Relationship) = .empty;
-            for (page.items) |edge| if (!std.mem.eql(u8, edge.identity.key, "ba")) try out.append(a, edge);
-            return .{ .items = out.items };
+            for (all.items) |edge| if (!acyclic or !std.mem.eql(u8, edge.identity.key, "ba")) try out.append(a, edge);
+            const offset = if (after) |text| try std.fmt.parseUnsigned(usize, text, 10) else 0;
+            const end = @min(out.items.len, offset + limit);
+            return .{ .items = out.items[offset..end], .next = if (end < out.items.len) try std.fmt.allocPrint(a, "{d}", .{end}) else null };
+        }
+        fn expand(ptr: *anyopaque, a: std.mem.Allocator, mapping: catalog.Relationship, identity: v.Identity, direction: c.ast.Direction, after: ?[]const u8, limit: usize) !b.Page(*const v.Relationship) {
+            return page(ptr, a, mapping, identity, direction, after, limit, true);
+        }
+        fn cyclic(ptr: *anyopaque, a: std.mem.Allocator, mapping: catalog.Relationship, identity: v.Identity, direction: c.ast.Direction, after: ?[]const u8, limit: usize) !b.Page(*const v.Relationship) {
+            return page(ptr, a, mapping, identity, direction, after, limit, false);
         }
     };
-    for ([_]bool{ false, true }) |dag| {
+    for ([_]bool{ false, true }) |dag| for ([_]usize{ 1, 128 }) |demand| {
         var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
         defer arena.deinit();
         const a = arena.allocator();
@@ -1795,7 +1808,7 @@ test "weighted cursor negotiates endpoint bags and falls back for cyclic trails"
         var fixture: Fixture = .{};
         const base = fixture.backend();
         var callbacks = base.vtable.*;
-        if (dag) callbacks.expand = Dag.expand;
+        callbacks.expand = if (dag) Dag.expand else Dag.cyclic;
         const backend: b.Backend = .{ .ptr = base.ptr, .vtable = &callbacks };
         var reference = try runtime.execute(a, backend, graph, &compiled, &.{}, .{});
         defer reference.deinit();
@@ -1805,7 +1818,7 @@ test "weighted cursor negotiates endpoint bags and falls back for cyclic trails"
         var weights = [_]u64{ 0, 0, 0 };
         var compressed = false;
         while (!cursor.done) {
-            const rows = try cursor.next(a, 128);
+            const rows = try cursor.next(a, demand);
             try std.testing.expectEqual(rows.len, cursor.last_weights.items.len);
             for (rows, cursor.last_weights.items) |row, weight| {
                 weights[@intCast(row[0].value.integer - 1)] += weight;
@@ -1816,7 +1829,7 @@ test "weighted cursor negotiates endpoint bags and falls back for cyclic trails"
         for (reference.rows) |row| expected[@intCast(row[0].integer - 1)] += 1;
         try std.testing.expectEqualSlices(u64, &expected, &weights);
         if (dag) try std.testing.expect(compressed);
-    }
+    };
 }
 
 test "bound pair reads and counts use seeks through owner RPC and pull cursors" {
@@ -1943,6 +1956,8 @@ test "multi-root DAG reductions share physical pages and preserve zero-hop bags"
         "(a:Document)-[:CITES*0..]->(b:Document)",
         "(a:Document)-[:CITES*1..]->(b:Document)",
         "(a:Document)-[:CITES*2..]->(b:Document)",
+        "(a:Document)-[:CITES*3..]->(b:Document)",
+        "(a:Document)-[:CITES*2..3]->(b:Document)",
         "(a:Document)-[:CITES*0..3]->(b:Document)",
         "(a:Document)-[:CITES*1..3]->(b:Document)",
         "(a:Document)-[:CITES]->(middle:Document)-[:CITES]->(b:Document)",
@@ -1950,6 +1965,8 @@ test "multi-root DAG reductions share physical pages and preserve zero-hop bags"
     }) |pattern| for ([_][]const u8{
         "RETURN count(*),sum(b.rank),avg(b.rank),min(b.rank),max(b.rank)",
         "RETURN a.rank,b.rank,count(*) ORDER BY a.rank,b.rank",
+        "RETURN a.rank,count(*) ORDER BY a.rank",
+        "RETURN sum(a.rank)",
         "WHERE b.rank>=2 RETURN count(*),sum(b.rank)",
         "RETURN DISTINCT b{.rank} AS node ORDER BY node",
     }) |tail| {
@@ -2009,6 +2026,20 @@ test "soft graph cache and anchor admission failure retain exact fallback" {
             page.items = nodes;
             return page;
         }
+        fn scanAll(ptr: *anyopaque, a: std.mem.Allocator, table: []const u8, after: ?[]const u8, limit: usize) !b.Page(*const v.Node) {
+            const result = try scan(ptr, a, table, after, limit);
+            const nodes = try a.dupe(*const v.Node, result.items);
+            for (nodes) |*node| if (std.mem.eql(u8, node.*.identity.key, "a")) {
+                const owned = try a.create(v.Node);
+                owned.* = node.*.*;
+                const properties = try a.alloc(v.Entry, owned.properties.len + 1);
+                @memcpy(properties[0..owned.properties.len], owned.properties);
+                properties[owned.properties.len] = .{ .name = "payload", .value = .{ .string = &payload } };
+                owned.properties = properties;
+                node.* = owned;
+            };
+            return .{ .items = nodes, .next = result.next, .examined = result.examined, .unfiltered = result.unfiltered };
+        }
         fn expand(ptr: *anyopaque, a: std.mem.Allocator, mapping: catalog.Relationship, identity: v.Identity, direction: c.ast.Direction, after: ?[]const u8, limit: usize) !b.Page(*const v.Relationship) {
             const page = try Fixture.expand(ptr, a, mapping, identity, direction, after, limit);
             var output: std.ArrayList(*const v.Relationship) = .empty;
@@ -2032,4 +2063,41 @@ test "soft graph cache and anchor admission failure retain exact fallback" {
     var result = try runtime.execute(std.testing.allocator, .{ .ptr = &fixture, .vtable = &callbacks }, graph, &compiled, &.{}, .{ .memory_bytes = 1 << 20 });
     defer result.deinit();
     try std.testing.expectEqual(@as(i64, 8), result.rows[0][0].integer);
+    // Cursor seed admission must also flush an already-retained prefix when
+    // the next full record exceeds its soft allowance. Scan pages stay narrow.
+    var projected = try c.compile(std.testing.allocator, "MATCH (a:Document)-[:CITES*0..]->(b:Document) RETURN b.rank", .{}, &diagnostic);
+    defer projected.deinit();
+    for ([_]bool{ false, true }) |first_root_large| {
+        var cursor_callbacks = callbacks;
+        if (first_root_large) cursor_callbacks.scan = Large.scanAll;
+        const cursor = (try runtime.NodeCursor.open(std.testing.allocator, .{ .ptr = &fixture, .vtable = &cursor_callbacks }, graph, projected.query, &.{}, .{ .memory_bytes = 1 << 20 })).?;
+        defer cursor.close();
+        try std.testing.expect(try cursor.enableWeights(.exact));
+        var weights = [_]u64{ 0, 0, 0 };
+        while (!cursor.done) {
+            var page = std.heap.ArenaAllocator.init(std.testing.allocator);
+            defer page.deinit();
+            const rows = try cursor.next(page.allocator(), 1);
+            for (rows, cursor.last_weights.items) |row, weight| weights[@intCast(row[0].value.integer - 1)] += weight;
+        }
+        try std.testing.expectEqualSlices(u64, &.{ 1, 3, 4 }, &weights);
+    }
+}
+
+test "consumer orientation preserves anchors with unknown relative populations" {
+    const Guard = struct {
+        fn scan(ptr: *anyopaque, a: std.mem.Allocator, table: []const u8, after: ?[]const u8, limit: usize) !b.Page(*const v.Node) {
+            if (std.mem.eql(u8, table, "people")) return error.UnexpectedPopulationScan;
+            return Fixture.scan(ptr, a, table, after, limit);
+        }
+    };
+    var fixture: Fixture = .{};
+    var callbacks = fixture.backend().vtable.*;
+    callbacks.scan = Guard.scan;
+    var diagnostic: c.Diagnostic = .{};
+    var compiled = try c.compile(std.testing.allocator, "MATCH (a:Document)-[:MENTIONS*1..]->(b:Person) RETURN sum(a.rank)", .{}, &diagnostic);
+    defer compiled.deinit();
+    var result = try runtime.execute(std.testing.allocator, .{ .ptr = &fixture, .vtable = &callbacks }, graph, &compiled, &.{}, .{});
+    defer result.deinit();
+    try std.testing.expectEqual(@as(i64, 1), result.rows[0][0].integer);
 }
