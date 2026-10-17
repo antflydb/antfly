@@ -350,6 +350,25 @@ a local convenience.
   Only after registry cleanup succeeds does the workflow remove the R2
   container-identity record and release objects.
 
+## Release qualification before tagging
+
+Select `ci:linux-release` and/or `ci:darwin-release` on a PR, then use the
+normal `/ci run <sha>` approval. The trusted controller and suite wiring must
+exist on `main` before a newly introduced label can be used. The suites share
+`qualify-release-archives.yml`, select targets from `platforms.json`, and build
+every product declared by `build-contract.json` through the production archive
+script with the pinned Nix Zig. Linux includes x86-64 and ARM64, GNU and musl;
+Darwin cross-compiles on the Linux x86-64 release runner with the pinned SDK.
+Both entry workflows can also be dispatched on `main` without publishing.
+Embedded package snapshots record their source policy's wheel platform tags;
+verification preserves historical schema-1 snapshots and does not reinterpret
+new snapshots through a later controller's platform policy.
+
+Archive checks verify product contents and native target identities. Compiler
+logs, memory summaries, and linker maps are uploaded on failure as separate
+diagnostic artifacts, without compiler caches. macOS cross builds resolve the
+versioned LLVM linker directory and check linker/nm availability before compiling.
+
 ## Version Behavior
 
 Stable tags use `vX.Y.Z`; prerelease tags use the canonical
