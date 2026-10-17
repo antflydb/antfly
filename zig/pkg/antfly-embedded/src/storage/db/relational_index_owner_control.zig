@@ -339,7 +339,10 @@ pub const Effect = union(enum) {
                 try value.validate();
                 if (value.binding.authority != .native) return error.InvalidControlReceiptPosition;
             },
-            .generation_validation => |value| try value.validate(),
+            .generation_validation => |value| {
+                try value.validate();
+                if (value.binding.authority != .native) return error.InvalidControlReceiptPosition;
+            },
             .validation_seal => |value| try value.validate(),
             .install => |value| try value.validate(),
             .release => |value| try value.validate(),
@@ -954,7 +957,7 @@ pub const GenerationOutcome = struct {
         const expected = request.target_expectation orelse return error.InvalidPrivateIndexNativeReceipt;
         try self.record.validate();
         if (!std.mem.eql(u8, &try expected.digest(), &try self.record.expected.digest()) or
-            !std.meta.eql(self.position, self.record.position) or !self.position.namespace.eql(request.identity.namespace) or
+            self.record.position != .native or !std.meta.eql(self.position, self.record.position.native) or !self.position.namespace.eql(request.identity.namespace) or
             self.replication_pending != (self.error_name != null)) return error.InvalidPrivateIndexNativeReceipt;
     }
 };
@@ -965,6 +968,14 @@ pub const PreparedGenerationValidation = struct {
     payload: ?[]u8 = null,
     prefix_len: usize = 0,
     pub fn prepare(alloc: Allocator, core: anytype, reservation: *const Prepared, expected: private_claims.TargetExpectation, budget: pages.Budget, context: RequestContext) !?@This() {
+        if (reservation.command.binding.authority != .native) return error.InvalidControlReceiptPosition;
+        return prepareReservation(alloc, core, reservation, expected, budget, context);
+    }
+    pub fn prepareRaft(alloc: Allocator, core: anytype, reservation: *const @import("relational_index_raft_control.zig").Prepared, expected: private_claims.TargetExpectation, budget: pages.Budget, context: RequestContext) !?@This() {
+        if (reservation.command.binding.authority != .raft) return error.InvalidControlReceiptPosition;
+        return prepareReservation(alloc, core, reservation, expected, budget, context);
+    }
+    fn prepareReservation(alloc: Allocator, core: anytype, reservation: anytype, expected: private_claims.TargetExpectation, budget: pages.Budget, context: RequestContext) !?@This() {
         if (reservation.command.effect != .reserved) return error.PrivateIndexOwnerJobChanged;
         const artifacts = if (reservation.artifacts) |*value| value else return error.InvalidPrivateIndexOwnerJob;
         var binding = reservation.command.binding;
@@ -981,7 +992,7 @@ pub const PreparedGenerationValidation = struct {
         try jobs.requireReserved(&read, command.binding);
         var manifest = try inputs.Prepared.load(alloc, &read, command.binding.inputs_digest);
         defer manifest.deinit();
-        var artifacts = try Artifacts.init(alloc, view, &read, manifest.bytes, .native);
+        var artifacts = try Artifacts.init(alloc, view, &read, manifest.bytes, if (command.binding.authority == .native) .native else .raft);
         defer artifacts.deinit();
         if (!std.mem.eql(u8, &artifacts.unique.generation, &command.expected.generation)) return error.PrivateIndexOwnerJobChanged;
         return .{ .alloc = alloc, .page = try validation.Prepared.replay(alloc, core, &artifacts.addition, command) };
@@ -1003,17 +1014,27 @@ pub const PreparedGenerationValidation = struct {
     }
     pub fn replayDuplicateOutcome(self: *const @This(), position: Native) GenerationOutcome {
         const command = self.page.command;
-        return .{ .binding = command.binding, .record = .{ .expected = command.expected, .inventory_digest = command.inventory_digest, .source_members = command.source_members, .fields = command.next, .position = position, .page_digest = command.digest() catch unreachable }, .position = position, .duplicate = true };
+        return .{ .binding = command.binding, .record = .{ .expected = command.expected, .inventory_digest = command.inventory_digest, .source_members = command.source_members, .fields = command.next, .position = .{ .native = position }, .page_digest = command.digest() catch unreachable }, .position = position, .duplicate = true };
     }
     pub fn stage(self: *@This(), core: anytype, txn: anytype, position: ?Native) !GenerationOutcome {
         const result = try self.page.stage(core, txn, position);
-        return .{ .binding = self.page.command.binding, .record = result.summary, .position = result.summary.position, .duplicate = result.duplicate };
+        return .{ .binding = self.page.command.binding, .record = result.summary, .position = result.summary.position.native, .duplicate = result.duplicate };
+    }
+    pub fn stageRaft(self: *@This(), core: anytype, txn: anytype, owner_group: u64, entry: @import("apply_receipts.zig").OrderedApplyReceipt) !void {
+        try self.page.context.ensureActive();
+        const binding = self.page.command.binding;
+        if (binding.authority != .raft or owner_group == 0 or owner_group != binding.fence.owner_group_id) return error.PrivateIndexOwnerJobChanged;
+        const prior = try @import("apply_receipts.zig").readOrderedApplyReceiptTxn(txn);
+        if (try @import("apply_receipts.zig").orderedApplyDisposition(prior, entry) != .apply) return error.InvalidControlReceiptPosition;
+        if (prior) |value| if (entry.index <= value.index or entry.term < value.term) return error.InvalidControlReceiptPosition;
+        _ = try self.page.stageAt(core, txn, .{ .raft = .{ .term = entry.term, .index = entry.index } });
     }
     pub fn hasPublicationReceipt(_: *const @This()) bool {
         return false;
     }
     pub fn populateReceipt(_: *const @This(), _: anytype, _: *GenerationOutcome) !void {}
     pub fn preparePayload(self: *@This()) !void {
+        if (self.page.command.binding.authority != .native) return error.InvalidControlReceiptPosition;
         try prepareNativePayload(self, "generation_validation", self.page.command, validation.max_wire_bytes);
     }
     pub fn finalizePayload(self: *@This(), position: Native) ![]const u8 {

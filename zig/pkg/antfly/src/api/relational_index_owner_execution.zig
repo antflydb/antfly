@@ -1868,7 +1868,7 @@ const TestDriver = struct {
                 const position: local.storage_db_receipt_position.Native = .{ .namespace = binding.fence.namespace, .sequence = 7 };
                 // Scheduling-only physical progress; real durable generation
                 // bytes and replay are qualified by the independent LSM tests.
-                return .{ .root_generation = self.root_generation, .outcome = try parsed(native.BuildResponse, alloc, .{ .generation = .{ .binding = binding, .record = .{ .expected = expected, .inventory_digest = @splat(9), .source_members = 1, .fields = .{ .phase = .ready, .counts = @splat(1), .chain = @splat(7), .cursor_digest = local.storage_db_relational_integrity_contract.hash("") }, .position = position, .page_digest = @splat(8) }, .position = position, .duplicate = false } }) };
+                return .{ .root_generation = self.root_generation, .outcome = try parsed(native.BuildResponse, alloc, .{ .generation = .{ .binding = binding, .record = .{ .expected = expected, .inventory_digest = @splat(9), .source_members = 1, .fields = .{ .phase = .ready, .counts = @splat(1), .chain = @splat(7), .cursor_digest = local.storage_db_relational_integrity_contract.hash("") }, .position = .{ .native = position }, .page_digest = @splat(8) }, .position = position, .duplicate = false } }) };
             }
             self.inventory_pages += 1;
             self.inventory_finished = true;

@@ -2329,6 +2329,51 @@ test "relational index system Raft owner controls commit authentic phase cuts at
         defer alloc.free(bytes);
         try std.testing.expectEqualSlices(u8, "AICV\x03\x00\x00\x00", bytes[0..8]);
     }
+    const Generation = owner_control.PreparedGenerationValidation;
+    const physical = @import("relational_index_validation.zig");
+    var physical_pages: usize = 0;
+    while (try Generation.prepareRaft(alloc, db.core, &retry, expected, .{ .records = 1, .time_ns = std.time.ns_per_s }, .{})) |owned| {
+        var page = owned;
+        defer page.deinit();
+        physical_pages += 1;
+        try std.testing.expect(physical_pages <= 12);
+        try std.testing.expect(page.page.command.scanned <= 1);
+        try std.testing.expectError(error.InvalidControlReceiptPosition, (owner_control.Effect{ .generation_validation = page.page.command }).validate());
+        try std.testing.expectError(error.InvalidControlReceiptPosition, page.preparePayload());
+        var follower = try Generation.replay(alloc, db.core, page.page.command);
+        defer follower.deinit();
+        const entry: receipts.OrderedApplyReceipt = .{ .term = 11, .index = last_validation_index + 1 };
+        {
+            var txn = try db.core.store.beginWriteTxn();
+            defer txn.abort();
+            try follower.stageRaft(db.core, &txn, 11, entry);
+        }
+        try std.testing.expectEqual(last_validation_index, (try db.orderedApplyReceipt()).?.index);
+        try db.applyCommittedRaftIndexGeneration(&follower, 11, entry);
+        last_validation_index = entry.index;
+        // A new log entry retry must retain the original physical proof cut.
+        try db.applyCommittedRaftIndexGeneration(&follower, 11, .{ .term = 11, .index = last_validation_index + 1 });
+        last_validation_index += 1;
+    }
+    try std.testing.expect(physical_pages >= 3);
+    db.close();
+    db_live = false;
+    db = try db_mod.DB.open(alloc, directory.path(), options);
+    db_live = true;
+    {
+        var read = try db.core.store.beginReadTxn();
+        defer read.abort();
+        var verified = (try physical.load(alloc, &read, reserved_binding)).?;
+        defer verified.deinit();
+        try std.testing.expectEqual(physical.Phase.ready, verified.summary.fields.phase);
+        try std.testing.expectEqualDeep([3]u64{ 1, 1, 1 }, verified.summary.fields.counts);
+        try std.testing.expectEqual(last_validation_index - 1, verified.summary.position.raft.index);
+        try std.testing.expectEqual(@as(u64, 0), (try @import("../source_authority.zig").load(&read)).?.sequence);
+        try std.testing.expectError(error.InvalidControlReceiptPosition, physical.SealCommand.prepare(alloc, &read, reserved_binding, expected));
+        const encoded = try verified.encodeAlloc(alloc);
+        defer alloc.free(encoded);
+        try std.testing.expectEqualSlices(u8, "AIGV\x02\x00\x00\x00", encoded[0..8]);
+    }
     try @import("antfly_server_test_sources").local_test_sources.storage_relational_index_raft_apply.run(admission.command);
 }
 

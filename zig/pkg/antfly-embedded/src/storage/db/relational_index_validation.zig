@@ -27,6 +27,7 @@ const internal = @import("../internal_keys.zig");
 const range_state = @import("range_state.zig");
 const authority = @import("../source_authority.zig");
 const Native = @import("receipt_position.zig").Native;
+const Position = @import("receipt_position.zig").Position;
 const Context = @import("../../api/operation.zig").RequestContext;
 const Allocator = std.mem.Allocator;
 const Digest = [32]u8;
@@ -49,6 +50,12 @@ fn equal(a: Digest, b: Digest) bool {
 }
 fn nonzero(value: Digest) bool {
     return !std.mem.allEqual(u8, &value, 0);
+}
+fn cutAfter(value: Position, previous: Position) bool {
+    return switch (value) {
+        .native => |cut| previous == .native and cut.namespace.eql(previous.native.namespace) and cut.sequence > previous.native.sequence,
+        .raft => |cut| previous == .raft and cut.index > previous.raft.index and cut.term >= previous.raft.term,
+    };
 }
 fn optional(txn: anytype, key_: []const u8) !?[]const u8 {
     return txn.get(key_) catch |err| switch (err) {
@@ -85,8 +92,41 @@ pub const Summary = struct {
     inventory_digest: Digest,
     source_members: u64,
     fields: Fields,
-    position: Native,
+    position: Position,
     page_digest: Digest,
+    const Wire = struct {
+        expected: Expected,
+        inventory_digest: Digest,
+        source_members: u64,
+        fields: Fields,
+        position: claims.InventoryValidation.Record.WirePosition,
+        page_digest: Digest,
+    };
+    pub fn nativeJsonProjection(self: Summary) Wire {
+        return .{ .expected = self.expected, .inventory_digest = self.inventory_digest, .source_members = self.source_members, .fields = self.fields, .position = switch (self.position) {
+            .native => |cut| .{ .namespace = cut.namespace, .sequence = cut.sequence },
+            .raft => |cut| .{ .raft = cut },
+        }, .page_digest = self.page_digest };
+    }
+    pub fn jsonStringify(self: Summary, stream: anytype) @TypeOf(stream.*).Error!void {
+        try stream.beginObject();
+        inline for (.{ "expected", "inventory_digest", "source_members", "fields" }) |name| {
+            try stream.objectField(name);
+            try stream.write(@field(self, name));
+        }
+        try stream.objectField("position");
+        switch (self.position) {
+            .native => |cut| try stream.write(cut),
+            .raft => try stream.write(self.position),
+        }
+        try stream.objectField("page_digest");
+        try stream.write(self.page_digest);
+        try stream.endObject();
+    }
+    pub fn jsonParse(a: Allocator, source: anytype, options: std.json.ParseOptions) !Summary {
+        const wire = try std.json.innerParse(Wire, a, source, options);
+        return .{ .expected = wire.expected, .inventory_digest = wire.inventory_digest, .source_members = wire.source_members, .fields = wire.fields, .position = if (wire.position.raft) |cut| .{ .raft = cut } else .{ .native = .{ .namespace = wire.position.namespace.?, .sequence = wire.position.sequence.? } }, .page_digest = wire.page_digest };
+    }
     pub fn validate(self: Summary) !void {
         try self.expected.validate();
         try self.fields.validate(self.source_members);
@@ -120,7 +160,7 @@ fn encodeRecord(alloc: Allocator, summary: Summary, cursor: []const u8) ![]u8 {
     defer alloc.free(json);
     if (json.len > max_summary) return error.InvalidRelationalIndexValidation;
     const bytes = try alloc.alloc(u8, 48 + json.len + cursor.len);
-    @memcpy(bytes[0..8], "AIGV\x01\x00\x00\x00");
+    @memcpy(bytes[0..8], if (summary.position == .native) "AIGV\x01\x00\x00\x00" else "AIGV\x02\x00\x00\x00");
     std.mem.writeInt(u32, bytes[8..12], @intCast(json.len), .little);
     std.mem.writeInt(u32, bytes[12..16], @intCast(cursor.len), .little);
     @memcpy(bytes[16..][0..json.len], json);
@@ -129,7 +169,7 @@ fn encodeRecord(alloc: Allocator, summary: Summary, cursor: []const u8) ![]u8 {
     return bytes;
 }
 fn decodeRecord(alloc: Allocator, bytes: []const u8) !Loaded {
-    if (bytes.len < 48 or bytes.len > max_record or !std.mem.eql(u8, bytes[0..8], "AIGV\x01\x00\x00\x00") or !equal(bytes[bytes.len - 32 ..][0..32].*, hash(bytes[0 .. bytes.len - 32]))) return error.InvalidRelationalIndexValidation;
+    if (bytes.len < 48 or bytes.len > max_record or (!std.mem.eql(u8, bytes[0..8], "AIGV\x01\x00\x00\x00") and !std.mem.eql(u8, bytes[0..8], "AIGV\x02\x00\x00\x00")) or !equal(bytes[bytes.len - 32 ..][0..32].*, hash(bytes[0 .. bytes.len - 32]))) return error.InvalidRelationalIndexValidation;
     const json_len = std.mem.readInt(u32, bytes[8..12], .little);
     const cursor_len = std.mem.readInt(u32, bytes[12..16], .little);
     if (json_len > max_summary or cursor_len > max_cursor or @as(u64, json_len) + cursor_len + 48 != bytes.len) return error.InvalidRelationalIndexValidation;
@@ -137,6 +177,7 @@ fn decodeRecord(alloc: Allocator, bytes: []const u8) !Loaded {
     defer parsed.deinit();
     const summary = parsed.value;
     try summary.validate();
+    if ((bytes[4] == 1) != (summary.position == .native)) return error.InvalidRelationalIndexValidation;
     const canonical = try std.json.Stringify.valueAlloc(alloc, summary, .{});
     defer alloc.free(canonical);
     const raw_cursor = bytes[16 + json_len ..][0..cursor_len];
@@ -150,9 +191,17 @@ pub fn load(alloc: Allocator, txn: anytype, binding: owner.Binding) !?Loaded {
     const bytes = (try optional(txn, &key(binding))) orelse return null;
     var loaded = try decodeRecord(alloc, bytes);
     errdefer loaded.deinit();
-    try loaded.summary.expected.requireBinding(binding);
-    const current = try authority.require(txn, .native, @import("online_source_contract.zig").namespaceBytes(binding.fence.namespace));
-    if (!loaded.summary.position.namespace.eql(binding.fence.namespace) or loaded.summary.position.sequence > current.sequence) return error.InvalidRelationalIndexValidation;
+    try loaded.summary.expected.requireOwnerBinding(binding);
+    const cut = loaded.summary.position;
+    try cut.requireNamespace(binding.fence.namespace);
+    if ((cut == .native) != (binding.authority == .native)) return error.InvalidRelationalIndexValidation;
+    if (cut == .native) {
+        const current = try authority.require(txn, .native, @import("online_source_contract.zig").namespaceBytes(binding.fence.namespace));
+        if (cut.native.sequence > current.sequence) return error.InvalidRelationalIndexValidation;
+    } else {
+        const current = (try @import("apply_receipts.zig").readOrderedApplyReceiptTxn(txn)) orelse return error.InvalidRelationalIndexValidation;
+        if (cut.raft.index > current.index or cut.raft.term > current.term or (cut.raft.index == current.index and cut.raft.term != current.term)) return error.InvalidRelationalIndexValidation;
+    }
     return loaded;
 }
 pub const Command = struct {
@@ -166,7 +215,7 @@ pub const Command = struct {
     next: Fields,
     cursor_b64: []const u8,
     pub fn validate(self: Command) !void {
-        try self.expected.requireBinding(self.binding);
+        try self.expected.requireOwnerBinding(self.binding);
         try self.next.validate(self.source_members);
         if (!nonzero(self.inventory_digest) or self.scanned > claims.max_claims or self.cursor_b64.len > std.base64.standard.Encoder.calcSize(max_cursor)) return error.InvalidRelationalIndexValidation;
         if (try std.base64.standard.Decoder.calcSizeForSlice(self.cursor_b64) > max_cursor) return error.InvalidRelationalIndexValidation;
@@ -204,8 +253,8 @@ pub fn verifyRecovery(alloc: Allocator, txn: anytype, binding: owner.Binding) !v
     };
     defer loaded.deinit();
     if (try @import("relational_index_cancellation_intent.zig").load(txn)) |closed| if (closed.intent.fence.admission_epoch == binding.fence.admission_epoch) return;
-    const frozen = try claims.InventoryValidation.requireReady(alloc, txn, binding, loaded.summary.expected);
-    if (!equal(frozen.digest, loaded.summary.inventory_digest) or frozen.source_members != loaded.summary.source_members or loaded.summary.position.sequence <= frozen.position.sequence) return error.InvalidRelationalIndexValidation;
+    const frozen = try claims.InventoryValidation.requireReadyAt(alloc, txn, binding, loaded.summary.expected);
+    if (!equal(frozen.digest, loaded.summary.inventory_digest) or frozen.source_members != loaded.summary.source_members or !cutAfter(loaded.summary.position, frozen.position)) return error.InvalidRelationalIndexValidation;
     if (try Seal.load(alloc, txn, binding)) |sealed| {
         const command = try SealCommand.prepare(alloc, txn, binding, loaded.summary.expected);
         if (!std.meta.eql(command, sealed.command)) return error.InvalidRelationalIndexValidation;
@@ -255,8 +304,8 @@ pub const SealCommand = struct {
             !equal(try generation.summary.expected.digest(), try expected.digest()) or
             !equal(generation.summary.inventory_digest, frozen.digest) or
             generation.summary.source_members != frozen.source_members or
-            generation.summary.position.sequence <= frozen.position.sequence) return error.PrivateIndexTargetValidationRequired;
-        const result: @This() = .{ .binding = binding, .expected = expected, .generation_digest = generation.digest, .inventory_digest = frozen.digest, .source_members = frozen.source_members, .generation_position = generation.summary.position };
+            generation.summary.position.native.sequence <= frozen.position.sequence) return error.PrivateIndexTargetValidationRequired;
+        const result: @This() = .{ .binding = binding, .expected = expected, .generation_digest = generation.digest, .inventory_digest = frozen.digest, .source_members = frozen.source_members, .generation_position = generation.summary.position.native };
         try result.validate();
         return result;
     }
@@ -615,7 +664,7 @@ pub fn auditReadPage(alloc: Allocator, core: anytype, read: anytype, binding: ow
     defer canonical.deinit();
     if (!equal(try canonical.summary.expected.digest(), try expected.digest()) or
         !equal(canonical.summary.inventory_digest, frozen.digest) or canonical.summary.source_members != frozen.source_members or
-        canonical.summary.position.sequence <= frozen.position.sequence) return error.PrivateIndexAuditScopeChanged;
+        canonical.summary.position.native.sequence <= frozen.position.sequence) return error.PrivateIndexAuditScopeChanged;
     if (canonical.summary.fields.phase != .ready) return error.PrivateIndexTargetValidationRequired;
     var local: ?Loaded = null;
     if (previous) |state| {
@@ -751,7 +800,7 @@ pub const Prepared = struct {
     fn prepareImpl(alloc: Allocator, core: anytype, binding: owner.Binding, expected: Expected, addition: *const catalog.PrivateAddition, budget: jobs.Budget, context: Context, replay_command: ?Command) !?Prepared {
         try context.ensureActive();
         try budget.validate();
-        try expected.requireBinding(binding);
+        try expected.requireOwnerBinding(binding);
         if (!addition.candidate.head.eql(binding.physical_candidate) or !addition.reservation.head.eql(binding.physical_reserved) or addition.index.mapKey() != binding.index.mapKey()) return error.PrivateIndexOwnerJobChanged;
         const namespace_generation = core.schemaNamespaceGeneration();
         const pinned: catalog.WriteSnapshot = .{ .head = addition.candidate.head, .plan = addition.plan.clone() };
@@ -764,11 +813,11 @@ pub const Prepared = struct {
         } else return error.IndexNotFound;
         var read = try core.store.beginReadTxn();
         defer read.abort();
-        const frozen = try claims.InventoryValidation.requireReady(alloc, &read, binding, expected);
+        const frozen = try claims.InventoryValidation.requireReadyAt(alloc, &read, binding, expected);
         var loaded = try load(alloc, &read, binding);
         defer if (loaded) |*value| value.deinit();
         if (loaded) |value| {
-            if (!equal(try value.summary.expected.digest(), try expected.digest()) or !equal(value.summary.inventory_digest, frozen.digest) or value.summary.source_members != frozen.source_members or value.summary.position.sequence <= frozen.position.sequence) return error.PrivateIndexOwnerJobChanged;
+            if (!equal(try value.summary.expected.digest(), try expected.digest()) or !equal(value.summary.inventory_digest, frozen.digest) or value.summary.source_members != frozen.source_members or !cutAfter(value.summary.position, frozen.position)) return error.PrivateIndexOwnerJobChanged;
         }
         return preparePage(alloc, core, &read, binding, expected, pinned, index, namespace_generation, frozen, loaded, budget, context, replay_command);
     }
@@ -913,28 +962,45 @@ pub const Prepared = struct {
     }
     /// Caller commits progress with its ordered receipt/outbox and MUST abort
     /// the whole transaction on every error, including encode/allocation failure.
-    pub fn stage(self: *@This(), core: anytype, txn: anytype, replay_position: ?Native) !struct { summary: Summary, duplicate: bool } {
+    pub const Outcome = struct { summary: Summary, duplicate: bool };
+    pub fn stage(self: *@This(), core: anytype, txn: anytype, replay_position: ?Native) !Outcome {
+        if (self.command.binding.authority != .native) return error.InvalidControlReceiptPosition;
+        return self.stageAt(core, txn, if (replay_position) |cut| .{ .native = cut } else null);
+    }
+    pub fn stageAt(self: *@This(), core: anytype, txn: anytype, replay_position: ?Position) !Outcome {
         try self.context.ensureActive();
         try self.command.validate();
+        if (self.command.binding.authority == .raft and replay_position == null) return error.InvalidControlReceiptPosition;
+        if (replay_position) |cut| {
+            try cut.requireNamespace(self.command.binding.fence.namespace);
+            if ((cut == .native) != (self.command.binding.authority == .native)) return error.InvalidControlReceiptPosition;
+        }
         if (core.schemaNamespaceGeneration() != self.namespace_generation) return error.PreparedGenerationChanged;
-        const frozen = try claims.InventoryValidation.requireReady(self.arena.allocator(), txn, self.command.binding, self.command.expected);
+        const frozen = try claims.InventoryValidation.requireReadyAt(self.arena.allocator(), txn, self.command.binding, self.command.expected);
         if (!equal(frozen.digest, self.command.inventory_digest) or frozen.source_members != self.command.source_members) return error.PrivateIndexOwnerJobChanged;
         var loaded = try load(self.arena.allocator(), txn, self.command.binding);
         defer if (loaded) |*value| value.deinit();
         const digest = try self.command.digest();
         if (loaded) |value| if (equal(value.summary.page_digest, digest)) {
-            if (replay_position) |position| if (!std.meta.eql(position, value.summary.position)) return error.InvalidPrivateIndexNativeReceipt;
+            if (replay_position) |cut| {
+                if (cut == .native and !std.meta.eql(cut, value.summary.position)) return error.InvalidPrivateIndexNativeReceipt;
+                if (!std.meta.eql(cut, value.summary.position) and !cutAfter(cut, value.summary.position)) return error.InvalidControlReceiptPosition;
+            }
             return .{ .summary = value.summary, .duplicate = true };
         };
         const previous = if (loaded) |value| value.digest else @as(Digest, @splat(0));
         if (!equal(previous, self.command.previous)) return error.VersionConflict;
-        if (replay_position) |position| if (!position.namespace.eql(self.command.binding.fence.namespace)) return error.IdentityNamespaceMismatch;
         const a = self.arena.allocator();
         const raw_cursor = try a.alloc(u8, try std.base64.standard.Decoder.calcSizeForSlice(self.command.cursor_b64));
         try std.base64.standard.Decoder.decode(raw_cursor, self.command.cursor_b64);
         if (!equal(hash(raw_cursor), self.command.next.cursor_digest)) return error.InvalidRelationalIndexValidation;
         try self.context.ensureActive();
-        const position: Native = .{ .namespace = self.command.binding.fence.namespace, .sequence = try authority.advance(txn, @import("online_source_contract.zig").namespaceBytes(self.command.binding.fence.namespace), if (replay_position) |value| value.sequence else null) };
+        const position: Position = if (self.command.binding.authority == .raft) replay_position.? else .{ .native = .{ .namespace = self.command.binding.fence.namespace, .sequence = try authority.advance(txn, @import("online_source_contract.zig").namespaceBytes(self.command.binding.fence.namespace), if (replay_position) |value| value.native.sequence else null) } };
+        if (!cutAfter(position, frozen.position)) return error.InvalidControlReceiptPosition;
+        if (position == .raft) {
+            const current = (try @import("apply_receipts.zig").readOrderedApplyReceiptTxn(txn)) orelse return error.InvalidControlReceiptPosition;
+            if (position.raft.index <= current.index or position.raft.term < current.term) return error.InvalidControlReceiptPosition;
+        }
         const summary: Summary = .{ .expected = self.command.expected, .inventory_digest = frozen.digest, .source_members = frozen.source_members, .fields = self.command.next, .position = position, .page_digest = digest };
         const bytes = try encodeRecord(a, summary, raw_cursor);
         try txn.put(&key(self.command.binding), bytes);
@@ -942,7 +1008,7 @@ pub const Prepared = struct {
     }
 };
 
-test "relational index build pages generation checkpoint keeps maximum cursors out of fixed summaries" {
+test "relational index system generation checkpoint keeps maximum cursors out of fixed summaries" {
     const alloc = std.testing.allocator;
     const cursor = try alloc.alloc(u8, max_cursor);
     defer alloc.free(cursor);
@@ -952,7 +1018,7 @@ test "relational index build pages generation checkpoint keeps maximum cursors o
         .inventory_digest = @splat(6),
         .source_members = 0,
         .fields = .{ .chain = @splat(7), .cursor_digest = hash(cursor) },
-        .position = .{ .namespace = .{ .table_id = 1, .shard_id = 2, .range_id = 3 }, .sequence = 1 },
+        .position = .{ .native = .{ .namespace = .{ .table_id = 1, .shard_id = 2, .range_id = 3 }, .sequence = 1 } },
         .page_digest = @splat(8),
     };
     const bytes = try encodeRecord(alloc, summary, cursor);
@@ -965,6 +1031,43 @@ test "relational index build pages generation checkpoint keeps maximum cursors o
     defer loaded.deinit();
     try std.testing.expectEqualDeep(summary, loaded.summary);
     try std.testing.expectEqualSlices(u8, cursor, loaded.cursor);
+    // Existing native storage and control shapes remain byte-for-byte stable.
+    const original = .{ .expected = summary.expected, .inventory_digest = summary.inventory_digest, .source_members = summary.source_members, .fields = summary.fields, .position = summary.position.native, .page_digest = summary.page_digest };
+    const original_json = try std.json.Stringify.valueAlloc(alloc, original, .{});
+    defer alloc.free(original_json);
+    try std.testing.expectEqualSlices(u8, original_json, response);
+    const wire = @import("relational_integrity_json.zig");
+    var native_wire: std.Io.Writer.Allocating = .init(alloc);
+    defer native_wire.deinit();
+    var original_wire: std.Io.Writer.Allocating = .init(alloc);
+    defer original_wire.deinit();
+    var native_stream: std.json.Stringify = .{ .writer = &native_wire.writer };
+    var original_stream: std.json.Stringify = .{ .writer = &original_wire.writer };
+    try wire.write(summary, &native_stream);
+    try wire.write(original, &original_stream);
+    try std.testing.expectEqualSlices(u8, original_wire.written(), native_wire.written());
+    const DecodeFaults = struct {
+        fn run(a: Allocator, encoded: []const u8) !void {
+            var decoded = try decodeRecord(a, encoded);
+            defer decoded.deinit();
+        }
+    };
+    for ([_]Position{
+        .{ .native = .{ .namespace = .{ .table_id = std.math.maxInt(u64), .shard_id = 2, .range_id = 3 }, .sequence = std.math.maxInt(u64) - 1 } },
+        .{ .raft = .{ .term = 19, .index = std.math.maxInt(u64) - 1 } },
+    }) |cut| {
+        var exact = summary;
+        exact.position = cut;
+        const encoded = try encodeRecord(alloc, exact, cursor);
+        defer alloc.free(encoded);
+        var decoded = try decodeRecord(alloc, encoded);
+        defer decoded.deinit();
+        try std.testing.expectEqualDeep(exact, decoded.summary);
+        try @import("antfly_platform").allocator.checkAllAllocationFailures(alloc, DecodeFaults.run, .{encoded});
+        encoded[4] = if (cut == .native) 2 else 1;
+        @memcpy(encoded[encoded.len - 32 ..], &hash(encoded[0 .. encoded.len - 32]));
+        try std.testing.expectError(error.InvalidRelationalIndexValidation, decodeRecord(alloc, encoded));
+    }
     // A source may produce 32 local index rows while all UNIQUE claims route
     // to other owners. Physical index counts bind the consumed source rows,
     // not the independently routed target-inventory cardinality.

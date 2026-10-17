@@ -53,12 +53,16 @@ and the apply watermark commit together; READY survives cold recovery but grants
 neither installation nor publication authority. Native AICV v2 bytes and control
 reply shapes stay unchanged; explicit Raft cuts use AICV v3, without advertising
 the still-incomplete Raft lifecycle. Native proof adapters still reject Raft
-records. This does not yet wire replicated
-claim delivery, validation, installation, cancellation or publication release
-through the public receiver.
+records. The same bounded physical verifier now checks primary coverage,
+forward tuples, reverse ownership and covering payloads at committed Raft cuts.
+Fixed-page replay, progress and the apply watermark remain atomic; cold recovery
+checks the durable cut and frozen source cardinality. Native AIGV v1 storage and
+reply bytes are unchanged; the explicit Raft representation uses AIGV v2.
+This does not yet wire replicated claim delivery, validation seals,
+installation, cancellation or publication release through the public receiver.
 
 Verification: `zig build antfly-relational-index-system-test -Doptimize=Debug -j1`
-passes 290 storage tests and one server test, with no skips or leaks. The Raft
+passes 291 storage tests and one server test, with no skips or leaks. The Raft
 regression covers aborted apply, exact replay, retry cuts, physical membership,
 wrong-authority corruption, allocation failures and cold reopens. Consumption
 controls additionally cover expired apply, future cuts with valid checksums,

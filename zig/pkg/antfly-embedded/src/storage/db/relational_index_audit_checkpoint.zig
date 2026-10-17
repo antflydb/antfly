@@ -234,7 +234,7 @@ pub const Guard = struct {
     }
     pub fn summary(self: *const @This(), state: State) !Summary {
         try state.validate(self.root, self.physical_incarnation, self.binding, self.expected);
-        return .{ .root_incarnation = self.root.root_incarnation, .physical_root_incarnation = self.physical_incarnation, .expectation_digest = state.inventory.expectation_digest, .inventory = state.inventory.fields, .generation = if (state.generation) |value| value.progress.summary.fields else null, .inventory_canonical_digest = state.inventory.canonical_digest, .generation_canonical_digest = if (state.generation) |value| value.canonical_digest else null, .source_members = if (state.generation) |value| value.progress.summary.source_members else null, .canonical_position = if (state.generation) |value| value.progress.summary.position else null, .checkpoint_digest = self.checkpoint_digest orelse return error.PrivateIndexTargetValidationRequired };
+        return .{ .root_incarnation = self.root.root_incarnation, .physical_root_incarnation = self.physical_incarnation, .expectation_digest = state.inventory.expectation_digest, .inventory = state.inventory.fields, .generation = if (state.generation) |value| value.progress.summary.fields else null, .inventory_canonical_digest = state.inventory.canonical_digest, .generation_canonical_digest = if (state.generation) |value| value.canonical_digest else null, .source_members = if (state.generation) |value| value.progress.summary.source_members else null, .canonical_position = if (state.generation) |value| value.progress.summary.position.native else null, .checkpoint_digest = self.checkpoint_digest orelse return error.PrivateIndexTargetValidationRequired };
     }
 };
 

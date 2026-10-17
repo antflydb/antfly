@@ -725,7 +725,7 @@ pub fn verifyUninstalledRecovery(alloc: std.mem.Allocator, txn: anytype, job: Bi
     const pages = @import("relational_index_jobs.zig");
     try @import("relational_index_owner_control.zig").PreparedBuild.verifyRecovery(txn, job);
     try private_claims.InventoryValidation.verifyRecovery(alloc, txn, job);
-    if (job.authority == .native) try @import("relational_index_validation.zig").verifyRecovery(alloc, txn, job);
+    try @import("relational_index_validation.zig").verifyRecovery(alloc, txn, job);
     // Decode borrowed progress last: another store read may invalidate it.
     const owner = try pages.ownership(txn);
     if (try optional(txn, &pages.progressKey(job.index))) |bytes| {

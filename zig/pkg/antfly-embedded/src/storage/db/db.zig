@@ -8429,10 +8429,16 @@ pub const DB = struct {
         return self.applyCommittedRaftIndexEffect(prepared, owner_group, entry);
     }
 
+    pub fn applyCommittedRaftIndexGeneration(self: *DB, prepared: *@import("relational_index_owner_control.zig").PreparedGenerationValidation, owner_group: u64, entry: OrderedApplyReceipt) !void {
+        if (prepared.page.command.binding.authority != .raft) return error.InvalidControlReceiptPosition;
+        return self.applyCommittedRaftIndexEffect(prepared, owner_group, entry);
+    }
+
     fn applyCommittedRaftIndexEffect(self: *DB, prepared: anytype, owner_group: u64, entry: OrderedApplyReceipt) !void {
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
         if (self.local_execution.restore_staging_required.load(.acquire)) return error.RestoreStagingScopeChanged;
-        const command = if (comptime @hasField(@typeInfo(@TypeOf(prepared)).pointer.child, "command")) prepared.command else prepared.batch.command;
+        const PreparedType = @typeInfo(@TypeOf(prepared)).pointer.child;
+        const command = if (comptime @hasField(PreparedType, "command")) prepared.command else if (comptime @hasField(PreparedType, "batch")) prepared.batch.command else prepared.page.command;
         try command.validate();
         if (owner_group == 0 or owner_group != command.binding.fence.owner_group_id) return error.PrivateIndexOwnerJobChanged;
         if (!command.binding.fence.namespace.eql(self.core.identity_namespace)) return error.IdentityNamespaceMismatch;
@@ -8877,8 +8883,8 @@ pub const DB = struct {
             var loaded = (try @import("relational_index_validation.zig").load(alloc, &read, binding)) orelse return error.InvalidRelationalIndexValidation;
             defer loaded.deinit();
             const frozen = try @import("relational_index_private_claims.zig").InventoryValidation.requireReady(alloc, &read, binding, request.target_expectation.?);
-            if (!std.mem.eql(u8, &loaded.summary.inventory_digest, &frozen.digest) or loaded.summary.source_members != frozen.source_members or loaded.summary.position.sequence <= frozen.position.sequence) return error.PrivateIndexOwnerJobChanged;
-            var result: native_index_control.GenerationOutcome = .{ .binding = binding, .record = loaded.summary, .position = loaded.summary.position, .duplicate = true };
+            if (!std.mem.eql(u8, &loaded.summary.inventory_digest, &frozen.digest) or loaded.summary.source_members != frozen.source_members or loaded.summary.position != .native or loaded.summary.position.native.sequence <= frozen.position.sequence) return error.PrivateIndexOwnerJobChanged;
+            var result: native_index_control.GenerationOutcome = .{ .binding = binding, .record = loaded.summary, .position = loaded.summary.position.native, .duplicate = true };
             if (try durable_outbox_store.hasPendingTxn(&read)) {
                 result.replication_pending = true;
                 result.error_name = "ReplicationOutboxPending";

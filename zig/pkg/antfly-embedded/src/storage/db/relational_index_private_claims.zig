@@ -1207,7 +1207,7 @@ pub const InventoryValidation = struct {
         fields: Fields,
         position: Position,
         page_digest: integrity.Digest,
-        const WirePosition = struct {
+        pub const WirePosition = struct {
             namespace: ?@import("doc_identity_namespace.zig").Namespace = null,
             sequence: ?u64 = null,
             raft: ?@FieldType(Position, "raft") = null,
