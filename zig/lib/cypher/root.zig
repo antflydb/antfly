@@ -45,6 +45,7 @@ test {
     _ = @import("request.zig");
     _ = wire;
     _ = distributed;
+    _ = rpc;
     _ = bounded_json;
     _ = regex;
 }

@@ -362,7 +362,7 @@ pub const Overlay = struct {
             return !self.from_base or self.dirty or self.created;
         }
     };
-    const plain_vtable: b.Backend.VTable = .{ .bind = bind, .checkpoint = checkpoint, .scan = scan, .scan_where = scanWhere, .get = get, .get_many = getMany, .get_relationship = getRelationship, .expand = expand, .expand_between = expandBetween, .search = search, .set_work = setWork, .set_read_fields = setReadFields, .begin = begin, .startup_work = startupWork, .mutate = mutate, .commit = commit, .rollback = rollback, .new_identity = newIdentity };
+    const plain_vtable: b.Backend.VTable = .{ .bind = bind, .checkpoint = checkpoint, .scan = scan, .scan_where = scanWhere, .estimate_where = estimateWhere, .get = get, .get_many = getMany, .get_relationship = getRelationship, .expand = expand, .expand_between = expandBetween, .search = search, .set_work = setWork, .set_read_fields = setReadFields, .begin = begin, .startup_work = startupWork, .mutate = mutate, .commit = commit, .rollback = rollback, .new_identity = newIdentity };
     const projecting_vtable: b.Backend.VTable = projected: {
         var value = plain_vtable;
         value.project_node = projectNode;
@@ -702,6 +702,12 @@ pub const Overlay = struct {
                 if (after == null) break;
             }
         }
+    }
+    fn estimateWhere(ptr: *anyopaque, a: A, table: []const u8, filters: []const b.PropertyFilter, limit: usize) anyerror!?usize {
+        const self = cast(ptr);
+        try checkpoint(ptr);
+        if (self.active) return null;
+        return if (self.base.vtable.estimate_where) |estimate| try estimate(self.base.ptr, a, table, filters, limit) else null;
     }
     fn scanWhere(ptr: *anyopaque, a: A, table: []const u8, filters: []const b.PropertyFilter, after: ?[]const u8, limit: usize) anyerror!b.Page(*const v.Node) {
         const self = cast(ptr);

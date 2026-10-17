@@ -25,21 +25,33 @@ const Names = std.StringHashMapUnmanaged(void);
 
 pub const Plan = struct {
     const Stage = struct { node: *const binding.Node, fields: []const []const []const u8 };
+    pub const Terminal = union(enum) {
+        scan,
+        ordinary,
+        union_all: struct { left: *Plan, right: *Plan },
+        cross: struct { child: *Plan, singleton: *const binding.Node, graph_left: bool },
+    };
     source: *const binding.Node,
+    terminal: Terminal = .scan,
+    requests: []const catalog.AggregateWeight,
     stages: []const Stage,
     physical: []const catalog.AggregateWeight,
     width: usize,
 
-    pub fn init(a: A, root: *const binding.Node, requests: []const catalog.AggregateWeight) !?Plan {
+    pub fn init(a: A, root: *const binding.Node, requests: []const catalog.AggregateWeight) anyerror!?Plan {
+        return initDepth(a, root, requests, 0);
+    }
+    fn initDepth(a: A, root: *const binding.Node, requests: []const catalog.AggregateWeight, depth: usize) anyerror!?Plan {
+        if (depth >= 64 or requests.len == 0) return null;
         var node = root;
         var mapped = requests;
         var stages: std.ArrayList(Stage) = .empty;
         var width: usize = 0;
         while (node.operation == .query) {
-            if (stages.items.len == 64) return null;
+            if (depth + stages.items.len >= 64) return null;
             const query = node.operation.query;
             if (query.binding.aggregate != null or query.binding.window != null or query.statement.count_all or
-                query.binding.order_keys.len != 0 or query.statement.limit != null or query.statement.offset != null or
+                !unobservedOrder(query) or query.statement.limit != null or query.statement.offset != null or
                 query.statement.scalar_cardinality_limit or query.constant_refs.len != 0 or
                 query.statement.columns.len != node.columns.len or query.binding.columns.len != node.columns.len) return null;
             const bound = query.binding.scalars;
@@ -90,7 +102,33 @@ pub const Plan = struct {
             mapped = inputs;
             node = query.source;
         }
-        if (node.operation != .scan) return null;
+        const terminal: Terminal = switch (node.operation) {
+            .scan => .scan,
+            .set => |set| blk: {
+                if (set.kind != .@"union" or !set.all) return null;
+                const left = try child(a, set.left, try positional(a, node, set.left, mapped), depth + stages.items.len + 1);
+                const right = try child(a, set.right, try positional(a, node, set.right, mapped), depth + stages.items.len + 1);
+                width += @max(left.width, right.width);
+                break :blk .{ .union_all = .{ .left = left, .right = right } };
+            },
+            .join => |join| blk: {
+                if ((join.kind != .inner and join.kind != .cross) or join.condition != null or join.correlation or join.membership != null) return null;
+                const graph_left = singleton(join.right, 0);
+                const graph = if (graph_left) join.left else if (singleton(join.left, 0)) join.right else return null;
+                const single = if (graph_left) join.right else join.left;
+                const input = try a.alloc(catalog.AggregateWeight, mapped.len);
+                for (mapped, input) |request, *out| {
+                    var fields: Names = .empty;
+                    for (request.fields) |field| if (columnIndex(graph, field) != null) try fields.put(a, field, {});
+                    out.* = .{ .fields = try names(a, fields), .multiplicity = request.multiplicity };
+                }
+                const nested = try child(a, graph, input, depth + stages.items.len + 1);
+                width += nested.width + single.columns.len;
+                break :blk .{ .cross = .{ .child = nested, .singleton = single, .graph_left = graph_left } };
+            },
+            else => return null,
+        };
+        if (terminal != .scan) return .{ .source = node, .terminal = terminal, .requests = requests, .stages = stages.items, .physical = &.{}, .width = width + node.columns.len };
         const physical = try a.alloc(catalog.AggregateWeight, mapped.len);
         for (mapped, physical) |request, *out| {
             const fields = try a.alloc([]const u8, request.fields.len);
@@ -100,7 +138,58 @@ pub const Plan = struct {
             }
             out.* = .{ .fields = fields, .multiplicity = request.multiplicity };
         }
-        return .{ .source = node, .stages = stages.items, .physical = physical, .width = width + node.columns.len };
+        return .{ .source = node, .requests = requests, .stages = stages.items, .physical = physical, .width = width + node.columns.len };
+    }
+
+    fn child(a: A, node: *const binding.Node, requests: []const catalog.AggregateWeight, depth: usize) !*Plan {
+        const result = try a.create(Plan);
+        result.* = (try initDepth(a, node, requests, depth)) orelse .{ .source = node, .terminal = .ordinary, .requests = requests, .stages = &.{}, .physical = &.{}, .width = node.columns.len };
+        return result;
+    }
+    fn positional(a: A, parent: *const binding.Node, nested: *const binding.Node, requests: []const catalog.AggregateWeight) ![]const catalog.AggregateWeight {
+        const result = try a.alloc(catalog.AggregateWeight, requests.len);
+        for (requests, result) |request, *out| {
+            const fields = try a.alloc([]const u8, request.fields.len);
+            for (request.fields, fields) |field, *name| name.* = nested.columns[columnIndex(parent, field) orelse return error.InvalidSqlBackendResponse].internal;
+            out.* = .{ .fields = fields, .multiplicity = request.multiplicity };
+        }
+        return result;
+    }
+    // A singleton subtree may filter its row away, but cannot multiply it.
+    // Its normal SQL iterator still evaluates all expressions and errors.
+    fn singleton(node: *const binding.Node, depth: usize) bool {
+        if (depth >= 64) return false;
+        return switch (node.operation) {
+            .singleton => true,
+            .query => |q| blk: {
+                if (q.binding.aggregate != null or q.binding.window != null or q.constant_refs.len != 0) break :blk false;
+                if (q.binding.scalars.predicate) |p| if (!p.repeatable()) break :blk false;
+                for (q.binding.scalars.projections) |p| if (p) |program| if (!program.repeatable()) break :blk false;
+                break :blk singleton(q.source, depth + 1);
+            },
+            else => false,
+        };
+    }
+    fn totalOrderProgram(program: scalar.Program) bool {
+        const root = program.instructions[program.root];
+        return !root.input_function and (root.operation == .column or root.operation == .literal) and
+            orderedScalar(program.output_type.kind);
+    }
+    fn orderedScalar(kind: ?@import("ast.zig").ColumnType) bool {
+        return if (kind) |k| k == .integer or k == .number or k == .boolean or k == .string else true;
+    }
+    fn unobservedOrder(query: anytype) bool {
+        for (query.binding.order_keys) |key| switch (key.source) {
+            .column => |column| if (!orderedScalar(column.type)) return false,
+            .output => |index| {
+                if (index >= query.binding.columns.len or !orderedScalar(query.binding.columns[index].type)) return false;
+                if (index < query.binding.scalars.projections.len) if (query.binding.scalars.projections[index]) |program| {
+                    if (!totalOrderProgram(program)) return false;
+                };
+            },
+            .expression => return false,
+        };
+        return true;
     }
 
     pub fn project(self: Plan, a: A, original_context: anytype, initial: catalog.Row, slots: ?[]const usize) !?catalog.Row {

@@ -46,7 +46,7 @@ pub const View = struct {
         };
     };
     pub fn backend(self: *View) cypher.backend.Backend {
-        return .{ .ptr = self, .vtable = &.{ .bind = bind, .checkpoint = checkpoint, .scan = scan, .scan_where = scanWhere, .get = get, .expand = expand, .expand_between = expandBetween, .search = search, .startup_work = startupWork, .set_work = setWork, .set_read_fields = setReadFields } };
+        return .{ .ptr = self, .vtable = &.{ .bind = bind, .checkpoint = checkpoint, .scan = scan, .scan_where = scanWhere, .estimate_where = estimateWhere, .get = get, .expand = expand, .expand_between = expandBetween, .search = search, .startup_work = startupWork, .set_work = setWork, .set_read_fields = setReadFields } };
     }
     fn cast(ptr: *anyopaque) *View {
         return @ptrCast(@alignCast(ptr));
@@ -241,6 +241,10 @@ pub const View = struct {
     fn scan(ptr: *anyopaque, a: A, table: []const u8, after: ?[]const u8, limit: usize) !cypher.backend.Page(*const cypher.value.Node) {
         const backend_inner = cast(ptr).inner.backend();
         return backend_inner.vtable.scan(backend_inner.ptr, a, table, after, limit);
+    }
+    fn estimateWhere(ptr: *anyopaque, a: A, table: []const u8, filters: []const cypher.backend.PropertyFilter, limit: usize) !?usize {
+        const inner = cast(ptr).inner.backend();
+        return if (inner.vtable.estimate_where) |estimate| try estimate(inner.ptr, a, table, filters, limit) else null;
     }
     fn scanWhere(ptr: *anyopaque, a: A, table: []const u8, filters: []const cypher.backend.PropertyFilter, after: ?[]const u8, limit: usize) !cypher.backend.Page(*const cypher.value.Node) {
         const backend_inner = cast(ptr).inner.backend();

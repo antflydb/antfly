@@ -129,6 +129,10 @@ pub const Backend = struct {
         /// Typed comparisons are candidate restrictions; the runtime always
         /// rechecks Cypher semantics after authorization and projection.
         scan_where: ?*const fn (*anyopaque, std.mem.Allocator, []const u8, []const PropertyFilter, ?[]const u8, usize) anyerror!Page(*const v.Node) = null,
+        /// Optional snapshot-bound index cardinality evidence, capped by limit.
+        /// Unknown/broad/unindexed populations return null; planning consumes
+        /// work quota without binding query anchors or advancing a scan cursor.
+        estimate_where: ?*const fn (*anyopaque, std.mem.Allocator, []const u8, []const PropertyFilter, usize) anyerror!?usize = null,
         /// Authorized document lookup also serves nonvertex producers. The runtime
         /// applies graph membership before admitting traversal endpoints.
         get: *const fn (*anyopaque, std.mem.Allocator, v.Identity) anyerror!?*const v.Node,

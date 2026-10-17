@@ -280,7 +280,7 @@ pub const NodeCursor = struct {
         const owned_parameters = try a.alloc(v.Entry, parameters.len);
         for (parameters, owned_parameters) |parameter, *out| out.* = .{ .name = try a.dupe(u8, parameter.name), .value = try parameter.value.clone(a) };
         const engine = try a.create(Engine);
-        engine.* = .{ .a = a, .scratch_allocator = budget.allocator(), .backend = backend, .graph = graph, .source = owned_query.source, .parameters = owned_parameters, .limits = limits, .read_only = true, .cache_reads = true, .regex = .{ .a = a, .scratch = std.heap.ArenaAllocator.init(budget.allocator()) } };
+        engine.* = .{ .a = a, .planning_allocator = a, .scratch_allocator = budget.allocator(), .backend = backend, .graph = graph, .source = owned_query.source, .parameters = owned_parameters, .limits = limits, .read_only = true, .cache_reads = true, .regex = .{ .a = a, .scratch = std.heap.ArenaAllocator.init(budget.allocator()) } };
         var aliases: std.ArrayList([]const u8) = .empty;
         for (owned_query.clauses[0].operation.match.paths) |path| {
             for (path.nodes) |node| if (node.alias) |alias| try aliases.append(a, alias);
@@ -298,6 +298,7 @@ pub const NodeCursor = struct {
         arena_moved = true;
         engine.adjacency_cache = &self.adjacency_cache;
         engine.a = self.arena.allocator();
+        engine.planning_allocator = engine.a;
         engine.values.a = engine.a;
         engine.strings.a = engine.a;
         engine.regex.a = engine.a;
@@ -801,7 +802,7 @@ pub const NodeCursor = struct {
 fn executeBudget(budget: *Budget, backend: backend_mod.Backend, graph: catalog.Graph, compiled: *const compiler.Compiled, parameters: []const v.Entry, limits: Limits) !Result {
     var arena = std.heap.ArenaAllocator.init(budget.allocator());
     errdefer arena.deinit();
-    var engine: Engine = .{ .a = arena.allocator(), .scratch_allocator = budget.allocator(), .backend = backend, .graph = graph, .source = compiled.query.source, .parameters = parameters, .limits = limits, .regex = .{ .a = arena.allocator(), .scratch = std.heap.ArenaAllocator.init(budget.allocator()) } };
+    var engine: Engine = .{ .a = arena.allocator(), .planning_allocator = arena.allocator(), .scratch_allocator = budget.allocator(), .backend = backend, .graph = graph, .source = compiled.query.source, .parameters = parameters, .limits = limits, .regex = .{ .a = arena.allocator(), .scratch = std.heap.ArenaAllocator.init(budget.allocator()) } };
     engine.values = .{ .a = engine.a, .ptr = &engine, .charge = Engine.chargeWork };
     engine.strings = .{ .a = engine.a, .ptr = &engine, .charge = Engine.chargeWork };
     defer engine.regex.deinit();
@@ -904,6 +905,8 @@ const aggregates = @import("expressions.zig").aggregates;
 const Engine = struct {
     a: A,
     scratch_allocator: A,
+    planning_allocator: A = undefined,
+    anchor_estimates: std.StringHashMapUnmanaged(?usize) = .empty,
     regex: @import("regex.zig").Runtime,
     backend: backend_mod.Backend,
     graph: catalog.Graph,
@@ -920,6 +923,7 @@ const Engine = struct {
     stream_predicate: ?*const ast.Expr = null,
     shortest_count: ?*u64 = null,
     count_endpoints: bool = false,
+    component_proof: bool = false,
     weighted_sink: ?struct { ptr: *anyopaque, emit: *const fn (*anyopaque, Row, u64) anyerror!void, multiplicity: Multiplicity } = null,
     lower_graph: ?*LowerGraph = null,
     anchor_batch: ?*AnchorBatch = null,
@@ -1662,6 +1666,7 @@ const Engine = struct {
             }
             break :blk true;
         };
+        if (self.component_proof and !count_endpoints and !count_shortest) return null;
         var shape: std.ArrayList(v.Entry) = .empty;
         if (input.len != 0) try shape.appendSlice(self.a, input[0]);
         for (operation.paths) |pattern| {
@@ -1831,6 +1836,94 @@ const Engine = struct {
         }
         return self.run(plan, &.{row}, false, true);
     }
+    const ComponentResult = struct { rows: []const Row, next: usize };
+    fn reverseComponent(self: *Engine, path: ast.Path) !ast.Path {
+        var result = path;
+        const nodes = try self.a.dupe(ast.Node, path.nodes);
+        const edges = try self.a.dupe(ast.Edge, path.edges);
+        std.mem.reverse(ast.Node, nodes);
+        std.mem.reverse(ast.Edge, edges);
+        for (edges) |*edge| edge.direction = switch (edge.direction) {
+            .out => .in,
+            .in => .out,
+            .both => .both,
+        };
+        result.nodes = nodes;
+        result.edges = edges;
+        return result;
+    }
+    fn joinComponent(self: *Engine, left: ast.Path, right: ast.Path) !?ast.Path {
+        const end = left.nodes[left.nodes.len - 1];
+        const start = right.nodes[0];
+        if (end.alias == null or start.alias == null or !std.mem.eql(u8, end.alias.?, start.alias.?)) return null;
+        const nodes = try self.a.alloc(ast.Node, left.nodes.len + right.nodes.len - 1);
+        @memcpy(nodes[0..left.nodes.len], left.nodes);
+        @memcpy(nodes[left.nodes.len..], right.nodes[1..]);
+        const labels = try self.a.alloc([]const u8, end.labels.len + start.labels.len);
+        @memcpy(labels[0..end.labels.len], end.labels);
+        @memcpy(labels[end.labels.len..], start.labels);
+        const properties = try self.a.alloc(ast.Entry, end.properties.len + start.properties.len);
+        @memcpy(properties[0..end.properties.len], end.properties);
+        @memcpy(properties[end.properties.len..], start.properties);
+        nodes[left.nodes.len - 1].labels = labels;
+        nodes[left.nodes.len - 1].properties = properties;
+        const edges = try self.a.alloc(ast.Edge, left.edges.len + right.edges.len);
+        @memcpy(edges[0..left.edges.len], left.edges);
+        @memcpy(edges[left.edges.len..], right.edges);
+        return .{ .span = left.span, .alias = null, .nodes = nodes, .edges = edges };
+    }
+    /// Plan a connected linear component once. Cross-clause fusion is only
+    /// committed after the compressed producer proves uniqueness; a declined
+    /// proof resumes the original clauses, which reset trail history separately.
+    fn tryComponent(self: *Engine, input: []const Row, clauses: []const ast.Clause) anyerror!?ComponentResult {
+        if (!self.read_only or self.component_proof or clauses.len < 2 or clauses[0].operation != .match) return null;
+        var operation = clauses[0].operation.match;
+        var paths: std.ArrayList(ast.Path) = .empty;
+        var match_count: usize = 0;
+        while (match_count < clauses.len and clauses[match_count].operation == .match) : (match_count += 1) {
+            const step = clauses[match_count].operation.match;
+            if (step.mode != operation.mode or (match_count != 0 and (step.optional or operation.optional))) return null;
+            if (match_count != 0 and operation.predicate != null) return null;
+            operation.predicate = step.predicate;
+            try paths.appendSlice(self.a, step.paths);
+        }
+        if (paths.items.len < 2) return null;
+        for (paths.items) |path| if (path.alias != null or path.selector != .all or path.execution_prefix or path.execution_reversed) return null;
+        var path = paths.orderedRemove(0);
+        while (paths.items.len != 0) {
+            var found = false;
+            for (paths.items, 0..) |candidate, index| {
+                const reverse = try self.reverseComponent(candidate);
+                const merged = try self.joinComponent(path, candidate) orelse try self.joinComponent(path, reverse) orelse try self.joinComponent(candidate, path) orelse try self.joinComponent(reverse, path);
+                if (merged) |combined| {
+                    path = combined;
+                    _ = paths.orderedRemove(index);
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) return null;
+        }
+        if (path.edges.len == 0 or (path.edges.len == 1 and path.edges[0].min_hops == 1 and path.edges[0].max_hops == 1)) return null;
+        operation.paths = try self.a.dupe(ast.Path, &.{path});
+        for (clauses[match_count..], match_count..) |clause, index| {
+            if (clause.operation == .unwind) continue;
+            if (clause.operation != .project) return null;
+            const projection = clause.operation.project.value;
+            var reduction = false;
+            for (projection.items) |item| reduction = reduction or aggregates(item.expression);
+            if (!clause.operation.project.final and !reduction and projection.limit == null) continue;
+            const previous = self.component_proof;
+            self.component_proof = true;
+            defer self.component_proof = previous;
+            const result = self.streamMatchProjection(input, operation, projection, clauses[match_count..index], clauses[0].span, clause.span) catch |err| switch (err) {
+                error.CypherComponentDeclined => return null,
+                else => return err,
+            };
+            return if (result) |rows| .{ .rows = rows, .next = index + 1 } else null;
+        }
+        return null;
+    }
     fn run(self: *Engine, clauses: []const ast.Clause, input: []const Row, explain: bool, preserve_rows: bool) anyerror![]const Row {
         const prior_lower_graph = self.lower_graph;
         const prior_join = self.join;
@@ -1844,7 +1937,7 @@ const Engine = struct {
         self.recursion += 1;
         defer self.recursion -= 1;
         if (self.recursion > self.limits.recursion_depth) return error.CypherRecursionBudgetExceeded;
-        if (!explain and input.len == 1 and input[0].len == 0 and clauses.len >= 2 and clauses[0].operation == .match) {
+        if (!explain and input.len == 1 and input[0].len == 0 and clauses.len >= 2 and clauses[0].operation == .match and clauses[0].operation.match.paths.len == 1) {
             for (clauses[1..], 1..) |clause, index| {
                 if (clause.operation == .unwind) continue;
                 if (clause.operation != .project) break;
@@ -1868,6 +1961,10 @@ const Engine = struct {
                 continue;
             }
             if (clause.operation == .match) {
+                if (try self.tryComponent(rows, clauses[clause_index..])) |component| {
+                    if (clause_index + component.next < clauses.len) return self.run(clauses[clause_index + component.next ..], component.rows, false, preserve_rows);
+                    return component.rows;
+                }
                 for (clauses[clause_index + 1 ..], clause_index + 1..) |following, index| {
                     if (following.operation == .unwind) continue;
                     if (following.operation != .project) break;
@@ -2877,6 +2974,7 @@ const Engine = struct {
             .relationship_simple => try self.lowerTrailAcyclic(&graph),
         };
         if (!compressible) {
+            if (self.component_proof) return error.CypherComponentDeclined;
             if (self.weighted_sink != null or starts.len != 1) return false;
             const previous = self.lower_graph;
             self.lower_graph = &graph;
@@ -3071,6 +3169,7 @@ const Engine = struct {
             };
             engine.stream_predicate = original_predicate;
             if (!compressed) {
+                if (engine.component_proof) return error.CypherComponentDeclined;
                 for (self.nodes.items) |node| {
                     const row = (try engine.bind(self.input.row, self.path.nodes[0].alias, .{ .node = node })).?;
                     try engine.startPath(.{ .row = row }, self.path, self.mode, node, output);
@@ -3130,9 +3229,35 @@ const Engine = struct {
         for (filters.items) |filter| if (filter.op == .eq or filter.op == .in) {
             seeks += 1;
         };
-        // A range residual is not a cardinality estimate. Keep batching unless
-        // a point/equality admission actually justifies a different anchor.
-        return (if (self.backend.vtable.scan_where != null) @as(usize, 100) * @min(seeks, 999) else 0) + @intFromBool(node.labels.len > 0);
+        var score = (if (self.backend.vtable.scan_where != null) @as(usize, 100) * @min(seeks, 999) else 0) + @intFromBool(node.labels.len > 0);
+        // Bounded index cardinality evidence distinguishes a selective range
+        // from a broad residual without overriding point/bound admissions.
+        if (self.read_only and seeks == 0 and filters.items.len != 0) {
+            const estimate = self.backend.vtable.estimate_where orelse return score;
+            const key = try std.fmt.allocPrint(self.a, "{s}:{s}", .{ self.graph.name, try std.json.Stringify.valueAlloc(self.a, .{ .table = if (node.labels.len != 0) self.graph.label(node.labels[0]).?.table else "", .filters = filters.items }, .{}) });
+            const upper = if (self.anchor_estimates.get(key)) |cached| cached else blk: {
+                if (key.len > 4096 or self.anchor_estimates.count() >= 64) return score;
+                var total: usize = 0;
+                for (self.graph.labels, 0..) |label, index| {
+                    if (!self.firstTableLabel(index, node)) continue;
+                    if (total == 32) {
+                        try self.anchor_estimates.put(self.planning_allocator, try self.planning_allocator.dupe(u8, key), null);
+                        return score;
+                    }
+                    try self.state();
+                    const bound = (try estimate(self.backend.ptr, self.a, label.table, filters.items, 32 -| total)) orelse {
+                        try self.anchor_estimates.put(self.planning_allocator, try self.planning_allocator.dupe(u8, key), null);
+                        return score;
+                    };
+                    total += bound;
+                    if (total > 32) return error.CypherInvalidBackendPage;
+                }
+                try self.anchor_estimates.put(self.planning_allocator, try self.planning_allocator.dupe(u8, key), total);
+                break :blk total;
+            };
+            if (upper) |bound| score = @max(score, 50 - bound);
+        }
+        return score;
     }
     fn batchEligible(self: *Engine, path: ast.Path, row: Row, operation: ast.Match, projection: ast.Projection, middle: []const ast.Clause) !bool {
         if (path.selector != .all or path.edges.len == 0 or path.execution_prefix) return false;
@@ -3161,6 +3286,7 @@ const Engine = struct {
             }
         }
         if ((self.shortest_count != null or self.count_endpoints) and path.selector == .all and try self.countAllPath(input, path, mode, node, output)) return;
+        if (self.component_proof) return error.CypherComponentDeclined;
         if (!self.shortest_fast or path.selector == .all or path.edges.len != 1 or input.used.len != 0 or input.constraints.len != 0) {
             return self.pathStep(input, path, mode, 0, &.{node}, &.{}, output);
         }

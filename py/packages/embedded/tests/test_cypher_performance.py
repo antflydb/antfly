@@ -1545,6 +1545,19 @@ def test_pure_endpoint_expressions_keep_compressed_bags(graph_db):
             },
         )
         assert [cell["value"] for cell in result["rows"][0]] == [str(value) for value in expected]
+    for prefix in (
+        "MATCH (a:D)-[:R*3..3]->(m:D),(m)-[:R*3..3]->(b:D)",
+        "MATCH (a:D)-[:R*3..3]->(m:D) MATCH (m)-[:R*3..3]->(b:D)",
+        "MATCH (m:D)-[:R*3..3]->(b:D),(a:D)-[:R*3..3]->(m)",
+    ):
+        component = db.cypher_json(
+            "g",
+            {
+                "query": prefix + " RETURN count(*),sum(b.score)",
+                "limits": {"intermediate_states": 15000, "explored_edges": 120},
+            },
+        )
+        assert [cell["value"] for cell in component["rows"][0]] == [str(paths), str(total)]
     for predicate, expected in (
         ("", [paths, paths, total, 6]),
         (" WHERE false", [1, 0, 0, None]),
@@ -1632,6 +1645,34 @@ def test_pure_endpoint_expressions_keep_compressed_bags(graph_db):
 
     with pytest.raises(SQLStateError, match="22012"):
         db.sql(f"SELECT sum(d.e) FROM (SELECT q.e,1/(q.e-q.e) AS unused FROM {mixed_relation}) d")
+
+    for statement, expected in (
+        (f"SELECT sum(d.e),count(*) FROM (SELECT q.e FROM {mixed_relation} ORDER BY q.e) d", [str(total), str(paths)]),
+        (
+            f"SELECT sum(d.e),count(*) FROM (SELECT q.e FROM {mixed_relation} UNION ALL SELECT q.e FROM {mixed_relation}) d",
+            [str(2 * total), str(2 * paths)],
+        ),
+        (f"SELECT sum(q.e),count(*) FROM {mixed_relation} CROSS JOIN (SELECT 1 AS x) d", [str(total), str(paths)]),
+        (
+            f"SELECT sum(q.e*d.x),count(*) FROM (SELECT 2 AS x) d CROSS JOIN {mixed_relation}",
+            [str(2 * total), str(paths)],
+        ),
+        (f"SELECT sum(q.e),count(*) FROM {mixed_relation} CROSS JOIN (SELECT 1 AS x WHERE false) d", [None, "0"]),
+        (
+            f"SELECT sum(d.e),count(DISTINCT d.e) FROM (SELECT q.e FROM {mixed_relation} UNION ALL SELECT q.e FROM {mixed_relation}) d",
+            [str(2 * total), str(size - 6)],
+        ),
+    ):
+        started = time.monotonic()
+        assert db.sql(statement)["rows"] == [expected]
+        assert time.monotonic() - started < 5
+    for statement in (
+        f"SELECT sum(d.e) FROM (SELECT q.e FROM {mixed_relation} ORDER BY 1/(q.e-q.e)) d",
+        f"SELECT sum(q.e) FROM {mixed_relation} CROSS JOIN (SELECT 1/0 AS x) d",
+        f"SELECT sum(d.e) FROM (SELECT CAST(q.e AS BIGINT) AS e FROM {mixed_relation} UNION ALL SELECT CAST(1/0 AS BIGINT) AS e) d",
+    ):
+        with pytest.raises(SQLStateError, match="22012"):
+            db.sql(statement)
 
     # An empty relation exhausts both negotiated passes, retaining the SQL
     # global group and its NULL sums / zero count.
@@ -1728,6 +1769,21 @@ def test_multi_anchor_reductions_share_work_across_bounded_batches(graph_db):
     assert [[cell["value"] for cell in row] for row in grouped["rows"]] == [
         [str(i), str(size - i - 1)] for i in range(size - 1)
     ]
+
+    for first in range(0, 2000, 500):
+        db.sql(
+            "INSERT INTO docs (_id,id,score) VALUES "
+            + ",".join(f"('isolated{i}','isolated{i}',{1000 + i})" for i in range(first, first + 500))
+        )
+    selective = db.cypher_json(
+        "g",
+        {
+            "query": "MATCH (a:D)-[:R*1..]->(b:D) WHERE b.score>=399 AND b.score<400 RETURN count(*),sum(b.score)",
+            "limits": {"scanned_anchors": 10, "explored_edges": 399, "intermediate_states": 100000},
+        },
+    )
+    assert [cell["value"] for cell in selective["rows"][0]] == ["399", "159201"]
+    assert selective["stats"]["scanned_anchors"] == 1
 
 
 def test_bounded_singleton_dag_reductions_use_proven_depth(graph_db):

@@ -1365,9 +1365,20 @@ required outputs through aliases and computed expressions to physical graph
 fields before opening a pass. Predicates remain live in every pass; demanded
 computations run in their assigned pass, and unused computations that could fail
 retain their error dependencies. Projected rows carry explicit aligned weights
-and active aggregate slots through filtering and pagination. Joins, set operators,
-materialized relations, ordering, windows and cardinality-changing stages decline
-this capability. No aggregate expression is algebraically rewritten.
+and active aggregate slots through filtering and pagination. A bounded operator
+tree concatenates UNION ALL contributions and carries them through cross joins
+with a proven at-most-one-row, repeatable subtree. Each unsupported child retains
+ordinary production with unit weights, so negotiation never requires advancing a
+producer or rolling back another child's capability. A tree with no weighted
+producer declines negotiation and retains the ordinary columnar execution path.
+Positional set coercions,
+NULLs and DISTINCT state stay in the typed SQL machinery. Singleton expressions
+run through their normal iterator, including errors and empty inputs. Pure direct
+sort keys can be omitted when no pagination observes their order and the consumer
+has negotiated duplicate/order-insensitive typed reduction. Other joins, set
+operators, materialized relations, windows, ordered/error-producing sort keys and
+cardinality-changing stages retain ordinary production. No aggregate expression
+is algebraically rewritten.
 
 Read phases share a bounded, quota-accounted cache of raw adjacency pages across
 anchors. Cache keys include mapping, direction, identity and continuation; each
@@ -1397,8 +1408,14 @@ from residual endpoint evaluation. Admission filters roots before collecting a
 batch; the residual must observe only the emitted endpoint. The totality proof
 covers nullable entity properties and comparisons, preserving eager Boolean
 errors by retaining an entire predicate whenever any operand can fail. Range
-predicates alone do not override batching orientation; selective point seeks and
-bound identities retain priority.
+predicates alone do not override batching orientation. An optional snapshot-bound
+index estimate probes at most 32 candidates per population and reports a bound
+only after exhausting the index range. Unindexed and broad populations retain
+batching; proven selective ranges can select an endpoint instead. Probe work is
+charged as planning work without advancing a query scan or binding anchors. Native,
+owner RPC and distributed providers share the same authority and read cut; active
+write overlays decline estimates. The statement caches bounded estimate keys;
+selective point seeks and bound identities retain priority.
 A declined proof resumes each original anchor before emitting compressed rows;
 soft batch allocation failure flushes retained roots and disables admission.
 Unbounded DAG segments first form the exact mandatory minimum-hop frontier,
@@ -1411,6 +1428,16 @@ Fixed single-hop segments transfer their frontier directly to the next segment,
 applying target-node constraints during insertion. They share the same captured
 arc eligibility and uniqueness proof without copying every frontier through an
 extra endpoint table.
+
+Connected linear MATCH components combine shared endpoint constraints before
+compression, including reversed pattern order and adjacent read-only MATCH
+clauses. The compressed producer must prove uniqueness for the complete
+component before using merged histories. A declined proof returns to the original
+clauses, preserving their independent relationship/node uniqueness scopes.
+Intermediate bindings observed by the consumer, optional clause boundaries,
+early predicates and path-sensitive constraints retain ordinary execution.
+Single-hop bound-pair plans keep their direct seek instead of discovering a
+component closure.
 
 Endpoint-local predicates, grouping keys, COUNT/SUM/AVG/MIN/MAX and their
 DISTINCT variants consume weighted endpoint rows from those same states.
@@ -1520,8 +1547,9 @@ point reads/writes with a one-anchor ceiling, shared-label counts, bounded-memor
 terminal operators, SQL graph composition, shortest paths on a dense acyclic
 graph, and lazy incident-edge deletion. Weighted regression cases include
 indexed and unindexed root/endpoint predicates, computed derived-table and CTE
-projections, independent 100-hop SQL endpoint reductions, floating DISTINCT
-SUM/AVG, and finite ordered windows over saturated path bags. Core oracles compare
+projections, SQL ordering/UNION ALL/singleton joins, selective indexed ranges,
+connected multi-pattern and multi-clause components, independent 100-hop SQL
+endpoint reductions, floating DISTINCT SUM/AVG, and finite ordered windows over saturated path bags. Core oracles compare
 compressed execution with exact cyclic and acyclic trails, including OPTIONAL
 null extension, partial bag pagination, eager Boolean errors, pattern-property
 errors, and heterogeneous outer bindings. Core regressions cover computed top-k

@@ -62,7 +62,7 @@ pub fn Adapter(comptime DB: type, comptime GraphIndex: type, comptime EdgeScanCu
         read_fields: ?[]const []const u8 = null,
 
         pub fn backend(self: *Self) b.Backend {
-            return .{ .ptr = self, .vtable = &.{ .bind = bind, .checkpoint = checkpoint, .scan = scan, .scan_where = scanWhere, .get = get, .expand = expand, .expand_between = expandBetween, .search = search, .set_work = setWork, .set_read_fields = setReadFields } };
+            return .{ .ptr = self, .vtable = &.{ .bind = bind, .checkpoint = checkpoint, .scan = scan, .scan_where = scanWhere, .estimate_where = estimateWhere, .get = get, .expand = expand, .expand_between = expandBetween, .search = search, .set_work = setWork, .set_read_fields = setReadFields } };
         }
         fn setReadFields(ptr: *anyopaque, fields: ?[]const []const u8) void {
             cast(ptr).read_fields = fields;
@@ -238,8 +238,19 @@ pub fn Adapter(comptime DB: type, comptime GraphIndex: type, comptime EdgeScanCu
             };
         }
         fn scanWhere(ptr: *anyopaque, a: A, table: []const u8, filters: []const b.PropertyFilter, encoded: ?[]const u8, limit: usize) !b.Page(*const v.Node) {
-            if (comptime !@hasDecl(DB, "openRelationalReadSession") or !@hasDecl(DB, "cypherDocumentScanOptions")) return scan(ptr, a, table, encoded, limit);
-            if (filters.len == 0) return scan(ptr, a, table, encoded, limit);
+            return (try scanWhereImpl(ptr, a, table, filters, encoded, limit, false)).?;
+        }
+        fn estimateWhere(ptr: *anyopaque, a: A, table: []const u8, filters: []const b.PropertyFilter, limit: usize) !?usize {
+            if (limit == 0) return null;
+            if (cast(ptr).work) |work| try work.charge(work.ptr, limit);
+            var scratch = std.heap.ArenaAllocator.init(b.reclaimingAllocator(a));
+            defer scratch.deinit();
+            const page = (try scanWhereImpl(ptr, scratch.allocator(), table, filters, null, limit, true)) orelse return null;
+            return if (page.next == null) page.items.len else null;
+        }
+        fn scanWhereImpl(ptr: *anyopaque, a: A, table: []const u8, filters: []const b.PropertyFilter, encoded: ?[]const u8, limit: usize, index_only: bool) !?b.Page(*const v.Node) {
+            if (comptime !@hasDecl(DB, "openRelationalReadSession") or !@hasDecl(DB, "cypherDocumentScanOptions")) return if (index_only) null else try scan(ptr, a, table, encoded, limit);
+            if (filters.len == 0) return if (index_only) null else try scan(ptr, a, table, encoded, limit);
             const self = cast(ptr);
             var scratch = std.heap.ArenaAllocator.init(b.reclaimingAllocator(a));
             defer scratch.deinit();
@@ -247,11 +258,11 @@ pub fn Adapter(comptime DB: type, comptime GraphIndex: type, comptime EdgeScanCu
             try checkpoint(ptr);
             const db = try self.selected(table);
             const cursor = if (encoded) |json| try std.json.parseFromSliceLeaky(PropertyCursor, temporary, json, .{}) else PropertyCursor{};
-            if (cursor.primary) return propertyFallback(ptr, a, table, cursor, limit);
+            if (cursor.primary) return if (index_only) null else try propertyFallback(ptr, a, table, cursor, limit);
             const authorization = try self.readAuthorization(temporary, table);
             var opts = try self.scanOptions(temporary, db, .{ .execution_deadline_ns = authorization.deadline_ns, .row_policy_principal_proof = authorization.proof, .row_policy_database = authorization.database, .include_documents = true, .limit = @intCast(limit) });
-            if (opts.relational_query == null) return propertyFallback(ptr, a, table, cursor, limit);
-            var schema = db.core.acquireSchemaView() orelse return propertyFallback(ptr, a, table, cursor, limit);
+            if (opts.relational_query == null) return if (index_only) null else try propertyFallback(ptr, a, table, cursor, limit);
+            var schema = db.core.acquireSchemaView() orelse return if (index_only) null else try propertyFallback(ptr, a, table, cursor, limit);
             defer schema.release();
             const Query = @TypeOf(opts.relational_query.?);
             var conditions: std.ArrayList(Query.Condition) = .empty;
@@ -322,7 +333,7 @@ pub fn Adapter(comptime DB: type, comptime GraphIndex: type, comptime EdgeScanCu
                     .gte => .gte,
                 }, .value = value });
             }
-            if (conditions.items.len == 0) return propertyFallback(ptr, a, table, cursor, limit);
+            if (conditions.items.len == 0) return if (index_only) null else try propertyFallback(ptr, a, table, cursor, limit);
             opts.relational_query.?.conditions = conditions.items;
             opts.relational_query.?.auto_index = true;
             opts.relational_query.?.index = cursor.index;
@@ -332,13 +343,13 @@ pub fn Adapter(comptime DB: type, comptime GraphIndex: type, comptime EdgeScanCu
             const session = db.openRelationalReadSession(temporary, cursor.key orelse "", "", opts) catch |err| switch (err) {
                 // Native schema types can be narrower than Cypher values.
                 // Unsupported operands keep the complete residual scan path.
-                error.InvalidBatchRequest, error.RelationalIndexColumnTypeMismatch, error.UnsupportedRelationalIndexColumn, error.RelationalIndexColumnNotFound => return propertyFallback(ptr, a, table, cursor, limit),
+                error.InvalidBatchRequest, error.RelationalIndexColumnTypeMismatch, error.UnsupportedRelationalIndexColumn, error.RelationalIndexColumnNotFound => return if (index_only) null else try propertyFallback(ptr, a, table, cursor, limit),
                 else => return err,
             };
             defer session.deinit();
             // An unindexed predicate must remain a paged runtime residual,
             // rather than hiding an unbounded native scan inside one call.
-            if (session.reader.index == null) return propertyFallback(ptr, a, table, cursor, limit);
+            if (session.reader.index == null) return if (index_only) null else try propertyFallback(ptr, a, table, cursor, limit);
             session.reader.now_ns = self.ttl_now_ns;
             try session.checkpoint();
             var page = try session.reader.nextPage(temporary, null, .{ .rows = limit, .records = limit, .output_bytes = 16 << 20 });

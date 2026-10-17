@@ -150,7 +150,7 @@ pub const ReadSet = struct {
         self.* = undefined;
     }
     pub fn backend(self: *ReadSet) b.Backend {
-        return .{ .ptr = self, .vtable = &.{ .bind = bind, .checkpoint = checkpoint, .scan = scan, .scan_where = scanWhere, .get = get, .get_many = getMany, .expand = expand, .expand_between = expandBetween, .search = search, .set_work = setWork, .set_read_fields = setReadFields } };
+        return .{ .ptr = self, .vtable = &.{ .bind = bind, .checkpoint = checkpoint, .scan = scan, .scan_where = scanWhere, .estimate_where = estimateWhere, .get = get, .get_many = getMany, .expand = expand, .expand_between = expandBetween, .search = search, .set_work = setWork, .set_read_fields = setReadFields } };
     }
     fn setReadFields(ptr: *anyopaque, fields: ?[]const []const u8) void {
         for (cast(ptr).snapshots) |snapshot| if (snapshot.backend.vtable.set_read_fields) |configure| configure(snapshot.backend.ptr, fields);
@@ -206,6 +206,20 @@ pub const ReadSet = struct {
         const page = if (owner.vtable.scan_where) |filtered| try filtered(owner.ptr, a, table, filters, position.after, limit) else try owner.vtable.scan(owner.ptr, a, table, position.after, limit);
         try checkpoint(ptr);
         return .{ .items = page.items, .examined = page.examined, .unfiltered = page.unfiltered, .next = try self.next(a, table, position, page.next) };
+    }
+    fn estimateWhere(ptr: *anyopaque, a: A, table: []const u8, filters: []const b.PropertyFilter, limit: usize) !?usize {
+        const self = cast(ptr);
+        var total: usize = 0;
+        for (self.targets, self.snapshots) |target, snapshot| {
+            if (!std.mem.eql(u8, target.table, table)) continue;
+            try checkpoint(ptr);
+            const estimate = snapshot.backend.vtable.estimate_where orelse return null;
+            const count = (try estimate(snapshot.backend.ptr, a, table, filters, @max(1, limit -| total))) orelse return null;
+            if (count > limit -| total) return null;
+            total += count;
+        }
+        try checkpoint(ptr);
+        return total;
     }
     fn get(ptr: *anyopaque, a: A, identity: v.Identity) !?*const v.Node {
         const self = cast(ptr);

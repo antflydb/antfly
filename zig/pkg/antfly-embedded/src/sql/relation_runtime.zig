@@ -200,6 +200,107 @@ const SetTestBackend = struct {
     }
 };
 
+test "SQL weighted relational operators retain bags and unwind failed negotiation" {
+    const Fixture = struct {
+        const This = @This();
+        fn checkpoint(_: *anyopaque) !void {}
+        opened: usize = 0,
+        closed: usize = 0,
+        const table: catalog.Table = .{ .id = 1, .physical_name = "docs", .schema_version = 1, .columns = &.{.{ .name = "v", .path = "v", .type = .integer, .element_type = .int64, .nullable = false }} };
+        fn resolve(_: *anyopaque, _: Allocator, _: @import("ast.zig").Name, _: catalog.Action) !catalog.Table {
+            return table;
+        }
+        fn scan(_: *anyopaque, _: Allocator, _: catalog.Table, _: catalog.Scan) !catalog.Page {
+            return error.UnexpectedBackendCall;
+        }
+        const State = struct {
+            a: Allocator,
+            owner: *This,
+            position: usize = 0,
+            weighted: bool = false,
+            fn enable(ptr: *anyopaque, _: catalog.Multiplicity) !bool {
+                const self: *@This() = @ptrCast(@alignCast(ptr));
+                if (self.position != 0) return false;
+                self.weighted = true;
+                return true;
+            }
+            fn next(ptr: *anyopaque, a: Allocator, limit: u32) !catalog.Page {
+                const self: *@This() = @ptrCast(@alignCast(ptr));
+                const count = if (self.weighted) @as(usize, 1) else 100;
+                const wanted = @min(limit, count - self.position);
+                const rows = try a.alloc(catalog.Row, wanted);
+                const weights = try a.alloc(u64, wanted);
+                for (rows, weights) |*row, *weight| {
+                    const cells = try a.alloc(Datum, 1);
+                    cells[0] = Datum.json(.{ .integer = 2 });
+                    row.* = try catalog.Row.fromDatums(a, "row", try catalog.Row.TypedLayout.init(a, &.{"v"}), cells);
+                    weight.* = if (self.weighted) 100 else 1;
+                }
+                self.position += wanted;
+                return .{ .rows = rows, .multiplicities = if (self.weighted) weights else null, .after = if (self.position < count) "next" else null };
+            }
+            fn close(ptr: *anyopaque) void {
+                const self: *@This() = @ptrCast(@alignCast(ptr));
+                self.owner.closed += 1;
+                self.a.destroy(self);
+            }
+        };
+        fn open(ptr: *anyopaque, a: Allocator, _: catalog.Table, _: catalog.Scan) !?catalog.Cursor {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            const state = try a.create(State);
+            state.* = .{ .a = a, .owner = self };
+            self.opened += 1;
+            return .{ .ptr = state, .next = State.next, .close = State.close, .enable_weights = State.enable };
+        }
+        const Statement = struct {
+            a: Allocator,
+            cursors: []catalog.Cursor,
+            fn close(ptr: *anyopaque) void {
+                const self: *@This() = @ptrCast(@alignCast(ptr));
+                for (self.cursors) |cursor| cursor.close(cursor.ptr);
+                self.a.free(self.cursors);
+                self.a.destroy(self);
+            }
+        };
+        fn openStatement(ptr: *anyopaque, a: Allocator, scans: []const catalog.StatementScan) !catalog.StatementRead {
+            const state = try a.create(Statement);
+            errdefer a.destroy(state);
+            const cursors = try a.alloc(catalog.Cursor, scans.len);
+            errdefer a.free(cursors);
+            var opened: usize = 0;
+            errdefer for (cursors[0..opened]) |cursor| cursor.close(cursor.ptr);
+            for (scans, cursors) |input, *cursor| {
+                cursor.* = (try open(ptr, a, input.table, input.request)).?;
+                opened += 1;
+            }
+            state.* = .{ .a = a, .cursors = cursors };
+            return .{ .ptr = state, .cursors = cursors, .close = Statement.close };
+        }
+        fn run(a: Allocator) !void {
+            var self: @This() = .{};
+            const backend: catalog.Backend = .{ .ptr = &self, .pinned_statement_snapshot = true, .vtable = &.{ .resolve = resolve, .scan = scan, .open_scan = open, .open_statement = openStatement, .mutate = SetTestBackend.mutate, .checkpoint = checkpoint } };
+            for ([_]struct { sql: []const u8, sum: []const u8, count: []const u8 }{
+                .{ .sql = "SELECT sum(d.v),count(*) FROM (SELECT v FROM docs ORDER BY v) d", .sum = "200", .count = "100" },
+                .{ .sql = "SELECT sum(d.v),count(*) FROM (SELECT v FROM docs WHERE v>=2) d", .sum = "200", .count = "100" },
+                .{ .sql = "SELECT sum(d.v),count(*) FROM (SELECT v FROM docs UNION ALL SELECT v FROM docs) d", .sum = "400", .count = "200" },
+                .{ .sql = "SELECT sum(d.v),count(*) FROM (SELECT v FROM docs UNION ALL SELECT CAST(3 AS BIGINT) AS v) d", .sum = "203", .count = "101" },
+                .{ .sql = "SELECT sum(d.v*x.k),count(*) FROM docs d CROSS JOIN (SELECT 3 AS k) x", .sum = "600", .count = "100" },
+                .{ .sql = "SELECT sum(d.v*x.k),count(*) FROM (SELECT 3 AS k) x CROSS JOIN docs d", .sum = "600", .count = "100" },
+            }) |case| {
+                var compiled = try @import("compiler.zig").compile(a, case.sql, .{});
+                defer compiled.deinit();
+                var result = try @import("runtime.zig").execute(a, backend, &compiled, &.{}, .{ .page_rows = 1, .scan_rows = 10 });
+                defer result.deinit();
+                try std.testing.expectEqualStrings(case.sum, result.output.rows[0][0].string);
+                try std.testing.expectEqualStrings(case.count, result.output.rows[0][1].string);
+            }
+            try std.testing.expectEqual(self.opened, self.closed);
+        }
+    };
+    try Fixture.run(std.testing.allocator);
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Fixture.run, .{});
+}
+
 test "SQL row membership executes captured typed relations with NULL-aware truth and query boundaries" {
     const Case = struct { sql: []const u8, rows: []const u8 };
     const Fixture = struct {
@@ -2106,6 +2207,176 @@ fn Engine(comptime Context: type) type {
             }
         };
 
+        const WeightedReader = struct {
+            const Plan = @import("weighted_relation.zig").Plan;
+            engine: *Self,
+            plan: Plan,
+            left: ?*WeightedReader = null,
+            right: ?*WeightedReader = null,
+            ordinary: ?*Iterator = null,
+            fallback: bool = false,
+            singleton_iterator: ?*Iterator = null,
+            singleton_values: ?[]const Datum = null,
+            singleton_ready: bool = false,
+            tagged: bool = false,
+            compressed: bool = false,
+            pending_error: ?anyerror = null,
+            done: bool = false,
+            closed: bool = false,
+            slots: []const usize,
+
+            fn create(engine: *Self, plan: Plan) anyerror!*WeightedReader {
+                const a = engine.context.arena;
+                const self = try a.create(WeightedReader);
+                const slots = try a.alloc(usize, plan.requests.len);
+                for (slots, 0..) |*slot, index| slot.* = index;
+                self.* = .{ .engine = engine, .plan = plan, .slots = slots };
+                errdefer self.deinit();
+                switch (plan.terminal) {
+                    .scan => {
+                        const cursor = engine.cursors[plan.source.operation.scan.index];
+                        self.tagged = if (cursor.enable_aggregate_weights) |enable| try enable(cursor.ptr, plan.physical) else false;
+                        const exact = for (plan.physical) |request| {
+                            if (request.multiplicity == .exact) break true;
+                        } else false;
+                        const weighted = self.tagged or if (cursor.enable_weights) |enable| try enable(cursor.ptr, if (exact) .exact else .presence) else false;
+                        self.compressed = weighted;
+                        if (!weighted) self.fallback = true;
+                    },
+                    .ordinary => self.fallback = true,
+                    .union_all => |set| {
+                        self.left = try create(engine, set.left.*);
+                        self.right = try create(engine, set.right.*);
+                        self.compressed = self.left.?.compressed or self.right.?.compressed;
+                    },
+                    .cross => |join| {
+                        self.left = try create(engine, join.child.*);
+                        self.singleton_iterator = try Iterator.create(engine, join.singleton);
+                        self.compressed = self.left.?.compressed;
+                    },
+                }
+                return self;
+            }
+            fn deinit(self: *WeightedReader) void {
+                if (self.closed) return;
+                self.closed = true;
+                if (self.left) |child| child.deinit();
+                if (self.right) |child| child.deinit();
+                if (self.ordinary) |iterator| iterator.deinit();
+                if (self.singleton_iterator) |iterator| iterator.deinit();
+            }
+            fn ownValues(self: *WeightedReader, values: []const Datum) ![]const Datum {
+                const a = self.engine.context.arena;
+                const result = try a.alloc(Datum, values.len);
+                for (values, result) |value, *out| out.* = try operators.cloneDatum(a, value);
+                return result;
+            }
+            fn node(self: *WeightedReader) *const binding.Node {
+                return if (self.plan.stages.len != 0) self.plan.stages[0].node else self.plan.source;
+            }
+            fn row(a: Allocator, columns: []const binding.Column, values: []const Datum) !catalog.Row {
+                const names = try a.alloc([]const u8, columns.len);
+                for (columns, names) |column, *name| name.* = column.internal;
+                return catalog.Row.fromDatums(a, "", try catalog.Row.TypedLayout.init(a, names), values);
+            }
+            fn next(self: *WeightedReader, a: Allocator, limit: u32) anyerror!catalog.Page {
+                try self.engine.context.checkpoint();
+                var page = try self.raw(a, limit);
+                defer page.deinit();
+                var rows: std.ArrayList(catalog.Row) = .empty;
+                var weights: std.ArrayList(u64) = .empty;
+                const slots = page.aggregate_slots orelse return error.InvalidSqlBackendResponse;
+                const multiplicities = page.multiplicities orelse return error.InvalidSqlBackendResponse;
+                if (page.rows.len != multiplicities.len or page.rows.len > limit) return error.InvalidSqlBackendResponse;
+                for (page.rows, multiplicities) |input, weight| {
+                    try self.engine.context.checkpoint();
+                    const projected = (try self.plan.project(a, self.engine.context, input, slots)) orelse continue;
+                    try rows.append(a, projected);
+                    try weights.append(a, weight);
+                }
+                self.done = page.after == null;
+                return .{ .rows = rows.items, .multiplicities = weights.items, .aggregate_slots = try a.dupe(usize, slots), .after = if (self.done) null else "weighted" };
+            }
+            fn raw(self: *WeightedReader, a: Allocator, limit: u32) anyerror!catalog.Page {
+                if (self.done) return .{ .rows = &.{}, .multiplicities = &.{}, .aggregate_slots = self.slots };
+                if (self.fallback and self.ordinary == null) self.ordinary = try Iterator.create(self.engine, self.plan.source);
+                if (self.ordinary) |iterator| {
+                    if (self.pending_error) |err| return err;
+                    var failure: ?anyerror = null;
+                    const batch = try iterator.nextBatch(a, limit, &failure);
+                    if (batch.len() == 0) if (failure) |err| return err;
+                    self.pending_error = failure;
+                    const rows = try a.alloc(catalog.Row, batch.len());
+                    for (rows, 0..) |*output, index| {
+                        const values = try a.alloc(Datum, self.plan.source.columns.len);
+                        for (values, 0..) |*value, column| value.* = try operators.cloneDatum(a, try batch.cell(a, index, column));
+                        output.* = try row(a, self.plan.source.columns, values);
+                    }
+                    const weights = try a.alloc(u64, rows.len);
+                    @memset(weights, 1);
+                    return .{ .rows = rows, .multiplicities = weights, .aggregate_slots = self.slots, .after = if (rows.len != 0 or failure != null) "ordinary" else null };
+                }
+                switch (self.plan.terminal) {
+                    .ordinary => unreachable,
+                    .scan => {
+                        const scan = self.plan.source.operation.scan;
+                        const cursor = self.engine.cursors[scan.index];
+                        var page = try cursor.next(cursor.ptr, a, limit);
+                        defer page.deinit();
+                        if (page.rows.len > limit or page.rows.len > self.engine.context.limits.scan_rows -| self.engine.visited) return error.SqlProgramLimitExceeded;
+                        self.engine.visited += page.rows.len;
+                        if ((page.aggregate_slots != null) != self.tagged) return error.InvalidSqlBackendResponse;
+                        const weights = page.multiplicities orelse return error.InvalidSqlBackendResponse;
+                        const rows = try a.alloc(catalog.Row, page.rows.len);
+                        for (page.rows, rows) |input, *output| {
+                            const values = try a.alloc(Datum, self.plan.source.columns.len);
+                            for (scan.source_columns, self.plan.source.columns, values) |name, column, *value| {
+                                const cell = try @import("joined_mutation.zig").cell(a, input, name);
+                                value.* = try operators.cloneDatum(a, try describe.coerceDatum(a, cell, column.type, column.element_type));
+                            }
+                            output.* = try row(a, self.plan.source.columns, values);
+                        }
+                        return .{ .rows = rows, .multiplicities = try a.dupe(u64, weights), .aggregate_slots = try a.dupe(usize, page.aggregate_slots orelse self.slots), .after = if (page.after) |after| try a.dupe(u8, after) else null };
+                    },
+                    .union_all => {
+                        const child = if (!self.left.?.done) self.left.? else self.right.?;
+                        var page = try child.next(a, limit);
+                        defer page.deinit();
+                        const rows = try a.alloc(catalog.Row, page.rows.len);
+                        for (page.rows, rows) |input, *output| {
+                            const values = try a.alloc(Datum, self.plan.source.columns.len);
+                            for (child.node().columns, self.plan.source.columns, values) |source, target, *value| {
+                                value.* = try describe.coerceDatum(a, try input.cell(source.internal), target.type, target.element_type);
+                            }
+                            output.* = try row(a, self.plan.source.columns, values);
+                        }
+                        return .{ .rows = rows, .multiplicities = try a.dupe(u64, page.multiplicities.?), .aggregate_slots = try a.dupe(usize, page.aggregate_slots.?), .after = if (self.left.?.done and self.right.?.done) null else "union" };
+                    },
+                    .cross => |join| {
+                        if (!self.singleton_ready) {
+                            self.singleton_ready = true;
+                            // One immutable typed row, independent of child page lifetimes.
+                            self.singleton_values = if (try self.singleton_iterator.?.next(self.engine.context.arena)) |values| try self.ownValues(values) else null;
+                        }
+                        const single = self.singleton_values orelse return .{ .rows = &.{}, .multiplicities = &.{}, .aggregate_slots = self.slots };
+                        var page = try self.left.?.next(a, limit);
+                        defer page.deinit();
+                        const rows = try a.alloc(catalog.Row, page.rows.len);
+                        for (page.rows, rows) |input, *output| {
+                            const values = try a.alloc(Datum, self.plan.source.columns.len);
+                            for (self.plan.source.columns, values) |column, *value| {
+                                value.* = for (join.singleton.columns, single) |source, cell| {
+                                    if (std.mem.eql(u8, source.internal, column.internal)) break cell;
+                                } else try input.cell(column.internal);
+                            }
+                            output.* = try row(a, self.plan.source.columns, values);
+                        }
+                        return .{ .rows = rows, .multiplicities = try a.dupe(u64, page.multiplicities.?), .aggregate_slots = try a.dupe(usize, page.aggregate_slots.?), .after = if (page.after == null) null else "cross" };
+                    },
+                }
+            }
+        };
+
         const Adapter = struct {
             engine: *Self,
             iterator: *Iterator,
@@ -2115,8 +2386,7 @@ fn Engine(comptime Context: type) type {
             pending_failure: ?anyerror = null,
             weighted: bool = false,
             partitioned: bool = false,
-            child_slots: bool = false,
-            weighted_plan: ?@import("weighted_relation.zig").Plan = null,
+            weighted_reader: ?*WeightedReader = null,
             requested_fields: ?[]const []const u8 = null,
 
             fn iface(self: *Adapter) catalog.Backend {
@@ -2200,61 +2470,44 @@ fn Engine(comptime Context: type) type {
                     break :blk names;
                 };
                 const plan = (try @import("weighted_relation.zig").Plan.init(a, self.iterator.node, &.{.{ .fields = fields, .multiplicity = multiplicity }})) orelse return false;
-                const cursor = self.engine.cursors[plan.source.operation.scan.index];
-                // The projected capability can narrow a physical graph bag
-                // before its first pull, including a single dependency group.
-                self.child_slots = if (cursor.enable_aggregate_weights) |enable| try enable(cursor.ptr, plan.physical) else false;
-                self.weighted = self.child_slots or if (cursor.enable_weights) |enable| try enable(cursor.ptr, multiplicity) else false;
-                if (self.weighted) self.weighted_plan = plan;
+                const reader = try WeightedReader.create(self.engine, plan);
+                if (!reader.compressed) {
+                    reader.deinit();
+                    return false;
+                }
+                self.weighted_reader = reader;
+                self.weighted = true;
                 return self.weighted;
             }
             fn enableAggregateWeights(ptr: *anyopaque, requests: []const catalog.AggregateWeight) !bool {
                 const self: *Adapter = @ptrCast(@alignCast(ptr));
                 if (!self.untouched()) return false;
                 const plan = (try @import("weighted_relation.zig").Plan.init(self.engine.context.arena, self.iterator.node, requests)) orelse return false;
-                const cursor = self.engine.cursors[plan.source.operation.scan.index];
-                const enable = cursor.enable_aggregate_weights orelse return false;
-                self.partitioned = try enable(cursor.ptr, plan.physical);
-                self.child_slots = self.partitioned;
-                self.weighted = self.partitioned;
-                if (self.weighted) self.weighted_plan = plan;
-                return self.partitioned;
+                const reader = try WeightedReader.create(self.engine, plan);
+                if (!reader.compressed) {
+                    reader.deinit();
+                    return false;
+                }
+                self.weighted_reader = reader;
+                self.partitioned = true;
+                self.weighted = true;
+                return true;
             }
             fn nextWeighted(self: *Adapter, a: Allocator, limit: u32) !catalog.Page {
-                const plan = self.weighted_plan orelse return error.InvalidSqlBackendResponse;
-                const scan_source = plan.source.operation.scan;
-                const cursor = self.engine.cursors[scan_source.index];
-                try self.engine.context.checkpoint();
+                const reader = self.weighted_reader orelse return error.InvalidSqlBackendResponse;
                 self.iterator.pages += 1;
                 if (self.iterator.pages > self.engine.context.limits.scan_pages) return error.SqlProgramLimitExceeded;
-                const wanted: u32 = @intCast(@min(limit, @max(@as(usize, 1), self.engine.context.limits.retained_bytes / (16 * 1024 + plan.width * @sizeOf(Datum) * 16))));
-                var page = try cursor.next(cursor.ptr, a, wanted);
-                defer page.deinit();
-                if (page.rows.len > wanted or page.rows.len > self.engine.context.limits.scan_rows -| self.engine.visited) return error.InvalidSqlBackendResponse;
-                const weights = page.multiplicities orelse return error.InvalidSqlBackendResponse;
-                if (weights.len != page.rows.len or (page.aggregate_slots != null) != self.child_slots) return error.InvalidSqlBackendResponse;
-                self.engine.visited += page.rows.len;
-                const names = try a.alloc([]const u8, plan.source.columns.len);
-                for (plan.source.columns, names) |column, *name| name.* = column.internal;
-                const layout = try catalog.Row.TypedLayout.init(a, names);
-                var rows: std.ArrayList(catalog.Row) = .empty;
-                var retained_weights: std.ArrayList(u64) = .empty;
-                for (page.rows, weights) |row, weight| {
-                    try self.engine.context.checkpoint();
-                    const values = try a.alloc(Datum, names.len);
-                    for (scan_source.source_columns, plan.source.columns, values) |name, column, *value| {
-                        const cell = try @import("joined_mutation.zig").cell(a, row, name);
-                        value.* = try operators.cloneDatum(a, try describe.coerceDatum(a, cell, column.type, column.element_type));
-                    }
-                    const input = try catalog.Row.fromDatums(a, row.id, layout, values);
-                    const projected = (try plan.project(a, self.engine.context, input, page.aggregate_slots)) orelse continue;
+                const wanted: u32 = @intCast(@min(limit, @max(@as(usize, 1), self.engine.context.limits.retained_bytes / (16 * 1024 + reader.plan.width * @sizeOf(Datum) * 16))));
+                var page = try reader.next(a, wanted);
+                const rows = try a.dupe(catalog.Row, page.rows);
+                page.rows = rows;
+                for (rows) |*output| {
                     self.ordinal += 1;
-                    var output = projected;
                     output.id = try std.fmt.allocPrint(a, "{d}", .{self.ordinal});
-                    try rows.append(a, output);
-                    try retained_weights.append(a, weight);
                 }
-                return .{ .rows = rows.items, .multiplicities = retained_weights.items, .aggregate_slots = if (self.partitioned) try a.dupe(usize, page.aggregate_slots.?) else null, .after = if (page.after) |after| try a.dupe(u8, after) else null };
+                if (!self.partitioned) page.aggregate_slots = null;
+                if (page.after != null) page.after = try std.fmt.allocPrint(a, "weighted:{d}", .{self.iterator.pages});
+                return page;
             }
             fn countRows(ptr: *anyopaque) !?u64 {
                 const self: *Adapter = @ptrCast(@alignCast(ptr));
@@ -2273,7 +2526,10 @@ fn Engine(comptime Context: type) type {
                 self.requested_fields = try self.engine.context.arena.dupe([]const u8, request.fields);
                 return .{ .ptr = self, .next = next, .next_columns = if (hasPatterns(self.iterator.node, 0)) null else nextColumns, .count_rows = countRows, .enable_weights = enableWeights, .enable_aggregate_weights = enableAggregateWeights, .close = close };
             }
-            fn close(_: *anyopaque) void {}
+            fn close(ptr: *anyopaque) void {
+                const self: *Adapter = @ptrCast(@alignCast(ptr));
+                if (self.weighted_reader) |reader| reader.deinit();
+            }
             fn next(ptr: *anyopaque, alloc: Allocator, limit: u32) !catalog.Page {
                 const self: *Adapter = @ptrCast(@alignCast(ptr));
                 if (self.weighted) return self.nextWeighted(alloc, limit);
@@ -2344,7 +2600,10 @@ fn Source(comptime Context: type) type {
             return self;
         }
         fn close(self: *Self) void {
-            if (self.iterator) |iterator| iterator.deinit();
+            if (self.iterator) |iterator| {
+                if (self.adapter.weighted_reader) |reader| reader.deinit();
+                iterator.deinit();
+            }
             self.engine.deinit();
             if (self.read) |read| read.close(read.ptr);
             if (self.single) |cursor| cursor.close(cursor.ptr);

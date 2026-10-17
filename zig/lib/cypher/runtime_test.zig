@@ -1832,6 +1832,42 @@ test "weighted cursor negotiates endpoint bags and falls back for cyclic trails"
     };
 }
 
+test "cursor planning allocations retain their moved arena and release estimates" {
+    const Estimates = struct {
+        fn expand(ptr: *anyopaque, a: std.mem.Allocator, mapping: catalog.Relationship, identity: v.Identity, direction: c.ast.Direction, after: ?[]const u8, limit: usize) !b.Page(*const v.Relationship) {
+            const page = try Fixture.expand(ptr, a, mapping, identity, direction, null, 128);
+            const first = if (after) |text| try std.fmt.parseUnsigned(usize, text, 10) else 0;
+            const end = @min(page.items.len, first + limit);
+            return .{ .items = page.items[first..end], .next = if (end < page.items.len) try std.fmt.allocPrint(a, "{d}", .{end}) else null };
+        }
+        fn estimate(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const b.PropertyFilter, limit: usize) !?usize {
+            return if (limit >= 1) @as(usize, 1) else null;
+        }
+    };
+    var fixture: Fixture = .{};
+    var callbacks = fixture.backend().vtable.*;
+    callbacks.estimate_where = Estimates.estimate;
+    callbacks.expand = Estimates.expand;
+    const backend: b.Backend = .{ .ptr = &fixture, .vtable = &callbacks };
+    var diagnostic: c.Diagnostic = .{};
+    var compiled = try c.compile(std.testing.allocator, "MATCH (a:Document)-[:CITES*0..2]->(b:Document) WHERE b.rank>=2 RETURN b.rank", .{}, &diagnostic);
+    defer compiled.deinit();
+    const cursor = (try runtime.NodeCursor.open(std.testing.allocator, backend, graph, compiled.query, &.{}, .{})).?;
+    defer cursor.close();
+    try std.testing.expect(try cursor.enableWeights(.exact));
+    var total: u64 = 0;
+    while (true) {
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        const rows = try cursor.next(arena.allocator(), 1);
+        if (rows.len == 0) break;
+        for (cursor.last_weights.items) |weight| total += weight;
+    }
+    var exact = try runtime.execute(std.testing.allocator, backend, graph, &compiled, &.{}, .{});
+    defer exact.deinit();
+    try std.testing.expectEqual(exact.rows.len, total);
+}
+
 test "bound pair reads and counts use seeks through owner RPC and pull cursors" {
     const rpc = @import("rpc.zig");
     const Pair = struct {
@@ -2063,6 +2099,51 @@ test "middle sort keeps property errors across heterogeneous outer inputs" {
     defer compiled.deinit();
     var fixture: Fixture = .{};
     try std.testing.expectError(error.CypherTypeMismatch, runtime.execute(std.testing.allocator, fixture.backend(), graph, &compiled, &.{}, .{}));
+}
+
+test "connected components preserve exact clause boundaries labels and cyclic fallback" {
+    const Dag = struct {
+        fn expand(ptr: *anyopaque, a: std.mem.Allocator, mapping: catalog.Relationship, identity: v.Identity, direction: c.ast.Direction, after: ?[]const u8, limit: usize) !b.Page(*const v.Relationship) {
+            const page = try Fixture.expand(ptr, a, mapping, identity, direction, after, limit);
+            var out: std.ArrayList(*const v.Relationship) = .empty;
+            for (page.items) |edge| if (!std.mem.eql(u8, edge.identity.key, "ba")) try out.append(a, edge);
+            return .{ .items = out.items };
+        }
+    };
+    for ([_]bool{ false, true }) |dag| for ([_][]const u8{
+        "MATCH (a:Document)-[:CITES*0..2]->(m:Document),(m)-[:CITES*0..2]->(b:Document)",
+        "MATCH (m:Document)-[:CITES*0..2]->(b:Document),(a:Document)-[:CITES*0..2]->(m)",
+        "MATCH (a:Document)-[:CITES*0..2]->(m:Document) MATCH (m)-[:CITES*0..2]->(b:Document)",
+        "MATCH (a:Document)-[:CITES*0..2]->(m:Document) MATCH (m:Document {rank:2})-[:CITES*0..2]->(b:Document)",
+        "MATCH (a:Document)-[:CITES*0..2]->(m:Document) MATCH (m)-[:CITES*0..2]->(b:Document) WHERE b.rank>=2",
+        "OPTIONAL MATCH (a:Document)-[:CITES*0..2]->(m:Document),(m)-[:CITES*0..2]->(b:Document) WHERE a.rank<0",
+    }) |prefix| for ([_][]const u8{
+        "RETURN count(*),sum(b.rank),min(a.rank)",
+        "RETURN a.rank,b.rank,count(*) ORDER BY a.rank,b.rank",
+        "WITH b ORDER BY b.rank DESC SKIP 1 LIMIT 3 RETURN count(*),sum(b.rank)",
+        "RETURN count(DISTINCT b),min(b.rank),max(b.rank)",
+    }) |tail| {
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+        var diagnostic: c.Diagnostic = .{};
+        var compiled = try c.compile(a, try std.fmt.allocPrint(a, "{s} {s}", .{ prefix, tail }), .{}, &diagnostic);
+        defer compiled.deinit();
+        // A selection barrier separates MATCH clauses and blocks component
+        // projection, providing the original history-preserving interpreter.
+        const separated = try std.mem.replaceOwned(u8, a, prefix, " MATCH (m", " WITH * ORDER BY a.rank SKIP 0 MATCH (m");
+        var exact = try c.compile(a, try std.fmt.allocPrint(a, "{s} WITH * ORDER BY a.rank SKIP 0 {s}", .{ separated, tail }), .{}, &diagnostic);
+        defer exact.deinit();
+        var fixture: Fixture = .{};
+        var callbacks = fixture.backend().vtable.*;
+        if (dag) callbacks.expand = Dag.expand;
+        const backend: b.Backend = .{ .ptr = &fixture, .vtable = &callbacks };
+        var result = try runtime.execute(a, backend, graph, &compiled, &.{}, .{});
+        defer result.deinit();
+        var expected = try runtime.execute(a, backend, graph, &exact, &.{}, .{});
+        defer expected.deinit();
+        try std.testing.expectEqualStrings(try std.json.Stringify.valueAlloc(a, expected.rows, .{}), try std.json.Stringify.valueAlloc(a, result.rows, .{}));
+    };
 }
 
 test "zero aggregate demand skips partition planning and graph work" {

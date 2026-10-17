@@ -147,7 +147,7 @@ pub const Read = struct {
         self.pin_arena = null;
     }
     pub fn pinnedBackend(self: *Read) cypher.backend.Backend {
-        return .{ .ptr = self, .vtable = &.{ .bind = pinnedBind, .checkpoint = checkpoint, .scan = pinnedScan, .scan_where = pinnedScanWhere, .get = pinnedGet, .expand = pinnedExpand, .expand_between = pinnedExpandBetween, .set_work = pinnedWork, .set_read_fields = pinnedReadFields, .normalize_node = normalize, .document_relationships = documentRelationships } };
+        return .{ .ptr = self, .vtable = &.{ .bind = pinnedBind, .checkpoint = checkpoint, .scan = pinnedScan, .scan_where = pinnedScanWhere, .estimate_where = pinnedEstimateWhere, .get = pinnedGet, .expand = pinnedExpand, .expand_between = pinnedExpandBetween, .set_work = pinnedWork, .set_read_fields = pinnedReadFields, .normalize_node = normalize, .document_relationships = documentRelationships } };
     }
     fn pinnedBind(ptr: *anyopaque, a: A, graph: cypher.catalog.Graph) !void {
         const backend = cast(ptr).pinned_adapter.backend();
@@ -168,6 +168,10 @@ pub const Read = struct {
     fn pinnedScanWhere(ptr: *anyopaque, a: A, table: []const u8, filters: []const cypher.backend.PropertyFilter, after: ?[]const u8, limit: usize) !cypher.backend.Page(*const cypher.value.Node) {
         const backend = cast(ptr).pinned_adapter.backend();
         return backend.vtable.scan_where.?(backend.ptr, a, table, filters, after, limit);
+    }
+    fn pinnedEstimateWhere(ptr: *anyopaque, a: A, table: []const u8, filters: []const cypher.backend.PropertyFilter, limit: usize) !?usize {
+        const backend = cast(ptr).pinned_adapter.backend();
+        return if (backend.vtable.estimate_where) |estimate| try estimate(backend.ptr, a, table, filters, limit) else null;
     }
     fn pinnedGet(ptr: *anyopaque, a: A, identity: cypher.value.Identity) !?*const cypher.value.Node {
         const backend = cast(ptr).pinned_adapter.backend();

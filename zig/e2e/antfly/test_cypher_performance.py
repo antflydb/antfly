@@ -419,18 +419,24 @@ def test_authenticated_cypher_property_plans_and_sql_overlays(monkeypatch):
         )
         assert weighted_sql["rows"] == [["497250", "6", "17", "138"]], weighted_sql
         assert time.monotonic() - start < 10
-        # Keep the authenticated SQL adapter's weights through a computed
-        # derived relation; run the identical statement through pgwire below.
+        # Exercise the weighted operator tree through both authenticated SQL
+        # and pgwire: projections, an unobserved sort, singleton joins and UNION ALL.
+        leaf = (
+            f"SELECT q.s+1 AS s,q.e*2 AS e FROM GRAPH_TABLE({hops} MATCH {path} "
+            "COLUMNS(a.score AS s,b.score AS e)) q CROSS JOIN (SELECT 1 AS k) constant"
+        )
         mixed_statement = (
             "SELECT sum(d.s),sum(d.e),count(*),avg(d.s),avg(d.e) FROM "
-            f"(SELECT q.s+1 AS s,q.e*2 AS e FROM GRAPH_TABLE({hops} MATCH {path} "
-            "COLUMNS(a.score AS s,b.score AS e)) q) d"
+            f"(SELECT s,e FROM ({leaf} ORDER BY q.e) ordered "
+            f"UNION ALL SELECT s,e FROM ({leaf}) unordered) d"
         )
         root_sum = sum(i * comb(17 - i, 6) for i in range(12))
         mixed_sql = call("/sql", {"statement": mixed_statement})
-        assert mixed_sql["rows"][0][:3] == [str(root_sum + 31824), "994500", "31824"], (
-            mixed_sql
-        )
+        assert mixed_sql["rows"][0][:3] == [
+            str(2 * (root_sum + 31824)),
+            "1989000",
+            "63648",
+        ], mixed_sql
         # Exercise the same negotiated cursor behind the pgwire authority guard.
         pgwire = subprocess.run(
             [
@@ -450,9 +456,9 @@ def test_authenticated_cypher_property_plans_and_sql_overlays(monkeypatch):
         )
         assert pgwire.returncode == 0, pgwire.stderr
         assert pgwire.stdout.strip().split("|")[:3] == [
-            str(root_sum + 31824),
-            "994500",
-            "31824",
+            str(2 * (root_sum + 31824)),
+            "1989000",
+            "63648",
         ]
         distinct_float = call(
             "/sql",
@@ -485,6 +491,37 @@ def test_authenticated_cypher_property_plans_and_sql_overlays(monkeypatch):
             assert [cell["value"] for cell in optimized["rows"][0]] == expected, (
                 optimized
             )
+        for component in (
+            "MATCH (a:H)-[:R*3..3]->(m:H),(m)-[:R*3..3]->(b:H)",
+            "MATCH (a:H)-[:R*3..3]->(m:H) MATCH (m)-[:R*3..3]->(b:H)",
+        ):
+            reduced = call(
+                f"/graphs/{hops}/query",
+                {
+                    "query": component + " RETURN count(*),sum(b.score)",
+                    "limits": {"explored_edges": 153, "intermediate_states": 30000},
+                },
+            )
+            assert [cell["value"] for cell in reduced["rows"][0]] == [
+                "31824",
+                "497250",
+            ], reduced
+        selective_range = call(
+            f"/graphs/{hops}/query",
+            {
+                "query": "MATCH (a:H)-[:R*6..6]->(b:H) WHERE b.score>=17 AND b.score<18 RETURN count(*),sum(b.score)",
+                "limits": {
+                    "scanned_anchors": 10,
+                    "explored_edges": 153,
+                    "intermediate_states": 30000,
+                },
+            },
+        )
+        assert [cell["value"] for cell in selective_range["rows"][0]] == [
+            "12376",
+            "210392",
+        ], selective_range
+        assert selective_range["stats"]["scanned_anchors"] == 1, selective_range
         optional = call(
             f"/graphs/{hops}/query",
             {
