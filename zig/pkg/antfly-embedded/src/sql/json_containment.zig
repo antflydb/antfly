@@ -24,7 +24,8 @@ const Json = std.json.Value;
 /// prepared typed cells directly: no JSON serialization or per-row key copies.
 pub fn existsKeys(value: Json, keys: @import("array_value.zig").Value, all: bool, work: *order.Budget) !bool {
     if (keys.element_type != .text) return error.SqlTypeMismatch;
-    for (keys.elements) |key| {
+    for (0..keys.cardinality()) |array_cell_0| {
+        const key = keys.flatCell(array_cell_0);
         try work.consume(1);
         if (key.sql_null) continue;
         if (key.array != null or key.value != .string) return error.SqlTypeMismatch;

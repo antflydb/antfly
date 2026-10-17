@@ -746,9 +746,10 @@ pub const Stream = struct {
         if (parameters.len != compiled.parameter_count) return error.InvalidSqlParameters;
         if (limits.execution_batch_rows == 0 or limits.execution_batch_rows > 4096 or limits.page_rows == 0 or limits.page_rows > 4096 or limits.page_bytes == 0 or limits.scan_rows == 0 or limits.scan_pages == 0) return error.InvalidSqlLimit;
         try backend.vtable.checkpoint(backend.ptr);
+        const memory = try limits.workingMemory();
         const self = try alloc.create(Stream);
         errdefer alloc.destroy(self);
-        self.budget = .{ .backing = alloc, .limit = limits.retained_bytes };
+        self.budget = .{ .backing = alloc, .limit = memory };
         self.regex_execution = .init(self.budget.allocator(), @min(16 * 1024 * 1024, limits.retained_bytes));
         errdefer self.regex_execution.deinit();
         self.arena = std.heap.ArenaAllocator.init(self.budget.allocator());
@@ -776,7 +777,7 @@ pub const Stream = struct {
         const arena = self.arena.allocator();
         var statement_backend = backend;
         statement_backend.regex_execution = &self.regex_execution;
-        statement_backend.parameter_fallback_types = try runtime.parameterFallbackTypes(arena, parameters);
+        statement_backend.parameter_fallback_types = try runtime.parameterFallbackTypesNative(arena, parameters, limits.parameter_cells);
         if (backend.setting_capture) |capture| {
             const view = try arena.create(@import("setting_catalog.zig").View);
             view.* = try @import("setting_catalog.zig").View.capture(self.budget.allocator(), capture.owner, capture.scope, capture.overlay);
@@ -788,9 +789,14 @@ pub const Stream = struct {
         statement_backend.execution_binding_validator = null;
         self.parameter_invocation = binding.parameter_invocation;
         statement_backend.parameter_invocation = binding.parameter_invocation;
-        if (self.parameter_invocation) |invocation| try invocation.prepareJson(self.budget.allocator(), parameters, .{ .bytes = limits.retained_bytes, .wire_bytes = limits.retained_bytes, .error_context = limits.error_context });
+        if (self.parameter_invocation) |invocation| try invocation.prepareNativeOrJson(self.budget.allocator(), parameters, limits.parameter_cells, .{ .bytes = limits.retained_bytes, .wire_bytes = limits.retained_bytes, .error_context = limits.error_context, .payload_owner = limits.parameter_owner });
         const statement = if (binding.relation) |relation| relation.statement else compiled.statement.select;
-        self.context = .{ .alloc = self.budget.allocator(), .arena = arena, .backend = @import("decision_eval.zig").scopedBackend(statement_backend, binding), .binding = binding, .parameters = &.{}, .limits = limits, .typed_output = true };
+        var execution_limits = limits;
+        // The frame owns or leases its payloads; never retain transport parameter
+        // pointers in a cursor that may outlive its opening request.
+        execution_limits.parameter_cells = null;
+        execution_limits.parameter_owner = null;
+        self.context = .{ .alloc = self.budget.allocator(), .arena = arena, .backend = @import("decision_eval.zig").scopedBackend(statement_backend, binding), .binding = binding, .parameters = &.{}, .limits = execution_limits, .typed_output = true };
         const params = if (self.parameter_invocation) |invocation| try invocation.compatibilityValues(arena) else try arena.dupe(Json, parameters);
         self.context.parameters = params;
         try @import("decision_eval.zig").validateStatement(arena, statement_backend.decision_provider, binding, params);
@@ -1723,8 +1729,8 @@ test "SQL native array projections retain bounds and NULL cells across leased an
                     };
                     try std.testing.expect(!value.sql_null);
                     try std.testing.expectEqual(@as(i32, -1), value.array.?.dimensions[0].lower);
-                    try std.testing.expectEqual(@as(i64, 9007199254740993), value.array.?.elements[0].value.integer);
-                    try std.testing.expect(value.array.?.elements[1].sql_null);
+                    try std.testing.expectEqual(@as(i64, 9007199254740993), value.array.?.flatCell(0).value.integer);
+                    try std.testing.expect(value.array.?.flatCell(1).sql_null);
                 }
             }
         }

@@ -593,12 +593,12 @@ fn conflictArrayOwnershipScenario(backing: std.mem.Allocator) !void {
     try std.testing.expectEqual(@as(usize, 0), mutation.json_null_fields.len);
     const array = try @import("array_wire.zig").decodeBorrowed(alloc, .int64, mutation.row.?.object.get("a").?, .{});
     try std.testing.expectEqual(@as(i32, -1), array.value.dimensions[0].lower);
-    try std.testing.expectEqual(@as(i64, 9007199254740993), array.value.elements[0].value.integer);
-    try std.testing.expect(array.value.elements[1].sql_null);
+    try std.testing.expectEqual(@as(i64, 9007199254740993), array.value.flatCell(0).value.integer);
+    try std.testing.expect(array.value.flatCell(1).sql_null);
     const json_array = try @import("array_wire.zig").decodeBorrowed(alloc, .jsonb, mutation.row.?.object.get("j").?, .{});
-    try std.testing.expect(json_array.value.elements[0].value == .null);
-    try std.testing.expect(!json_array.value.elements[0].sql_null);
-    try std.testing.expect(json_array.value.elements[1].sql_null);
+    try std.testing.expect(json_array.value.flatCell(0).value == .null);
+    try std.testing.expect(!json_array.value.flatCell(0).sql_null);
+    try std.testing.expect(json_array.value.flatCell(1).sql_null);
 }
 
 test "SQL conflict decision batches own arrays once across page retirement and unwind every allocation failure" {

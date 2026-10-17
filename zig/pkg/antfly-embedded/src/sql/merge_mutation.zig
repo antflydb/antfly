@@ -750,8 +750,8 @@ test "MERGE arm domains retain array identity and shared assignment inference" {
                 try std.testing.expect(!values[0].sql_null);
                 const array = values[0].array.?;
                 try std.testing.expectEqual(lower, array.dimensions[0].lower);
-                try std.testing.expectEqual(case.first, array.elements[0].value.integer);
-                try std.testing.expect(array.elements[1].sql_null);
+                try std.testing.expectEqual(case.first, array.flatCell(0).value.integer);
+                try std.testing.expect(array.flatCell(1).sql_null);
             } else {
                 try std.testing.expect(values[0].sql_null);
                 try std.testing.expect(values[0].array == null);
@@ -783,8 +783,8 @@ test "MERGE arm domains retain array identity and shared assignment inference" {
                     try std.testing.expect(stored != .null);
                     const decoded = try @import("array_wire.zig").decodeLeaky(a, .int64, stored, .{});
                     try std.testing.expectEqual(lower, decoded.dimensions[0].lower);
-                    try std.testing.expectEqual(case.first, decoded.elements[0].value.integer);
-                    try std.testing.expect(decoded.elements[1].sql_null);
+                    try std.testing.expectEqual(case.first, decoded.flatCell(0).value.integer);
+                    try std.testing.expect(decoded.flatCell(1).sql_null);
                 } else try std.testing.expect(stored == .null);
             }
         }
@@ -1255,6 +1255,7 @@ pub fn execute(context: anytype, bound: Candidates) !@import("runtime.zig").Outp
         if (normalized.len != prepared.mutations.len) return error.InvalidSqlBackendResponse;
         const output_rows = try context.arena.alloc([]const std.json.Value, normalized.len);
         const output_nulls = try context.arena.alloc([]const bool, normalized.len);
+        const native_rows = if (context.limits.native_result) try context.arena.alloc([]const scalar.Datum, normalized.len) else null;
         var external = false;
         for (plan.programs) |*program| external = external or decision_eval.hasExternal(program);
         const returning_cells = if (external) try context.arena.alloc([]const scalar.Datum, normalized.len) else null;
@@ -1292,15 +1293,12 @@ pub fn execute(context: anytype, bound: Candidates) !@import("runtime.zig").Outp
                 all[returning_index] = owned;
                 continue;
             }
-            const projected = try context.arena.alloc(std.json.Value, plan.programs.len);
-            const projected_nulls = try context.arena.alloc(bool, plan.programs.len);
-            for (plan.programs, projected, projected_nulls, plan.columns) |program, *value, *is_null, column| {
-                const datum = try context.evaluate(context.arena, program, cells);
-                value.* = try context.outputDatum(datum, column.type, column.element_type);
-                is_null.* = datum.sql_null;
-            }
-            values.* = projected;
-            nulls.* = projected_nulls;
+            const evaluated = try context.arena.alloc(scalar.Datum, plan.programs.len);
+            for (plan.programs, evaluated) |program, *datum| datum.* = try context.evaluate(context.arena, program, cells);
+            const row = try context.resultRow(evaluated, plan.columns);
+            values.* = row.json;
+            nulls.* = row.nulls;
+            if (native_rows) |native_output| native_output[returning_index] = row.native.?;
         }
         if (returning_cells) |all| {
             var arena = std.heap.ArenaAllocator.init(context.alloc);
@@ -1320,15 +1318,12 @@ pub fn execute(context: anytype, bound: Candidates) !@import("runtime.zig").Outp
                 const columns = try scratch.alloc([]const scalar.Datum, plan.programs.len);
                 for (plan.programs, columns) |*program, *values| values.* = try decision_eval.evaluateBatchWithLimits(scratch, context.backend.decision_provider, program, all[first..end], context.parameters, @import("decision_eval.zig").limitsFor(context.backend));
                 for (first..end) |index| {
-                    const projected = try context.arena.alloc(std.json.Value, plan.programs.len);
-                    const projected_nulls = try context.arena.alloc(bool, plan.programs.len);
-                    for (columns, projected, projected_nulls, plan.columns) |values, *value, *is_null, column| {
-                        const datum = values[index - first];
-                        value.* = try context.outputDatum(datum, column.type, column.element_type);
-                        is_null.* = datum.sql_null;
-                    }
-                    output_rows[index] = projected;
-                    output_nulls[index] = projected_nulls;
+                    const evaluated = try scratch.alloc(scalar.Datum, plan.programs.len);
+                    for (columns, evaluated) |values, *datum| datum.* = values[index - first];
+                    const row = try context.resultRow(evaluated, plan.columns);
+                    output_rows[index] = row.json;
+                    output_nulls[index] = row.nulls;
+                    if (native_rows) |native_output| native_output[index] = row.native.?;
                 }
                 first = end;
             }
@@ -1339,8 +1334,9 @@ pub fn execute(context: anytype, bound: Candidates) !@import("runtime.zig").Outp
         selected_live = false;
         var output = try context.commitPreparedMutations(bound.target, normalized, "MERGE");
         output.columns = plan.columns;
-        output.rows = output_rows;
-        output.sql_nulls = output_nulls;
+        output.rows = if (native_rows == null) output_rows else &.{};
+        output.native_rows = native_rows;
+        output.sql_nulls = if (native_rows == null) output_nulls else null;
         return output;
     }
     selected.close();

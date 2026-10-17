@@ -86,7 +86,14 @@ fn indexOwnershipNamespaces(allocator: std.mem.Allocator) !void {
             const before = try std.json.Stringify.valueAlloc(a, schema, .{});
             var compiled = try compiler.compile(a, try std.fmt.allocPrint(a, "ALTER TABLE items {s} CONSTRAINT {s}", .{ action, name }), .{});
             defer compiled.deinit();
-            try std.testing.expectError(error.SqlConstraintNotFound, apply(a, &schema, compiled.statement.catalog_ddl));
+            if (apply(a, &schema, compiled.statement.catalog_ddl)) |_| {
+                return error.ExpectedConstraintNotFound;
+            } else |err| {
+                // Allocation fault enumeration must observe injected OOM,
+                // including failures while staging an otherwise invalid DDL.
+                if (err == error.OutOfMemory) return err;
+                try std.testing.expectEqual(error.SqlConstraintNotFound, err);
+            }
             try std.testing.expectEqualStrings(before, try std.json.Stringify.valueAlloc(a, schema, .{}));
         }
     }

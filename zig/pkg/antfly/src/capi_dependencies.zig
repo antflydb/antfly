@@ -33,6 +33,7 @@ pub const sql_schema_ddl = @import("antfly_local_sources").sql_schema_ddl;
 pub const sql_ast = @import("antfly_local_sources").sql_ast;
 pub const sql_compiler = @import("antfly_local_sources").sql_compiler;
 pub const sql_runtime = @import("antfly_local_sources").sql_runtime;
+pub const sql_operators = @import("antfly_local_sources").sql_operators;
 pub const sql_errors = @import("antfly_local_sources").sql_errors;
 pub const sql_memory_budget = @import("antfly_local_sources").sql_memory_budget;
 pub const sql_mutation_images = @import("antfly_local_sources").sql_mutation_images;

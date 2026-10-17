@@ -492,7 +492,8 @@ pub fn execute(execution: anytype, definition_: Bound) !runtime.Output {
         var committed = try execution.commitPreparedMutations(target, output.prepared, if (definition_.deleting) "DELETE" else "UPDATE");
         committed.columns = binding.columns;
         committed.rows = output.rows;
-        committed.sql_nulls = output.nulls;
+        committed.native_rows = output.native_rows;
+        committed.sql_nulls = if (output.native_rows == null) output.nulls else null;
         return committed;
     }
     if (definition_.returning_plan) |plan| {
@@ -502,13 +503,14 @@ pub fn execute(execution: anytype, definition_: Bound) !runtime.Output {
         var committed = try execution.commitPreparedMutations(target, output.prepared, if (definition_.deleting) "DELETE" else "UPDATE");
         committed.columns = plan.columns;
         committed.rows = output.rows;
-        committed.sql_nulls = output.nulls;
+        committed.native_rows = output.native_rows;
+        committed.sql_nulls = if (output.native_rows == null) output.nulls else null;
         return committed;
     }
     return execution.commitMutations(target, pending_mutations.items, if (definition_.deleting) "DELETE" else "UPDATE", definition_.returning);
 }
 
-const ReturningOutput = struct { prepared: []const catalog.Mutation, rows: []const []const std.json.Value, nulls: []const []const bool };
+const ReturningOutput = struct { prepared: []const catalog.Mutation, rows: []const []const std.json.Value, nulls: []const []const bool, native_rows: ?[]const []const scalar.Datum = null };
 
 fn relationalReturningOutput(context: runtime.Context, bound: Bound, input: []const catalog.Mutation, sources: ?*@import("result_cursor.zig").Cursor) !ReturningOutput {
     if (input.len > context.limits.result_rows) return error.SqlResultTooLarge;
@@ -552,9 +554,9 @@ fn relationalReturningOutput(context: runtime.Context, bound: Bound, input: []co
     output_context.returning_cursor = rows;
     output_context.returning_layout = layout;
     output_context.sink = null;
-    const output = if (input.len == 0) runtime.Output{ .columns = output_context.binding.columns, .rows = &.{}, .sql_nulls = &.{}, .command_tag = "SELECT" } else try output_context.select(bound.returning_query.?);
-    if (output.rows.len != input.len) return error.InvalidSqlBackendResponse;
-    return .{ .prepared = prepared, .rows = output.rows, .nulls = output.sql_nulls orelse return error.InvalidSqlBackendResponse };
+    const output = if (input.len == 0) runtime.Output{ .columns = output_context.binding.columns, .rows = &.{}, .sql_nulls = &.{}, .command_tag = "SELECT" } else try output_context.selectOutput(bound.returning_query.?);
+    if (output.rowCount() != input.len) return error.InvalidSqlBackendResponse;
+    return .{ .prepared = prepared, .rows = output.rows, .native_rows = output.native_rows, .nulls = if (output.native_rows != null) &.{} else output.sql_nulls orelse return error.InvalidSqlBackendResponse };
 }
 
 fn returningOutput(context: runtime.Context, bound: Bound, plan: @import("mutation_returning.zig").Plan, input: []const catalog.Mutation, sources: ?*@import("result_cursor.zig").Cursor) !ReturningOutput {
@@ -573,6 +575,7 @@ fn returningOutput(context: runtime.Context, bound: Bound, plan: @import("mutati
     const images = try runtime.Context.ReturningImages.init(context.arena, context.binding.table.?, fields.items);
     const rows = try context.arena.alloc([]const std.json.Value, input.len);
     const nulls = try context.arena.alloc([]const bool, input.len);
+    const native_rows = if (context.limits.native_result) try context.arena.alloc([]const scalar.Datum, input.len) else null;
     const reader = if (sources) |capture| try capture.openReplayReader() else null;
     defer if (reader) |cursor| cursor.close();
     var arena = std.heap.ArenaAllocator.init(context.alloc);
@@ -606,18 +609,15 @@ fn returningOutput(context: runtime.Context, bound: Bound, plan: @import("mutati
         const evaluated = try a.alloc([]const scalar.Datum, plan.programs.len);
         for (plan.programs, evaluated) |*program, *column_| column_.* = try decisions.evaluateBatchWithLimits(a, context.backend.decision_provider, program, page.items, context.parameters, @import("decision_eval.zig").limitsFor(context.backend));
         for (first..end) |index| {
-            const values = try context.arena.alloc(std.json.Value, plan.programs.len);
-            const flags = try context.arena.alloc(bool, plan.programs.len);
-            for (evaluated, plan.columns, values, flags) |column_values, descriptor, *value, *flag| {
-                const datum = column_values[index - first];
-                value.* = try context.outputDatum(datum, descriptor.type, descriptor.element_type);
-                flag.* = datum.sql_null;
-            }
-            rows[index] = values;
-            nulls[index] = flags;
+            const values = try a.alloc(scalar.Datum, plan.programs.len);
+            for (evaluated, values) |column_values, *value| value.* = column_values[index - first];
+            const row = try context.resultRow(values, plan.columns);
+            rows[index] = row.json;
+            nulls[index] = row.nulls;
+            if (native_rows) |native_output| native_output[index] = row.native.?;
         }
         first = end;
     }
     if (reader) |cursor| if (cursor.index != input.len or cursor.owner.count() != input.len) return error.InvalidSqlBackendResponse;
-    return .{ .prepared = prepared, .rows = rows, .nulls = nulls };
+    return .{ .prepared = prepared, .rows = if (native_rows == null) rows else &.{}, .nulls = if (native_rows == null) nulls else &.{}, .native_rows = native_rows };
 }

@@ -28,7 +28,38 @@ pub const View = struct {
     root: Node,
     materialized_values: usize = 0,
     parse_numbers: bool = false,
+    /// Canonical native storage provenance, bounded to these immutable pinned
+    /// bytes. Copying view state cannot authorize an unrelated source span.
+    canonical_source: ?[]const u8 = null,
     root_sources: []const RootSource = &.{},
+    canonical_paths: []const CanonicalPath = &.{},
+    canonical_path_source: ?[]const u8 = null,
+    validated_ranges: ?*const ValidatedRanges.Ref = null,
+    const CanonicalPath = struct { parts: []const []const u8, raw: []const u8 };
+    /// Only complete leaf spans carry copy authority. Ancestors remain ordinary
+    /// source nodes; a later whole/overlapping selection can use lazy navigation.
+    pub fn canonicalPath(self: *const View, parts: []const []const u8) ?[]const u8 {
+        const source = self.canonical_path_source orelse return null;
+        if (source.ptr != self.root.raw.ptr or source.len != self.root.raw.len or !self.canCopyCanonical(source)) return null;
+        for (self.canonical_paths) |path| {
+            if (path.parts.len != parts.len) continue;
+            for (path.parts, parts) |left, right| {
+                if (!std.mem.eql(u8, left, right)) break;
+            } else return path.raw;
+        }
+        return null;
+    }
+
+    pub const ValidatedRanges = @import("validated_ranges.zig").ValidatedRanges;
+    /// `raw` must be a complete subvalue identified by this view's traversal.
+    pub fn canCopyCanonical(self: *const View, raw: []const u8) bool {
+        if (self.parse_numbers) return false;
+        const source = self.canonical_source orelse return false;
+        const base = @intFromPtr(source.ptr);
+        const start = @intFromPtr(raw.ptr);
+        return start >= base and start - base <= source.len and raw.len <= source.len - (start - base);
+    }
+
     pub const RootSource = struct {
         name: []const u8,
         value: Value = .null,
@@ -345,9 +376,169 @@ pub const View = struct {
         // fanout items without caching navigation for the whole array.
         defer_fanout: bool = false,
         root_excluded: []const []const u8 = &.{},
+        ranges: ?*ValidatedRanges = null,
     };
+    /// Admission has already established syntax and unique keys for this exact
+    /// pinned source. Terminal selections can skip trailing siblings; nested
+    /// selections cache only complete leaf spans from a bounded prefix probe.
+    /// Ordinary navigation never claims a complete index of a partial object.
+    fn canonicalPrefixFits(view: *const View, selector: *const Selector) bool {
+        // A tiny, allocation-free probe pays only when it can avoid a large
+        // tail. Truncated strings/numbers/containers simply select the ordinary
+        // parser, so whole large values do not pay for a speculative fast path.
+        const raw = view.root.raw;
+        if (raw.len <= 4096) return false;
+        var bytes: [512]u8 = undefined;
+        var fixed = std.heap.FixedBufferAllocator.init(&bytes);
+        const prefix = raw[0..@min(raw.len, 256)];
+        var scanner = std.json.Scanner.initCompleteInput(fixed.allocator(), prefix);
+        defer scanner.deinit();
+        if ((scanner.next() catch return false) != .object_begin) return false;
+        var found: usize = 0;
+        while (true) {
+            if ((scanner.peekNextTokenType() catch return false) != .string) return false;
+            const token = scanner.nextAllocMax(fixed.allocator(), .alloc_if_needed, prefix.len) catch return false;
+            const name = switch (token) {
+                .string, .allocated_string => |name| name,
+                else => return false,
+            };
+            const wanted = selector.fields.contains(name);
+            scanner.skipValue() catch return false;
+            if (scanner.cursor >= prefix.len) return false;
+            found += @intFromBool(wanted);
+            if (found == selector.fields.count()) return true;
+        }
+    }
+    const CanonicalPrefix = struct {
+        const max_nodes = 64;
+        const max_depth = 32;
+        const Record = struct { name: []const u8, parent: ?usize, raw: ?[]const u8 = null };
+        records: [max_nodes]Record = undefined,
+        count: usize = 0,
+        found: usize = 0,
+        leaves: usize = 0,
+        fn countLeaves(selected: *const Selector, nodes: *usize, depth: usize) ?usize {
+            if (depth == max_depth or selected.fields.count() > max_nodes - nodes.*) return null;
+            nodes.* += selected.fields.count();
+            var leaves: usize = 0;
+            var it = selected.fields.iterator();
+            while (it.next()) |entry| {
+                if (std.mem.eql(u8, entry.key_ptr.*, "*")) return null;
+                leaves += if (entry.value_ptr.*.fields.count() == 0) 1 else countLeaves(entry.value_ptr.*, nodes, depth + 1) orelse return null;
+            }
+            return leaves;
+        }
+        fn walk(self: *@This(), scanner: *std.json.Scanner, alloc: Allocator, selected: *const Selector, parent: ?usize, depth: usize) anyerror!bool {
+            if (depth == max_depth or try scanner.next() != .object_begin) return error.IneligibleCanonicalPrefix;
+            while (try scanner.peekNextTokenType() != .object_end) {
+                const name = switch (try scanner.nextAllocMax(alloc, .alloc_if_needed, scanner.input.len)) {
+                    .string, .allocated_string => |key| key,
+                    else => return error.IneligibleCanonicalPrefix,
+                };
+                _ = try scanner.peekNextTokenType();
+                if (selected.fields.getEntry(name)) |entry| {
+                    if (self.count == max_nodes) return error.IneligibleCanonicalPrefix;
+                    const index = self.count;
+                    self.records[index] = .{ .name = entry.key_ptr.*, .parent = parent };
+                    self.count += 1;
+                    if (entry.value_ptr.*.fields.count() == 0) {
+                        const start = scanner.cursor;
+                        try scanner.skipValue();
+                        if (scanner.cursor >= scanner.input.len) return error.IneligibleCanonicalPrefix;
+                        self.records[index].raw = scanner.input[start..scanner.cursor];
+                        self.found += 1;
+                        if (self.found == self.leaves) return true;
+                    } else if (try self.walk(scanner, alloc, entry.value_ptr.*, index, depth + 1)) return true;
+                } else try scanner.skipValue();
+            }
+            _ = try scanner.next();
+            return false;
+        }
+    };
+    fn prepareCanonicalPaths(view: *View, selector: *const Selector) !bool {
+        const raw = view.root.raw;
+        if (raw.len <= 4096) return false;
+        var nodes: usize = 0;
+        var probe: CanonicalPrefix = .{ .leaves = CanonicalPrefix.countLeaves(selector, &nodes, 0) orelse return false };
+        if (probe.leaves == 0) return false;
+        var bytes: [512]u8 = undefined;
+        var fixed = std.heap.FixedBufferAllocator.init(&bytes);
+        var scanner = std.json.Scanner.initCompleteInput(fixed.allocator(), raw[0..@min(raw.len, 256)]);
+        defer scanner.deinit();
+        if (!(probe.walk(&scanner, fixed.allocator(), selector, null, 0) catch return false)) return false;
+        errdefer view.invalidatePreparation();
+        const paths = try view.alloc.alloc(CanonicalPath, probe.leaves);
+        var next: usize = 0;
+        for (probe.records[0..probe.count], 0..) |record, index| if (record.raw) |span| {
+            var names: [CanonicalPrefix.max_depth][]const u8 = undefined;
+            var len: usize = 0;
+            var current: ?usize = index;
+            while (current) |i| {
+                names[len] = probe.records[i].name;
+                len += 1;
+                current = probe.records[i].parent;
+            }
+            const parts = try view.alloc.alloc([]const u8, len);
+            for (parts, 0..) |*part, i| part.* = try view.alloc.dupe(u8, names[len - i - 1]);
+            paths[next] = .{ .parts = parts, .raw = span };
+            next += 1;
+        };
+        view.canonical_paths = paths;
+        view.canonical_path_source = raw;
+        return true;
+    }
+    fn prepareCanonicalTerminals(view: *View, selector: *const Selector) !bool {
+        if (view.root.kind() != '{' or !view.canCopyCanonical(view.root.raw) or selector.fields.count() == 0) return false;
+        var selected = selector.fields.iterator();
+        while (selected.next()) |entry| {
+            if (std.mem.eql(u8, entry.key_ptr.*, "*")) return false;
+            if (entry.value_ptr.*.fields.count() != 0) return view.prepareCanonicalPaths(selector);
+        }
+        if (!view.canonicalPrefixFits(selector)) return false;
+        const raw = view.root.raw;
+        errdefer view.invalidatePreparation();
+        view.root.object_index = try ObjectIndex.selected(view.alloc, selector);
+        var selected_children: std.ArrayListUnmanaged(Child) = .empty;
+        try selected_children.ensureTotalCapacityPrecise(view.alloc, selector.fields.count());
+        var work = std.heap.ArenaAllocator.init(@import("antfly_platform").allocator.reclaimingScratch(view.alloc));
+        defer work.deinit();
+        var tokens = std.heap.ArenaAllocator.init(@import("antfly_platform").allocator.reclaimingScratch(view.alloc));
+        defer tokens.deinit();
+        var scanner = std.json.Scanner.initCompleteInput(work.allocator(), raw);
+        defer scanner.deinit();
+        _ = try scanner.next();
+        var found: usize = 0;
+        while (found < selector.fields.count() and try scanner.peekNextTokenType() != .object_end) {
+            if (!tokens.reset(.{ .retain_with_limit = 4096 })) return error.OutOfMemory;
+            const token = try scanner.nextAllocMax(tokens.allocator(), .alloc_if_needed, raw.len);
+            const name = switch (token) {
+                .string, .allocated_string => |name| name,
+                else => return error.SyntaxError,
+            };
+            const wanted = selector.fields.contains(name);
+            _ = try scanner.peekNextTokenType();
+            const value_start = scanner.cursor;
+            try scanner.skipValue();
+            if (wanted) {
+                const owned = view.root.object_index.canonicalName(name) orelse try view.alloc.dupe(u8, name);
+                try view.root.object_index.put(view.alloc, owned, selected_children.items.len);
+                selected_children.appendAssumeCapacity(.{ .node = .{ .raw = raw[value_start..scanner.cursor] } });
+                found += 1;
+            }
+        }
+        selected = selector.fields.iterator();
+        while (selected.next()) |entry| if (!view.root.object_index.contains(entry.key_ptr.*)) try view.root.object_index.put(view.alloc, try view.alloc.dupe(u8, entry.key_ptr.*), std.math.maxInt(usize));
+        view.root.children = try selected_children.toOwnedSlice(view.alloc);
+        view.root.markObjectComplete(false);
+        return true;
+    }
     pub fn prepareProjectionWithOptions(view: *View, selector: *const Selector, policy: DuplicatePolicy, root_mode: RootMode, options: PreparationOptions) !void {
         const raw = view.root.raw;
+        view.validated_ranges = null;
+        view.canonical_paths = &.{};
+        view.canonical_path_source = null;
+        if (policy == .visited and !options.retain_root_fields and options.root_excluded.len == 0 and try view.prepareCanonicalTerminals(selector)) return;
+        if (options.ranges) |ranges| ranges.reserveFor(raw.len);
         errdefer {
             view.root.raw = raw;
             view.invalidatePreparation();
@@ -356,158 +547,193 @@ pub const View = struct {
         defer scanner.deinit();
         try view.prepareProjectionValue(selector, policy, root_mode, options, &scanner, raw, @import("antfly_platform").allocator.reclaimingScratch(view.alloc));
         if (try scanner.next() != .end_of_document) return error.SyntaxError;
+        if (options.ranges) |ranges| {
+            view.validated_ranges = try ranges.publish(raw, policy == .all);
+        }
     }
 
     fn invalidatePreparation(view: *View) void {
+        view.validated_ranges = null;
+        view.canonical_paths = &.{};
+        view.canonical_path_source = null;
         view.root.children = null;
         view.root.object_index = .empty;
         view.root.array_index.clearRetainingCapacity();
         view.root.state = .{};
     }
 
+    const PreparationFrame = struct {
+        object: bool = false,
+        key: bool = true,
+        container_start: usize = 0,
+        inside_fanout: bool = false,
+        node: ?*View.Node = null,
+        children: std.ArrayListUnmanaged(View.Child) = .empty,
+        selected: ?*const Selector = null,
+        name: []const u8 = "",
+        retain: bool = false,
+        retain_all: bool = false,
+        defer_items: bool = false,
+        omitted: bool = false,
+        excluded: []const []const u8 = &.{},
+        ordinal: usize = 0,
+        start: usize = 0,
+        pending_node: ?*View.Node = null,
+        // Stable across work-stack growth; reused for siblings. Only the
+        // finished child is copied into the view's retained navigation.
+        pending_storage: *View.Node,
+        pending_selector: ?*const Selector = null,
+
+        fn wants(self: *@This(), name: []const u8) bool {
+            if (self.selected == null) return false;
+            for (self.excluded) |omit| if (std.mem.eql(u8, omit, "*") or std.mem.eql(u8, omit, name)) return false;
+            return self.retain_all or self.selected.?.fields.contains(name);
+        }
+
+        fn plan(self: *@This(), a: Allocator) !void {
+            const node = self.node orelse return;
+            if (self.object) {
+                node.children = null;
+                node.object_index.clearRetainingCapacity();
+                if (!self.retain_all and self.selected.?.fields.count() <= 8) node.object_index = try ObjectIndex.selected(a, self.selected.?);
+                node.markObjectComplete(false);
+                return;
+            }
+            node.state.fanout_keys_validated = false;
+            const selected = self.selected orelse return;
+            var indices = selected.indices.iterator();
+            while (indices.next()) |entry| try self.node.?.array_index.put(a, entry.key_ptr.*, null);
+        }
+        fn beginValue(self: *@This(), start: usize, object_value: bool) !void {
+            self.start = start;
+            self.pending_node = null;
+            self.pending_selector = null;
+            const selected = self.selected orelse return;
+            if (self.object) {
+                if (!self.retain) return;
+                if (selected.fields.get(self.name)) |child| {
+                    if (child.fields.count() != 0) {
+                        self.pending_selector = child;
+                        if (self.node != null) self.pending_node = self.pending_storage;
+                    }
+                }
+            } else {
+                const item = selected.array_items.get(self.ordinal);
+                if (item == null and selected.fanout == null) return;
+                if (self.node != null and (!self.defer_items or item != null)) self.pending_node = self.pending_storage;
+                if (object_value) {
+                    const child = item orelse selected.fanout.?;
+                    if (child.fields.count() != 0) self.pending_selector = child;
+                }
+            }
+            if (self.pending_node) |node| node.* = .{ .raw = &.{} };
+        }
+        fn finishValue(self: *@This(), a: Allocator, source: []const u8, end: usize) !void {
+            if (self.node) |parent| {
+                const span = source[self.start..end];
+                if (self.pending_node) |node| node.raw = span;
+                if (self.object) {
+                    if (!self.retain) {
+                        self.omitted = true;
+                        self.ordinal += 1;
+                        return;
+                    }
+                    try parent.object_index.put(a, self.name, self.children.items.len);
+                    // Tiny selectors should not reserve eight full nodes
+                    // per object. Allocate lazily and bound the first slab
+                    // by the known selector width, never the source width.
+                    if (self.children.capacity == 0 and !self.retain_all) try self.children.ensureTotalCapacityPrecise(a, @min(self.selected.?.fields.count(), 8));
+                    try self.children.append(a, .{ .node = if (self.pending_node) |node| node.* else .{ .raw = span } });
+                } else if (self.pending_node) |node| {
+                    if (self.selected.?.fanout != null and !self.defer_items) try self.children.append(a, .{ .node = node.* }) else {
+                        const owned = try a.create(View.Node);
+                        owned.* = node.*;
+                        try parent.array_index.put(a, self.ordinal, owned);
+                    }
+                }
+            }
+            self.ordinal += 1;
+        }
+        fn finishContainer(self: *@This(), a: Allocator) !void {
+            if (self.node) |node| {
+                if (!self.object and self.selected.?.fanout != null) node.state.fanout_keys_validated = true;
+                if (self.object or (self.selected.?.fanout != null and !self.defer_items)) node.children = try self.children.toOwnedSlice(a);
+                if (self.object) {
+                    node.markObjectComplete(!self.omitted);
+                    if (!node.objectComplete()) {
+                        var it = self.selected.?.fields.iterator();
+                        while (it.next()) |entry| {
+                            if (node.object_index.contains(entry.key_ptr.*)) continue;
+                            // Missing-name cache keys belong to the view,
+                            // which can outlive its borrowed selector plan.
+                            const name = try a.dupe(u8, entry.key_ptr.*);
+                            try node.object_index.put(a, name, std.math.maxInt(usize));
+                        }
+                    }
+                }
+            }
+        }
+    };
+    /// Reusable parser state, independent of row-owned navigation. Completed
+    /// keys are bounded; an oversized traversal retires before the next value.
+    pub const PreparationWorkspace = struct {
+        keys: @import("antfly-json").ObjectKeyWorkspace(PreparationFrame),
+        pub fn init(work: Allocator) @This() {
+            return .{ .keys = .init(@import("antfly_platform").allocator.reclaimingScratch(work)) };
+        }
+        pub fn deinit(self: *@This()) void {
+            for (self.keys.stack.items) |frame| self.keys.allocator.destroy(frame.state.pending_storage);
+            self.keys.deinit();
+        }
+        pub fn retainedBytes(self: *const @This()) usize {
+            return self.keys.retainedBytes() + self.keys.stack.items.len * @sizeOf(View.Node);
+        }
+        fn finishValue(self: *@This()) void {
+            if (self.retainedBytes() > @TypeOf(self.keys).reuse_limit) self.deinit();
+        }
+    };
+
     /// Consume one value from a scanner over `raw`, leaving its enclosing
     /// container positioned at the next separator. Captured spans use the same
     /// immutable backing bytes; navigation belongs only to this view's arena.
     pub fn prepareProjectionValue(view: *View, selector: *const Selector, policy: DuplicatePolicy, root_mode: RootMode, options: PreparationOptions, scanner: *std.json.Scanner, raw: []const u8, work: Allocator) !void {
+        var workspace: PreparationWorkspace = .init(work);
+        defer workspace.deinit();
+        try view.prepareProjectionValueWithWorkspace(selector, policy, root_mode, options, scanner, raw, &workspace);
+    }
+
+    pub fn prepareProjectionValueWithWorkspace(view: *View, selector: *const Selector, policy: DuplicatePolicy, root_mode: RootMode, options: PreparationOptions, scanner: *std.json.Scanner, raw: []const u8, workspace: *PreparationWorkspace) !void {
         errdefer {
             // A failed preparation cannot publish half-built caches to a
             // later predicate or projection using this same source view.
             view.invalidatePreparation();
+            workspace.deinit();
         }
         const alloc = view.alloc;
         const root_start = scanner.cursor;
-        const scratch = work;
-        const Frame = struct {
-            object: bool = false,
-            key: bool = true,
-            arena: std.heap.ArenaAllocator,
-            names: std.StringHashMapUnmanaged(void) = .empty,
-            node: ?*View.Node = null,
-            children: std.ArrayListUnmanaged(View.Child) = .empty,
-            selected: ?*const Selector = null,
-            name: []const u8 = "",
-            retain: bool = false,
-            retain_all: bool = false,
-            defer_items: bool = false,
-            omitted: bool = false,
-            excluded: []const []const u8 = &.{},
-            ordinal: usize = 0,
-            start: usize = 0,
-            pending_node: ?*View.Node = null,
-            // Stable across work-stack growth; reused for siblings. Only the
-            // finished child is copied into the view's retained navigation.
-            pending_storage: *View.Node,
-            pending_selector: ?*const Selector = null,
-
-            fn wants(self: *@This(), name: []const u8) bool {
-                if (self.selected == null) return false;
-                for (self.excluded) |omit| if (std.mem.eql(u8, omit, "*") or std.mem.eql(u8, omit, name)) return false;
-                return self.retain_all or self.selected.?.fields.contains(name);
-            }
-
-            fn plan(self: *@This(), a: Allocator) !void {
-                const node = self.node orelse return;
-                if (self.object) {
-                    node.children = null;
-                    node.object_index.clearRetainingCapacity();
-                    if (!self.retain_all and self.selected.?.fields.count() <= 8) node.object_index = try ObjectIndex.selected(a, self.selected.?);
-                    node.markObjectComplete(false);
-                    return;
-                }
-                node.state.fanout_keys_validated = false;
-                const selected = self.selected orelse return;
-                var indices = selected.indices.iterator();
-                while (indices.next()) |entry| try self.node.?.array_index.put(a, entry.key_ptr.*, null);
-            }
-            fn beginValue(self: *@This(), start: usize, object_value: bool) !void {
-                self.start = start;
-                self.pending_node = null;
-                self.pending_selector = null;
-                const selected = self.selected orelse return;
-                if (self.object) {
-                    if (!self.retain) return;
-                    if (selected.fields.get(self.name)) |child| {
-                        if (child.fields.count() != 0) {
-                            self.pending_selector = child;
-                            if (self.node != null) self.pending_node = self.pending_storage;
-                        }
-                    }
-                } else {
-                    const item = selected.array_items.get(self.ordinal);
-                    if (item == null and selected.fanout == null) return;
-                    if (self.node != null and (!self.defer_items or item != null)) self.pending_node = self.pending_storage;
-                    if (object_value) {
-                        const child = item orelse selected.fanout.?;
-                        if (child.fields.count() != 0) self.pending_selector = child;
-                    }
-                }
-                if (self.pending_node) |node| node.* = .{ .raw = &.{} };
-            }
-            fn finishValue(self: *@This(), a: Allocator, source: []const u8, end: usize) !void {
-                if (self.node) |parent| {
-                    const span = source[self.start..end];
-                    if (self.pending_node) |node| node.raw = span;
-                    if (self.object) {
-                        if (!self.retain) {
-                            self.omitted = true;
-                            self.ordinal += 1;
-                            return;
-                        }
-                        try parent.object_index.put(a, self.name, self.children.items.len);
-                        // Tiny selectors should not reserve eight full nodes
-                        // per object. Allocate lazily and bound the first slab
-                        // by the known selector width, never the source width.
-                        if (self.children.capacity == 0 and !self.retain_all) try self.children.ensureTotalCapacityPrecise(a, @min(self.selected.?.fields.count(), 8));
-                        try self.children.append(a, .{ .node = if (self.pending_node) |node| node.* else .{ .raw = span } });
-                    } else if (self.pending_node) |node| {
-                        if (self.selected.?.fanout != null and !self.defer_items) try self.children.append(a, .{ .node = node.* }) else {
-                            const owned = try a.create(View.Node);
-                            owned.* = node.*;
-                            try parent.array_index.put(a, self.ordinal, owned);
-                        }
-                    }
-                }
-                self.ordinal += 1;
-            }
-            fn finishContainer(self: *@This(), a: Allocator) !void {
-                if (self.node) |node| {
-                    if (!self.object and self.selected.?.fanout != null) node.state.fanout_keys_validated = true;
-                    if (self.object or (self.selected.?.fanout != null and !self.defer_items)) node.children = try self.children.toOwnedSlice(a);
-                    if (self.object) {
-                        node.markObjectComplete(!self.omitted);
-                        if (!node.objectComplete()) {
-                            var it = self.selected.?.fields.iterator();
-                            while (it.next()) |entry| {
-                                if (node.object_index.contains(entry.key_ptr.*)) continue;
-                                // Missing-name cache keys belong to the view,
-                                // which can outlive its borrowed selector plan.
-                                const name = try a.dupe(u8, entry.key_ptr.*);
-                                try node.object_index.put(a, name, std.math.maxInt(usize));
-                            }
-                        }
-                    }
-                }
-            }
-        };
-        var frames: std.ArrayListUnmanaged(Frame) = .empty;
-        defer {
-            for (frames.items) |*frame| {
-                frame.arena.deinit();
-                scratch.destroy(frame.pending_storage);
-            }
-            frames.deinit(scratch);
-        }
+        const keys = &workspace.keys;
+        const scratch = keys.allocator;
+        const frames = &keys.stack;
         var depth: usize = 0;
         var root_seen = false;
         while (!root_seen or depth != 0) {
             const token = try scanner.peekNextTokenType();
             if (depth != 0) {
-                const frame = &frames.items[depth - 1];
+                const frame = &frames.items[depth - 1].state;
                 if ((frame.object and frame.key and token == .object_end) or (!frame.object and token == .array_end)) {
                     _ = try scanner.next();
+                    if (options.ranges) |ranges| {
+                        if (!frame.object and frame.node == null and frame.selected != null and frame.selected.?.fanout != null) {
+                            if (policy == .all) try ranges.remember(raw[frame.container_start..scanner.cursor]) else try ranges.rememberSelected(raw[frame.container_start..scanner.cursor], frame.selected.?.fanout.?);
+                        }
+                    }
+                    if (view.validated_ranges) |ranges| {
+                        if (!frame.object and frame.selected != null and frame.selected.?.fanout != null) try ranges.refillSelected(raw[frame.container_start..scanner.cursor], frame.selected.?.fanout.?);
+                    }
                     try frame.finishContainer(alloc);
+                    try keys.finishFrame(depth - 1);
                     depth -= 1;
-                    if (depth != 0) try frames.items[depth - 1].finishValue(alloc, raw, scanner.cursor);
+                    if (depth != 0) try frames.items[depth - 1].state.finishValue(alloc, raw, scanner.cursor);
                     continue;
                 }
                 if (frame.object and frame.key) {
@@ -519,11 +745,11 @@ pub const View = struct {
                         frame.key = false;
                         continue;
                     }
-                    const name = switch (try scanner.nextAllocMax(frame.arena.allocator(), .alloc_if_needed, raw.len)) {
+                    const name = switch (try keys.nextKey(depth - 1, scanner, raw.len)) {
                         .string, .allocated_string => |key_name| key_name,
                         else => return error.SyntaxError,
                     };
-                    if (policy == .all or frame.selected != null) if ((try frame.names.getOrPut(frame.arena.allocator(), name)).found_existing) return error.DuplicateField;
+                    if (policy == .all or frame.selected != null) try keys.remember(depth - 1, name, false);
                     frame.retain = frame.wants(name);
                     frame.name = if (frame.retain and frame.node != null) (frame.node.?.object_index.canonicalName(name) orelse try alloc.dupe(u8, name)) else name;
                     frame.key = false;
@@ -534,26 +760,44 @@ pub const View = struct {
             }
             root_seen = true;
             if (token == .object_begin or token == .array_begin) {
-                const selected_node: ?*View.Node = if (depth == 0) (if (token == .object_begin or root_mode == .any_container) &view.root else null) else if (frames.items[depth - 1].pending_selector != null) frames.items[depth - 1].pending_node else null;
-                const selected_plan = if (depth == 0) (if (token == .object_begin or root_mode == .any_container) selector else null) else frames.items[depth - 1].pending_selector;
-                _ = try scanner.next();
-                if (depth == frames.items.len) {
-                    try frames.ensureUnusedCapacity(scratch, 1);
-                    frames.appendAssumeCapacity(.{ .arena = .init(scratch), .pending_storage = try scratch.create(View.Node) });
+                const selected_node: ?*View.Node = if (depth == 0) (if (token == .object_begin or root_mode == .any_container) &view.root else null) else if (frames.items[depth - 1].state.pending_selector != null) frames.items[depth - 1].state.pending_node else null;
+                const selected_plan = if (depth == 0) (if (token == .object_begin or root_mode == .any_container) selector else null) else frames.items[depth - 1].state.pending_selector;
+                // Initial preparation already checked every descendant key in
+                // document JSON. A deferred array without numeric slots needs
+                // only its validated extent, not another descendant traversal.
+                if (token == .array_begin and options.defer_fanout and selected_plan != null and selected_plan.?.fanout != null and selected_plan.?.indices.count() == 0) {
+                    const start = scanner.cursor;
+                    if (view.validated_ranges) |ranges| if (try ranges.skipSelected(scanner, selected_plan.?.fanout.?)) {
+                        if (selected_node) |node| node.* = .{ .raw = raw[start..scanner.cursor], .state = .{ .fanout_keys_validated = true } };
+                        if (depth != 0) try frames.items[depth - 1].state.finishValue(alloc, raw, scanner.cursor);
+                        continue;
+                    };
                 }
-                const frame = &frames.items[depth];
-                var key_arena = frame.arena;
-                _ = key_arena.reset(.{ .retain_with_limit = 16 * 1024 });
-                frame.* = .{ .pending_storage = frame.pending_storage, .arena = key_arena, .object = token == .object_begin, .node = selected_node, .selected = selected_plan, .defer_items = options.defer_fanout and token == .array_begin and selected_plan != null and selected_plan.?.fanout != null, .retain_all = depth == 0 and options.retain_root_fields, .excluded = if (depth == 0) options.root_excluded else &.{} };
-                try frame.plan(alloc);
+                const container_start = scanner.cursor;
+                _ = try scanner.next();
+                const fresh = depth == frames.items.len;
+                const pending_storage = if (fresh) try scratch.create(View.Node) else frames.items[depth].state.pending_storage;
+                keys.enter(depth, .{ .container_start = container_start, .inside_fanout = (depth != 0 and frames.items[depth - 1].state.inside_fanout) or (options.defer_fanout and token == .array_begin and selected_plan != null and selected_plan.?.fanout != null), .pending_storage = pending_storage, .object = token == .object_begin, .node = selected_node, .selected = selected_plan, .defer_items = options.defer_fanout and token == .array_begin and selected_plan != null and selected_plan.?.fanout != null, .retain_all = depth == 0 and options.retain_root_fields, .excluded = if (depth == 0) options.root_excluded else &.{} }) catch |err| {
+                    // Failed stack growth never takes ownership of a new node.
+                    if (fresh) scratch.destroy(pending_storage);
+                    return err;
+                };
+                try frames.items[depth].state.plan(alloc);
                 depth += 1;
             } else {
                 if (token == .object_end or token == .array_end or token == .end_of_document) return error.SyntaxError;
-                try scanner.skipValue();
-                if (depth != 0) try frames.items[depth - 1].finishValue(alloc, raw, scanner.cursor);
+                const start = scanner.cursor;
+                const reused = if (view.validated_ranges) |ranges| try ranges.skip(scanner, false) else false;
+                if (!reused) try scanner.skipValue();
+                if (options.ranges) |ranges| {
+                    if (scanner.cursor - start >= 256 and depth != 0 and frames.items[depth - 1].state.inside_fanout) try ranges.remember(raw[start..scanner.cursor]);
+                }
+                if (!reused and scanner.cursor - start >= 256) if (view.validated_ranges) |ranges| ranges.refill(raw[start..scanner.cursor]);
+                if (depth != 0) try frames.items[depth - 1].state.finishValue(alloc, raw, scanner.cursor);
             }
         }
         view.root.raw = raw[root_start..scanner.cursor];
+        workspace.finishValue();
     }
 
     pub fn materialize(self: *View, node: *Node) !Value {
@@ -959,4 +1203,238 @@ test "public graph metric borrowed wire streaming deferred fanout preserves obje
     try std.testing.expect(ignored.root.children == null);
     var strict = View.init(arena.allocator(), ignored.root.raw);
     try std.testing.expectError(error.DuplicateField, strict.prepareProjectionWithOptions(selector, .all, .object_only, .{ .defer_fanout = true }));
+}
+
+test "public graph metric borrowed wire projection preparation reuses wide sibling keys" {
+    const a = std.testing.allocator;
+    var calls: ?usize = null;
+    for ([_]usize{ 10, 100 }) |count| {
+        var input: std.Io.Writer.Allocating = .init(a);
+        defer input.deinit();
+        try input.writer.writeAll("{\"unused\":[");
+        for (0..count) |row| {
+            if (row != 0) try input.writer.writeByte(',');
+            try input.writer.writeByte('{');
+            for (0..1000) |i| {
+                if (i != 0) try input.writer.writeByte(',');
+                try input.writer.print("\"\\u006b{d}\":0", .{i});
+            }
+            try input.writer.writeByte('}');
+        }
+        try input.writer.writeAll("]}");
+        var counted: std.testing.FailingAllocator = .init(a, .{});
+        var view = View.init(counted.allocator(), input.written());
+        var selector: Selector = .{};
+        try view.prepareProjection(&selector, .all, .object_only);
+        if (calls) |prior| try std.testing.expectEqual(prior, counted.allocations);
+        calls = counted.allocations;
+        try std.testing.expect(counted.allocations < 32);
+        try std.testing.expect(counted.allocated_bytes < 128 * 1024);
+        try std.testing.expectEqual(counted.allocated_bytes, counted.freed_bytes);
+    }
+}
+
+test "public graph metric borrowed wire projection key workspace preserves active ancestors and visited policy" {
+    const a = std.testing.allocator;
+    const Fixture = struct {
+        fn run(alloc: Allocator) !void {
+            var view = View.init(alloc, "{\"unused\":[{\"\\u0061\":0},{\"a\":1}]}");
+            var selector: Selector = .{};
+            try view.prepareProjection(&selector, .all, .object_only);
+        }
+    };
+    try Fixture.run(a);
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(a, Fixture.run, .{});
+    for ([_][]const u8{
+        "{\"unused\":[{\"a\":0,\"\\u0061\":1}]}",
+        "{\"\\u0061\":{\"b\":0},\"a\":1}",
+    }) |raw| {
+        var view = View.init(a, raw);
+        var selector: Selector = .{};
+        try std.testing.expectError(error.DuplicateField, view.prepareProjection(&selector, .all, .object_only));
+    }
+    var unvisited = View.init(a, "{\"unused\":[{\"a\":0,\"\\u0061\":1}]}");
+    var selector: Selector = .{};
+    try unvisited.prepareProjection(&selector, .visited, .object_only);
+}
+
+test "public graph metric borrowed wire arena backed preparation bounds physical scratch" {
+    const a = std.testing.allocator;
+    var plan_arena = std.heap.ArenaAllocator.init(a);
+    defer plan_arena.deinit();
+    const selector = try plan_mod.compile(plan_arena.allocator(), &.{.{ .parts = &.{ "items", "chosen" } }});
+    for ([_]usize{ 1, 10 }) |count| {
+        var input: std.Io.Writer.Allocating = .init(a);
+        defer input.deinit();
+        try input.writer.writeAll("{\"items\":[");
+        for (0..count) |row| {
+            if (row != 0) try input.writer.writeByte(',');
+            try input.writer.writeByte('{');
+            for (0..12000) |i| {
+                if (i != 0) try input.writer.writeByte(',');
+                try input.writer.print("\"k{d}\":0", .{i});
+            }
+            try input.writer.writeAll(",\"chosen\":1}");
+        }
+        try input.writer.writeAll("]}");
+        const counters = @import("../../lite/test_allocator.zig");
+        var stable: counters.NoResizeAllocator = .{ .backing = a };
+        var budget: counters.BudgetAllocator = .{ .backing = stable.allocator(), .limit = 1024 * 1024 };
+        var row = std.heap.ArenaAllocator.init(budget.allocator());
+        defer row.deinit();
+        var scanner = std.json.Scanner.initCompleteInput(row.allocator(), input.written());
+        defer scanner.deinit();
+        var view = View.init(row.allocator(), input.written());
+        try view.prepareProjectionValue(selector, .visited, .object_only, .{ .defer_fanout = true }, &scanner, input.written(), row.allocator());
+        try std.testing.expect(budget.peak < 512 * 1024);
+        try std.testing.expect(budget.live < 4096);
+        const items = (try view.field(&view.root, "items")).?;
+        try std.testing.expectEqual(@as(u8, '['), items.kind());
+    }
+}
+
+test "public graph metric borrowed wire temporary preparation preserves retained escaped names and failures" {
+    const Fixture = struct {
+        fn run(a: Allocator) !void {
+            var row = std.heap.ArenaAllocator.init(a);
+            defer row.deinit();
+            const raw = "{\"\\u006futer\":{\"\\u0069nner\":7}}";
+            var scanner = std.json.Scanner.initCompleteInput(row.allocator(), raw);
+            defer scanner.deinit();
+            var view = View.init(row.allocator(), raw);
+            {
+                var plan_arena = std.heap.ArenaAllocator.init(a);
+                defer plan_arena.deinit();
+                const selector = try plan_mod.compile(plan_arena.allocator(), &.{.{ .parts = &.{ "outer", "inner" } }});
+                var temporary = std.heap.ArenaAllocator.init(row.allocator());
+                defer temporary.deinit();
+                try view.prepareProjectionValue(selector, .all, .object_only, .{}, &scanner, raw, temporary.allocator());
+            }
+            // Both the selector and temporary owner have retired. Navigation
+            // and decoded retained names still belong to the output row.
+            const outer = (try view.field(&view.root, "outer")).?;
+            const inner = (try view.field(outer, "inner")).?;
+            try std.testing.expectEqualStrings("7", inner.raw);
+        }
+    };
+    try Fixture.run(std.testing.allocator);
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Fixture.run, .{});
+}
+
+test "public graph metric borrowed wire reclaimable preparation preserves scratch quotas" {
+    const a = std.testing.allocator;
+    const Counter = @import("../../lite/test_allocator.zig").BudgetAllocator;
+    var budget: Counter = .{ .backing = a, .limit = 32 };
+    var temporary = std.heap.ArenaAllocator.init(budget.allocator());
+    defer temporary.deinit();
+    var row = std.heap.ArenaAllocator.init(a);
+    defer row.deinit();
+    const raw = "{\"a\":0}";
+    var scanner = std.json.Scanner.initCompleteInput(a, raw);
+    defer scanner.deinit();
+    var view = View.init(row.allocator(), raw);
+    var selector: Selector = .{};
+    try std.testing.expectError(error.OutOfMemory, view.prepareProjectionValue(&selector, .all, .object_only, .{}, &scanner, raw, temporary.allocator()));
+    try std.testing.expectEqual(@as(usize, 0), budget.live);
+    try std.testing.expect(budget.alloc_attempts > 0);
+}
+
+test "public graph metric borrowed wire preparation workspace reuses across row retirement and recovers" {
+    const a = std.testing.allocator;
+    const raw = "{\"\\u0061\":{\"\\u0062\":1}}";
+    var counted: std.testing.FailingAllocator = .init(a, .{});
+    var workspace: View.PreparationWorkspace = .init(counted.allocator());
+    defer workspace.deinit();
+    var selector: Selector = .{};
+    for (0..8) |iteration| {
+        var row = std.heap.ArenaAllocator.init(a);
+        defer row.deinit();
+        var scanner = std.json.Scanner.initCompleteInput(row.allocator(), raw);
+        defer scanner.deinit();
+        var view = View.init(row.allocator(), raw);
+        const calls = counted.allocations;
+        try view.prepareProjectionValueWithWorkspace(&selector, .all, .object_only, .{}, &scanner, raw, &workspace);
+        if (iteration != 0) try std.testing.expectEqual(calls, counted.allocations);
+        try std.testing.expect(workspace.retainedBytes() <= 256 * 1024);
+        try std.testing.expectEqual(counted.allocated_bytes - counted.freed_bytes, workspace.retainedBytes());
+    }
+    const invalid = "{\"a\":0,\"\\u0061\":1}";
+    var invalid_scanner = std.json.Scanner.initCompleteInput(a, invalid);
+    defer invalid_scanner.deinit();
+    var invalid_view = View.init(a, invalid);
+    try std.testing.expectError(error.DuplicateField, invalid_view.prepareProjectionValueWithWorkspace(&selector, .all, .object_only, .{}, &invalid_scanner, invalid, &workspace));
+    try std.testing.expectEqual(@as(usize, 0), workspace.retainedBytes());
+    var recovered_scanner = std.json.Scanner.initCompleteInput(a, raw);
+    defer recovered_scanner.deinit();
+    var recovered_view = View.init(a, raw);
+    try recovered_view.prepareProjectionValueWithWorkspace(&selector, .all, .object_only, .{}, &recovered_scanner, raw, &workspace);
+}
+
+test "public graph metric borrowed wire validated ranges publish only after complete preparation and preserve visited policy" {
+    const a = std.testing.allocator;
+    var arena: std.heap.ArenaAllocator = .init(a);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const selector = try plan_mod.compile(alloc, &.{.{ .parts = &.{ "items", "x", "m" } }});
+    var ranges = View.ValidatedRanges.init(alloc);
+    defer ranges.deinit();
+    const raw = "{\"items\":[{\"x\":[{\"m\":1,\"ignored\":{\"d\":0,\"d\":1}}]}]}";
+    var view = View.init(alloc, raw);
+    try view.prepareProjectionWithOptions(selector, .visited, .object_only, .{ .defer_fanout = true, .ranges = &ranges });
+    // The visited pass records no structural extents for this scalar-only fixture.
+    try std.testing.expect(view.validated_ranges == null);
+    // A previous visited pass cannot authorize skipping duplicate checks in
+    // a stronger pass, and failed validation cannot leave a usable certificate.
+    try std.testing.expectError(error.DuplicateField, view.prepareProjectionWithOptions(selector, .all, .object_only, .{ .defer_fanout = true, .ranges = &ranges }));
+    try std.testing.expect(view.validated_ranges == null);
+    view = View.init(alloc, "{\"items\":[{\"x\":[{\"m\":1}]}]}");
+    try view.prepareProjectionWithOptions(selector, .all, .object_only, .{ .defer_fanout = true, .ranges = &ranges });
+    try std.testing.expect(view.validated_ranges.?.proof.all_keys);
+}
+
+test "public graph metric borrowed wire canonical terminal preparation keeps missing fields and fallback isolation" {
+    const a = std.testing.allocator;
+    var selectors_arena = std.heap.ArenaAllocator.init(a);
+    defer selectors_arena.deinit();
+    const compile = @import("json_projection_plan.zig").compile;
+    const selected = try compile(selectors_arena.allocator(), &.{.{ .parts = &.{"keep"} }});
+    var raw_builder = std.Io.Writer.Allocating.init(a);
+    defer raw_builder.deinit();
+    try raw_builder.writer.writeAll("{\"keep\":100,\"other\":{\"x\":2},\"padding\":\"");
+    try raw_builder.writer.splatByteAll('x', 1024 * 1024);
+    try raw_builder.writer.writeAll("\"}");
+    const raw = raw_builder.written();
+    const Check = struct {
+        fn run(alloc: Allocator, selector: *const Selector, input: []const u8) !void {
+            var region = std.heap.ArenaAllocator.init(alloc);
+            defer region.deinit();
+            var view = View.init(region.allocator(), input);
+            view.canonical_source = input;
+            try std.testing.expect(view.canonicalPrefixFits(selector));
+            try view.prepareProjection(selector, .visited, .object_only);
+            try std.testing.expectEqualStrings("100", (try view.field(&view.root, "keep")).?.raw);
+            // Preparation is deliberately partial; later general lookup must
+            // still discover an unplanned original member.
+            try std.testing.expectEqualStrings("{\"x\":2}", (try view.field(&view.root, "other")).?.raw);
+        }
+    };
+    try Check.run(a, selected, raw);
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(a, Check.run, .{ selected, raw });
+    var region = std.heap.ArenaAllocator.init(a);
+    defer region.deinit();
+    const missing = try compile(region.allocator(), &.{.{ .parts = &.{"missing"} }});
+    var view = View.init(region.allocator(), raw);
+    view.canonical_source = raw;
+    try view.prepareProjection(missing, .visited, .object_only);
+    try std.testing.expect((try view.field(&view.root, "missing")) == null);
+    // A caller without native admission must validate trailing syntax/keys.
+    const invalid = "{\"keep\":100,\"other\":0,\"other\":1}";
+    var ordinary = View.init(region.allocator(), invalid);
+    try std.testing.expectError(error.DuplicateField, ordinary.prepareProjection(selected, .visited, .object_only));
+    const padding = try compile(region.allocator(), &.{.{ .parts = &.{"padding"} }});
+    var zero: @import("../../lite/test_allocator.zig").BudgetAllocator = .{ .backing = a, .limit = 0 };
+    var whole = View.init(zero.allocator(), raw);
+    whole.canonical_source = raw;
+    try std.testing.expect(!try whole.prepareCanonicalTerminals(padding));
+    try std.testing.expectEqual(@as(usize, 0), zero.alloc_attempts);
 }

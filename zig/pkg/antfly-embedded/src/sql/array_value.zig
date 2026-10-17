@@ -14,7 +14,8 @@
 // limitations under the License.
 
 //! Immutable typed SQL arrays, distinct from JSON arrays. Elements are flat,
-//! row-major prepared values; bounds and SQL NULL provenance are authoritative.
+//! row-major prepared values or canonical storage views. Consumers use
+//! cardinality()/flatCell(); bounds and SQL NULL provenance are authoritative.
 //! Borrowed views require a pinned owner. Owned copies include nested payloads.
 const std = @import("std");
 const scalar = @import("scalar.zig");
@@ -55,7 +56,45 @@ pub const Quantifier = enum { any, all };
 pub const Value = struct {
     element_type: ElementType,
     dimensions: []const Dimension,
-    elements: []const Element,
+    elements: []const Element = &.{},
+    /// Canonical, page-owned storage bytes for primitive/text arrays.
+    stored: ?*const @import("../common/sql_array_layout.zig").View = null,
+
+    pub fn flatCell(self: Value, index: usize) Element {
+        if (self.stored) |view| {
+            const raw = view.cell(index) catch unreachable;
+            if (raw.sql_null) return .{};
+            return Element.json(switch (self.element_type) {
+                .boolean => .{ .bool = raw.bytes[0] == 1 },
+                .int16 => .{ .integer = std.mem.readInt(i16, raw.bytes[0..2], .little) },
+                .int32 => .{ .integer = std.mem.readInt(i32, raw.bytes[0..4], .little) },
+                .int64 => .{ .integer = std.mem.readInt(i64, raw.bytes[0..8], .little) },
+                .float32 => .{ .float = @as(f32, @bitCast(std.mem.readInt(u32, raw.bytes[0..4], .little))) },
+                .float64 => .{ .float = @bitCast(std.mem.readInt(u64, raw.bytes[0..8], .little)) },
+                .text => .{ .string = raw.bytes },
+                .uuid, .numeric, .jsonb => unreachable,
+            });
+        }
+        return self.elements[index];
+    }
+
+    pub fn validate(self: Value, limits: Limits) !Value {
+        var work: Budget = .{ .remaining = limits.work };
+        return self.validateWithBudget(limits, &work);
+    }
+    pub fn validateWithBudget(self: Value, limits: Limits, work: *Budget) !Value {
+        if (self.stored) |stored| {
+            if (self.elements.len != 0 or self.element_type != stored.kind or stored.rank != self.dimensions.len) return error.InvalidSqlArrayShape;
+            if (stored.count > limits.elements or stored.bytes.len > limits.bytes) return error.SqlProgramLimitExceeded;
+            for (self.dimensions, 0..) |axis, index| {
+                const expected = try stored.dimension(index);
+                if (axis.length != expected.length or axis.lower != expected.lower) return error.InvalidSqlArrayShape;
+            }
+            for (0..stored.count) |index| try validateElement(self.element_type, self.flatCell(index), work);
+            return self;
+        }
+        return initWithBudget(self.element_type, self.dimensions, self.elements, limits, work);
+    }
 
     /// Validate borrowed prepared cells before they enter an operator. Empty
     /// arrays have no dimensions, including an input shape containing a zero.
@@ -97,7 +136,7 @@ pub const Value = struct {
     }
 
     pub fn cardinality(self: Value) usize {
-        return self.elements.len;
+        return if (self.stored) |view| view.count else self.elements.len;
     }
 
     pub fn rank(self: Value) ?usize {
@@ -116,7 +155,8 @@ pub const Value = struct {
             else => self.element_type,
         }, scalar_value, work);
         var saw_null = false;
-        for (self.elements) |element| {
+        for (0..self.cardinality()) |array_cell_0| {
+            const element = self.flatCell(array_cell_0);
             try work.consume(1);
             if (scalar_value.sql_null or element.sql_null) {
                 saw_null = true;
@@ -148,7 +188,7 @@ pub const Value = struct {
             if (relative < 0 or relative >= dimension.length) return null;
             offset = offset * dimension.length + @as(usize, @intCast(relative));
         }
-        return self.elements[offset];
+        return self.flatCell(offset);
     }
 
     /// PostgreSQL search uses IS NOT DISTINCT FROM, not strict equality:
@@ -160,8 +200,9 @@ pub const Value = struct {
         if (self.dimensions.len == 0) return null;
         const lower_bound = self.dimensions[0].lower;
         const offset: usize = @intCast(@max(@as(i64, 0), @as(i64, start orelse lower_bound) - lower_bound));
-        if (offset >= self.elements.len) return null;
-        for (self.elements[offset..], offset..) |element, i| {
+        if (offset >= self.cardinality()) return null;
+        for (offset..self.cardinality()) |i| {
+            const element = self.flatCell(i);
             if (try compareElement(self.element_type, element, needle, work) == .eq) return @intCast(@as(i64, lower_bound) + @as(i64, @intCast(i)));
         }
         return null;
@@ -174,7 +215,7 @@ pub const Value = struct {
         if (self.dimensions.len > 1) return error.UnsupportedSqlShape;
         try validateElement(self.element_type, needle, work);
         var count: usize = 0;
-        for (self.elements) |element| if (try compareElement(self.element_type, element, needle, work) == .eq) {
+        for (0..self.cardinality()) |i| if (try compareElement(self.element_type, self.flatCell(i), needle, work) == .eq) {
             count += 1;
         };
         try resultAdmission(count, @intFromBool(count != 0), limits);
@@ -182,7 +223,7 @@ pub const Value = struct {
         if (count != 0) dimensions[0] = .{ .length = @intCast(count) };
         const elements = try alloc.alloc(Element, count);
         var output: usize = 0;
-        for (self.elements, 0..) |element, i| if (try compareElement(self.element_type, element, needle, work) == .eq) {
+        for (0..self.cardinality()) |i| if (try compareElement(self.element_type, self.flatCell(i), needle, work) == .eq) {
             elements[output] = Element.json(.{ .integer = @as(i64, self.dimensions[0].lower) + @as(i64, @intCast(i)) });
             output += 1;
         };
@@ -196,8 +237,9 @@ pub const Value = struct {
         if (replacement == null and self.dimensions.len > 1) return error.UnsupportedSqlShape;
         try validateElement(self.element_type, needle, work);
         if (replacement) |value| try validateElement(self.element_type, value, work);
-        var count = self.elements.len;
-        if (replacement == null) for (self.elements) |element| {
+        var count = self.cardinality();
+        if (replacement == null) for (0..self.cardinality()) |array_cell_0| {
+            const element = self.flatCell(array_cell_0);
             if (try compareElement(self.element_type, element, needle, work) == .eq) count -= 1;
         };
         const rank_: usize = if (count == 0) 0 else self.dimensions.len;
@@ -206,7 +248,8 @@ pub const Value = struct {
         if (replacement == null and count != 0) dimensions[0].length = @intCast(count);
         const elements = try alloc.alloc(Element, count);
         var output: usize = 0;
-        for (self.elements) |element| {
+        for (0..self.cardinality()) |array_cell_0| {
+            const element = self.flatCell(array_cell_0);
             const matches = try compareElement(self.element_type, element, needle, work) == .eq;
             if (matches and replacement == null) continue;
             elements[output] = if (matches) replacement.? else element;
@@ -221,13 +264,13 @@ pub const Value = struct {
     pub fn append(self: Value, alloc: Allocator, element: Element, prepend: bool, limits: Limits, work: *Budget) !Value {
         if (self.dimensions.len > 1) return error.SqlArrayAppendDimensions;
         try validateElement(self.element_type, element, work);
-        const count = self.elements.len + 1;
+        const count = self.cardinality() + 1;
         try resultAdmission(count, 1, limits);
         const lower_bound: i32 = if (self.dimensions.len == 0) 1 else self.dimensions[0].lower;
         if (@as(i64, lower_bound) + @as(i64, @intCast(count)) > std.math.maxInt(i32)) return error.SqlProgramLimitExceeded;
         const dimensions = try alloc.dupe(Dimension, &.{.{ .length = @intCast(count), .lower = lower_bound }});
         const elements = try alloc.alloc(Element, count);
-        @memcpy(elements[@intFromBool(prepend)..][0..self.elements.len], self.elements);
+        for (elements[@intFromBool(prepend)..][0..self.cardinality()], 0..) |*out, i| out.* = self.flatCell(i);
         elements[if (prepend) 0 else count - 1] = element;
         return Value.initWithBudget(self.element_type, dimensions, elements, limits, work);
     }
@@ -238,8 +281,8 @@ pub const Value = struct {
     /// results borrow all storage; nonidentity results allocate one flat vector.
     pub fn concatenate(self: Value, alloc: Allocator, other: Value, limits: Limits, work: *Budget) !Value {
         if (self.element_type != other.element_type) return error.SqlTypeMismatch;
-        if (self.elements.len == 0) return other;
-        if (other.elements.len == 0) return self;
+        if (self.cardinality() == 0) return other;
+        if (other.cardinality() == 0) return self;
         const left_rank = self.dimensions.len;
         const right_rank = other.dimensions.len;
         if (@max(left_rank, right_rank) - @min(left_rank, right_rank) > 1) return error.SqlArrayConcatenationDimensions;
@@ -249,26 +292,28 @@ pub const Value = struct {
         for (higher.dimensions[1..], tails) |a, b| {
             if (a.length != b.length or a.lower != b.lower) return error.SqlArrayConcatenationDimensions;
         }
-        const count = self.elements.len + other.elements.len;
+        const count = self.cardinality() + other.cardinality();
         try resultAdmission(count, higher.dimensions.len, limits);
         const first_length = higher.dimensions[0].length + @as(u32, if (left_rank == right_rank) other.dimensions[0].length else 1);
         if (@as(i64, higher.dimensions[0].lower) + first_length > std.math.maxInt(i32)) return error.SqlProgramLimitExceeded;
         const dimensions = try alloc.dupe(Dimension, higher.dimensions);
         dimensions[0].length = first_length;
         const elements = try alloc.alloc(Element, count);
-        @memcpy(elements[0..self.elements.len], self.elements);
-        @memcpy(elements[self.elements.len..], other.elements);
+        for (elements[0..self.cardinality()], 0..) |*out, i| out.* = self.flatCell(i);
+        for (elements[self.cardinality()..], 0..) |*out, i| out.* = other.flatCell(i);
         return Value.initWithBudget(self.element_type, dimensions, elements, limits, work);
     }
 
     pub fn compare(self: Value, other: Value, budget: *Budget) !std.math.Order {
         try budget.consume(1);
         if (self.element_type != other.element_type) return error.SqlTypeMismatch;
-        for (self.elements[0..@min(self.elements.len, other.elements.len)], other.elements[0..@min(self.elements.len, other.elements.len)]) |a, b| {
+        for (0..@min(self.cardinality(), other.cardinality())) |index| {
+            const a = self.flatCell(index);
+            const b = other.flatCell(index);
             const order = try compareElement(self.element_type, a, b, budget);
             if (order != .eq) return order;
         }
-        return compareShape(self.elements.len, other.elements.len, self.dimensions, other.dimensions, budget);
+        return compareShape(self.cardinality(), other.cardinality(), self.dimensions, other.dimensions, budget);
     }
 
     pub fn semanticHash(self: Value, budget: *Budget) !u64 {
@@ -279,14 +324,15 @@ pub const Value = struct {
         hash.update(&bytes);
         std.mem.writeInt(u64, &bytes, self.dimensions.len, .little);
         hash.update(&bytes);
-        std.mem.writeInt(u64, &bytes, self.elements.len, .little);
+        std.mem.writeInt(u64, &bytes, self.cardinality(), .little);
         hash.update(&bytes);
         for (self.dimensions) |dimension| {
             std.mem.writeInt(u32, bytes[0..4], dimension.length, .little);
             std.mem.writeInt(i32, bytes[4..8], dimension.lower, .little);
             hash.update(&bytes);
         }
-        for (self.elements) |element| {
+        for (0..self.cardinality()) |array_cell_0| {
+            const element = self.flatCell(array_cell_0);
             std.mem.writeInt(u64, &bytes, try hashElement(self.element_type, element, budget), .little);
             hash.update(&bytes);
         }
@@ -427,7 +473,7 @@ pub const Owned = struct {
     value: Value,
 
     pub fn init(backing: Allocator, value: Value, limits: Limits) !Owned {
-        const validated = try Value.init(value.element_type, value.dimensions, value.elements, limits);
+        const validated = try value.validate(limits);
         const budget = try backing.create(MemoryBudget);
         errdefer backing.destroy(budget);
         budget.* = .{ .backing = backing, .limit = limits.bytes };
@@ -437,8 +483,15 @@ pub const Owned = struct {
         errdefer arena.deinit();
         const owned = arena.allocator();
         const dimensions = owned.dupe(Dimension, validated.dimensions) catch |err| return allocationError(budget, err);
-        const elements = owned.alloc(Element, value.elements.len) catch |err| return allocationError(budget, err);
-        for (value.elements, elements) |element, *out| out.* = operators.cloneDatum(owned, element) catch |err| return allocationError(budget, err);
+        if (validated.stored) |stored| {
+            const copy = owned.create(@import("../common/sql_array_layout.zig").View) catch |err| return allocationError(budget, err);
+            copy.* = stored.*;
+            copy.bytes = owned.dupe(u8, stored.bytes) catch |err| return allocationError(budget, err);
+            return .{ .arena = arena, .budget = budget, .value = .{ .element_type = validated.element_type, .dimensions = dimensions, .stored = copy } };
+        }
+
+        const elements = owned.alloc(Element, value.cardinality()) catch |err| return allocationError(budget, err);
+        for (elements, 0..) |*out, index| out.* = operators.cloneDatum(owned, value.flatCell(index)) catch |err| return allocationError(budget, err);
         return .{ .arena = arena, .budget = budget, .value = .{ .element_type = value.element_type, .dimensions = dimensions, .elements = elements } };
     }
 
@@ -647,9 +700,10 @@ test "SQL typed array prepared membership bounds repeated probe work without all
     const retained = index.budget.live;
     var work: Budget = .{ .remaining = 20_000_000 };
     const scan_start = std.Io.Clock.now(.awake, std.testing.io).nanoseconds;
-    for (0..10) |_| for (probes.elements) |probe| {
+    for (0..10) |_| for (0..probes.cardinality()) |array_cell_0| {
+        const probe = probes.flatCell(array_cell_0);
         var matched = false;
-        for (source.elements) |candidate| if (try compareElement(.int32, probe, candidate, &work) == .eq) {
+        for (0..source.cardinality()) |candidate_index| if (try compareElement(.int32, probe, source.flatCell(candidate_index), &work) == .eq) {
             matched = true;
             break;
         };
@@ -682,7 +736,7 @@ pub const Membership = struct {
     }
 
     pub fn initWithBudget(backing: Allocator, value: Value, limits: Limits, work: *Budget) !Membership {
-        const validated = try Value.initWithBudget(value.element_type, value.dimensions, value.elements, limits, work);
+        const validated = try value.validateWithBudget(limits, work);
         const budget = try backing.create(MemoryBudget);
         errdefer backing.destroy(budget);
         budget.* = .{ .backing = backing, .limit = limits.bytes };
@@ -693,7 +747,8 @@ pub const Membership = struct {
         const a = budget.allocator();
         errdefer index.heads.deinit(a);
         errdefer index.entries.deinit(a);
-        for (value.elements, 0..) |element, ordinal| {
+        for (0..value.cardinality(), 0..) |array_cell_0, ordinal| {
+            const element = value.flatCell(array_cell_0);
             if (element.sql_null) {
                 if (index.first_null == null) index.first_null = ordinal;
                 continue;
@@ -721,7 +776,7 @@ pub const Membership = struct {
         var cursor = self.heads.get(hash);
         while (cursor) |slot| {
             const entry = self.entries.items[slot];
-            if (try compareElement(self.value.element_type, self.value.elements[entry.ordinal], element, budget) == .eq) return entry.ordinal;
+            if (try compareElement(self.value.element_type, self.value.flatCell(entry.ordinal), element, budget) == .eq) return entry.ordinal;
             cursor = entry.next;
         }
         return null;
@@ -729,7 +784,8 @@ pub const Membership = struct {
 
     pub fn contains(self: *const Membership, other: Value, work: *Budget) !bool {
         if (self.value.element_type != other.element_type) return error.SqlTypeMismatch;
-        for (other.elements) |element| {
+        for (0..other.cardinality()) |array_cell_0| {
+            const element = other.flatCell(array_cell_0);
             try work.consume(1);
             if (element.sql_null) return false;
             if (try self.find(element, try hashElement(other.element_type, element, work), work) == null) return false;
@@ -739,7 +795,8 @@ pub const Membership = struct {
 
     pub fn overlaps(self: *const Membership, other: Value, work: *Budget) !bool {
         if (self.value.element_type != other.element_type) return error.SqlTypeMismatch;
-        for (other.elements) |element| {
+        for (0..other.cardinality()) |array_cell_0| {
+            const element = other.flatCell(array_cell_0);
             try work.consume(1);
             if (element.sql_null) continue;
             if (try self.find(element, try hashElement(other.element_type, element, work), work) != null) return true;

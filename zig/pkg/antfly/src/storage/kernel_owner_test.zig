@@ -71,7 +71,8 @@ test "opaque owner retained relational read crosses checked archive boundary" {
     defer first.deinit();
     try std.testing.expectEqual(@as(usize, 1), first.rows.len);
     try std.testing.expectEqualStrings("a", first.rows[0].id);
-    try std.testing.expectEqual(@as(i64, 9007199254740993), first.rows[0].value.object.get("id").?.integer);
+    try std.testing.expect(first.rows[0].typed_cells != null and first.rows[0].value == .null);
+    try std.testing.expectEqual(@as(i64, 9007199254740993), (try first.rows[0].cell("id")).value.integer);
     try std.testing.expect(first.after != null);
     var updated = try owner.batchJson("rows",
         \\{"inserts":{"b":{"id":99}},"sync_level":"write"}
@@ -81,7 +82,7 @@ test "opaque owner retained relational read crosses checked archive boundary" {
     defer second.deinit();
     try std.testing.expectEqual(@as(usize, 1), second.rows.len);
     try std.testing.expectEqualStrings("b", second.rows[0].id);
-    try std.testing.expectEqual(@as(i64, 42), second.rows[0].value.object.get("id").?.integer);
+    try std.testing.expectEqual(@as(i64, 42), (try second.rows[0].cell("id")).value.integer);
     var end = try view.next(alloc, 1);
     defer end.deinit();
     try std.testing.expectEqual(@as(usize, 0), end.rows.len);

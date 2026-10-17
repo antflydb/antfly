@@ -1951,6 +1951,33 @@ test "capi SQL array mutations retain native cells and returning provenance" {
     }
 }
 
+test "capi SQL relational search highlight values own captured text and match public JSON" {
+    const a = std.testing.allocator;
+    const sql = @import("antfly_local_sources").capi_sql;
+    var source = std.heap.ArenaAllocator.init(a);
+    var source_live = true;
+    defer if (source_live) source.deinit();
+    const input = source.allocator();
+    const spans = try input.dupe(db_mod.types.HighlightSpan, &.{.{ .start = 1, .end = 3 }});
+    const fragments = try input.alloc(db_mod.types.HighlightFragment, 2);
+    fragments[0] = .{ .text = try input.dupe(u8, "éclair"), .offset = 7, .spans = spans };
+    fragments[1] = .{ .text = try input.dupe(u8, "array"), .offset = 12, .item = 2, .spans = spans };
+    const fields = try input.alloc(db_mod.types.HighlightedField, 1);
+    fields[0] = .{ .field = try input.dupe(u8, "body"), .fragments = fragments };
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const expected_value = try antfly.public_api.query.highlightsJsonValue(arena.allocator(), fields);
+    const expected = try std.json.Stringify.valueAlloc(a, expected_value.?, .{});
+    defer a.free(expected);
+    const value = (try sql.highlightsValueLeaky(arena.allocator(), fields)).?;
+    source.deinit();
+    source_live = false;
+    const actual = try std.json.Stringify.valueAlloc(a, value, .{});
+    defer a.free(actual);
+    try std.testing.expectEqualStrings(expected, actual);
+    try std.testing.expect(value.object.get("body").?.array.items[0].object.get("item") == null);
+}
+
 test "capi SQL relational search preserves typed nulls and exact JSON numbers" {
     const alloc = std.testing.allocator;
     var directory = try TestDirectory.init("capi-sql-search-typed");
@@ -1958,36 +1985,68 @@ test "capi SQL relational search preserves typed nulls and exact JSON numbers" {
     var database = try db_mod.DB.open(alloc, directory.path(), .{ .start_optional_runtimes = false, .start_index_workers = false });
     defer database.close();
     try database.setSchemaJson(alloc,
-        \\{"version":1,"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"body":{"type":"string"},"payload":{"type":"json","nullable":true}},"additionalProperties":false}}}}
+        \\{"version":1,"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"body":{"type":"string"},"payload":{"type":"json","nullable":true},"a":{"type":["sql_array","null"],"x-antfly-sql-type":"int64"},"n":{"type":["number","null"],"x-antfly-sql-type":"numeric"}},"additionalProperties":false}}}}
     );
     try database.addIndex(.{ .name = "ft_v1", .kind = .full_text, .config_json = "{}" });
     const sql = @import("antfly_local_sources").capi_sql;
     var adapter = sql.Adapter(antfly){ .db = &database, .table_name = "rows" };
     var inserted = try sql.compiler.compile(alloc,
-        \\INSERT INTO rows(_id,body,payload) VALUES ('a','alpha',NULL),('b','alpha',CAST('null' AS JSONB)),('c','alpha',CAST('{"amount":9007199254740993.0,"fraction":0.123456789012345678901}' AS JSONB))
+        \\INSERT INTO rows(_id,body,payload,a,n) VALUES ('a','alpha',NULL,ARRAY[9007199254740993::bigint,NULL::bigint],1.2300::numeric),('b','alpha',CAST('null' AS JSONB),NULL,NULL),('c','alpha',CAST('{"amount":9007199254740993.0,"fraction":0.123456789012345678901}' AS JSONB),ARRAY[-7::bigint],9007199254740993.1200::numeric)
     , .{});
     defer inserted.deinit();
     var mutation = try sql.runtime.execute(alloc, adapter.backend(), &inserted, &.{}, .{});
     defer mutation.deinit();
     try database.runUntilIdle();
-    var scanned = try sql.compiler.compile(alloc, "SELECT _id,payload,payload IS NULL,payload->>'amount',payload->>'fraction' FROM rows ORDER BY _id", .{});
+    var scanned = try sql.compiler.compile(alloc, "SELECT _id,payload,payload IS NULL,payload->>'amount',payload->>'fraction',a,cardinality(a),n FROM rows ORDER BY _id", .{});
     defer scanned.deinit();
-    var baseline = try sql.runtime.execute(alloc, adapter.backend(), &scanned, &.{}, .{});
+    var baseline = try sql.runtime.execute(alloc, adapter.backend(), &scanned, &.{}, .{ .page_rows = 1 });
     defer baseline.deinit();
-    var searched = try sql.compiler.compile(alloc, "SELECT _id,payload,payload IS NULL,payload->>'amount',payload->>'fraction' FROM antfly_search('rows','body:alpha') ORDER BY _id", .{});
+    var searched = try sql.compiler.compile(alloc, "SELECT _id,payload,payload IS NULL,payload->>'amount',payload->>'fraction',a,cardinality(a),n FROM antfly_search('rows','body:alpha') ORDER BY _id", .{});
     defer searched.deinit();
-    var hits = try sql.runtime.execute(alloc, adapter.backend(), &searched, &.{}, .{});
-    defer hits.deinit();
-    try std.testing.expectEqual(@as(usize, 3), hits.output.rows.len);
-    const expected = try std.json.Stringify.valueAlloc(alloc, .{ .rows = baseline.output.rows, .nulls = baseline.output.sql_nulls }, .{});
-    defer alloc.free(expected);
-    const actual = try std.json.Stringify.valueAlloc(alloc, .{ .rows = hits.output.rows, .nulls = hits.output.sql_nulls }, .{});
-    defer alloc.free(actual);
-    try std.testing.expectEqualStrings(expected, actual);
-    try std.testing.expect(hits.output.rows[0][2].bool);
-    try std.testing.expect(!hits.output.rows[1][2].bool);
-    try std.testing.expectEqualStrings("9007199254740993", hits.output.rows[2][3].string);
-    try std.testing.expectEqualStrings("0.123456789012345678901", hits.output.rows[2][4].string);
+    for ([_]u32{ 1, 256 }) |page_rows| {
+        var hits = try sql.runtime.execute(alloc, adapter.backend(), &searched, &.{}, .{ .page_rows = page_rows });
+        defer hits.deinit();
+        try std.testing.expectEqual(@as(usize, 3), hits.output.rows.len);
+        const expected = try std.json.Stringify.valueAlloc(alloc, .{ .rows = baseline.output.rows, .nulls = baseline.output.sql_nulls }, .{});
+        defer alloc.free(expected);
+        const actual = try std.json.Stringify.valueAlloc(alloc, .{ .rows = hits.output.rows, .nulls = hits.output.sql_nulls }, .{});
+        defer alloc.free(actual);
+        try std.testing.expectEqualStrings(expected, actual);
+        try std.testing.expect(hits.output.rows[0][2].bool);
+        try std.testing.expect(!hits.output.rows[1][2].bool);
+        try std.testing.expect(hits.output.rows[0][5] == .object);
+        try std.testing.expectEqualStrings("2", hits.output.rows[0][6].string);
+        try std.testing.expectEqualStrings("9007199254740993.1200", hits.output.rows[2][7].string);
+        try std.testing.expectEqualStrings("9007199254740993", hits.output.rows[2][3].string);
+        try std.testing.expectEqualStrings("0.123456789012345678901", hits.output.rows[2][4].string);
+    }
+    // A delivered ranked page owns its identities, layouts and values after
+    // both the ranked cursor and its primary snapshot have been released.
+    var region = std.heap.ArenaAllocator.init(alloc);
+    defer region.deinit();
+    const a = region.allocator();
+    const backend = adapter.backend();
+    const relation = searched.statement.select.source.?.table;
+    const table = try backend.vtable.resolve(backend.ptr, a, relation.name, .read);
+    const request: @import("antfly_local_sources").sql_catalog.Scan.Search = .{ .expression = relation.search.?.*, .request_text = "body:alpha" };
+    const statement = try backend.vtable.open_statement.?(backend.ptr, alloc, &.{.{ .table = table, .request = .{ .fields = &.{ "a", "n", "payload" }, .search = &request, .limit = 1 } }});
+    var live = true;
+    defer if (live) statement.close(statement.ptr);
+    const cursor = statement.cursors[0];
+    const page = try cursor.next(cursor.ptr, alloc, 1);
+    defer page.deinit();
+    try std.testing.expectEqual(@as(usize, 1), page.rows.len);
+    const expected_id = try a.dupe(u8, page.rows[0].id);
+    const before = try page.rows[0].cell("a");
+    const expected_first: ?i64 = if (before.array) |array| array.flatCell(0).value.integer else null;
+    statement.close(statement.ptr);
+    live = false;
+    try std.testing.expectEqualStrings(expected_id, page.rows[0].id);
+    const after = try page.rows[0].cell("a");
+    if (expected_first) |value| {
+        try std.testing.expect(after.array.?.stored != null);
+        try std.testing.expectEqual(value, after.array.?.flatCell(0).value.integer);
+    } else try std.testing.expect(after.sql_null);
 }
 
 test "capi SQL uses native typed snapshots and atomic mutations" {
@@ -6068,6 +6127,174 @@ test "capi SQL runtime refresh fences serving inputs while reusing lease and sha
         else
             try std.testing.expect(before != after);
     }
+}
+
+test "capi native replacement wait observes its background owner without rebuilding" {
+    if (builtin.single_threaded or builtin.os.tag == .freestanding) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var directory = try TestDirectory.init("native-replacement-observer");
+    defer directory.cleanup();
+    const path = try tempTestAflitePath(a, directory.path(), "database");
+    defer a.free(path);
+    defer cleanupTestFile(path);
+    var options: capi.OpenOptions = .{};
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_open_options_init(&options));
+    options.storage_kind = capi.storage_kind_lite;
+    options.profile = capi.profile_native;
+    var handle: ?*anyopaque = null;
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_create_with_options(path, &options, &handle));
+    defer antfly_db_close(handle);
+    const owner = blk: {
+        const guard = public.enterHandle(handle, .exclusive).?;
+        defer guard.leave();
+        break :blk guard.connection.?.owner;
+    };
+    owner.stopping.store(true, .release);
+    owner.wake.set(shared.handleLockIo());
+    owner.worker.?.join();
+    // Simulate a paused native builder while preserving its ownership. Only
+    // explicit scheduler turns below may mutate its reservation.
+    defer owner.worker = null;
+    owner.stopping.store(false, .release);
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_add_index_json(handle, .fromSlice(
+        \\{"name":"old","type":"graph","edge_types":[{"name":"R","field":"links"}]}
+    )));
+    var inserted: capi.Buffer = .{};
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_batch_json(handle, .fromSlice(
+        \\{"inserts":{"source":{"links":["target"]}}}
+    ), &inserted));
+    freeRawBuffer(inserted.ptr, inserted.len);
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_run_until_idle(handle));
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_add_index_json(handle, .fromSlice(
+        \\{"name":"new","type":"graph","replaces":"old","edge_types":[{"name":"R","field":"links"}]}
+    )));
+    const Reservation = struct {
+        fn bytes(allocator: std.mem.Allocator, id: ?*anyopaque) ![]u8 {
+            const guard = public.enterHandle(id, .read).?;
+            defer guard.leave();
+            const jobs = try guard.handle.database().graphReplacementStatusAlloc(allocator);
+            defer jobs.deinit();
+            try std.testing.expectEqual(@as(usize, 1), jobs.value.len);
+            return std.json.Stringify.valueAlloc(allocator, jobs.value, .{});
+        }
+    };
+    const before = try Reservation.bytes(a, handle);
+    defer a.free(before);
+    try std.testing.expectEqual(capi.ErrorCode.busy, antfly_db_add_index_json(handle, .fromSlice(
+        \\{"name":"new","type":"graph","replaces":"old","wait":{"timeout_ms":1000},"edge_types":[{"name":"R","field":"links"}]}
+    )));
+    const after = try Reservation.bytes(a, handle);
+    defer a.free(after);
+    try std.testing.expectEqualStrings(before, after);
+    for (0..32) |_| if (!try owner.maintenanceTurnForTest()) break;
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_add_index_json(handle, .fromSlice(
+        \\{"name":"new","type":"graph","replaces":"old","wait":{"timeout_ms":0},"edge_types":[{"name":"R","field":"links"}]}
+    )));
+}
+
+test "capi native resolver maintenance retries transient inference and survives reopen" {
+    if (builtin.single_threaded or builtin.os.tag == .freestanding) return error.SkipZigTest;
+    const producer = @import("antfly_local_sources").storage_db_enrichment_asset_producer;
+    const Fixture = struct {
+        failures: usize = 0,
+        successful: usize = 0,
+        fn memory(_: *anyopaque, _: std.mem.Allocator, _: []const producer.Request) !@import("antfly_inference_work").InvocationMemoryPlan {
+            return .{ .attachment_transport = .data_uri, .fixed_bytes = 16 << 20, .allocator_limit_bytes = 16 << 20, .max_result_bytes_per_item = 1 << 20, .max_result_bytes = 1 << 20 };
+        }
+        fn produce(ptr: *anyopaque, a: std.mem.Allocator, _: producer.Request) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            // Admission pressure and an open provider circuit must preserve
+            // durable replay debt, not require another foreground write.
+            if (self.failures < 2) {
+                self.failures += 1;
+                return if (self.failures == 1) error.ResourceTemporarilyUnavailable else error.InferenceCircuitOpen;
+            }
+            self.successful += 1;
+            return a.dupe(u8, "{\"entities\":[{\"id\":\"a\",\"text\":\"Antfly\",\"label\":\"technology\"}],\"relations\":[]}");
+        }
+        fn produceBounded(ptr: *anyopaque, a: std.mem.Allocator, request: producer.Request, context: producer.InvocationContext) ![]u8 {
+            try context.check();
+            return produce(ptr, a, request);
+        }
+        fn notify(ptr: *anyopaque, root: *shared.Handle) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (!root.db_live) return;
+            const runtime = root.db.enrichment_runtime orelse return;
+            runtime.config.asset_producer = .{ .ptr = self, .vtable = &.{ .produce = produce, .produce_with_context = produceBounded, .foreground_bounded = true, .invocation_memory_for_requests = memory } };
+            runtime.config.inline_retry_max_attempts = 1;
+        }
+        fn pause(handle: ?*anyopaque) !std.meta.Child(@FieldType(shared.Handle, "maintenance_owner")) {
+            const owner = blk: {
+                const guard = public.enterHandle(handle, .exclusive).?;
+                defer guard.leave();
+                break :blk guard.connection.?.owner;
+            };
+            owner.stopping.store(true, .release);
+            owner.wake.set(shared.handleLockIo());
+            owner.worker.?.join();
+            owner.worker = null;
+            owner.stopping.store(false, .release);
+            return owner;
+        }
+    };
+    const a = std.testing.allocator;
+    var directory = try TestDirectory.init("native-resolver-retry");
+    defer directory.cleanup();
+    const path = try tempTestAflitePath(a, directory.path(), "database");
+    defer a.free(path);
+    defer cleanupTestFile(path);
+    var options: capi.OpenOptions = .{};
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_open_options_init(&options));
+    options.storage_kind = capi.storage_kind_lite;
+    options.profile = capi.profile_native;
+    options.flags |= capi.open_flag_generated_enrichment_replay;
+    var handle: ?*anyopaque = null;
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_create_with_options(path, &options, &handle));
+    defer if (handle != null) antfly_db_close(handle);
+    var owner = try Fixture.pause(handle);
+    var fixture: Fixture = .{};
+    owner.test_after_capture = .{ .ptr = &fixture, .notify = Fixture.notify };
+    try std.testing.expectEqual(capi.ErrorCode.ok, struct {
+        extern fn antfly_db_create_table_json(?*anyopaque, capi.Slice, capi.Slice) capi.ErrorCode;
+    }.antfly_db_create_table_json(handle, .fromSlice("concepts"), .fromSlice("{}")));
+    const config =
+        \\{"source":{"artifact":"extraction","path":"$.relations[*]","format":"extraction_relation","mention_edge_type":"about"},"artifact":{"name":"extraction","kind":"asset","source":{"type":"field","value":"text"},"content_type":"application/json","producer_json":{"type":"generator","config":{"provider":"mock"}}},"edge_types":[{"name":"about"}],"resolvers":[{"name":"concepts","table":"concepts","source_artifact":"extraction","resolution_artifact":"resolution","key_template":"concept/{{ uslug _entity.text }}"}]}
+    ;
+    const index = try std.json.Stringify.valueAlloc(a, .{ .name = "kg", .kind = "graph", .config_json = config }, .{});
+    defer a.free(index);
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_add_index_json(handle, .fromSlice(index)));
+    for (0..30) |i| {
+        {
+            const guard = public.enterHandle(handle, .exclusive).?;
+            defer guard.leave();
+            const key = try std.fmt.allocPrint(a, "d{d}", .{i});
+            defer a.free(key);
+            try guard.handle.db.batch(.{ .writes = &.{.{ .key = key, .value = "{\"text\":\"Antfly\"}" }}, .sync_level = .write });
+            owner.maintenance_pending = true;
+        }
+        _ = try owner.maintenanceTurnForTest();
+    }
+    try std.testing.expect(fixture.failures > 0);
+    antfly_db_close(handle);
+    handle = null;
+    // Reopen with unfinished work and no new mutation or foreground drain.
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_open_with_options(path, &options, &handle));
+    owner = try Fixture.pause(handle);
+    owner.test_after_capture = .{ .ptr = &fixture, .notify = Fixture.notify };
+    for (0..160) |_| {
+        if (!try owner.maintenanceTurnForTest()) break;
+        try shared.handleLockIo().sleep(.fromMilliseconds(25), .awake);
+    }
+    try std.testing.expectEqual(@as(usize, 2), fixture.failures);
+    try std.testing.expect(fixture.successful >= 30);
+    const guard = public.enterHandle(handle, .read).?;
+    defer guard.leave();
+    const stats = guard.handle.db.pendingWorkStats();
+    try std.testing.expect(stats.enrichment.applied_sequence >= stats.enrichment.target_sequence);
+    try std.testing.expect(!stats.resolution.catch_up_required);
+    if (stats.promotion.catch_up_required) std.debug.print("resolver reopen stats={f} publications={f}\n", .{ std.json.fmt(stats, .{}), std.json.fmt(owner.publication_stats, .{}) });
+    try std.testing.expect(!stats.promotion.catch_up_required);
+    try std.testing.expectEqual(@as(?[]const u8, null), owner.publication_stats.last_maintenance_error);
 }
 
 test "capi SQL idle native maintenance avoids runtime construction and resumes work" {

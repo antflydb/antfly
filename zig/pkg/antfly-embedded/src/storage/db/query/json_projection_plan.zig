@@ -25,7 +25,12 @@ pub const Selector = struct {
     fanout: ?*Selector = null,
     prepared: bool = false,
 };
-pub const Path = struct { parts: []const []const u8 };
+pub const Path = struct {
+    parts: []const []const u8,
+    // Single-path selectors preserve ordered replacement without rebuilding
+    // suffix tries for each row or nested fanout. Borrowed from the plan owner.
+    selector: ?*const Selector = null,
+};
 
 pub fn index(part: []const u8) ?usize {
     if (part.len == 0 or std.mem.indexOfNone(u8, part, "0123456789") != null) return null;

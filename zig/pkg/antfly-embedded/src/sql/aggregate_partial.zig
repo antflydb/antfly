@@ -551,8 +551,8 @@ test "SQL aggregate typed-array partials use the shared portable block codec" {
             defer decoded.deinit();
             const value = decoded.selected.?.row.values[0];
             try std.testing.expectEqual(@as(i32, -3), value.array.?.dimensions[0].lower);
-            try std.testing.expectEqual(@as(i64, 9007199254740993), value.array.?.elements[0].value.integer);
-            try std.testing.expect(value.array.?.elements[1].sql_null);
+            try std.testing.expectEqual(@as(i64, 9007199254740993), value.array.?.flatCell(0).value.integer);
+            try std.testing.expect(value.array.?.flatCell(1).sql_null);
         }
     };
     try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Scenario.run, .{});

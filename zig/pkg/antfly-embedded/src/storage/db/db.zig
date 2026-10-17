@@ -20472,11 +20472,12 @@ pub const DB = struct {
         while (true) {
             const target_sequence = self.currentMaintenanceTargetSequence();
             if (statement_fence == null) {
-                self.runMaintenanceUntilWithCancellation(
+                self.runMaintenanceUntilWithEnrichmentCompletion(
                     target_sequence,
                     .{},
                     cancellation,
                     maintenance_deadline_ns orelse std.math.maxInt(u64),
+                    if (query_cut != null) .settled_requests else .successful_requests,
                 ) catch |err| switch (err) {
                     error.Cancelled => return error.Canceled,
                     else => return err,
@@ -28655,6 +28656,10 @@ pub const DB = struct {
         return repair_id;
     }
 
+    fn graphReplacementCutoverBudgetNs(activation_attempts: u32) u64 {
+        return (if (activation_attempts >= 8) @as(u64, 1000) else 100) * std.time.ns_per_ms;
+    }
+
     const PreparedGraphReplacement = struct {
         manager: *index_manager_mod.IndexManager,
         sequence: u64,
@@ -28672,8 +28677,7 @@ pub const DB = struct {
             // ordinals retain completed work when either budget expires. A
             // slow storage operation may overrun a quantum, but no loop may
             // hold write admission until an arbitrarily large tail is empty.
-            const pause_ms: u64 = if (candidate.activation_attempts >= 8) 1000 else 100;
-            const deadline = @min(db.graphReplacementWorkNow() +| pause_ms * std.time.ns_per_ms, candidate.deadline_ns orelse std.math.maxInt(u64));
+            const deadline = @min(db.graphReplacementWorkNow() +| graphReplacementCutoverBudgetNs(candidate.activation_attempts), candidate.deadline_ns orelse std.math.maxInt(u64));
             // Freeze writes only for a bounded progress window. Even a tail
             // larger than 1024 can advance its durable checkpoint; it never
             // throws completed work away waiting for an initially small gap.
@@ -28984,10 +28988,12 @@ pub const DB = struct {
     const GraphReplacementIdentity = struct { name: []const u8, generation: u64 };
 
     fn advanceGraphReplacementUntil(self: *DB, deadline: ?u64) !bool {
-        return self.advanceGraphReplacementForIdentityUntil(deadline, null, false);
+        return self.advanceGraphReplacementForIdentityUntil(deadline, null, .manual);
     }
 
-    fn advanceGraphReplacementForIdentityUntil(self: *DB, deadline: ?u64, identity: ?GraphReplacementIdentity, bounded_replay: bool) !bool {
+    const GraphReplacementDrive = enum { manual, detached, cutover };
+
+    fn advanceGraphReplacementForIdentityUntil(self: *DB, deadline: ?u64, identity: ?GraphReplacementIdentity, drive: GraphReplacementDrive) !bool {
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return false;
         if (deadline) |end| if (self.graphReplacementWorkNow() >= end) return self.hasPendingGraphReplacements();
         if (!self.graph_replacement_mutex.tryLock()) return self.hasPendingGraphReplacements();
@@ -29017,14 +29023,19 @@ pub const DB = struct {
                 try self.core.index_manager.saveGraphReplacementBuild(self.core.store, saved);
             }
             if (saved.retry_after_ns > retry_now) continue;
+            // The native cutover shares the tail's finite escalation policy.
+            const work_deadline = if (drive == .cutover)
+                self.graphReplacementWorkNow() +| graphReplacementCutoverBudgetNs(saved.activation_attempts)
+            else
+                deadline;
             const pending = blk: {
                 // Detached shadow turns use generation-scoped, per-write
                 // publication admission. Holding the connection lease across
                 // producer append would reenter GeneratedPublication.commit.
-                const admission = if (bounded_replay) null else self.graph_replacement_admission;
+                const admission = if (drive == .detached) null else self.graph_replacement_admission;
                 if (admission) |lease| try GraphReplacementAdmissionBoundary.call("enter", lease.dispatch, lease.enter, .{lease.ptr});
                 defer if (admission) |lease| lease.leave(lease.ptr);
-                break :blk self.advanceGraphReplacementOnce(deadline, saved, bounded_replay);
+                break :blk self.advanceGraphReplacementOnce(work_deadline, saved, drive == .detached);
             };
             return pending catch |err| {
                 if (err == error.Canceled or err == error.Cancelled or err == error.EnrichmentWaitCanceled) {
@@ -29440,7 +29451,7 @@ pub const DB = struct {
             // corpus builds. Recheck its generation under scheduler ownership
             // so cancellation/name reuse cannot redirect this quantum.
             try self.driveManualGraphReplacementReplay(pending.producer_replay_target, deadline);
-            _ = try self.advanceGraphReplacementForIdentityUntil(deadline, .{ .name = name, .generation = generation }, false);
+            _ = try self.advanceGraphReplacementForIdentityUntil(deadline, .{ .name = name, .generation = generation }, .manual);
             // The control IO also exists for manual/inline runtimes. Never
             // spin when there is no independent background IO runtime.
             try self.core.index_manager.checkpointIo().sleep(.fromMilliseconds(1), .awake);
@@ -31705,6 +31716,19 @@ pub const DB = struct {
         cancellation: types.CancellationToken,
         deadline_ns: u64,
     ) !void {
+        return self.runMaintenanceUntilWithEnrichmentCompletion(sequence, sync_targets, cancellation, deadline_ns, .successful_requests);
+    }
+
+    const EnrichmentCompletion = enum { successful_requests, settled_requests };
+
+    fn runMaintenanceUntilWithEnrichmentCompletion(
+        self: *DB,
+        sequence: u64,
+        sync_targets: ManagedSyncTargets,
+        cancellation: types.CancellationToken,
+        deadline_ns: u64,
+        completion: EnrichmentCompletion,
+    ) !void {
         const wait = derived_executor_mod.VisibilityWait{
             .cancellation = cancellation,
             .deadline_ns = deadline_ns,
@@ -31712,7 +31736,14 @@ pub const DB = struct {
         };
         var stable_target = sequence;
         while (true) {
-            try self.runEnrichmentUntilWithVisibilityDeadline(stable_target, cancellation, deadline_ns);
+            const outcome = self.runEnrichmentUntilWithVisibilityDeadline(stable_target, cancellation, deadline_ns);
+            outcome catch |err| {
+                if (completion != .settled_requests or err != error.EnrichmentWorkerFailed) return err;
+            };
+            // A completed watermark alone does not prove owner health. This
+            // also runs when the visibility wait took its already-applied path.
+            if (completion == .settled_requests) if (self.enrichment_runtime) |runtime|
+                try runtime.requireSettledForQueryCapture(stable_target);
             try self.runDerivedUntilWithVisibilityWait(stable_target, wait);
 
             const next_target = self.core.nextDerivedSequence();
@@ -33553,7 +33584,7 @@ pub const DB = struct {
     /// publication fence. Producer replay runs in the separate detached turn.
     pub fn finishBackgroundGraphReplacement(self: *DB, name: []const u8, generation: u64) !bool {
         if (comptime storage_engine.enabled) return storage_engine.call("finishBackgroundGraphReplacement", .{ self, name, generation });
-        return self.advanceGraphReplacementForIdentityUntil(self.graphReplacementWorkNow() +| 100 * std.time.ns_per_ms, .{ .name = name, .generation = generation }, false);
+        return self.advanceGraphReplacementForIdentityUntil(null, .{ .name = name, .generation = generation }, .cutover);
     }
 
     /// Detached Lite turns alternate replay with generation-scoped shadow
@@ -33567,7 +33598,7 @@ pub const DB = struct {
                 if (self.resolution_runtime == null) try self.initResolutionRuntime();
                 if (self.promotion_runtime == null) try self.initPromotionRuntime();
             }
-            return self.advanceGraphReplacementForIdentityUntil(null, null, true);
+            return self.advanceGraphReplacementForIdentityUntil(null, null, .detached);
         }
         const before = self.core.nextDerivedSequence();
         try self.runUntilIdleWithReplayDrainOptions(.{
@@ -40436,6 +40467,11 @@ pub const DB = struct {
         var fallback_opts = opts;
         if (columnar_progress.delivered != 0) fallback_opts.inclusive_from = false;
 
+        var stream_plan = if (visitor.borrow_documents and opts.include_documents and !projection_plan.special.all_artifacts and !projection_plan.special.all_chunks and !projection_plan.special.all_embeddings)
+            try @import("document_query.zig").SpanProjectionPlan.init(alloc, .{ .fields = opts.fields, .include_all_fields = opts.include_all_fields })
+        else
+            null;
+        defer if (stream_plan) |*plan| plan.deinit();
         const ScanState = struct {
             const max_resident_schema_plans = 32;
             const SchemaPlan = struct {
@@ -40463,6 +40499,7 @@ pub const DB = struct {
             now_ns: u64,
             filter: ?*db_query_graph.PreparedPatternFilter,
             direct_projection_fields: ?[]const []const u8,
+            stream_plan: ?*const @import("document_query.zig").SpanProjectionPlan,
             read_txn: *docstore_mod.DocStore.Txn,
             projection_context: *TransactionProjectionContext,
             values_authenticated: bool,
@@ -40649,17 +40686,24 @@ pub const DB = struct {
                     ordinal_filter_match = try filter.matches(state.alloc, raw_key, ordinal_row.?);
                     if (ordinal_filter_match == false) return .@"continue";
                 };
+                const stream_whole_row = relational and state.visitor.borrow_documents and state.opts.include_documents and state.opts.fields.len == 0 and state.opts.include_all_fields;
                 const needs_logical_value = !relational or semantic_hash == null or
                     (state.filter != null and ordinal_filter_match == null) or
-                    (state.opts.include_documents and state.direct_projection_fields == null);
-                const logical_value = if (needs_logical_value)
+                    (state.opts.include_documents and state.direct_projection_fields == null and !stream_whole_row);
+                // Scan callbacks pin their borrowed storage slices until they
+                // return. A synchronous plain-document producer can keep that
+                // borrow instead of copying the entire input before projection.
+                const borrow_plain = !relational and state.visitor.borrow_documents and state.stream_plan != null;
+                const logical_value: ?[]const u8 = if (needs_logical_value)
                     if (ordinal_row) |row|
                         try row.reconstructValueAlloc(state.alloc)
+                    else if (borrow_plain)
+                        stored_value
                     else
                         try state.alloc.dupe(u8, stored_value)
                 else
                     null;
-                defer if (logical_value) |value| state.alloc.free(value);
+                defer if (logical_value) |value| if (!borrow_plain) state.alloc.free(value);
 
                 if (state.filter) |filter| if (ordinal_filter_match == null)
                     if (!(try filter.matchesStored(state.alloc, raw_key, logical_value.?)))
@@ -40672,7 +40716,15 @@ pub const DB = struct {
                     else
                         try document_content_hash.hashJson(state.alloc, logical_value.?);
                 }
-                const projected = if (state.opts.include_documents)
+                var streamed: ?@import("query/streamed_projection.zig").Context = null;
+                if (state.visitor.borrow_documents and state.opts.include_documents) {
+                    if (ordinal_row) |row| {
+                        if (stream_whole_row) {
+                            streamed = .{ .scratch = state.alloc, .value = .{ .whole_row = row } };
+                        } else if (row_plan.?.projection) |plan| streamed = .{ .scratch = state.alloc, .value = .{ .row = .{ .plan = plan, .row = row } } };
+                    } else if (state.stream_plan) |plan| streamed = .{ .scratch = state.alloc, .value = .{ .document = .{ .plan = plan, .raw = logical_value.? } } };
+                }
+                const projected = if (state.opts.include_documents and streamed == null)
                     if (state.direct_projection_fields) |_|
                         if (ordinal_row) |row|
                             try row_plan.?.projection.?.project(state.alloc, row)
@@ -40689,6 +40741,9 @@ pub const DB = struct {
                 else
                     null;
                 defer if (projected) |document| state.alloc.free(document);
+                if (streamed == null and state.visitor.borrow_documents) if (projected) |json| {
+                    streamed = .{ .scratch = state.alloc, .value = .{ .json_fields = json } };
+                };
 
                 try state.visitor.visitEntry(.{
                     .id = raw_key,
@@ -40700,7 +40755,8 @@ pub const DB = struct {
                     else
                         std.hash.Wyhash.hash(0, logical_value.?),
                     .content_hash = content_hash,
-                    .document_json = projected,
+                    .document_json = if (streamed == null) projected else null,
+                    .document_stream = if (streamed) |*context| context.borrow() else null,
                 });
 
                 state.count += 1;
@@ -40719,6 +40775,7 @@ pub const DB = struct {
             .now_ns = scan_now_ns,
             .filter = if (prepared_filter) |*filter| filter else null,
             .direct_projection_fields = direct_projection_fields,
+            .stream_plan = if (stream_plan) |*plan| plan else null,
             .read_txn = &read_txn,
             .projection_context = &projection_context,
             .values_authenticated = self.core.store.valuesAreAuthenticated(),
@@ -65272,7 +65329,10 @@ test "relational columnar selected payload pages bound wide projection reads" {
         try std.testing.expectEqualDeep(all.documents[0], filtered.documents[0]);
         try std.testing.expectEqualDeep(all.documents[63], filtered.documents[1]);
         try std.testing.expect(filtered_stats.payload_bytes_read * 4 < all_stats.payload_bytes_read);
-        try std.testing.expectEqual(@as(u64, 2), filtered_stats.values_materialized);
+        // Typed predicates and borrowed text projection need neither logical
+        // value materialization nor a block-owned logical cache.
+        try std.testing.expectEqual(@as(u64, 0), filtered_stats.values_materialized);
+        try std.testing.expectEqual(@as(u64, 0), filtered_stats.logical_slots_initialized);
         // Equivalent predicate order must not force wide payload reads.
         const reversed_filter = try std.fmt.allocPrint(scratch, "{{\"conjuncts\":[{{\"term\":{{\"payload\":\"{s}\"}}}},{{\"term\":{{\"n\":0}}}}]}}", .{payloads[0]});
         var reversed_stats: types.ColumnarScanStats = .{};
@@ -67999,6 +68059,79 @@ test "relational columnar typed masks avoid vector expansion and eliminated colu
             try std.testing.expectEqualDeep(baseline[i].hashes[0..@min(limit, baseline[i].hashes.len)], limited.hashes);
         }
     }
+    // Projecting an indexed component and a complete JSON column must borrow
+    // the pinned payloads without filling block-owned logical-value slots.
+    var projection_stats: types.ColumnarScanStats = .{};
+    var projected = try db.scan(alloc, "", "", .{
+        .include_documents = true,
+        .include_all_fields = false,
+        .fields = &.{ "embedding.0", "payload" },
+        .columnar_stats = &projection_stats,
+    });
+    defer projected.deinit(alloc);
+    try std.testing.expect(projection_stats.used);
+    try std.testing.expectEqualStrings("{\"embedding\":[1],\"payload\":[1,2]}", projected.documents[0].json);
+    try std.testing.expectEqual(@as(u64, 0), projection_stats.values_materialized);
+    try std.testing.expectEqual(@as(u64, 0), projection_stats.logical_slots_initialized);
+    const Stream = struct {
+        expected: []const types.ScanDocument,
+        count: usize = 0,
+        fail: bool = false,
+        fn visit(ptr: ?*anyopaque, entry: types.ScanVisitEntry) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr.?));
+            try std.testing.expect(entry.document_json == null);
+            const borrowed = entry.document_stream orelse return error.TestUnexpectedResult;
+            var writer = std.Io.Writer.Allocating.init(std.testing.allocator);
+            defer writer.deinit();
+            try borrowed.writeFields(&writer.writer);
+            const expected = self.expected[self.count];
+            try std.testing.expectEqualStrings(expected.id, entry.id);
+            if (expected.json.len == 2) try std.testing.expectEqual(@as(usize, 0), writer.written().len) else {
+                try std.testing.expectEqual(@as(u8, ','), writer.written()[0]);
+                try std.testing.expectEqualStrings(expected.json[1 .. expected.json.len - 1], writer.written()[1..]);
+            }
+            self.count += 1;
+            if (self.fail) return error.Canceled;
+        }
+    };
+    var stream: Stream = .{ .expected = projected.documents };
+    const streaming_opts: types.ScanOptions = .{ .include_documents = true, .include_all_fields = false, .fields = &.{ "embedding.0", "payload" } };
+    try db.scanVisit(alloc, "", "", streaming_opts, .{ .context = &stream, .visit = Stream.visit, .borrow_documents = true });
+    try std.testing.expectEqual(projected.documents.len, stream.count);
+    stream.count = 0;
+    stream.fail = true;
+    try std.testing.expectError(error.Canceled, db.scanVisit(alloc, "", "", streaming_opts, .{ .context = &stream, .visit = Stream.visit, .borrow_documents = true }));
+    try std.testing.expectEqual(@as(usize, 1), stream.count);
+    // Dirty owners must use the same borrowed contract through the primary
+    // fallback, with no stale page payload and no duplicate delivery.
+    try db.batch(.{ .writes = &.{.{ .key = "a", .value = "{\"n\":2,\"embedding\":[9],\"payload\":[4]}" }} });
+    var dirty = try db.scan(alloc, "", "", streaming_opts);
+    defer dirty.deinit(alloc);
+    stream = .{ .expected = dirty.documents };
+    var dirty_stats: types.ColumnarScanStats = .{};
+    var dirty_opts = streaming_opts;
+    dirty_opts.columnar_stats = &dirty_stats;
+    try db.scanVisit(alloc, "", "", dirty_opts, .{ .context = &stream, .visit = Stream.visit, .borrow_documents = true });
+    try std.testing.expectEqual(dirty.documents.len, stream.count);
+    try std.testing.expect(dirty_stats.primary_rows_read > 0);
+    for ([_]bool{ false, true }) |disable_columnar| {
+        var whole = try db.scan(alloc, "", "", .{ .include_documents = true });
+        defer whole.deinit(alloc);
+        stream = .{ .expected = whole.documents };
+        try db.scanVisit(alloc, "", "", .{ .include_documents = true, .disable_columnar_scan = disable_columnar }, .{ .context = &stream, .visit = Stream.visit, .borrow_documents = true });
+        try std.testing.expectEqual(whole.documents.len, stream.count);
+    }
+    // A small LIMIT keeps the clean covered-row path in columnar execution;
+    // its borrowed primary scope must stay alive through producer completion.
+    try std.testing.expect(try db.rebuildRelationalColumns());
+    var first = try db.scan(alloc, "", "", .{ .include_documents = true, .limit = 1 });
+    defer first.deinit(alloc);
+    stream = .{ .expected = first.documents };
+    var full_stats: types.ColumnarScanStats = .{};
+    try db.scanVisit(alloc, "", "", .{ .include_documents = true, .limit = 1, .columnar_stats = &full_stats }, .{ .context = &stream, .visit = Stream.visit, .borrow_documents = true });
+    try std.testing.expectEqual(first.documents.len, stream.count);
+    try std.testing.expect(full_stats.used);
+    try std.testing.expectEqual(@as(u64, 1), full_stats.primary_rows_read);
 }
 
 test "relational columnar bounded compaction splits empty ranges and resumes canceled staging" {
@@ -71413,6 +71546,70 @@ test "db index catalog barrier canceled query capture unwinds staging and permit
     try db.captureQueryCut(request, .{});
     try @import("native_query_cut.zig").validate(alloc, io, root, request, db.core.identity_namespace, .{});
     try std.testing.expect(!db.indexCatalogBarrierActive());
+}
+
+test "db query capture retains settled terminal repair debt without acknowledging visibility" {
+    const Fixture = struct {
+        fn produce(_: *anyopaque, _: Allocator, _: asset_producer_mod.Request) ![]u8 {
+            return error.InvalidExtractorResponse;
+        }
+    };
+    const alloc = std.testing.allocator;
+    var tmp = try TestDirectory.init("query-terminal-debt");
+    defer tmp.cleanup();
+    const pins = try std.fmt.allocPrint(alloc, "{s}.query-pins", .{tmp.path()});
+    defer alloc.free(pins);
+    defer std.Io.Dir.cwd().deleteTree(std.testing.io, pins) catch {};
+    var db = try DB.open(alloc, tmp.path(), .{
+        .identity_namespace = .{ .table_id = 7, .shard_id = 1, .range_id = 1 },
+        .start_optional_runtimes = false,
+        .start_optional_runtime_workers = false,
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer db.close();
+    try db.addEnrichment(.{ .name = "broken", .kind = .asset, .field = "body", .producer_json = "{\"type\":\"generator\",\"config\":{\"provider\":\"mock\"}}" });
+    var fixture: u8 = 0;
+    var config: enrichment_runtime_mod.Config = .{ .asset_producer = .{ .ptr = &fixture, .vtable = &.{ .produce = Fixture.produce, .invocation_memory_for_requests = GateAssetProducer.invocationMemory } } };
+    try db.initOptionalEnrichmentRuntime(&config);
+    try db.batch(.{ .writes = &.{.{ .key = "doc", .value = "{\"body\":\"broken input\"}" }}, .sync_level = .write });
+    const runtime = db.enrichment_runtime.?;
+    const sequence = db.core.nextDerivedSequence();
+    try std.testing.expectError(error.EnrichmentWorkerFailed, runtime.catchUpUntilForDrain(sequence));
+    try std.testing.expect(runtime.stats().applied_sequence >= sequence);
+    try std.testing.expectError(error.EnrichmentWorkerFailed, db.runMaintenanceUntilWithCancellation(sequence, .{}, .none, std.math.maxInt(u64)));
+
+    const id: [64]u8 = @splat('b');
+    const request: @import("native_query_cut.zig").Request = .{
+        .id = &id,
+        .table_id = 7,
+        .expires_ms = @import("native_query_cut.zig").nowMs() + 300_000,
+        .create = true,
+    };
+    // An applied watermark is insufficient when the owner itself is unhealthy.
+    try runtime.catchUpUntil(db.core.nextDerivedSequence());
+    try std.testing.expect(runtime.stats().applied_sequence >= db.core.nextDerivedSequence());
+    runtime.worker_failed = true;
+    try std.testing.expectError(error.EnrichmentWorkerFailed, db.captureQueryCut(request, .none));
+    runtime.worker_failed = false;
+    runtime.retrying = true;
+    runtime.next_retry_at_ms = runtime.clock.nowRealtimeMs() + 60_000;
+    try std.testing.expectError(error.EnrichmentRetryInProgress, db.captureQueryCut(request, .none));
+    runtime.retrying = false;
+    runtime.next_retry_at_ms = 0;
+
+    var retained = try db.openQueryCut(request, .none);
+    defer retained.close();
+    var document = (try retained.getDocument(alloc, "doc", .{})) orelse return error.TestUnexpectedResult;
+    defer document.deinit(alloc);
+    try ant_json.testing.expectSubsetJsonText(alloc, "{\"body\":\"broken input\"}", document.json);
+    const issues = try retained.listArtifactRepairIssues(alloc, .asset, null, 0);
+    defer types.freeArtifactRepairIssues(alloc, issues);
+    try std.testing.expectEqual(@as(usize, 1), issues.len);
+    try std.testing.expectEqualStrings("broken", issues[0].artifact_name);
+    // Capturing reads must neither clear the debt nor turn a later write
+    // visibility acknowledgement into success.
+    try std.testing.expectError(error.EnrichmentWorkerFailed, runtime.catchUpUntilForDrain(sequence));
 }
 
 test "db published dense admission cannot overflow into catalog closure" {
@@ -99401,7 +99598,8 @@ test "db repair queue reprocesses corrupt generated dense embedding artifacts" {
     defer alloc.free(artifact_key);
     const artifact_value = try reopened.core.store.get(alloc, artifact_key);
     defer alloc.free(artifact_value);
-    try expectDenseEmbeddingArtifactValue(alloc, artifact_value, enrichment_artifact_codec.hashSource("repair target text"), 3);
+    // Forced repair advances the generation so cached corrupt work cannot be reused.
+    try expectDenseEmbeddingArtifactValue(alloc, artifact_value, enrichment_artifact_codec.hashEmbeddingSourceForGeneration("repair target text", "", 1), 3);
 }
 
 test "db repair queue reprocesses corrupt chunk generated dense embedding artifacts from parent document" {
@@ -99488,7 +99686,8 @@ test "db repair queue reprocesses corrupt chunk generated dense embedding artifa
     defer alloc.free(artifact_key);
     const artifact_value = try reopened.core.store.get(alloc, artifact_key);
     defer alloc.free(artifact_value);
-    try expectDenseEmbeddingArtifactValue(alloc, artifact_value, enrichment_artifact_codec.hashSource("abcdefgh"), 3);
+    // Forced repair advances the generation so cached corrupt work cannot be reused.
+    try expectDenseEmbeddingArtifactValue(alloc, artifact_value, enrichment_artifact_codec.hashEmbeddingSourceForGeneration("abcdefgh", "", 1), 3);
 }
 
 test "db replay applies sparse embeddings from artifact payloads" {
@@ -139191,7 +139390,7 @@ test "capi resolver escalated deadline bounds tail work and releases queued writ
     DB.test_graph_replacement_tail_batch = Check.batch;
     defer DB.test_graph_replacement_tail_batch = null;
     defer if (Check.thread) |worker| worker.join();
-    try std.testing.expect(try db.advanceGraphReplacement());
+    try std.testing.expect(try db.finishBackgroundGraphReplacement("new", job.generation));
     const io = db.core.index_manager.checkpointIo();
     try Check.done.waitTimeout(io, .{ .duration = .{ .raw = .fromMilliseconds(1500), .clock = .awake } });
     Check.thread.?.join();
@@ -140530,7 +140729,7 @@ test "inline resolver replacement named scheduler rejects a reused reservation g
     const current = try db.replaceGraphIndex("old", cfg);
     try std.testing.expect(current != previous);
     // Model reuse between a waiter's observation and scheduler admission.
-    try std.testing.expect(try db.advanceGraphReplacementForIdentityUntil(null, .{ .name = "new", .generation = previous }, false));
+    try std.testing.expect(try db.advanceGraphReplacementForIdentityUntil(null, .{ .name = "new", .generation = previous }, .manual));
     try std.testing.expect(db.indexGeneration("new") == null);
     const jobs = try db.graphReplacementStatusAlloc(a);
     defer jobs.deinit();
@@ -140699,4 +140898,42 @@ test "inline resolver replacement isolates serving graph consumers and releases 
             }
         }
     }
+}
+
+test "public graph metric borrowed wire document scan producers preserve projection and cancellation" {
+    const a = std.testing.allocator;
+    var directory = try TestDirectory.init("db-stream-projection");
+    defer directory.cleanup();
+    var db = try DB.open(a, directory.path(), .{ .start_optional_runtimes = false });
+    defer db.close();
+    try db.batch(.{ .writes = &.{
+        .{ .key = "a", .value = "{\"title\":\"first\",\"unselected\":false}" },
+        .{ .key = "b", .value = "{\"title\":\"second\"}" },
+    } });
+    const Visitor = struct {
+        count: usize = 0,
+        fail: bool = false,
+        whole: bool = false,
+        fn visit(ptr: ?*anyopaque, entry: types.ScanVisitEntry) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr.?));
+            try std.testing.expect(entry.document_json == null);
+            const producer = entry.document_stream orelse return error.TestUnexpectedResult;
+            var writer = std.Io.Writer.Allocating.init(std.testing.allocator);
+            defer writer.deinit();
+            try producer.writeFields(&writer.writer);
+            try std.testing.expectEqualStrings(if (self.count == 0) (if (self.whole) ",\"title\":\"first\",\"unselected\":false" else ",\"title\":\"first\"") else ",\"title\":\"second\"", writer.written());
+            self.count += 1;
+            if (self.fail) return error.Canceled;
+        }
+    };
+    var visitor: Visitor = .{};
+    const opts: types.ScanOptions = .{ .include_documents = true, .include_all_fields = false, .fields = &.{"title"} };
+    try db.scanVisit(a, "", "", opts, .{ .context = &visitor, .visit = Visitor.visit, .borrow_documents = true });
+    try std.testing.expectEqual(@as(usize, 2), visitor.count);
+    visitor = .{ .whole = true };
+    try db.scanVisit(a, "", "", .{ .include_documents = true }, .{ .context = &visitor, .visit = Visitor.visit, .borrow_documents = true });
+    try std.testing.expectEqual(@as(usize, 2), visitor.count);
+    visitor = .{ .fail = true };
+    try std.testing.expectError(error.Canceled, db.scanVisit(a, "", "", opts, .{ .context = &visitor, .visit = Visitor.visit, .borrow_documents = true }));
+    try std.testing.expectEqual(@as(usize, 1), visitor.count);
 }

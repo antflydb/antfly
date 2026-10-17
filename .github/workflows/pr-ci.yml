@@ -53,6 +53,9 @@ jobs:
           CHECK_ID: ${{ inputs.check_id }}
           COMMENT_ID: ${{ inputs.comment_id }}
         with:
+          # Status/check updates are safe to repeat after transient GitHub 5xx.
+          # Permission and validation failures retain the action's 4xx exclusions.
+          retries: 3
           script: |
             const {main} = require('./.github/scripts/pr-ci.cjs');
             await main({github, context, core, mode: 'admit',
@@ -197,6 +200,9 @@ jobs:
           COMMENT_ID: ${{ inputs.comment_id }}
           RESULT: ${{ needs.result.result }}
         with:
+          # Status/check updates are safe to repeat after transient GitHub 5xx.
+          # Permission and validation failures retain the action's 4xx exclusions.
+          retries: 3
           script: |
             const {main} = require('./.github/scripts/pr-ci.cjs');
             await main({github, context, core, mode: 'complete',

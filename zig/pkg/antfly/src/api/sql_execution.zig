@@ -165,6 +165,26 @@ pub const Adapter = struct {
     /// exact serving generation, including a publication changed mid-read.
     policy_proofs: ?std.AutoHashMapUnmanaged(u64, ?[]u8) = null,
     graph_parameters: []const std.json.Value = &.{},
+    graph_parameter_cells: ?[]const @import("antfly_local_sources").sql_scalar.Datum = null,
+    /// Materialize only arguments actually crossing into a graph expression;
+    /// ordinary SQL retains its native parameter frame without a JSON copy.
+    fn graphParameter(self: *Adapter, a: std.mem.Allocator, index: usize) !std.json.Value {
+        if (index == 0) return error.InvalidSqlParameters;
+        if (self.graph_parameter_cells) |cells| {
+            if (index > cells.len) return error.InvalidSqlParameters;
+            const cell = cells[index - 1];
+            if (cell.sql_null) return .null;
+            if (cell.array) |array| return @import("antfly_local_sources").sql_array_wire.toJsonLeaky(a, array.*, .{});
+            if (cell.numeric) |number| {
+                const numeric = @import("antfly_local_sources").sql_numeric_value;
+                var context: numeric.Context = .{ .alloc = a };
+                return .{ .number_string = try numeric.format(&context, number.*) };
+            }
+            return cell.value;
+        }
+        if (index > self.graph_parameters.len) return error.InvalidSqlParameters;
+        return self.graph_parameters[index - 1];
+    }
 
     pub fn decisionRuntime(self: *Adapter) !?@import("antfly_local_sources").functions_runtime.Runtime {
         if (self.server.cfg.node_config) |config| {
@@ -188,6 +208,9 @@ pub const Adapter = struct {
         const previous_graph_parameters = self.graph_parameters;
         self.graph_parameters = parameters;
         defer self.graph_parameters = previous_graph_parameters;
+        const previous_graph_cells = self.graph_parameter_cells;
+        self.graph_parameter_cells = limits.parameter_cells;
+        defer self.graph_parameter_cells = previous_graph_cells;
         const previous_receipt_wait_budget = self.receipt_wait_budget;
         self.receipt_wait_budget = .{};
         defer self.receipt_wait_budget = previous_receipt_wait_budget;
@@ -905,9 +928,9 @@ pub const Adapter = struct {
             for (page.rows, rows) |row, *out| {
                 if (row.schema_version != self.schema_version) return error.CatalogGenerationChanged;
                 if (self.require_primary_digest and row.expected_content_digest == null) return error.InvalidSqlBackendResponse;
-                out.* = try self.projection.adaptBorrowed(page.arena.allocator(), layout, .{ .id = row.id, .version = row.version, .value = row.value, .sql_nulls = row.sql_nulls, .expected_content_digest = row.expected_content_digest, .document = row.document });
+                out.* = try self.projection.adaptBorrowed(page.arena.allocator(), layout, row.sqlRow());
             }
-            return .{ .rows = rows, .after = page.after, .owned_arena = page.arena };
+            return .{ .rows = rows, .after = page.after, .storage_page = page };
         }
 
         fn close(ptr: *anyopaque) void {
@@ -1772,8 +1795,7 @@ pub const Adapter = struct {
                 const parameters = try owned.alloc(cypher.value.Entry, binding.definition.parameters.len);
                 for (binding.definition.parameters, parameters) |name, *parameter| {
                     const index = std.fmt.parseUnsigned(usize, name, 10) catch return error.InvalidSqlParameters;
-                    if (index == 0 or index > self.graph_parameters.len) return error.InvalidSqlParameters;
-                    var value = self.graph_parameters[index - 1];
+                    var value = try self.graphParameter(owned, index);
                     if (index <= request.request.graph_parameter_types.len) if (request.request.graph_parameter_types[index - 1]) |kind| {
                         if (value == .string) value = switch (kind) {
                             .integer => .{ .integer = std.fmt.parseInt(i64, value.string, 10) catch return error.InvalidSqlParameters },
@@ -1912,39 +1934,13 @@ pub const Adapter = struct {
     }
 
     fn scan(ptr: *anyopaque, alloc: std.mem.Allocator, table: catalog.Table, request: catalog.Scan) !catalog.Page {
-        // The stateless wire fallback is relational-only. Document SQL needs
-        // its retained native view to preserve projection/null and TTL semantics.
-        if (table.storage_mode != .relational or request.include_primary_digest) return error.UnsupportedSqlExecution;
-        const self: *Adapter = @ptrCast(@alignCast(ptr));
-        const scan_request = try self.prepareScan(alloc, table, request);
-        const source = self.server.table_reads orelse return error.TableNotFound;
-        var response = (try source.scan(alloc, table.physical_name, scan_request.from, scan_request.to, scan_request.opts, .read_index)) orelse return error.TableNotFound;
-        defer response.deinit(alloc);
-        var rows: std.ArrayList(catalog.Row) = .empty;
-        const projection = try @import("antfly_local_sources").sql_document_row.Projection.init(alloc, table, request.fields);
-        defer projection.deinit(alloc);
-        const layout = try projection.pageLayout(alloc);
-        var lines = std.mem.splitScalar(u8, response.ndjson, '\n');
-        while (lines.next()) |line| {
-            if (line.len == 0) continue;
-            if (rows.items.len >= request.limit) return error.InvalidSqlBackendResponse;
-            const row = try std.json.parseFromSliceLeaky(wire.RelationalRow, alloc, line, .{ .parse_numbers = false, .allocate = .alloc_always });
-            if (request.primary_key) |key| {
-                if (rows.items.len != 0 or !std.mem.eql(u8, row._id, key)) return error.InvalidSqlBackendResponse;
-            }
-            if (row.schema_version != table.schema_version) return error.CatalogGenerationChanged;
-            const sql_nulls = try alloc.alloc(bool, row.row.map.count());
-            for (row.row.map.values(), sql_nulls) |value, *is_null| is_null.* = value == .null;
-            for (row.json_null_fields orelse &.{}) |field| {
-                const column = table.column(field) catch return error.InvalidSqlBackendResponse;
-                if (column.type != .json) return error.InvalidSqlBackendResponse;
-                const index = row.row.map.getIndex(field) orelse return error.InvalidSqlBackendResponse;
-                if (!sql_nulls[index]) return error.InvalidSqlBackendResponse;
-                sql_nulls[index] = false;
-            }
-            try rows.append(alloc, try projection.adaptBorrowed(alloc, layout, .{ .id = row._id, .version = try std.fmt.parseInt(u64, row.version, 10), .value = .{ .object = row.row.map }, .sql_nulls = sql_nulls }));
-        }
-        return .{ .rows = rows.items, .after = if (request.primary_key == null and rows.items.len == request.limit) rows.items[rows.items.len - 1].id else null };
+        // SQL execution requires retained typed pages. Public HTTP/NDJSON
+        // scans have no statement snapshot or native-cell ownership contract;
+        // do not silently choose that transport when a provider lacks SQL.
+        _ = ptr;
+        _ = alloc;
+        if (table.storage_mode == .document or request.include_primary_digest) return error.UnsupportedSqlExecution;
+        return error.SqlStatementSnapshotRequired;
     }
 
     fn prepareMutations(ptr: *anyopaque, alloc: std.mem.Allocator, table: catalog.Table, input: []const catalog.Mutation) ![]const catalog.Mutation {
@@ -3599,7 +3595,7 @@ test "SQL API cross-table MERGE retains both source and target range proofs" {
     try std.testing.expectEqual(attempts_before_proof_failure, fake.commit_attempts);
 }
 
-test "SQL document reads reject the relational stateless fallback before transport" {
+test "SQL stateless fallback rejects JSON scans before transport" {
     var identity: ?http_server.AuthenticatedIdentity = null;
     var io_impl = std.Io.Threaded.init(std.testing.allocator, .{});
     defer io_impl.deinit();
@@ -3608,6 +3604,7 @@ test "SQL document reads reject the relational stateless fallback before transpo
     // poisoned so rejected requests cannot touch those authorities.
     server.embedding_provider_runtime.io = io_impl.io();
     var adapter = Adapter{ .server = &server, .identity = &identity, .context = .{} };
+    try std.testing.expectError(error.SqlStatementSnapshotRequired, Adapter.scan(&adapter, std.testing.allocator, .{ .id = 1, .physical_name = "rows", .schema_version = 1, .storage_mode = .relational, .columns = &.{} }, .{ .fields = &.{}, .limit = 1 }));
     try std.testing.expectError(error.UnsupportedSqlExecution, Adapter.scan(&adapter, std.testing.allocator, .{
         .id = 1,
         .physical_name = "docs",
@@ -4099,4 +4096,24 @@ test "lake SQL GRAPH_TABLE shared graph joins release every provider allocation"
     try std.testing.expectEqualStrings("b", result.output.rows[0][1].string);
     try std.testing.expectEqual(@as(usize, 1), fake.captures);
     try std.testing.expectEqual(fake.captures, fake.releases);
+}
+
+test "graph arguments borrow native SQL scalars without materializing unrelated parameters" {
+    const scalar = @import("antfly_local_sources").sql_scalar;
+    const numeric = @import("antfly_local_sources").sql_numeric_value;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var context: numeric.Context = .{ .alloc = a };
+    var number = try numeric.parse(&context, "12345678901234567890.125");
+    defer number.deinit();
+    var adapter: Adapter = undefined;
+    adapter.graph_parameters = &.{.{ .integer = 99 }};
+    adapter.graph_parameter_cells = &.{ scalar.Datum.json(.{ .integer = 7 }), scalar.Datum{}, scalar.Datum.typedNumeric(&number.value) };
+    try std.testing.expectEqual(@as(i64, 7), (try adapter.graphParameter(a, 1)).integer);
+    try std.testing.expect((try adapter.graphParameter(a, 2)) == .null);
+    try std.testing.expectEqualStrings("12345678901234567890.125", (try adapter.graphParameter(a, 3)).number_string);
+    try std.testing.expectError(error.InvalidSqlParameters, adapter.graphParameter(a, 4));
+    adapter.graph_parameter_cells = null;
+    try std.testing.expectEqual(@as(i64, 99), (try adapter.graphParameter(a, 1)).integer);
 }
