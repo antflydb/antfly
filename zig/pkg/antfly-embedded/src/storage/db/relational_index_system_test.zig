@@ -28,6 +28,232 @@ const time = @import("antfly_platform").time;
 const alloc = std.testing.allocator;
 const docstore = @import("../docstore.zig");
 
+test "relational index system Raft owner controls commit authentic phase cuts atomically and recover" {
+    const api = @import("../../schema/mod.zig");
+    const compiler = @import("../../schema/relational_declarations.zig");
+    const catalog = @import("relational_integrity_catalog.zig");
+    const candidates = @import("relational_index_candidate.zig");
+    const jobs = @import("relational_index_owner_job.zig");
+    const raft = @import("relational_index_raft_control.zig");
+    const receipts = @import("apply_receipts.zig");
+    const before =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"integer"},"email":{"type":"string"}},"additionalProperties":false}}}}
+    ;
+    const after =
+        \\{"version":2,"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"integer"},"email":{"type":"string"}},"additionalProperties":false}}},"relational_indexes":[{"name":"email_idx","keys":[{"column":"email"}]}],"unique_constraints":[{"name":"email_idx","origin":"index","columns":["email"]}]}
+    ;
+    var directory = try @import("../../common/test_directory.zig").TestDirectory.init("raft-private-index-cuts");
+    defer directory.cleanup();
+    const options: db_mod.OpenOptions = .{
+        .start_optional_runtimes = false,
+        .primary_backend = .{ .lsm = .{} },
+        .online_source_authority = .raft,
+        .identity_namespace = .{ .table_id = 101, .shard_id = 11, .range_id = 12 },
+    };
+    var db = try db_mod.DB.open(alloc, directory.path(), options);
+    var db_live = true;
+    defer if (db_live) db.close();
+    try db.setSchemaJson(alloc, before);
+    var parsed = try api.parseValidatedTableSchema(alloc, before);
+    defer parsed.deinit(alloc);
+    var prior = try compiler.compileCatalog(alloc, parsed, 101, null);
+    defer prior.deinit();
+    try db.core.store.putBatch(&.{.{ .key = catalog.key, .value = prior.value }}, &.{});
+    try db.applyOrderedCommittedMutation(.{ .writes = &.{.{ .key = "a", .value = "{\"id\":1,\"email\":\"a@example.org\"}" }} }, .{ .term = 1, .index = 1 }, false);
+    var candidate = try candidates.Candidate.prepare(alloc, 101, before, after, prior.value, "email_idx");
+    defer candidate.deinit();
+    const header: raft.Admission = .{
+        .id = @splat(1),
+        .plan_digest = @splat(2),
+        .owner_digest = @splat(3),
+        .ordinal = 0,
+        .fence = .{ .role = .index_build, .transition_id = 7, .attempt = 1, .owner_group_id = 11, .peer_group_id = 11, .namespace = options.identity_namespace.?, .catalog_digest = @import("relational_index_inputs.zig").digest(prior.value) },
+        .candidate_digest = @import("relational_index_inputs.zig").digest(candidate.next.value),
+        .reservation_digest = @import("relational_index_inputs.zig").digest(candidate.reservation.value),
+    };
+    try std.testing.expectError(error.OnlineSourceScopeChanged, db.prepareNativeIndexOwnerAdmission(header, candidate.inputs.bytes));
+    var admission = try db.prepareRaftIndexOwnerAdmission(header, candidate.inputs.bytes);
+    defer admission.deinit();
+    const binding = admission.command.binding;
+    {
+        db.local_execution.restore_staging_required.store(true, .release);
+        defer db.local_execution.restore_staging_required.store(false, .release);
+        try std.testing.expectError(error.RestoreStagingScopeChanged, db.applyCommittedRaftIndexOwnerControl(&admission, 11, .{ .term = 1, .index = 10 }));
+        try std.testing.expectEqual(@as(u64, 1), (try db.orderedApplyReceipt()).?.index);
+    }
+    const PrepareFaults = struct {
+        fn run(a: std.mem.Allocator, database: *db_mod.DB, command: raft.Command) !void {
+            var vtable = a.vtable.*;
+            vtable.resize = std.mem.Allocator.noResize;
+            vtable.remap = std.mem.Allocator.noRemap;
+            const deterministic: std.mem.Allocator = .{ .ptr = a.ptr, .vtable = &vtable };
+            var view = database.core.acquireSchemaView().?;
+            defer view.release();
+            var read = try database.core.store.beginReadTxn();
+            defer read.abort();
+            var prepared = try raft.Prepared.control(deterministic, view, &read, command);
+            defer prepared.deinit();
+            try std.testing.expectEqualDeep(command.binding, prepared.command.binding);
+        }
+    };
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(alloc, PrepareFaults.run, .{ &db, admission.command });
+    {
+        var barrier: @import("antfly_runtime_abi").mutation_barrier.MutationBarrier = .{};
+        var publisher: TestNativeIndexPublisher = .{ .barrier = &barrier };
+        defer if (publisher.payload) |bytes| alloc.free(bytes);
+        db.local_execution.replication_async_batch_mirror = publisher.asMirror();
+        defer db.local_execution.replication_async_batch_mirror = null;
+        try std.testing.expectError(error.ReplicationPublisherUnavailable, db.applyCommittedRaftIndexOwnerControl(&admission, 11, .{ .term = 1, .index = 10 }));
+        try std.testing.expectEqual(@as(usize, 0), publisher.attempts);
+        try std.testing.expectEqual(@as(u64, 1), (try db.orderedApplyReceipt()).?.index);
+    }
+    var wrong = admission.command;
+    wrong.binding.authority = .native;
+    try std.testing.expectError(error.InvalidPrivateIndexOwnerJob, wrong.validate());
+    var early_fence = try db.prepareRaftIndexOwnerControl(.{ .effect = .fenced, .binding = binding });
+    defer early_fence.deinit();
+    try std.testing.expectError(error.PrivateIndexJobRequired, db.applyCommittedRaftIndexOwnerControl(&early_fence, 11, .{ .term = 1, .index = 3 }));
+    try std.testing.expectEqual(@as(u64, 1), (try db.orderedApplyReceipt()).?.index);
+    try std.testing.expectError(error.InvalidOrderedApplyReceipt, db.applyCommittedRaftIndexOwnerControl(&admission, 11, .{ .term = 1, .index = 0 }));
+    try std.testing.expectError(error.PrivateIndexOwnerJobChanged, db.applyCommittedRaftIndexOwnerControl(&admission, 12, .{ .term = 1, .index = 10 }));
+
+    const Fault = struct {
+        child: *docstore.DocStore.Txn,
+        at: usize,
+        writes: usize = 0,
+        pub fn get(self: *@This(), name: []const u8) ![]const u8 {
+            return self.child.get(name);
+        }
+        pub fn openCursor(self: *@This()) !docstore.DocStore.Txn.CursorAdapter {
+            return self.child.openCursor();
+        }
+        fn write(self: *@This()) !void {
+            self.writes += 1;
+            if (self.writes == self.at) return error.InjectedPhaseWriteFailure;
+        }
+        pub fn put(self: *@This(), name: []const u8, value: []const u8) !void {
+            try self.write();
+            try self.child.put(name, value);
+        }
+        pub fn delete(self: *@This(), name: []const u8) !void {
+            try self.write();
+            try self.child.delete(name);
+        }
+        fn probe(database: *db_mod.DB, prepared: *raft.Prepared, entry: receipts.OrderedApplyReceipt) !void {
+            var saved_job: ?jobs.Binding = null;
+            var saved_marker: ?receipts.OrderedApplyReceipt = null;
+            var saved_catalog: [32]u8 = undefined;
+            {
+                var read = try database.core.store.beginReadTxn();
+                defer read.abort();
+                saved_job = try jobs.load(&read);
+                saved_marker = try receipts.readOrderedApplyReceiptTxn(&read);
+                saved_catalog = @import("relational_index_inputs.zig").digest(try read.get(catalog.key));
+            }
+            var completed = false;
+            for (1..64) |at| {
+                const succeeded = attempt: {
+                    var txn = try database.core.store.beginWriteTxn();
+                    defer txn.abort();
+                    var fault: @This() = .{ .child = &txn, .at = at };
+                    const outcome = prepared.stage(database.core, &fault, 11, entry) catch |err| {
+                        try std.testing.expectEqual(error.InjectedPhaseWriteFailure, err);
+                        break :attempt false;
+                    };
+                    try std.testing.expect(!outcome.duplicate);
+                    var bytes: [receipts.ordered_apply_receipt_value_len]u8 = undefined;
+                    const marker_write = receipts.orderedApplyReceiptWrite(entry, &bytes);
+                    fault.put(marker_write.key, marker_write.value) catch |err| {
+                        try std.testing.expectEqual(error.InjectedPhaseWriteFailure, err);
+                        break :attempt false;
+                    };
+                    break :attempt true;
+                };
+                {
+                    var read = try database.core.store.beginReadTxn();
+                    defer read.abort();
+                    try std.testing.expectEqualDeep(saved_job, try jobs.load(&read));
+                    try std.testing.expectEqualDeep(saved_marker, try receipts.readOrderedApplyReceiptTxn(&read));
+                    try std.testing.expectEqual(saved_catalog, @import("relational_index_inputs.zig").digest(try read.get(catalog.key)));
+                    if (saved_job) |job| {
+                        try raft.requireCuts(&read, job);
+                        try @import("relational_index_inputs.zig").require(&read, job.inputs_digest);
+                    } else {
+                        try std.testing.expect(try @import("relational_integrity_topology.zig").current(&read) == null);
+                        try std.testing.expectError(error.NotFound, read.get(@import("relational_index_inputs.zig").key));
+                    }
+                }
+                if (succeeded) {
+                    completed = true;
+                    break;
+                }
+            }
+            try std.testing.expect(completed);
+        }
+    };
+    try Fault.probe(&db, &admission, .{ .term = 1, .index = 10 });
+
+    // A real durable predecessor must resolve before a drained-fence receipt.
+    const transaction = try db.beginTransaction(1);
+    try db.applyCommittedRaftIndexOwnerControl(&admission, 11, .{ .term = 1, .index = 10 });
+    try db.applyCommittedRaftIndexOwnerControl(&admission, 11, .{ .term = 1, .index = 10 });
+    try std.testing.expectError(error.ConflictingOrderedApplyReceipt, db.applyCommittedRaftIndexOwnerControl(&admission, 11, .{ .term = 2, .index = 10 }));
+    try std.testing.expectError(error.TransactionTopologyBusy, db.applyCommittedRaftIndexOwnerControl(&early_fence, 11, .{ .term = 2, .index = 20 }));
+    try std.testing.expectEqual(@as(u64, 10), (try db.orderedApplyReceipt()).?.index);
+    try db.abortTransaction(transaction, 2);
+    try Fault.probe(&db, &early_fence, .{ .term = 2, .index = 20 });
+    try db.applyCommittedRaftIndexOwnerControl(&early_fence, 11, .{ .term = 2, .index = 20 });
+    const fenced = (try db.raftIndexOwnerReceipt(11, binding, .fenced)).?;
+    try std.testing.expect(fenced.position == .raft);
+    try std.testing.expectEqual(@as(u64, 20), fenced.position.raft.index);
+    try std.testing.expectEqual(@as(u64, 2), fenced.position.raft.term);
+    try db.applyCommittedRaftIndexOwnerControl(&early_fence, 11, .{ .term = 3, .index = 25 });
+    try std.testing.expectEqualDeep(fenced, (try db.raftIndexOwnerReceipt(11, binding, .fenced)).?);
+    try std.testing.expectEqual(@as(u64, 25), (try db.orderedApplyReceipt()).?.index);
+    try std.testing.expectError(error.InvalidControlReceiptPosition, db.applyCommittedRaftIndexOwnerControl(&early_fence, 11, .{ .term = 1, .index = 26 }));
+    var reserve = try db.prepareRaftIndexOwnerControl(.{ .effect = .reserved, .binding = binding });
+    defer reserve.deinit();
+    try Fault.probe(&db, &reserve, .{ .term = 3, .index = 30 });
+    try db.applyCommittedRaftIndexOwnerControl(&reserve, 11, .{ .term = 3, .index = 30 });
+    const reserved = (try db.raftIndexOwnerReceipt(11, binding, .reserved)).?;
+    try std.testing.expectEqual(@as(u64, 30), reserved.position.raft.index);
+    try std.testing.expectEqualDeep(fenced, (try db.raftIndexOwnerReceipt(11, binding, .fenced)).?);
+    {
+        var read = try db.core.store.beginReadTxn();
+        defer read.abort();
+        const state = (try @import("../source_authority.zig").load(&read)).?;
+        try std.testing.expectEqual(.raft, state.kind);
+        try std.testing.expectEqual(@as(u64, 0), state.sequence);
+        try std.testing.expectError(error.NotFound, read.get(&jobs.nativeEffectKey(.admitted)));
+        try std.testing.expectEqual(.reserved, (try jobs.load(&read)).?.phase);
+    }
+    db.close();
+    db_live = false;
+    db = try db_mod.DB.open(alloc, directory.path(), options);
+    db_live = true;
+    try std.testing.expectEqualDeep(reserved, (try db.raftIndexOwnerReceipt(11, binding, .reserved)).?);
+    var retry = try db.prepareRaftIndexOwnerControl(.{ .effect = .reserved, .binding = binding });
+    defer retry.deinit();
+    try db.applyCommittedRaftIndexOwnerControl(&retry, 11, .{ .term = 4, .index = 40 });
+    try std.testing.expectEqualDeep(reserved, (try db.raftIndexOwnerReceipt(11, binding, .reserved)).?);
+    try std.testing.expectEqual(@as(u64, 40), (try db.orderedApplyReceipt()).?.index);
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(alloc, PrepareFaults.run, .{ &db, raft.Command{ .effect = .reserved, .binding = binding } });
+    {
+        var cut_key: [raft.prefix.len + 1]u8 = undefined;
+        @memcpy(cut_key[0..raft.prefix.len], raft.prefix);
+        cut_key[raft.prefix.len] = @backingInt(raft.Effect.reserved);
+        const saved = try db.core.store.get(alloc, &cut_key);
+        defer alloc.free(saved);
+        const corrupt = try alloc.dupe(u8, saved);
+        defer alloc.free(corrupt);
+        corrupt[56] ^= 1;
+        try db.core.store.putBatch(&.{.{ .key = &cut_key, .value = corrupt }}, &.{});
+        try std.testing.expectError(error.InvalidControlReceiptPosition, db.raftIndexOwnerReceipt(11, binding, .reserved));
+        try db.core.store.putBatch(&.{.{ .key = &cut_key, .value = saved }}, &.{});
+        try std.testing.expectEqualDeep(reserved, (try db.raftIndexOwnerReceipt(11, binding, .reserved)).?);
+    }
+}
+
 test {
     _ = @import("relational_index_release.zig");
 }

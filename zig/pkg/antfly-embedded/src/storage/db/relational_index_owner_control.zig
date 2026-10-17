@@ -949,7 +949,7 @@ pub const PreparedGenerationValidation = struct {
         try jobs.requireReserved(&read, command.binding);
         var manifest = try inputs.Prepared.load(alloc, &read, command.binding.inputs_digest);
         defer manifest.deinit();
-        var artifacts = try Artifacts.init(alloc, view, &read, manifest.bytes);
+        var artifacts = try Artifacts.init(alloc, view, &read, manifest.bytes, .native);
         defer artifacts.deinit();
         if (!std.mem.eql(u8, &artifacts.unique.generation, &command.expected.generation)) return error.PrivateIndexOwnerJobChanged;
         return .{ .alloc = alloc, .page = try validation.Prepared.replay(alloc, core, &artifacts.addition, command) };
@@ -1549,7 +1549,7 @@ pub const PreparedBuild = struct {
         try jobs.requireReserved(&read, command.binding);
         var manifest = try inputs.Prepared.load(alloc, &read, command.binding.inputs_digest);
         defer manifest.deinit();
-        var artifacts = try Artifacts.init(alloc, view, &read, manifest.bytes);
+        var artifacts = try Artifacts.init(alloc, view, &read, manifest.bytes, .native);
         defer artifacts.deinit();
         if (!std.mem.eql(u8, &artifacts.unique.generation, &command.source.generation) or
             !std.mem.eql(u8, &artifacts.unique.tuple.fingerprint, &command.source.tuple_fingerprint) or
@@ -1901,61 +1901,7 @@ pub const BuildCache = struct {
     }
 };
 
-const Artifacts = struct {
-    candidate: candidate_mod.Candidate,
-    addition: physical.PrivateAddition,
-    unique: struct { tuple: @import("relational_index_keys.zig").TuplePlan, generation: integrity.Generation, nulls_not_distinct: bool },
-
-    fn deinit(self: *Artifacts) void {
-        self.unique.tuple.deinit();
-        self.addition.deinit();
-        self.candidate.deinit();
-    }
-
-    fn init(alloc: Allocator, before: registry.SchemaView, txn: anytype, bytes: []const u8) !Artifacts {
-        const view = try inputs.decode(bytes);
-        const namespace = (try @import("doc_identity.zig").loadNamespaceTxn(txn)) orelse return error.IdentityNamespaceMismatch;
-        _ = try source_authority.require(txn, .native, @import("online_source_contract.zig").namespaceBytes(namespace));
-        var candidate = try candidate_mod.Candidate.prepare(alloc, namespace.table_id, view.before_json, view.after_json, view.predecessor, view.name);
-        errdefer candidate.deinit();
-        var after_schema = try schema_api.parseValidatedTableSchema(alloc, view.after_json);
-        defer after_schema.deinit(alloc);
-        const runtime = try schema_api.deriveRuntimeTableSchema(alloc, after_schema);
-        const epoch = registry.Epoch.createOwned(alloc, runtime) catch |err| {
-            @import("../schema.zig").freeSchema(alloc, runtime);
-            return err;
-        };
-        var after: registry.SchemaView = .{ .epoch = epoch };
-        defer after.release();
-        var declaration_arena = std.heap.ArenaAllocator.init(alloc);
-        defer declaration_arena.deinit();
-        const definitions = (try after_schema.relationalIndexDefinitions(declaration_arena.allocator())) orelse return error.InvalidIndexPublicationCandidate;
-        var existing = try physical.load(alloc, txn);
-        defer if (existing) |*value| value.deinit();
-        const job = try jobs.load(txn);
-        var addition = if (job != null and job.?.phase == .reserved)
-            try jobs.reopenPhysical(alloc, txn, before, after, view.name)
-        else
-            try physical.PrivateAddition.init(alloc, before, after, if (existing) |*value| value else null, definitions, view.name);
-        errdefer addition.deinit();
-        const rules = try after_schema.relationalUniqueDefinitions(declaration_arena.allocator());
-        const unique = for (rules) |rule| {
-            if (std.mem.eql(u8, rule.name, view.name)) break rule;
-        } else return error.InvalidIndexPublicationCandidate;
-        if (unique.deferrable or unique.timing != .immediate or unique.expressions.len != 0 or
-            unique.where_expressions.len != 0 or unique.without_overlaps_period != null) return error.InvalidIndexPublicationCandidate;
-        const keys = if (unique.keys.len != 0) unique.keys else blk: {
-            const result = try declaration_arena.allocator().alloc(@import("../relational_index.zig").RelationalIndexKey, unique.columns.len);
-            for (result, unique.columns) |*entry, column| entry.* = .{ .column = column };
-            break :blk result;
-        };
-        const generation = (candidate.next.catalog.find(.unique, view.name) orelse return error.InvalidIndexPublicationCandidate).generation;
-        const allocation = try @import("relational_integrity_catalog.zig").privateIndexAllocationFromReservation(candidate.reservation.value, inputs.digest(candidate.reservation.value), namespace.table_id);
-        if (!std.mem.eql(u8, &allocation.generation, &generation)) return error.InvalidIndexPublicationCandidate;
-        const tuple = try @import("relational_index_keys.zig").TuplePlan.init(alloc, after.tableSchema().*, after.physicalLayout(), keys);
-        return .{ .candidate = candidate, .addition = addition, .unique = .{ .tuple = tuple, .generation = generation, .nulls_not_distinct = unique.nulls_not_distinct } };
-    }
-};
+const Artifacts = @import("relational_index_preparation.zig").PreparedCandidate;
 
 pub const Prepared = struct {
     pub const ApplyOutcome = Outcome;
@@ -2038,7 +1984,7 @@ pub const Prepared = struct {
     /// Physical allocation comes from the actual local immutable catalog, not
     /// from a coordinator-selected counter. Compile before taking the apply lock.
     pub fn admission(alloc: Allocator, before: registry.SchemaView, txn: anytype, header: Admission, manifest: []const u8) !Prepared {
-        var artifacts = try Artifacts.init(alloc, before, txn, manifest);
+        var artifacts = try Artifacts.init(alloc, before, txn, manifest, .native);
         errdefer artifacts.deinit();
         if (!std.mem.eql(u8, &inputs.digest(artifacts.candidate.next.value), &header.candidate_digest) or
             !std.mem.eql(u8, &inputs.digest(artifacts.candidate.reservation.value), &header.reservation_digest)) return error.InvalidIndexPublicationCandidate;
@@ -2060,12 +2006,12 @@ pub const Prepared = struct {
             defer alloc.free(bytes);
             std.base64.standard.Decoder.decode(bytes, b64) catch return error.InvalidPrivateIndexInputs;
             if (!std.mem.eql(u8, &inputs.digest(bytes), &command.binding.inputs_digest)) return error.InvalidPrivateIndexInputs;
-            prepared.artifacts = try Artifacts.init(alloc, before, txn, bytes);
+            prepared.artifacts = try Artifacts.init(alloc, before, txn, bytes, .native);
             prepared.command.inputs_b64 = try alloc.dupe(u8, b64);
         } else if (command.effect == .reserved) {
             var manifest = try inputs.Prepared.load(alloc, txn, command.binding.inputs_digest);
             defer manifest.deinit();
-            prepared.artifacts = try Artifacts.init(alloc, before, txn, manifest.bytes);
+            prepared.artifacts = try Artifacts.init(alloc, before, txn, manifest.bytes, .native);
         }
         if (prepared.artifacts) |*artifacts| {
             const b = command.binding;

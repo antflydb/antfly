@@ -10297,3 +10297,73 @@ Checkpoint validation (Debug):
 - Formatting, source licensing, the 2,064-source Apache boundary and immutable
   original-inventory audit pass. Cache GC was previewed only; nothing deleted.
   No original cases receive new credit from these component contracts.
+
+### Raft owner admission, drain and reservation kernel (not mounted)
+
+Private UNIQUE candidate preparation now has one authority-neutral implementation
+shared by native and Raft controls. It validates the actual persisted source
+authority; the authority selector is an internal construction parameter, not an
+RPC capability. Parsing, schema/layout compilation and owned immutable inputs
+remain outside apply exclusion.
+
+The Raft kernel has distinct admission, drained-fence and reservation commands.
+The trusted state-machine caller supplies the actual owner group and committed
+term/index separately from the command. Each phase effect and its ordered apply
+watermark share one store transaction. Three checksummed fixed-size slots retain
+the original phase positions, binding the full immutable job and effect.
+Retries at later positions advance the watermark without reburning generations
+or changing the original receipt. Zero/conflicting positions, backward terms,
+foreign groups/namespaces, native authority, stale catalogs and undrained
+predecessors fail closed. No native source clock advances or native receipt is
+minted.
+
+Receipt recovery and cold owner verification check those cuts against the same
+snapshot's applied watermark, schema, catalogs, manifest and topology fence.
+Configured standby/mirror publication remains explicitly unsupported by this
+new apply entry point until its ordered envelope is implemented; the shared
+replication mutation lease follows the existing publisher/snapshot ordering.
+Hidden restore-staging owners are rejected and retain their existing scoped
+restore command path.
+
+The LSM kernel regression exercises original-cut recovery across leader terms
+and cold reopen, duplicate application, pre-admission rejection, predecessor
+transaction drain, corruption rejection, configured-mirror nonadmission,
+allocation-failure ownership and rollback at every phase/marker write boundary.
+These are real storage transaction contracts with supplied committed-entry
+identities, NOT a distributed consensus/leadership qualification.
+
+Complete distributed activation still requires:
+
+- Private data-Raft and standby envelope codecs, strict public nonadmission,
+  decoder support and an all-member durable capability barrier.
+- Authenticated server receiver/proposal dispatch, guarded by the actual
+  leader, owner namespace and immutable metadata decision.
+- Position-aware bounded source/build pages, streaming claims, target
+  provenance and resumable checkpoints using real Raft cuts.
+- Inventory validation, schema/catalog installation, publication coverage and
+  cancellation/release/GC through the same authority-specific transaction path.
+- Metadata's real Raft authority adapter and distributed fault campaigns plus
+  successful execution of the original positive index cases.
+
+Metadata's unsupported-Raft guard is unchanged. No standalone reporter namespace
+or retirement activation is enabled. Original dispositions remain 531 implemented
+/ 132 rejected / 113 superseded / 810 unresolved; these kernel contracts do not
+qualify the unfinished distributed DDL cohort.
+
+Checkpoint validation (Debug):
+
+- After the restore-staging guard, the complete native index suite passes
+  274 contracts plus its Raft snapshot companion, no skips/failures/leaks,
+  51/51 steps in
+  `/private/tmp/antfly-sql-raft-index-control-scoped-final-system-debug.log`.
+- The focused kernel contract, including all allocation-failure and
+  phase/marker rollback probes, passes in
+  `/private/tmp/antfly-sql-raft-index-control-scoped-final-debug.log`.
+- Shared-preparation compatibility: full SQL passes 881 core plus 234 server
+  contracts, four existing opt-in skips, no failures/leaks, 21/21 steps in
+  `/private/tmp/antfly-sql-raft-index-control-final-sql-debug.log`.
+  The native C ABI owner-control gate passes six contracts, no skips,
+  failures or leaks, 52/52 steps in
+  `/private/tmp/antfly-sql-raft-index-control-final-capi-debug.log`.
+- Formatting, source licensing, the 2,066-source Apache boundary and immutable
+  original-inventory audit pass. Cache GC was previewed only; nothing deleted.

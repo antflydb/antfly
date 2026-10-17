@@ -461,7 +461,7 @@ pub fn inspectCancellation(txn: anytype, expected: anytype) !CancellationState {
 /// Shared by live page admission, receipt production and cold recovery. Read
 /// the clock once, then validate only the three fixed slots; never scan history.
 fn requireNativeCuts(txn: anytype, job: Binding) !void {
-    if (job.authority != .native) return;
+    if (job.authority == .raft) return @import("relational_index_raft_control.zig").requireCuts(txn, job);
     const state = try source_authority.require(txn, .native, @import("online_source_contract.zig").namespaceBytes(job.fence.namespace));
     const admitted = (try readNativeCutAt(txn, job, .admitted, state)) orelse return error.InvalidPrivateIndexNativeReceipt;
     const fenced = try readNativeCutAt(txn, job, .fenced, state);

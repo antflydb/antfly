@@ -45,6 +45,19 @@ pub fn readOrderedApplyReceipt(
         else => return err,
     };
     defer alloc.free(raw);
+    return try decodeOrderedReceipt(raw);
+}
+
+/// Borrow only until decoding finishes; another transaction read may reuse it.
+pub fn readOrderedApplyReceiptTxn(txn: anytype) !?OrderedApplyReceipt {
+    const raw = txn.get(&internal_keys.ordered_document_applied_entry_key) catch |err| {
+        if (err == error.NotFound) return null;
+        return err;
+    };
+    return try decodeOrderedReceipt(raw);
+}
+
+fn decodeOrderedReceipt(raw: []const u8) !OrderedApplyReceipt {
     if (raw.len != ordered_apply_receipt_value_len) return error.CorruptOrderedApplyReceipt;
     const identity: OrderedApplyReceipt = .{
         .term = std.mem.readInt(u64, raw[0..8], .little),

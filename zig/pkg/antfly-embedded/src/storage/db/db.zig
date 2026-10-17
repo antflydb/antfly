@@ -8083,6 +8083,70 @@ pub const DB = struct {
         try self.batchInternal(request, null, options);
     }
 
+    pub const RaftIndexOwnerControl = @import("relational_index_raft_control.zig");
+
+    pub fn prepareRaftIndexOwnerAdmission(self: *DB, header: RaftIndexOwnerControl.Admission, manifest: []const u8) !RaftIndexOwnerControl.Prepared {
+        var view = self.core.acquireSchemaView() orelse return error.RelationalTableRequired;
+        defer view.release();
+        var txn = try self.core.store.beginReadTxn();
+        defer txn.abort();
+        return RaftIndexOwnerControl.Prepared.admission(self.alloc, view, &txn, header, manifest);
+    }
+
+    pub fn prepareRaftIndexOwnerControl(self: *DB, command: RaftIndexOwnerControl.Command) !RaftIndexOwnerControl.Prepared {
+        var view = self.core.acquireSchemaView() orelse return error.RelationalTableRequired;
+        defer view.release();
+        var txn = try self.core.store.beginReadTxn();
+        defer txn.abort();
+        return RaftIndexOwnerControl.Prepared.control(self.alloc, view, &txn, command);
+    }
+
+    /// Trusted committed-entry apply only. The position is supplied by the
+    /// state machine, not decoded from the command. Effects and the replay
+    /// watermark commit together; preparation never runs under apply exclusion.
+    pub fn applyCommittedRaftIndexOwnerControl(self: *DB, prepared: *RaftIndexOwnerControl.Prepared, owner_group: u64, entry: OrderedApplyReceipt) !void {
+        if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
+        if (self.local_execution.restore_staging_required.load(.acquire)) return error.RestoreStagingScopeChanged;
+        try prepared.command.validate();
+        if (owner_group == 0 or owner_group != prepared.command.binding.fence.owner_group_id) return error.PrivateIndexOwnerJobChanged;
+        if (!prepared.command.binding.fence.namespace.eql(self.core.identity_namespace)) return error.IdentityNamespaceMismatch;
+        // Until the ordered standby envelope carries this control, fail closed
+        // for configured mirrors instead of committing an unmirrored effect.
+        var replication_mutation = self.acquireReplicationMutationShared();
+        defer if (replication_mutation) |*lease| lease.release();
+        if (self.local_execution.replication_async_batch_mirror != null or self.local_execution.replication_async_metadata_mirror != null or
+            self.local_execution.replication_async_effect_mirror != null or self.local_execution.replication_write_gate != null) return error.ReplicationPublisherUnavailable;
+        var mutation = self.core.snapshot_admission.acquireMutation();
+        defer mutation.release();
+        var replay_mutation = try self.acquireSnapshotReplayMutation();
+        defer replay_mutation.release();
+        try self.lockApplyForPortableRuntime();
+        defer self.core.unlockApply();
+        var txn = try self.core.store.beginWriteTxn();
+        errdefer txn.abort();
+        const prior = try apply_receipts.readOrderedApplyReceiptTxn(&txn);
+        if (try orderedApplyDisposition(prior, entry) == .already_applied) {
+            txn.abort();
+            return;
+        }
+        _ = try prepared.stage(self.core, &txn, owner_group, entry);
+        var marker_bytes: [ordered_apply_receipt_value_len]u8 = undefined;
+        const marker_write = orderedApplyReceiptWrite(entry, &marker_bytes);
+        try txn.put(marker_write.key, marker_write.value);
+        try txn.commit();
+    }
+
+    /// Recovery reads the original committed phase cut; it never uses the
+    /// current leader term or invents a receipt from the latest watermark.
+    pub fn raftIndexOwnerReceipt(self: *DB, owner_group: u64, binding: @import("relational_index_owner_job.zig").Binding, effect: RaftIndexOwnerControl.Effect) !?@import("relational_index_publication_progress.zig").Receipt {
+        if (owner_group == 0 or owner_group != binding.fence.owner_group_id) return error.PrivateIndexOwnerJobChanged;
+        if (!binding.fence.namespace.eql(self.core.identity_namespace)) return error.IdentityNamespaceMismatch;
+        var txn = try self.core.store.beginReadTxn();
+        defer txn.abort();
+        if (try @import("relational_index_owner_job.zig").load(&txn) == null) return null;
+        return RaftIndexOwnerControl.receipt(&txn, binding, effect);
+    }
+
     pub const NativeIndexOwnerAdmission = native_index_control.Admission;
     pub const NativeIndexOwnerCommand = native_index_control.Command;
     pub const PreparedNativeIndexOwnerControl = native_index_control.Prepared;
