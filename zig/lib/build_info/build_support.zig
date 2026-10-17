@@ -23,6 +23,11 @@ pub const BuildInfo = struct {
     /// unit tests import `module` directly and must not depend on `object`.
     pub fn link(self: BuildInfo, module: *std.Build.Module) void {
         module.addImport("build_info", self.module);
+        // Composition layers can share a final module. Deduplicate within
+        // that module, while each independent image still owns its metadata.
+        for (module.link_objects.items) |input| {
+            if (input == .other_step and input.other_step == self.object) return;
+        }
         module.addObject(self.object);
     }
 };

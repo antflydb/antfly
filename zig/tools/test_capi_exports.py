@@ -173,6 +173,48 @@ else:
             shutil.copyfile(zig_root / relative, destination)
 
     @unittest.skipUnless(shutil.which("zig"), "Zig compiler required")
+    def test_release_metadata_is_linked_once_per_final_image(self):
+        self.copy_native_build_support()
+        (self.root / "api.zig").write_text("""
+export fn antfly_first() c_int { return @intCast(@import("build_info").version().len); }
+export fn antfly_second(_: c_int) void {}
+""")
+        (self.root / "build.zig").write_text("""
+const std = @import("std");
+const metadata = @import("lib/build_info/build_support.zig");
+pub fn build(b: *std.Build) void {
+    const target = b.standardTargetOptions(.{});
+    const info = metadata.create(b, .{ .root = b.path("lib/build_info"), .target = target, .optimize = .fast, .version = "0.3.0-rc.1" });
+    for ([_][]const u8{ "metadata-first", "metadata-second" }) |name| {
+        // Repeated requests within one final image deduplicate, while each
+        // independent image must still own its own version object.
+        const api = b.createModule(.{ .root_source_file = b.path("api.zig"), .target = target, .optimize = .fast, .pic = true });
+        info.link(api);
+        info.link(api);
+        const library = b.addLibrary(.{ .name = name, .linkage = .dynamic, .root_module = api, .use_llvm = true, .use_lld = true });
+        library.link_z_defs = true;
+        b.installArtifact(library);
+    }
+}
+""")
+        for target in ("x86_64-linux-gnu", "aarch64-linux-gnu"):
+            with self.subTest(target=target):
+                result = run_fixture_build(
+                    [
+                        "zig",
+                        "build",
+                        f"-Dtarget={target}",
+                        "--prefix",
+                        str(self.root / target),
+                    ],
+                    self.root,
+                )
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                for name in ("metadata-first", "metadata-second"):
+                    library = self.root / target / f"lib/lib{name}.so"
+                    self.assertEqual(library.read_bytes()[:4], b"\x7fELF")
+
+    @unittest.skipUnless(shutil.which("zig"), "Zig compiler required")
     def test_private_engine_final_links_are_target_and_image_scoped(self):
         self.copy_native_build_support()
         local = self.root / "pkg/antfly-embedded/src"
