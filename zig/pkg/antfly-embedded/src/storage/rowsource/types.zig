@@ -143,6 +143,7 @@ pub fn DictionaryNumeric(comptime T: type) type {
 /// Fixed scale belongs to the column; coefficients never pass through text
 /// inside the SQL pipeline. Payload ownership follows the enclosing page.
 pub const Decimal128 = struct {
+    pub const max_text_bytes = 41;
     values: []const i128,
     precision: i32,
     scale: i32,
@@ -255,6 +256,16 @@ pub const ColumnVector = struct {
             .dictionary_bytes => |values| values.values[values.indices[row]],
             else => error.RowSourceColumnKindMismatch,
         };
+    }
+
+    /// Raw/string consumers can format fixed decimals into caller scratch;
+    /// semantic NUMERIC consumers keep the coefficient vector instead.
+    pub fn bytesAtScratch(self: ColumnVector, row: usize, scratch: []u8) ![]const u8 {
+        if (self.values == .decimal128) {
+            var buffer = std.heap.FixedBufferAllocator.init(scratch);
+            return self.values.decimal128.text(buffer.allocator(), row);
+        }
+        return self.bytesAt(row);
     }
 
     /// Dictionary identity is local to this column's retained page. Null slots

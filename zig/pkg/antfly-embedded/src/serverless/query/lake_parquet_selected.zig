@@ -44,8 +44,17 @@ pub fn create(a: A, chunk: Chunk, header: page.Header, encoded: []const u8, dict
     const kind: @FieldType(Self, "kind") = if (std.mem.eql(u8, chunk.physical_type, "int64") or std.mem.eql(u8, chunk.physical_type, "int32")) .integer else if (std.mem.eql(u8, chunk.physical_type, "float") or std.mem.eql(u8, chunk.physical_type, "double")) .number else if (std.mem.eql(u8, chunk.physical_type, "boolean")) .boolean else if (std.mem.eql(u8, chunk.physical_type, "byte_array") or std.mem.eql(u8, chunk.physical_type, "fixed_len_byte_array")) .bytes else return null;
     // Keep unsupported logical interpretations on the established decoder.
     const logical = chunk.logical_type;
+    // Match the complete decoder's physical/logical eligibility before taking
+    // the encoded path; unsupported annotations retain its established errors.
+    if (std.mem.startsWith(u8, logical, "int")) {
+        const physical = if (std.mem.eql(u8, logical, "int64")) "int64" else "int32";
+        if (!std.mem.eql(u8, chunk.physical_type, physical)) return null;
+    }
+    if (std.mem.startsWith(u8, logical, "timestamp_") and !std.mem.eql(u8, chunk.physical_type, "int64")) return null;
+    if (std.mem.eql(u8, logical, "decimal") and kind != .integer and kind != .bytes) return null;
+
     if (logical.len != 0 and !std.mem.eql(u8, logical, "string") and !std.mem.eql(u8, logical, "decimal") and !std.mem.startsWith(u8, logical, "int") and !std.mem.startsWith(u8, logical, "timestamp_")) return null;
-    if (std.mem.eql(u8, logical, "decimal") and (chunk.decimal_precision < 1 or chunk.decimal_precision > 38 or chunk.decimal_scale < 0)) return null;
+    if (std.mem.eql(u8, logical, "decimal") and (chunk.decimal_precision < 1 or chunk.decimal_precision > 38 or chunk.decimal_scale < 0 or chunk.decimal_scale > chunk.decimal_precision)) return null;
     if (kind == .bytes and std.mem.eql(u8, chunk.physical_type, "fixed_len_byte_array") and !std.mem.eql(u8, logical, "decimal")) return null;
     if (header.encoding != .plain and (dictionary == null or kind == .boolean)) return null;
     if (header.encoding != .plain) {
@@ -413,6 +422,10 @@ test "lake SQL encoded numeric predicate runs preserve exact integers selections
     const chunk: Chunk = .{ .column_id = @constCast("n"), .file_offset = 0, .compressed_len = payload.len, .physical_type = @constCast("int64") };
     const selected = (try create(a, chunk, header, &payload, null, 65536)).?;
     defer selected.destroy();
+    var unsupported = chunk;
+    unsupported.logical_type = @constCast("int8");
+    try std.testing.expect((try create(a, unsupported, header, &payload, null, 65536)) == null);
+
     for ([_]types.EncodedOp{ .eq, .neq, .lt, .lte, .gt, .gte }) |op| {
         var dense: [8]bool = @splat(true);
         var sparse = [_]bool{ true, false, true, true, false, true, true, false };

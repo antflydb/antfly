@@ -115,6 +115,16 @@ pub fn chunkTextWithConfigJsonAndProvider(
     return try chunkTextWithConfigJson(alloc, text, config_json);
 }
 
+/// Reduced storage owners do not link model/media inference. Keep the same
+/// configuration boundary as the full chunker and reject unavailable execution
+/// explicitly; binary/model-aware inputs must never fall back to text windows.
+pub fn chunkInputWithConfigJsonAndProvider(alloc: Allocator, _: anytype, config_json: []const u8, _: anytype) ![]Chunk {
+    var cfg = try chunking_types.parseConfigFromSlice(alloc, config_json);
+    defer cfg.deinit(alloc);
+    if (cfg.embedding == null or cfg.provider != .antfly) return error.InvalidChunkerConfig;
+    return error.UnsupportedPlatform;
+}
+
 pub fn freeChunks(alloc: Allocator, chunks: []Chunk) void {
     for (chunks) |*chunk| chunk.deinit(alloc);
     alloc.free(chunks);
@@ -223,4 +233,14 @@ test "chunker stub rejects antfly configured chunking" {
             \\{"provider":"antfly","model":"fixed"}
         ),
     );
+}
+
+test "chunker stub model input preserves config errors and never flattens binary inputs" {
+    const a = std.testing.allocator;
+    try std.testing.expectError(error.InvalidChunkerConfig, chunkInputWithConfigJsonAndProvider(a, &.{ 0xff, 0 },
+        \\{"provider":"antfly"}
+    , null));
+    try std.testing.expectError(error.UnsupportedPlatform, chunkInputWithConfigJsonAndProvider(a, &.{ 0xff, 0 },
+        \\{"provider":"antfly","embedding":{"model":"fixed"}}
+    , null));
 }

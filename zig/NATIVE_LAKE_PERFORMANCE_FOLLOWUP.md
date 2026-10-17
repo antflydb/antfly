@@ -5514,3 +5514,31 @@ values and 11 payload values from 1,024 source rows, while evaluating four encod
 predicate pages. These are bounded-work regression checks, not archive-scale
 latency/RSS measurements. Plain and dictionary decimal128 files are added to the
 real Parquet NUMERIC seek/join, algebraic aggregate, and pruning/restart E2Es.
+
+The final integration also carries native coefficients into canonical ordered
+NUMERIC index keys. String-declared index keys, raw predicates, text sidecars and
+raw string group sidecars format into caller scratch and retain fixed display
+scale. Encoded predicate eligibility matches the full decoder's physical/logical
+annotation rules before borrowing a page; unsupported interpretations keep the
+established decoder and errors.
+
+Latest fetched origin/main `acf50f2f60` is merged. All existing main runtime-error
+wire identifiers remain pinned; the branch-only decision limit detail follows
+main's last assigned detail. Reduced storage chunker owners implement main's new
+model-input boundary and explicitly reject unavailable model execution rather
+than flattening binary inputs.
+
+Qualification on the merged tree: 1,016 SQL tests passed (three opt-in benchmarks
+skipped), all 521 native lake tests passed, and the runtime I/O ABI gate passed
+with zero failures or leaks. All 32 runtime error ABI tests and the reduced
+chunker's model-input/configuration regression passed. The final shared native
+rerun includes canonical decimal index keys, fixed-scale raw consumers and
+unsupported Parquet annotation fallback.
+All 56 real Parquet/Iceberg E2Es passed in 327.93 seconds against the final Debug
+CLI with two workers; its SHA-256 remained unchanged throughout the run. Fixtures
+and standalone roots were isolated under the worktree for this qualification.
+This includes plain/dictionary decimal128 indexed joins, exact materializations,
+pruning and restart coverage. Zig/Python formatting, Python lint, whitespace,
+source/error catalog checks, license headers and the Apache product boundary
+(2,282 source files) passed. Representative archive-scale latency/RSS and
+live-provider retention qualification remain deferred.
